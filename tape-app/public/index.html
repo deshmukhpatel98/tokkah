@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover so env(safe-area-inset-*) is non-zero on notched phones;
+     every piece of chrome below is padded off those insets rather than off the
+     raw viewport edge (task #38 §A.2/A.8). -->
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>TAPE</title>
+<!-- Inline so the browser never issues a /favicon.ico request. Every page load was logging a
+     404 in the console, which trains you to ignore console errors — the opposite of useful in an
+     app whose whole point is that its telemetry can be trusted. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2306080d'/%3E%3Ccircle cx='11' cy='16' r='4.4' fill='none' stroke='%2360a5fa' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='4.4' fill='none' stroke='%2360a5fa' stroke-width='2'/%3E%3C/svg%3E">
+<style>
+  :root {
+    /* --muted was #7d8590, which lands at 1.8:1 against the dark-glass
+       surfaces below — fine on the flat page background it was chosen for,
+       unreadable the moment it sits on a panel over bright video. Lightened
+       until it clears 4.5:1 on every surface it is actually used on. */
+    --fg:#e8eaed; --muted:#9aa4b2; --line:#1f2937; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#ef4444;
+    /* ── Glass (task #38 §1.6) ────────────────────────────────────────────
+       A translucent surface has NO fixed contrast ratio — it inherits whatever
+       video sits behind it, which is the single thing that makes glass both
+       look cheap and fail WCAG 1.4.3. Bounded here by construction: a dark
+       tint floor (55% black) so luminance can never run away over a bright
+       frame, strong blur so background detail cannot compete with the glyph,
+       a hairline edge to define the shape, and glyphs at FULL opacity white —
+       never translucent ink on translucent glass.
+
+       Two tints, because the requirement differs: an icon circle carries a
+       white glyph and needs 3:1 (WCAG 1.4.11), a surface carrying sentences
+       needs 4.5:1 (1.4.3). Both are computed against the worst case — white
+       video behind the glass. Blur does NOT help here: it scrambles detail but
+       leaves mean luminance where it was, which is exactly the trap that makes
+       pretty glass fail an audit. The tint is what bounds it. */
+    --glass-bg: rgba(10,14,22,.72);
+    --glass-text: rgba(8,11,18,.90);
+    --glass-line: rgba(255,255,255,.14);
+    --glass-blur: blur(18px) saturate(1.4);
+    --r-fast: .16s; --r-mid: .22s; --r-slow: .25s;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #06080d; color: var(--fg); overflow: hidden;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select { font: inherit; }
+  button {
+    background: #111827; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 16px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06080d; font-weight: 600; }
+  button.primary:hover { background: #7cb5fd; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+  /* The one glass recipe, used by every floating surface in the app. Two glass
+     layers on screen at once is the ceiling (§1.6) — bar + sheet, or bar +
+     badge, never a screen made of glass. */
+  .glass {
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-line);
+  }
+  /* Samsung Internet < 18 and Firefox < 103 have no backdrop-filter. The
+     fallback is the SAME design one notch darker — not a different one. */
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .glass { background: rgba(10,14,22,.88); }
+  }
+
+  /* ── Icon controls (§A.1) ──────────────────────────────────────────────
+     48 px visible circle, 56 px hit area via the ::before halo — clears Apple
+     HIG 44 pt, Material 48 dp and WCAG 2.5.5 AAA at once. No text ever
+     renders: the label exists for screen readers and desktop hover only. */
+  .icon-btn {
+    position: relative; width: 48px; height: 48px; flex: 0 0 auto; padding: 0;
+    border-radius: 50%; display: grid; place-items: center; cursor: pointer;
+    color: #fff; background: var(--glass-bg); border: 1px solid var(--glass-line);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    transition: color var(--r-fast), box-shadow var(--r-fast), background var(--r-fast),
+                opacity var(--r-fast), width var(--r-mid) ease-out, border-radius var(--r-mid) ease-out;
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .icon-btn { background: rgba(10,14,22,.88); }
+  }
+  .icon-btn::before { content: ''; position: absolute; inset: -4px; border-radius: 50%; }
+  .icon-btn:hover:not(:disabled) { border-color: rgba(255,255,255,.28); }
+  .icon-btn:disabled { opacity: .4; cursor: default; }
+  .icon-btn svg { width: 22px; height: 22px; display: block; pointer-events: none;
+    fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-btn svg .solid { fill: currentColor; stroke: none; }
+  /* ON/active = a soft inner ring. OFF (muted / camera dark) = the glyph goes
+     red and wears a slash: red means "you are silent or dark to them", which
+     is parseable without reading anything. */
+  .icon-btn[data-on="1"] { box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.35); }
+  .icon-btn[data-off="1"] { color: var(--bad); }
+  .icon-btn .slash { opacity: 0; }
+  .icon-btn[data-off="1"] .slash { opacity: 1; }
+  /* The only filled control on the screen. One filled thing per screen is the
+     rule that keeps the rest calm. */
+  .icon-btn.leave { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .icon-btn.leave:hover { background: #f26464; border-color: #f26464; }
+  .icon-btn .lbl { display: none; font-size: 13px; font-weight: 600; white-space: nowrap; }
+  /* Two-step destructive confirm (§B.11): the circle morphs IN PLACE into a
+     pill. Not a modal — a modal over a live face is hostile, and it moves the
+     target under a finger that is already travelling. */
+  .icon-btn.leave.confirming { width: 150px; border-radius: 24px; gap: 8px;
+    grid-auto-flow: column; place-content: center; }
+  .icon-btn.leave.confirming .lbl { display: block; }
+  /* Six circles plus a 150 px pill overflows a 390 px phone: the row got
+     clipped at both edges and left a live mute button under the finger that
+     was already travelling toward "leave". So the row contracts to the single
+     decision — siblings collapse to zero width and stop taking taps. */
+  #bar.confirming { gap: 0; }
+  #bar.confirming .icon-btn:not(.leave) {
+    width: 0; opacity: 0; pointer-events: none; border-width: 0; overflow: hidden;
+  }
+
+  /* ── Lobby ─────────────────────────────────────────────── */
+  /* Self view fills the screen from page load until the peer joins (task #28,
+     user directive 2026-08-02) — the same fullscreen preserve-aspect treatment
+     as the remote view: object-fit: cover keeps the camera's aspect, mirrors
+     like every video app's self view, never stretches. The join panel floats
+     on top on a scrim so the form stays readable over any scene.
+     Bailenson's objection is the mirror DURING the conversation (§17.x / spec
+     §1.1–1.2); before it, a framing check is exactly what you want. */
+  #lobby { height: 100%; overflow: auto; display: grid; padding: 24px; position: relative; z-index: 1; }
+  .panel {
+    width: 100%; max-width: 460px; margin: auto; position: relative; z-index: 1;
+    border-radius: 20px; padding: 24px;
+    /* The densest text on the screen sits here, over an arbitrary camera
+       scene, so this surface is the most opaque one in the app. It still reads
+       as glass — blur, saturation and the hairline edge do that — but the
+       luminance floor is what keeps 12 px muted text legible over a window. */
+    background: rgba(6,8,13,.94);
+    -webkit-backdrop-filter: blur(22px) saturate(1.4); backdrop-filter: blur(22px) saturate(1.4);
+    border: 1px solid var(--glass-line);
+    box-shadow: 0 18px 60px rgba(0,0,0,.45);
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .panel { background: rgba(6,8,13,.97); }
+  }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -.01em; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  #previewWrap { position: fixed; inset: 0; background: #000; z-index: 0; }
+  #previewWrap video { display: block; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #previewBadge {
+    position: absolute; left: 12px; bottom: 12px; font-size: 11px; padding: 5px 10px;
+    border-radius: 999px; background: var(--glass-text); border: 1px solid var(--glass-line);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  }
+  /* Device pickers + level meter, overlaid on the preview (§15). Top-left so the
+     join panel (centred) never covers them at any viewport size. */
+  #devPick { position: absolute; left: 12px; top: 12px; z-index: 2; display: flex;
+    flex-direction: column; gap: 6px; max-width: min(58vw, 260px); }
+  #devPick select {
+    background: var(--glass-bg); color: var(--fg); border: 1px solid var(--glass-line);
+    border-radius: 999px; padding: 6px 10px; font-size: 11px; max-width: 100%;
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); cursor: pointer;
+  }
+  #devPick select:hover { border-color: rgba(255,255,255,.28); }
+  #devPick select:disabled { opacity: .5; cursor: default; }
+  /* A REAL level meter (§15) — actual mic RMS, not a decorative animation.
+     Peak-hold decays slowly so a single clap stays visible long enough to read. */
+  #levelWrap { position: relative; height: 5px; border-radius: 999px; overflow: hidden;
+    background: rgba(10,14,22,.7); border: 1px solid var(--glass-line); }
+  #levelBar { position: absolute; inset: 0 100% 0 0; border-radius: 999px;
+    background: linear-gradient(90deg, var(--ok), var(--ok) 62%, var(--warn) 84%, var(--bad));
+    transition: right .06s linear; }
+  #levelPeak { position: absolute; top: 0; bottom: 0; width: 2px; left: 0; opacity: 0;
+    background: var(--fg); transition: left .18s ease-out, opacity .5s; }
+  #capBadge {
+    position: absolute; right: 12px; bottom: 12px; font-size: 11px; padding: 5px 10px;
+    border-radius: 999px; background: var(--glass-text); border: 1px solid var(--glass-line);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    color: var(--muted);
+  }
+  #capBadge.locked { color: var(--ok); border-color: rgba(74,222,128,.35); }
+  .field { margin-top: 16px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input[type=text] {
+    width: 100%; background: rgba(6,8,13,.6); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .rowGap { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #joinRow { margin-top: 4px; }
+  #joinRow button { flex: 1; min-height: 48px; border-radius: 12px; font-size: 15px; }
+  /* The named room demotes to a quiet secondary row: possessing an unguessable
+     link is the credential (§7), so minting one is the primary act and typing
+     a shared name is the exception. Kept visible (not inside a disclosure)
+     because every testbed driver fills it. */
+  #namedRow { margin-top: 14px; display: flex; align-items: center; gap: 8px; }
+  #namedRow label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  #namedRow input {
+    flex: 1; min-width: 0; background: rgba(6,8,13,.55); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; font-size: 12px;
+  }
+  #namedRow input:focus { outline: none; border-color: var(--accent); }
+  .note {
+    margin-top: 18px; font-size: 12px; color: var(--muted);
+    border-left: 2px solid rgba(251,191,36,.45); padding: 2px 0 2px 12px;
+  }
+  .note b { color: var(--warn); font-weight: 600; }
+  details { margin-top: 14px; font-size: 12px; color: var(--muted); }
+  summary { cursor: pointer; }
+  details .body { margin-top: 8px; padding-left: 2px; }
+  #cardCal { height: 118px; background: linear-gradient(135deg,#1e3a5f,#312e81); border: 1px solid var(--accent);
+    border-radius: 9px; position: relative; cursor: ew-resize; user-select: none; margin-top: 8px;
+    display: flex; align-items: flex-end; padding: 7px; }
+  #cardCal::after { content:''; position:absolute; right:0; top:0; bottom:0; width:13px;
+    background: var(--accent); opacity:.35; border-radius: 0 8px 8px 0; }
+  #cardCal span { font-size: 11px; color: #c7d2fe; }
+
+  /* ── Call ──────────────────────────────────────────────── */
+  #call { display: none; position: fixed; inset: 0; background: #06080d; }
+  #remoteWrap { position: absolute; z-index: 0; overflow: hidden; }
+  #remoteWrap video, #remoteWrap canvas { display: block; width: 100%; height: 100%; object-fit: cover; background: transparent; }
+  #remoteWrap #remote { position: relative; z-index: 1; }
+  #remoteWrap canvas { position: absolute; inset: 0; z-index: 1; } /* #14 paint-on-arrival display (?l2canvas=1) */
+  #call.fill #remoteWrap { inset: 0 !important; width: auto !important; height: auto !important; }
+  /* ── Cross-device aspect (§5, user directive: no crop on either side) ────
+     Default fit is CONTAIN: a 9:19.5 phone frame shown on a 16:9 desktop keeps
+     every pixel the sender captured. The space either side is not a black bar —
+     it is a heavily blurred, dimmed wash of the same picture, so edge luminance
+     stays continuous and the face reads as the subject instead of as a letterbox.
+     #remoteFill is a 32×18 canvas resampled by the compositor, NOT a second
+     decoded <video>: it works identically on the lane-2 canvas display path
+     (where #remote's srcObject is the carrier, not the presented picture) and
+     costs one 2 Hz drawImage instead of a second decode. */
+  #remoteFill { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%;
+    object-fit: cover; display: none; filter: blur(28px) brightness(.42) saturate(1.25);
+    transform: scale(1.14); }
+  #call.contain #remoteFill { display: block; }
+  /* `:not(#remoteFill)` is load-bearing, not tidiness. The wash canvas lives
+     inside #remoteWrap too, so a bare `#remoteWrap canvas` outranks the
+     `object-fit: cover` above and makes the 32×18 fill letterbox ITSELF —
+     a phone in portrait watching a landscape caller got the exact black bars
+     this whole policy exists to remove. */
+  #call.contain #remoteWrap #remote,
+  #call.contain #remoteWrap canvas:not(#remoteFill) { object-fit: contain; }
+  /* Weak devices skip the wash entirely — a flat panel, no filter, no sampler. */
+  #call.contain.flat #remoteFill { display: none; }
+  #call.contain.flat #remoteWrap { background: #06080d; }
+
+  /* Joined but peer not here yet: own camera fills the screen (task #28).
+     Identical treatment to the remote view — cover, aspect preserved, mirrored. */
+  #selfFull { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1); background: #000; display: none;
+    transition: opacity var(--r-slow) ease-out; }
+  #selfFull.on { display: block; }
+  /* §D.17 — the peer's first frame crossfades in rather than cutting. */
+  #selfFull.fading { opacity: 0; }
+  #selfWrap { position: absolute; right: 16px; bottom: 86px; width: 132px; border-radius: 12px;
+    overflow: hidden; border: 1px solid var(--glass-line); display: none; z-index: 3;
+    box-shadow: 0 8px 28px rgba(0,0,0,.5); }
+  #selfWrap.on { display: block; }
+  #selfWrap video { width: 100%; display: block; transform: scaleX(-1); }
+  /* Rear camera: front is mirrored (universal), rear never is (§8 item 36). */
+  #selfWrap.rear video, #selfFull.rear, #previewWrap.rear video { transform: none; }
+
+  #waiting { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+    z-index: 2; text-shadow: 0 1px 8px rgba(0,0,0,.85);
+    background: radial-gradient(ellipse at center, rgba(6,8,13,.55), transparent 72%); }
+  #waiting.gone { display: none; }
+  #shareBox { margin-top: 14px; }
+  #shareUrl { width: 320px; max-width: 70vw; background: rgba(8,11,18,.9); color: var(--fg);
+    border: 1px solid var(--glass-line); border-radius: 999px; padding: 9px 14px; font-size: 12px; }
+  #copy { border-radius: 999px; padding: 9px 16px; font-size: 12px;
+    background: var(--glass-text); border: 1px solid var(--glass-line);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); }
+
+  /* ── The one chrome bar (§A.2) ─────────────────────────────────────────
+     Five or six circles, centred, in the bottom third — Hoober's easy thumb
+     arc on a tall phone, and nowhere near the top corners. Nothing else lives
+     here: the toggles that used to be chips moved into the more sheet. */
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+    padding: 26px 12px max(14px, env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(6,8,13,.72) 62%);
+    display: flex; flex-wrap: nowrap; gap: 14px; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity var(--r-mid) ease-out; pointer-events: none; }
+  #bar.show { opacity: 1; pointer-events: auto; }
+  /* Very narrow phones: shrink the gap before the circles, and only to 44 px —
+     the HIG floor. Never below it. Six controls at 44 px need 264 px, so the
+     gap that still fits is (100vw - 280px) / 5; the clamp spends the slack up
+     to 9 px and gives it back down to 8 px at 320 px (iPhone SE 1). Below
+     320 px the row overflows rather than shrink a target under the floor. */
+  @media (max-width: 380px) {
+    #bar { gap: clamp(6px, calc(20vw - 56px), 9px); padding-left: 8px; padding-right: 8px; }
+    #bar .icon-btn { width: 44px; height: 44px; }
+  }
+  /* ── Persistent state that auto-hide must never take away (§A.5) ────────
+     Chrome hides; STATE does not. Muting yourself and then wondering whether
+     you actually did is the most common anxiety in every video app, and the
+     fix is that the answer is always on screen. Rides up out of the bar's way
+     when the bar is showing so the two never collide on a narrow phone. */
+  #muteBadge, #floorIcon {
+    position: absolute; width: 34px; height: 34px; border-radius: 50%; z-index: 5;
+    display: none; place-items: center; background: var(--glass-bg);
+    border: 1px solid var(--glass-line);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    #muteBadge, #floorIcon { background: rgba(10,14,22,.88); }
+  }
+  #muteBadge svg, #floorIcon svg { width: 17px; height: 17px; fill: none; stroke: currentColor;
+    stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+  #muteBadge { left: max(14px, env(safe-area-inset-left)); bottom: max(14px, env(safe-area-inset-bottom));
+    color: var(--bad); border-color: rgba(239,68,68,.4); transition: transform var(--r-mid) ease-out; }
+  #muteBadge.on { display: grid; }
+  #call.barShown #muteBadge { transform: translateY(-62px); }
+  /* Loud room (§6): an ambient icon at the edge, never a sentence across the
+     face. Top-left, mirroring the speaking dots top-right — state lives at the
+     edges of the frame, and the middle stays a face. */
+  #floorIcon { left: max(14px, env(safe-area-inset-left)); top: max(14px, env(safe-area-inset-top));
+    color: var(--warn); border-color: rgba(251,191,36,.4); cursor: pointer; }
+  #floorIcon.on { display: grid; }
+  #floorIcon.pulse { animation: floorPulse .6s ease-out 2; }
+  @keyframes floorPulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(251,191,36,0); }
+    50% { box-shadow: 0 0 0 6px rgba(251,191,36,.22); }
+  }
+
+  /* §15 "Elapsed time, small, top center." Small enough to read only when looked
+     for — a clock you notice is a clock you watch, and watching the clock is the
+     fatigue this whole design exists to remove. Sits ABOVE #status so a held
+     connection's pill never has to fight it for the same pixels. */
+  #elapsed { position: absolute; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3;
+    font-size: 11px; color: rgba(232,234,237,.62); letter-spacing: .04em; pointer-events: none;
+    /* A soft drop shadow vanishes over bright video; a tight dark halo does not,
+       and it keeps the clock chrome-less instead of putting it on a pill. */
+    text-shadow: 0 0 3px rgba(0,0,0,.95), 0 0 8px rgba(0,0,0,.8), 0 1px 2px rgba(0,0,0,.9);
+    transition: opacity .4s; }
+  #elapsed.gone { opacity: 0; }
+
+  /* §15 VIDEO HELD: "Desaturates ~8% over 400 ms. Hairline indeterminate line at
+     the top." The desaturation is the load-bearing part — it makes a held frame
+     legible as INTENTIONAL rather than broken, without touching sharpness. The
+     hairline says the app is still working on it. Both are on the wrapper, so
+     they apply to the <video> and the paint-on-arrival <canvas> alike. */
+  #remoteWrap { transition: filter .4s ease; }
+  #call.held #remoteWrap, #call.held #selfFull { filter: saturate(.92); }
+  #call.paused #remoteWrap, #call.paused #selfFull { filter: saturate(.72) brightness(.82); }
+  #holdLine { position: absolute; top: 0; left: 0; right: 0; height: 2px; z-index: 5;
+    overflow: hidden; display: none; }
+  #call.held #holdLine, #call.paused #holdLine { display: block; }
+  /* Indeterminate: it reports "something is happening", never a fake percentage.
+     There is no honest progress number for a connection that may or may not come
+     back, and inventing one is the kind of lie the rest of this app refuses. */
+  #holdLine::after { content: ''; position: absolute; top: 0; left: 0; height: 100%; width: 34%;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: holdSlide 1.6s ease-in-out infinite; }
+  #call.paused #holdLine::after { background: linear-gradient(90deg, transparent, var(--warn), transparent); }
+  @keyframes holdSlide { 0% { left: -34%; } 100% { left: 100%; } }
+
+  #status { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 4;
+    font-size: 11px; padding: 5px 12px; border-radius: 999px; background: var(--glass-text);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-line); color: rgba(232,234,237,.92); white-space: nowrap; transition: opacity .6s; }
+  /* "connected" is said once and then gets out of the face's way — textContent is
+     kept (tests read it), only the pill fades. */
+  #status.gone { opacity: 0; }
+  /* §17.1 room-noise-ceiling honesty. The sentence is still here and still
+     verbatim, but it is now the EXPANDED state of #floorIcon rather than a
+     permanent banner: state is ambient, explanation is on demand (§6 item 27). */
+  /* Below the stall badge's band (top: 44 px, set in app.js) so an honest
+     connection state and a room-noise explanation can never fight for pixels. */
+  #floorHint { position: absolute; top: 84px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; padding: 10px 14px; border-radius: 14px; background: var(--glass-text);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    border: 1px solid rgba(251,191,36,.45); color: var(--warn); text-align: center;
+    max-width: min(420px, 84vw); display: none; z-index: 5; }
+  #floorHint.on { display: block; }
+  #dots { position: absolute; top: max(14px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right));
+    display: flex; gap: 7px; align-items: center; z-index: 3; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #1f2937; transition: background .08s; }
+  .dot.breath { background: var(--warn); box-shadow: 0 0 9px #fbbf2488; }
+  .dot.voice { background: var(--ok); box-shadow: 0 0 9px #4ade8088; }
+
+  /* ── More sheet (§B.12) ────────────────────────────────────────────────
+     Where the chips went. `visibility` (not just transform) so a closed sheet
+     is genuinely absent — off-screen-but-visible children are readable by
+     screen readers and would count as visible to the zero-stats DOM scan. */
+  #moreScrim { position: absolute; inset: 0; z-index: 5; display: none; }
+  #moreScrim.on { display: block; }
+  #moreSheet {
+    position: absolute; left: 50%; bottom: 0; z-index: 6; width: min(92vw, 420px);
+    border-radius: 20px 20px 0 0; padding: 10px 10px calc(12px + max(14px, env(safe-area-inset-bottom)));
+    background: var(--glass-text); border: 1px solid var(--glass-line); border-bottom: 0;
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    visibility: hidden; transform: translate(-50%, 100%);
+    transition: transform var(--r-mid) ease-out, visibility 0s var(--r-mid);
+  }
+  #moreSheet.on { visibility: visible; transform: translate(-50%, 0); transition: transform var(--r-mid) ease-out, visibility 0s 0s; }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    #moreSheet { background: rgba(10,14,22,.94); }
+  }
+  #moreSheet .grip { width: 36px; height: 4px; border-radius: 999px; background: rgba(255,255,255,.2);
+    margin: 2px auto 10px; }
+  /* Real <button>s, not divs: the sheet is the only place some settings live,
+     so it has to be reachable by keyboard and announced as switches. */
+  #moreSheet .row { display: flex; align-items: center; gap: 12px; min-height: 48px; width: 100%;
+    padding: 0 12px; border: 0; border-radius: 12px; background: none; font: inherit;
+    text-align: left; cursor: pointer; user-select: none; font-size: 14px;
+    -webkit-tap-highlight-color: transparent;
+    color: rgba(232,234,237,.86); }
+  #moreSheet .row:hover { background: rgba(255,255,255,.06); }
+  #moreSheet .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* An action, not a toggle — ruled off so it never reads as a fifth switch. */
+  #moreSheet .row.action { margin-top: 6px; padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,.09); border-radius: 0 0 12px 12px; }
+  #moreSheet .row[data-on="1"] { color: var(--fg); }
+  #moreSheet .row .tick { margin-left: auto; width: 18px; height: 18px; opacity: 0; color: var(--ok);
+    fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  #moreSheet .row[data-on="1"] .tick { opacity: 1; }
+  #moreSheet .hint { font-size: 11px; color: var(--muted); padding: 8px 12px 2px; opacity: .8; }
+  /* Neither a switch nor an action — a fact about this call. No hover, no cursor,
+     nothing to press, because there is no decision here for anyone to make. */
+  #moreSheet .row.static { cursor: default; }
+  #moreSheet .row.static:hover { background: none; }
+  #moreSheet .code { margin-left: auto; letter-spacing: .09em; color: var(--fg);
+    font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #moreSheet .code[data-pending="1"] { color: var(--muted); font-weight: 400; letter-spacing: 0; }
+
+  /* Motion budget (§A.7): everything above is ≤250 ms, opacity/transform only.
+     Reduced motion collapses every fade to instant and stops the hold line. */
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0s !important; animation-duration: 0s !important; }
+    #holdLine::after { animation: none; left: 0; width: 100%; opacity: .5; }
+    #floorIcon.pulse { animation: none; }
+  }
+
+  /* ── Live metrics overlay ──────────────────────────────── */
+  #hud { position: absolute; top: 42px; right: 16px; width: 254px; font-size: 11px; z-index: 6;
+    background: rgba(6,8,13,.9); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px; display: none; }
+  #hud.on { display: block; }
+  #hud h3 { margin: 0 0 8px; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  #hud .kv { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; }
+  #hud .kv span:nth-child(even) { text-align: right; font-family: ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  #hud hr { border: 0; border-top: 1px solid var(--line); margin: 9px 0; }
+  #hud .big { font-size: 17px; font-family: ui-monospace, Menlo, monospace; }
+  #logHealth { margin-top: 9px; font-size: 10px; color: var(--muted); }
+  #logHealth.bad { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <!-- Fullscreen self view behind the panel. Must NOT live inside .panel: the
+       panel's backdrop-filter makes it the containing block for fixed
+       descendants, which would size the video to the panel, not the viewport. -->
+  <div id="previewWrap">
+    <video id="preview" autoplay muted playsinline></video>
+    <div id="previewBadge" class="mono">starting camera…</div>
+    <!-- §15: "Device pickers overlaid on the preview, not in a panel." Overlaid
+         because choosing a camera is something you do while LOOKING at the
+         camera; a settings panel makes you switch, guess, and switch back. -->
+    <div id="devPick">
+      <select id="camSel" class="mono" aria-label="camera"></select>
+      <select id="micSel" class="mono" aria-label="microphone"></select>
+      <div id="levelWrap" title="your microphone level">
+        <div id="levelBar"></div>
+        <div id="levelPeak"></div>
+      </div>
+    </div>
+    <!-- §15: "The capacity probe resolves into a single locked badge." One line,
+         no numbers to interpret — what you are actually going to get. -->
+    <div id="capBadge" class="mono">measuring…</div>
+  </div>
+  <div class="panel">
+    <h1>TAPE</h1>
+    <p class="sub">A call that tries to feel like a conversation instead of a video call.</p>
+
+    <div class="rowGap" id="joinRow">
+      <button id="join" class="primary">Start a new call</button>
+    </div>
+    <div class="muted" id="joinStatus" style="margin-top:10px;font-size:12px"></div>
+
+    <!-- Unguessable links are the credential (§7). Typing a shared name still
+         works and old ?r=morning links still resolve — it just stops being the
+         thing the screen pushes you toward. -->
+    <div id="namedRow">
+      <label for="room">or join a named room</label>
+      <input id="room" type="text" value="" placeholder="name" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="note" id="hpNote">
+      <b>Wear headphones.</b> Echo cancellation is off on purpose — it deletes the breath before
+      someone speaks, and that breath is the whole point.
+      <div class="rowGap" style="margin-top:9px">
+        <button id="hpCheck" style="padding:5px 11px;font-size:12px">check my audio</button>
+        <span class="muted mono" id="hpOut" style="font-size:11px">not checked</span>
+      </div>
+    </div>
+
+    <details>
+      <summary>What's being recorded</summary>
+      <div class="body">
+        Timings and connection numbers only — when speech started and stopped, round-trip time,
+        frame rate, dropped frames. <b style="color:var(--ok)">No audio or video is recorded,
+        stored, or uploaded anywhere.</b> Nothing that was said is captured. The log is a list of
+        millisecond timestamps and counters, and you can download it from the call screen.
+      </div>
+    </details>
+
+    <details>
+      <summary>Screen size (optional — makes faces life-size)</summary>
+      <div class="body">
+        Hold a credit card against the screen and drag the right edge to match its width. Without
+        this, "life size" is a guess and the face falls back to filling the screen.
+        <div id="cardCal"><span id="cardLabel">drag right edge →</span></div>
+        <div class="rowGap" style="margin-top:8px">
+          <span class="muted mono" id="scaleOut">not set</span>
+          <button id="cardReset" style="padding:5px 11px;font-size:12px">reset</button>
+        </div>
+        <div class="rowGap" style="margin-top:10px">
+          <label class="muted" style="font-size:12px">how far you sit
+            <input id="dist" type="range" min="300" max="1200" step="10" value="600" style="vertical-align:middle">
+            <span class="mono" id="distOut">600 mm</span>
+          </label>
+        </div>
+      </div>
+    </details>
+  </div>
+</div>
+
+<div id="call">
+  <div id="remoteWrap">
+    <canvas id="remoteFill" width="32" height="18" aria-hidden="true"></canvas>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+  <video id="selfFull" autoplay muted playsinline></video>
+  <div id="selfWrap"><video id="self" autoplay muted playsinline></video></div>
+
+  <div id="waiting">
+    <div>
+      <div style="font-size:16px">Waiting for the other person…</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">This link is the key — anyone who has it can join</div>
+      <div id="shareBox" class="rowGap" style="justify-content:center">
+        <input id="shareUrl" readonly class="mono">
+        <button id="copy">copy</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="holdLine"></div>
+  <div id="elapsed" class="mono gone">0:00</div>
+  <div id="status">connecting…</div>
+  <div id="floorIcon" role="button" tabindex="0" aria-label="your room is loud">
+    <svg viewBox="0 0 24 24"><path d="M4 10v4"/><path d="M8 7.5v9"/><path d="M12 5v14"/><path d="M16 8.5v7"/><path d="M20 10v4"/><path d="M3.2 20.8 20.8 3.2"/></svg>
+  </div>
+  <div id="floorHint">Your room is loud — the other person won't hear the breath before you start talking. A quieter room or a closer mic fixes it.</div>
+  <div id="dots">
+    <span class="dot" id="dotLocal" title="you"></span>
+    <span class="dot" id="dotRemote" title="them"></span>
+  </div>
+
+  <!-- Mute is the state you cannot see any other way, so it is the one that
+       survives auto-hide (§A.5). Camera-off you can always see. -->
+  <div id="muteBadge" aria-live="polite" aria-label="your microphone is muted">
+    <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="10.5" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M4 4l16 16"/></svg>
+  </div>
+
+  <div id="hud">
+    <h3>turn-taking, live</h3>
+    <div class="kv">
+      <span>their reply, felt</span><span class="big" id="hPerceived">—</span>
+      <span>human only</span><span class="big" id="hHuman">—</span>
+      <span>their breath head start</span><span id="hLead">—</span>
+      <span>their turns w/ breath</span><span id="hBreath">—</span>
+      <span class="muted">yours (control)</span><span class="muted" id="hBreathLocal">—</span>
+      <span>usable turns</span><span id="hTurns">—</span>
+    </div>
+    <hr>
+    <div class="kv">
+      <span>round trip</span><span id="hRtt">—</span>
+      <span>playout buffer</span><span id="hPlayout">—</span>
+      <span>video</span><span id="hVideo">—</span>
+      <span>sending</span><span id="hSend">—</span>
+      <span>freezes</span><span id="hFreeze">—</span>
+      <span>audio glitches</span><span id="hConceal">—</span>
+    </div>
+    <div id="logHealth">log: —</div>
+  </div>
+
+  <div id="moreScrim"></div>
+  <div id="moreSheet" role="dialog" aria-label="more controls">
+    <div class="grip"></div>
+    <button type="button" class="row" id="c-selfview" data-on="0" role="switch" aria-checked="false">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4.5" width="19" height="15" rx="3"/><rect x="12.5" y="11.5" width="7" height="5.5" rx="1.5"/></svg>
+      <span>Pin self view</span>
+      <svg class="tick" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></svg>
+    </button>
+    <button type="button" class="row" id="c-lifesize" data-on="0" role="switch" aria-checked="false">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V4.5A1.5 1.5 0 0 1 4.5 3H8"/><path d="M16 3h3.5A1.5 1.5 0 0 1 21 4.5V8"/><path d="M21 16v3.5a1.5 1.5 0 0 1-1.5 1.5H16"/><path d="M8 21H4.5A1.5 1.5 0 0 1 3 19.5V16"/></svg>
+      <span>Life size</span>
+      <svg class="tick" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></svg>
+    </button>
+    <button type="button" class="row" id="c-gaze" data-on="1" role="switch" aria-checked="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.8"/></svg>
+      <span>Eye-line alignment</span>
+      <svg class="tick" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></svg>
+    </button>
+    <button type="button" class="row" id="c-hud" data-on="0" role="switch" aria-checked="false">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>
+      <span>Connection numbers</span>
+      <svg class="tick" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></svg>
+    </button>
+    <div class="row static" id="c-safety">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10.5" width="16" height="10.5" rx="2.5"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/></svg>
+      <span>Encryption code</span>
+      <span class="code" id="safetyCode" data-pending="1">…</span>
+    </div>
+    <div class="hint" id="safetyHint">Read it aloud. Same code on both screens means nobody is in the middle.</div>
+    <button type="button" class="row action" id="save">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11"/><path d="M7.5 10.5 12 15l4.5-4.5"/><path d="M4.5 19.5h15"/></svg>
+      <span>Save call log</span>
+    </button>
+    <div class="hint">Hold the self-view button to peek without pinning.</div>
+  </div>
+
+  <div id="bar">
+    <button id="mic" class="icon-btn" data-off="0" aria-label="microphone" title="microphone">
+      <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="10.5" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path class="slash" d="M4 4l16 16"/></svg>
+    </button>
+    <button id="cam" class="icon-btn" data-off="0" aria-label="camera" title="camera">
+      <svg viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="3"/><path d="M15.5 10.5l6-3.5v10l-6-3.5z"/><path class="slash" d="M4 4l16 16"/></svg>
+    </button>
+    <button id="flip" class="icon-btn" style="display:none" aria-label="switch camera" title="switch camera">
+      <svg viewBox="0 0 24 24"><path d="M3.2 12a8.8 8.8 0 0 1 8.8-8.8c2.5 0 4.8 1.05 6.4 2.75"/><path d="M20.8 12a8.8 8.8 0 0 1-8.8 8.8c-2.5 0-4.8-1.05-6.4-2.75"/><path d="M18.4 2.6v3.6h-3.6"/><path d="M5.6 21.4v-3.6h3.6"/></svg>
+    </button>
+    <button id="selfPeek" class="icon-btn" data-on="0" aria-label="self view — hold to peek, double-tap to pin" title="hold to peek, double-tap to pin">
+      <svg viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="3"/><rect x="12.5" y="11.5" width="7" height="5.5" rx="1.5"/></svg>
+    </button>
+    <button id="more" class="icon-btn" aria-label="more controls" title="more">
+      <svg viewBox="0 0 24 24"><circle class="solid" cx="5.5" cy="12" r="1.7"/><circle class="solid" cx="12" cy="12" r="1.7"/><circle class="solid" cx="18.5" cy="12" r="1.7"/></svg>
+    </button>
+    <button id="leave" class="icon-btn leave" aria-label="leave call" title="leave">
+      <svg viewBox="0 0 24 24"><path class="solid" d="M2.6 14.9c5.2-5.1 13.6-5.1 18.8 0l-2.3 2.3c-.6.6-1.5.6-2.1 0l-1.5-1.4a1.6 1.6 0 0 1-.45-1.45l.25-1.3a10.4 10.4 0 0 0-6.5 0l.25 1.3c.1.55-.1 1.1-.45 1.45l-1.5 1.4c-.6.6-1.5.6-2.1 0z"/></svg>
+      <span class="lbl">tap to leave</span>
+    </button>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

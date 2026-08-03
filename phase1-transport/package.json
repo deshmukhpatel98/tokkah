@@ -1,0 +1,16 @@
+{
+  "name": "tape-phase1-transport",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Phase 1 decision gate: can an unordered/unreliable RTCDataChannel sustain 12 Mbps at realistic RTT?",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

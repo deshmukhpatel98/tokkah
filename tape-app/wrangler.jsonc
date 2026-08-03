@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Generic, fork-friendly config: deploys to YOUR workers.dev subdomain with
+  // zero edits. The production deployment for room.tokkah.com uses a separate,
+  // uncommitted wrangler.prod.jsonc (same shape plus a custom-domain route) —
+  // that split is what makes the one-click deploy work on any account without
+  // trying to claim someone else's domain.
+  "name": "tokkah",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-05-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Assets-first serving would bypass the Worker for the page itself, and
+    // Lane A needs the Worker to gate COOP/COEP (SharedArrayBuffer) on
+    // ?pcmaudio=1. With the flag off the Worker returns the asset untouched,
+    // so flag-off responses stay byte-identical.
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "observability": { "enabled": true },
+  "workers_dev": true
+
+  // OPTIONAL — TURN relay credentials (calls between different networks — a
+  // phone on cellular and a laptop on wifi will often need a relay). Without
+  // them the app falls back to STUN-only gracefully: same-network and most
+  // home-NAT calls still connect. Server-side only, minted per-request at
+  // /api/ice with 3600 s TTL; never in code or the browser:
+  //   wrangler secret put TURN_KEY_ID
+  //   wrangler secret put TURN_KEY_API_TOKEN
+  // (Cloudflare TURN keys: dash.cloudflare.com → Calls → TURN)
+}

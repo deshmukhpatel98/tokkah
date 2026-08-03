@@ -1,0 +1,117 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>g2g selfprobe</title>
+<!--
+  Self-view glass-to-glass, standalone (task #29): the exact pipeline the app's
+  self-preview uses — getUserMedia → <video>.srcObject → compositor — with the
+  one instrument the platform offers: requestVideoFrameCallback.
+
+  If the source stamps captureTime (Chromium's VideoFrameMetadata key for camera
+  reference time — measured present on both the fake and the real camera here),
+  self-view G2G is a two-key subtraction on ONE clock:
+      G2G = expectedDisplayTime − captureTime
+  No cross-clock mapping anywhere — the cleanest number in the whole probe.
+
+  A MediaStreamTrackProcessor also reads the same track (a second reader is
+  legal) so we learn the VideoFrame.timestamp media-clock base behaviour of the
+  same source — that is the fallback design's data if captureTimestamp is absent.
+
+  Testbed only. Never shipped, never in the call UI.
+-->
+<video id="v" autoplay muted playsinline style="width: 640px"></video>
+<script>
+window.__selfprobe = { done: false };
+(async () => {
+  const out = window.__selfprobe;
+  const pct = (a, p) => {
+    const b = a.filter((x) => x != null && Number.isFinite(x));
+    if (!b.length) return null;
+    const s = [...b].sort((x, y) => x - y);
+    return +s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))].toFixed(2);
+  };
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, frameRate: { ideal: 30 } },
+    });
+    const v = document.getElementById('v');
+    v.srcObject = stream;
+    const track = stream.getVideoTracks()[0];
+    out.settings = track.getSettings();
+
+    // rVFC series — ~10 s at vsync cadence.
+    const rv = [];
+    let firstKeys = null;
+    const N = 600;
+    v.requestVideoFrameCallback(function cb(_ts, m) {
+      if (!firstKeys) firstKeys = Object.keys(m);
+      rv.push({
+        pt: m.presentationTime,
+        ed: m.expectedDisplayTime,
+        // Chromium names it captureTime (measured: present on fake AND real
+        // cameras); captureTimestamp is the other spec spelling — take either.
+        cap: m.captureTime ?? m.captureTimestamp ?? null,
+        mt: m.mediaTime,
+        pf: m.presentedFrames,
+        now: performance.now(),
+      });
+      if (rv.length < N) v.requestVideoFrameCallback(cb);
+      else finish();
+    });
+
+    // Track reader: VideoFrame.timestamp domain + running-min raw lag (tape.js's
+    // capLag method — the base offset of the capture clock is unobservable, the
+    // running min is the standard estimator).
+    const frames = [];
+    let mco = Infinity;
+    (async () => {
+      try {
+        const rdr = new MediaStreamTrackProcessor({ track }).readable.getReader();
+        for (;;) {
+          const { done, value: fr } = await rdr.read();
+          if (done) return;
+          const raw = performance.now() - fr.timestamp / 1000;
+          mco = Math.min(mco, raw);
+          frames.push({ raw, lag: raw - mco });
+          fr.close();
+          if (frames.length >= 300) return;
+        }
+      } catch (e) {
+        out.trackErr = String(e);
+      }
+    })();
+
+    function finish() {
+      const stamped = rv.filter((r) => r.cap != null);
+      const g2g = stamped.map((r) => +(r.ed - r.cap).toFixed(2));
+      const g2gPt = stamped.map((r) => +(r.pt - r.cap).toFixed(2));
+      const vsync = rv.slice(1).map((r, i) => +(r.now - rv[i].now).toFixed(2));
+      out.rvfcKeys = firstKeys;
+      out.capStamped = stamped.length > 0;
+      out.n = rv.length;
+      out.g2gExpected = {
+        p50: pct(g2g, 50), p95: pct(g2g, 95),
+        min: g2g.length ? +Math.min(...g2g).toFixed(2) : null,
+        max: g2g.length ? +Math.max(...g2g).toFixed(2) : null,
+      };
+      out.g2gCallback = { p50: pct(g2gPt, 50), p95: pct(g2gPt, 95) };
+      out.vsyncMs = { p50: pct(vsync, 50), p95: pct(vsync, 95) };
+      out.trackLag = frames.length
+        ? {
+            n: frames.length,
+            mco: +mco.toFixed(2),
+            lagP50: pct(frames.map((x) => x.lag), 50),
+            lagP95: pct(frames.map((x) => x.lag), 95),
+            rawFirst: +frames[0].raw.toFixed(2),
+          }
+        : null;
+      out.done = true;
+    }
+    setTimeout(() => {
+      if (!out.done) { out.timedOut = true; finish(); }
+    }, 25000);
+  } catch (e) {
+    out.err = String(e);
+    out.done = true;
+  }
+})();
+</script>

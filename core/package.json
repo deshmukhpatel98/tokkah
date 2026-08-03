@@ -1,0 +1,10 @@
+{
+  "name": "tape-core",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Shared media-core modules. Plain ESM, no dependencies, no browser or node APIs in the hot paths — so the same file runs under an AudioWorklet and under `node` for testing. Slated for port to Rust (DESIGN.md §19.3).",
+  "scripts": {
+    "test": "node onset.test.mjs"
+  }
+}

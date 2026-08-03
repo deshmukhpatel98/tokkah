@@ -1,0 +1,18 @@
+node_modules/
+.wrangler/
+.DS_Store
+.claude/
+
+# Production deploy config (custom domain route) — each deployment supplies its own.
+tape-app/wrangler.prod.jsonc
+
+# Measurement-rig bulk: fixtures, captures, and run outputs (gigabytes).
+# The rig SCRIPTS are committed; their inputs/outputs are not.
+testbed/media/
+testbed/runs/
+testbed/out/
+testbed/profiles/
+testbed/*.png
+phase1-transport/runs/
+fatigue-lab/runs/
+*.log

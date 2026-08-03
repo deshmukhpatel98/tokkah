@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TAPE — fatigue lab</title>
+<style>
+  :root { --fg:#e5e7eb; --muted:#6b7280; --line:#1f2937; --accent:#60a5fa; --ok:#4ade80; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #07090f; color: var(--fg);
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow: hidden;
+  }
+  button, input, select {
+    font: inherit; background: #0b1120; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: #1e3a5f; border-color: var(--accent); color: #dbeafe; }
+  .muted { color: var(--muted); }
+  h2 { font-size: 13px; margin: 0 0 4px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+
+  /* ── Lobby ─────────────────────────────────────────────── */
+  #lobby { height: 100%; overflow: auto; padding: 26px; max-width: 760px; margin: 0 auto; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 14px 0; background: #0a0e17; }
+  .step p { margin: 6px 0 12px; color: #9ca3af; font-size: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  /* credit-card calibration */
+  #card {
+    height: 150px; background: linear-gradient(135deg,#1e3a5f,#312e81);
+    border: 1px solid var(--accent); border-radius: 10px; position: relative;
+    display: flex; align-items: flex-end; padding: 8px; cursor: ew-resize;
+    user-select: none;
+  }
+  #card::after {
+    content: ''; position: absolute; right: 0; top: 0; bottom: 0; width: 14px;
+    background: var(--accent); opacity: .35; border-radius: 0 9px 9px 0; cursor: ew-resize;
+  }
+  #card span { font-size: 11px; color: #c7d2fe; }
+
+  /* face geometry */
+  #geomWrap { position: relative; width: 100%; max-width: 480px; background: #000; border-radius: 8px; overflow: hidden; }
+  #geomWrap video { width: 100%; display: block; transform: scaleX(-1); }
+  #eyeLine { position: absolute; left: 0; right: 0; height: 2px; background: var(--ok); cursor: ns-resize; }
+  #eyeLine::after { content: 'eye line — drag'; position: absolute; left: 6px; top: 4px; font-size: 10px; color: var(--ok); }
+  #headBox {
+    position: absolute; border: 2px solid #fbbf24; border-top: none; border-bottom: none;
+    top: 0; bottom: 0; cursor: ew-resize;
+  }
+  #headBox::after { content: 'head width — drag edge'; position: absolute; right: 4px; bottom: 4px; font-size: 10px; color: #fbbf24; }
+
+  /* ── Call ──────────────────────────────────────────────── */
+  #call { display: none; position: fixed; inset: 0; background: #07090f; }
+  #remoteWrap { position: absolute; }
+  #remoteWrap video { display: block; width: 100%; height: 100%; object-fit: cover; background: #000; }
+  #call.fill #remoteWrap { inset: 0 !important; width: auto !important; height: auto !important; }
+  #selfWrap {
+    position: absolute; right: 18px; bottom: 18px; width: 150px;
+    border-radius: 8px; overflow: hidden; border: 1px solid var(--line); display: none;
+  }
+  #selfWrap.on { display: block; }
+  #selfWrap video { width: 100%; display: block; transform: scaleX(-1); }
+
+  #panel {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px;
+    background: linear-gradient(transparent, rgba(7,9,15,.96));
+    display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap;
+    opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  #panel.show { opacity: 1; pointer-events: auto; }
+  .toggles { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tg {
+    display: flex; align-items: center; gap: 6px; font-size: 11px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; cursor: pointer;
+    background: #0b1120; user-select: none;
+  }
+  .tg[data-on="1"] { border-color: var(--ok); color: var(--ok); }
+  .tg[data-on="0"] { color: var(--muted); }
+  #readout { font-size: 11px; color: var(--muted); white-space: pre; line-height: 1.7; }
+  #hint {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; color: var(--muted); background: rgba(7,9,15,.8);
+    padding: 5px 12px; border-radius: 999px; border: 1px solid var(--line);
+  }
+  #warn { color: #fbbf24; font-size: 11px; margin-top: 8px; }
+
+  /* ── Turn / onset meter ────────────────────────────────────── */
+  #turnDot {
+    width: 14px; height: 14px; border-radius: 50%; background: #1f2937;
+    transition: background .08s, box-shadow .08s; flex: none;
+  }
+  #turnDot.breath { background: #fbbf24; box-shadow: 0 0 12px #fbbf2488; }
+  #turnDot.voice  { background: var(--ok);  box-shadow: 0 0 12px #4ade8088; }
+  #meterWrap {
+    position: relative; height: 6px; background: #0b1120; border: 1px solid var(--line);
+    border-radius: 3px; margin-top: 12px; overflow: hidden;
+  }
+  #meter { position: absolute; inset: 0 100% 0 0; background: var(--accent); transition: right .05s linear; }
+  #meterFloor { position: absolute; top: 0; bottom: 0; width: 2px; background: #ef4444; left: 0; }
+  #turnLog { margin-top: 8px; font-size: 11px; max-height: 132px; overflow: auto; }
+  #turnLog div { display: flex; gap: 10px; padding: 2px 0; border-top: 1px solid #111827; }
+  #turnLog .lead { color: var(--ok); font-variant-numeric: tabular-nums; }
+  #turnLog .kind { color: var(--muted); width: 62px; }
+  #turnLog .bar { flex: 1; align-self: center; height: 4px; background: #14532d; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <h1>TAPE — fatigue lab</h1>
+  <p class="muted">
+    A/B test for the six known causes of Zoom fatigue. Ordinary WebRTC transport on purpose — these
+    fixes are independent of the pipeline, so they can be tested before it exists.
+    <b>Hold SPACE during a call to flip every fix off</b> and feel the difference.
+  </p>
+
+  <div class="step">
+    <h2>1 · Screen scale</h2>
+    <p>Hold a credit card (or any ID card) against the screen and drag the right edge until the blue
+      box matches its width exactly. This is the only way a browser can learn your display's real
+      physical size — without it, "life size" is a guess.</p>
+    <div id="card"><span id="cardLabel">drag right edge →</span></div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" id="scaleOut">not calibrated</span>
+      <button id="cardReset">reset</button>
+    </div>
+  </div>
+
+  <div class="step">
+    <h2>2 · How far are you sitting?</h2>
+    <p>Eye-to-screen distance. Typical laptop use is 50–70 cm.</p>
+    <div class="row">
+      <input id="dist" type="range" min="300" max="1200" step="10" value="600" style="flex:1;min-width:220px">
+      <span id="distOut">600 mm</span>
+    </div>
+  </div>
+
+  <div class="step">
+    <h2>3 · Your face</h2>
+    <p>Drag the green line to your eyes, and the yellow edges to the sides of your head (temple to
+      temple). Your peer needs this to render you at true physical scale.</p>
+    <div id="geomWrap">
+      <video id="preview" autoplay muted playsinline></video>
+      <div id="eyeLine"></div>
+      <div id="headBox"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="muted">head width
+        <input id="headMm" type="number" value="150" min="110" max="200" style="width:74px"> mm
+      </label>
+      <span class="muted">(adult average ≈ 150 mm)</span>
+    </div>
+  </div>
+
+  <div class="step">
+    <h2>4 · Your breath <span class="muted" style="text-transform:none">— test this one alone</span></h2>
+    <p>The single most valuable 200 ms in the design. Before you speak, you inhale — and that inhale
+      reaches the other person before your words do. Every call app deletes it as noise; we send it
+      first. Say a few sentences with pauses between them, and watch what the lead actually measures
+      on <i>your</i> voice.</p>
+    <div class="row" style="gap:14px">
+      <div id="turnDot" title="idle"></div>
+      <div id="turnState" class="muted">waiting for mic…</div>
+      <div style="margin-left:auto"><button id="onsetReset">reset</button></div>
+    </div>
+    <div id="meterWrap"><div id="meter"></div><div id="meterFloor"></div></div>
+    <div id="turnStats" class="muted" style="margin-top:10px">no turns yet</div>
+    <div id="turnLog"></div>
+  </div>
+
+  <div class="step">
+    <h2>5 · Join</h2>
+    <div class="row">
+      <input id="room" value="lab1" size="12">
+      <button id="join" class="primary">Join call</button>
+      <span class="muted" id="joinStatus"></span>
+    </div>
+    <div id="warn">
+      Raw audio means echo cancellation is OFF — that is the point, but it needs headphones.
+      Without them you will echo. You can switch to processed audio mid-call to compare.
+    </div>
+  </div>
+</div>
+
+<div id="call">
+  <div id="remoteWrap"><video id="remote" autoplay playsinline></video></div>
+  <div id="selfWrap"><video id="self" autoplay muted playsinline></video></div>
+  <div id="hint">move the mouse for controls · hold SPACE to compare</div>
+  <div id="panel">
+    <div class="toggles">
+      <div class="tg" id="t-audio"      data-on="1">raw audio</div>
+      <div class="tg" id="t-lifesize"   data-on="1">life size</div>
+      <div class="tg" id="t-gaze"       data-on="1">gaze aligned</div>
+      <div class="tg" id="t-selfview"   data-on="0">self view</div>
+      <div class="tg" id="t-lockcam"    data-on="1">locked exposure</div>
+    </div>
+    <div id="readout"></div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button id="fs">fullscreen</button>
+      <button id="leave">leave</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/lab.js"></script>
+</body>
+</html>

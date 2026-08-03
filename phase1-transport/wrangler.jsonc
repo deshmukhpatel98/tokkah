@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tape-phase1",
+  "main": "src/worker.ts",
+  // Bump this (and `npm i -D wrangler@latest`) whenever you upgrade; the local
+  // runtime refuses dates newer than the installed workerd binary supports.
+  "compatibility_date": "2026-05-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "observability": { "enabled": true }
+
+  // Secrets (set with `wrangler secret put`, not here):
+  //   TURN_KEY_ID
+  //   TURN_KEY_API_TOKEN
+  // Without them the harness runs P2P-only and says so in the UI.
+}

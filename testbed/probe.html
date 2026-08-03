@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mic probe</title>
+<body style="font:13px monospace;background:#111;color:#eee;padding:20px">
+<pre id="out">starting…</pre>
+<script type="module">
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; };
+const result = { ok: false, err: null, frames: 0, peak: 0, rms: 0, silentPct: null, track: null };
+window.__probe = result;
+
+try {
+  // Exactly the constraints the app uses: everything off, so the file arrives raw.
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+      channelCount: 1, sampleRate: 48000,
+    },
+    video: false,
+  });
+  const t = stream.getAudioTracks()[0];
+  result.track = { label: t.label, settings: t.getSettings() };
+  log('track: ' + t.label);
+  log('settings: ' + JSON.stringify(t.getSettings()));
+
+  const ac = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  const src = ac.createMediaStreamSource(stream);
+  const an = ac.createAnalyser();
+  an.fftSize = 2048;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+
+  let frames = 0, silent = 0, peak = 0, sumSq = 0, n = 0;
+  const tick = () => {
+    an.getFloatTimeDomainData(buf);
+    let p = 0, s = 0;
+    for (const v of buf) { const a = Math.abs(v); if (a > p) p = a; s += v * v; }
+    frames++;
+    if (p < 1e-4) silent++;
+    if (p > peak) peak = p;
+    sumSq += s; n += buf.length;
+    if (frames < 300) requestAnimationFrame(tick);
+    else {
+      result.ok = peak > 0.01;
+      result.frames = frames;
+      result.peak = +peak.toFixed(5);
+      result.rms = +Math.sqrt(sumSq / n).toFixed(5);
+      result.silentPct = +((silent / frames) * 100).toFixed(1);
+      result.done = true;
+      log('frames=' + frames + ' peak=' + result.peak + ' rms=' + result.rms + ' silent=' + result.silentPct + '%');
+      log(result.ok ? 'FILE AUDIO IS REACHING getUserMedia' : 'SILENT — flag did not work');
+    }
+  };
+  requestAnimationFrame(tick);
+} catch (e) {
+  result.err = String(e);
+  result.done = true;
+  log('ERROR: ' + e);
+}
+</script>
+</body>

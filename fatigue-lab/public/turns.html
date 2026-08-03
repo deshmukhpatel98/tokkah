@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TAPE — turn-taking gate</title>
+<style>
+  :root { --fg:#e5e7eb; --muted:#6b7280; --line:#1f2937; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #07090f; color: var(--fg); min-height: 100vh;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px; }
+  button, input, select { font: inherit; background: #0b1120; color: var(--fg); border: 1px solid var(--line); border-radius: 5px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: #1e3a5f; border-color: var(--accent); color: #dbeafe; }
+  .muted { color: var(--muted); }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  h2 { font-size: 12px; margin: 0 0 8px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 14px 0; background: #0a0e17; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  p { color: #9ca3af; font-size: 12px; margin: 6px 0 12px; }
+
+  #prompt {
+    font-size: 26px; line-height: 1.35; min-height: 92px; display: flex; align-items: center;
+    padding: 18px; border-radius: 8px; background: #0b1120; border: 1px solid var(--line);
+  }
+  #prompt.asking { border-color: var(--accent); background: #0d1729; }
+  #prompt.answering { border-color: var(--ok); background: #0b1a12; }
+  #role { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+  #role.asker { color: var(--accent); }
+  #role.answerer { color: var(--ok); }
+
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: #1f2937; flex: none; transition: background .08s; }
+  .dot.breath { background: var(--warn); box-shadow: 0 0 10px #fbbf2488; }
+  .dot.voice { background: var(--ok); box-shadow: 0 0 10px #4ade8088; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { text-align: right; color: var(--muted); font-weight: normal; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  td { text-align: right; padding: 3px 6px; border-bottom: 1px solid #111827; font-variant-numeric: tabular-nums; }
+  td.ttfe { color: var(--warn); }
+  td.voice { color: var(--ok); }
+
+  .big { font-size: 24px; font-variant-numeric: tabular-nums; }
+  .verdict { padding: 14px 16px; border-radius: 8px; border: 1px solid var(--line); margin-top: 12px; }
+  .verdict.pass { border-color: var(--ok); background: #08160e; }
+  .verdict.fail { border-color: var(--bad); background: #1a0b0b; }
+  .verdict.pending { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; font-size: 12px; }
+  .kv span:nth-child(even) { font-variant-numeric: tabular-nums; text-align: right; }
+  code { background: #0b1120; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+  #log { font-size: 11px; color: var(--muted); max-height: 130px; overflow: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>TAPE — turn-taking gate</h1>
+  <p>
+    The falsification test for <code>DESIGN.md §1.1c</code>. Boland et al. (2021) measured turn
+    transitions at <b>297&nbsp;ms</b> face to face and <b>976&nbsp;ms</b> over Zoom. Latency alone
+    explains about 797 of that, so ~179&nbsp;ms is Zoom destroying the cues people use to predict a
+    turn ending. This page checks whether raw audio wins that back — and whether the pre-turn inhale
+    really arrives before the words.
+    <b>Needs two machines and headphones on both.</b>
+  </p>
+
+  <div class="card">
+    <h2>Run sheet — read this first</h2>
+    <p style="font-size:12.5px;color:#c9d2e0">
+      Two people, two computers, headphones on both, <b>in different rooms</b> (if you can hear each
+      other through the air, the timing is meaningless).
+    </p>
+    <ol style="color:#c9d2e0;font-size:12.5px;line-height:1.8;margin:4px 0 8px;padding-left:22px">
+      <li>Both of you: type the <b>same room word</b> and a <b>run label</b> like <code>run1</code>.</li>
+      <li><b>Run A (raw):</b> both leave <i>raw audio</i> <b>ticked</b>, press Join. Check the line next
+        to Join says your modes match.</li>
+      <li>Whoever sees <b>you ask</b>: read the question out loud, then stop talking. Whoever sees
+        <b>you answer</b>: say "yes" or "no" <b>the instant you know</b> — do not wait to be polite.
+        The page advances by itself after each answer.</li>
+      <li>After ~10 questions press <b>swap asker</b> so the other person answers for a while.
+        Aim for <b>20+ scored turns</b> (bottom table), then <b>export CSV</b>.</li>
+      <li><b>Run B (processed):</b> reload the page, both <b>untick</b> raw audio, use a new label like
+        <code>run2</code>, and repeat. That A/B is the whole experiment.</li>
+      <li>If something goes weird mid-question, the asker presses <b>discard this one</b>.</li>
+    </ol>
+    <p style="margin:0">
+      The verdict panel judges the <b>raw</b> run against the gate. A FAIL is information, not a bug —
+      it would mean the design's central inference is wrong, which is exactly what this page exists to
+      find out before anyone builds the rest of it.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Setup</h2>
+    <div class="row">
+      <input id="room" value="turns1" size="10" title="room word — same on both machines">
+      <input id="runlabel" value="run1" size="6" title="run label — goes into the CSV filename">
+      <label class="row" style="gap:6px"><input type="checkbox" id="raw" checked> raw audio (the thing under test)</label>
+      <button id="join" class="primary">Join</button>
+      <span id="status" class="muted">not connected</span>
+      <span id="peermode" class="muted"></span>
+    </div>
+    <p style="margin:10px 0 0">
+      Both sides must set the same audio mode for a run to be comparable — the page checks and warns
+      on a mismatch. The checkbox locks after Join because the mode is baked into the captured stream.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <span id="role" class="muted">—</span>
+      <span class="muted" id="progress"></span>
+      <span style="margin-left:auto" class="row">
+        <span class="dot" id="dotLocal" title="your mic"></span><span class="muted">you</span>
+        <span class="dot" id="dotRemote" title="incoming audio" style="margin-left:8px"></span><span class="muted">them</span>
+      </span>
+    </div>
+    <div id="prompt">Join to begin.</div>
+    <div class="row" style="margin-top:12px">
+      <button id="next" disabled>swap asker</button>
+      <button id="skip" disabled>discard this one</button>
+      <span class="muted" id="hint"></span>
+      <span style="margin-left:auto" class="row" style="gap:8px">
+        <button id="csv" disabled>export CSV</button>
+        <button id="reset">reset</button>
+      </span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Results — this run</h2>
+    <div class="row" style="gap:32px;align-items:flex-start">
+      <div>
+        <div class="muted">median time to first evidence</div>
+        <div class="big" id="mTtfe" style="color:var(--warn)">—</div>
+      </div>
+      <div>
+        <div class="muted">median to first word</div>
+        <div class="big" id="mVoice" style="color:var(--ok)">—</div>
+      </div>
+      <div>
+        <div class="muted">breath head start</div>
+        <div class="big" id="mCredit">—</div>
+      </div>
+      <div>
+        <div class="muted">measured RTT</div>
+        <div class="big" id="mRtt">—</div>
+      </div>
+    </div>
+    <div class="verdict pending" id="verdict">Need at least 8 scored turns for a verdict.</div>
+  </div>
+
+  <div class="card">
+    <h2>Turns</h2>
+    <table>
+      <thead><tr>
+        <th>#</th><th>question</th><th>first evidence</th><th>first word</th>
+        <th>head start</th><th>opened with</th><th>human-only</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+
+</div>
+<script type="module" src="/turns.js"></script>
+</body>
+</html>

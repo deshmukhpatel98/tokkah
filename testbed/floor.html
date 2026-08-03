@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>floor probe</title>
+<body style="font:12px monospace;background:#111;color:#eee;padding:16px">
+<pre id="out">…</pre>
+<script type="module">
+// Run the *shipping* detector directly on the fake-mic stream and report its internal
+// state over time. The point is to stop guessing why a turn does not end and read the
+// two numbers that decide it: the tracked floor, and the level of the audio arriving.
+import { OnsetDetector } from '/core/onset.js';
+
+const out = document.getElementById('out');
+const trace = [];
+const events = [];
+window.__floor = { trace, events, done: false };
+
+const stream = await navigator.mediaDevices.getUserMedia({
+  audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+});
+const ac = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+const src = ac.createMediaStreamSource(stream);
+
+// A ScriptProcessor is deprecated and jittery, which does not matter here — this probe
+// measures levels, not latency, and it avoids needing a worklet just to read state.
+const node = ac.createScriptProcessor(2048, 1, 1);
+const det = new OnsetDetector({ sampleRate: 48000 });
+let lastTrace = 0;
+
+node.onaudioprocess = (e) => {
+  const ch = e.inputBuffer.getChannelData(0);
+  for (const ev of det.push(ch)) {
+    events.push({ t: +(performance.now()).toFixed(0), type: ev.type, kind: ev.kind ?? null,
+      snrDb: ev.snrDb != null ? +ev.snrDb.toFixed(1) : null,
+      floorDb: ev.floorDb != null ? +ev.floorDb.toFixed(1) : null,
+      durationMs: ev.durationMs != null ? +ev.durationMs.toFixed(0) : null,
+      forced: !!ev.forced });
+  }
+  const now = performance.now();
+  if (now - lastTrace > 250) {
+    lastTrace = now;
+    // Level of this block, independent of the detector's own accounting.
+    let s = 0;
+    for (const v of ch) s += v * v;
+    const db = 20 * Math.log10(Math.sqrt(s / ch.length) + 1e-12);
+    trace.push({
+      t: +now.toFixed(0), db: +db.toFixed(1),
+      floor: det.floorDb == null ? null : +det.floorDb.toFixed(1),
+      snr: det.floorDb == null ? null : +(db - det.floorDb).toFixed(1),
+      state: det.state, quiet: det.quietHops, active: det.activeHops, real: det.realHops,
+    });
+    out.textContent = trace.slice(-24).map((r) =>
+      `${String(r.t).padStart(6)} ${r.state.padEnd(7)} lvl ${String(r.db).padStart(7)} floor ${String(r.floor).padStart(7)} snr ${String(r.snr).padStart(6)} quiet ${String(r.quiet).padStart(4)} active ${r.active}`,
+    ).join('\n');
+  }
+};
+src.connect(node);
+node.connect(ac.destination);
+setTimeout(() => { window.__floor.done = true; }, Number(new URLSearchParams(location.search).get('ms') ?? 50000));
+</script>
+</body>

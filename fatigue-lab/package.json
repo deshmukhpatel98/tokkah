@@ -1,0 +1,15 @@
+{
+  "name": "tape-fatigue-lab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A/B lab for the six causes of Zoom fatigue (DESIGN.md §1.1), on ordinary WebRTC transport.",
+  "scripts": {
+    "dev": "wrangler dev --port 8793",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
