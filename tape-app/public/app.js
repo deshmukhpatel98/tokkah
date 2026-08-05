@@ -264,12 +264,25 @@ function recoverCall(why) {
   setStatus('connection lost — reconnecting…');
   // The same proven route as reArmForNewPeer: boot with ?rejoin=1 presses join
   // itself. 300 ms lets the telemetry flush attempt and the beacon leave first.
-  setTimeout(() => safe(() => {
+  //
+  // NEVER navigate while offline (measured on the M13, 2026-08-05: cutting
+  // WiFi mid-call fired this reload ~3 s later, straight into
+  // chrome-error://chromewebdata — and an error page has none of our code, so
+  // the call stayed dead even after the network returned). If the browser says
+  // offline, hold the reload until the 'online' event, then give the new
+  // network a beat to validate before navigating.
+  const go = () => safe(() => {
     const u = new URL(location.href);
     u.searchParams.set('r', activeRoom);
     u.searchParams.set('rejoin', '1');
     location.replace(u.toString());
-  }, 'recover.go'), 300);
+  }, 'recover.go');
+  setTimeout(() => {
+    if (navigator.onLine) return go();
+    setStatus('connection lost — will reconnect when the network returns');
+    tel?.log('recover', { why: 'awaiting-online' });
+    window.addEventListener('online', () => setTimeout(go, 1500), { once: true });
+  }, 300);
 }
 
 // ── Self-view lobby (task #28, user directive 2026-08-02) ────────────────────
@@ -1393,6 +1406,40 @@ let rtpVideoTrack = null; // lane 2: the carrier's decoded track, held for fallb
 // 99.3% delivery, 0 sender drops, 4.4% concealed, age p50 40.5 ms, and no RTT
 // inflation at all. Join got no slower (1465 ms vs 1794 for the video lane alone).
 const PCM_AUDIO = QS.get('pcmaudio') !== '0';
+// Interpreter (TRANSLATE-SPEC.md). One button, no setup: the speaker's
+// language is auto-detected server-side per phrase; each listener hears
+// translations in their own browser language. `?xlate=<lang>` overrides the
+// listening language (the rig uses it) and auto-starts at welcome.
+const XLATE_LANG = QS.get('xlate') || null;
+const xlateListenLang = () => XLATE_LANG || (navigator.language || 'en');
+let xlateApi = null;    // { stop } once running
+let xlateBusy = false;  // guards the async import against double-click
+const xlateBtn = () => document.getElementById('xlate');
+async function xlateStart(fromPeer) {
+  if (xlateApi || xlateBusy || !role || !localStream) return;
+  xlateBusy = true;
+  try {
+    const x = await import('./xlate.js');
+    xlateApi = await x.start({ stream: localStream, room: activeRoom, role, lang: xlateListenLang(), tel });
+    xlateBtn()?.setAttribute('data-off', '0');
+    tel.log('xlate-start', { fromPeer: fromPeer ? 1 : 0, lang: xlateListenLang() });
+    // One click turns the interpreter on for the CALL, not for one side — a
+    // translator that only one person has is half a translator.
+    if (!fromPeer) send({ type: 'xlate-on' });
+  } catch (e) {
+    tel.log('xlate-load-err', { e: String(e) });
+  } finally {
+    xlateBusy = false;
+  }
+}
+function xlateStop(fromPeer) {
+  if (!xlateApi) return;
+  try { xlateApi.stop(); } catch { /* partial */ }
+  xlateApi = null;
+  xlateBtn()?.setAttribute('data-off', '1');
+  tel.log('xlate-stop', { fromPeer: fromPeer ? 1 : 0 });
+  if (!fromPeer) send({ type: 'xlate-off' });
+}
 const PCM_CFG = {
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
@@ -3877,8 +3924,20 @@ async function join(room) {
   // because the answer is needed at `welcome`, which is the first thing the
   // socket delivers. `wantTape` is already final by here: the lane's own support
   // check ran during pc setup, so this is what we ARE running, not what we hope.
+  // `sid` is this TAB's stable identity (survives the recovery reload —
+  // sessionStorage is per-tab). Its one job is ghost eviction: a phone that
+  // loses its network mid-call leaves a socket the room still counts as OPEN
+  // (nothing ever closed it), and the phone's own rejoin then 409s against its
+  // own corpse. Measured on the M13 WiFi-cut, 2026-08-05: the rejoin's upgrade
+  // failed once and the call was dead forever. The room evicts the old socket
+  // with the same sid before counting occupants.
+  const sid = safe(() => {
+    let s = sessionStorage.getItem('tape.sid');
+    if (!s) { s = crypto.randomUUID(); sessionStorage.setItem('tape.sid', s); }
+    return s;
+  }, 'join.sid') ?? '';
   ws = new WebSocket(
-    `${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?lane=${wantTape}&pcm=${PCM_AUDIO ? 1 : 0}`,
+    `${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?lane=${wantTape}&pcm=${PCM_AUDIO ? 1 : 0}&sid=${encodeURIComponent(sid)}`,
   );
   // A room already holding two people rejects the upgrade with 409 — the room
   // DO caps at 2 by design, which IS the admission model (§7 item 32): the link
@@ -3919,6 +3978,10 @@ async function join(room) {
         sendDisplayHz();
         laneAgree(m.peerLane, 'welcome');
         pcmAgree(m.peerPcm, 'welcome');
+        // Interpreter rides beside the call, never inside it (Law 0): a
+        // failure here logs and vanishes, the call proceeds untouched.
+        // ?xlate= auto-starts (the rig's path); people use the 🌐 button.
+        if (XLATE_LANG) void xlateStart(false);
         // Before any offer: `a` creates the tape channels so they are in the first SDP,
         // `b` only arms its listener. Creating a channel after the offer would need a
         // renegotiation round trip before video could start.
@@ -4037,6 +4100,9 @@ async function join(room) {
         // so a mismatched lane is already torn down when the SDP goes out.
         laneAgree(m.peerLane, 'peer-joined');
         pcmAgree(m.peerPcm, 'peer-joined');
+        // A peer who joins after we turned translation on was not there for
+        // the original xlate-on — repeat it so they come up translated too.
+        if (xlateApi) send({ type: 'xlate-on' });
         if (role === 'a') {
           await offer();
           if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll();
@@ -4137,6 +4203,12 @@ async function join(room) {
         // The fallback sender is no longer the only consumer: lane 2 encodes on its own
         // clock and never looked at `maxFramerate` at all.
         syncTapeFps('peer-display');
+      } else if (m.type === 'xlate-on') {
+        // The other side pressed 🌐 — the interpreter is a property of the
+        // call, so this side comes up too, listening in its own language.
+        void xlateStart(true);
+      } else if (m.type === 'xlate-off') {
+        xlateStop(true);
       } else if (m.type === 'peer-left') {
         setStatus('they left');
         tel.log('peer-left', {});
@@ -4368,6 +4440,11 @@ $('mic').onclick = () => {
   $('mic').dataset.off = t.enabled ? '0' : '1';
   haptic();
   tel?.log('toggle', { what: 'mic', on: t.enabled, pre: joined ? 0 : 1 });
+};
+$('xlate').onclick = () => {
+  haptic();
+  if (xlateApi) xlateStop(false);
+  else void xlateStart(false); // no-op until in a call (needs role + mic)
 };
 $('cam').onclick = () => {
   const t = armStream()?.getVideoTracks()[0];
@@ -4865,6 +4942,10 @@ function roomFromInput(raw) {
   return /^[A-Za-z0-9_-]{1,64}$/.test(cleaned) ? cleaned : null;
 }
 
+// Recovery-boot retry budget (see the catch below). 15 tries × 4 s ≈ one
+// minute of walking back toward a call whose room is already in the URL.
+const REJOIN_RETRY_MAX = 15;
+let rejoinRetries = 0;
 $('join').onclick = async () => {
   const wanted = roomFromInput($('room').value);
   if (wanted === null) {
@@ -4883,6 +4964,16 @@ $('join').onclick = async () => {
     // not chase the user across every future visit — one failure spends it.
     if (resumePending) { resumePending = false; clearLive(); }
     tel?.log('join-failed', { msg: String(e.message).slice(0, 160) });
+    // A RECOVERY boot must not die on its first try. Measured on the M13
+    // (WiFi cut → cellular, 2026-08-05): the rejoin's ws upgrade failed once
+    // right at the network transition and the page then sat at "connecting…"
+    // forever with the call one button-press away. Only ?rejoin=1 retries —
+    // a human's own failed join stays a human's decision.
+    if (QS.get('rejoin') === '1' && !joined && rejoinRetries < REJOIN_RETRY_MAX) {
+      rejoinRetries++;
+      tel?.log('rejoin-retry', { n: rejoinRetries });
+      setTimeout(() => safe(() => { if (!joined) $('join').click(); }, 'rejoin.retry'), 4000);
+    }
   }
 };
 

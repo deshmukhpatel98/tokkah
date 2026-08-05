@@ -80,6 +80,7 @@ export class Room implements DurableObject {
   // untouched. Both maps are keyed by the socket and torn down together.
   private laneCaps = new Map<WebSocket, number>();
   private pcmCaps = new Map<WebSocket, number>();
+  private sids = new Map<WebSocket, string>();
   private sql: SqlStorage;
   // §10: the room's sole time authority. Stamped once at DO creation, persisted
   // so a DO restart keeps the epoch (a call's session clock must not rebase
@@ -262,6 +263,25 @@ export class Room implements DurableObject {
     for (const [p] of this.peers) {
       if (p.readyState !== WebSocket.READY_STATE_OPEN) this.peers.delete(p);
     }
+    // Ghost eviction (task #50). A client whose NETWORK died mid-call leaves a
+    // socket that still reads OPEN here — nothing on either end closed it — and
+    // the sweep above cannot see that. When the same TAB rejoins (its `sid`
+    // survives the recovery reload in sessionStorage), the old socket is its
+    // own corpse: close it and admit the newcomer. Measured on the M13
+    // (WiFi cut → cellular, 2026-08-05): without this, the phone's rejoin
+    // 409'd against itself and the call was unrecoverable.
+    const upSid = new URL(request.url).searchParams.get('sid');
+    if (upSid) {
+      for (const [p] of this.peers) {
+        if (this.sids.get(p) === upSid) {
+          try { p.close(1000, 'replaced by same tab'); } catch { /* already dead */ }
+          this.peers.delete(p);
+          this.laneCaps.delete(p);
+          this.pcmCaps.delete(p);
+          this.sids.delete(p);
+        }
+      }
+    }
     if (this.peers.size >= 2) return new Response('room full', { status: 409 });
 
     const pair = new WebSocketPair();
@@ -299,6 +319,7 @@ export class Room implements DurableObject {
     const pcm = Number(q.get('pcm')) || 0;
     this.laneCaps.set(server, lane);
     this.pcmCaps.set(server, pcm);
+    if (upSid) this.sids.set(server, upSid);
     const peerCap = (m: Map<WebSocket, number>) => {
       for (const [p] of this.peers) if (p !== server) return m.get(p) ?? 0;
       return null; // nobody else here yet; `peer-joined` carries it when they arrive
@@ -320,6 +341,7 @@ export class Room implements DurableObject {
       this.peers.delete(server);
       this.laneCaps.delete(server);
       this.pcmCaps.delete(server);
+      this.sids.delete(server);
       for (const [p] of this.peers) {
         try {
           p.send(JSON.stringify({ type: 'peer-left' }));
@@ -381,47 +403,85 @@ export class Room implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     server.accept();
+    // Binary frames arrive as Blob by default here (measured: every uplink
+    // chunk decoded to 0 bytes and Scribe heard pure silence). Ask for
+    // ArrayBuffer explicitly.
+    try { (server as unknown as { binaryType: string }).binaryType = 'arraybuffer'; } catch { /* older runtime */ }
     try { this.xl.get(role)?.sock.close(); this.xl.get(role)?.up?.close(); } catch { /* replaced */ }
     const st = { sock: server, lang, up: null as WebSocket | null, ttsBusy: Promise.resolve(), seg: 0 };
     this.xl.set(role, st);
     const peer = () => this.xl.get(role === 'a' ? 'b' : 'a') ?? null;
     const say = (s: WebSocket | undefined | null, m: unknown) => { try { s?.send(JSON.stringify(m)); } catch { /* dead */ } };
 
-    // Upstream Scribe. Workers outbound WS = fetch with an Upgrade header.
-    try {
-      const r = await fetch(
-        `https://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&language_code=${encodeURIComponent(lang)}`,
-        { headers: { Upgrade: 'websocket', 'xi-api-key': key } },
-      );
-      st.up = r.webSocket ?? null;
-      if (!st.up) throw new Error(`scribe upgrade ${r.status}`);
-      st.up.accept();
-    } catch (e) {
-      say(server, { type: 'xl-err', where: 'scribe-connect', e: String(e) });
-      server.close(1011, 'stt unavailable');
-      this.xl.delete(role);
-      return new Response(null, { status: 101, webSocket: client });
-    }
+    let lastCommitAt = 0; // Date.now() at the client's quiet-flush — msStt anchor
+    let upSent = 0;       // audio chunks actually forwarded upstream
+    let upConnecting = false;
+    let lastUpTry = 0;
+    const upOpen = () => st.up !== null && st.up.readyState === WebSocket.READY_STATE_OPEN;
+    const upTypes: Record<string, number> = {};
 
-    let lastCommitAt = 0; // Date.now() at the commit we sent — msStt anchor
-    st.up.addEventListener('message', (e: MessageEvent) => {
+    const onUpMessage = (e: MessageEvent) => {
       let m: Record<string, unknown>;
       try { m = JSON.parse(e.data as string); } catch { return; }
       const mt = String(m.message_type ?? '');
+      upTypes[mt] = (upTypes[mt] ?? 0) + 1;
       if (mt === 'partial_transcript' && m.text) {
         // Live source-language caption on the far side while the phrase is
         // still being spoken — the "they're saying something" feedback.
         say(peer()?.sock, { type: 'cap', fin: 0, lang, txt: String(m.text) });
-      } else if ((mt === 'committed_transcript') && String(m.text ?? '').trim()) {
+      } else if (mt === 'committed_transcript_with_timestamps' && String(m.text ?? '').trim()) {
+        // With include_language_detection=true every commit arrives TWICE —
+        // this variant (carrying language_code) and a bare committed_transcript.
+        // Handle only this one or every phrase is translated and spoken twice.
         const msStt = lastCommitAt ? Date.now() - lastCommitAt : null;
-        void this.deliver(role, String(m.text), msStt);
+        void this.deliver(role, String(m.text), msStt, String(m.language_code ?? ''));
       } else if (mt === 'session_started') {
         say(server, { type: 'xl-ready', lang });
       } else if (/error|invalid/.test(mt)) {
         say(server, { type: 'xl-err', where: 'scribe', e: JSON.stringify(m).slice(0, 300) });
       }
-    });
-    st.up.addEventListener('close', () => say(server, { type: 'xl-err', where: 'scribe-closed' }));
+    };
+
+    // Scribe idles out a silent listener and closes (measured: code 1000 after
+    // ~15 s of no speech). That must never be terminal — the session is
+    // re-opened lazily by the next audio chunk, so a person who listens for
+    // ten minutes and then speaks still gets transcribed.
+    const connectScribe = async (): Promise<boolean> => {
+      if (upConnecting || Date.now() - lastUpTry < 2000) return false;
+      upConnecting = true;
+      lastUpTry = Date.now();
+      try {
+        const r = await fetch(
+          // commit_strategy=vad: Scribe segments at phrase ends itself. Manual
+          // commits are OFF — at conversational pause cadence they trip the
+          // vendor's `commit_throttled` and it hard-closes the session
+          // (measured 2026-08-05; 4 s spacing survived, ~1.5 s did not).
+          // vad_silence_threshold_secs=0.5: commit half a second into a pause —
+          // the phrase boundary in conversational speech (defaults never fired
+          // on 900 ms inter-sentence pauses, measured 2026-08-05).
+          // No language_code: the speaker's language is DETECTED per segment
+          // (the button asks nothing, TRANSLATE-SPEC.md P0'). `lang` on this
+          // socket is the LISTENING language — what this side wants to hear.
+          `https://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=vad&vad_silence_threshold_secs=0.5&min_silence_duration_ms=400&include_language_detection=true`,
+          { headers: { Upgrade: 'websocket', 'xi-api-key': key } },
+        );
+        const up = r.webSocket;
+        if (!up) throw new Error(`scribe upgrade ${r.status}`);
+        up.accept();
+        up.addEventListener('message', onUpMessage);
+        up.addEventListener('close', (e: CloseEvent) =>
+          say(server, { type: 'xl-err', where: 'scribe-closed', code: e.code, reason: String(e.reason).slice(0, 200), upSent }));
+        up.addEventListener('error', () => say(server, { type: 'xl-err', where: 'scribe-socket-error', upSent }));
+        st.up = up;
+        return true;
+      } catch (e) {
+        say(server, { type: 'xl-err', where: 'scribe-connect', e: String(e) });
+        return false;
+      } finally {
+        upConnecting = false;
+      }
+    };
+    await connectScribe();
 
     // 64 KiB-safe base64 for audio chunks (browser sends 100 ms = 3,200 B).
     const b64 = (u8: Uint8Array) => {
@@ -431,19 +491,34 @@ export class Room implements DurableObject {
     };
     server.addEventListener('message', (e: MessageEvent) => {
       if (typeof e.data === 'string') {
-        // Client's onset detector says the floor went quiet: force a commit so
-        // T_tail doesn't wait on the vendor's VAD (the spec's real latency lever).
-        let m: Record<string, unknown>; try { m = JSON.parse(e.data); } catch { return; }
-        if (m.type === 'flush' && st.up) {
-          lastCommitAt = Date.now();
-          st.up.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: b64(new Uint8Array(3200)), commit: true, sample_rate: 16000 }));
-        }
+        // The client's onset VAD saying "phrase over". With commit_strategy=vad
+        // this is a TIMING ANCHOR only (msStt = end-of-speech → transcript);
+        // sending manual commits at this cadence killed the session (above).
+        let mm: Record<string, unknown>; try { mm = JSON.parse(e.data); } catch { return; }
+        if (mm.type === 'flush') lastCommitAt = Date.now();
         return;
       }
-      if (st.up) {
-        st.up.send(JSON.stringify({
+      if (!upOpen()) { void connectScribe(); return; } // chunk dropped; next ones flow
+      {
+        upSent++;
+        const u8 = new Uint8Array(e.data as ArrayBuffer);
+        const enc = b64(u8);
+        if (upSent % 50 === 0) {
+          // Instrument the instrument: decode our own base64 back and measure
+          // the audio energy Scribe is actually being handed.
+          const back = atob(enc);
+          let s2 = 0;
+          for (let i = 0; i + 1 < back.length; i += 2) {
+            let v = back.charCodeAt(i) | (back.charCodeAt(i + 1) << 8);
+            if (v > 32767) v -= 65536;
+            s2 += v * v;
+          }
+          const rms = Math.round(Math.sqrt(s2 / (back.length / 2)));
+          say(server, { type: 'xl-stat', upSent, upTypes, chunkBytes: u8.byteLength, rms });
+        }
+        st.up!.send(JSON.stringify({
           message_type: 'input_audio_chunk',
-          audio_base_64: b64(new Uint8Array(e.data as ArrayBuffer)),
+          audio_base_64: enc,
           commit: false,
           sample_rate: 16000,
         }));
@@ -459,25 +534,31 @@ export class Room implements DurableObject {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // committed source text → translate → caption both sides → speak to the peer.
-  private async deliver(role: string, srcTxt: string, msStt: number | null): Promise<void> {
+  // committed source text (+ detected language) → translate → caption both
+  // sides → speak to the peer, in the peer's LISTENING language.
+  private async deliver(role: string, srcTxt: string, msStt: number | null, detected: string): Promise<void> {
     const me = this.xl.get(role);
     const peer = this.xl.get(role === 'a' ? 'b' : 'a');
     if (!me) return;
     const say = (s: WebSocket | undefined, m: unknown) => { try { s?.send(JSON.stringify(m)); } catch { /* dead */ } };
+    const base = (s: string) => s.split('-')[0].toLowerCase();
+    const src = detected || me.lang; // detection is per segment — mixed-language speakers just work
     const dst = peer?.lang ?? me.lang;
+    const same = base(src) === base(dst);
     const t0 = Date.now();
     let out = srcTxt;
     let mtMode = 'same';
-    if (dst !== me.lang) {
-      try { [out, mtMode] = await this.translate(srcTxt, me.lang, dst); }
+    if (!same) {
+      try { [out, mtMode] = await this.translate(srcTxt, src, dst); }
       catch (e) { say(me.sock, { type: 'xl-err', where: 'mt', e: String(e) }); }
     }
     const msMt = Date.now() - t0;
     const seg = me.seg++;
-    say(me.sock, { type: 'cap', fin: 1, who: 'me', seg, lang: me.lang, txt: srcTxt, tr: out });
-    say(peer?.sock, { type: 'cap', fin: 1, who: 'peer', seg, lang: dst, txt: out, src: srcTxt, msStt, msMt, mtMode });
-    if (!peer || dst === me.lang) return;
+    say(me.sock, { type: 'cap', fin: 1, who: 'me', seg, lang: src, txt: srcTxt, tr: out });
+    say(peer?.sock, { type: 'cap', fin: 1, who: 'peer', seg, lang: dst, srcLang: src, txt: out, src: srcTxt, msStt, msMt, mtMode });
+    // Same language on both ears → captions only. No TTS parroting people to
+    // each other in a language they share.
+    if (!peer || same) return;
     // Serialize TTS per speaker so segments never interleave in the peer's ear.
     me.ttsBusy = me.ttsBusy.then(() => this.speak(me, peer, out, seg, msStt, msMt)).catch(() => { /* reported inside */ });
   }
@@ -793,7 +874,7 @@ export default {
     }
 
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary
-    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary)$/);
+    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate)$/);
     if (m) {
       const code = decodeURIComponent(m[1]);
       if (!ROOM_RE.test(code)) return json({ error: 'bad room code' }, 400);
