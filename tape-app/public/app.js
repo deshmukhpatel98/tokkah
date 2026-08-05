@@ -3456,8 +3456,15 @@ async function join(room) {
     cores: navigator.hardwareConcurrency ?? null,
   });
 
-  const ice = await safeAsync(() => fetch('/api/ice').then((r) => r.json()), 'ice');
-  tel.log('ice-config', { p2pOnly: ice?.p2pOnly ?? true, servers: ice?.iceServers?.length ?? 0 });
+  // Task #51: the lobby already fetched this — reuse it instead of spending a
+  // serial round trip here. 120 s freshness: TURN credentials are minted with
+  // hours of TTL, the cap is just paranoia about a lobby left open overnight.
+  const ice = await safeAsync(() => {
+    const fresh = iceCache && Date.now() - iceCache.at < 120_000;
+    if (!fresh) iceCache = { at: Date.now(), promise: fetch('/api/ice').then((r) => r.json()) };
+    return iceCache.promise;
+  }, 'ice');
+  tel.log('ice-config', { p2pOnly: ice?.p2pOnly ?? true, servers: ice?.iceServers?.length ?? 0, cached: iceCache ? 1 : 0 });
 
   localStream = await getMedia();
   // Task #37: the camera probes arm at JOIN, not peer-join — the pre-call
@@ -4946,6 +4953,21 @@ function roomFromInput(raw) {
 // minute of walking back toward a call whose room is already in the URL.
 const REJOIN_RETRY_MAX = 15;
 let rejoinRetries = 0;
+// Task #51: the /api/ice response the lobby fetched, reused by join() so the
+// click pays no serial round trip. { at, promise }.
+let iceCache = null;
+// Task #51: the FIRST joiner's ws-open was ~1.1 s against ~0.3 s for the
+// second (measured, ttc-measure, prod medians) — the difference is the room
+// Durable Object's cold start, paid by whoever CREATES the room. The lobby
+// knows the room name long before the click (deep link, typed name, or the
+// pre-minted one below), so warm the DO while the human is still looking at
+// the preview. /summary without a token is a 401 — but the DO is constructed
+// and its storage read to answer it, which is the entire point.
+let pendingMint = null; // minted at lobby load so its DO can be warmed too
+function prewarmRoom(room) {
+  if (!room) return;
+  safe(() => { fetch(`/api/room/${encodeURIComponent(room)}/summary`).catch(() => {}); }, 'prewarm');
+}
 $('join').onclick = async () => {
   const wanted = roomFromInput($('room').value);
   if (wanted === null) {
@@ -4956,7 +4978,7 @@ $('join').onclick = async () => {
   $('join').disabled = true;
   $('joinStatus').textContent = 'starting…';
   try {
-    await join(wanted || mintRoom());
+    await join(wanted || pendingMint || mintRoom());
   } catch (e) {
     $('joinStatus').textContent = `couldn't join: ${e.message}`;
     $('join').disabled = false;
@@ -5283,8 +5305,10 @@ $('hpCheck').onclick = () => safeAsync(headphoneCheck, 'hp.click');
 // explanation. Checked in the lobby rather than at join time so it is read before the call, and
 // it never blocks: a failed probe leaves the lobby exactly as it was.
 safe(() => {
-  fetch('/api/ice')
-    .then((r) => r.json())
+  // Task #51: this same response is what join() needs — cache it so joining
+  // costs no serial /api/ice round trip. One fetch, two customers.
+  iceCache = { at: Date.now(), promise: fetch('/api/ice').then((r) => r.json()) };
+  iceCache.promise
     .then((ice) => {
       if (!ice?.p2pOnly) return;
       const el = $('joinStatus');
@@ -5296,6 +5320,27 @@ safe(() => {
       /* the lobby is not the place to report a failed probe */
     });
 });
+
+// Task #51: warm the room DO from the lobby (see prewarmRoom). Three ways a
+// room name is known before the click: the URL, the pre-minted "Start a call"
+// name, and whatever the user is typing (debounced — every keystroke would
+// construct a DO per prefix).
+safe(() => {
+  pendingMint = mintRoom();
+  // This runs BEFORE the deep-link block fills the input, so read the URL the
+  // same way it does.
+  const urlRoom = location.pathname.match(/^\/([a-z]{3}-[a-z]{4}-[a-z]{3})$/)?.[1]
+    ?? new URLSearchParams(location.search).get('r');
+  prewarmRoom(urlRoom || pendingMint);
+  let warmT = null;
+  $('room').addEventListener('input', () => {
+    clearTimeout(warmT);
+    warmT = setTimeout(() => {
+      const r = roomFromInput($('room').value);
+      if (r) prewarmRoom(r);
+    }, 800);
+  });
+}, 'prewarm.lobby');
 
 // Deep link: /?r=<id> — the whole join flow for the second person. Named rooms
 // from before the mint (?r=morning) still resolve; nothing about old links breaks.
