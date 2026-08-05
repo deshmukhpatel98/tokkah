@@ -76,7 +76,12 @@ async function launch(side, wav) {
   page.on('pageerror', (e) => errors.push('pageerror: ' + String(e.message).slice(0, 200)));
   await page.goto(PAGE_URL, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#join', { timeout: 20000 });
+  // The named-room field moved into the lobby setup sheet (••• ) when the first
+  // screen became one button. Open it, type, close — the same three moves a
+  // person makes.
+  await page.click('#more');
   await page.fill('#room', ROOM);
+  await page.keyboard.press('Escape');
   return { side, browser, page, errors };
 }
 

@@ -16,3 +16,6 @@ testbed/*.png
 phase1-transport/runs/
 fatigue-lab/runs/
 *.log
+
+# Local dev secrets
+tape-app/.dev.vars

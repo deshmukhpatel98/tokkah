@@ -1320,17 +1320,25 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       ctx.fillRect(0, 0, 1, 1);
     };
     setInterval(dirty, 16); // hidden-tab floor; rAF below is the fast path
-    if (cfg.l2FastCarrier !== false) {
-      const spin = () => { dirty(); requestAnimationFrame(spin); };
-      requestAnimationFrame(spin);
-    }
     // Twice the data rate covers the tick that each parity fragment spends. Asked, not
     // guaranteed: the compositor caps it at the display refresh regardless.
     const carrierTicksAsked = cfg.l2FastCarrier === false
       ? 60
       : Math.min(240, Math.max(60, (cfg.fps || 30) * 2));
+    // The rAF spin exists to lift ticks past the interval floor (~59.7/s measured
+    // above) — needed only when the lane wants MORE than 60. When the negotiated
+    // fps fits under the floor, spinning at display refresh buys zero extra ticks
+    // (captureStream caps emission at `carrierTicksAsked` anyway) and costs real
+    // energy: ~3% of total call CPU on a 144 Hz display (energy.mjs A/B,
+    // 2026-08-05, `?ctick=0` arm). The lobby's getUserMedia fixes the camera fps
+    // for the whole call, so this decision cannot go stale mid-call.
+    if (cfg.l2FastCarrier !== false && carrierTicksAsked > 60) {
+      const spin = () => { dirty(); requestAnimationFrame(spin); };
+      requestAnimationFrame(spin);
+    }
     const carrierTrack = canvas.captureStream(carrierTicksAsked).getVideoTracks()[0];
-    L('carrier-ticks', { asked: carrierTicksAsked, fastFlicker: cfg.l2FastCarrier !== false,
+    L('carrier-ticks', { asked: carrierTicksAsked,
+      fastFlicker: cfg.l2FastCarrier !== false && carrierTicksAsked > 60,
       cfgFps: cfg.fps, settings: carrierTrack.getSettings?.() ?? null });
     const tx = pc.addTransceiver(carrierTrack, { direction: 'sendonly' });
     tx.sender.transform = new RTCRtpScriptTransform(worker, { role: 'send' });
@@ -2563,7 +2571,14 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   async function setupDecoder(m) {
     if (dec) return;
     const config = { codec: m.codec, codedWidth: m.width, codedHeight: m.height, optimizeForLatency: true };
-    const sup = await VideoDecoder.isConfigSupported(config);
+    // Task #48: same hardware preference as the encoder, same rule — the hint
+    // is dropped before the lane ever is.
+    if (cfg.l2Hw) config.hardwareAcceleration = cfg.l2Hw;
+    let sup = await VideoDecoder.isConfigSupported(config);
+    if (!sup?.supported && config.hardwareAcceleration) {
+      delete config.hardwareAcceleration;
+      sup = await VideoDecoder.isConfigSupported(config);
+    }
     if (!sup?.supported) throw new Error(`decoder unsupported: ${m.codec}`);
     ctx2d = displayCanvas
       ? displayCanvas.getContext('2d', { alpha: false, desynchronized: true })
@@ -2658,6 +2673,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       codec: cfg.codec, width: size.width, height: size.height, framerate: cfg.fps,
       latencyMode: 'realtime', bitrateMode: 'quantizer', avc: { format: 'annexb' },
     };
+    // Task #48 energy A/B (`?l2hw=hw|sw`). A preference, not a demand: if the
+    // engine rejects the config WITH the hint, the hint is dropped rather than
+    // the lane — an energy experiment must never be able to cost the picture.
+    if (cfg.l2Hw) config.hardwareAcceleration = cfg.l2Hw;
     // FIXED QP IS NOT UNIVERSAL. Measured 2026-08-03 (testbed/wkenc.mjs): WebKit 26.5
     // throws `TypeError: Type error` for `bitrateMode:'quantizer'` — the value is not in
     // its enum, so even isConfigSupported THROWS rather than returning false, which is
@@ -2688,6 +2707,15 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       if (!sup?.supported) quantizerOk = false;
       else if (sup.config?.bitrateMode && sup.config.bitrateMode !== 'quantizer') quantizerOk = false;
     } catch { quantizerOk = false; }
+    if (!quantizerOk && config.hardwareAcceleration && cfg.l2RcMode !== 'vbr') {
+      // Retry fixed QP without the hw hint before downgrading rate control:
+      // a hint the engine dislikes must not silently buy the VBR arm.
+      delete config.hardwareAcceleration;
+      try {
+        sup = await VideoEncoder.isConfigSupported(config);
+        quantizerOk = !!sup?.supported && (!sup.config?.bitrateMode || sup.config.bitrateMode === 'quantizer');
+      } catch { quantizerOk = false; }
+    }
     if (!quantizerOk) {
       config.bitrateMode = 'variable';
       // Not a tuned number. It is the same 12 Mbps ceiling the RTP sender already
@@ -2695,6 +2723,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // fixed-QP arm competes for. What it actually BUYS is unmeasured until scored.
       config.bitrate = cfg.l2VbrBps || 12_000_000;
       sup = await VideoEncoder.isConfigSupported(config);
+      if (!sup?.supported && config.hardwareAcceleration) {
+        delete config.hardwareAcceleration;
+        sup = await VideoEncoder.isConfigSupported(config);
+      }
       if (!sup?.supported) throw new Error(`config unsupported even as VBR: ${cfg.codec}`);
     }
     rateControl = quantizerOk ? 'quantizer' : 'vbr';

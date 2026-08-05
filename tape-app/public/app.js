@@ -15,7 +15,7 @@
  *     the second measured to cost nothing in concealment under 1% loss (§17.4)
  *   · life-size rendering and gaze-aligned layout (§1.1a, §1.1b)
  *   · no self view (§1.1)
- *   · locked exposure / white balance / focus (§5)
+ *   · locked white balance / focus; exposure stays AE (root fix 2026-08-04)
  *   · dual onset detectors driving passive turn-taking measurement (turntaking.js)
  *
  * What that means honestly: **latency here is Zoom-class, but turn-taking should not
@@ -31,7 +31,7 @@
  */
 
 import { attachDetector, audioConstraints, audioContext } from './onset-monitor.js';
-import { Telemetry, sampleStats, recoverMirror } from './telemetry.js';
+import { Telemetry, sampleStats } from './telemetry.js';
 import { TurnTaking, median } from './turntaking.js';
 import { startTapeVideo, startTapeRtp, prepareTapeRtp, tapeSupported, tapeRtpSupported } from './tape.js';
 import { initPcmAudio } from './pcm.js';
@@ -39,16 +39,9 @@ import { initTimeSync } from './timesync.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-const CARD_MM = 85.6; // ISO/IEC 7810 ID-1
-const D_TARGET_MM = 1100; // Hall's personal distance
-const EYE_MIN_PX = 24;
-
-const cal = { pxPerMm: null, distMm: 600, eyeLineY: 0.42, headWidthFrac: 0.34, headMm: 150 };
-// Fullscreen is the default view (2026-08-01, user request): fill mode sizes
-// #remoteWrap to the viewport and `object-fit: cover` keeps the camera's own
-// aspect ratio — the frame crops, it never stretches. The §1.1a life-size +
-// gaze experiment is one chip away (c-lifesize); it needs calibration and peer
-// geometry to do anything, and until both exist layout() falls back to fill.
+// Fullscreen is the only view (2026-08-04, user directive: the life-size /
+// eye-line experiment and the self-view PiP are removed). layout() applies
+// fill + contain and nothing else.
 // Stats HUD (task #28, user directive 2026-08-02: "do not show me stats in the
 // UI"): a debug affordance gated behind ?stats=1 — chip hidden and HUD off
 // unless the flag is passed. Default call UI is a face and nothing else (the
@@ -56,7 +49,7 @@ const cal = { pxPerMm: null, distMm: 600, eyeLineY: 0.42, headWidthFrac: 0.34, h
 // stats, and stay). Telemetry logging is untouched — measurement never
 // depended on the HUD being visible.
 const STATS_UI = new URLSearchParams(location.search).get('stats') === '1';
-const view = { lifesize: false, gaze: true, selfview: false, hud: STATS_UI };
+const view = { hud: STATS_UI };
 
 let pc = null;
 let ws = null;
@@ -64,7 +57,6 @@ let localStream = null;
 let previewStream = null;
 let videoDegraded = null; // null | 'busy' | 'none' — set by getMedia when video couldn't open
 let wsPreOpenFail = null; // rejects the join promise when the upgrade dies before open (§7)
-let peerGeom = null;
 // What the PEER's display can present, in Hz, once they have told us. Null until then.
 // This is the number that decides how many frames per second are worth encoding: frames
 // beyond the receiver's refresh rate cannot be seen by anyone and cost real bandwidth.
@@ -194,47 +186,6 @@ const localCert = (async () => {
 let sharedCert = null;
 const certArg = () => (sharedCert ? { certificates: [sharedCert] } : {});
 
-// ── Calibration (persisted, optional) ────────────────────────────────────────
-safe(() => {
-  const saved = localStorage.getItem('tape.cal');
-  if (saved) Object.assign(cal, JSON.parse(saved));
-}, 'cal.load');
-
-const persist = () => safe(() => localStorage.setItem('tape.cal', JSON.stringify(cal)), 'cal.save');
-
-(function cardCalibration() {
-  const card = $('cardCal');
-  const apply = (w) => {
-    card.style.width = `${w}px`;
-    cal.pxPerMm = w / CARD_MM;
-    $('scaleOut').textContent = `${cal.pxPerMm.toFixed(3)} px/mm · screen ≈ ${(screen.width / cal.pxPerMm / 25.4).toFixed(1)}" wide`;
-    $('cardLabel').textContent = `${(w / cal.pxPerMm / 25.4).toFixed(2)}" — match your card`;
-    persist();
-    layout();
-  };
-  apply(cal.pxPerMm ? cal.pxPerMm * CARD_MM : 320);
-
-  let dragging = false;
-  card.addEventListener('pointerdown', (e) => {
-    dragging = true;
-    card.setPointerCapture(e.pointerId);
-  });
-  card.addEventListener('pointermove', (e) => {
-    if (dragging) apply(clamp(e.clientX - card.getBoundingClientRect().left, 120, 900));
-  });
-  card.addEventListener('pointerup', () => (dragging = false));
-  $('cardReset').onclick = () => apply(320);
-})();
-
-$('dist').value = cal.distMm;
-$('distOut').textContent = `${cal.distMm} mm`;
-$('dist').oninput = (e) => {
-  cal.distMm = +e.target.value;
-  $('distOut').textContent = `${cal.distMm} mm`;
-  persist();
-  layout();
-};
-
 // ── Re-arming for a second peer ──────────────────────────────────────────────
 // A page that has already carried a call cannot carry a second one. `ontrack`
 // has a once-guard (`remoteAttaching || remoteMon`) that will not attach a
@@ -252,14 +203,20 @@ $('dist').oninput = (e) => {
 let hadPeer = false;
 const REARM_KEY = 'tape.rearmAt';
 const REARM_COOLDOWN_MS = 20_000;
-function reArmForNewPeer(room) {
+// `force` is for the one caller that has no other move left: the in-place reset
+// failed, so this reload IS the recovery rather than a duplicate of it. Without
+// it the cooldown below could swallow the only path back and leave a spent page
+// sitting there forever — which is exactly how "refresh used to work" turned
+// into "refresh stopped working" once the in-place path went in front of it.
+// A forced reload cannot loop: the fresh page starts with `hadPeer` false.
+function reArmForNewPeer(room, { force = false } = {}) {
   if (!hadPeer) return false;
   // Per-tab cooldown, in sessionStorage so it survives the reload it guards.
   // Two people reconnecting in the same second can otherwise each re-arm on
   // the other's arrival forever; this caps each side at one reset per window,
   // so the pathological case costs a few seconds and then settles.
   const last = safe(() => Number(sessionStorage.getItem(REARM_KEY)) || 0, 'rearm.read') ?? 0;
-  if (Date.now() - last < REARM_COOLDOWN_MS) return false;
+  if (!force && Date.now() - last < REARM_COOLDOWN_MS) return false;
   safe(() => sessionStorage.setItem(REARM_KEY, String(Date.now())), 'rearm.mark');
   tel?.log('rearm', { room });
   setStatus('reconnecting…');
@@ -270,6 +227,49 @@ function reArmForNewPeer(room) {
     location.replace(u.toString());
   }, 'rearm.go');
   return true;
+}
+
+// ── Own-side connection recovery (task #50) ──────────────────────────────────
+// reArmForNewPeer covers the PEER vanishing. This covers US: walk out of wifi
+// range mid-call and every transport dies at once — the signaling socket
+// closes, ICE on 7 peer connections goes disconnected→failed — and until now
+// the app's entire response was a status string telling the user to leave and
+// rejoin by hand. The recovery IS that rejoin, done for them: reload into the
+// same room and let the resume machinery (task #36) walk back in. The peer's
+// side needs nothing new — our rejoin arrives as peer-joined and its own
+// reArmForNewPeer resets it to match. In-place ICE restart (no reload, no
+// black frame) is the planned refinement; this ships the difference between
+// "call comes back by itself" and "call is dead forever".
+let leavingDeliberately = false; // teardown's own closes must not read as death
+let recoverTimer = null; // pending 'disconnected' escalation
+let activeRoom = null; // the joined room; join() owns `room` locally
+const RECOVER_KEY = 'tape.recoverAt';
+const RECOVER_COOLDOWN_MS = 10_000; // per-tab, survives the reload it causes
+const RECOVER_MAX = 4; // within RECOVER_WINDOW_MS — then stop trying: this
+const RECOVER_WINDOW_MS = 3 * 60_000; // network is not coming back on its own
+function recoverCall(why) {
+  if (leavingDeliberately || !hadPeer || !joined || !activeRoom) return;
+  const now = Date.now();
+  const past = (safe(() => JSON.parse(sessionStorage.getItem(RECOVER_KEY) ?? '[]'), 'recover.read') ?? [])
+    .filter((t) => now - t < RECOVER_WINDOW_MS);
+  if (past.length && now - past[past.length - 1] < RECOVER_COOLDOWN_MS) return;
+  if (past.length >= RECOVER_MAX) {
+    setStatus('connection lost — will reconnect when the network returns');
+    return;
+  }
+  past.push(now);
+  safe(() => sessionStorage.setItem(RECOVER_KEY, JSON.stringify(past)), 'recover.mark');
+  tel?.log('recover', { why, attempt: past.length });
+  window.__hbEnd?.('recover'); // field data: how often real calls hit this
+  setStatus('connection lost — reconnecting…');
+  // The same proven route as reArmForNewPeer: boot with ?rejoin=1 presses join
+  // itself. 300 ms lets the telemetry flush attempt and the beacon leave first.
+  setTimeout(() => safe(() => {
+    const u = new URL(location.href);
+    u.searchParams.set('r', activeRoom);
+    u.searchParams.set('rejoin', '1');
+    location.replace(u.toString());
+  }, 'recover.go'), 300);
 }
 
 // ── Self-view lobby (task #28, user directive 2026-08-02) ────────────────────
@@ -291,6 +291,7 @@ function peerArrived() {
       setTimeout(() => safe(() => sf.classList.remove('on', 'fading'), 'peer.crossfade'), 260);
     }
     startElapsed();
+    window.__hbConnect?.(); // health beacon: the call counts as connected here
     // Self view stays OFF (task #38 §B.9). This is the line that used to force
     // the PiP on, and removing it is the single most evidence-backed change in
     // the redesign: the all-day mirror is Bailenson's second mechanism (2021),
@@ -379,60 +380,14 @@ function setStatus(t) {
   }, 'status');
 }
 
-// ── Layout: life size + gaze (§1.1a, §1.1b) ──────────────────────────────────
-// Positioning is by the *face*, not the frame: hair, ceiling and room are croppable,
-// the head is not. Clamping the frame's top-left is what silently defeats gaze
-// alignment — placing an eye line at the top of the viewport needs top ≈ −0.42·H,
-// which no sane frame-based bound permits.
+// ── Layout ───────────────────────────────────────────────────────────────────
+// One mode: fill the viewport, CONTAIN the picture (§5, user directive: no crop
+// on either device). The §1.1a life-size + gaze experiment that used to live
+// here was removed 2026-08-04 (user directive) along with its calibration UI.
 function layout() {
   safe(() => {
-    const call = $('call');
-    const rw = $('remoteWrap');
-    const v = $('remote');
-    const vw = v.videoWidth;
-    const vh = v.videoHeight;
-
-    if (!view.lifesize || !cal.pxPerMm || !peerGeom || !vw || !vh) {
-      call.classList.add('fill');
-      // Default fit is CONTAIN (§5, user directive: no crop on either device).
-      // A phone's 9:19.5 frame on a 16:9 desktop keeps every pixel the sender
-      // captured; the space either side is a blurred wash of the same picture,
-      // not a black bar. Nothing about this reaches the sender — capture never
-      // adapts to a receiver's viewport, because re-applying constraints
-      // mid-call re-opens the sensor and re-triggers exactly the AE/AWB hunt
-      // lockCamera() exists to kill (§5 item 21a).
-      call.classList.add('contain');
-      return;
-    }
-    call.classList.remove('fill');
-    // Life size is the one mode where cropping is the POINT: holding a head at
-    // its true 165 mm on a letterboxed frame is geometrically impossible, so
-    // the opt-in trades hair and ceiling for true scale (§5 item 23).
-    call.classList.remove('contain');
-
-    const wantHeadMm = peerGeom.headMm * (cal.distMm / D_TARGET_MM);
-    const W = (wantHeadMm * cal.pxPerMm) / peerGeom.headWidthFrac;
-    const H = W * (vh / vw);
-    const headW = W * peerGeom.headWidthFrac;
-
-    const chromeH = Math.max(0, window.outerHeight - window.innerHeight);
-    const camX = screen.width / 2 - window.screenX;
-    const camY = -(window.screenY + chromeH);
-
-    let cx = view.gaze ? camX : window.innerWidth / 2;
-    let eyeY = view.gaze ? camY : (window.innerHeight - H) / 2 + peerGeom.eyeLineY * H;
-    cx = headW >= window.innerWidth ? window.innerWidth / 2 : clamp(cx, headW / 2, window.innerWidth - headW / 2);
-    eyeY = clamp(eyeY, EYE_MIN_PX, window.innerHeight * 0.55);
-
-    rw.style.cssText = `left:${cx - W / 2}px;top:${eyeY - peerGeom.eyeLineY * H}px;width:${W}px;height:${H}px`;
-
-    const offPx = Math.hypot(cx - camX, eyeY - camY);
-    layout.info = {
-      W: Math.round(W),
-      H: Math.round(H),
-      headMm: +wantHeadMm.toFixed(1),
-      gazeErrDeg: +((Math.atan2(offPx / cal.pxPerMm, cal.distMm) * 180) / Math.PI).toFixed(2),
-    };
+    $('call').classList.add('fill');
+    $('call').classList.add('contain');
   }, 'layout');
 }
 
@@ -496,6 +451,64 @@ function startRemoteFill() {
 // rather than argued about — `?res=720&codec=vp8` reproduces the previously measured config.
 // The defaults are the ones that won on this machine; see §17.2.
 const QS = new URLSearchParams(location.search);
+
+// ── Synthetic media (test hook, ?synthmedia=1) ───────────────────────────────
+// Real Safari has no fake-device flags (Chromium's --use-fake-device... has no
+// WebKit equivalent) and a WebDriver session cannot answer the camera/mic
+// permission prompt. This shim replaces getUserMedia wholesale with a canvas
+// capture + noise audio graph so the REAL engine's scheduling, worklets and
+// datachannel path can be measured end-to-end (task #42). It fakes the
+// stimulus, never the pipeline — everything downstream of the tracks is the
+// shipping code. Off unless the flag is present, so it cannot affect users.
+if (QS.get('synthmedia') === '1') {
+  const cv = document.createElement('canvas');
+  cv.width = 1280; cv.height = 720;
+  const g = cv.getContext('2d');
+  let fr = 0;
+  const draw = () => {
+    fr++;
+    // Moving gradient + per-frame noise blocks: sd well above the harness's
+    // "black/flat" threshold, and it never repeats a frame exactly.
+    const grad = g.createLinearGradient((fr * 7) % cv.width, 0, ((fr * 7) % cv.width) + 640, cv.height);
+    grad.addColorStop(0, '#204060'); grad.addColorStop(1, '#c0a040');
+    g.fillStyle = grad; g.fillRect(0, 0, cv.width, cv.height);
+    for (let i = 0; i < 64; i++) {
+      g.fillStyle = `rgb(${(i * 53 + fr * 11) % 256},${(i * 97 + fr * 5) % 256},${(i * 31 + fr * 17) % 256})`;
+      g.fillRect((i * 149 + fr * 3) % (cv.width - 40), (i * 211) % (cv.height - 40), 40, 40);
+    }
+  };
+  // setInterval, NOT requestAnimationFrame. Safari stops rAF entirely while
+  // the window is occluded (another window on top is enough — no tab switch
+  // needed), so an rAF-driven source dies the moment the harness's own peer
+  // browser opens over it: preview never lights, joins wedge with no error.
+  // Measured 2026-08-05: 8/8 batch failures with the user's window in front,
+  // and window-stacking races made single runs fail ~half the time. Interval
+  // timers keep firing at full rate while the page is visible-but-occluded.
+  setInterval(draw, 33);
+  let synthCtx = null;
+  navigator.mediaDevices.getUserMedia = async (c = {}) => {
+    const out = new MediaStream();
+    if (c.video) for (const t of cv.captureStream(30).getVideoTracks()) out.addTrack(t);
+    if (c.audio) {
+      synthCtx ??= new (window.AudioContext ?? window.webkitAudioContext)({ sampleRate: 48000 });
+      const dst = synthCtx.createMediaStreamDestination();
+      // Speech-band noise, not silence: the PCM lane's lossless coder would
+      // shrink silence to nothing and understate the real send rate.
+      const buf = synthCtx.createBuffer(1, synthCtx.sampleRate * 2, synthCtx.sampleRate);
+      const d = buf.getChannelData(0);
+      let s = 22222;
+      for (let i = 0; i < d.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; d[i] = (s / 0x3fffffff - 1) * 0.08; }
+      const src = synthCtx.createBufferSource();
+      src.buffer = buf; src.loop = true; src.connect(dst); src.start();
+      // Safari suspends a context created without a user gesture; the join
+      // click (a trusted WebDriver click counts) resumes it.
+      if (synthCtx.state === 'suspended') addEventListener('click', () => synthCtx.resume(), { once: true });
+      for (const t of dst.stream.getAudioTracks()) out.addTrack(t);
+    }
+    return out;
+  };
+}
+
 const WANT_H = Number(QS.get('res')) || 1080;
 const WANT_W = WANT_H >= 1080 ? 1920 : 1280;
 // H.264 by default, which is not the obvious choice and was not a guess. Measured with VMAF
@@ -772,16 +785,33 @@ async function devStepDown(track, why) {
 // Evaluation order per tick is revive → lowlight → devstep: a dead camera has
 // no fps to judge, and a tier step while exposure-capped buys nothing — each
 // stage only sees the signal the earlier stages couldn't fix.
-const LOWLIGHT_ON = QS.get('lowlight') !== '0'; // needs the luma watchdog (?luma=0 blinds it)
+// OPT-IN as of 2026-08-05 (?lowlight=1). Measured on the SAME real M13 that
+// proved the recipe in session 4: in a LIT room (luma 53.5) the manual-exposure
+// recipe now drives luma to 0 — a black picture, not a brighter one — flips the
+// sensor into its 1088×1088 square mode, and leaves exposureMode reading
+// 'none'; in a live prod call it stalled delivery to 0 fps, all 4 revives
+// failed, and the re-acquire returned no video — a dead camera for the rest of
+// the call. This is the user-visible "Android dimming". The recipe's fps win
+// was real once, but a mode that can black out or kill the camera cannot be a
+// default; brightness belongs to AE (see the camlock block comment).
+const LOWLIGHT_ON = QS.get('lowlight') === '1'; // needs the luma watchdog (?luma=0 blinds it)
 const REVIVE_ON = QS.get('revive') !== '0';
 const LOWLIGHT_LUMA = 20; // below: dark enough that AE is stretching exposure
 const LOWLIGHT_LUMA_HI = 60; // above, sustained: light returned — restore AE
+// The shutter-entry exit is a different threshold on purpose. A lamp-lit room
+// engages via slow shutter with a WELL-EXPOSED picture (~110 luma), and the
+// brightness-preserving recipe below keeps it there — luma > 60 would fire
+// immediately and flap forever (engage 4 s, exit 10 s, repeat). Under a fixed
+// short exposure, luma rises in proportion to room light, so "near clipping"
+// is the honest signal that AE could now hold the target fps on its own.
+const LOWLIGHT_SLOW_EXIT = 180; // shutter entries exit only this bright, sustained
 const LOWLIGHT_HOLD_MS = 4000; // dark AND starving, sustained, to engage
 const LOWLIGHT_HI_MS = 10000; // bright, sustained, to disengage (hysteresis)
 const REVIVE_STALL_MS = 3000; // delivered == 0 this long with a live track
 const REVIVE_MAX = 3; // this many failed revivals inside REVIVE_WIN_MS → re-acquire
 const REVIVE_WIN_MS = 60000;
 let lowlightOn = false;
+let lowlightWhy = null; // 'dark' | 'shutter' — decides recipe and exit threshold
 let lowDarkMs = 0; // accumulated dark-and-starving time
 let lowLightMs = 0; // accumulated bright-again time while engaged
 let lowlightResultTimer = null;
@@ -810,16 +840,27 @@ function currentCaptureAsk() {
  * picture, and the ceiling it costs is 1000/(expMs + sensor readout) fps.
  */
 const LOWLIGHT_EXP = Number(QS.get('llexp')) || 0; // 100 us units; 0 = the proven default
-async function applyLowlightExposure(track) {
+async function applyLowlightExposure(track, why = 'dark', prev = null) {
   const caps = safe(() => track.getCapabilities?.(), 'lowlight.caps') ?? {};
   const fps = devTargetFps();
-  const want = LOWLIGHT_EXP > 0 ? LOWLIGHT_EXP : 1000 / fps;
-  const expMs = Math.min(Math.max(want, caps.exposureTime?.min ?? 0), caps.exposureTime?.max ?? 1000);
-  const iso = Math.min(2500, caps.iso?.max ?? 2500);
+  // Two entries, two recipes (task #46). 'dark': the proven M13 numbers — a
+  // tenth of the frame period plus max ISO, because there is no light to
+  // spare. 'shutter': the room HAS light (the picture was well exposed at a
+  // slow shutter), so ask 0.35 of the frame period — still clears the fps
+  // ceiling after sensor readout, 3.5× brighter per unit ISO — and pick the
+  // ISO that preserves AE's exposure product (prevExp × prevIso), so the
+  // picture keeps its brightness instead of jumping to a max-ISO glare.
+  const want = LOWLIGHT_EXP > 0 ? LOWLIGHT_EXP : why === 'shutter' ? 3500 / fps : 1000 / fps;
+  const expUnits = Math.min(Math.max(want, caps.exposureTime?.min ?? 0), caps.exposureTime?.max ?? 1000);
+  let iso = Math.min(2500, caps.iso?.max ?? 2500);
+  if (why === 'shutter' && prev?.expUnits > 0 && prev?.iso > 0) {
+    const keep = Math.round((prev.expUnits * prev.iso) / expUnits);
+    iso = Math.min(iso, Math.max(caps.iso?.min ?? 40, keep));
+  }
   await safeAsync(async () => {
-    await track.applyConstraints({ exposureMode: 'manual', exposureTime: expMs, iso });
+    await track.applyConstraints({ exposureMode: 'manual', exposureTime: expUnits, iso });
   }, 'lowlight.exposure');
-  return { expMs: +expMs.toFixed(1), iso };
+  return { expUnits: +expUnits.toFixed(1), iso };
 }
 
 function lowlightEval(fps, dtMs) {
@@ -842,13 +883,24 @@ function lowlightEval(fps, dtMs) {
   }
   if (!lowlightOn) {
     const starving = fps < devTargetFps() * DEV_STEP_LOW_FRAC;
-    lowDarkMs = lastLuma.y < LOWLIGHT_LUMA && starving ? lowDarkMs + dtMs : 0;
+    // Two ways in (task #46). Dark: the image itself says AE is stretching.
+    // Shutter: the camera's own reported exposureTime (100-µs units) exceeds
+    // the target frame period — the shutter ALONE makes the target fps
+    // physically impossible, however bright the picture looks. A lamp-lit
+    // room sits at luma ~110 with a 50 ms exposure; the old luma-only gate
+    // could never see it (dimRoomDiagnostic, measured in ladder-sim).
+    const sett = safe(() => track.getSettings?.(), 'lowlight.settings') ?? {};
+    const expUnits = sett.exposureTime > 0 ? sett.exposureTime : null;
+    const slowShutter = expUnits != null && expUnits / 10 > 1000 / devTargetFps();
+    const dark = lastLuma.y < LOWLIGHT_LUMA;
+    lowDarkMs = starving && (dark || slowShutter) ? lowDarkMs + dtMs : 0;
     if (lowDarkMs >= LOWLIGHT_HOLD_MS) {
       lowDarkMs = 0;
-      lowlightEnter(track, lastLuma.y, fps);
+      lowlightEnter(track, lastLuma.y, fps, dark ? 'dark' : 'shutter', { expUnits, iso: sett.iso });
     }
   } else {
-    lowLightMs = lastLuma.y > LOWLIGHT_LUMA_HI ? lowLightMs + dtMs : 0;
+    const exitAt = lowlightWhy === 'shutter' ? LOWLIGHT_SLOW_EXIT : LOWLIGHT_LUMA_HI;
+    lowLightMs = lastLuma.y > exitAt ? lowLightMs + dtMs : 0;
     if (lowLightMs >= LOWLIGHT_HI_MS) {
       lowLightMs = 0;
       lowlightExit(track, lastLuma.y, fps);
@@ -856,7 +908,7 @@ function lowlightEval(fps, dtMs) {
   }
 }
 
-async function lowlightEnter(track, luma, fpsBefore) {
+async function lowlightEnter(track, luma, fpsBefore, why = 'dark', prev = null) {
   // Capability gate: only where manual exposure actually exists. Read off the
   // M13 itself (session 5): exposureMode ['continuous','manual'], exposureTime
   // {min 0.6546, max 1420, step 0.1}, iso {min 40, max 2500}. Those exposure
@@ -867,30 +919,38 @@ async function lowlightEnter(track, luma, fpsBefore) {
   // Elsewhere the honest state is the telemetry, not a pretend fix.
   const caps = safe(() => track.getCapabilities?.(), 'lowlight.caps') ?? {};
   if (!caps.exposureMode?.includes?.('manual')) {
-    tel?.log('lowlight', { on: 0, luma: +luma.toFixed(1), fpsBefore, capable: 0 });
+    tel?.log('lowlight', { on: 0, luma: +luma.toFixed(1), fpsBefore, why, capable: 0 });
     return;
   }
   lowlightOn = true;
+  lowlightWhy = why;
   const ask = currentCaptureAsk();
   // Sequencing rule: stream constraints first, ImageCapture constraints second.
   await safeAsync(() => track.applyConstraints({ frameRate: { ideal: ask.fps } }), 'lowlight.fps');
-  const { expMs, iso } = await applyLowlightExposure(track);
-  tel?.log('lowlight', { on: 1, luma: +luma.toFixed(1), fpsBefore, expMs, iso });
+  const { expUnits, iso } = await applyLowlightExposure(track, why, prev);
+  tel?.log('lowlight', { on: 1, luma: +luma.toFixed(1), fpsBefore, why, expUnits, iso });
   clearTimeout(lowlightResultTimer);
   lowlightResultTimer = setTimeout(() => {
     safe(() => {
       const dt = (performance.now() - (srcProbe?.lastT ?? 0)) / 1000;
       const fpsAfter = srcProbe && dt > 0 ? +((srcProbe.frames - srcProbe.lastF) / dt).toFixed(1) : null;
-      tel?.log('lowlight-result', {
-        fpsAfter,
-        luma: lumaWin.length ? +lumaWin[lumaWin.length - 1].y.toFixed(1) : null,
-      });
+      const lumaAfter = lumaWin.length ? +lumaWin[lumaWin.length - 1].y.toFixed(1) : null;
+      tel?.log('lowlight-result', { fpsAfter, luma: lumaAfter });
+      // Verify-and-revert: the recipe exists to buy frame rate, so a stalled
+      // camera or a blacked-out picture after it is proof it failed on this
+      // device (measured on the M13, 2026-08-05: luma 53.5 → 0, then 0 fps →
+      // dead camera). Restore AE before the stall-revive chain can kill it.
+      if (lowlightOn && (fpsAfter === 0 || (lumaAfter != null && lumaAfter < 3))) {
+        tel?.log('lowlight', { on: 0, reverted: 1, fpsAfter, luma: lumaAfter });
+        lowlightExit(track, lumaAfter ?? 0, fpsAfter ?? 0);
+      }
     }, 'lowlight.result');
   }, 8000);
 }
 
 async function lowlightExit(track, luma, fpsBefore) {
   lowlightOn = false;
+  lowlightWhy = null;
   clearTimeout(lowlightResultTimer);
   await safeAsync(() => track.applyConstraints({ exposureMode: 'continuous' }), 'lowlight.exit');
   tel?.log('lowlight', { on: 0, luma: +luma.toFixed(1), fpsBefore, restored: 'continuous' });
@@ -971,7 +1031,7 @@ async function reacquireCamera() {
       localStream?.removeTrack(old);
       old.stop(); // free the device first — the M13's HAL refuses a second open
     }
-    const fresh = await getMedia();
+    const fresh = await getMedia({ requireVideo: false });
     // getMedia's stream carries a mic we already have — never double-open it.
     for (const t of fresh.getAudioTracks()) t.stop();
     const nv = fresh.getVideoTracks()[0];
@@ -1250,6 +1310,12 @@ const TAPE_CFG = {
   // to what the fixed-QP arm actually delivers: comparing VBR-at-12-Mbps against
   // QP24-at-6.4-Mbps would score rate control and rate together and settle neither.
   l2VbrBps: Number(QS.get('l2vbrbps')) || 0,
+  // Task #48 A/B knob: WebCodecs hardwareAcceleration preference for the lane-2
+  // encoder/decoder. Unset means the browser decides (the shipping default,
+  // logged as `hw` in tape-encoder telemetry). `?l2hw=hw` asks for the
+  // dedicated silicon, `?l2hw=sw` forces software — the arm exists to measure
+  // energy per call-minute, not to be guessed at.
+  l2Hw: { hw: 'prefer-hardware', sw: 'prefer-software' }[QS.get('l2hw')] ?? null,
   // #33: cadence-locked presentation for the default (non-avsync) canvas path.
   // §17.8 removed the element's adaptive jitter buffer; the measured cost was
   // arrival jitter on screen (remote IPI bimodal ~31/62 ms, on-cadence ~56%,
@@ -1389,6 +1455,18 @@ const PCM_CFG = {
   fecLate: QS.get('pcmfeclate') === '1',
   // ms of hold released per 250 ms tick. 2 = 8 ms/s.
   jitterRelease: Number(QS.get('pcmjitrel')) || undefined,
+  // Latency governor (task #47): trims buffer depth the measured per-frame
+  // slack proves the call never needed. STAYS OPT-IN — the gates ran and were
+  // NOT met (2026-08-05, all on real shipping browsers): under injected
+  // stalls (Brave x Brave, 70/120 ms) it correctly never trims; in natural
+  // Safari x Brave calls the ~1.2% background concealment floors its 20 s
+  // safety window every time, so it never trims there either; and in clean
+  // calls (paired n=8) it DOES engage (19-161 trim ticks/run) but buys only
+  // -0.6 ms last-third / -3.1 ms whole-call, far under the -5 ms ship gate —
+  // because the estimator's fast release (jitterRelease=2, shipped) already
+  // drains what this law was built to drain. Conceal parity held everywhere,
+  // so `?pcmgov=1` is safe insurance for future regimes, not a win today.
+  jitterGov: QS.get('pcmgov') === '1',
   // Strip the trailing zero bits a 16-bit capture chain leaves in the int24
   // container — half the audio lane on every device measured. Encoder only; the
   // decoder always honours the header, so `?pcmwaste=0` is a safe control arm
@@ -1414,6 +1492,9 @@ const PCM_CFG = {
   // decodes both unconditionally, so `?pcmsw=0` (the block-RS control arm)
   // still interoperates and one call can carry one arm per direction.
   pcmSw: QS.get('pcmsw') !== '0',
+  pcmDiag: QS.get('pcmdiag') === '1',
+  pcmCapSab: QS.get('pcmcap') !== '0',
+  pcmPump: QS.get('pcmpump') ?? 'timer',
   // Pins the stride (data frames per parity; 0 = parity off). Unset = adaptive,
   // driven off the same T_LOSS ladder as fecN.
   pcmSwStride: QS.get('pcmswstride') != null ? Number(QS.get('pcmswstride')) : undefined,
@@ -1857,7 +1938,7 @@ function laneAgree(peerLane, when) {
   // Before the offer this is nearly free: the carrier sender simply gets the
   // camera instead of the flicker canvas, which is a replaceTrack on a track of
   // the same kind and needs no renegotiation.
-  fallbackToRtp(`peer-lane-${peerLane}`);
+  fallbackToRtp(`peer-lane-${peerLane}`, true); // quiet: a peer with no lane has nothing to stop
 }
 
 /**
@@ -1954,10 +2035,19 @@ function armPcmWatchdog() {
   }, 6000);
 }
 
-function fallbackToRtp(why) {
+function fallbackToRtp(why, quiet) {
   if (tapeFellBack) return; // failures arrive in bursts; renegotiating per failure would thrash
   tapeFellBack = true;
-  tel?.log('tape-fallback', { why });
+  tel?.log('tape-fallback', { why, quiet: !!quiet });
+  // Tell the peer, exactly as the audio lane does (`audio-fallback`): a lane
+  // fallback that stays private leaves the OTHER end running the lane, and its
+  // negotiated video m-line keeps carrying the flicker-canvas carrier — which
+  // we, now on plain RTP, render literally. Measured on real Safari x Chromium
+  // (task #42, 2026-08-04): Safari fell back at t+5 s on no-frames and watched
+  // a black 320x180 carrier for the rest of the call while Chromium reported
+  // itself healthy. `quiet` is for the cases where the peer needs no telling:
+  // it never had a lane, or it is the one that told us.
+  if (!quiet) send({ type: 'video-fallback', why });
   // TIME_SYNC rides lane 2's ctl channel, so the channel it pings over is about to
   // stop existing. Stopping it here is not tidiness: measured on the deployed build,
   // a Brave x Chromium call that fell back kept pinging at 5 Hz for the whole call
@@ -2374,7 +2464,11 @@ async function repairFrameRate(track, want, full) {
   }, 'capture.fpsrepair');
 }
 
-async function getMedia() {
+// `requireVideo` (default): STARTING a call requires both devices — a call may
+// not begin without the camera (user directive 2026-08-04). The mid-call
+// re-acquire passes false: a camera that dies during a conversation degrades
+// gracefully instead of ending it, which is a different promise than joining.
+async function getMedia({ requireVideo = true } = {}) {
   // `ideal` not `exact` on frameRate: an `exact` constraint that the camera can't
   // satisfy throws OverconstrainedError and there is no call at all. During a real
   // conversation, a wobbling frame rate beats no conversation. Same reasoning applies to
@@ -2407,7 +2501,6 @@ async function getMedia() {
   // track over cleanly before the call's own detectors attach to it.
   lobbyMon?.disconnect();
   lobbyMon = null;
-  const forceNoVideo = QS.get('novideo') === '1'; // test hook: exercise the audio-only fallback
 
   const askAudioOnly = () => navigator.mediaDevices.getUserMedia({ audio: audioConstraints(true) });
   const askBoth = () => navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: audioConstraints(true) });
@@ -2416,10 +2509,7 @@ async function getMedia() {
 
   let stream;
   let degradedVideo = null; // null | 'busy' | 'none'
-  if (forceNoVideo) {
-    stream = await askAudioOnly();
-    degradedVideo = 'busy';
-  } else if (reuseV) {
+  if (reuseV) {
     // Both from the lobby: no getUserMedia at join at all, which is the whole
     // point of one-open-per-device. Only fetch a mic if the lobby somehow lacks one.
     stream = reuseA ? new MediaStream([reuseA]) : await askAudioOnly();
@@ -2446,14 +2536,25 @@ async function getMedia() {
     } catch (e) {
       if (e.name === 'NotAllowedError' || e.name === 'SecurityError') throw denied(e);
       // Camera busy or missing (NotReadableError / NotFoundError / OverconstrainedError).
-      // One retry in case it's a transient driver hiccup, then join with audio only:
-      // a busy camera must not kill the whole call — that's the Zoom failure mode.
+      // One retry in case it's a transient driver hiccup. At JOIN there is no
+      // audio-only door anymore: a call may not start without the camera (user
+      // directive 2026-08-04), so the failure is said honestly instead. The
+      // mid-call re-acquire (requireVideo: false) keeps the graceful path — a
+      // camera dying DURING a call must not end it.
       try {
         await new Promise((r) => setTimeout(r, 700));
         stream = await askBoth();
       } catch (e2) {
         if (e2.name === 'NotAllowedError' || e2.name === 'SecurityError') throw denied(e2);
-        stream = await askAudioOnly(); // if the mic also fails, join fails honestly
+        if (requireVideo) {
+          throw new Error(
+            e2.name === 'NotFoundError'
+              ? 'No camera was found. Connect one, then rejoin — calls here need both camera and microphone.'
+              : 'The camera could not be started (another app may be using it). Close it, then rejoin.',
+            { cause: e2 },
+          );
+        }
+        stream = await askAudioOnly(); // if the mic also fails, this fails honestly
         degradedVideo = e2.name === 'NotFoundError' ? 'none' : 'busy';
       }
     }
@@ -2499,90 +2600,44 @@ async function getMedia() {
 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => k in o).map((k) => [k, o[k]]));
 
-// Whether the manual exposure/WB/focus lock has been applied. The luma
-// watchdog's constraint writes (task #37) must re-assert it — a constraint
-// re-application can silently flip exposureMode back to continuous, and the
-// watchdog and the lock must never fight.
+// Whether the WB/focus lock has been applied. EXPOSURE IS NEVER LOCKED — this
+// is the root fix for the Android dimming reports (2026-08-04, user directive
+// "fixed from root, not a patch"). History: to hide auto-exposure hunting
+// (tell 9) the app used to set exposureMode:'manual', and on lock-hostile
+// Androids manual mode collapses to a dark gain default (measured on the M13:
+// luma 101 with AE, 16 locked — gain, not exposure length). Three generations
+// of defensive machinery grew around that decision (an 8 s verify-and-revert,
+// verified relocks, watchdog unlock cures) and every gap in it was a dark
+// call. The root cause was the decision itself: brightness belongs to the
+// camera's AE for the whole call. White balance and focus stay locked —
+// their hunting is a tell too, and neither can dim a picture. The only
+// deliberate exception is low-light mode, which sets manual exposure IN THE
+// DARK to buy frame rate (measured, m13-diagnosis session 4) and always
+// restores continuous on exit.
 let camLocked = false;
-// `?lockverify=0` keeps the lock even when it darkens the picture — the arm that
-// reproduces the old behaviour. `?lockdark=` is the fraction of the pre-lock luma
-// below which the lock counts as harmful (0.6 = "lost more than 40% of the light").
-const LOCK_VERIFY = QS.get('lockverify') !== '0';
-const LOCK_DARK_FRAC = Number(QS.get('lockdark')) || 0.6;
 /** Newest luma-watchdog reading, or null if the watchdog has nothing yet. */
 const lumaNow = () => (lumaWin.length ? lumaWin[lumaWin.length - 1].y : null);
 
 async function lockCamera(stream) {
-  // Let auto-exposure settle on the real scene first, then freeze it. The hunting is
-  // the loudest "this is a video call" tell there is (§5 tell 9).
+  // Let AWB/AF settle on the real scene first, then freeze them. (AE keeps
+  // running forever — see the block comment above.)
   await new Promise((r) => setTimeout(r, 2500));
-  // A luma baseline is a PRECONDITION of the exposure lock, not a nicety: without
-  // it verifyCamlock has nothing to compare and the lock can never be undone.
-  // The camera can still be spinning up here — the second arm of the phone gate
-  // reliably had zero frames at t=2.5 s, so it locked unverifiably and stayed at
-  // luma 16 for the whole call while the identical first arm sat at 101.
-  let before = lumaNow();
-  for (let i = 0; i < 10 && before == null; i++) {
-    await new Promise((r) => setTimeout(r, 500));
-    before = lumaNow();
-  }
   await safeAsync(async () => {
     const t = stream.getVideoTracks()[0];
     if (!t) return;
-    // Too dark, or blind: lock what is safe to lock. White balance and focus
-    // hunting are tells too, and neither can black out a picture.
-    if (before == null || before < 8) {
-      await t.applyConstraints({ whiteBalanceMode: 'manual', focusMode: 'manual' });
-      tel?.log('camlock', { ok: 1, exposure: 0, why: before == null ? 'no-luma' : 'too-dark', luma: before });
-      return;
-    }
-    await t.applyConstraints({ exposureMode: 'manual', whiteBalanceMode: 'manual', focusMode: 'manual' });
+    await t.applyConstraints({ whiteBalanceMode: 'manual', focusMode: 'manual' });
     camLocked = true;
-    tel?.log('camlock', { ok: 1, exposure: 1, luma: +before.toFixed(1) });
-    verifyCamlock(t, before);
+    tel?.log('camlock', { ok: 1, exposure: 0, luma: lumaNow() != null ? +lumaNow().toFixed(1) : null });
   }, 'camlock');
 }
 
-/**
- * The lock must prove it did no harm.
- *
- * "Freeze the exposure AE just chose" is what the spec implies and NOT what the
- * M13 does: `exposureMode:'manual'` with no `exposureTime` drops it to a dark
- * default. Measured on the device, same room, minutes apart — locked luma 16,
- * `?nolock=1` luma 101, with frame rate unchanged at ~16 fps in both, so it is
- * gain and not exposure length. That 6x collapse at t=2.5 s IS the user-reported
- * "the picture goes dark after a few seconds", and an earlier simulator run
- * cleared the lock only because the simulator modelled it the way the spec reads.
- *
- * So: read the luma back and undo the lock if the picture got materially darker.
- * Auto-exposure hunting is a tell; a dark picture is not a picture.
- */
-function verifyCamlock(track, before) {
-  if (LOCK_VERIFY === false || before == null || before < 8) return; // nothing to compare against
-  // WATCH, don't glance. The sensor takes ~1.5 s to actually darken after the
-  // constraint lands, and a single check at a fixed offset is a coin flip: read
-  // it too early and the picture still looks fine, so the lock stays and the
-  // call is dark for its whole length. That exact race made one arm of the
-  // phone gate come back at luma 16 while the identical arm came back at 101.
-  let ticks = 0;
-  const iv = setInterval(() => {
-    const after = lumaNow();
-    if (++ticks > 8 || !camLocked) return clearInterval(iv); // ~8 s, or something else already unlocked
-    if (after == null || after >= before * LOCK_DARK_FRAC) return;
-    clearInterval(iv);
-    safeAsync(async () => {
-      await track.applyConstraints({ exposureMode: 'continuous' });
-      camLocked = false;
-      tel?.log('camlock', { reverted: 1, before: +before.toFixed(1), after: +after.toFixed(1), afterMs: ticks * 1000 });
-    }, 'camlock.verify');
-  }, 1000);
-}
-
-/** Re-assert the manual lock after any later constraint re-application. */
+/** Re-assert the WB/focus lock after any later constraint re-application —
+ *  a constraint write can silently flip these back to continuous. Exposure is
+ *  never touched here (root fix above), so there is nothing to verify. */
 function relockCamera(track) {
   if (!camLocked || QS.get('nolock') === '1') return;
   safeAsync(async () => {
-    await track.applyConstraints({ exposureMode: 'manual', whiteBalanceMode: 'manual', focusMode: 'manual' });
+    await track.applyConstraints({ whiteBalanceMode: 'manual', focusMode: 'manual' });
     tel?.log('camlock', { ok: true, relock: 1 });
   }, 'camlock.relock');
 }
@@ -2595,7 +2650,7 @@ function relockCamera(track) {
 // falls more than 40% below its own 5 s-ago baseline and stays there for 3 s
 // while the camera is live, it tries an exposureCompensation nudge where the
 // platform exposes one (feature-detected via getCapabilities), then re-asserts
-// the camlock. The `lumadrop` event is logged either way — on platforms without
+// the WB/focus lock. The `lumadrop` event is logged either way — on platforms without
 // the knob, the honest state IS the data. Kill switch: `?luma=0`.
 const LUMA_ON = QS.get('luma') !== '0';
 const lumaWin = []; // { t, y } — ~12 s ring of 1 Hz readings
@@ -2816,13 +2871,6 @@ function srcProbeSample() {
   }, 'srcprobe.sample');
 }
 
-// ── Face geometry ────────────────────────────────────────────────────────────
-// Sent to the peer so they can render us at true scale. Defaults are adult averages;
-// there is no calibration UI here on purpose — the lobby has to stay short enough
-// that someone joining from a link actually gets through it.
-const sendGeom = () =>
-  send({ type: 'geom', geom: { eyeLineY: cal.eyeLineY, headWidthFrac: cal.headWidthFrac, headMm: cal.headMm } });
-
 // ── Display refresh, told to the peer ────────────────────────────────────────
 // Sent exactly the way face geometry is — at welcome and again at peer-joined — because
 // it answers the same kind of question: something only the far end knows, that only this
@@ -2832,12 +2880,114 @@ const sendDisplayHz = () =>
     // medianMs is what makes iqrMs interpretable: the gate is a RATIO, and an absolute
     // IQR cannot be judged without the interval it is a fraction of.
     ? send({ type: 'display', hz: localHz.hz, lockedPct: localHz.lockedPct,
-             iqrMs: localHz.iqrMs, medianMs: localHz.medianMs })
+             iqrMs: localHz.iqrMs, medianMs: localHz.medianMs,
+             // Task #52, resolution half: the peer cannot present more pixels than
+             // this panel has, so their SEND resolution is our display's business —
+             // the same law as the refresh rate, one axis over. Physical px, not CSS.
+             w: Math.round(screen.width * devicePixelRatio),
+             h: Math.round(screen.height * devicePixelRatio) })
     : false;
 // Started at load. It needs ~2 s of animation frames and the lobby is at least that
 // long, so by join time the answer is usually already in hand. The three sends cover
 // every order these can complete in: `send()` no-ops until the socket is open, and this
 // one covers the case where the measurement lands after both signaling hooks fired.
+// ── Peer display SIZE, acted on (task #52, resolution half) ─────────────────
+// Two consumers, different reliability classes:
+//   1. The ENCODE ceiling (TAPE_CFG.width/height, mutated in place — tape.js's
+//      fitSize reads cfg live and reconfigures within RESIZE_HOLD frames).
+//      Deterministic: works on every engine, needs nothing from the camera.
+//      Pixels above the peer's panel are bandwidth spent on detail nobody sees.
+//   2. The CAMERA, moved toward the ceiling — attempt-and-verify, never assumed,
+//      because the first getUserMedia may or may not be a hard cap depending on
+//      engine and device (the fps analog IS a hard cap — lobby-ask-caps-the-call
+//      — and the fake device ignores applyConstraints entirely, so this can only
+//      be judged from the `capture-res` telemetry on real hardware).
+let peerPxLong = null;
+let peerPxShort = null;
+// The sensor-moving half of the receiver-driven ceiling. Opt-in: see the long
+// note at its guard below — it restarts Android's auto-exposure.
+const CAM_RES = QS.get('camres') === '1';
+
+// Absent peer info → the historical default. Known → never encode above their
+// panel, never above 4K (encoder/decoder budget), never below 640×360 (a junk
+// or tiny display must not turn the call to soup).
+function sendResCeiling() {
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  if (!peerPxLong) return { w: WANT_W, h: WANT_H };
+  return { w: clamp(peerPxLong, 640, 3840), h: clamp(peerPxShort, 360, 2160) };
+}
+
+async function syncSendRes(why) {
+  const ceil = sendResCeiling();
+  const from = { w: TAPE_CFG.width, h: TAPE_CFG.height };
+  TAPE_CFG.width = ceil.w;
+  TAPE_CFG.height = ceil.h;
+  if (from.w !== ceil.w || from.h !== ceil.h) {
+    tel?.log('send-res', { why, from, to: ceil, peerPx: [peerPxLong, peerPxShort] });
+  }
+  // The fallback RTP lane reads the ceiling through tuneVideoSender (scale-down);
+  // re-tune so a fallback already in progress picks it up too.
+  for (const s of pc?.getSenders() ?? []) {
+    if (s.track?.kind === 'video') tuneVideoSender(s, 'send-res');
+  }
+  // Camera, opportunistically — OFF BY DEFAULT (`?camres=1` opts in).
+  //
+  // Reported from a real Android device 2026-08-05, hours after this shipped: the
+  // screen dimming of tasks #40/#41 was back. A mid-call `applyConstraints` naming
+  // width/height makes the camera re-solve its format, and re-solving restarts
+  // auto-exposure — the same mechanism both dimming fixes were about, reached from
+  // a new direction. The encode ceiling above already collects essentially the whole
+  // bandwidth win and cannot touch the sensor, so the sensor-moving half stays
+  // behind a flag until it is measured on a real phone. Never re-enable it by
+  // default on lab evidence: the fake camera has no auto-exposure to disturb, so
+  // the lab cannot see this failure at all.
+  if (!CAM_RES) return;
+  // Skipped while the starvation ladder or low-light mode owns the capture ask —
+  // their constraint is delivery, not presentation, and a re-solve here would fight
+  // machinery that steps exactly once.
+  const track = localStream?.getVideoTracks?.()[0];
+  // "The ladder owns the ask" means it has STEPPED — devStepTier is seeded to the
+  // STATIC tier at every join (line ~3370), so truthiness alone would disable this
+  // path on every phone forever.
+  const ladderStepped = devStepTier != null && devStepTier !== resolveDevTier();
+  if (!track || track.readyState !== 'live' || ladderStepped || lowlightOn) return;
+  const s0 = safe(() => track.getSettings(), 'sendres.settings') ?? {};
+  const caps = safe(() => track.getCapabilities?.(), 'sendres.caps') ?? {};
+  const tier = devCeiling();
+  let wantW = Math.min(ceil.w, caps.width?.max ?? s0.width ?? ceil.w, tier?.w ?? Infinity);
+  let wantH = Math.min(ceil.h, caps.height?.max ?? s0.height ?? ceil.h, tier?.h ?? Infinity);
+  // Preserve the CAMERA's aspect inside that box. Asking the panel's box verbatim
+  // invites the solver onto a different-aspect format (measured: an 800x600 ask
+  // re-solved a 16:9 fake camera to 640x480) — fewer pixels than the box allows
+  // and a shape change nobody asked for.
+  const aspect = s0.width > 0 && s0.height > 0 ? s0.width / s0.height : 16 / 9;
+  const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+  if (wantW / wantH > aspect) wantW = even(wantH * aspect);
+  else wantH = even(wantW / aspect);
+  wantW = even(wantW); wantH = even(wantH);
+  // Within 10% on the long edge: leave it alone. Device formats are coarse and a
+  // re-solve costs a keyframe and an AE settle; chasing exact pixels buys nothing.
+  const longNow = Math.max(s0.width ?? 0, s0.height ?? 0);
+  if (longNow > 0 && Math.abs(longNow - wantW) / wantW < 0.1) return;
+  let applied = null;
+  await safeAsync(async () => {
+    await track.applyConstraints({
+      width: { ideal: wantW },
+      height: { ideal: wantH },
+      frameRate: { ideal: s0.frameRate || 30 }, // keep the rate we have; never re-open that solve
+      resizeMode: 'none',
+    });
+    applied = pick(track.getSettings(), ['width', 'height', 'frameRate']);
+  }, 'sendres.apply');
+  tel?.log('capture-res', { why, asked: { w: wantW, h: wantH }, before: pick(s0, ['width', 'height', 'frameRate']), applied, ok: applied ? 1 : 0 });
+  if (applied) {
+    relockCamera(track); // interaction rule: never fight camlock
+    // WebKit's solver satisfies resolution first and will pay for it in frame
+    // rate (measured: 1080p at 10 fps). The shipped remedy already exists.
+    await repairFrameRate(track, s0.frameRate || 30);
+  }
+}
+
 measureDisplayHz().then((r) => {
   localHz = r;
   tel?.log('display-hz', r ?? { hz: null, why: 'rAF never fired — backgrounded tab?' });
@@ -2984,9 +3134,8 @@ function onDetector(side, ev) {
       }
       return;
     }
-    const dot = $(side === 'local' ? 'dotLocal' : 'dotRemote');
-    if (ev.type === 'classified') dot.className = `dot ${ev.kind === 'transient' ? '' : ev.kind}`;
-    if (ev.type === 'end') dot.className = 'dot';
+    // The speaking-dots indicator that consumed these events was removed
+    // (2026-08-04, user directive); the events still feed the measurements below.
 
     // Use the detector's own sample-accurate time, not the time this handler ran.
     //
@@ -3070,10 +3219,9 @@ function paintHud() {
     const fmt = (v, unit = ' ms') => (v == null ? '—' : `${Math.round(v)}${unit}`);
     $('hPerceived').textContent = fmt(s.perceivedMedian);
     $('hHuman').textContent = fmt(s.humanMedian);
-    $('hLead').textContent = s.leadMedian == null ? '—' : `${Math.round(s.leadMedian)} ms (n=${s.leadN})`;
-    $('hBreath').textContent = s.breathRate == null ? '—' : `${s.breathRate}%`;
-    $('hBreathLocal').textContent = s.breathRateLocal == null ? '—' : `${s.breathRateLocal}%`;
-    $('hTurns').textContent = `${s.usable} / ${s.total}`;
+    // leadMedian / breathRate / breathRateLocal / usable-vs-total are no longer
+    // ON SCREEN (they are rig instrumentation, not call UI) but are still
+    // computed and still published through window.__tape.turns.summary().
 
     const a = lastStats.audio ?? {};
     const v = lastStats.video ?? {};
@@ -3127,12 +3275,9 @@ function paintHud() {
     $('hFreeze').textContent = v.freezeCount != null ? `${v.freezeCount} (${Math.round((v.freezeMs ?? 0) / 100) / 10}s)` : '—';
     $('hConceal').textContent = a.concealmentEvents != null ? String(a.concealmentEvents) : '—';
 
-    const h = tel?.health;
-    if (h) {
-      const el = $('logHealth');
-      el.textContent = `log: ${h.sent} sent · ${h.buffered} queued${h.failures ? ` · ${h.failures} fails` : ''}${h.dropped ? ` · ${h.dropped} dropped` : ''}`;
-      el.className = h.failures > 2 || h.dropped ? 'bad' : '';
-    }
+    // The log-health line is gone from the call screen: a person on a call has
+    // no use for "3 sent, 1 queued", and it was the last thing making telemetry
+    // feel like a feature. It remains readable at window.__tape.tel.health.
   }, 'hud');
 }
 
@@ -3217,8 +3362,19 @@ function tuneVideoSender(s, why) {
     // invariant because it divides both dimensions equally. `peerGeom` carries
     // {eyeLineY, headWidthFrac, headMm} off the sender's `cal` — never a capture or
     // encode resolution. So downscaling changes sharpness, not rendered physical size.
-    // Left at 1 anyway: this is the measurement default, not a life-size requirement.
-    p.encodings[0].scaleResolutionDownBy = V_SCALEDOWN; // `?scaledown=`; unset === 1
+    //
+    // Task #52 (resolution half): no longer always 1. When the peer's display is
+    // smaller than our capture, this lane — the plain-RTP fallback, where WebRTC owns
+    // the encoder and TAPE_CFG's ceiling cannot reach — downscales to their panel.
+    // `?scaledown=` (≠1) still forces a value for A/B work; the dynamic path only
+    // ever DOWNscales (clamped ≥1: raising it above 1 on a matched display would
+    // shrink below the panel, and <1 throws on some engines).
+    const rc = sendResCeiling();
+    const vs = vt?.getSettings?.() ?? {};
+    const vShort = Math.min(vs.width ?? 0, vs.height ?? 0);
+    const dynScale = vShort > 0 && rc.h > 0 ? Math.max(1, +(vShort / rc.h).toFixed(3)) : 1;
+    const scaleDown = V_SCALEDOWN !== 1 ? V_SCALEDOWN : dynScale;
+    p.encodings[0].scaleResolutionDownBy = scaleDown;
     s.setParameters(p)
       .then(() => tel?.log('senderparams', {
         maxBitrate: 12_000_000,
@@ -3234,7 +3390,8 @@ function tuneVideoSender(s, why) {
         // that is fast and uneven looks worse than a slower even one, so a frame-rate
         // figure without this beside it cannot be judged.
         cadence: tf.cadence, evenOnPeer: tf.evenOnPeer,
-        scaleResolutionDownBy: V_SCALEDOWN,
+        scaleResolutionDownBy: scaleDown,
+        sendResCeil: [rc.w, rc.h],
       }))
       .catch((e) => tel?.log('senderparams', { error: String(e).slice(0, 80) }));
   }, `video-params-${why}`);
@@ -3248,8 +3405,6 @@ async function join(room) {
     screen: [screen.width, screen.height],
     dpr: devicePixelRatio,
     viewport: [innerWidth, innerHeight],
-    pxPerMm: cal.pxPerMm ? +cal.pxPerMm.toFixed(3) : null,
-    distMm: cal.distMm,
     lang: navigator.language,
     cores: navigator.hardwareConcurrency ?? null,
   });
@@ -3264,8 +3419,15 @@ async function join(room) {
   devStepTier = resolveDevTier(); // the measured ladder starts where the static one landed
   startSourceProbe(localStream);
   startLumaWatchdog(localStream);
-  $('self').srcObject = localStream;
+  // Task #52: the peer's display size can arrive BEFORE the camera exists (their
+  // 'display' rides the welcome round; getMedia takes ~1 s — measured, sendres-diag
+  // 2026-08-05: display at t=546 ms against a not-yet-assigned localStream, and it
+  // is sent only once per socket). The ceiling half needs no camera; the camera
+  // half re-runs here now that there is a track to move.
+  if (peerPxLong) safe(() => syncSendRes('media-ready'), 'sendres.media-ready');
+
   $('preview').srcObject = localStream;
+  syncArmState(); // whatever you armed on the first screen is how you arrive
   if (videoDegraded) {
     $('previewBadge').textContent =
       videoDegraded === 'none'
@@ -3685,9 +3847,23 @@ async function join(room) {
   pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate });
   pc.oniceconnectionstatechange = () => {
     tel.log('ice-state', { state: pc.iceConnectionState });
-    if (pc.iceConnectionState === 'failed') setStatus('connection failed — try leaving and rejoining');
-    if (pc.iceConnectionState === 'disconnected') setStatus('reconnecting…');
-    if (pc.iceConnectionState === 'connected') setStatus('connected');
+    if (pc.iceConnectionState === 'failed') {
+      setStatus('connection lost — reconnecting…');
+      recoverCall('ice-failed'); // task #50: was a status string telling the user to do this
+    }
+    if (pc.iceConnectionState === 'disconnected') {
+      setStatus('reconnecting…');
+      // 'disconnected' recovers by itself after a blip; 'failed' can take 15 s+
+      // to be declared. A sustained disconnect IS the walk-out-the-door case —
+      // escalate after 5 s instead of waiting for the browser's verdict.
+      clearTimeout(recoverTimer);
+      recoverTimer = setTimeout(() => recoverCall('ice-disconnected'), 5000);
+    }
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      clearTimeout(recoverTimer);
+      recoverTimer = null;
+      setStatus('connected');
+    }
   };
   pc.onconnectionstatechange = () => {
     tel.log('pc-state', { state: pc.connectionState });
@@ -3714,11 +3890,15 @@ async function join(room) {
   ws.addEventListener('open', () => { wsOpened = true; });
   ws.onclose = () => {
     tel.log('ws-close', { opened: wsOpened ? 1 : 0 });
-    if (!wsOpened) wsPreOpenFail?.(new Error('couldn’t join — this call may already have two people in it'));
+    if (!wsOpened) wsPreOpenFail?.(new Error('this call may already have two people in it'));
+    // Task #50: a mid-call socket close is the first symptom of a network flip
+    // (it dies faster than ICE notices). recoverCall's own guards keep lobby
+    // closes, deliberate leaves, and rejected joins out of here.
+    if (wsOpened) recoverCall('ws-close');
   };
   ws.onerror = () => {
     tel.log('ws-error', { opened: wsOpened ? 1 : 0 });
-    if (!wsOpened) wsPreOpenFail?.(new Error('couldn’t join — this call may already have two people in it'));
+    if (!wsOpened) wsPreOpenFail?.(new Error('this call may already have two people in it'));
   };
   ws.onmessage = async (ev) => {
     await safeAsync(async () => {
@@ -3736,7 +3916,6 @@ async function join(room) {
         sessionEpochUs = m.session_epoch_us ?? null;
         if (PCM_AUDIO) tel.log('session-epoch', { epochUs: sessionEpochUs, welcomeAtMs: +welcomeAtMs.toFixed(1) });
         setStatus(m.peerPresent ? 'connecting…' : 'waiting for the other person');
-        sendGeom();
         sendDisplayHz();
         laneAgree(m.peerLane, 'welcome');
         pcmAgree(m.peerPcm, 'welcome');
@@ -3794,6 +3973,27 @@ async function join(room) {
         if (wantTape === 2 && role === 'a') {
           safe(() => {
             const slotTx = pc.addTransceiver('video', { direction: 'recvonly' });
+            // The slot must negotiate VP8 — the lane's payloads ride the carrier
+            // opaquely and only VP8's packetizer leaves them intact (tape.js).
+            // The app's codec-pref pass keys on sender.track and the slot has
+            // none, so without this the OFFER leads with the engine's default
+            // codec, and the negotiated codec follows the offer: Chromium's
+            // default is VP8 (worked by luck), Safari's is H264 — measured
+            // 2026-08-04 (task #44): Safari-first calls negotiated the slot as
+            // H264, the answerer's frames arrived mangled, zero delivered, and
+            // the whole lane fell back within 5 s. The answerer's own
+            // setCodecPreferences in claimSlot does not override the offer's
+            // ordering, so the offerer is the only place this can be pinned.
+            const caps = RTCRtpReceiver.getCapabilities?.('video');
+            if (slotTx.setCodecPreferences && caps?.codecs) {
+              const rank = (c) => {
+                const n = (c.mimeType || '').toLowerCase();
+                if (n.includes('vp8')) return 0;
+                if (/rtx|red|ulpfec|flexfec/i.test(n)) return 9;
+                return 5;
+              };
+              slotTx.setCodecPreferences([...caps.codecs].sort((a, b) => rank(a) - rank(b)));
+            }
             // Attach the receive transform NOW, at transceiver creation. The answer
             // builds this receiver's pipeline inside setRemoteDescription(answer) —
             // BEFORE ontrack fires — and an attach that lands after the build is
@@ -3813,13 +4013,24 @@ async function join(room) {
           if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll();
         }
       } else if (m.type === 'peer-joined') {
-        // Before anything else, and synchronously: an incumbent whose call is
-        // already spent reloads instead of negotiating. Negotiating first is
-        // what turns this into a ping-pong — the arriving peer would reach
-        // `peerArrived`, inherit a spent page of its own, and re-arm on the
-        // NEXT arrival. Reloading before the offer leaves the newcomer clean.
-        if (reArmForNewPeer(room)) return;
-        sendGeom();
+        // Before anything else: an incumbent whose call is already spent must
+        // become clean BEFORE negotiating — negotiating on a spent page is
+        // what turned this into a ping-pong (the arriving peer reached
+        // `peerArrived`, inherited a spent page of its own, and re-armed on
+        // the NEXT arrival). It used to reload the whole page for that clean
+        // slate, so one person's refresh flashed both screens. Now the reset
+        // happens in place — same clean slate, no reload — and the NEW
+        // socket's welcome drives negotiation from there. The reload re-arm
+        // stays as the fallback if the in-place path ever fails.
+        if (hadPeer) {
+          if (!(await resetForNextPeer(room))) {
+            hadPeer = true; // reset cleared it, but a failed reset IS a spent page — reArm's precondition
+            // Forced: a failed reset has no second recovery behind it, so the
+            // cooldown must not be allowed to turn this into silence.
+            reArmForNewPeer(room, { force: true });
+          }
+          return;
+        }
         sendDisplayHz();
         // The incumbent's own `welcome` reached an empty room, so this is the
         // first moment it can know what the arriving peer runs. Before the offer,
@@ -3858,6 +4069,14 @@ async function join(room) {
         // The peer's lane A died. Its graph is both our playout and its capture,
         // so its failure is ours too — switch to Opus without re-broadcasting.
         fallbackToOpus(`peer-${m.why || 'fallback'}`, true);
+      } else if (m.type === 'video-fallback') {
+        // The peer's lane 2 died and it is now on plain RTP. Our carrier is a
+        // clock to a decoder that no longer exists — worse, the peer RENDERS it
+        // (a black 320x180 canvas). Fall back too; our fallbackToRtp puts the
+        // camera on the carrier's negotiated m-line, which is exactly the track
+        // the peer's fallback display is watching. Guarded on wantTape: a side
+        // that never ran the lane has no carrier to un-cripple.
+        if (wantTape) fallbackToRtp(`peer-${m.why || 'fallback'}`, true);
       } else if (m.type === 'reoffer') {
         // The answerer added a sender mid-call and cannot offer for it. Only 'a'
         // ever offers — that invariant is what keeps glare out of this codebase —
@@ -3879,9 +4098,8 @@ async function join(room) {
       } else if (m.type === 'pcm-ice') {
         await pcmPcs[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'geom') {
-        peerGeom = m.geom;
-        layout();
-        tel.log('peer-geom', m.geom);
+        // Legacy peers still send face geometry; the life-size renderer that
+        // consumed it is gone (2026-08-04).
       } else if (m.type === 'display') {
         // What the peer's screen can present. Their frames are OUR send problem, so
         // this arrives and immediately re-tunes our sender: anything above their
@@ -3897,6 +4115,18 @@ async function join(room) {
         const trust = hzTrusted(m.hz, m.medianMs, m.iqrMs, m.lockedPct);
         peerHzRaw = m.hz ?? null;
         if (trust && m.hz > 0) peerHz = m.hz;
+        // Task #52, resolution half. Orientation-agnostic (long/short edge) because a
+        // portrait phone presenting a landscape stream contain-fits INSIDE its panel —
+        // the long-edge box is the generous bound that is safe for both orientations.
+        // Sanity bounds, not trust scoring: a display size needs no vsync to be real,
+        // but a junk value must not become our encode ceiling (absent-field law: a
+        // legacy peer without w/h changes nothing).
+        if (Number.isFinite(m.w) && Number.isFinite(m.h) &&
+            Math.min(m.w, m.h) >= 320 && Math.max(m.w, m.h) <= 16384) {
+          peerPxLong = Math.round(Math.max(m.w, m.h));
+          peerPxShort = Math.round(Math.min(m.w, m.h));
+          syncSendRes('peer-display');
+        }
         tel.log('peer-display', { hz: m.hz ?? null, lockedPct: m.lockedPct ?? null,
           iqrMs: m.iqrMs ?? null, medianMs: m.medianMs ?? null,
           relIqr: m.medianMs > 0 && m.iqrMs != null ? +(m.iqrMs / m.medianMs).toFixed(3) : null,
@@ -3934,18 +4164,33 @@ async function join(room) {
 
   turns = new TurnTaking(onTransition);
   joined = true;
-  $('lobby').style.display = 'none';
-  $('call').style.display = 'block';
+  // A call survives anything except an explicit hang-up (user directive
+  // 2026-08-04): refresh, crash, closed window — this record walks you back
+  // in. Heartbeaten on the stats cadence so a record can be told apart from a
+  // stale one left by a machine that died weeks ago; cleared in exactly one
+  // place, the leave button.
+  markLive(room);
+  activeRoom = room; // recoverCall (task #50) reloads back into this room
+  // THE transition: one class. No screen is shown or hidden, no element moves —
+  // the button in the middle goes away, #waiting takes its place, and the two
+  // call-only circles appear in the bar that was already there.
+  $('call').classList.remove('pre');
   // The address bar becomes the shareable link, so a reload rejoins the same
   // room and the link is copyable from where people look for links. Existing
   // params (tape, pcmaudio, …) survive — a reload must not silently change the
   // configuration the call is being measured under.
   safe(() => {
     const u = new URL(location.href);
-    if (u.searchParams.get('r') !== room) {
+    if (MEET_RE.test(room)) {
+      // Short form: the path is the room. Flags in the query string survive —
+      // a reload must not silently change the configuration the call is
+      // being measured under.
+      u.pathname = `/${room}`;
+      u.searchParams.delete('r');
+    } else if (u.searchParams.get('r') !== room) {
       u.searchParams.set('r', room);
-      history.replaceState(null, '', u);
     }
+    if (u.href !== location.href) history.replaceState(null, '', u);
   }, 'join.url');
   // Controls pinned for the first 10 s (§A.3): the icon vocabulary gets learned
   // once, at the only moment the user is looking for it, and then the screen
@@ -3963,11 +4208,12 @@ async function join(room) {
       sf.classList.add('on');
     }
   }, 'selffull');
-  $('shareUrl').value = `${location.origin}/?r=${encodeURIComponent(room)}`;
+  $('shareUrl').value = roomUrl(room);
   $('hud').classList.toggle('on', view.hud);
   applyChips();
 
   statsTimer = setInterval(async () => {
+    markLive(room); // heartbeat: "this tab was in this call as of now"
     lastStats = await sampleStats(pc);
     tel?.log('stats', lastStats);
     srcProbeSample(); // task #37: camera-delivered fps, armed at join
@@ -3975,7 +4221,6 @@ async function join(room) {
     if (pcm) tel?.log('pcm-stats', pcm.snapshot());
     if (tsync) tel?.log('timesync-stats', tsync.snapshot());
     stallPcmSample(); // §12–13: the HOLD classifier rides the 2 s stats cadence
-    if (layout.info) tel?.log('geometry', layout.info);
     paintHud();
   }, 2000);
 }
@@ -4019,28 +4264,22 @@ if (!STATS_UI) $('c-hud').style.display = 'none';
  *  Safari has no vibrate at all; the visual state change stands alone there. */
 const haptic = (ms = 8) => safe(() => navigator.vibrate?.(ms), 'haptic');
 
-/** True while the self-view button is held down (§B.9). Distinct from
- *  view.selfview, which is the PINNED state — a peek must never latch. */
-let selfPeek = false;
-
 function applyChips() {
-  for (const [k, id] of [['lifesize', 'c-lifesize'], ['gaze', 'c-gaze'], ['selfview', 'c-selfview'], ['hud', 'c-hud']]) {
+  for (const [k, id] of [['hud', 'c-hud']]) {
     $(id).dataset.on = view[k] ? '1' : '0';
     $(id).setAttribute('aria-checked', view[k] ? 'true' : 'false');
   }
   // A control with no track behind it must LOOK dead, not just act dead. An
   // audio-only join left the camera button looking live and silently doing
   // nothing, which reads as a broken app rather than a missing camera.
-  $('mic').disabled = !localStream?.getAudioTracks?.().length;
-  $('cam').disabled = !localStream?.getVideoTracks?.().length;
-  const showSelf = (view.selfview || selfPeek) && !videoDegraded;
-  $('selfWrap').classList.toggle('on', showSelf);
-  $('selfPeek').dataset.on = view.selfview ? '1' : '0';
-  $('selfPeek').disabled = !!videoDegraded;
+  // Before a call the stream underneath these controls is the preview's; after
+  // it, the call's. Same buttons, same rule, one source of truth.
+  $('mic').disabled = !armStream()?.getAudioTracks?.().length;
+  $('cam').disabled = !armStream()?.getVideoTracks?.().length;
   $('hud').classList.toggle('on', view.hud);
   layout();
 }
-for (const [k, id] of [['lifesize', 'c-lifesize'], ['gaze', 'c-gaze'], ['selfview', 'c-selfview'], ['hud', 'c-hud']]) {
+for (const [k, id] of [['hud', 'c-hud']]) {
   $(id).onclick = () => {
     view[k] = !view[k];
     applyChips();
@@ -4048,56 +4287,6 @@ for (const [k, id] of [['lifesize', 'c-lifesize'], ['gaze', 'c-gaze'], ['selfvie
     tel?.log('toggle', { what: k, on: view[k] });
   };
 }
-
-// ── Self view: hold to peek, tap to unpin (§B.9) ─────────────────────────────
-// The user's rule is "self view only appears on long press, otherwise off".
-// Implemented as press-and-hold rather than a 500 ms threshold: on a button you
-// deliberately pressed there is no accidental case to guard against, and a
-// threshold makes a quick tap feel broken. So the mirror appears the instant
-// you press and leaves when you let go, with a 900 ms floor so a quick tap
-// still buys a real glance. Pinning lives in the more sheet, not on a
-// double-tap — an undiscoverable gesture for a state you can already see.
-let peekDownAt = 0;
-let peekOffTimer = null;
-const peekOn = () => {
-  if (videoDegraded || view.selfview) return;
-  clearTimeout(peekOffTimer);
-  peekDownAt = performance.now();
-  selfPeek = true;
-  applyChips();
-  haptic(10);
-  tel?.log('gesture', { what: 'selfview-peek', on: 1 });
-};
-const peekOff = () => {
-  if (!selfPeek) return;
-  const held = performance.now() - peekDownAt;
-  clearTimeout(peekOffTimer);
-  peekOffTimer = setTimeout(() => {
-    selfPeek = false;
-    applyChips();
-    tel?.log('gesture', { what: 'selfview-peek', on: 0, heldMs: Math.round(held) });
-  }, Math.max(0, 900 - held));
-};
-safe(() => {
-  const b = $('selfPeek');
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault(); // no text-selection / long-press context menu on hold
-    if (view.selfview) return; // pinned: the pointerup unpins instead
-    peekOn();
-  });
-  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
-    b.addEventListener(ev, () => {
-      if (view.selfview && ev === 'pointerup') {
-        view.selfview = false;
-        applyChips();
-        haptic();
-        tel?.log('toggle', { what: 'selfview', on: false, via: 'unpin' });
-        return;
-      }
-      peekOff();
-    });
-  }
-}, 'selfpeek.bind');
 
 // ── More sheet (§B.12) ───────────────────────────────────────────────────────
 // The four toggles that used to be always-visible chips. Off the face, one tap
@@ -4107,7 +4296,7 @@ function setSheet(on) {
   safe(() => {
     $('moreSheet').classList.toggle('on', on);
     $('moreScrim').classList.toggle('on', on);
-    if (on) { showBar(true); refreshSafetyCode(); }
+    if (on) { showBar(true); if (joined) refreshSafetyCode(); }
     else scheduleHide();
     tel?.log('gesture', { what: 'more-sheet', on: on ? 1 : 0 });
   }, 'sheet');
@@ -4125,26 +4314,68 @@ safe(() => {
   });
 }, 'sheet.swipe');
 
+// ── One bar, two phases ──────────────────────────────────────────────────────
+// There is no second set of controls. The same mic / camera / flip / ••• circles
+// serve the pre-join screen and the call; `#call.pre` only hides the two that
+// need a call to act on (self view, leave). So the transition into a call moves
+// nothing: the class comes off, the button in the middle is replaced by the
+// waiting block, and every other pixel stays where it was.
+//
+// Which stream a control acts on is the ONLY thing that differs, and it is
+// derived rather than remembered — `joined` is the single source of truth, so a
+// pre-join mute cannot drift out of sync with the call's own state.
+const armStream = () => (joined ? localStream : previewStream);
+/**
+ * Re-assert mic/camera state on a FRESH stream, and make a control with no
+ * device behind it look dead rather than act dead. Called whenever the stream
+ * underneath the buttons changes: switching camera or mic opens new tracks, and
+ * new tracks are born enabled — without this, muting yourself and then changing
+ * microphone quietly un-mutes you.
+ */
+function syncArmState() {
+  safe(() => {
+    const st = armStream();
+    const a = st?.getAudioTracks?.() ?? [];
+    const v = st?.getVideoTracks?.() ?? [];
+    for (const t of a) t.enabled = $('mic').dataset.off !== '1';
+    for (const t of v) t.enabled = $('cam').dataset.off !== '1';
+    $('mic').disabled = !a.length;
+    $('cam').disabled = !v.length;
+  }, 'arm.sync');
+}
+// Pre-join camera switch: the setup sheet already owns a device picker, so
+// flipping before the call is "advance the picker and re-open" rather than a
+// second code path that could disagree with it. In-call it is the real track
+// swap (see below).
+function flipPreJoin() {
+  return safeAsync(async () => {
+    const sel = $('camSel');
+    if (sel.options.length < 2) return;
+    sel.selectedIndex = (sel.selectedIndex + 1) % sel.options.length;
+    await sel.onchange?.();
+  }, 'pre.flip');
+}
+
 // ── Mic / camera ─────────────────────────────────────────────────────────────
 // State is colour and a slash, never a word. Red means "you are silent or dark
-// to them" — parseable without reading. The mute badge is the half that
-// survives auto-hide.
+// to them" — parseable without reading. (The persistent mute badge was removed
+// 2026-08-04, user directive — the mic circle itself is the only mute state.)
+
 $('mic').onclick = () => {
-  const t = localStream?.getAudioTracks()[0];
+  const t = armStream()?.getAudioTracks()[0];
   if (!t) return;
   t.enabled = !t.enabled;
   $('mic').dataset.off = t.enabled ? '0' : '1';
-  $('muteBadge').classList.toggle('on', !t.enabled);
   haptic();
-  tel?.log('toggle', { what: 'mic', on: t.enabled });
+  tel?.log('toggle', { what: 'mic', on: t.enabled, pre: joined ? 0 : 1 });
 };
 $('cam').onclick = () => {
-  const t = localStream?.getVideoTracks()[0];
+  const t = armStream()?.getVideoTracks()[0];
   if (!t) return;
   t.enabled = !t.enabled;
   $('cam').dataset.off = t.enabled ? '0' : '1';
   haptic();
-  tel?.log('toggle', { what: 'cam', on: t.enabled });
+  tel?.log('toggle', { what: 'cam', on: t.enabled, pre: joined ? 0 : 1 });
 };
 // ── Rear camera (§8) ─────────────────────────────────────────────────────────
 // The control only exists where it can do something: two or more cameras, and a
@@ -4172,8 +4403,7 @@ function applyMirror(track) {
     if (s.facingMode) rear = s.facingMode !== 'user';
     else if (/back|rear|environment/i.test(label)) rear = true;
     else if (/front|user|facetime/i.test(label)) rear = false;
-    else rear = $('selfWrap').classList.contains('rear');
-    $('selfWrap').classList.toggle('rear', rear);
+    else rear = $('selfFull').classList.contains('rear');
     $('selfFull').classList.toggle('rear', rear);
     $('previewWrap').classList.toggle('rear', rear);
   }, 'mirror');
@@ -4183,6 +4413,9 @@ let flipBusy = false;
 $('flip').onclick = () =>
   safeAsync(async () => {
     if (flipBusy) return;
+    // Before the call there is no sender to renegotiate — flipping is re-opening
+    // the preview on the next camera, which is what the picker already does.
+    if (!joined) { haptic(); return void (await flipPreJoin()); }
     flipBusy = true;
     $('flip').disabled = true;
     const old = localStream?.getVideoTracks()[0];
@@ -4219,7 +4452,7 @@ $('flip').onclick = () =>
       await adoptVideoTrack(nv);
       old?.stop(); // the wire is on the new sensor now; retire the old one
       applyMirror(nv);
-      for (const id of ['self', 'selfFull']) $(id).srcObject = localStream;
+      $('selfFull').srcObject = localStream;
       safe(() => localStorage.setItem('tape.cam', next.deviceId), 'flip.remember');
       haptic();
       tel?.log('camera-flip', {
@@ -4238,22 +4471,51 @@ $('flip').onclick = () =>
     }
   }, 'flip');
 
-$('save').onclick = () => {
-  // Release the analyser's held events first, or the last few transitions of the call
-  // never make it into the log — see the watermark buffer in turntaking.js.
-  turns?.flush();
-  tel?.flush();
-  tel?.download();
-  // Confirmation is the icon going green for 600 ms. A toast over a face costs
-  // more attention than the event is worth.
-  haptic();
+// The "Save call log" control is gone from the more sheet — downloading a
+// counter dump is not something a person in a conversation wants, and offering
+// it made the log look like part of the product. tel.download() still exists
+// and the testbed calls it directly; nothing in the collection path changed.
+// Sharing the link is THE task of the waiting screen, so it gets three routes
+// that all end the same way: the native share sheet where one exists (phones —
+// the gesture people actually use to send a link), the copy button, and
+// tapping the link itself. Copy always confirms — silence after a copy is why
+// people paste into the wrong chat to check.
+function copiedFlash(btn) {
   safe(() => {
-    const b = $('save');
-    b.style.color = 'var(--ok)';
-    setTimeout(() => { b.style.color = ''; }, 600);
-  }, 'save.flash');
-};
-$('copy').onclick = () => safe(() => navigator.clipboard.writeText($('shareUrl').value), 'copy');
+    const was = btn.textContent;
+    btn.textContent = 'copied ✓';
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = was; btn.disabled = false; }, 1400);
+  }, 'copy.flash');
+}
+$('copy').onclick = () =>
+  safeAsync(async () => {
+    // Flash first: confirmation must land inside the perceptual "instant"
+    // window, and the write resolves in microtasks anyway. The rare failure
+    // overwrites the flash with the truth.
+    copiedFlash($('copy'));
+    await navigator.clipboard.writeText($('shareUrl').value).catch(() => { $('copy').textContent = 'copy failed'; });
+    tel?.log('share', { via: 'copy' });
+  }, 'copy');
+$('shareUrl').onclick = () =>
+  safeAsync(async () => {
+    $('shareUrl').select();
+    await navigator.clipboard.writeText($('shareUrl').value);
+    copiedFlash($('copy'));
+    tel?.log('share', { via: 'url-tap' });
+  }, 'copy.url');
+safe(() => {
+  if (!navigator.share) return; // desktop: copy IS the native gesture
+  const b = document.createElement('button');
+  b.id = 'shareBtn';
+  b.textContent = 'share';
+  $('copy').before(b);
+  b.onclick = () =>
+    safeAsync(
+      () => navigator.share({ url: $('shareUrl').value }).then(() => tel?.log('share', { via: 'sheet' })),
+      'share.sheet',
+    );
+}, 'share.btn');
 
 // ── Leave: two taps, no modal (§B.11) ────────────────────────────────────────
 // A dropped 1:1 call is unrecoverable — you cannot un-hang-up. The circle
@@ -4271,30 +4533,137 @@ function cancelLeaveConfirm() {
     $('bar').classList.remove('confirming');
   }, 'leave.cancel');
 }
-function teardownCall() {
+// Everything a call session owns, stopped. Shared by the deliberate leave and
+// by the in-place reset (task #50 follow-up) — one list, so a resource added to
+// one path cannot leak on the other. Elapsed-time is NOT here: a peer that
+// drops and returns is one conversation, and the reset keeps its clock running.
+// `keepMedia` is the in-place reset's whole safety story. The deliberate leave
+// stops the camera because the page is navigating away; the RESET must not,
+// because this file's own law (getMedia, "one open per device, per page") says
+// stopping a camera and reopening it moments later is what makes real drivers
+// throw NotReadableError. The fake device used in the e2e never does, so the
+// first version of this passed 8/8 in the lab and broke real calls — including
+// re-running Android's auto-exposure from scratch, which is the dimming bug
+// coming back by another door (tasks #40/#41).
+function stopCallMachinery({ keepMedia = false } = {}) {
   safe(() => {
     turns?.flush();
-    tel?.log('session-end', turns?.summary() ?? {});
     tel?.stop();
+    // Watchdog timers armed by the OLD call must die with it: a stale
+    // armPcmWatchdog timer fired 0.7 s into the reset call, read the NEW
+    // pcm's playedFrames=0 and killed the lane with 'no-audio' (measured,
+    // refresh-trace 2026-08-05). Same hazard for the video lane's timer.
+    clearTimeout(pcmWatchdog);
+    clearTimeout(laneWatchdog);
+    clearTimeout(recoverTimer);
     clearInterval(statsTimer);
     clearInterval(concealProbe);
     clearInterval(lumaTimer);
     clearInterval(fillTimer);
-    stopElapsed();
     lumaTimer = null;
     fillTimer = null;
     srcProbe?.reader?.cancel().catch(() => {});
     srcProbe = null;
     localMon?.disconnect();
     remoteMon?.disconnect();
+    // NULLED, not just disconnected — ontrack's claim guard is
+    // `if (remoteAttaching || remoteMon) return`, and it runs before everything
+    // that makes a peer count as arrived (peerArrived → hadPeer, the lane
+    // watchdogs, the 'connected' status). A disconnected-but-non-null monitor
+    // surviving into the next call makes that call LOOK healthy while hadPeer
+    // stays false — so the reset after it skips, renegotiates on a spent page,
+    // and the audio lane dies. Found via callFlags polling, slowclose-diag
+    // 2026-08-05: gen2's whole second call ran with hadPeer:false.
+    localMon = null;
+    remoteMon = null;
+    remoteAttaching = false;
     pcm?.stop();
     tsync?.stop();
     for (const spc of pcmPcs) spc?.close();
     pc?.close();
     ws?.close();
-    for (const t of localStream?.getTracks() ?? []) t.stop();
-  }, 'leave');
-  location.href = location.pathname;
+    if (!keepMedia) for (const t of localStream?.getTracks() ?? []) t.stop();
+  }, 'call.stop');
+}
+
+function teardownCall() {
+  leavingDeliberately = true; // the closes below must not trigger recovery
+  clearTimeout(recoverTimer);
+  window.__hbEnd?.('leave'); // before teardown, while pcm stats still exist
+  tel?.log('session-end', turns?.summary() ?? {});
+  stopCallMachinery();
+  stopElapsed();
+  clearLive(); // the ONE place the call actually ends for this side
+  location.href = '/'; // the path may BE the room now — home is /, not pathname
+}
+
+// ── In-place reset (the "more flawless" refresh, user directive 2026-08-05) ──
+// When the PEER refreshes, this side used to reload its whole page to get a
+// clean slate (reArmForNewPeer) — so one person's refresh flashed BOTH
+// screens. This resets the call without the page: stop every per-call
+// resource, then run join() again on the same page. join() was audited for
+// re-entry: every per-call binding it touches it reassigns (pc, ws, tel,
+// localStream, tapePre, stripes by index, timers), `joined` is set inside it,
+// and the elapsed clock deliberately survives (one conversation). The reload
+// re-arm remains as the fallback if this ever throws — flawless when it
+// works, never worse than before when it does not.
+// Resolves when `s` has finished closing, or after `ms` — bounded because a
+// socket that never completes its handshake must not strand the reset; the
+// timeout path simply falls through to the room's own ghost sweep.
+function waitSocketClosed(s, ms) {
+  if (!s || s.readyState === WebSocket.CLOSED) return Promise.resolve();
+  return new Promise((res) => {
+    const done = () => res();
+    s.addEventListener('close', done, { once: true });
+    s.addEventListener('error', done, { once: true });
+    setTimeout(done, ms);
+  });
+}
+
+let resettingInPlace = false;
+async function resetForNextPeer(room) {
+  if (resettingInPlace) return true; // a second peer-joined mid-reset is the new socket's business
+  resettingInPlace = true;
+  leavingDeliberately = true; // recoverCall must ignore our own closes
+  tel?.log('reset-in-place', { room });
+  setStatus('reconnecting…');
+  const oldWs = ws;
+  stopCallMachinery({ keepMedia: true });
+  // WAIT FOR THE OLD SOCKET TO ACTUALLY BE GONE before opening the new one.
+  // `ws.close()` only STARTS a close handshake. The room counts occupants by
+  // socket readyState and answers a third upgrade with 409 "room full", so
+  // racing our own closing socket means the reset's join() is rejected with
+  // "this call may already have two people in it" — and the closer the peer's
+  // arrival is to our close, the likelier it is. On loopback the handshake
+  // finishes in well under a millisecond, which is why every lab run passed;
+  // over cellular it is tens to hundreds of milliseconds, which is where real
+  // refreshes stopped coming back.
+  await waitSocketClosed(oldWs, 2500);
+  // Hand the still-live tracks back to the lobby slot getMedia() reuses. That
+  // path is the proven one — it re-applies the capture constraints and repairs
+  // the frame rate on a reused track — so the reset opens NO camera and NO mic,
+  // and Android's exposure is never restarted.
+  previewStream = localStream;
+  hadPeer = false; // the next peerArrived is a fresh arrival, not a spent page
+  joined = false;
+  // The fallback latches are per-call verdicts, not page state: a fresh page
+  // starts with them clear, so the reset call must too — otherwise one old
+  // fallback silently downgrades every call this page ever hosts.
+  pcm = null;
+  pcmFellBack = false;
+  pcmFellBackWhy = null;
+  pcmSpareSender = null; // belonged to the closed pc; join() re-creates it
+  tapeFellBack = false;
+  try {
+    await join(room);
+    return true;
+  } catch (e) {
+    tel?.log('reset-in-place-failed', { e: String(e).slice(0, 120) });
+    return false; // caller falls back to the reload re-arm
+  } finally {
+    leavingDeliberately = false;
+    resettingInPlace = false;
+  }
 }
 $('leave').onclick = () => {
   if (leaveArmed) {
@@ -4335,6 +4704,10 @@ function showBar(pin = false) {
 }
 function scheduleHide() {
   clearTimeout(hideTimer);
+  // Auto-hide exists to get chrome off a FACE mid-conversation (§A.3). Before
+  // the call the screen is your own mirror and one button, and hiding the
+  // controls there just makes the app look broken.
+  if (!joined) return;
   // Wait out whichever ends later: 2.6 s of stillness, or the intro pin. An
   // earlier version re-armed on a flat 2.6 s tick whenever it found itself
   // still pinned, which meant the bar could outlive the pin by up to another
@@ -4362,14 +4735,15 @@ addEventListener('pointermove', (e) => { if (e.pointerType !== 'touch') showBar(
 // disappearing under your finger. Touch never sees the pointermove above, so
 // this is the only thing re-arming the timer on a phone.
 $('bar').addEventListener('pointerdown', () => showBar());
+$('more').addEventListener('pointerdown', () => showBar());
 $('call').addEventListener('pointerdown', (e) => {
   // Only empty video toggles. A tap that lands on chrome is that control's.
-  if (e.target.closest('#bar, #moreSheet, #moreScrim, #floorIcon, #floorHint, #hud, #muteBadge, #shareBox')) return;
+  if (e.target.closest('#bar, #more, #moreSheet, #moreScrim, #floorIcon, #floorHint, #hud, #shareBox')) return;
   cancelLeaveConfirm();
   // Any tap out in the picture also puts the loud-room explanation away — it is
   // an answer to a question you asked, not a notice that needs dismissing.
   if ($('floorHint').classList.contains('on')) collapseFloorHint();
-  if ($('bar').classList.contains('show') && performance.now() >= barPinnedUntil) {
+  if (joined && $('bar').classList.contains('show') && performance.now() >= barPinnedUntil) {
     safe(() => {
       $('bar').classList.remove('show');
       $('call').classList.remove('barShown');
@@ -4404,17 +4778,67 @@ setInterval(() => {
 // server changes: the DO already keys on an arbitrary string, and the hard cap
 // of two occupants is the admission control (a knock-and-admit flow would buy a
 // 1:1 product nothing but a second waiting room).
+// ── A call outlives its tab (user directive 2026-08-04) ─────────────────────
+// "A call should persist even on a refresh or window close until both parties
+// explicitly cut it." The room DO already has that lifetime — a room is just a
+// name, and the waiting screen holds it open. What was missing is the CLIENT
+// remembering it was mid-call: this record is written at join, heartbeaten
+// every 2 s, and deleted in exactly one place — the leave button. A refresh or
+// a closed-and-reopened window finds it and walks straight back in.
+// RESUME_MAX_MS bounds the surprise: a record whose last heartbeat is older
+// than 30 min means the call is long over on the other side too, and yanking
+// next week's fresh visit into last week's empty room would be worse than the
+// forgetting. localStorage (not sessionStorage) on purpose: sessionStorage
+// dies with the window, and the directive says a closed window is not a cut.
+const LIVE_KEY = 'tape.live';
+const RESUME_MAX_MS = 30 * 60_000;
+function markLive(room) {
+  safe(() => localStorage.setItem(LIVE_KEY, JSON.stringify({ room, at: Date.now() })), 'live.mark');
+}
+function clearLive() {
+  safe(() => localStorage.removeItem(LIVE_KEY), 'live.clear');
+}
+/** The room to walk back into, or null. An explicit invite in the URL always
+ *  wins — clicking a NEW link is as clear a statement as pressing leave. */
+function resumeRoom(urlRoom) {
+  return safe(() => {
+    const rec = JSON.parse(localStorage.getItem(LIVE_KEY) ?? 'null');
+    if (!rec?.room || Date.now() - rec.at > RESUME_MAX_MS) return null;
+    if (urlRoom && urlRoom !== rec.room) return null; // new invite beats old call
+    return rec.room;
+  }, 'live.read') ?? null;
+}
+
+// Meet-shaped: xxx-xxxx-xxx, lowercase letters (user directive 2026-08-04 —
+// "link should not be longer or complex than meet.google.com/etm-bkmb-iev").
+// That is 26^10 ≈ 47 bits, the same budget Meet spends. The old 128-bit mint
+// assumed brute force must be impossible rather than merely expensive; 47 bits
+// against a Worker that has to complete a WebSocket upgrade per guess is 4
+// billion years at 1k guesses/s — the human trade (a link you can read aloud)
+// wins. Old 22-char ?r= links still resolve; nothing breaks.
+const MEET_RE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 function mintRoom() {
-  const b = new Uint8Array(16);
+  const b = new Uint8Array(10);
   crypto.getRandomValues(b);
-  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // Rejection-free and unbiased enough: 256 % 26 = 22, a 0.3% skew toward the
+  // first 22 letters — irrelevant at this entropy, and branchless.
+  const c = [...b].map((x) => String.fromCharCode(97 + (x % 26))).join('');
+  return `${c.slice(0, 3)}-${c.slice(3, 7)}-${c.slice(7)}`;
+}
+/** The canonical shareable URL for a room: the short path form for minted
+ *  codes, the ?r= form for legacy/named rooms. One function so the address
+ *  bar, the waiting screen and the clipboard can never disagree. */
+function roomUrl(room) {
+  return MEET_RE.test(room)
+    ? `${location.origin}/${room}`
+    : `${location.origin}/?r=${encodeURIComponent(room)}`;
 }
 
 /** The button says what it is about to do — mint a new room, or join a named
  *  one. One button, because two buttons is a decision nobody asked for. */
 function paintJoinLabel() {
   safe(() => {
-    $('join').textContent = $('room').value.trim() ? 'Join call' : 'Start a new call';
+    $('join').textContent = $('room').value.trim() ? 'Join call' : 'Start a call';
   }, 'join.label');
 }
 $('room').addEventListener('input', paintJoinLabel);
@@ -4433,8 +4857,10 @@ $('room').addEventListener('input', paintJoinLabel);
 function roomFromInput(raw) {
   const s = String(raw ?? '').trim();
   if (!s) return '';
-  const link = s.match(/[?&#]r=([A-Za-z0-9_-]{1,64})/); // a pasted invite link
+  const link = s.match(/[?&#]r=([A-Za-z0-9_-]{1,64})/); // a pasted legacy invite link
   if (link) return link[1];
+  const short = s.match(/(?:^|\/)([a-z]{3}-[a-z]{4}-[a-z]{3})(?:[/?#]|$)/); // pasted short link or bare code
+  if (short) return short[1];
   const cleaned = s.replace(/\s+/g, '-'); // "morning call" is a room name, not a mistake
   return /^[A-Za-z0-9_-]{1,64}$/.test(cleaned) ? cleaned : null;
 }
@@ -4453,6 +4879,9 @@ $('join').onclick = async () => {
   } catch (e) {
     $('joinStatus').textContent = `couldn't join: ${e.message}`;
     $('join').disabled = false;
+    // A resume that cannot land (room refilled, second tab already in it) must
+    // not chase the user across every future visit — one failure spends it.
+    if (resumePending) { resumePending = false; clearLive(); }
     tel?.log('join-failed', { msg: String(e.message).slice(0, 160) });
   }
 };
@@ -4497,7 +4926,21 @@ async function openPreview(camId, micId) {
   }
   previewStream = s;
   $('preview').srcObject = s;
-  $('previewBadge').textContent = 'camera ready';
+  // The corner PiP is the same element in both states, so it gets the same
+  // picture in both states — otherwise the self-view circle in the bar is a
+  // control that looks alive before a call and does nothing.
+
+  const pb = $('previewBadge');
+  pb.textContent = 'camera ready';
+  // Same manner as #status ("connected" fades): good news is said once. Bad
+  // news — the blocked-camera paths below — stays up, because it needs acting on.
+  pb.classList.remove('gone');
+  setTimeout(() => safe(() => {
+    if (pb.textContent === 'camera ready') {
+      pb.classList.add('gone');
+      $('capBadge').classList.add('gone');
+    }
+  }, 'badge.fade'), 2600);
   return s;
 }
 
@@ -4647,13 +5090,33 @@ async function headphoneCheck() {
   }
 }
 
-openPreview(safe(() => localStorage.getItem('tape.cam'), 'flip.recall') || null)
+// The bar is up from the first paint: it is the same bar the call uses, and
+// before a call there is nothing for it to get out of the way of.
+showBar();
+// The whole preview boot is a named, re-runnable function because its failure
+// mode is the single worst moment in the product: a first-time visitor who
+// clicked "Block" (or whose browser remembered a block) used to get "reload the
+// page" as their only door back in. Now the same sentence is a button that
+// re-asks, and the Permissions API re-runs it AUTOMATICALLY the moment the
+// toggle flips — the user fixes the setting and the mirror just appears,
+// no reload, no instructions.
+function bootPreview() {
+  return openPreview(safe(() => localStorage.getItem('tape.cam'), 'flip.recall') || null)
   .then(async () => {
+    // The door opens only with both devices in hand (user directive 2026-08-04:
+    // nobody starts a call without allowing microphone AND camera). openPreview
+    // resolving means one getUserMedia granted both, so the gate lifts here and
+    // only here; the catch below is every other state, and it keeps it shut.
+    $('join').disabled = false;
     await fillDevicePickers();
     paintCapBadge();
     applyMirror(previewStream?.getVideoTracks?.()[0]);
     await refreshFlipAffordance();
     await startLevelMeter(previewStream);
+    syncArmState();
+    // A recovery must erase the failure it recovered from: the blocked-state
+    // sentence and the deadened controls both un-happen here.
+    safe(() => { if ($('joinStatus').textContent.startsWith('Camera and microphone')) $('joinStatus').textContent = ''; }, 'perm.clear');
     // Labels and the device list can both change when something is plugged in.
     navigator.mediaDevices.addEventListener?.('devicechange', () =>
       safeAsync(async () => {
@@ -4663,26 +5126,61 @@ openPreview(safe(() => localStorage.getItem('tape.cam'), 'flip.recall') || null)
     // ?rejoin=1 — set by reArmForNewPeer and by nothing else. The camera is
     // ready and the room is in the URL, so the only thing left between the user
     // and the call they never meant to leave is a button press. Skip it.
-    if (QS.get('rejoin') === '1' && !joined) safe(() => $('join').click(), 'rejoin.auto');
+    if ((QS.get('rejoin') === '1' || resumePending) && !joined) safe(() => $('join').click(), 'rejoin.auto');
     for (const [sel, kind] of [
       ['camSel', 'cam'],
       ['micSel', 'mic'],
     ]) {
       $(sel).onchange = () =>
         safeAsync(async () => {
+          $('previewBadge').classList.remove('gone');
+          $('capBadge').classList.remove('gone');
           $('previewBadge').textContent = `switching ${kind}…`;
           await openPreview($('camSel').value || null, $('micSel').value || null);
           paintCapBadge();
           applyMirror(previewStream?.getVideoTracks?.()[0]);
           await startLevelMeter(previewStream);
+          syncArmState();
         }, `lobby.switch.${kind}`);
     }
   })
   .catch((e) => {
+    // No devices, no call: the join button is dead until a re-ask succeeds.
+    $('join').disabled = true;
+    $('previewBadge').classList.remove('gone');
     $('previewBadge').textContent = `camera blocked (${e.name})`;
-    $('joinStatus').textContent = 'Allow camera and microphone, then reload.';
+    safe(() => {
+      const st = $('joinStatus');
+      st.textContent = e.name === 'NotFoundError'
+        ? 'A camera and microphone are required to join, and none was found. '
+        : 'Camera and microphone are blocked. ';
+      const retry = document.createElement('button');
+      retry.className = 'linkbtn';
+      retry.textContent = 'allow and try again';
+      retry.onclick = () => { st.textContent = 'asking…'; bootPreview(); };
+      st.appendChild(retry);
+    }, 'perm.retry');
     $('capBadge').textContent = 'no camera';
+    // Controls with no device behind them must LOOK dead, not just act dead.
+    for (const id of ['mic', 'cam', 'flip']) safe(() => { $(id).disabled = true; }, `dead.${id}`);
+    tel?.log('preview-blocked', { name: e?.name ?? 'unknown' });
   });
+}
+bootPreview();
+// The self-healing half: when the user flips the browser's permission toggle,
+// the mirror appears by itself. Chrome fires onchange on both grant and deny;
+// re-boot only on grant, and only while not joined.
+safeAsync(async () => {
+  for (const name of ['camera', 'microphone']) {
+    const st = await navigator.permissions.query({ name });
+    st.onchange = () => {
+      if (st.state === 'granted' && !joined && !previewStream) {
+        $('joinStatus').textContent = '';
+        bootPreview();
+      }
+    };
+  }
+}, 'perm.watch');
 
 $('hpCheck').onclick = () => safeAsync(headphoneCheck, 'hp.click');
 
@@ -4710,8 +5208,15 @@ safe(() => {
 
 // Deep link: /?r=<id> — the whole join flow for the second person. Named rooms
 // from before the mint (?r=morning) still resolve; nothing about old links breaks.
+let resumePending = false; // set at boot, consumed once the camera is ready
 safe(() => {
-  const r = new URLSearchParams(location.search).get('r');
+  const pathRoom = location.pathname.match(/^\/([a-z]{3}-[a-z]{4}-[a-z]{3})$/)?.[1];
+  const urlRoom = pathRoom ?? new URLSearchParams(location.search).get('r');
+  // Mid-call refresh / closed window: the live record walks back in without a
+  // press. An explicit new invite in the URL outranks it (resumeRoom decides).
+  const back = resumeRoom(urlRoom);
+  if (back) { resumePending = true; tel?.log('resume', { room: back, viaUrl: back === urlRoom ? 1 : 0 }); }
+  const r = urlRoom ?? back;
   if (r) {
     $('room').value = r;
     // Arriving by link means the room is already decided. Leaving its raw
@@ -4723,13 +5228,9 @@ safe(() => {
   paintJoinLabel();
 }, 'deeplink');
 
-// If a previous session's mirror is still around, say so — that's recoverable data.
-safe(() => {
-  const m = recoverMirror();
-  if (m?.events?.length) {
-    $('joinStatus').textContent = `${m.events.length} events from a previous call are still saved locally.`;
-  }
-}, 'mirror');
+// The telemetry localStorage mirror and the life-size calibration are gone
+// (2026-08-04, user directive) — clear what earlier builds left on devices.
+safe(() => { localStorage.removeItem('tape.log.mirror'); localStorage.removeItem('tape.cal'); }, 'legacy.clear');
 
 window.__tape = {
   get pc() { return pc; },
@@ -4743,6 +5244,9 @@ window.__tape = {
   adopt: (nv) => adoptVideoTrack(nv),
   get tel() { return tel; },
   get turns() { return turns; },
+  // Task #50 test hook: the recovery harness kills this socket to simulate the
+  // network dying under a live call. Read-only access; the app owns lifecycle.
+  get ws() { return ws; },
   get stats() { return lastStats; },
   // The custom video lane's own counters. getStats() cannot see this path at all —
   // it is datachannel bytes as far as WebRTC is concerned — so this is the only
@@ -4786,6 +5290,13 @@ window.__tape = {
     // pc), so index 0 is a hole and .length overcounts the stripes by one.
     return { code: safetyCode, sharedCert: !!sharedCert, stripes: pcmPcs.filter(Boolean).length };
   },
+  // The reset/recovery state machine's inputs, readable from a live page. Added
+  // while diagnosing the second-reset failure (2026-08-05): every one of these
+  // has now been the hidden variable in at least one wrong theory, and none of
+  // them was observable without a rebuild.
+  get callFlags() {
+    return { hadPeer, joined, resettingInPlace, leavingDeliberately, activeRoom };
+  },
   get pcmMode() {
     return {
       wanted: PCM_AUDIO, running: !!pcm, fellBack: pcmFellBack,
@@ -4812,8 +5323,7 @@ window.__tape = {
       pinnedForMs: Math.max(0, Math.round(barPinnedUntil - performance.now())),
       sheetOpen: $('moreSheet').classList.contains('on'),
       leaveArmed,
-      selfPinned: view.selfview,
-      selfPeek,
+
     };
   },
   // Task #37: the weak-device ladder's decision (tier, why, ceiling) and the
@@ -4852,11 +5362,10 @@ window.__tape = {
       accepted: p ? { degradationPreference: p.degradationPreference ?? null, maxFramerate: p.encodings?.[0]?.maxFramerate ?? null, scaleResolutionDownBy: p.encodings?.[0]?.scaleResolutionDownBy ?? null, maxBitrate: p.encodings?.[0]?.maxBitrate ?? null } : null,
     };
   },
-  // camLocked flips back to false when verifyCamlock undoes a lock that darkened
-  // the picture — the only way to tell "never locked" from "locked and reverted".
-  get camlock() { return { locked: camLocked, verify: LOCK_VERIFY, darkFrac: LOCK_DARK_FRAC, blindTicks: lumaBlindTicks }; },
+  // camLocked = WB/focus lock applied. exposureLocked is a constant false and
+  // exists as a tripwire: exposure is never locked (root fix 2026-08-04).
+  get camlock() { return { locked: camLocked, exposureLocked: false, blindTicks: lumaBlindTicks }; },
   get luma() { return lumaWin.length ? { y: +lumaWin[lumaWin.length - 1].y.toFixed(1), n: lumaWin.length } : null; },
-  cal,
   view,
   layout,
   paintHud,
@@ -4867,3 +5376,61 @@ window.__tape = {
   // must hang off the app's gesture-created, guaranteed-running context.
   get audioCtx() { return audioContext(); },
 };
+
+// ── Call-health beacon (task #49) ─────────────────────────────────────────────
+// The one number the lab cannot produce: how often REAL calls connect, how
+// fast, how long they run, how much audio got concealed. At most two tiny
+// same-origin POSTs per call. Everything sent is listed right here — engine
+// family (not the UA string), coarse network type, and the call's outcome
+// numbers. Never a room code, never an identifier of any kind; the server
+// stores nothing about who sent it and rejects any field not on its allowlist.
+//
+// The lab must not pollute the field: automation (navigator.webdriver) and any
+// flagged URL (every harness run carries query params; real users carry none —
+// their room ids live in the PATH) are silent. `?hb=1` forces the beacon on so
+// the pipe itself stays testable end to end.
+safe(() => {
+  const hbQs = new URLSearchParams(location.search);
+  const forced = hbQs.get('hb') === '1';
+  if (!forced && (navigator.webdriver || [...hbQs.keys()].some((k) => k !== 'r'))) return;
+  const ua = navigator.userAgent;
+  const engine = /Firefox\//.test(ua) ? 'gecko'
+    : (/Chrome\/|Chromium\/|CriOS\//.test(ua) ? 'chromium'
+      : (/Safari\//.test(ua) ? 'webkit' : 'other'));
+  const beat = (o) => {
+    const body = JSON.stringify({ v: 1, engine, net: navigator.connection?.effectiveType ?? null, ...o });
+    try {
+      if (!navigator.sendBeacon('/api/health', new Blob([body], { type: 'application/json' }))) {
+        fetch('/api/health', { method: 'POST', body, keepalive: true }).catch(() => {});
+      }
+    } catch { /* a beacon must never break the call */ }
+  };
+  let joinAt = 0, connectedAt = 0, hbDone = false;
+  // Capture-phase listener: observes the same click the join handler consumes,
+  // without touching that handler.
+  $('join').addEventListener('click', () => { joinAt ||= performance.now(); }, true);
+  window.__hbConnect = () => {
+    if (connectedAt) return;
+    connectedAt = performance.now();
+    beat({ evt: 'connect', ttcMs: joinAt ? Math.round(connectedAt - joinAt) : null });
+  };
+  window.__hbEnd = (reason) => {
+    if (hbDone) return;
+    hbDone = true;
+    if (!connectedAt) {
+      // Joined but the other side never appeared, or it never connected: only
+      // a real attempt counts as a failure — an idle lobby close is not one.
+      if (joinAt) beat({ evt: 'fail', reason, waitMs: Math.round(performance.now() - joinAt) });
+      return;
+    }
+    const p = window.__tape?.pcm;
+    const played = p?.playedFrames, lost = p?.lostFrames;
+    beat({
+      evt: 'end', reason,
+      durS: Math.round((performance.now() - connectedAt) / 1000),
+      concealPct: played > 0 && lost != null ? +((100 * lost) / played).toFixed(2) : null,
+      tape: window.__tape?.tapeMode?.running ? 1 : 0,
+    });
+  };
+  addEventListener('pagehide', () => window.__hbEnd?.('pagehide'));
+}, 'health.beacon');

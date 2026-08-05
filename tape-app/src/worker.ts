@@ -24,8 +24,15 @@
 interface Env {
   ASSETS: Fetcher;
   ROOM: DurableObjectNamespace;
+  HEALTH: DurableObjectNamespace;
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
+  // Interpreter (TRANSLATE-SPEC.md). Key lives here so the browser never sees
+  // it; absent key means /xlate answers 503 and the client shows nothing.
+  ELEVENLABS_API_KEY?: string;
+  // MT backend. Absent → passthrough (captions/TTS in the source language),
+  // which keeps the whole pipeline measurable before the key exists.
+  ANTHROPIC_API_KEY?: string;
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -85,8 +92,11 @@ export class Room implements DurableObject {
   // it, exactly like session_epoch_us.
   private logToken = '';
   private postTimes: number[] = [];
+  // Interpreter sessions, keyed by signaling role. Parallel to `peers` like the
+  // cap maps: the translation socket is a sibling of the call, never a part of it.
+  private xl = new Map<string, { sock: WebSocket; lang: string; up: WebSocket | null; ttsBusy: Promise<void>; seg: number }>();
 
-  constructor(private state: DurableObjectState, _env: unknown) {
+  constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
     this.state.blockConcurrencyWhile(async () => {
       const e = await this.state.storage.get<number>('session_epoch_us');
@@ -116,6 +126,7 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/log') && request.method === 'POST') return this.ingest(request);
     if (url.pathname.endsWith('/log') && request.method === 'GET') return this.dump(url);
     if (url.pathname.endsWith('/summary')) return this.summary(url);
+    if (url.pathname.endsWith('/xlate')) return this.xlate(request);
     return this.signal(request);
   }
 
@@ -350,6 +361,179 @@ export class Room implements DurableObject {
 
     return new Response(null, { status: 101, webSocket: client });
   }
+
+  // ── Interpreter (TRANSLATE-SPEC.md) ───────────────────────────────────────
+  // One WS per speaking side: browser streams 16 kHz s16le mic audio up; we run
+  // Scribe v2 Realtime → MT → Flash v2.5 TTS and deliver captions (JSON) and
+  // translated 48 kHz s16le audio (binary) to the PEER's socket. Law 0: nothing
+  // here touches signaling or Lane A — if this socket dies the call is unchanged.
+  //
+  // No transcript is STORED anywhere (the header's no-content rule): text lives
+  // only in flight between the vendors and the two occupants of the call.
+  private async xlate(request: Request): Promise<Response> {
+    if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expected websocket' }, 426);
+    const key = this.env.ELEVENLABS_API_KEY;
+    if (!key) return json({ error: 'translation not configured' }, 503);
+    const q = new URL(request.url).searchParams;
+    const role = q.get('role') === 'b' ? 'b' : 'a';
+    const lang = (q.get('lang') || 'en').slice(0, 8);
+
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+    try { this.xl.get(role)?.sock.close(); this.xl.get(role)?.up?.close(); } catch { /* replaced */ }
+    const st = { sock: server, lang, up: null as WebSocket | null, ttsBusy: Promise.resolve(), seg: 0 };
+    this.xl.set(role, st);
+    const peer = () => this.xl.get(role === 'a' ? 'b' : 'a') ?? null;
+    const say = (s: WebSocket | undefined | null, m: unknown) => { try { s?.send(JSON.stringify(m)); } catch { /* dead */ } };
+
+    // Upstream Scribe. Workers outbound WS = fetch with an Upgrade header.
+    try {
+      const r = await fetch(
+        `https://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&language_code=${encodeURIComponent(lang)}`,
+        { headers: { Upgrade: 'websocket', 'xi-api-key': key } },
+      );
+      st.up = r.webSocket ?? null;
+      if (!st.up) throw new Error(`scribe upgrade ${r.status}`);
+      st.up.accept();
+    } catch (e) {
+      say(server, { type: 'xl-err', where: 'scribe-connect', e: String(e) });
+      server.close(1011, 'stt unavailable');
+      this.xl.delete(role);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    let lastCommitAt = 0; // Date.now() at the commit we sent — msStt anchor
+    st.up.addEventListener('message', (e: MessageEvent) => {
+      let m: Record<string, unknown>;
+      try { m = JSON.parse(e.data as string); } catch { return; }
+      const mt = String(m.message_type ?? '');
+      if (mt === 'partial_transcript' && m.text) {
+        // Live source-language caption on the far side while the phrase is
+        // still being spoken — the "they're saying something" feedback.
+        say(peer()?.sock, { type: 'cap', fin: 0, lang, txt: String(m.text) });
+      } else if ((mt === 'committed_transcript') && String(m.text ?? '').trim()) {
+        const msStt = lastCommitAt ? Date.now() - lastCommitAt : null;
+        void this.deliver(role, String(m.text), msStt);
+      } else if (mt === 'session_started') {
+        say(server, { type: 'xl-ready', lang });
+      } else if (/error|invalid/.test(mt)) {
+        say(server, { type: 'xl-err', where: 'scribe', e: JSON.stringify(m).slice(0, 300) });
+      }
+    });
+    st.up.addEventListener('close', () => say(server, { type: 'xl-err', where: 'scribe-closed' }));
+
+    // 64 KiB-safe base64 for audio chunks (browser sends 100 ms = 3,200 B).
+    const b64 = (u8: Uint8Array) => {
+      let s = '';
+      for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode(...u8.subarray(i, i + 8192));
+      return btoa(s);
+    };
+    server.addEventListener('message', (e: MessageEvent) => {
+      if (typeof e.data === 'string') {
+        // Client's onset detector says the floor went quiet: force a commit so
+        // T_tail doesn't wait on the vendor's VAD (the spec's real latency lever).
+        let m: Record<string, unknown>; try { m = JSON.parse(e.data); } catch { return; }
+        if (m.type === 'flush' && st.up) {
+          lastCommitAt = Date.now();
+          st.up.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: b64(new Uint8Array(3200)), commit: true, sample_rate: 16000 }));
+        }
+        return;
+      }
+      if (st.up) {
+        st.up.send(JSON.stringify({
+          message_type: 'input_audio_chunk',
+          audio_base_64: b64(new Uint8Array(e.data as ArrayBuffer)),
+          commit: false,
+          sample_rate: 16000,
+        }));
+      }
+    });
+
+    const teardown = () => {
+      try { st.up?.close(); } catch { /* gone */ }
+      if (this.xl.get(role) === st) this.xl.delete(role);
+    };
+    server.addEventListener('close', teardown);
+    server.addEventListener('error', teardown);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // committed source text → translate → caption both sides → speak to the peer.
+  private async deliver(role: string, srcTxt: string, msStt: number | null): Promise<void> {
+    const me = this.xl.get(role);
+    const peer = this.xl.get(role === 'a' ? 'b' : 'a');
+    if (!me) return;
+    const say = (s: WebSocket | undefined, m: unknown) => { try { s?.send(JSON.stringify(m)); } catch { /* dead */ } };
+    const dst = peer?.lang ?? me.lang;
+    const t0 = Date.now();
+    let out = srcTxt;
+    let mtMode = 'same';
+    if (dst !== me.lang) {
+      try { [out, mtMode] = await this.translate(srcTxt, me.lang, dst); }
+      catch (e) { say(me.sock, { type: 'xl-err', where: 'mt', e: String(e) }); }
+    }
+    const msMt = Date.now() - t0;
+    const seg = me.seg++;
+    say(me.sock, { type: 'cap', fin: 1, who: 'me', seg, lang: me.lang, txt: srcTxt, tr: out });
+    say(peer?.sock, { type: 'cap', fin: 1, who: 'peer', seg, lang: dst, txt: out, src: srcTxt, msStt, msMt, mtMode });
+    if (!peer || dst === me.lang) return;
+    // Serialize TTS per speaker so segments never interleave in the peer's ear.
+    me.ttsBusy = me.ttsBusy.then(() => this.speak(me, peer, out, seg, msStt, msMt)).catch(() => { /* reported inside */ });
+  }
+
+  private async translate(text: string, src: string, dst: string): Promise<[string, string]> {
+    const k = this.env.ANTHROPIC_API_KEY;
+    if (!k) return [text, 'passthrough']; // measurable pipeline, no MT key yet
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': k, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 500,
+        system: `You are a simultaneous interpreter on a live call. Translate the utterance from ${src} to ${dst}. Preserve tone and register. Output ONLY the translation — no quotes, no notes.`,
+        messages: [{ role: 'user', content: text }],
+      }),
+    });
+    if (!r.ok) throw new Error(`mt ${r.status}`);
+    const j = (await r.json()) as { content?: Array<{ text?: string }> };
+    const out = j.content?.[0]?.text?.trim();
+    if (!out) throw new Error('mt empty');
+    return [out, 'claude'];
+  }
+
+  // Flash v2.5 HTTP stream (measured p50 176 ms to first byte from a cold
+  // request — beat the WS arm in the 2026-08-05 probe). 48 kHz s16le chunks are
+  // forwarded to the peer as they arrive; the client worklet does the pacing.
+  private async speak(
+    me: { lang: string; sock: WebSocket }, peer: { lang: string; sock: WebSocket },
+    text: string, seg: number, msStt: number | null, msMt: number,
+  ): Promise<void> {
+    const say = (s: WebSocket, m: unknown) => { try { s.send(JSON.stringify(m)); } catch { /* dead */ } };
+    const VOICE = '21m00Tcm4TlvDq8ikWAM'; // stock P1 voice; per-speaker clone is P2
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE}/stream?output_format=pcm_48000`, {
+        method: 'POST',
+        headers: { 'xi-api-key': this.env.ELEVENLABS_API_KEY as string, 'content-type': 'application/json' },
+        body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5', voice_settings: { stability: 0.5, similarity_boost: 0.8 } }),
+      });
+      if (!r.ok || !r.body) throw new Error(`tts ${r.status}`);
+      let first = true, bytes = 0;
+      const reader = r.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (first) { say(peer.sock, { type: 'tts', seg, state: 'start', msStt, msMt, msTts: Date.now() - t0 }); first = false; }
+        bytes += value.byteLength;
+        try { peer.sock.send(value); } catch { await reader.cancel(); return; }
+      }
+      say(peer.sock, { type: 'tts', seg, state: 'end', bytes, ms: Date.now() - t0 });
+    } catch (e) {
+      say(me.sock, { type: 'xl-err', where: 'tts', e: String(e) });
+      say(peer.sock, { type: 'tts', seg, state: 'fail' }); // captions remain — degrade, never stall
+    }
+  }
 }
 
 const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -380,6 +564,122 @@ const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ICE_MINT_WINDOW_MS = 10 * 60_000;
 const ICE_MINT_MAX = 20;
 const iceMints = new Map<string, number[]>();
+
+// ── Call-health beacon (task #49) ─────────────────────────────────────────────
+// One singleton DO accumulating anonymous per-call outcomes: did it connect,
+// how fast, how long it ran, how much audio was concealed. The point is the
+// number we have never had — the real-world connect success rate.
+//
+// What is deliberately NOT here: room codes, IPs, user agents, timestamps finer
+// than the server's insert time, or anything about WHO called. `cf-connecting-ip`
+// is used at the edge for rate capping and never forwarded to the DO. Ingest is
+// strict-allowlist like the room log: a beat with any unrecognised field, value
+// type, or enum member is dropped whole, so a careless client edit cannot start
+// leaking richer data through this pipe.
+const HB_WINDOW_MS = 60 * 60_000;
+const HB_MAX_PER_HOUR = 30; // a legit client sends ≤2 per call
+const hbPosts = new Map<string, number[]>();
+const HB_MAX_BODY = 2048;
+const HB_MAX_ROWS = 50_000;
+const HB_EVT = new Set(['connect', 'end', 'fail']);
+const HB_ENGINE = new Set(['chromium', 'webkit', 'gecko', 'other']);
+const HB_NET = new Set(['slow-2g', '2g', '3g', '4g']);
+const HB_REASON = new Set(['leave', 'pagehide', 'error', 'recover']);
+// field → validator; a beat may carry only fields its evt allows (see below)
+const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
+  v: (v) => v === 1,
+  evt: (v) => typeof v === 'string' && HB_EVT.has(v),
+  engine: (v) => typeof v === 'string' && HB_ENGINE.has(v),
+  net: (v) => v === null || (typeof v === 'string' && HB_NET.has(v)),
+  ttcMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 600_000),
+  waitMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 600_000),
+  durS: (v) => typeof v === 'number' && v >= 0 && v < 86_400,
+  concealPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
+  tape: (v) => v === 0 || v === 1,
+  reason: (v) => typeof v === 'string' && HB_REASON.has(v),
+};
+const HB_ALLOWED: Record<string, Set<string>> = {
+  connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs']),
+  end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason']),
+  fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
+};
+
+export class Health implements DurableObject {
+  private sql: SqlStorage;
+  constructor(private state: DurableObjectState, _env: unknown) {
+    this.sql = state.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS beats (
+        id INTEGER PRIMARY KEY,
+        wall REAL NOT NULL,
+        evt TEXT NOT NULL,
+        engine TEXT,
+        net TEXT,
+        ttc_ms REAL,
+        wait_ms REAL,
+        dur_s REAL,
+        conceal_pct REAL,
+        tape INTEGER,
+        reason TEXT
+      );
+    `);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === '/ingest' && request.method === 'POST') {
+      let beat: Record<string, unknown>;
+      try { beat = (await request.json()) as Record<string, unknown>; } catch { return json({ error: 'bad json' }, 400); }
+      if (beat === null || typeof beat !== 'object' || Array.isArray(beat)) return json({ error: 'bad shape' }, 400);
+      const evt = beat.evt;
+      if (typeof evt !== 'string' || !HB_ALLOWED[evt]) return json({ error: 'bad evt' }, 400);
+      const allowed = HB_ALLOWED[evt];
+      for (const [k, v] of Object.entries(beat)) {
+        if (!allowed.has(k) || !HB_FIELDS[k]?.(v)) return json({ error: 'rejected', field: k }, 400);
+      }
+      this.sql.exec(
+        `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        Date.now(), evt, beat.engine ?? null, beat.net ?? null,
+        beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
+        beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
+      );
+      this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
+      return json({ ok: true });
+    }
+    if (url.pathname === '/summary' && request.method === 'GET') {
+      const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days')) || 7));
+      const since = Date.now() - days * 86_400_000;
+      const rows = this.sql.exec(
+        `SELECT evt, engine, net, ttc_ms, dur_s, conceal_pct, reason FROM beats WHERE wall >= ? ORDER BY id DESC LIMIT 20000`,
+        since,
+      ).toArray() as Array<Record<string, unknown>>;
+      const by = (f: (r: Record<string, unknown>) => unknown) => {
+        const m: Record<string, number> = {};
+        for (const r of rows) { const k = String(f(r) ?? '-'); m[k] = (m[k] ?? 0) + 1; }
+        return m;
+      };
+      const nums = (evt: string, field: string) =>
+        rows.filter((r) => r.evt === evt && typeof r[field] === 'number').map((r) => r[field] as number).sort((a, b) => a - b);
+      const pct = (a: number[], p: number) => (a.length ? +a[Math.min(a.length - 1, Math.floor((p / 100) * a.length))].toFixed(1) : null);
+      const stats = (a: number[]) => ({ n: a.length, p50: pct(a, 50), p90: pct(a, 90), max: a.length ? +a[a.length - 1].toFixed(1) : null });
+      const connects = rows.filter((r) => r.evt === 'connect').length;
+      const fails = rows.filter((r) => r.evt === 'fail').length;
+      return json({
+        days, beats: rows.length,
+        byEvt: by((r) => r.evt), byEngine: by((r) => r.engine), byNet: by((r) => r.net),
+        connectRatePct: connects + fails ? +((100 * connects) / (connects + fails)).toFixed(1) : null,
+        ttcMs: stats(nums('connect', 'ttc_ms')),
+        durS: stats(nums('end', 'dur_s')),
+        concealPct: stats(nums('end', 'conceal_pct')),
+        failReasons: rows.filter((r) => r.evt === 'fail').reduce((m: Record<string, number>, r) => {
+          const k = String(r.reason ?? '-'); m[k] = (m[k] ?? 0) + 1; return m;
+        }, {}),
+      });
+    }
+    return json({ error: 'not found' }, 404);
+  }
+}
 
 // ── Security headers for the served app ───────────────────────────────────────
 // Scripts are all same-origin files (module graph from /app.js, worklets, and
@@ -470,6 +770,28 @@ export default {
       }
     }
 
+    // Call-health beacon. POST is the client's beat; GET /summary is aggregate
+    // numbers only (no per-call rows are ever served). The per-IP cap bounds a
+    // hostile flooder; the DO's allowlist bounds a careless client.
+    if (url.pathname === '/api/health' && request.method === 'POST') {
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      const now = Date.now();
+      const hits = (hbPosts.get(ip) ?? []).filter((t) => now - t < HB_WINDOW_MS);
+      if (hits.length >= HB_MAX_PER_HOUR) { hbPosts.set(ip, hits); return json({ error: 'rate' }, 429); }
+      hits.push(now);
+      hbPosts.set(ip, hits);
+      const body = await request.text();
+      if (body.length > HB_MAX_BODY) return json({ error: 'too big' }, 413);
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request('https://do/ingest', { method: 'POST', body }),
+      );
+    }
+    if (url.pathname === '/api/health/summary' && request.method === 'GET') {
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request(`https://do/summary${url.search}`),
+      );
+    }
+
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary
     const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary)$/);
     if (m) {
@@ -481,7 +803,17 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404);
-    const asset = await env.ASSETS.fetch(request);
+    // Short invite links: room.tokkah.com/etm-bkmb-iev (Meet-shaped, minted by
+    // the client). The path IS the room; the asset behind it is the app shell.
+    // Tightly scoped to the minted format so real assets (/app.js, /embed.js)
+    // can never be shadowed by a room name.
+    let assetReq = request;
+    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(url.pathname)) {
+      const rewritten = new URL(url);
+      rewritten.pathname = '/';
+      assetReq = new Request(rewritten.toString(), request);
+    }
+    const asset = await env.ASSETS.fetch(assetReq);
     // Hardening headers on everything; CSP on the HTML (previously none — the
     // only headers were COOP/COEP, and only under ?pcmaudio=1). The response is
     // now always re-wrapped, so the old "flag-off is byte-identical" invariant

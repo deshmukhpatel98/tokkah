@@ -200,6 +200,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     fecSymMismatch: 0,
     // Jitter estimator internals; see the decayTimer.
     jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
+    capSabOverruns: 0,
     jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
     // WHEN the run-max spread happened, and the same max ignoring the first
     // JIT_WARM ms. OBSERVABILITY ONLY — the control law does not read these.
@@ -230,6 +231,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // returns early and does NOT refresh lastPain, so the two diverge exactly
     // when the target is pinned at max). decays counts the giving-back.
     painEvents: 0, bumps: 0, decays: 0,
+    // Latency governor (task #47). govTrim/govFloor are the last tick's values;
+    // govTrimTicks is lever authority (how often the trim actually bound).
+    govTrim: 0, govFloor: null, govPops: 0, govTrimTicks: 0, govTrimMaxRun: 0,
     // Lane 0 (§3.1 levers 3+4) — all zero with cfg.lane0 off.
     predSent: 0, predRecv: 0, predDup: 0,
     padBytesSent: 0, padMsgsSent: 0, padBytesRecv: 0, padMsgsRecv: 0,
@@ -341,6 +345,40 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     pub[1] = -1; // playhead frame seq (-1 = playout not started)
   }
   const mode = sab ? 'sab' : 'port';
+  // ── Capture ring (task #37) ────────────────────────────────────────────
+  // WebKit hands worklet port messages to the main thread on the rendering
+  // tick (~16.7 ms, stalling to ~60 ms under load) — measured as the entire
+  // WebKit-peer buffer cost: departure cadence == capture-delivery cadence,
+  // wire adds nothing. So capture mirrors playout: frames go into shared
+  // memory on the audio thread and the main thread PULLS on its own timer
+  // chain (a 0 ms setTimeout chain clamps to ~4 ms — half a frame) instead of
+  // waiting to be scheduled. ?pcmcap=0 keeps the old push path as the control.
+  const CAP_RING_F = 32;
+  const capSab = (sabOk && cfg.pcmCapSab !== false)
+    ? new SharedArrayBuffer(320 + CAP_RING_F * FRAME_BYTES) : null;
+  const capHi = capSab ? new Int32Array(capSab, 0, 1) : null;
+  const capTsRing = capSab ? new Float64Array(capSab, 64, CAP_RING_F) : null;
+  const capRingU8 = capSab ? new Uint8Array(capSab, 320, CAP_RING_F * FRAME_BYTES) : null;
+  let capRd = 0;
+  let capPumpT = null;
+  function drainCap() {
+    if (!capRingU8 || closed) return;
+    let hi = Atomics.load(capHi, 0);
+    if (hi - capRd > CAP_RING_F) {
+      // Main thread stalled past the whole ring: those frames are gone. Land
+      // on the oldest survivor and say so — a silent skip here would read as
+      // wire loss and send FEC chasing a local scheduling problem.
+      stats.capSabOverruns += hi - CAP_RING_F - capRd;
+      capRd = hi - CAP_RING_F;
+    }
+    while (capRd < hi) {
+      const slot = capRd % CAP_RING_F;
+      const buf = capRingU8.slice(slot * FRAME_BYTES, (slot + 1) * FRAME_BYTES).buffer;
+      onCaptureFrame(capRd, buf, capTsRing[slot]);
+      capRd++;
+      if (capRd === hi) hi = Atomics.load(capHi, 0); // frames landed while draining
+    }
+  }
   let startSeq = -1;
   let hiSeq1 = 0;
   // The FIRST frame ever seen and when. `startSeq` moves when the pre-playout ring
@@ -499,6 +537,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     if (seq < lo) { stats.late++; bumpTarget('late'); return false; }
     if (seq >= lo + RING_F) { stats.farFuture++; return false; }
     if (Atomics.load(tags, seq % RING_F) === seq) { stats.dup++; return false; }
+    // Governor input (task #47): this frame's SLACK — how many frames ahead of
+    // the playhead it landed. Exact counterfactual, not a model: had the buffer
+    // been (lead − 1) frames shallower, this frame would still have played.
+    // FEC repairs pass through here too, deliberately — a repair that landed
+    // with 2 frames of slack is 2 frames of slack, and trimming past it would
+    // turn the repair inaudible-late. `play >= 0` because before the playhead
+    // exists there is no deadline to have slack against.
+    if (JIT_GOV && play >= 0) {
+      const lead = seq - play;
+      if (lead < govTickMin) govTickMin = lead;
+    }
     ring.set(samples, (seq % RING_F) * 384);
     capTs[seq % RING_F] = cap;
     // Release-publish: the tag store is seq_cst, so a reader that sees the tag
@@ -578,6 +627,30 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // decoder side below is unconditional. Stride is the code-rate knob: pinned
   // by `?pcmswstride=`, else driven off the same loss ladder as fecN, mapped
   // through overhead equivalence (n parity per K data ≈ stride K/n).
+  // ── Stage timing diagnostics (?pcmdiag=1, task #37) ────────────────────────
+  // The WebKit peer costs 9x the buffer and we have never known WHICH STAGE
+  // owns the spread: worklet capture emission, datachannel departure, or wire
+  // arrival. Three interval recorders, one per stage, kept as coarse
+  // percentile-ready reservoirs. Off by default: two Date.now()s per frame is
+  // cheap but this lane has a rule against unconditional instrumentation.
+  const DIAG = !!cfg.pcmDiag;
+  function intervalRec() {
+    let last = 0;
+    const N = 4096; const buf = new Float32Array(N); let n = 0, i = 0;
+    return {
+      hit(t) { if (last) { buf[i] = t - last; i = (i + 1) % N; if (n < N) n++; } last = t; },
+      stats() {
+        if (n < 32) return null;
+        const a = [...buf.slice(0, n)].sort((x, y) => x - y);
+        const q = (f) => +a[Math.min(n - 1, Math.floor(f * n))].toFixed(2);
+        return { n, p50: q(0.5), p90: q(0.9), p99: q(0.99), max: +a[n - 1].toFixed(2) };
+      },
+    };
+  }
+  const diagCap = DIAG ? intervalRec() : null;  // worklet frame handed to main thread
+  const diagSend = DIAG ? intervalRec() : null; // dc.send() actually called
+  const diagRecv = DIAG ? intervalRec() : null; // T_DATA arrival off the wire
+
   const SW = !!cfg.pcmSw;
   const SW_STRIDE_PIN = Number.isFinite(cfg.pcmSwStride) && cfg.pcmSwStride >= 0
     ? cfg.pcmSwStride : null;
@@ -809,6 +882,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
 
   function onCaptureFrame(seq, buf, capUs) {
     if (closed) return;
+    diagCap?.hit(performance.now());
     stats.captureFrames++;
     const a = pickDataAssoc(seq);
     if (a === undefined) return; // channel not up yet — silently skipped, as before
@@ -913,6 +987,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     }
     new Uint8Array(msg, hdr).set(ZIP ? zipOut.subarray(0, payLen) : new Uint8Array(buf));
     try { a.dc.send(msg); } catch { return; }
+    diagSend?.hit(performance.now());
     a.framesSent++;
     a.bytesSent += msg.byteLength;
     stats.framesSent++;
@@ -1347,6 +1422,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       return;
     }
     if (t === T_DATA || t === T_DATA_C || t === T_DATA_Z) {
+      diagRecv?.hit(performance.now());
       const zipped = t === T_DATA_Z;
       const compact = zipped || t === T_DATA_C;
       const hdr = compact ? HDR_DATA_C : HDR;
@@ -1530,6 +1606,34 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // 1.8-6x smaller, 8/8 paired calls at 5% loss (p=0.0346), and direction at 2.5 Mbps.
   const JIT_RELEASE = cfg.jitterRelease ?? 2;
   let spreadHold = 0;
+  // ── Latency governor (task #47, `?pcmgov=` ) ──────────────────────────────
+  // The estimator sizes the buffer from arrival SPREAD; the governor audits the
+  // OUTCOME. Every accepted frame reports its slack (ringWrite above); the
+  // rolling MINIMUM of that slack is depth the call has been carrying that
+  // provably prevented nothing — every frame would have played from a buffer
+  // that much shallower. Trim it, keep GOV_SAFETY_F frames in place, and hand
+  // the depth back as mouth-to-ear latency.
+  //
+  // The floor is a TRUE ROLLING MINIMUM over the last GOV_WIN_TICKS (20 s),
+  // not a held peak with a re-rise. Measured (2026-08-04, paired n=8 on real
+  // Brave at 70 ms recurring stalls): the re-rise variant let the trim climb
+  // back between stalls and bite just before the next one — +11 concealed
+  // frames per call, 7/8 runs worse. A rolling min cannot do that: any dip in
+  // the last 20 s IS the floor, so in a recurring-stall regime the governor
+  // stands down entirely, and only depth that stayed free through the worst
+  // recent dip is handed back. Pain (a late frame or a conceal) zeroes the
+  // current tick's entry outright — a frame that missed is a slack of zero
+  // however deep the buffer was.
+  //
+  // SAB path only: the port path's playhead is 1 Hz stale, and a governor fed
+  // a stale playhead would be a watchdog that cannot see.
+  const JIT_GOV = cfg.jitterGov === true && !!sab;
+  const GOV_SAFETY_F = 2; // frames of measured slack never trimmed (16 ms)
+  const GOV_WIN_TICKS = 80; // 20 s of 250 ms ticks the floor must survive
+  const govRing = new Float64Array(GOV_WIN_TICKS).fill(Infinity);
+  let govRingI = 0, govRingN = 0;
+  let govTickMin = Infinity; // min slack seen since the last estimator tick
+  let govPainSeen = 0; // late+conceal watermark; any advance zeroes this tick
   function noteArrival(seq) {
     if (!dT0) dT0 = now();
     // ── inter-arrival GAPS, which answer a different question from spread ──
@@ -1692,14 +1796,48 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     stats.jitMaxMs = +(s[dN - 1] - s[0]).toFixed(1);
     stats.jitWant = want;
     stats.jitN = dN;
+    // ── Governor: subtract the measured-free depth from `want` ──────────────
+    // `eff` is `want` minus the trim; on a clean shallow call the slack floor
+    // sits near the target itself so the trim is ~0 and nothing changes. Pain
+    // pops the floor to zero FIRST, so the same tick that saw a conceal already
+    // restores the untrimmed target ("UP immediately" applies to the pop too).
+    let eff = want;
+    if (JIT_GOV) {
+      const pain = stats.late + (wl.lateFrames ?? 0) + (wl.concealedFrames ?? 0);
+      let entry = govTickMin; // Infinity when nothing arrived this tick: no evidence, no entry
+      if (pain > govPainSeen) {
+        govPainSeen = pain;
+        entry = 0; // something missed — this tick's slack is zero by definition
+        stats.govPops++;
+      }
+      govTickMin = Infinity;
+      if (entry < Infinity) {
+        govRing[govRingI] = entry;
+        govRingI = (govRingI + 1) % GOV_WIN_TICKS;
+        if (govRingN < GOV_WIN_TICKS) govRingN++;
+      }
+      // Trim only once a FULL window of evidence exists: a young window's min
+      // is an optimist, and the cost of waiting 20 s is nothing against the
+      // cost of a trim that a longer memory would have refused.
+      if (govRingN === GOV_WIN_TICKS) {
+        let floor = Infinity;
+        for (let i = 0; i < GOV_WIN_TICKS; i++) if (govRing[i] < floor) floor = govRing[i];
+        const trim = Math.max(0, Math.floor(floor) - GOV_SAFETY_F);
+        eff = Math.max(cfg.targetFrames, want - trim);
+        stats.govTrim = want - eff; // the trim that ACTUALLY bound, not the ask
+        stats.govFloor = floor === Infinity ? null : +floor.toFixed(1);
+        if (stats.govTrim > 0) stats.govTrimTicks++;
+        if (stats.govTrim > stats.govTrimMaxRun) stats.govTrimMaxRun = stats.govTrim;
+      }
+    }
     // UP immediately: the evidence that more buffer is needed has already cost
     // someone a dropout, and hesitating costs another.
-    if (want > target) { setTarget(want); return; }
+    if (eff > target) { setTarget(eff); return; }
     // DOWN at one frame per second — 8 ms/s, four times the old rate but still
     // bounded. The bound is not about audibility (the worklet's drift clamp owns
     // that, and it can drain 100 ms in ~5 s) but about not chasing a p99 that
     // dips for one window and comes back.
-    if (want < target && now() - lastDrop > 1000) { setTarget(target - 1); lastDrop = now(); }
+    if (eff < target && now() - lastDrop > 1000) { setTarget(target - 1); lastDrop = now(); }
   }, 250);
 
   // ── Audio graph ───────────────────────────────────────────────────────────
@@ -1713,15 +1851,36 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         numberOfOutputs: 0,
         // §3.1 lever 4: run the turn-end predictor on the mic at zero latency
         // (Lane 0 only — with cfg.lane0 off the worklet never constructs it).
-        processorOptions: { turnend: !!cfg.lane0 },
+        processorOptions: { turnend: !!cfg.lane0, capSab: capSab ?? undefined },
       });
       capNode.port.onmessage = (e) => {
         const m = e.data;
-        if (m && m.buf) onCaptureFrame(m.seq, m.buf, m.capUs);
+        if (m === 1) drainCap(); // capture-ring drain hint
+        else if (m && m.buf) onCaptureFrame(m.seq, m.buf, m.capUs);
         else if (m && m.type === 'turnend') {
           try { onTurnEnd?.(m); } catch { /* predictor plumbing must never break the lane */ }
         }
       };
+      if (capSab) {
+        // The pump. Measured 2026-08-04: WebKit quantizes setTimeout to the
+        // same ~16.7 ms rendering tick as port delivery (a 0 ms chain drained
+        // at p90 16.4 ms), but it did cut the stall tail (send max 43 → 28 ms).
+        // ?pcmpump=mc tries the one scheduler left that is not the timer
+        // system: a MessageChannel self-ping loop, which runs at event-loop
+        // speed. It is a hot loop, so it is an experiment arm, not a default.
+        // Either way the port hint above still drains when the page is hidden
+        // and timers are throttled — the worst case degrades to exactly the
+        // old behaviour, never below it.
+        if (cfg.pcmPump === 'mc') {
+          const ch = new MessageChannel();
+          ch.port1.onmessage = () => { if (closed) return; drainCap(); ch.port2.postMessage(0); };
+          ch.port2.postMessage(0);
+          capPumpT = { close: () => { ch.port1.onmessage = null; ch.port1.close(); ch.port2.close(); } };
+        } else {
+          const pump = () => { if (closed) return; drainCap(); capPumpT = setTimeout(pump, 0); };
+          capPumpT = setTimeout(pump, 0);
+        }
+      }
       source = ctx.createMediaStreamSource(stream);
       source.connect(capNode); // no destination: the pull pattern proven by attachDetector
 
@@ -1836,7 +1995,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         ...stats,
         ageMs: undefined,
         ageP50: pct(stats.ageMs, 50), ageP95: pct(stats.ageMs, 95),
-        mode, fec: cfg.fec,
+        mode, capMode: capSab ? 'sab' : 'port', fec: cfg.fec,
+        // Stage cadence diagnostics (?pcmdiag=1, task #37): inter-event
+        // intervals at capture, departure and arrival — null when off.
+        diag: DIAG ? { cap: diagCap.stats(), send: diagSend.stats(), recv: diagRecv.stats() } : undefined,
         mbpsSent: elapsed > 1 ? +((stats.bytesSent * 8) / elapsed / 1e6).toFixed(2) : null,
         // The wire size of one data frame, reported rather than assumed. The
         // single-datagram budget is a byte count, so the one number that says
@@ -1909,6 +2071,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         jitSpreadMaxAtMs: stats.jitSpreadMaxAtMs, jitWarmMs: JIT_WARM,
         jitSpreadMaxLate: stats.jitSpreadMaxLate, jitSpreadMaxLateAtMs: stats.jitSpreadMaxLateAtMs,
         jitMaxTarget: cfg.maxTargetFrames,
+        // Latency governor (task #47). govOn distinguishes "off" from "on but
+        // never trimmed"; govTrimTicks is the authority check demanded by
+        // [[the-contradiction-was-a-dead-knob]] — an A/B where this reads 0 in
+        // the governed arm compared two identical control laws.
+        govOn: JIT_GOV ? 1 : 0, govTrim: stats.govTrim, govFloor: stats.govFloor,
+        govPops: stats.govPops, govTrimTicks: stats.govTrimTicks, govTrimMaxRun: stats.govTrimMaxRun,
         jitSpreadMs: stats.jitSpreadMs, jitP99Ms: stats.jitP99Ms, jitP90Ms: stats.jitP90Ms,
         jitMaxMs: stats.jitMaxMs, jitWant: stats.jitWant, jitN: stats.jitN,
         fecSymMismatch: stats.fecSymMismatch,
@@ -1954,6 +2122,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       clearInterval(lossTimer);
       clearInterval(decayTimer);
       clearInterval(padTimer);
+      if (capPumpT?.close) capPumpT.close(); else clearTimeout(capPumpT);
       try { source?.disconnect(); } catch { /* ignore */ }
       try { capNode?.disconnect(); } catch { /* ignore */ }
       try { playNode?.disconnect(); } catch { /* ignore */ }

@@ -34,17 +34,20 @@
   })();
 
   const randomRoom = () => {
-    // 96 bits, base36 — same unguessability class as the app's own room mint.
-    const b = new Uint8Array(12);
+    // Meet-shaped xxx-xxxx-xxx, same mint as the app's own — so embed-created
+    // rooms get the short path-form link too.
+    const b = new Uint8Array(10);
     crypto.getRandomValues(b);
-    return Array.from(b, (x) => x.toString(36)[0]).join('') +
-           Array.from(b.slice(0, 6), (x) => (x % 36).toString(36)).join('');
+    const c = Array.from(b, (x) => String.fromCharCode(97 + (x % 26))).join('');
+    return `${c.slice(0, 3)}-${c.slice(3, 7)}-${c.slice(7)}`;
   };
 
   const build = (opts = {}) => {
     const base = (opts.base || DEFAULT_BASE).replace(/\/+$/, '');
     const room = opts.room || randomRoom();
-    const url = `${base}/?r=${encodeURIComponent(room)}`;
+    const url = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(room)
+      ? `${base}/${room}`
+      : `${base}/?r=${encodeURIComponent(room)}`;
     const f = document.createElement('iframe');
     f.src = url;
     // The call needs the camera and mic INSIDE the frame; fullscreen and PiP

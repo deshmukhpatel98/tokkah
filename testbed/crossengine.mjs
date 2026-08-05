@@ -112,6 +112,7 @@ const stats = (p) => p.evaluate(() => {
       rxWastedShift: need(q, 'rxWastedShift'), rxFit32767: need(q, 'rxFit32767Pct'),
       spreadMaxRun: need(q, 'jitSpreadMaxRun'), holdMaxRun: need(q, 'jitHoldMaxRun'),
       outLatMs: need(q, 'outputLatencyMs'),
+      diag: q.diag ?? null, // stage cadence percentiles, only under ?pcmdiag=1
     };
   }
   return {
@@ -130,6 +131,12 @@ const fmt = (s) => {
     L.push(`    audio in   conceal ${q.conceal}%  played ${q.played} lost ${q.lost}  recv ${q.framesRecv}  late ${q.late} dup ${q.dup} fec ${q.fecRepaired}`);
     L.push(`    buffer     depthMs ${q.depthMs}  target ${q.target}f  drift ${q.driftPpm}ppm  outLat ${q.outLatMs}ms  spreadMax ${q.spreadMaxRun} holdMax ${q.holdMaxRun}`);
     L.push(`    audio out  ${q.bPerFrame} B/frame  ${q.mbpsSent} Mbps  |  peer chain rxWastedShift ${q.rxWastedShift} rxFit32767 ${q.rxFit32767}%`);
+    if (q.diag) {
+      const d = (r) => (r ? `p50 ${r.p50} p90 ${r.p90} p99 ${r.p99} max ${r.max} (n=${r.n})` : '(warming)');
+      L.push(`    diag cap   ${d(q.diag.cap)}`);
+      L.push(`    diag send  ${d(q.diag.send)}`);
+      L.push(`    diag recv  ${d(q.diag.recv)}`);
+    }
   } else L.push('    audio      PCM lane not running on this engine');
   return L.join('\n');
 };

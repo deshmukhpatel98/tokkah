@@ -58,6 +58,18 @@ const MAX_CONCEAL = 3;      // 24 ms of extrapolation, then HOLD — §10, invar
 const SAB_HI = 0, SAB_PLAY = 1, SAB_START = 2, SAB_TARGET = 3, SAB_LOCK = 4;
 const SAB_BYTES = 816 + RING * 4;
 
+// Capture SAB layout (task #37): WebKit delivers worklet port messages on the
+// RENDERING tick (~16.7 ms quantum, stalls to ~60 ms), so a frame posted here
+// could sit two rendering frames before dc.send() saw it — measured as the
+// whole of the WebKit peer's buffer cost. The ring lets the main thread PULL
+// at its own cadence instead of waiting to be handed the frame.
+//   0    Int32 ×1 : hi — frames written (seq of next frame), release-stored
+//   64   Float64 ×32 : capUs per slot
+//   320  Uint8 32×1152 : int24 frames, frame f at (f%32)*1152
+const CAP_RING_F = 32; // 256 ms — vastly more than the worst 60 ms stall seen
+const CAP_FRAME_B = FRAME * 3;
+const CAP_SAB_BYTES = 320 + CAP_RING_F * CAP_FRAME_B;
+
 class PcmCapture extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -75,6 +87,12 @@ class PcmCapture extends AudioWorkletProcessor {
     const o = options?.processorOptions ?? {};
     this.pred = o.turnend ? new TurnEndPredictor({ sampleRate }) : null;
     this.predT0 = -1; // ctx time (s) of the predictor's sample 0
+    // Pull mode: write frames into shared memory; the port carries only a
+    // payload-free drain hint (and turnend events). Absent capSab, the
+    // original transfer-per-frame path below is untouched.
+    this.cHi = o.capSab ? new Int32Array(o.capSab, 0, 1) : null;
+    this.cTs = o.capSab ? new Float64Array(o.capSab, 64, CAP_RING_F) : null;
+    this.cRing = o.capSab ? new Uint8Array(o.capSab, 320, CAP_RING_F * CAP_FRAME_B) : null;
   }
 
   process(inputs) {
@@ -107,8 +125,10 @@ class PcmCapture extends AudioWorkletProcessor {
       if (this.n === FRAME) {
         // int24 LE — the ADC's real ceiling; float32 → 24-bit discards nothing
         // physical (§4). Clamped, never scaled: quality is a constant.
-        const buf = new ArrayBuffer(FRAME * 3);
-        const u8 = new Uint8Array(buf);
+        const buf = this.cRing ? null : new ArrayBuffer(FRAME * 3);
+        const u8 = this.cRing
+          ? this.cRing.subarray((this.seq % CAP_RING_F) * CAP_FRAME_B, (this.seq % CAP_RING_F + 1) * CAP_FRAME_B)
+          : new Uint8Array(buf);
         for (let s = 0; s < FRAME; s++) {
           let x = this.acc[s];
           if (x > 1) x = 1;
@@ -128,7 +148,13 @@ class PcmCapture extends AudioWorkletProcessor {
         // This is the sender's audio-capture timestamp the A-V sync anchors
         // to; it rides the wire header to the far playout worklet.
         const capUs = (currentTime + (i - FRAME) / sampleRate) * 1e6;
-        this.port.postMessage({ seq: this.seq++, buf, capUs }, [buf]);
+        if (this.cRing) {
+          this.cTs[this.seq % CAP_RING_F] = capUs;
+          Atomics.store(this.cHi, 0, ++this.seq); // release: bytes+ts land first
+          this.port.postMessage(1); // drain hint only — late delivery is harmless
+        } else {
+          this.port.postMessage({ seq: this.seq++, buf, capUs }, [buf]);
+        }
         this.n = 0;
       }
     }

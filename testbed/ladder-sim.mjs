@@ -45,10 +45,10 @@ function slice(startMarker, endMarker, label) {
   if (b < 0) throw new Error(`ladder-sim: slice end missing for ${label}: ${JSON.stringify(endMarker)}`);
   return SRC.slice(a, b);
 }
-const S_HELPERS = slice('function safe(fn, label) {', '// ── Calibration (persisted, optional)', 'helpers');
+const S_HELPERS = slice('function safe(fn, label) {', '// ── One certificate for the whole call', 'helpers');
 const S_LADDER = slice('// ── Weak-device ladder (task #37)', '// ── What to ask Opus for', 'ladder');
-const S_RELOCK = slice('/** Re-assert the manual lock after any later constraint', '// ── Luma / exposure watchdog', 'relock');
-const S_PROBE = slice('// ── Source-frame probe, armed at JOIN (task #37)', '// ── Face geometry', 'srcprobe');
+const S_RELOCK = slice('/** Re-assert the WB/focus lock after any later constraint', '// ── Luma / exposure watchdog', 'relock');
+const S_PROBE = slice('// ── Source-frame probe, armed at JOIN (task #37)', '// ── Display refresh, told to the peer', 'srcprobe');
 
 // ── The generated module: prelude + real slices + export hooks ───────────────
 const MODULE = `
@@ -73,6 +73,7 @@ let localStream = ENV.localStream;
 let videoDegraded = null;
 let camLocked = ENV.camLocked;
 let lumaVideo = ENV.lumaVideo;
+let lumaBlindTicks = 0; // declared in the watchdog section, outside every slice
 
 ${S_HELPERS}
 ${S_LADDER}
@@ -597,10 +598,10 @@ scenario('no-manual-exposure-degrades-honestly', async () => {
   ok(s.cam.settings.exposureMode === 'continuous', 'AE left alone');
   const ladderErrs = evs(s.events, 'error').filter((e) => /^(lowlight|revive|devstep|srcprobe)/.test(e.where || ''));
   ok(ladderErrs.length === 0, `no exceptions escaped the ladder (${ladderErrs.length})`, JSON.stringify(ladderErrs[0] || {}));
-  // The camlock DOES throw here (it asks for manual exposure on a camera that
-  // has none) — pre-existing, guarded, logged. Assert it stayed contained.
+  // Root fix 2026-08-04: the lock asks only for manual WB/focus (which every
+  // modeled camera has) — exposure is never requested, so nothing can throw.
   const lockErrs = evs(s.events, 'error').filter((e) => (e.where || '').startsWith('camlock'));
-  ok(lockErrs.length > 0 && lockErrs.every((e) => e.name === 'OverconstrainedError'), 'camlock failure contained and logged, not thrown');
+  ok(lockErrs.length === 0, `camlock never asks for manual exposure, so it never fails (${lockErrs.length} errors)`);
   // And the fallback that matters: no manual exposure means the RESOLUTION
   // ladder is the only lever left, so it must be the one that acts.
   ok(evs(s.events, 'devstep').length >= 1, `fell back to the resolution ladder (${evs(s.events, 'devstep').length} steps)`);
@@ -642,15 +643,45 @@ scenario('honest-camera-below-30fps-is-not-starving', async () => {
   }
 });
 
+// 13 ─ The lamp-lit room (task #46): well exposed but shutter-bound. AE holds
+// luma at ~110 by stretching exposure to ~50 ms, which caps delivery at
+// 1000/(50+readout) fps — the old luma<20 gate could never see it (this was
+// dimRoomDiagnostic until 2026-08-04; promoted to a gate with the fix).
+scenario('dim-room-engages-on-slow-shutter', async () => {
+  const s = await build({ cam: { scene: 0.02 } }); // a lamp-lit room at night
+  await s.run(3000);
+  const before = s.trace[s.trace.length - 1];
+  ok(before.fps < 18, `starved before the fix (${before.fps} fps)`);
+  ok(s.cam.luma > 60, `image WELL exposed (luma ${s.cam.luma.toFixed(1)}) — invisible to the luma gate`);
+  ok(!s.H.lowlightOn, 'not engaged at the baseline sample');
+  await s.run(57000);
+  const end = s.trace[s.trace.length - 1];
+  ok(s.H.lowlightOn, 'low-light engaged via the shutter trigger');
+  const ll = evs(s.events, 'lowlight').find((e) => e.on === 1);
+  ok(ll?.why === 'shutter', `entry reason is shutter (got ${ll?.why})`);
+  ok(end.fps > 20, `fps recovered: ${before.fps} -> ${end.fps}`);
+  ok(s.cam.luma > 60, `picture stayed bright (luma ${s.cam.luma.toFixed(1)}): brightness-preserving ISO`);
+  ok(evs(s.events, 'lowlight').filter((e) => e.on === 1).length === 1, 'engaged once — no flapping');
+  ok(evs(s.events, 'devstep').length === 0, 'no resolution tier was spent on an exposure problem');
+  // Lights on: under the fixed short exposure the picture climbs toward
+  // clipping — the shutter entry's own exit signal — and AE gets the camera
+  // back. The dark-entry threshold (60) must NOT be the one in force here,
+  // or the mode would have flapped all along at luma 110.
+  s.cam.scene = 0.2;
+  await s.run(15000);
+  ok(!s.H.lowlightOn, 'released after the room got bright (sustained)');
+  ok(s.cam.settings.exposureMode === 'continuous', 'AE restored');
+});
+
 // ── Diagnostic (does NOT gate the suite) ─────────────────────────────────────
 // The user's report has three phases: "the video goes dark, not completely,
 // after a few seconds / opens up pretty good / but then sucks". Session 4
 // explained phase 3 (AE stretches exposure, fps starves) and the low-light
 // mode fixes it. Phases 1 and 2 were never explained. This runs the mechanism
-// that fits them: a real AE loop needs a second or two to converge, and the §5
-// camlock freezes exposure at 2.5 s — so a camera that opens dark and is still
-// climbing gets FROZEN mid-climb. It is a HYPOTHESIS reproduced in a model,
-// not a measurement; `phone-test.sh --arm=camlock` is what would settle it.
+// that fitted them under the OLD code: the §5 camlock used to freeze exposure
+// at 2.5 s, so a camera still climbing got FROZEN mid-climb. The root fix
+// (2026-08-04) removed the exposure lock entirely — this diagnostic replays
+// the historical lock by hand to document what the fix removed.
 async function camlockDiagnostic() {
   console.log('\n  camlock-freeze (diagnostic, not a gate)');
   const out = [];
@@ -678,35 +709,6 @@ async function camlockDiagnostic() {
   console.log(`    control (instant AE): luma ${instant.lumaEnd}, fps ${instant.fpsEnd}, low-light ${instant.lowlight}`);
 }
 
-// The run above surfaced something the dark-room work never covered: BOTH arms
-// sat at 14-16 fps in a merely dim room with a perfectly well-exposed picture.
-// That is the starvation the user calls "sucks", in the lighting a real call
-// actually happens in — and the low-light fix cannot reach it, because its
-// trigger asks whether the IMAGE IS DARK (luma < 20) when the mechanism is
-// whether the EXPOSURE IS LONG. A well-exposed 90-luma frame at a 50 ms
-// exposure is the same physics as a black one at 120 ms.
-async function dimRoomDiagnostic() {
-  console.log('\n  dim-room gap (diagnostic, not a gate)');
-  const s = await build({ cam: { scene: 0.02 } }); // dim: a lamp-lit room at night
-  await s.run(90000);
-  const end = s.trace[s.trace.length - 1];
-  const steps = evs(s.events, 'devstep');
-  console.log(`    luma ${s.cam.luma.toFixed(1)}/255 (well exposed), exposure ${(s.cam.expMs).toFixed(0)} ms, delivered ${end.fps} fps`);
-  console.log(`    low-light: ${s.H.lowlightOn ? 'engaged' : 'NEVER (luma gate: image is not dark)'}`);
-  console.log(`    resolution ladder: ${steps.length} step(s) -> ${s.H.devStepTier ?? 'strong'} (${s.cam.settings.width}x${s.cam.settings.height})`);
-  if (steps.length && end.fps < 20) {
-    console.log(
-      `    OBSERVED: the stepper spent ${steps.length} tier(s) of resolution and delivery is still ${end.fps} fps.\n` +
-        `      Resolution was never the lever here either — the ${s.cam.expMs.toFixed(0)} ms exposure sets a ${(1000 / s.cam.expMs).toFixed(0)} fps\n` +
-        `      ceiling that no frame size can lift. The exposure lever that WOULD fix it is gated off\n` +
-        `      by "is the image dark", so the app trades away pixels and gains nothing.\n` +
-        `      SUGGESTED (needs device confirmation): trigger on measured exposureTime, not luma.`,
-    );
-  } else {
-    console.log(`    not reproduced: fps ${end.fps}, steps ${steps.length}`);
-  }
-}
-
 // ── Run ──────────────────────────────────────────────────────────────────────
 console.log('ladder-sim — real app.js source, modelled Samsung M13, virtual clock\n');
 for (const sc of SCENARIOS) {
@@ -729,7 +731,7 @@ for (const sc of SCENARIOS) {
   }
   if (fail === before) console.log(`    ✓ ${sc.name}`);
 }
-if (!ONLY) { await camlockDiagnostic(); await dimRoomDiagnostic(); }
+if (!ONLY) { await camlockDiagnostic(); }
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) {
   console.log('\nfailures:');

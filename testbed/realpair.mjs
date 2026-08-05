@@ -50,7 +50,7 @@ const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
 const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
 
-const KNOWN = new Set(['peer', 'secs', 'port', 'peerport', 'base', 'query', 'json', 'probe', 'cold', 'cpu', 'queryA', 'queryB', 'cam']);
+const KNOWN = new Set(['peer', 'secs', 'port', 'peerport', 'base', 'query', 'json', 'probe', 'cold', 'cpu', 'queryA', 'queryB', 'cam', 'stall', 'stallms', 'stallevery', 'stallfrom']);
 for (const a of process.argv.slice(2)) {
   const m = /^--([a-zA-Z]+)(=|$)/.exec(a);
   if (!m || !KNOWN.has(m[1])) {
@@ -94,6 +94,18 @@ const PROBE_ON = arg('probe', '1') !== '0';
 // measured at 0.24%-4.38% concealment, which is larger than the effect being looked for.
 // Clearing one side makes the single call its own control — same host, same fixture, same
 // network, same 40 s — exactly as the release-rate n=8 did with a per-side parameter.
+// ── Stall stimulus (task #47) ────────────────────────────────────────────────
+// `--stall=both|a|b` blocks the chosen page's MAIN THREAD for --stallms every
+// --stallevery seconds starting at --stallfrom. This is the faithful stimulus
+// for the jitter/governor work (relpair.mjs precedent): nothing is dispatched,
+// then the backlog arrives in a clump — the shape a tab switch or notification
+// produces on a real machine. `both` fires the two sides in the same instant so
+// a per-side A/B sees ONE stimulus, not two.
+const STALL = arg('stall', '0');
+if (!['0', 'both', 'a', 'b'].includes(STALL)) { console.error('--stall must be 0|both|a|b'); process.exit(2); }
+const STALL_MS = Number(arg('stallms', 120));
+const STALL_EVERY = Number(arg('stallevery', 10));
+const STALL_FROM = Number(arg('stallfrom', 15));
 const COLD = arg('cold', '0');
 if (!['0', '1', 'a', 'b'].includes(COLD)) { console.error('--cold must be 0|1|a|b'); process.exit(2); }
 const coldFor = (key) => COLD === '1' || (COLD === 'a' && key === 'brave') || (COLD === 'b' && key === 'peer');
@@ -324,7 +336,8 @@ const snap = (p) => p.evaluate(() => ({
 
 const room = 'rp' + Math.random().toString(36).slice(2, 7);
 const report = {
-  meta: { room, peer: PEER, secs: SECS, base: BASE, query: QUERY, queryA: QUERY_A, queryB: QUERY_B, probe: PROBE_ON, cold: COLD, cpuThrottle: CPU, at: new Date().toISOString(),
+  meta: { room, peer: PEER, secs: SECS, base: BASE, query: QUERY, queryA: QUERY_A, queryB: QUERY_B, probe: PROBE_ON, cold: COLD, cpuThrottle: CPU,
+          stall: STALL, stallMs: STALL_MS, stallEvery: STALL_EVERY, stallFrom: STALL_FROM, at: new Date().toISOString(),
           host: `${os.cpus().length} cores, ${os.platform()} ${os.release()}` },
   sides: {}, series: { brave: [], peer: [] }, limits: [], console: { brave: [], peer: [] },
 };
@@ -525,8 +538,21 @@ try {
 
   const t0 = Date.now();
   let negBrave = 0, negPeer = 0, nBrave = 0, nPeer = 0;
+  // Stall stimulus scheduling. Fired from the harness (not a page timer) so the
+  // two sides' blocks are issued in the same instant, and recorded with their
+  // actual wall time so the series can be aligned to them.
+  let nextStallAt = STALL === '0' ? Infinity : STALL_FROM;
+  report.stalls = [];
+  const stallPages = STALL === 'both' ? [A.page, B.page] : STALL === 'a' ? [A.page] : STALL === 'b' ? [B.page] : [];
+  const mainBlock = (p) => p.evaluate((ms) => { const t = performance.now(); while (performance.now() - t < ms); }, STALL_MS);
   while (Date.now() - t0 < SECS * 1000) {
     const el = (Date.now() - t0) / 1000;
+    if (el >= nextStallAt) {
+      nextStallAt += STALL_EVERY;
+      report.stalls.push(+el.toFixed(2));
+      await Promise.all(stallPages.map(mainBlock));
+      continue;
+    }
     const [sa, sb] = await Promise.all([snap(A.page), snap(B.page)]);
     if (report.series.brave.length % 4 === 0) {
       const [la, lb] = await Promise.all([luma(A.page), luma(B.page)]);
@@ -538,6 +564,11 @@ try {
       const d = s.pcm.depthMs;
       report.series[e.key].push({ t: +el.toFixed(2), depth: d, lost: s.pcm.lostFrames ?? null,
         target: s.pcm.targetFrames ?? null, recv: s.pcm.framesRecv ?? null,
+        // Latency governor (task #47). Arm identity is read out of the PAGE
+        // (govOn), never inferred from which side carried which query.
+        late: s.pcm.lateFrames ?? null, want: s.pcm.jitWant ?? null,
+        govOn: s.pcm.govOn ?? null, govTrim: s.pcm.govTrim ?? null, govFloor: s.pcm.govFloor ?? null,
+        govPops: s.pcm.govPops ?? null, govTrimTicks: s.pcm.govTrimTicks ?? null,
         farFuture: s.pcm.farFuture ?? null, reseeds: s.pcm.ringReseeds ?? null,
         // THE VIDEO DELIVERY COLUMN. Cumulative counters, sampled: the rate is computed
         // from a DIFF over the last third of the call, because the pacer ramps at the

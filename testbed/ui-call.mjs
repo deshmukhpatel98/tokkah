@@ -171,14 +171,12 @@ for (const [i, r] of RATIOS.entries()) {
         transform: getComputedStyle(v).transform,
         intrinsic: [v.videoWidth, v.videoHeight],
         waitingUp: !document.querySelector('#waiting').classList.contains('gone'),
-        pipOn: document.querySelector('#selfWrap').classList.contains('on'),
         stats: eval(`(${scanSrc})`)(),
       };
     }, statsScan.toString());
     checkFull(wait, 'A waiting selfFull', { mirror: true });
     if (!wait.waitingUp) fail('A waiting: overlay not shown while alone');
     else ok('A waiting: overlay + share link shown');
-    if (wait.pipOn) fail('A waiting: corner PiP should not be up before the peer joins');
     commonAsserts(wait, 'A waiting');
     await a.screenshot({ path: `${SHOTS}/${r.name}-2-waiting.png` });
 
@@ -197,9 +195,6 @@ for (const [i, r] of RATIOS.entries()) {
         const v = document.querySelector('#remote');
         const media = c ?? v;
         const mr = media.getBoundingClientRect();
-        const pip = document.querySelector('#selfWrap');
-        const pr = pip.getBoundingClientRect();
-        const pv = document.querySelector('#self');
         return {
           wrap: { x: wrap.x, y: wrap.y, w: wrap.width, h: wrap.height },
           rect: { x: mr.x, y: mr.y, w: mr.width, h: mr.height },
@@ -225,9 +220,7 @@ for (const [i, r] of RATIOS.entries()) {
             };
           })(),
           floorHintUp: getComputedStyle(document.querySelector('#floorHint')).display !== 'none',
-          pip: pip.classList.contains('on')
-            ? { x: pr.x, y: pr.y, w: pr.width, h: pr.height, intrinsic: [pv.videoWidth, pv.videoHeight] }
-            : null,
+          pip: !!document.querySelector('#selfWrap'), // must be null — feature removed 2026-08-04
           stats: eval(`(${scanSrc})`)(),
         };
       }, statsScan.toString());
@@ -237,11 +230,10 @@ for (const [i, r] of RATIOS.entries()) {
       const wcovers = Math.abs(inc.wrap.x) < 1 && Math.abs(inc.wrap.y) < 1
         && Math.abs(inc.wrap.w - inc.win.w) < 1 && Math.abs(inc.wrap.h - inc.win.h) < 1;
       if (!wcovers) fail(`${name} in-call: remoteWrap not viewport-sized ${JSON.stringify(inc.wrap)}`);
-      // Task #38 §B.9 — the headline change. The mirror is the most strongly
-      // evidenced cause of videoconference fatigue, so it must NOT be up by
-      // default; the old assertion here demanded the opposite.
-      if (inc.pip) fail(`${name} in-call: self view is up by default (must be off — §B.9)`);
-      else ok(`${name} in-call: self view off by default`);
+      // §B.9 taken to its end state (2026-08-04, user directive): the in-call
+      // mirror is REMOVED, not merely off — the element must not exist at all.
+      if (inc.pip) fail(`${name} in-call: #selfWrap still in the DOM (self-view PiP was removed)`);
+      else ok(`${name} in-call: no self-view PiP in the DOM`);
       if (inc.floorHintUp) fail(`${name} in-call: floor sentence banner is up by default (must be an icon — §6)`);
       else ok(`${name} in-call: no loud-room banner across the face`);
       commonAsserts(inc, `${name} in-call`);
@@ -354,20 +346,18 @@ for (const [i, r] of RATIOS.entries()) {
       await a.evaluate(() => { document.querySelector('#flip').style.display = 'none'; });
       await a.waitForTimeout(80);
 
-      // Self view: hold to peek, release to hide (§B.9).
-      const pb = await a.locator('#selfPeek').boundingBox();
-      await a.mouse.move(pb.x + pb.width / 2, pb.y + pb.height / 2);
-      await a.mouse.down();
-      await a.waitForTimeout(150);
-      const peeking = await a.evaluate(() => document.querySelector('#selfWrap').classList.contains('on'));
-      if (!peeking) fail('A self view: holding the button did not reveal the mirror');
-      else ok('A self view: hold reveals the mirror');
-      await a.screenshot({ path: `${SHOTS}/${r.name}-5-peek.png` });
-      await a.mouse.up();
-      await a.waitForTimeout(1200);
-      const stillPeeking = await a.evaluate(() => document.querySelector('#selfWrap').classList.contains('on'));
-      if (stillPeeking) fail('A self view: mirror latched on after release (peek must never latch)');
-      else ok('A self view: mirror gone on release');
+      // Dormant features stay dead (2026-08-04, user directive): no self-view
+      // pin, no life size, no eye-line alignment anywhere in the sheet.
+      await a.click('#more');
+      await a.waitForTimeout(250);
+      const dormant = await a.evaluate(() =>
+        ['c-selfview', 'c-lifesize', 'c-gaze', 'calDetails', 'selfWrap']
+          .filter((id) => document.getElementById(id)));
+      if (dormant.length) fail(`A dormant: removed features back in the DOM → ${dormant.join(', ')}`);
+      else ok('A dormant: self-view pin / life size / eye-line / calibration all absent');
+      await a.screenshot({ path: `${SHOTS}/${r.name}-5-sheet.png` });
+      await a.keyboard.press('Escape');
+      await a.waitForTimeout(300);
 
       // ── Pinned mirror: bar × PiP × badges measured against each other ──────
       // Every geometry assertion above measures one thing on its own, and the
@@ -393,8 +383,7 @@ for (const [i, r] of RATIOS.entries()) {
           boxes.push({ name, x: q.x, y: q.y, w: q.width, h: q.height });
         };
         for (const el of document.querySelectorAll('#bar .icon-btn')) add(el, el.id);
-        add(document.querySelector('#selfWrap'), 'selfWrap');
-        add(document.querySelector('#muteBadge'), 'muteBadge');
+        add(document.querySelector('#more'), 'more');
         add(document.querySelector('#floorIcon'), 'floorIcon');
         return { boxes, barShown: document.querySelector('#bar').classList.contains('show') };
       });
@@ -428,77 +417,25 @@ for (const [i, r] of RATIOS.entries()) {
         await a.waitForFunction(() => document.querySelector('#bar').classList.contains('show'), null, { timeout: 4000 })
           .catch(() => fail('A chrome: bar would not come back for the overlap measurement'));
       };
-      // Pin the way a person does — through the sheet. A pin only a test can
-      // set proves nothing about the control that actually ships.
-      const pinSelf = async (want) => {
-        await showChrome();
-        await a.click('#more');
-        await a.waitForTimeout(300);
-        const already = await a.evaluate(() => document.querySelector('#c-selfview').dataset.on === '1');
-        if (already !== want) await a.click('#c-selfview');
-        await a.keyboard.press('Escape');
-        await a.waitForTimeout(300);
-        return a.evaluate(() => window.__tape.chrome.selfPinned);
-      };
-
-      const pinned = await pinSelf(true);
-      if (!pinned) fail('A self view: the more-sheet row did not pin the mirror');
-      else ok('A self view: more-sheet row pins the mirror');
-      await a.waitForFunction(() => {
-        const sw = document.querySelector('#selfWrap');
-        return sw.classList.contains('on') && sw.getBoundingClientRect().height > 1
-          && document.querySelector('#self').videoWidth > 0;
-      }, null, { timeout: 8000 }).catch(() => fail('A self view: pinned PiP never got a frame'));
-
-      // Pinned means it stays there for the whole call, so a PiP that hangs off
-      // an edge is a permanent bite out of the mirror, not a glimpse. The
-      // corner is positioned with hard px from right/bottom, which is exactly
-      // the arithmetic that walks off a short or narrow window.
-      const pipBox = await a.evaluate(() => {
-        const q = document.querySelector('#selfWrap').getBoundingClientRect();
-        return { x: q.x, y: q.y, r: q.right, b: q.bottom, w: q.width, h: q.height };
-      });
-      const outs = [];
-      if (pipBox.x < -0.5) outs.push(`left ${Math.round(pipBox.x)}`);
-      if (pipBox.y < -0.5) outs.push(`top ${Math.round(pipBox.y)}`);
-      if (pipBox.r > win.w + 0.5) outs.push(`right ${Math.round(pipBox.r)} > ${win.w}`);
-      if (pipBox.b > win.h + 0.5) outs.push(`bottom ${Math.round(pipBox.b)} > ${win.h}`);
-      if (outs.length) fail(`A self view: pinned PiP hangs off the viewport → ${outs.join(', ')}`);
-      else ok(`A self view: pinned PiP fully on-screen (${Math.round(pipBox.w)}x${Math.round(pipBox.h)})`);
-      await a.screenshot({ path: `${SHOTS}/${r.name}-6-pinned.png` });
-
       await showChrome();
-      noCollisions(await chromeBoxes(), 'pinned + bar', ['selfWrap', 'leave']);
+      noCollisions(await chromeBoxes(), 'bar out', ['leave']);
 
-      // Muted is the crowded state. The badge lives bottom-left and rides up
-      // 62 px whenever the bar is out, precisely so it does not land on the
-      // left-most circle; the PiP is bottom-right in the same band. If that
-      // ride ever stops, the answer to "am I muted?" ends up underneath the
-      // button that asks the question.
-      await a.click('#mic');
-      await a.waitForTimeout(300);
-      await showChrome();
-      noCollisions(await chromeBoxes(), 'pinned + muted + bar', ['selfWrap', 'muteBadge', 'leave']);
-      await a.click('#mic');
-      await a.waitForTimeout(200);
-
-      // Put the mirror back off: everything below here assumes the §B.9 resting
-      // state, and a latched self view would quietly change what they measure.
-      const stillPinned = await pinSelf(false);
-      if (stillPinned) fail('A self view: could not unpin from the more sheet');
-      else ok('A self view: unpinned again from the sheet');
-
-      // Mute state outlives the chrome (§A.5) — the "am I muted?" fix.
+      // Mute: the mic circle is the whole state now (badge and speaking dots
+      // removed 2026-08-04, user directive) — assert the two removed elements
+      // stay gone, then that the circle and the track agree.
+      const ghosts = await a.evaluate(() =>
+        ['muteBadge', 'dots'].filter((id) => document.getElementById(id)));
+      if (ghosts.length) fail(`A removed chrome back in the DOM → ${ghosts.join(', ')}`);
+      else ok('A dormant: mute badge / speaking dots absent');
       await a.click('#mic');
       const muted = await a.evaluate(() => ({
-        badge: document.querySelector('#muteBadge').classList.contains('on'),
         off: document.querySelector('#mic').dataset.off,
         // Under ?pcmaudio=1 the mic is off the peer connection entirely, so
         // getSenders cannot see it — the app's own getter is the instrument.
         track: window.__tape?.micEnabled,
       }));
-      if (muted.off !== '1' || !muted.badge) fail(`A mute: badge/state wrong ${JSON.stringify(muted)}`);
-      else ok('A mute: icon reds out and the persistent badge appears');
+      if (muted.off !== '1') fail(`A mute: mic circle state wrong ${JSON.stringify(muted)}`);
+      else ok('A mute: icon reds out');
       if (muted.track !== false) fail(`A mute: mic track still enabled (${muted.track})`);
       else ok('A mute: outbound audio actually muted');
       // Auto-hide has two halves and both are load-bearing: the controls stay
@@ -516,9 +453,6 @@ for (const [i, r] of RATIOS.entries()) {
       await a.waitForFunction(() => !document.querySelector('#bar').classList.contains('show'), null, { timeout: pinLeft + 5000 })
         .then(() => ok('A chrome: bar auto-hid once idle'))
         .catch(() => fail(`A chrome: bar never auto-hid (pin had ${pinLeft} ms left)`));
-      const badgeUp = await a.evaluate(() => getComputedStyle(document.querySelector('#muteBadge')).display !== 'none');
-      if (!badgeUp) fail('A mute: badge vanished with the chrome — state must outlive chrome');
-      else ok('A mute: badge still visible with chrome hidden');
       await a.click('#mic', { force: true });
 
       // Leave takes two deliberate taps (§B.11).

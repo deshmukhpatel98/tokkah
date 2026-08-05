@@ -17,9 +17,10 @@
  *   1. Batched POST every 5 s to the Durable Object (primary)
  *   2. `sendBeacon` on pagehide — closing the tab otherwise loses the tail, which
  *      is where the end of the conversation is
- *   3. A localStorage mirror, so if the server was unreachable for the entire call
- *      the data is still recoverable from the browser afterwards
- * Plus a download button, because the cheapest recovery path is a file.
+ *   3. An in-memory mirror behind tel.download(), because the cheapest recovery
+ *      path during a debugging session is a file. Nothing is ever persisted on
+ *      the participant's device (a localStorage mirror lived here during the
+ *      measurement campaign and was removed 2026-08-04, user directive).
  *
  * ── What is never recorded ───────────────────────────────────────────────────
  * No audio. No video. No frames. No transcript. No text the participants typed or
@@ -36,8 +37,7 @@ const MAX_BUFFER = 6000; // ~10 min of dense telemetry; beyond this, drop oldest
 // a clean send. A normal 5 s flush is a couple of hundred events; this only binds after the
 // buffer has grown from earlier failures, which is precisely when the log is worth having.
 const MAX_BATCH = 2000;
-const MAX_MIRROR = 4000; // localStorage cap, keeps us well under the 5 MB quota
-const MIRROR_KEY = 'tape.log.mirror';
+const MAX_MIRROR = 4000; // in-memory cap for tel.download()
 
 export class Telemetry {
   constructor({ room, role, session }) {
@@ -129,7 +129,6 @@ export class Telemetry {
         this.truncated += body.offered - stored;
       }
       this.failures = 0;
-      this.saveMirror();
     } catch (e) {
       // Put it back at the front — order is preserved and nothing is lost unless
       // the buffer overflows, which is itself recorded.
@@ -140,7 +139,6 @@ export class Telemetry {
       }
       this.failures++;
       this.lastError = String(e.message ?? e).slice(0, 120);
-      this.saveMirror(); // the mirror matters more when the network is failing
     } finally {
       this.flushing = false;
     }
@@ -152,7 +150,6 @@ export class Telemetry {
    */
   flushSync() {
     try {
-      this.saveMirror();
       if (!this.buffer.length) return;
       const body = JSON.stringify({
         session: this.session,
@@ -166,29 +163,6 @@ export class Telemetry {
       if (ok) this.buffer = [];
     } catch {
       /* nothing useful to do at teardown */
-    }
-  }
-
-  saveMirror() {
-    try {
-      localStorage.setItem(
-        MIRROR_KEY,
-        JSON.stringify({
-          room: this.room,
-          role: this.role,
-          session: this.session,
-          savedAt: Date.now(),
-          events: this.mirror,
-        }),
-      );
-    } catch {
-      // Quota exceeded — halve the mirror and move on. Losing the oldest half of a
-      // backup is strictly better than the backup failing entirely.
-      try {
-        this.mirror.splice(0, Math.floor(this.mirror.length / 2));
-      } catch {
-        /* give up on the mirror, the primary path is still live */
-      }
     }
   }
 
@@ -434,13 +408,3 @@ export async function sampleStats(pc) {
 }
 
 const num = (v, digits) => (typeof v === 'number' && Number.isFinite(v) ? +v.toFixed(digits) : null);
-
-/** Recover a mirror left behind by a previous session. */
-export function recoverMirror() {
-  try {
-    const raw = localStorage.getItem(MIRROR_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
