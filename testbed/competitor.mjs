@@ -361,15 +361,41 @@ if (!url) { console.log('need --url="<join link>" (or --self)'); process.exit(1)
 
 const A = await mk(FIX_A), B = await mk(FIX_B);
 console.log(`\n${label}\n${url}\n`);
+// A waiting room turns "joined" into a human act with no fixed duration: Meet's
+// "Ask to join" sits until the host clicks Admit, and the old fixed 8 s wait
+// timed out long before any human could admit two knockers. Joined-ness is
+// observable from the page itself — a decodable timecode means the fixture is
+// live on screen, which only happens once the call is actually entered — so
+// poll for that instead of guessing a duration. SELF keeps a short bound; the
+// join there is a button, not a doorman.
+async function waitInCall(page, tag, maxMs) {
+  const t0 = Date.now();
+  let told = false;
+  while (Date.now() - t0 < maxMs) {
+    const ok = await page.evaluate(() =>
+      [...document.querySelectorAll('video, canvas')].some((el) => window.__tc(el))).catch(() => false);
+    if (ok) { console.log(`  [${tag}] in call (${((Date.now() - t0) / 1000).toFixed(0)}s)`); return true; }
+    if (!told && Date.now() - t0 > 10000) {
+      told = true;
+      console.log(`  [${tag}] not in the call yet — if there is a waiting room, admit "probe-${tag}" now`);
+    }
+    await page.waitForTimeout(1000);
+  }
+  console.log(`  [${tag}] gave up after ${maxMs / 1000}s — never saw its own fixture on screen`);
+  return false;
+}
+const ADMIT_MS = SELF ? 20000 : 180000;
 await A.p.goto(url, { waitUntil: 'domcontentloaded' });
 await A.p.waitForTimeout(4000);
 if (SELF) { await A.p.click('#join').catch(() => {}); } else { await clickThrough(A.p, 'A'); }
+await waitInCall(A.p, 'A', ADMIT_MS);
 // Stagger so the two fixtures are demonstrably out of phase — that phase gap is
 // what makes a self-view identifiable instead of a plausible latency.
 await A.p.waitForTimeout(STAGGER * 1000);
 await B.p.goto(url, { waitUntil: 'domcontentloaded' });
 await B.p.waitForTimeout(4000);
 if (SELF) { await B.p.click('#join').catch(() => {}); } else { await clickThrough(B.p, 'B'); }
+await waitInCall(B.p, 'B', ADMIT_MS);
 await B.p.waitForTimeout(8000);
 
 // Pass 1: a 3 s sweep of everything, purely to learn which elements exist and

@@ -4,8 +4,42 @@
 your voice speaking theirs, fast enough to do business. This is the feature
 100M people will pay $20–50/month for; the call itself is not.
 
-Status: SPEC. Blocked on `ELEVENLABS_API_KEY` (verified absent from env,
-repo, `.dev.vars`, and both Workers' secret stores on 2026-08-05).
+Status (2026-08-06): **Vendor switched — Gemini 3.5 Live Translate
+(`gemini-3.5-live-translate-preview`) is now the DEFAULT interpreter on
+room.tokkah.com.** One Live API session per speaking side replaces the whole
+Scribe→MT→TTS chain: 16 kHz PCM up (unchanged tap), translated 24 kHz PCM +
+transcripts down, upsampled ×2 to 48 kHz in the Worker so the client is
+byte-identical. Translation is CONTINUOUS (streams ~a phrase behind the
+speaker; probe measured end-of-phrase→translated-audio 164 ms vs ~730–800 ms
+T_tail for the legacy chain) and preserves intonation/pacing per vendor docs.
+`echoTargetLanguage=false` gives the same-language-pair captions-only rule
+for free. Session resumption handles are stored for the vendor's session cap;
+idle/lazy reconnect mirrors the Scribe pattern. The ElevenLabs pipeline
+remains fully intact behind `?xlvendor=el` (rig: `--vendor=el`) as the A/B
+control. Default vendor = gemini whenever GEMINI_API_KEY is set (it is, on
+both workers). Measured on prod 2026-08-06 (`testbed/xlate-call.mjs`, flag
+and button arms): captions OK (correct Spanish), 32–34 s of translated 48 kHz
+audio per 40 s run, 0 failures. Caveats: per-segment msStt/msMt/msTts are
+null by design (stages collapsed — the rig's T_tail sum is not meaningful on
+this vendor; delivery + caption correctness + the probe's 164 ms gap are the
+metrics); rare preview-model artifact observed once (a refusal string
+surfaced as a caption on audiobook-style content).
+
+Previous status (2026-08-05, evening): **P0+P1 SHIPPED to room.tokkah.com as a
+one-tap 🌐 button** — no URL flags, no setup. One side taps the globe, both
+sides come up translated (peer gets `xlate-on` over signaling); the speaker's
+language is auto-detected per phrase (Scribe `include_language_detection`;
+note: detection doubles every commit — handle only the `_with_timestamps`
+variant); each listener hears their own `navigator.language`; a same-language
+pair gets captions only, never TTS parroting. Button-path measured on prod:
+7/7 segments, T_tail p50 730 ms / p95 824 ms. `?xlate=<lang>` remains as the
+rig's listening-language override (`testbed/xlate-call.mjs --button=1` is the
+no-flags arm). Measured on prod via `testbed/xlate-call.mjs` (n=7 segments):
+7/7 captions correct, 7/7 TTS segments delivered, T_tail server-side
+p50 794 ms / p95 889 ms (STT 668 + MT 0 + TTS-first-byte 112), 27.3 s of
+translated 48 kHz audio delivered clean. MT is passthrough until an
+`ANTHROPIC_API_KEY` secret is set (then Claude Haiku, no code change).
+Voice cloning (P2) and ducking/turn-yielding (P3) not started.
 
 ---
 

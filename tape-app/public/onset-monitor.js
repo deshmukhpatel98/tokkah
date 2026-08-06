@@ -19,6 +19,22 @@
 
 const WORKLET_URL = '/onset-worklet.js';
 
+/**
+ * addModule with one cache-busted retry. A live Android call (room log
+ * 2026-08-06) had EVERY worklet load fail with AbortError for 16 straight
+ * minutes — lobby meter, PCM lane, translation — after a reload interrupted a
+ * fetch: the signature of a poisoned HTTP cache entry, which a plain retry
+ * re-reads forever. A `?cb=` query is a different cache key, so the second
+ * attempt goes to the network.
+ */
+export async function addWorkletModule(context, url) {
+  try {
+    await context.audioWorklet.addModule(url);
+  } catch (e) {
+    await context.audioWorklet.addModule(url + (url.includes('?') ? '&' : '?') + 'cb=' + Date.now());
+  }
+}
+
 let ctx = null;
 let moduleLoaded = null;
 
@@ -29,7 +45,7 @@ export async function audioContext() {
     // ask for the floor. With the flag off the hint is exactly what it was.
     const pcm = new URLSearchParams(location.search).get('pcmaudio') === '1';
     ctx = new AudioContext({ sampleRate: 48000, latencyHint: pcm ? 0 : 'interactive' });
-    moduleLoaded = ctx.audioWorklet.addModule(WORKLET_URL);
+    moduleLoaded = addWorkletModule(ctx, WORKLET_URL);
   }
   await moduleLoaded;
   if (ctx.state === 'suspended') await ctx.resume();

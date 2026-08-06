@@ -27,8 +27,13 @@ interface Env {
   HEALTH: DurableObjectNamespace;
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
-  // Interpreter (TRANSLATE-SPEC.md). Key lives here so the browser never sees
-  // it; absent key means /xlate answers 503 and the client shows nothing.
+  // Interpreter (TRANSLATE-SPEC.md). Keys live here so the browser never sees
+  // them; with neither key /xlate answers 503 and the client shows nothing.
+  // GEMINI_API_KEY present → Gemini 3.5 Live Translate is the default vendor
+  // (one speech-to-speech session replaces the STT→MT→TTS chain). The legacy
+  // ElevenLabs pipeline stays reachable via ?xlvendor=el for A/Bs.
+  GEMINI_API_KEY?: string;
+  LOG_ADMIN_TOKEN?: string;
   ELEVENLABS_API_KEY?: string;
   // MT backend. Absent → passthrough (captions/TTS in the source language),
   // which keeps the whole pipeline measurable before the key exists.
@@ -95,7 +100,13 @@ export class Room implements DurableObject {
   private postTimes: number[] = [];
   // Interpreter sessions, keyed by signaling role. Parallel to `peers` like the
   // cap maps: the translation socket is a sibling of the call, never a part of it.
-  private xl = new Map<string, { sock: WebSocket; lang: string; up: WebSocket | null; ttsBusy: Promise<void>; seg: number }>();
+  private xl = new Map<string, {
+    sock: WebSocket; lang: string; up: WebSocket | null; ttsBusy: Promise<void>; seg: number;
+    // Gemini-vendor extras (absent on ElevenLabs sessions). `target` is the
+    // language the upstream session was OPENED with — the peer's listening
+    // language — so a peer arriving with a different lang can retire it.
+    vendor?: string; target?: string;
+  }>();
 
   constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
@@ -136,6 +147,9 @@ export class Room implements DurableObject {
   // channel over a network hop is not a practical oracle at this entropy.
   private tokenOk(url: URL): boolean {
     const t = url.searchParams.get('token');
+    // LOG_ADMIN_TOKEN (wrangler secret): operator read across rooms, for
+    // debugging live complaints without asking the caller for their token.
+    if (t !== null && this.env.LOG_ADMIN_TOKEN && t === this.env.LOG_ADMIN_TOKEN) return true;
     return t !== null && t === this.logToken;
   }
 
@@ -394,11 +408,26 @@ export class Room implements DurableObject {
   // only in flight between the vendors and the two occupants of the call.
   private async xlate(request: Request): Promise<Response> {
     if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expected websocket' }, 426);
-    const key = this.env.ELEVENLABS_API_KEY;
-    if (!key) return json({ error: 'translation not configured' }, 503);
     const q = new URL(request.url).searchParams;
     const role = q.get('role') === 'b' ? 'b' : 'a';
-    const lang = (q.get('lang') || 'en').slice(0, 8);
+    // The 🌐 button sends navigator.language, which is region-tagged (es-ES,
+    // en-US, hi-IN). Gemini's targetLanguageCode accepts setup but then closes
+    // 1007 "invalid argument" on ANY region subtag (probed 2026-08-06), which
+    // crash-looped the whole session. Primary subtag is the wire format here.
+    const lang = (q.get('lang') || 'en').split('-')[0].toLowerCase().slice(0, 8);
+    // Vendor: Gemini Live Translate is the default whenever its key exists;
+    // `?xlvendor=el` on the page (forwarded here as vendor=el) forces the
+    // legacy ElevenLabs pipeline so quality/latency stays A/B-able.
+    const vendor = q.get('vendor') === 'el' ? 'el'
+      : q.get('vendor') === 'gemini' ? 'gemini'
+      : this.env.GEMINI_API_KEY ? 'gemini' : 'el';
+    if (vendor === 'gemini') {
+      const gk = this.env.GEMINI_API_KEY;
+      if (!gk) return json({ error: 'translation not configured' }, 503);
+      return this.xlateGemini(role, lang, gk);
+    }
+    const key = this.env.ELEVENLABS_API_KEY;
+    if (!key) return json({ error: 'translation not configured' }, 503);
 
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
@@ -526,6 +555,291 @@ export class Room implements DurableObject {
     });
 
     const teardown = () => {
+      try { st.up?.close(); } catch { /* gone */ }
+      if (this.xl.get(role) === st) this.xl.delete(role);
+    };
+    server.addEventListener('close', teardown);
+    server.addEventListener('error', teardown);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // ── Interpreter, Gemini vendor ─────────────────────────────────────────────
+  // One Gemini 3.5 Live Translate session per speaking side replaces the whole
+  // Scribe→MT→TTS chain: 16 kHz PCM up, translated 24 kHz PCM + transcripts
+  // down, continuously (no turn boundaries — measured: the model streams
+  // translation ~a phrase behind the speaker; quiet→first-audio 164 ms on the
+  // 2026-08-06 probe vs ~730 ms T_tail for the legacy chain). The session's
+  // target language is the PEER's listening language, so it can only be opened
+  // once a peer with a known lang exists; until then uplink chunks queue
+  // (bounded) exactly like the Scribe-connecting race. Law 0 unchanged: this
+  // socket is a sibling of the call, killing it changes nothing else.
+  //
+  // Same-language pair: echoTargetLanguage=false makes the model stay silent
+  // and the transcripts still flow — captions only, no TTS parroting, same
+  // behaviour the EL path implemented by hand.
+  private xlateGemini(role: string, lang: string, key: string): Response {
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+    try { (server as unknown as { binaryType: string }).binaryType = 'arraybuffer'; } catch { /* older runtime */ }
+    try { this.xl.get(role)?.sock.close(); this.xl.get(role)?.up?.close(); } catch { /* replaced */ }
+    const st = { sock: server, lang, up: null as WebSocket | null, ttsBusy: Promise.resolve(), seg: 0, vendor: 'gemini', target: '' };
+    this.xl.set(role, st);
+    const peer = () => this.xl.get(role === 'a' ? 'b' : 'a') ?? null;
+    const say = (s: WebSocket | undefined | null, m: unknown) => { try { s?.send(JSON.stringify(m)); } catch { /* dead */ } };
+
+    // The peer's session translates INTO our language. If it was opened before
+    // we declared ours (or we changed), it is speaking the wrong language —
+    // retire it; its next uplink chunk reopens it against the right target.
+    const p0 = peer();
+    if (p0?.vendor === 'gemini' && p0.target && p0.target !== lang) {
+      try { p0.up?.close(); } catch { /* gone */ }
+      p0.up = null;
+    }
+
+    let ready = false;            // setupComplete seen on the current upstream
+    let handle = '';              // sessionResumption handle — survives the 15-min session cap
+    let queue: ArrayBuffer[] = []; // uplink audio while (re)connecting, bounded
+    let inTxt = '', outTxt = '';  // caption accumulators (continuous stream has no vendor segmentation)
+    let outBytes = 0;             // translated bytes in the open caption segment
+    let carry = 0;                // last 24 kHz sample, for the ×2 upsampler's continuity
+    let pend: Uint8Array | null = null; // odd trailing byte of an audio blob
+    let lastCommitAt = 0;         // client flush anchor (msTts = flush → first audio)
+    let awaitingAudio = false;
+    let lastAudioAt = 0;
+    let upSent = 0, upConnecting = false, lastUpTry = 0;
+    let capTimer: ReturnType<typeof setTimeout> | null = null;
+    // Refusal containment (measured on prod 2026-08-06: the preview model can
+    // emit "I'm just a language model and can't help with that", speak it,
+    // and then go PERMANENTLY quiet — no error, no close, translation dead
+    // for the rest of the call). When the output transcript matches, the
+    // caption is suppressed, remaining audio of that turn is muted, the
+    // resumption handle is dropped (resuming would resume the poisoned
+    // state), and the session is recycled.
+    const REFUSAL_RE = /(just|only) (a|an) (language model|AI( language)? model|LLM)|can'?t help with that|cannot help with that|unable to help with that/i;
+    let suppressAudio = false;
+    // Deaf-session watchdog: the failure above arrives as SILENCE, so the
+    // detector must be "we are speaking and the vendor says nothing", never
+    // "no traffic" (a quiet listener is normal — see the Scribe idle rule).
+    let lastVoicedUpAt = 0;
+    let lastDownAt = 0;
+    const upOpen = () => st.up !== null && st.up.readyState === WebSocket.READY_STATE_OPEN;
+
+    const b64 = (u8: Uint8Array) => {
+      let s = '';
+      for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode(...u8.subarray(i, i + 8192));
+      return btoa(s);
+    };
+    const unb64 = (s: string) => {
+      const b = atob(s);
+      const u = new Uint8Array(b.length);
+      for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
+      return u;
+    };
+
+    // The play worklet speaks 48 kHz s16le; Gemini emits 24 kHz. Linear ×2 with
+    // the previous sample carried across chunks — half-sample latency, no seams.
+    const up2x = (u8raw: Uint8Array): Uint8Array => {
+      let u8 = u8raw;
+      if (pend) { const j = new Uint8Array(pend.length + u8.length); j.set(pend); j.set(u8, pend.length); u8 = j; pend = null; }
+      const even = u8.length & ~1;
+      if (even < u8.length) pend = u8.slice(even);
+      const n = even >> 1;
+      const i16 = new Int16Array(n);
+      for (let i = 0; i < n; i++) { let v = u8[2 * i] | (u8[2 * i + 1] << 8); if (v > 32767) v -= 65536; i16[i] = v; }
+      const out = new Int16Array(n * 2);
+      let prev = carry;
+      for (let i = 0; i < n; i++) { const s = i16[i]; out[2 * i] = (prev + s) >> 1; out[2 * i + 1] = s; prev = s; }
+      carry = prev;
+      return new Uint8Array(out.buffer);
+    };
+
+    // Continuous transcripts are segmented HERE: a caption goes final when the
+    // stream pauses (no new text/audio for 1.2 s), sooner after a client flush.
+    const finalize = () => {
+      capTimer = null;
+      const src = inTxt.trim(), out = outTxt.trim();
+      inTxt = ''; outTxt = '';
+      if (!src && !out) return;
+      const seg = st.seg++;
+      say(server, { type: 'cap', fin: 1, who: 'me', seg, lang: '', txt: src || out, tr: out });
+      say(peer()?.sock, { type: 'cap', fin: 1, who: 'peer', seg, lang: st.target, txt: out || src, src, msStt: null, msMt: null, mtMode: 'gemini' });
+      if (outBytes) { say(peer()?.sock, { type: 'tts', seg, state: 'end', bytes: outBytes, ms: 0 }); outBytes = 0; }
+    };
+    const kick = (ms: number) => { if (capTimer) clearTimeout(capTimer); capTimer = setTimeout(finalize, ms); };
+
+    const onAudio = (u8: Uint8Array) => {
+      const now = Date.now();
+      // A burst boundary (>600 ms of downlink silence) is this vendor's "tts
+      // start" — the rig's segment counter and the msTts stamp hang off it.
+      if (now - lastAudioAt > 600) {
+        say(peer()?.sock, {
+          type: 'tts', seg: st.seg, state: 'start', msStt: null, msMt: null,
+          msTts: awaitingAudio && lastCommitAt ? now - lastCommitAt : null,
+        });
+        awaitingAudio = false;
+      }
+      lastAudioAt = now;
+      const out = up2x(u8);
+      if (!out.length) return;
+      outBytes += out.byteLength;
+      try { peer()?.sock.send(out); } catch { /* dead */ }
+    };
+
+    // Recycle the vendor session: fresh state, reconnect on the next chunk
+    // (or now, if audio is mid-flight). `fresh` drops the resumption handle.
+    const recycle = (why: string, fresh: boolean) => {
+      say(server, { type: 'xl-err', where: `gemini-recycle-${why}` });
+      if (fresh) handle = '';
+      lastUpTry = 0; // the recycle IS the backoff decision — reconnect now
+      const dead = st.up;
+      st.up = null;
+      ready = false;
+      try { dead?.close(); } catch { /* gone */ }
+      void connect();
+    };
+
+    const onUp = (e: MessageEvent) => {
+      const s = typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data as ArrayBuffer);
+      let m: Record<string, unknown>;
+      try { m = JSON.parse(s); } catch { return; }
+      lastDownAt = Date.now();
+      if (m.setupComplete) {
+        ready = true;
+        suppressAudio = false; // a fresh session speaks again
+        lastDownAt = Date.now();
+        say(server, { type: 'xl-ready', lang });
+        for (const c of queue.splice(0)) sendChunk(c);
+        return;
+      }
+      const sru = m.sessionResumptionUpdate as { newHandle?: string; resumable?: boolean } | undefined;
+      if (sru?.newHandle && sru.resumable) { handle = sru.newHandle; return; }
+      if (m.goAway) { say(server, { type: 'xl-err', where: 'gemini-goaway' }); return; } // close event drives the reconnect
+      if (m.error) { say(server, { type: 'xl-err', where: 'gemini', e: JSON.stringify(m.error).slice(0, 300) }); return; }
+      const sc = m.serverContent as {
+        inputTranscription?: { text?: string }; outputTranscription?: { text?: string };
+        modelTurn?: { parts?: Array<{ inlineData?: { data?: string } }> };
+        turnComplete?: boolean; generationComplete?: boolean;
+      } | undefined;
+      if (!sc) return;
+      if (sc.inputTranscription?.text) {
+        inTxt += sc.inputTranscription.text;
+        // Live source-language caption on the far side while the phrase is
+        // still being spoken — same contract as the EL path's partials.
+        say(peer()?.sock, { type: 'cap', fin: 0, lang: '', txt: inTxt.slice(-160) });
+        kick(1200);
+      }
+      if (sc.outputTranscription?.text) {
+        outTxt += sc.outputTranscription.text;
+        if (REFUSAL_RE.test(outTxt)) {
+          // Not a translation — swallow the caption, mute the rest of this
+          // turn's audio, and start over on a clean session.
+          outTxt = ''; inTxt = '';
+          suppressAudio = true;
+          recycle('refusal', true);
+          return;
+        }
+        kick(1200);
+      }
+      // Deliberately no kick() on audio: the model streams audio near-
+      // continuously during speech (measured: chunks every ~250 ms for the
+      // whole utterance), so an audio-refreshed timer would never fire and no
+      // caption would ever go final. Captions segment on TRANSCRIPT pauses.
+      for (const p of sc.modelTurn?.parts ?? []) {
+        if (p?.inlineData?.data && !suppressAudio) onAudio(unb64(String(p.inlineData.data)));
+      }
+      // A monologue with no pauses still needs readable captions: roll them.
+      if (inTxt.length + outTxt.length > 320) finalize();
+      if (sc.turnComplete || sc.generationComplete) kick(300);
+    };
+
+    const connect = async (): Promise<boolean> => {
+      const target = (peer()?.lang || '').slice(0, 16);
+      if (!target) return false; // nobody listening yet — chunks stay queued
+      if (upConnecting || Date.now() - lastUpTry < 2000) return false;
+      upConnecting = true;
+      lastUpTry = Date.now();
+      try {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${key}`,
+          { headers: { Upgrade: 'websocket' } },
+        );
+        const up = r.webSocket;
+        if (!up) throw new Error(`gemini upgrade ${r.status}`);
+        up.accept();
+        try { (up as unknown as { binaryType: string }).binaryType = 'arraybuffer'; } catch { /* older runtime */ }
+        ready = false;
+        st.target = target;
+        up.send(JSON.stringify({
+          setup: {
+            model: 'models/gemini-3.5-live-translate-preview',
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              translationConfig: { targetLanguageCode: target, echoTargetLanguage: false },
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            ...(handle ? { sessionResumption: { handle } } : {}),
+          },
+        }));
+        up.addEventListener('message', onUp);
+        up.addEventListener('close', (e: CloseEvent) => {
+          if (st.up === up) { st.up = null; ready = false; }
+          say(server, { type: 'xl-err', where: 'gemini-closed', code: e.code, reason: String(e.reason).slice(0, 200), upSent });
+        });
+        up.addEventListener('error', () => say(server, { type: 'xl-err', where: 'gemini-socket-error', upSent }));
+        st.up = up;
+        return true;
+      } catch (e) {
+        say(server, { type: 'xl-err', where: 'gemini-connect', e: String(e) });
+        return false;
+      } finally {
+        upConnecting = false;
+      }
+    };
+    void connect();
+
+    const sendChunk = (buf: ArrayBuffer) => {
+      const u8 = new Uint8Array(buf);
+      upSent++;
+      // Cheap per-chunk energy (16k mults/s): it feeds the deaf-session
+      // watchdog, and every 50th chunk it doubles as the xl-stat probe.
+      let s2 = 0;
+      const i16 = new Int16Array(buf);
+      for (let i = 0; i < i16.length; i++) s2 += i16[i] * i16[i];
+      const rms = Math.round(Math.sqrt(s2 / (i16.length || 1)));
+      const now = Date.now();
+      if (rms > 300) lastVoicedUpAt = now;
+      if (upSent % 50 === 0) say(server, { type: 'xl-stat', upSent, chunkBytes: u8.byteLength, rms });
+      st.up!.send(JSON.stringify({ realtimeInput: { audio: { data: b64(u8), mimeType: 'audio/pcm;rate=16000' } } }));
+      // Deaf-session watchdog: we are audibly speaking, the session is open,
+      // and the vendor has said NOTHING (no transcript, no audio, not even a
+      // resumption handle — those arrive every ~2 s normally) for 15 s. The
+      // refusal wedge presents exactly like this; a quiet LISTENER does not
+      // (no voiced uplink) and neither does normal translation (audio down).
+      if (lastVoicedUpAt === now && lastDownAt && now - lastDownAt > 15_000 && now - lastVoicedUpAt < 1_000) {
+        recycle('deaf', true);
+      }
+    };
+
+    server.addEventListener('message', (e: MessageEvent) => {
+      if (typeof e.data === 'string') {
+        let mm: Record<string, unknown>;
+        try { mm = JSON.parse(e.data); } catch { return; }
+        if (mm.type === 'flush') { lastCommitAt = Date.now(); awaitingAudio = true; kick(700); }
+        return;
+      }
+      if (!upOpen() || !ready) {
+        queue.push(e.data as ArrayBuffer);
+        if (queue.length > 20) queue.shift(); // ~2 s cap; losing older audio beats unbounded growth
+        void connect();
+        return;
+      }
+      sendChunk(e.data as ArrayBuffer);
+    });
+
+    const teardown = () => {
+      if (capTimer) { clearTimeout(capTimer); capTimer = null; }
       try { st.up?.close(); } catch { /* gone */ }
       if (this.xl.get(role) === st) this.xl.delete(role);
     };

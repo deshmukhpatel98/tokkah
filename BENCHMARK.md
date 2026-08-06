@@ -9,10 +9,51 @@ blocked on one action only you can take.
 
 | service | status |
 |---|---|
-| Google Meet | creating a meeting requires a signed-in Google account |
+| Google Meet | **re-tested 2026-08-06 with a live host: blocked at bot detection, not at the account** |
 | Zoom | joining requires a meeting ID that only an account holder can create |
 | WhatsApp / FaceTime | phone/Apple ID; no web join |
 | **meet.jit.si** | **re-tested 2026-08-02: now moderator-gated too** |
+
+## Google Meet: the block is bot detection, and it is not ours to defeat
+
+Tested 2026-08-06 against two live host-created meetings, the second from a
+Workspace account (`zls.app`). The account was never the binding constraint.
+Anonymous joining is allowed — the prejoin screen offers a name field and
+**"Ask to join"** — but the rig's browser is refused *before* that screen with:
+
+```
+You can't join this video call
+No one can join a meeting unless invited or admitted by the host
+```
+
+The refusal is a bot check, not a permission check, and the isolating experiment
+says so precisely. Four arms, same link, same minute:
+
+| arm | result |
+|---|---|
+| headless, default UA | refused, 0 video elements |
+| headless + normal-Chrome UA | refused, 0 video elements |
+| **headful, default UA** | **refused** — so it is not headlessness alone |
+| headful + normal-Chrome UA + `--disable-blink-features=AutomationControlled` | **prejoin reached**, camera live, "Ask to join" present |
+
+The only difference in the arm that works is that the browser stops declaring
+itself automated (`navigator.webdriver` false, UA scrubbed). Meet's own prejoin
+text names what that gate is for: system info is sent "to confirm you're not a
+bot." Passing it requires misrepresenting the client, which is bot-detection
+evasion however benign the purpose, so **this path is closed and the run was
+abandoned at that point.** No Meet number exists, and none should be
+manufactured by reopening this route.
+
+What that leaves, honestly: **Meet's pipeline is unmeasured and likely to stay
+unmeasured by this rig.** The blog cannot compare pipelines with Meet. It *can*
+still use the edge-distance bound in `MEASURED.md` (Meet's nearest edge is
+6.4 ms from here), because that needs no join at all.
+
+The one legitimate route not yet tried is to take automation out of the loop
+entirely: a human joins from two ordinary browser profiles with the timecode
+fixture bound to a virtual camera (OBS), and the decoder is pasted into each
+devtools console by hand. Slow, n=1-ish, and it needs a second machine or two
+profiles with separate cameras — but it involves no misrepresented client.
 
 Jitsi was the one account-free option and an earlier note here said its two
 browsers "just failed to join, fix the harness." That is now wrong. Both

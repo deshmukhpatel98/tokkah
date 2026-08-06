@@ -340,6 +340,31 @@ try {
     }
     await new Promise((r) => setTimeout(r, 250));
   }
+  // Interpreter readout (only meaningful when queryA/queryB carry xlate=…).
+  // __xlateStats is the client's debug surface, readable over safaridriver's
+  // executeScript where no init-script tap can be installed.
+  const XL_SRC = `
+    const x = window.__xlateStats;
+    if (!x) return null;
+    return { open: x.open, ready: x.ready, capsPeer: x.capsPeer, capsMe: x.capsMe,
+      partials: x.partials, binChunks: x.binChunks, binBytes: x.binBytes,
+      flushes: x.flushes, voiceOnsets: (x.voiceOnsets ?? []).length,
+      errs: (x.errs ?? []).slice(-4), lastCap: x.lastCap,
+      capShown: document.querySelector('#xlateCaps')?.textContent?.slice(0, 120) ?? null };
+  `;
+  if (/xlate=/.test(QUERY_A + QUERY_B)) {
+    console.log('\n── interpreter (window.__xlateStats) ──');
+    for (const e of [S, C]) {
+      const x = e.page
+        ? await e.page.evaluate(new Function(XL_SRC)).catch(() => null)
+        : await e.eval(XL_SRC).catch(() => null);
+      if (!x) { console.log(`  ${e.engine.padEnd(9)} xlate not running`); continue; }
+      console.log(`  ${e.engine.padEnd(9)} open ${x.open} ready ${x.ready}  capsPeer ${x.capsPeer} capsMe ${x.capsMe} partials ${x.partials}` +
+        `\n            audio in ${x.binChunks} chunks ${(x.binBytes / 96000).toFixed(1)}s@48k  voiceOnsets ${x.voiceOnsets}  flushes ${x.flushes}` +
+        `\n            lastCap "${x.lastCap}"  overlay "${x.capShown}"` +
+        (x.errs?.length ? `\n            errs ${JSON.stringify(x.errs)}` : ''));
+    }
+  }
   if (JSON_OUT) {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(JSON_OUT, JSON.stringify({ meta: { room, peer: C.engine, sec: SEC, queryA: QUERY_A, queryB: QUERY_B,

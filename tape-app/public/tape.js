@@ -1532,6 +1532,15 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // Every quality number this lane has ever produced was measured on the former.
   let rateControl = 'quantizer';
   let resizeHold = 0;
+  // Orientation (task #12). Android hands MediaStreamTrackProcessor frames in
+  // SENSOR orientation with the true orientation as metadata (VideoFrame.rotation,
+  // Chrome 137+). Standard WebRTC applies it on the wire (CVO); this lane encodes
+  // the raw pixels, so the metadata must ride the control channel or a portrait
+  // phone renders sideways on the peer (measured: room vjj-spil-qli, 2026-08-06,
+  // capture 1080x1920 while frames and encode ran 1920x1080).
+  let sentRot = null;  // sender: last rotation told to the peer
+  let remoteRot = 0;   // receiver: degrees CW to apply at paint
+  let rotWarned = false;
   // The camera the pump is currently reading. Moves on a flip or a re-acquire.
   let curTrack = track;
   let dcCtl = null;
@@ -2090,6 +2099,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     if (!m || typeof m.t !== 'string') return;
     switch (m.t) {
       case 'cfg': setupDecoder(m).catch((e) => fail('decoder-configure', e)); break;
+      case 'rot': remoteRot = ((m.rot | 0) % 360 + 360) % 360; L('tape-rot', { lane: 'rtp', dir: 'recv', rot: remoteRot }); break;
       case 'ready': remoteReady = true; L('tape-remote-ready', { lane: 'rtp' }); break;
       case 'key': stats.keyReqRecv++; wantKey = true; break;
       case 'fragreq': stats.fragReqRecv++; worker?.postMessage({ type: 'resplice', ids: m.ids }); break;
@@ -2204,6 +2214,31 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     return !!(avsync && peerAvDeltaUs != null && avsync.audioPlayoutUs?.() != null);
   }
 
+  // The one paint path for remote frames: sizes the backing store to the
+  // UPRIGHT dimensions and applies the peer-signaled rotation (see `remoteRot`).
+  // Decoder-output frames always carry rotation 0 (we never configure the
+  // decoder with one), so this cannot double-rotate.
+  function paintRemote(frame) {
+    const swap = remoteRot === 90 || remoteRot === 270;
+    const w = swap ? frame.displayHeight : frame.displayWidth;
+    const h = swap ? frame.displayWidth : frame.displayHeight;
+    if (displayCanvas.width !== w || displayCanvas.height !== h) {
+      displayCanvas.width = w;
+      displayCanvas.height = h;
+    }
+    try {
+      if (remoteRot) {
+        ctx2d.save();
+        ctx2d.translate(w / 2, h / 2);
+        ctx2d.rotate((remoteRot * Math.PI) / 180);
+        ctx2d.drawImage(frame, -frame.displayWidth / 2, -frame.displayHeight / 2);
+        ctx2d.restore();
+      } else {
+        ctx2d.drawImage(frame, 0, 0);
+      }
+    } catch { /* frame closing raced us */ }
+  }
+
   function avEnqueue(frame) {
     avq.push({ frame, avUs: frame.timestamp - peerAvDeltaUs });
     if (avq.length > AVQ_MAX) {
@@ -2236,11 +2271,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // Everything older is superseded — closed, counted, never painted.
     for (let i = 0; i < best; i++) { avq[i].frame.close(); avStats.skips++; }
     avq.splice(0, best + 1);
-    if (displayCanvas.width !== frame.displayWidth || displayCanvas.height !== frame.displayHeight) {
-      displayCanvas.width = frame.displayWidth;
-      displayCanvas.height = frame.displayHeight;
-    }
-    try { ctx2d.drawImage(frame, 0, 0); } catch { /* frame closing raced us */ }
+    paintRemote(frame);
     frame.close();
     lastDrawAt = now();
     avStats.presents++;
@@ -2301,11 +2332,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
 
   function vpPresent(frame, idx) {
     vpLastK = idx;
-    if (displayCanvas.width !== frame.displayWidth || displayCanvas.height !== frame.displayHeight) {
-      displayCanvas.width = frame.displayWidth;
-      displayCanvas.height = frame.displayHeight;
-    }
-    try { ctx2d.drawImage(frame, 0, 0); } catch { /* frame closing raced us */ }
+    paintRemote(frame);
     frame.close();
     lastDrawAt = now();
     vpStats.presents++;
@@ -2631,13 +2658,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
             vpEnqueue(frame);
             return;
           }
-          // Paint-on-arrival. Backing store tracks the stream's size so the
-          // CSS object-fit: cover crop matches the old <video> exactly.
-          if (displayCanvas.width !== frame.displayWidth || displayCanvas.height !== frame.displayHeight) {
-            displayCanvas.width = frame.displayWidth;
-            displayCanvas.height = frame.displayHeight;
-          }
-          try { ctx2d.drawImage(frame, 0, 0); } catch { /* frame closing raced us */ }
+          // Paint-on-arrival. Backing store tracks the stream's upright size so
+          // the CSS object-fit: cover crop matches the old <video> exactly.
+          paintRemote(frame);
           frame.close();
           lastDrawAt = t;
           stats.presentAt.push(+t.toFixed(1));
@@ -2927,6 +2950,27 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           }
         } else if (resizeHold) {
           resizeHold = 0;
+        }
+      }
+      {
+        // Forward the frame's orientation so the peer can paint it upright.
+        // The ctl channel is open here (remoteReady gated above). Rotation only
+        // moves on a device flip/rotate, so this sends once per change.
+        const rot = (((frame.rotation ?? 0) | 0) % 360 + 360) % 360;
+        if (rot !== sentRot) {
+          sentRot = rot;
+          ctlSend({ t: 'rot', rot });
+          L('tape-rot', { lane: 'rtp', dir: 'send', rot });
+        }
+        if (rot === 0 && !rotWarned) {
+          // The one case the metadata cannot cover: frames landscape, camera
+          // portrait, no rotation attribute (engine too old). Log it — guessing
+          // 90 vs 270 blind would flip half of phones upside down.
+          const s = curTrack?.getSettings?.() ?? {};
+          if (s.width && s.height && (s.width < s.height) !== (frame.displayWidth < frame.displayHeight)) {
+            rotWarned = true;
+            L('tape-rot-mismatch', { settings: `${s.width}x${s.height}`, frame: `${frame.displayWidth}x${frame.displayHeight}`, rotAttr: frame.rotation ?? null });
+          }
         }
       }
       const t = now();

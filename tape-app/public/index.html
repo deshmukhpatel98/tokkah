@@ -155,15 +155,15 @@
   /* Device pickers + level meter (§15): in the setup sheet now, but still over
      the live preview — the sheet is a bottom panel, so you can switch cameras
      while watching the mirror, which is the whole reason they were overlaid. */
-  #devPick { display: flex; flex-direction: column; gap: 7px;
+  #devPick, #devPickCall { display: flex; flex-direction: column; gap: 7px;
     padding: 4px 12px 10px; }
-  #devPick select {
+  #devPick select, #devPickCall select {
     background: var(--glass-bg); color: var(--fg); border: 1px solid var(--glass-line);
     border-radius: 999px; padding: 6px 10px; font-size: 11px; max-width: 100%;
     -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); cursor: pointer;
   }
-  #devPick select:hover { border-color: rgba(255,255,255,.28); }
-  #devPick select:disabled { opacity: .5; cursor: default; }
+  #devPick select:hover, #devPickCall select:hover { border-color: rgba(255,255,255,.28); }
+  #devPick select:disabled, #devPickCall select:disabled { opacity: .5; cursor: default; }
   /* A REAL level meter (§15) — actual mic RMS, not a decorative animation.
      Peak-hold decays slowly so a single clap stays visible long enough to read. */
   #levelWrap { position: relative; height: 5px; border-radius: 999px; overflow: hidden;
@@ -590,6 +590,15 @@
       <div class="hint">No audio or video is ever recorded or uploaded — timing counters only.</div>
     </div>
     <div class="callOnly">
+    <!-- §15, mid-call: the same device choice the lobby offers, without
+         leaving the call (user directive 2026-08-06: picking a particular
+         mic or camera must always be possible in-app). Camera switches ride
+         the flip machinery (adoptVideoTrack); the mic switch retargets every
+         consumer — senders, Lane A's capture tap, detectors, interpreter. -->
+    <div id="devPickCall">
+      <select id="camSelCall" class="mono" aria-label="camera"></select>
+      <select id="micSelCall" class="mono" aria-label="microphone"></select>
+    </div>
     <button type="button" class="row" id="c-hud" data-on="0" role="switch" aria-checked="false">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>
       <span>Connection numbers</span>
@@ -613,6 +622,9 @@
     </button>
     <button id="flip" class="icon-btn" style="display:none" aria-label="switch camera" title="switch camera">
       <svg viewBox="0 0 24 24"><path d="M3.2 12a8.8 8.8 0 0 1 8.8-8.8c2.5 0 4.8 1.05 6.4 2.75"/><path d="M20.8 12a8.8 8.8 0 0 1-8.8 8.8c-2.5 0-4.8-1.05-6.4-2.75"/><path d="M18.4 2.6v3.6h-3.6"/><path d="M5.6 21.4v-3.6h3.6"/></svg>
+    </button>
+    <button id="xlate" class="icon-btn" data-off="1" aria-label="live translation" title="live translation">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18"/><path class="slash" d="M4 4l16 16"/></svg>
     </button>
     <button id="leave" class="icon-btn leave" aria-label="leave call" title="leave">
       <svg viewBox="0 0 24 24"><path class="solid" d="M2.6 14.9c5.2-5.1 13.6-5.1 18.8 0l-2.3 2.3c-.6.6-1.5.6-2.1 0l-1.5-1.4a1.6 1.6 0 0 1-.45-1.45l.25-1.3a10.4 10.4 0 0 0-6.5 0l.25 1.3c.1.55-.1 1.1-.45 1.45l-1.5 1.4c-.6.6-1.5.6-2.1 0z"/></svg>

@@ -25,8 +25,12 @@ class XlateTap extends AudioWorkletProcessor {
     this.carry = [];                   // <3 leftover 48k samples between calls
     this.quietMs = 0;
     this.voiced = false;
+    this.voicedMs = 0;                 // speech accumulated since the last flush
     this.THRESH = 0.006;               // rms floor for "someone is talking"
     this.FLUSH_MS = 350;
+    this.MIN_VOICED_MS = 400;          // a flush must have a phrase behind it —
+                                       // Scribe closes the session on rapid
+                                       // commits (measured: `commit_throttled`)
   }
   process(inputs) {
     const ch = inputs[0]?.[0];
@@ -50,10 +54,13 @@ class XlateTap extends AudioWorkletProcessor {
     for (let i = whole; i < all.length; i++) this.carry.push(all[i]);
 
     const frameMs = (ch.length / sampleRate) * 1000;
-    if (rms > this.THRESH) { this.voiced = true; this.quietMs = 0; }
+    if (rms > this.THRESH) { this.voiced = true; this.quietMs = 0; this.voicedMs += frameMs; }
     else if (this.voiced) {
       this.quietMs += frameMs;
-      if (this.quietMs >= this.FLUSH_MS) { this.voiced = false; this.port.postMessage({ flush: true }); }
+      if (this.quietMs >= this.FLUSH_MS) {
+        this.voiced = false;
+        if (this.voicedMs >= this.MIN_VOICED_MS) { this.voicedMs = 0; this.port.postMessage({ flush: true }); }
+      }
     }
     return true;
   }

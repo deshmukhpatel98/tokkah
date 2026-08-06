@@ -46,7 +46,7 @@
  * absorb exactly this. pairs=1 is byte-for-byte today's behaviour.
  */
 
-import { audioContext } from './onset-monitor.js';
+import { audioContext, addWorkletModule } from './onset-monitor.js';
 import { RsEncoder, rsDecode, RS_K, RS_P, setRsK } from './core/pcmrs.js';
 import { SwEncoder, SwDecoder, SW_STRIDE } from './core/pcmsw.js';
 import { packFrame, unpackFrame } from './core/pcmpack.js';
@@ -1844,7 +1844,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   (async () => {
     try {
       ctx = await audioContext(); // the shared 48 kHz context — one clock origin for both detectors
-      await ctx.audioWorklet.addModule('/pcm-worklet.js');
+      await addWorkletModule(ctx, '/pcm-worklet.js');
       if (closed) return;
 
       capNode = new AudioWorkletNode(ctx, 'pcm-capture', {
@@ -1953,6 +1953,18 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         sendPing();
       };
       channel.onerror = (e) => L('pcm-dc-error', { assoc: idx, e: String(e?.error || e).slice(0, 120) });
+    },
+    // Mid-call mic switch (§15): point the capture worklet at the new stream.
+    // Only the source node is rebuilt — the worklet, the ring, and the seq
+    // continue untouched — because MediaStreamAudioSourceNode latches its
+    // track at construction and never follows the stream's track list.
+    retap(stream) {
+      if (!ctx || !capNode) return false;
+      try { source?.disconnect(); } catch { /* already gone */ }
+      source = ctx.createMediaStreamSource(stream);
+      source.connect(capNode);
+      L('pcm-retap', { track: (stream.getAudioTracks?.()[0]?.label ?? '').slice(0, 64) });
+      return true;
     },
     // ── §10 A-V sync probes ─────────────────────────────────────────────────
     // The LOCAL audio clock, in µs: the sender maps its VideoFrame clock onto

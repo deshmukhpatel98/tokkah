@@ -1667,7 +1667,14 @@ worth 0 ms is exactly the kind of thing this project keeps re-learning.
 Three of the eight product claims — cheapest, lowest-latency, most secure — are
 **comparative**, and every comparison is account-gated:
 
-- Google Meet, Zoom, WhatsApp, FaceTime: account required.
+- **Google Meet: bot detection, re-tested 2026-08-06 with a live Workspace host.**
+  The account was never the constraint — anonymous "Ask to join" exists — but the
+  automated browser is refused before the prejoin screen ("You can't join this
+  video call"). Four arms isolate it: headless and headful both fail on the
+  default UA; the prejoin appears only once the browser stops declaring itself
+  automated. That is bot-detection evasion, so the route is closed and no number
+  was taken. Full experiment in `BENCHMARK.md`.
+- Zoom, WhatsApp, FaceTime: account required.
 - meet.jit.si: re-tested 2026-08-02, now moderator-gated
   (`conference.connectionError.membersOnly`). It was the last account-free option.
 

@@ -522,7 +522,14 @@ if (QS.get('synthmedia') === '1') {
   };
 }
 
-const WANT_H = Number(QS.get('res')) || 1080;
+// Phones get hard ceilings the desktop path does not (task #13, room log
+// 2026-08-06): receiver-driven resolution made an Android encode 1080p60 while
+// decoding ~1080p — the device melted (2–5 fps out, 30 s of freezes per
+// session). A phone's panel is small and close; 720p is visually transparent
+// there, and half the pixels each way is the whole difference between a call
+// and a slideshow. `?res=`/`?fpsmax=` still override for experiments.
+const IS_MOBILE = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
+const WANT_H = Number(QS.get('res')) || (IS_MOBILE ? 720 : 1080);
 const WANT_W = WANT_H >= 1080 ? 1920 : 1280;
 // H.264 by default, which is not the obvious choice and was not a guess. Measured with VMAF
 // against a 1080p master, at the bitrate each codec actually achieves in Chrome on this machine:
@@ -592,7 +599,11 @@ const V_MAXFPS = Number(QS.get('maxfps')) || null;
 // FAILS outright at framerate 144 on this machine ("Unsupported bitrate mode"), and real
 // camera content at constant QP24 already runs ~9.5-12 Mbps at 30 fps, so the bandwidth
 // ceiling binds long before the CPU one does.
-const FPS_CEILING = Number(QS.get('fpsmax')) || 72;
+// On phones the ceiling is 30: the fps-repair pass was pushing a budget Android
+// camera to 1080p60 (capture-fps-repair 'repaired' in the 2026-08-06 room log),
+// and the sensor + ISP at 60 fps is a large slice of both the CPU melt and the
+// battery bill (#48: the phone bill is mostly camera and radio).
+const FPS_CEILING = Number(QS.get('fpsmax')) || (IS_MOBILE ? 30 : 72);
 // `?cadence=0` disables snapping the send rate to a whole divisor of the peer's refresh.
 const CADENCE_SNAP = QS.get('cadence') !== '0';
 // How much of the frame rate we are willing to give up to buy an even cadence. Two budgets,
@@ -2931,8 +2942,19 @@ const sendDisplayHz = () =>
              // Task #52, resolution half: the peer cannot present more pixels than
              // this panel has, so their SEND resolution is our display's business —
              // the same law as the refresh rate, one axis over. Physical px, not CSS.
-             w: Math.round(screen.width * devicePixelRatio),
-             h: Math.round(screen.height * devicePixelRatio) })
+             // Task #13: a phone lies here by telling the truth — its PANEL is
+             // 1080×2410 but its DECODER cannot run that next to its own encode
+             // (measured: 1089 dropped frames, 74 freezes in one session). A
+             // phone asks for at most 720p-class pixels.
+             ...(() => {
+               let w = Math.round(screen.width * devicePixelRatio);
+               let h = Math.round(screen.height * devicePixelRatio);
+               if (IS_MOBILE) {
+                 const k = Math.min(1, 1280 / Math.max(w, h), 720 / Math.min(w, h));
+                 w = Math.round(w * k); h = Math.round(h * k);
+               }
+               return { w, h };
+             })() })
     : false;
 // Started at load. It needs ~2 s of animation frames and the lobby is at least that
 // long, so by join time the answer is usually already in hand. The three sends cover
@@ -2960,8 +2982,12 @@ const CAM_RES = QS.get('camres') === '1';
 // or tiny display must not turn the call to soup).
 function sendResCeiling() {
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  if (!peerPxLong) return { w: WANT_W, h: WANT_H };
-  return { w: clamp(peerPxLong, 640, 3840), h: clamp(peerPxShort, 360, 2160) };
+  // Task #13: whatever the peer's panel wants, a phone never ENCODES above
+  // 720p-class — its own encode budget binds before the peer's display does.
+  const hiW = IS_MOBILE ? 1280 : 3840;
+  const hiH = IS_MOBILE ? 720 : 2160;
+  if (!peerPxLong) return { w: Math.min(WANT_W, hiW), h: Math.min(WANT_H, hiH) };
+  return { w: clamp(peerPxLong, 640, hiW), h: clamp(peerPxShort, 360, hiH) };
 }
 
 async function syncSendRes(why) {
@@ -4375,8 +4401,13 @@ function setSheet(on) {
   safe(() => {
     $('moreSheet').classList.toggle('on', on);
     $('moreScrim').classList.toggle('on', on);
-    if (on) { showBar(true); if (joined) refreshSafetyCode(); }
-    else scheduleHide();
+    if (on) {
+      showBar(true);
+      if (joined) refreshSafetyCode();
+      // Devices come and go mid-call (a headset plugged in IS the reason the
+      // sheet was opened); the pickers must say what is true right now.
+      safeAsync(fillDevicePickers, 'sheet.devs');
+    } else scheduleHide();
     tel?.log('gesture', { what: 'more-sheet', on: on ? 1 : 0 });
   }, 'sheet');
 }
@@ -4493,6 +4524,52 @@ function applyMirror(track) {
   }, 'mirror');
 }
 
+// The one mid-call camera-move path, shared by the flip button (which picks
+// the NEXT camera) and the in-call picker (which picks a PARTICULAR one —
+// user directive 2026-08-06). One path, or the two controls drift apart.
+async function switchCameraTo(deviceId) {
+  const old = localStream?.getVideoTracks()[0];
+  const want = { ...captureConstraints(), deviceId: { exact: deviceId } };
+
+  let nv = null;
+  let fallbackUsed = 0;
+  try {
+    // Open the new sensor BEFORE closing the old one, so a refusal leaves
+    // the call with a working camera instead of a black rectangle.
+    nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
+    // Take the old track OUT of the stream now (so the source probe below
+    // cannot latch onto it) but leave the sensor RUNNING until replaceTrack
+    // has actually landed — stopping it first parks an ended track on the
+    // sender and the other person sees a frozen frame during the swap.
+    if (old) localStream.removeTrack(old);
+  } catch (e) {
+    // Plenty of Android HALs refuse a second open while the first is live
+    // (NotReadableError). Take the ~0.5 s black gap rather than lose the
+    // flip — and log which path ran, because the gap is visible and a
+    // silent difference between devices is the thing that wastes an hour.
+    fallbackUsed = 1;
+    tel?.log('camera-flip-retry', { name: e?.name ?? 'unknown' });
+    if (old) { localStream.removeTrack(old); old.stop(); }
+    nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
+  }
+  const fromId = old?.getSettings?.().deviceId ?? null;
+  await adoptVideoTrack(nv);
+  old?.stop(); // the wire is on the new sensor now; retire the old one
+  applyMirror(nv);
+  $('selfFull').srcObject = localStream;
+  safe(() => localStorage.setItem('tape.cam', deviceId), 'flip.remember');
+  haptic();
+  tel?.log('camera-flip', {
+    // from/to, or a flip log cannot say which camera it moved between —
+    // which is the one question you ask it when a device misbehaves.
+    from: fromId,
+    to: deviceId,
+    facingMode: nv?.getSettings?.().facingMode ?? null,
+    fallbackUsed,
+    settings: pick(nv?.getSettings?.() ?? {}, ['width', 'height', 'frameRate']),
+  });
+}
+
 let flipBusy = false;
 $('flip').onclick = () =>
   safeAsync(async () => {
@@ -4502,58 +4579,86 @@ $('flip').onclick = () =>
     if (!joined) { haptic(); return void (await flipPreJoin()); }
     flipBusy = true;
     $('flip').disabled = true;
-    const old = localStream?.getVideoTracks()[0];
     try {
       const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
       if (cams.length < 2) return;
-      const cur = old?.getSettings?.().deviceId;
+      const cur = localStream?.getVideoTracks()[0]?.getSettings?.().deviceId;
       const i = Math.max(0, cams.findIndex((d) => d.deviceId === cur));
-      const next = cams[(i + 1) % cams.length];
-      const want = { ...captureConstraints(), deviceId: { exact: next.deviceId } };
-
-      let nv = null;
-      let fallbackUsed = 0;
-      try {
-        // Open the new sensor BEFORE closing the old one, so a refusal leaves
-        // the call with a working camera instead of a black rectangle.
-        nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
-        // Take the old track OUT of the stream now (so the source probe below
-        // cannot latch onto it) but leave the sensor RUNNING until replaceTrack
-        // has actually landed — stopping it first parks an ended track on the
-        // sender and the other person sees a frozen frame during the swap.
-        if (old) localStream.removeTrack(old);
-      } catch (e) {
-        // Plenty of Android HALs refuse a second open while the first is live
-        // (NotReadableError). Take the ~0.5 s black gap rather than lose the
-        // flip — and log which path ran, because the gap is visible and a
-        // silent difference between devices is the thing that wastes an hour.
-        fallbackUsed = 1;
-        tel?.log('camera-flip-retry', { name: e?.name ?? 'unknown' });
-        if (old) { localStream.removeTrack(old); old.stop(); }
-        nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
-      }
-      const fromId = old?.getSettings?.().deviceId ?? null;
-      await adoptVideoTrack(nv);
-      old?.stop(); // the wire is on the new sensor now; retire the old one
-      applyMirror(nv);
-      $('selfFull').srcObject = localStream;
-      safe(() => localStorage.setItem('tape.cam', next.deviceId), 'flip.remember');
-      haptic();
-      tel?.log('camera-flip', {
-        // from/to, or a flip log cannot say which camera it moved between —
-        // which is the one question you ask it when a device misbehaves.
-        from: fromId,
-        to: next.deviceId,
-        facingMode: nv?.getSettings?.().facingMode ?? null,
-        fallbackUsed,
-        settings: pick(nv?.getSettings?.() ?? {}, ['width', 'height', 'frameRate']),
-      });
+      await switchCameraTo(cams[(i + 1) % cams.length].deviceId);
+      await fillDevicePickers(); // the in-call picker must say where the flip landed
     } finally {
       flipBusy = false;
       $('flip').disabled = false;
       showBar(true); // a flip is a state change; the bar earns its 10 s again
     }
   }, 'flip');
+
+// ── Mid-call microphone switch (§15) ────────────────────────────────────────
+// The mic has more consumers than the camera, and none of them follow a
+// track swap on their own: the Opus-mode sender and the Lane-A hot spare
+// (RTCRtpSenders — replaceTrack), Lane A's capture worklet (pcm.retap — its
+// source node latches the track at construction), the local onset detector
+// (re-attach), and the interpreter's tap (restart, signaling-silent). Each is
+// retargeted explicitly; missing one is a silent one-way failure in that one
+// subsystem, which is exactly why the switch is logged per consumer.
+let micSwitchBusy = false;
+async function switchMicTo(deviceId) {
+  if (micSwitchBusy || !localStream) return;
+  micSwitchBusy = true;
+  try {
+    const old = localStream.getAudioTracks()[0];
+    const want = { ...audioConstraints(true), deviceId: { exact: deviceId } };
+    const nt = (await navigator.mediaDevices.getUserMedia({ audio: want })).getAudioTracks()[0];
+    // Mute survives the switch: a red mic must stay red on the new device.
+    if (old) nt.enabled = old.enabled;
+    const fromId = old?.getSettings?.().deviceId ?? null;
+    if (old) localStream.removeTrack(old);
+    localStream.addTrack(nt);
+    // Every sender currently holding an audio track moves over — Opus mode's
+    // live sender, or the hot spare after a Lane-A fallback. A spare that is
+    // parked on null stays null: giving it the mic here would START a second
+    // audio path alongside Lane A.
+    for (const s of pc?.getSenders?.() ?? []) {
+      if (s.track?.kind === 'audio') await s.replaceTrack(nt).catch(() => { /* sender torn down */ });
+    }
+    const retapped = pcm ? safe(() => pcm.retap?.(localStream) ?? false, 'micswitch.retap') : null;
+    // The local onset detector (turn-taking's ears) follows the new track.
+    localMon?.disconnect();
+    localMon = await safeAsync(() => attachDetector(localStream, 'local', (ev) => onDetector('local', ev)), 'micswitch.mon');
+    // Interpreter: its tap worklet latched the old track too. fromPeer=true on
+    // both calls keeps the restart signaling-silent — the peer never toggles.
+    if (xlateApi) { xlateStop(true); await xlateStart(true); }
+    old?.stop();
+    safe(() => localStorage.setItem('tape.mic', deviceId), 'micswitch.remember');
+    $('mic').dataset.off = nt.enabled ? '0' : '1';
+    haptic();
+    tel?.log('mic-switch', {
+      from: fromId,
+      to: deviceId,
+      label: (nt.label ?? '').slice(0, 64),
+      retapped,
+      settings: pick(nt.getSettings?.() ?? {}, ['sampleRate', 'channelCount', 'echoCancellation']),
+    });
+  } finally {
+    micSwitchBusy = false;
+  }
+}
+
+// In-call pickers (§15, user directive 2026-08-06): a particular device,
+// not just "the next one". Busy-guard via disabled — a second change while
+// the first is mid-swap would race two getUserMedia calls on one sensor.
+$('camSelCall').onchange = () =>
+  safeAsync(async () => {
+    if (!joined || !$('camSelCall').value) return;
+    $('camSelCall').disabled = true;
+    try { await switchCameraTo($('camSelCall').value); } finally { $('camSelCall').disabled = false; }
+  }, 'call.switch.cam');
+$('micSelCall').onchange = () =>
+  safeAsync(async () => {
+    if (!joined || !$('micSelCall').value) return;
+    $('micSelCall').disabled = true;
+    try { await switchMicTo($('micSelCall').value); } finally { $('micSelCall').disabled = false; }
+  }, 'call.switch.mic');
 
 // The "Save call log" control is gone from the more sheet — downloading a
 // counter dump is not something a person in a conversation wants, and offering
@@ -5029,12 +5134,13 @@ async function openPreview(camId, micId) {
   try {
     s = await navigator.mediaDevices.getUserMedia({ video, audio });
   } catch (e) {
-    // A remembered camera (§8 item 38) that has since been unplugged fails with
-    // OverconstrainedError. Remembering a preference must never be able to cost
-    // someone their camera, so an exact-device ask degrades to "any camera".
-    if (!video.deviceId) throw e;
+    // A remembered camera or mic (§8 item 38) that has since been unplugged
+    // fails with OverconstrainedError. Remembering a preference must never be
+    // able to cost someone their devices, so an exact ask degrades to "any".
+    if (!video.deviceId && !audio.deviceId) throw e;
     tel?.log('preview-device-fallback', { name: e?.name ?? 'unknown' });
     delete video.deviceId;
+    delete audio.deviceId;
     s = await navigator.mediaDevices.getUserMedia({ video, audio });
   }
   previewStream = s;
@@ -5060,11 +5166,15 @@ async function openPreview(camId, micId) {
 /** Fill the pickers. Labels are blank until permission is granted, hence after. */
 async function fillDevicePickers() {
   const devs = await navigator.mediaDevices.enumerateDevices();
-  const cur = previewStream?.getTracks?.() ?? [];
+  // Both phases fill from the stream that is actually live: the lobby's
+  // preview before join, the call's own stream after.
+  const cur = armStream()?.getTracks?.() ?? [];
   const curOf = (kind) => cur.find((t) => t.kind === kind)?.getSettings?.().deviceId;
   for (const [sel, kind, noun] of [
     ['camSel', 'videoinput', 'camera'],
     ['micSel', 'audioinput', 'microphone'],
+    ['camSelCall', 'videoinput', 'camera'],
+    ['micSelCall', 'audioinput', 'microphone'],
   ]) {
     const el = $(sel);
     if (!el) continue;
@@ -5078,9 +5188,11 @@ async function fillDevicePickers() {
     }
     const now = curOf(kind === 'videoinput' ? 'video' : 'audio');
     if (now) el.value = now;
-    // One device is not a choice; showing a dead dropdown is clutter.
-    el.disabled = list.length < 2;
-    el.style.display = list.length < 2 ? 'none' : '';
+    // Always shown (user directive 2026-08-06: selecting a particular device
+    // must always be possible in-app). A single-device list still NAMES the
+    // device in use — that is information, not clutter — and only an empty
+    // list deadens the control.
+    el.disabled = list.length < 1;
   }
 }
 
@@ -5214,7 +5326,10 @@ showBar();
 // toggle flips — the user fixes the setting and the mirror just appears,
 // no reload, no instructions.
 function bootPreview() {
-  return openPreview(safe(() => localStorage.getItem('tape.cam'), 'flip.recall') || null)
+  return openPreview(
+    safe(() => localStorage.getItem('tape.cam'), 'flip.recall') || null,
+    safe(() => localStorage.getItem('tape.mic'), 'mic.recall') || null,
+  )
   .then(async () => {
     // The door opens only with both devices in hand (user directive 2026-08-04:
     // nobody starts a call without allowing microphone AND camera). openPreview
@@ -5254,6 +5369,12 @@ function bootPreview() {
           applyMirror(previewStream?.getVideoTracks?.()[0]);
           await startLevelMeter(previewStream);
           syncArmState();
+          // A choice made in the lobby is a preference, same as the flip's:
+          // next visit opens on the devices this person actually picked.
+          safe(() => {
+            if ($('camSel').value) localStorage.setItem('tape.cam', $('camSel').value);
+            if ($('micSel').value) localStorage.setItem('tape.mic', $('micSel').value);
+          }, 'lobby.remember');
         }, `lobby.switch.${kind}`);
     }
   })
@@ -5378,6 +5499,12 @@ window.__tape = {
   // instead of re-implementing it. Re-implementing it is how the first version of
   // that test replaced the lane 2 carrier and called the result a mystery.
   adopt: (nv) => adoptVideoTrack(nv),
+  // The shipped device-switch paths (§15 pickers), for the same reason as
+  // `adopt`: the rig must drive what users get, not a re-implementation. A
+  // fake-device browser has one mic, so the mic test switches to ITSELF —
+  // which still exercises every consumer handoff the real switch performs.
+  switchMic: (id) => switchMicTo(id),
+  switchCam: (id) => switchCameraTo(id),
   get tel() { return tel; },
   get turns() { return turns; },
   // Task #50 test hook: the recovery harness kills this socket to simulate the
