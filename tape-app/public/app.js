@@ -4548,13 +4548,32 @@ function applyMirror(track) {
 async function switchCameraTo(deviceId) {
   const old = localStream?.getVideoTracks()[0];
   const want = { ...captureConstraints(), deviceId: { exact: deviceId } };
+  const openCam = async (constraints) =>
+    (await navigator.mediaDevices.getUserMedia({ video: constraints })).getVideoTracks()[0];
+  // stop() returns before the Android HAL actually frees the sensor — the
+  // release takes hundreds of ms — so an immediate open of the OTHER camera
+  // throws NotReadableError exactly like the two-cameras-at-once refusal did.
+  // Measured live (room rni-kqta-qak, 2026-08-08): every single-shot retry
+  // failed ~300 ms after the stop, seven flips in a row, and each failure
+  // threw out of this function with the old track already removed AND stopped
+  // — the call sat frozen with no video track at all until a manual refresh.
+  // Backoff, don't conclude: the sensor frees within a second or two.
+  const openWithBackoff = async (constraints, delays) => {
+    for (const ms of delays) {
+      await new Promise((r) => setTimeout(r, ms));
+      try { return await openCam(constraints); } catch (e) {
+        tel?.log('camera-flip-retry', { name: e?.name ?? 'unknown', afterMs: ms });
+      }
+    }
+    return null;
+  };
 
   let nv = null;
   let fallbackUsed = 0;
   try {
     // Open the new sensor BEFORE closing the old one, so a refusal leaves
     // the call with a working camera instead of a black rectangle.
-    nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
+    nv = await openCam(want);
     // Take the old track OUT of the stream now (so the source probe below
     // cannot latch onto it) but leave the sensor RUNNING until replaceTrack
     // has actually landed — stopping it first parks an ended track on the
@@ -4566,22 +4585,37 @@ async function switchCameraTo(deviceId) {
     // flip — and log which path ran, because the gap is visible and a
     // silent difference between devices is the thing that wastes an hour.
     fallbackUsed = 1;
-    tel?.log('camera-flip-retry', { name: e?.name ?? 'unknown' });
+    tel?.log('camera-flip-retry', { name: e?.name ?? 'unknown', afterMs: 0 });
     if (old) { localStream.removeTrack(old); old.stop(); }
-    nv = (await navigator.mediaDevices.getUserMedia({ video: want })).getVideoTracks()[0];
+    nv = await openWithBackoff(want, [250, 600, 1400]);
+    if (!nv) {
+      // The FLIP is lost; the CALL must not be. Reacquire the camera we just
+      // stopped — the one sensor this phone has proven it can run — rather
+      // than leave the stream trackless and both sides frozen.
+      const oldId = old?.getSettings?.().deviceId;
+      const oldWant = { ...captureConstraints(), ...(oldId ? { deviceId: { exact: oldId } } : {}) };
+      nv = await openWithBackoff(oldWant, [250, 600, 1400]);
+      tel?.log('camera-flip-failed', { wanted: deviceId, restored: nv ? 1 : 0 });
+      if (!nv) throw new Error('The other camera could not be started, and this one could not be reopened. Rejoin to restore video.');
+    }
   }
+  // Where we actually LANDED: the requested camera, or the old one restored
+  // after a failed flip. Everything downstream (mirror, picker, the remembered
+  // choice) must describe reality, not the request.
+  const landedId = nv.getSettings?.().deviceId ?? deviceId;
   const fromId = old?.getSettings?.().deviceId ?? null;
   await adoptVideoTrack(nv);
   old?.stop(); // the wire is on the new sensor now; retire the old one
   applyMirror(nv);
   $('selfFull').srcObject = localStream;
-  safe(() => localStorage.setItem('tape.cam', deviceId), 'flip.remember');
+  safe(() => localStorage.setItem('tape.cam', landedId), 'flip.remember');
   haptic();
   tel?.log('camera-flip', {
     // from/to, or a flip log cannot say which camera it moved between —
     // which is the one question you ask it when a device misbehaves.
     from: fromId,
-    to: deviceId,
+    to: landedId,
+    requested: deviceId,
     facingMode: nv?.getSettings?.().facingMode ?? null,
     fallbackUsed,
     settings: pick(nv?.getSettings?.() ?? {}, ['width', 'height', 'frameRate']),
