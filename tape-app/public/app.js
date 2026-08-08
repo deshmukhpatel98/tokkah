@@ -1103,7 +1103,7 @@ async function adoptVideoTrack(nv) {
   startSourceProbe(localStream);
   if (lumaVideo) {
     lumaVideo.srcObject = new MediaStream([nv]);
-    safeAsync(() => lumaVideo.play(), 'luma.play.reacquire'); // a re-pointed element is paused again
+    safeAsync(() => lumaVideo.play().catch((e) => { if (e?.name !== 'AbortError') throw e; }), 'luma.play.reacquire'); // a re-pointed element is paused again
   }
   lumaBlindTicks = 0;
   lowlightOn = false;
@@ -2044,7 +2044,9 @@ function fallbackToOpus(why, quiet) {
   safe(() => {
     pcm?.stop();
     pcm = null;
-    for (const spc of pcmPcs) safe(() => spc.close(), 'pcm.stripe-close');
+    // pcmPcs is indexed from 1 (association 0 rides the main pc), so slot 0 is
+    // always a hole — close only what exists, same as the teardown at leave.
+    for (const spc of pcmPcs) if (spc) safe(() => spc.close(), 'pcm.stripe-close');
     pcmPcs = [];
     const mic = localStream?.getAudioTracks()[0];
     if (pcmSpareSender && mic) pcmSpareSender.replaceTrack(mic).catch(() => {});
@@ -2737,7 +2739,9 @@ function startLumaWatchdog(stream) {
     // Measured: hidden element 0.0, visible element 96.2, VideoFrame 97.4, same
     // track and same second. Ask for play explicitly; the frame path below is
     // what actually carries this on Chromium, this is the fallback.
-    safeAsync(() => lumaVideo.play(), 'luma.play');
+    // AbortError is play() interrupted by a newer load/srcObject swap — routine
+    // on Safari, not a defect; it logged as an error 3× in room vjj-spil-qli.
+    safeAsync(() => lumaVideo.play().catch((e) => { if (e?.name !== 'AbortError') throw e; }), 'luma.play');
     const c = document.createElement('canvas');
     c.width = 64;
     c.height = 36;
@@ -3980,9 +3984,18 @@ async function join(room) {
   // the full twelve, and naming the likeliest cause beats "signaling timeout".
   let wsOpened = false;
   ws.addEventListener('open', () => { wsOpened = true; });
+  // A pre-open failure has two very different causes the browser won't
+  // distinguish: the room's 409 (full) and no network at all. Room vjj-spil-qli
+  // (2026-08-06): a phone whose radio had just died was told the call "may
+  // already have two people in it" — wrong, and it points the user at the
+  // other person instead of their own connection. navigator.onLine is the one
+  // signal we have; false is trustworthy (true is not).
+  const preOpenErr = () => new Error(navigator.onLine === false
+    ? 'no internet connection — check WiFi or mobile data'
+    : 'this call may already have two people in it');
   ws.onclose = () => {
     tel.log('ws-close', { opened: wsOpened ? 1 : 0 });
-    if (!wsOpened) wsPreOpenFail?.(new Error('this call may already have two people in it'));
+    if (!wsOpened) wsPreOpenFail?.(preOpenErr());
     // Task #50: a mid-call socket close is the first symptom of a network flip
     // (it dies faster than ICE notices). recoverCall's own guards keep lobby
     // closes, deliberate leaves, and rejected joins out of here.
@@ -3990,7 +4003,7 @@ async function join(room) {
   };
   ws.onerror = () => {
     tel.log('ws-error', { opened: wsOpened ? 1 : 0 });
-    if (!wsOpened) wsPreOpenFail?.(new Error('this call may already have two people in it'));
+    if (!wsOpened) wsPreOpenFail?.(preOpenErr());
   };
   ws.onmessage = async (ev) => {
     await safeAsync(async () => {
@@ -5099,7 +5112,11 @@ $('join').onclick = async () => {
     if (QS.get('rejoin') === '1' && !joined && rejoinRetries < REJOIN_RETRY_MAX) {
       rejoinRetries++;
       tel?.log('rejoin-retry', { n: rejoinRetries });
-      setTimeout(() => safe(() => { if (!joined) $('join').click(); }, 'rejoin.retry'), 4000);
+      // First retry comes fast: in room vjj-spil-qli the user out-raced the 4 s
+      // timer with a manual reload (~5 s), which mints a fresh session and a
+      // fresh ghost. A 1.2 s first probe beats the human reflex; later retries
+      // keep the 4 s spacing so a genuinely full room isn't hammered.
+      setTimeout(() => safe(() => { if (!joined) $('join').click(); }, 'rejoin.retry'), rejoinRetries === 1 ? 1200 : 4000);
     }
   }
 };
