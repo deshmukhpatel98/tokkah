@@ -1683,18 +1683,48 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // cheap, but 15% hysteresis keeps it off the per-frame path.
   // An explicit ?l2vbrbps= pins the bitrate and disables tracking — that is the
   // measurement hook, and a pinned arm must stay pinned.
+  let rcVbrLastConfigAt = -Infinity;
   function rcVbrRetune() {
     if (rateControl !== 'vbr' || cfg.l2VbrBps || !enc || enc.state !== 'configured'
         || !encConfig || rcBudgetMbps == null) return;
     const parityShare = stats.bytesSent > 0 ? stats.parityBytes / stats.bytesSent : 0.25;
-    const want = Math.max(1_000_000, Math.round((rcBudgetMbps * 1e6) / (1 + parityShare)));
+    // The budget must follow the frames the pacer actually admits. A VBR encoder
+    // budgets bits per unit TIME: hand it the full budget while the pacer admits
+    // 2 of 30 captures and every admitted frame balloons to ~budget/admitted —
+    // which takes longer to send, raises the peer's age, cuts admitRate further,
+    // and the loop closes. Measured live (room uol-jdmh-omn, 2026-08-07, Android
+    // on 4G): rcVbrBps pinned at 6.4 Mbps against a GCC estimate frozen at
+    // 37 Mbps, admitRate at the 2 fps floor, 43 KB mean frames, 84% of captures
+    // skipped, both sides cycling stall-HOLD for the whole call. Scaling by the
+    // admitted share keeps per-frame size ≈ budget/cameraFps — the same
+    // per-frame invariant the fixed-QP loop holds — so congested frames stay
+    // small and the AIMD's own recovery can climb back out. The quantizer arm
+    // needs none of this: rcOnEncoded targets budget/cfg.fps per frame already.
+    // Quantized to power-of-two steps with a cooldown, because configure() is
+    // NOT free here the way the 15% hysteresis assumed: tracking admitRate
+    // continuously reconfigured ~1/s and the hardware encoder stalled on each
+    // one (measured on the shaped 2 Mbps rig: encode p50 went 3.2 ms → 501 ms
+    // and delivery got WORSE than the spiral this replaces). Steps land on
+    // 1, ½, ¼, ⅛ of the budget, so the encoder is touched only when the pacer
+    // regime genuinely moved, and at most once per 3 s.
+    const rawShare = cfg.l2VbrAdmit === false ? 1 : Math.min(1, admitRate / cfg.fps);
+    const admitShare = rawShare >= 0.75 ? 1 : rawShare >= 0.375 ? 0.5 : rawShare >= 0.1875 ? 0.25 : 0.125;
+    const want = Math.max(250_000, Math.round((rcBudgetMbps * 1e6 * admitShare) / (1 + parityShare)));
     const cur = encConfig.bitrate || 0;
-    if (cur && Math.abs(want - cur) / cur < 0.15) return;
+    // 35%, not the 15% the original tracker used: the GCC budget estimate
+    // swings past 15% on nearly every 1 s poll, which put configure() back on
+    // a ~3 s cadence even with the cooldown. A retune should mark a regime
+    // change (the admit ladder moved, or the budget really collapsed), and the
+    // spiral this exists for is an 8× move — a wide deadband cannot miss it.
+    if (cur && Math.abs(want - cur) / cur < 0.35) return;
+    const tNow = now();
+    if (tNow - rcVbrLastConfigAt < 5000) return;
+    rcVbrLastConfigAt = tNow;
     try {
       encConfig = { ...encConfig, bitrate: want };
       enc.configure(encConfig);
       stats.rcVbrBps = want;
-      L('vbr-retune', { fromBps: cur, toBps: want, budgetMbps: rcBudgetMbps });
+      L('vbr-retune', { fromBps: cur, toBps: want, budgetMbps: rcBudgetMbps, admitFps: +admitRate.toFixed(1) });
     } catch (e) {
       L('vbr-retune-failed', { want, err: String(e).slice(0, 120) });
     }

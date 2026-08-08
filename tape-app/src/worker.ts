@@ -1001,7 +1001,7 @@ const HB_ALLOWED: Record<string, Set<string>> = {
 
 export class Health implements DurableObject {
   private sql: SqlStorage;
-  constructor(private state: DurableObjectState, _env: unknown) {
+  constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS beats (
@@ -1016,6 +1016,20 @@ export class Health implements DurableObject {
         conceal_pct REAL,
         tape INTEGER,
         reason TEXT
+      );
+    `);
+    // Operator room registry. The health BEATS stay anonymous by design (no
+    // room codes, ever) — this table is a separate, operator-only concern:
+    // WHICH room was live WHEN, so a "yesterday's call was bad" report can be
+    // turned into that room's own log without asking the user for the link.
+    // Reading it requires LOG_ADMIN_TOKEN, the same credential that already
+    // reads any room's full telemetry, so it widens nothing.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        code TEXT PRIMARY KEY,
+        first_wall REAL NOT NULL,
+        last_wall REAL NOT NULL,
+        joins INTEGER NOT NULL
       );
     `);
   }
@@ -1041,6 +1055,32 @@ export class Health implements DurableObject {
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
+    }
+    if (url.pathname === '/room-seen' && request.method === 'POST') {
+      const code = String((await request.text()) ?? '').slice(0, 32);
+      if (!/^[a-z]{3}-[a-z]{4}-[a-z]{3}$|^[a-z0-9-]{1,32}$/.test(code)) return json({ error: 'bad code' }, 400);
+      const wall = Date.now();
+      this.sql.exec(
+        `INSERT INTO rooms (code, first_wall, last_wall, joins) VALUES (?, ?, ?, 1)
+         ON CONFLICT(code) DO UPDATE SET last_wall = ?, joins = joins + 1`,
+        code, wall, wall, wall,
+      );
+      // Bounded: keep the 200 most recently active rooms.
+      this.sql.exec(`DELETE FROM rooms WHERE code NOT IN (SELECT code FROM rooms ORDER BY last_wall DESC LIMIT 200)`);
+      return json({ ok: true });
+    }
+    if (url.pathname === '/rooms' && request.method === 'GET') {
+      const t = url.searchParams.get('token');
+      if (!this.env.LOG_ADMIN_TOKEN || t !== this.env.LOG_ADMIN_TOKEN) return json({ error: 'admin token required' }, 403);
+      const rows = this.sql.exec(
+        `SELECT code, first_wall, last_wall, joins FROM rooms ORDER BY last_wall DESC LIMIT 100`,
+      ).toArray() as Array<{ code: string; first_wall: number; last_wall: number; joins: number }>;
+      return json(rows.map((r) => ({
+        code: r.code,
+        first: new Date(r.first_wall).toISOString(),
+        last: new Date(r.last_wall).toISOString(),
+        joins: r.joins,
+      })));
     }
     if (url.pathname === '/summary' && request.method === 'GET') {
       const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days')) || 7));
@@ -1106,7 +1146,7 @@ const csp = (host: string) => [
 ].join('; ');
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // WebRTC requires a secure context: an http:// page loads fine but
@@ -1186,12 +1226,30 @@ export default {
         new Request(`https://do/summary${url.search}`),
       );
     }
+    // Operator-only: which rooms were live, when. Gated inside the DO on
+    // LOG_ADMIN_TOKEN — the credential that already reads any room's log.
+    if (url.pathname === '/api/health/rooms' && request.method === 'GET') {
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request(`https://do/rooms${url.search}`),
+      );
+    }
 
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary
     const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate)$/);
     if (m) {
       const code = decodeURIComponent(m[1]);
       if (!ROOM_RE.test(code)) return json({ error: 'bad room code' }, 400);
+      // Every join stamps the operator registry with code + time, so "the call
+      // yesterday was bad" can be answered from /api/health/rooms without
+      // asking anyone for the link. Fire-and-forget: the registry must never
+      // cost the join anything, so its failure is swallowed whole.
+      if (m[2] === 'ws' && request.headers.get('upgrade') === 'websocket') {
+        ctx.waitUntil(
+          env.HEALTH.get(env.HEALTH.idFromName('global'))
+            .fetch(new Request('https://do/room-seen', { method: 'POST', body: code }))
+            .then(() => {}, () => {}),
+        );
+      }
       return env.ROOM.get(env.ROOM.idFromName(code)).fetch(
         new Request(`https://do/${m[2]}${url.search}`, request),
       );

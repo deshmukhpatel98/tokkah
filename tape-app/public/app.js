@@ -1334,6 +1334,11 @@ const TAPE_CFG = {
   // to what the fixed-QP arm actually delivers: comparing VBR-at-12-Mbps against
   // QP24-at-6.4-Mbps would score rate control and rate together and settle neither.
   l2VbrBps: Number(QS.get('l2vbrbps')) || 0,
+  // ?l2vbradmit=0 — control arm for the VBR admit-share coupling (room
+  // uol-jdmh-omn, 2026-08-07): on the VBR arm the encoder bitrate follows the
+  // pacer's admitted share so per-frame size cannot balloon when the link is
+  // scarce. 0 reverts to the fixed full-budget target.
+  l2VbrAdmit: QS.get('l2vbradmit') !== '0',
   // Task #48 A/B knob: WebCodecs hardwareAcceleration preference for the lane-2
   // encoder/decoder. Unset means the browser decides (the shipping default,
   // logged as `hw` in tape-encoder telemetry). `?l2hw=hw` asks for the
