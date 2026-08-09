@@ -1459,6 +1459,7 @@ function xlateStop(fromPeer) {
   if (!fromPeer) send({ type: 'xlate-off' });
 }
 const PCM_CFG = {
+  aec2: QS.get('aec2') === '1',
   echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
@@ -1837,6 +1838,10 @@ function startPcm(initiator) {
       onTurnEnd: LANE0 ? onTurnEnd : null,
       onPredict: LANE0 ? onPredict : null,
       onEchoDetected: ({ corr, lagMs }) => {
+        if (PCM_CFG.aec2) {
+          tel?.log('echo-detected', { corr, lagMs, aec2: true });
+          return;
+        }
         if (aecOn || QS.get('aec') === '0') {
           tel?.log('echo-detected', { corr, lagMs });
           return;

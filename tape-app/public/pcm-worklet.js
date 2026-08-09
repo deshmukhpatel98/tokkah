@@ -29,6 +29,7 @@
 
 import { OnsetDetector } from './core/onset.js';
 import { TurnEndPredictor } from './core/turnend.js';
+import { createAec } from './core/aec-core.js';
 
 const FRAME = 384;          // 8 ms at 48 kHz — one frame is one datagram
 const RING_F = 64;          // 512 ms of ring — 4× the 120 ms D_max plus slack
@@ -93,14 +94,35 @@ class PcmCapture extends AudioWorkletProcessor {
     this.cHi = o.capSab ? new Int32Array(o.capSab, 0, 1) : null;
     this.cTs = o.capSab ? new Float64Array(o.capSab, 64, CAP_RING_F) : null;
     this.cRing = o.capSab ? new Uint8Array(o.capSab, 320, CAP_RING_F * CAP_FRAME_B) : null;
+    if (o.aecSab) {
+      this.aecHi = new Int32Array(o.aecSab, 0, 1);
+      this.aecRing = new Float32Array(o.aecSab, 64, 512 * 128);
+      this.aec = createAec();
+      this.aecStatBlocks = 0;
+      // Preallocated zeros trigger silent-far bypass in core to keep mic bit-exact
+      this.aecZeroRef = new Float32Array(128);
+    }
   }
 
   process(inputs) {
-    const ch = inputs[0]?.[0];
+    let ch = inputs[0]?.[0];
     if (!ch) return true;
+    if (this.aec && ch.length === 128) {
+      // 1-block ref offset: previous quantum's block is guaranteed written regardless of execution order
+      const k = ((currentFrame / 128) | 0) - 1;
+      const ref = (k >= 0 && Atomics.load(this.aecHi, 0) >= k)
+        ? this.aecRing.subarray((k % 512) * 128, (k % 512) * 128 + 128)
+        : this.aecZeroRef;
+      ch = this.aec.process(ch, ref);
+      if (++this.aecStatBlocks % 2048 === 0) {
+        this.port.postMessage({ type: 'aec2', ...this.aec.stats() });
+      }
+    }
     if (this.pred) {
       // currentTime is the first sample of this block; the predictor counts
       // samples from its first push, so one anchor converts its `at` indices.
+      // With aec2 on, `ch` is the CLEANED block — local echo would otherwise
+      // read as voice activity and fake turn-taking signals.
       if (this.predT0 < 0) this.predT0 = currentTime;
       const evs = this.pred.push(ch);
       for (const ev of evs) {
@@ -244,6 +266,10 @@ class PcmPlayout extends AudioWorkletProcessor {
       if (this.mode === 'port' && m?.type === 'frame') this.takeFrame(m.seq, m.samples, m.capUs);
       else if (m?.type === 'target') this.targetP = m.n;
     };
+    if (o.aecSab) {
+      this.aecHi = new Int32Array(o.aecSab, 0, 1);
+      this.aecRing = new Float32Array(o.aecSab, 64, 512 * 128);
+    }
   }
 
   // Port-mode frame intake, with the same window guard the SAB writer applies
@@ -295,6 +321,11 @@ class PcmPlayout extends AudioWorkletProcessor {
     const out = outputs[0]?.[0];
     if (!out) return true;
     this.fill(out);
+    if (this.aecRing && out.length === 128) {
+      const k = (currentFrame / 128) | 0;
+      this.aecRing.subarray((k % 512) * 128, (k % 512) * 128 + 128).set(out);
+      Atomics.store(this.aecHi, 0, k);
+    }
     this.detect(out);
     this.tick();
     return true;

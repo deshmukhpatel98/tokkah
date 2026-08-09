@@ -252,6 +252,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Lane 0 (§3.1 levers 3+4) — all zero with cfg.lane0 off.
     predSent: 0, predRecv: 0, predDup: 0,
     padBytesSent: 0, padMsgsSent: 0, padBytesRecv: 0, padMsgsRecv: 0,
+    aec2: null,
   };
   // Filled by the playout worklet's 1 Hz port tick.
   const wl = {
@@ -371,6 +372,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   const CAP_RING_F = 32;
   const capSab = (sabOk && cfg.pcmCapSab !== false)
     ? new SharedArrayBuffer(320 + CAP_RING_F * FRAME_BYTES) : null;
+  const aecSab = (cfg.aec2 === true && sabOk)
+    ? new SharedArrayBuffer(64 + 512 * 128 * 4) : null;
   const capHi = capSab ? new Int32Array(capSab, 0, 1) : null;
   const capTsRing = capSab ? new Float64Array(capSab, 64, CAP_RING_F) : null;
   const capRingU8 = capSab ? new Uint8Array(capSab, 320, CAP_RING_F * FRAME_BYTES) : null;
@@ -1885,7 +1888,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         numberOfOutputs: 0,
         // §3.1 lever 4: run the turn-end predictor on the mic at zero latency
         // (Lane 0 only — with cfg.lane0 off the worklet never constructs it).
-        processorOptions: { turnend: !!cfg.lane0, capSab: capSab ?? undefined },
+        processorOptions: { turnend: !!cfg.lane0, capSab: capSab ?? undefined, aecSab: aecSab ?? undefined },
       });
       capNode.port.onmessage = (e) => {
         const m = e.data;
@@ -1893,6 +1896,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         else if (m && m.buf) onCaptureFrame(m.seq, m.buf, m.capUs);
         else if (m && m.type === 'turnend') {
           try { onTurnEnd?.(m); } catch { /* predictor plumbing must never break the lane */ }
+        } else if (m && m.type === 'aec2') {
+          stats.aec2 = m;
+          L('aec2-stats', m);
         }
       };
       if (capSab) {
@@ -1926,6 +1932,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           sab: sab ?? undefined,
           targetFrames: cfg.targetFrames,
           driftPpm: cfg.driftPpm,
+          aecSab: aecSab ?? undefined,
         },
       });
       playNode.port.onmessage = (e) => {
