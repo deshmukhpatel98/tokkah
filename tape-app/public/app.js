@@ -1422,6 +1422,8 @@ let rtpVideoTrack = null; // lane 2: the carrier's decoded track, held for fallb
 // 99.3% delivery, 0 sender drops, 4.4% concealed, age p50 40.5 ms, and no RTT
 // inflation at all. Join got no slower (1465 ms vs 1794 for the video lane alone).
 const PCM_AUDIO = QS.get('pcmaudio') !== '0';
+let aecOn = QS.get('aec') === '1';
+const micConstraints = () => ({ ...audioConstraints(true), ...(aecOn ? { echoCancellation: true } : {}) });
 // Interpreter (TRANSLATE-SPEC.md). One button, no setup: the speaker's
 // language is auto-detected server-side per phrase; each listener hears
 // translations in their own browser language. `?xlate=<lang>` overrides the
@@ -1457,6 +1459,7 @@ function xlateStop(fromPeer) {
   if (!fromPeer) send({ type: 'xlate-off' });
 }
 const PCM_CFG = {
+  echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
   // D_max for audio. 15 frames = 120 ms, and it is a HAND-SET constant, not a
@@ -1807,6 +1810,7 @@ let welcomeAtMs = 0; // local wall ms when the welcome (and its epoch) arrived
  * graph (worklets, SAB ring) initializes asynchronously inside pcm.js; the
  * channel simply stays quiet until both it and the graph are ready.
  */
+let aecLatched = false;
 function startPcm(initiator) {
   safe(() => {
     pcm = initPcmAudio({
@@ -1832,6 +1836,24 @@ function startPcm(initiator) {
       // wire type, no behaviour change.
       onTurnEnd: LANE0 ? onTurnEnd : null,
       onPredict: LANE0 ? onPredict : null,
+      onEchoDetected: ({ corr, lagMs }) => {
+        if (aecOn || QS.get('aec') === '0') {
+          tel?.log('echo-detected', { corr, lagMs });
+          return;
+        }
+        if (aecLatched) return;
+        aecLatched = true;
+        aecOn = true;
+        const curMicTrack = localStream?.getAudioTracks?.()[0];
+        const deviceId = curMicTrack?.getSettings?.()?.deviceId ?? null;
+        tel?.log('aec-on', { corr, lagMs, deviceId });
+        // Same-device reacquire through the one path that retargets every mic
+        // consumer. A failure leaves the latch set: the next user-driven mic
+        // switch still lands with AEC, which beats retry loops on a busy HAL.
+        if (deviceId) {
+          switchMicTo(deviceId).catch((e) => tel?.log('aec-reacquire-failed', { msg: String(e?.message ?? e) }));
+        }
+      },
     });
     if (initiator) {
       const dc = pc.createDataChannel('pcm-audio', { ordered: false, maxRetransmits: 0 });
@@ -2567,8 +2589,8 @@ async function getMedia({ requireVideo = true } = {}) {
   lobbyMon?.disconnect();
   lobbyMon = null;
 
-  const askAudioOnly = () => navigator.mediaDevices.getUserMedia({ audio: audioConstraints(true) });
-  const askBoth = () => navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: audioConstraints(true) });
+  const askAudioOnly = () => navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+  const askBoth = () => navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: micConstraints() });
   const denied = (e) =>
     new Error('Camera and microphone permission was denied. Allow both in the browser address bar, then rejoin.', { cause: e });
 
@@ -4659,7 +4681,7 @@ async function switchMicTo(deviceId) {
   micSwitchBusy = true;
   try {
     const old = localStream.getAudioTracks()[0];
-    const want = { ...audioConstraints(true), deviceId: { exact: deviceId } };
+    const want = { ...micConstraints(), deviceId: { exact: deviceId } };
     const nt = (await navigator.mediaDevices.getUserMedia({ audio: want })).getAudioTracks()[0];
     // Mute survives the switch: a red mic must stay red on the new device.
     if (old) nt.enabled = old.enabled;
@@ -5184,7 +5206,7 @@ async function openPreview(camId, micId) {
   // Resolution stays at 1280 on purpose (join re-applies the full ask); the rate cannot.
   const video = { width: { ideal: 1280 }, frameRate: { ideal: FPS_CEILING } };
   if (camId) video.deviceId = { exact: camId };
-  const audio = { ...audioConstraints(true) };
+  const audio = { ...micConstraints() };
   if (micId) audio.deviceId = { exact: micId };
   let s;
   try {

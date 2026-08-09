@@ -46,6 +46,7 @@
  * absorb exactly this. pairs=1 is byte-for-byte today's behaviour.
  */
 
+import { createEchoDetector } from './echo-detect.js';
 import { audioContext, addWorkletModule } from './onset-monitor.js';
 import { RsEncoder, rsDecode, RS_K, RS_P, setRsK } from './core/pcmrs.js';
 import { SwEncoder, SwDecoder, SW_STRIDE } from './core/pcmsw.js';
@@ -148,8 +149,22 @@ const now = () => performance.timeOrigin + performance.now();
  * @param {(ev: object) => void} o.onTurnEnd  Lane 0: local-mic turn-end predictor events
  * @param {(ev: object) => void} o.onPredict  Lane 0: a peer's T_PRED arrived (deduped)
  */
-export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, onPredict }) {
+export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, onPredict, onEchoDetected }) {
   const L = (tag, d) => { try { log?.(tag, d); } catch { /* telemetry must never break the call */ } };
+
+  const det = cfg?.echoDetect !== false ? createEchoDetector() : null;
+  let echoTimer = null;
+  if (det) {
+    echoTimer = setInterval(() => {
+      if (closed) return;
+      const res = det.poll(now());
+      if (res) {
+        L('echo-detected', res);
+        try { onEchoDetected?.(res); } catch { /* the latch must not kill the timer */ }
+        clearInterval(echoTimer); // one-way latch: nothing left to poll for
+      }
+    }, 500);
+  }
 
   // FIRST, before anything reads RS_K — stats below sizes arrays from it, and so
   // do the group staging buffers. `?pcmrsk=` must be set identically on both
@@ -467,6 +482,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // buffer too small for exactly the frames FEC is there to save.
     noteArrival(seq);
     const samples = zip ? decodeZip(payload) : decodeFrame(payload);
+    if (det) {
+      let sumSq = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        sumSq += s * s;
+      }
+      det.play(now(), Math.sqrt(sumSq / samples.length));
+    }
     if (!sab) {
       const copy = samples.slice(0);
       if (playNode) playNode.port.postMessage({ type: 'frame', seq, samples: copy, capUs: cap }, [copy.buffer]);
@@ -884,6 +907,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     if (closed) return;
     diagCap?.hit(performance.now());
     stats.captureFrames++;
+    if (det) {
+      const u8 = new Uint8Array(buf);
+      let sumSq = 0;
+      for (let i = 0, o = 0; i < 384; i++, o += 3) {
+        const v = u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16);
+        const s = (v & 0x800000) ? (v | ~0xffffff) : v;
+        const norm = s / 8388608;
+        sumSq += norm * norm;
+      }
+      det.mic(now(), Math.sqrt(sumSq / 384));
+    }
     const a = pickDataAssoc(seq);
     if (a === undefined) return; // channel not up yet — silently skipped, as before
     if (a === null) {
@@ -2134,6 +2168,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       clearInterval(lossTimer);
       clearInterval(decayTimer);
       clearInterval(padTimer);
+      clearInterval(echoTimer);
       if (capPumpT?.close) capPumpT.close(); else clearTimeout(capPumpT);
       try { source?.disconnect(); } catch { /* ignore */ }
       try { capNode?.disconnect(); } catch { /* ignore */ }
