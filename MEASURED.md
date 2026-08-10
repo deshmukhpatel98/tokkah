@@ -4083,3 +4083,47 @@ unrecovered at 10% iid was honest). The e2e sign FLIPS at this rate: the window 
 ~10 ms more buffer than RS at 10% loss, worth watching if this regime ever matters, but
 delivery-weighted it is not close — 1.26 s/min of speech saved against 10 ms of latency
 (the delivery column decides, latency-needs-a-delivery-column). n=1; enough for today.
+
+## Live-only session: five features, three instruments, two honest retreats (2026-08-11)
+
+Ground rule for the whole session (operator directive): every verdict from live calls
+on the production edge — no local servers, no shaped links, no synthetic rigs. What a
+loopback-through-prod call CAN judge: plumbing end-to-end, off-arm inertness, connect
+timing, latency decomposition, engage/disengage logic. What it CANNOT: behaviour under
+real loss (no loss to have) — those features ship default-on with control flags and the
+verdict deferred to real-call telemetry (dupSent/dupRecv, rc-duress).
+
+**Presence renderer** (`presence-core.js`, default ON): six early reflections,
+interaurally asymmetric, direct path untouched at unity. Live: both sides render, off
+arm null, 0 ms concealed. **Burst shield** (frame twins 24 ms apart on opposite
+stripes above the ladder's top rung): the LIVE arms found the auto-trigger firing on a
+pristine path TWICE — first the fast loss window alone (stripe reordering at open
+reads as loss; now needs slow-window corroboration at half-cap), then the slow window
+too (the sender's own skipped seqs while associations open are honest loss for
+~2.5 s; auto-engage now deaf for the first 6 s). Force arm: 1098 twins sent, 1098
+accounted, 0 ms concealed. **Video duress coupling**: pcm.duress() (2=shield, 1=upper
+ladder) quarters/halves the video budget in rcPollBudget — live: 4.77 → 1.10 Mbps
+under a forced shield, control arm unmoved. **WS pre-dial**: the second joiner's
+472 ms click→connected decomposed (room log) as 241 dial+welcome / 75 offer-gen / 12
+ICE / 144 DTLS-stripes; the lobby now dials in hold state (accepted, not admitted —
+no slot, no relay, no registry stamp, 120 s timeout) and the click sends
+{type:'join'}. Live A/B, 5 calls/arm: median 565 → 347 ms, −39%, zero overlap.
+Full-room probe: third joiner gets the honest message, no recovery storm, the
+standing call untouched.
+
+**Instruments**: mouthToEarMs (8 + age p50 + depth + outputLatency) and
+glassToGlassMs (fullAge p50 + present p50) in every snapshot, both on the anonymous
+health beat with humanGapMs. Getting glassToGlass honest found the #14 present probe
+fed only from the legacy paint-on-arrival path — the v-presenter and the avsync
+scheduler (the paths that actually present) never stamped, so presentLag had read
+null or warmup-bias on every default call since they shipped. Both stamp now; live:
+present p50 8–9 ms, glassToGlass ~36 ms.
+
+**Retreats, recorded**: (1) latencyHint-0 fix for the Lane-A default-on mismatch
+REVERTED unproven — the A/B confounded when the Mac's audio sink went Bluetooth
+mid-experiment (~300 ms in BOTH arms); retry condition pinned in onset-monitor.js
+(control must read ~34 ms). The instrument's first decomposition made the lesson
+plain anyway: 340 ms mouth-to-ear was 305 ms Bluetooth + 36 ms pipeline — the device,
+not the network, owns the latency on that setup. (2) The first health-beat probe
+watched only the send and missed the server 400 (allowlist knew the new fields,
+HB_FIELDS had no validators) — beacons are judged by response status now.
