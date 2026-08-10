@@ -741,7 +741,7 @@ if (ra.pcmAudio || rb.pcmAudio) {
     log(
       `      depth ${p.depthMs} ms  target ${p.targetFrames}f  drift ${p.driftPpm} ppm` +
         `  age p50 ${p.ageP50} ms  p95 ${p.ageP95} ms  (rtt ${p.rttMs}, baseRtt ${p.baseRttMs}, offset ${p.clockOffsetMs})` +
-        `  mode ${p.mode}  outLatency ${p.outputLatencyMs} ms`,
+        `  mode ${p.mode}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
     );
     // Lane 0 (§3.1 lever 4) wire counters: T_PRED pairs sent/received (+ the
     // duplicate copies proving the duplication works) and T_PAD pre-warm

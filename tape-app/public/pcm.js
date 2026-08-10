@@ -2242,6 +2242,18 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         presence: wl.presence ?? null, // ?presence=1 room renderer, null when off
 
         outputLatencyMs: ctx?.outputLatency != null ? +(ctx.outputLatency * 1000).toFixed(1) : null,
+        // One-way mouth-to-ear estimate, the number the latency campaign must
+        // move (ITU-T G.114: 0–150 ms transparent). Composed, not measured
+        // end-to-end: 8 ms frame assembly + age p50 (capture→arrival, needs
+        // the ping clock offset, so null until it exists) + buffer depth +
+        // device output latency. Each term is itself measured; the sum's
+        // honesty is bounded by the ping offset's symmetric-path assumption.
+        mouthToEarMs: (() => {
+          const age = pct(stats.ageMs, 50);
+          const outL = ctx?.outputLatency != null ? ctx.outputLatency * 1000 : null;
+          if (age == null || wl.depthMs == null || outL == null) return null;
+          return +(8 + age + wl.depthMs + outL).toFixed(1);
+        })(),
         buffered: assocs[0].dc?.bufferedAmount ?? null,
         groupsHeld: groups.size,
         // §17.12 striping: per-association counters (ping/buffered/backpressure
