@@ -19,7 +19,7 @@
  *
  *   node testbed/carriertick.mjs
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
 const CASES = [
   ['setInterval(16) + captureStream(60)', 'interval', 16, 60],

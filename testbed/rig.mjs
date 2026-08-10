@@ -50,14 +50,14 @@
  * It is not a real internet path, and Playwright's WebKit is not Safari. Those
  * limits are printed in the report rather than left to be forgotten.
  */
-import { webkit, chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { webkit, chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
-const OUT = '/Users/earningsgpt/video calling/testbed/out';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
+const OUT = '/Users/deveshpatel/Downloads/video calling/testbed/out';
 
 // ─── flags: unknown is fatal ────────────────────────────────────────────────────
 const KNOWN = new Set(['sec', 'engines', 'every', 'query', 'base', 'shots', 'json', 'wait', 'noprobe']);
@@ -387,7 +387,7 @@ check('fixtures', 'a fixture that starves the camera looks exactly like a failin
   return `cam ${(cam / 1e6).toFixed(1)} MB; note timecode-class fixtures loop every 256 frames (~8.5 s)`;
 });
 check('deploy-fresh', 'a far side on an older bundle reported wastedShift undefined for a whole run', async () => {
-  const local = fs.readFileSync('/Users/earningsgpt/video calling/tape-app/public/pcm.js', 'utf8');
+  const local = fs.readFileSync('/Users/deveshpatel/Downloads/video calling/tape-app/public/pcm.js', 'utf8');
   const r = await fetch(`${BASE}/pcm.js?cb=${Date.now()}`);
   if (!r.ok) throw new Error(`GET ${BASE}/pcm.js -> ${r.status}`);
   const dep = await r.text();

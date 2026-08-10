@@ -46,14 +46,14 @@
  *
  *   node testbed/startup.mjs [--secs=120] [--loss=0] [--bw=0] [--json=PATH]
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-import { startP2PSim } from '/Users/earningsgpt/video calling/testbed/netsim.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { startP2PSim } from '/Users/deveshpatel/Downloads/video calling/testbed/netsim.mjs';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 // Unknown flags are FATAL. `--secs=` once silently failed to match `--sec=` here and
 // every run quietly took the default while the log claimed otherwise.

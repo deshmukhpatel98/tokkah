@@ -19,7 +19,7 @@
 # 1 frame, and the ranking flips.
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 K='RESULT|release \(ms/s\)|baseline depth|baseline age|baseline e2e|peak target|peak depth|peak e2e|added latency|added e2e|excursion|recovered at|final target|frames concealed|─────|^ +A +B|stimulus|Error|VOID|ABORT|conceal '
 
 echo "############ moderate pressure: 150 ms holes every 5 s x 12   (A slow, B fast)"

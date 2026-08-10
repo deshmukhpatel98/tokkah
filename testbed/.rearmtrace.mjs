@@ -3,7 +3,7 @@
 import { chromium } from 'playwright-core';
 
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const BASE = process.argv[2] ?? 'https://room.tokkah.com';
 
 async function launch() {

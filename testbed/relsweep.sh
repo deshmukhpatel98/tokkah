@@ -18,7 +18,7 @@
 # pinned and fast is not, the window is between them.
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 mkdir -p $S/sweep
 for bw in 0.3 0.8 1.5 2.5; do
   f=$S/sweep/bw${bw}.json

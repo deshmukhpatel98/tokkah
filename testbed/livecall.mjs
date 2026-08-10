@@ -19,11 +19,11 @@
  *   MY SIDE    what this fake-device browser sees (control)
  *   FAR SIDE   the real device's capture settings and wasted-bits telemetry
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const FIX = '/Users/earningsgpt/video calling/testbed/media/timecode720.y4m';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const FIX = '/Users/deveshpatel/Downloads/video calling/testbed/media/timecode720.y4m';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const arg = (k, d) => {
   const m = process.argv.find((a) => a.startsWith(`--${k}=`));

@@ -20,7 +20,7 @@
 # Sign convention for analysis: report fast-minus-slow, so NEGATIVE favours fast.
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 mkdir -p $S/n8
 
 # FIRST ATTEMPT PRODUCED ONE RESULT AND SEVEN ABORTS, all reading

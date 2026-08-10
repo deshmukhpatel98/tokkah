@@ -1,8 +1,8 @@
 // Reproduce the LIVE-CALL path: no ?xlate= param, user clicks the 🌐 button.
 // A's browser locale is es-ES, B's en-US — the languages the button infers.
 import { chromium } from 'playwright-core';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const WAV = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const WAV = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 const BASE = process.env.BASE ?? 'https://room.tokkah.com';
 const LOC_A = process.env.LOC_A ?? 'es-ES';
 const LOC_B = process.env.LOC_B ?? 'en-US';

@@ -1,5 +1,5 @@
 import { chromium } from 'playwright-core';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 // Real devices, auto-granted permission: what Chrome (⇒ Meet, tokkah) actually sees.
 const b = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--use-fake-ui-for-media-stream'] });
 const page = await (await b.newContext({ permissions: ['camera', 'microphone'] })).newPage();

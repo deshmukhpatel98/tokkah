@@ -9,7 +9,7 @@
 // whichever ran second.
 import { execFileSync } from 'node:child_process';
 
-const TB = '/Users/earningsgpt/video calling/testbed';
+const TB = '/Users/deveshpatel/Downloads/video calling/testbed';
 const REPS = Number(process.env.REPS ?? 4);
 // SEC=40 for anything with a warm-up: the adaptive code rate spends its first
 // ~5.6 s at the starting rung (no loss report can exist until LOSS_LAG +

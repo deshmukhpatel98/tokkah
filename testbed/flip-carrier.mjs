@@ -15,9 +15,9 @@
 //               skips tapePre.getCarrierSender()
 //
 // Prediction if the carrier is the cause: control ~22.5, treatment ~30.
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const TB = '/Users/earningsgpt/video calling/testbed';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const TB = '/Users/deveshpatel/Downloads/video calling/testbed';
 const ARM = process.argv[2] === 'control' ? 'control' : 'treatment';
 
 const mk = async () => {

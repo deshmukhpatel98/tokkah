@@ -2,7 +2,7 @@
 // then watch what the join flow actually does. Brave joins too (same shape
 // as the failing runs) so the conditions match.
 import { spawn } from 'node:child_process';
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
 const PORT = 4757;
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';

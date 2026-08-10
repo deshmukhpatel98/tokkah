@@ -26,19 +26,19 @@
 // reports p50 28.5 ms / p95 47.2 ms / 1920x1080 against a known 27.3 / 46.9 / 1080p,
 // and rejects all four self-view elements.
 import { readFileSync } from 'node:fs';
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import { startP2PSim } from './netsim.mjs';
 import { P2P_REWRITE } from './p2p-rewrite.mjs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 // --fixture=camcode720 selects the high-entropy pair built by mktimecode.mjs.
 // The default `timecode720` pair compresses to ONE 1100 B fragment per frame, so
 // lane 1's parity (gated on `count > 1`) can never fire and every loss result on
 // it is void. Use the default for latency, `camcode720` for anything touching
 // fragmentation, FEC or loss. `--dump` prints fragsSent next to framesEncoded so
 // the ratio is visible in the run that used it.
-const FIXBASE = '/Users/earningsgpt/video calling/testbed/media';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const FIXBASE = '/Users/deveshpatel/Downloads/video calling/testbed/media';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const arg = (k, d) => {
   const m = process.argv.find((a) => a.startsWith(`--${k}=`));

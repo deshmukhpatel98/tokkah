@@ -37,17 +37,17 @@
  *   node testbed/realpair.mjs [--peer=webkit|chromium] [--secs=45] [--port=9333]
  *                             [--base=URL] [--query=tape=2] [--json=PATH]
  */
-import { chromium, webkit } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium, webkit } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 // The FULL Chrome for Testing, not Playwright's headless shell. Measured: with the
 // shell, lane 2 died at t+1.14s with `tape-fallback {why:"encoder-setup"}` on every
 // run, because the shell ships no usable video encoder. That is a property of the
 // test binary and it was silently being attributed to the product. rig.mjs has always
 // named this path explicitly; this harness defaulted and paid for it.
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
 
 const KNOWN = new Set(['peer', 'secs', 'port', 'peerport', 'base', 'query', 'json', 'probe', 'cold', 'cpu', 'queryA', 'queryB', 'cam', 'stall', 'stallms', 'stallevery', 'stallfrom']);
@@ -124,11 +124,11 @@ if (!Number.isFinite(SECS) || SECS < 20) { console.error('--secs must be >= 20')
 // capability max 30) but honors a Y4M `F60:1` header. Testing 60 fps against a 30 fps
 // fixture measures the fixture — the trap that once capped every frame-rate figure here.
 const CAMS = {
-  '1080p30': '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg',
-  '1080p60': '/Users/earningsgpt/video calling/testbed/media/motion1080_60.y4m',
+  '1080p30': '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg',
+  '1080p60': '/Users/deveshpatel/Downloads/video calling/testbed/media/motion1080_60.y4m',
   // 72 is the whole divisor of 144 Hz just below our ceiling, so this is the fixture that
   // lets a 144 Hz peer actually be served an even cadence instead of 60-on-144 at 2.40.
-  '1080p72': '/Users/earningsgpt/video calling/testbed/media/motion1080_72.y4m',
+  '1080p72': '/Users/deveshpatel/Downloads/video calling/testbed/media/motion1080_72.y4m',
 };
 const CAM = CAMS[arg('cam', '1080p30')] ?? (() => {
   console.error(`--cam must be one of: ${Object.keys(CAMS).join(', ')}`); process.exit(2);

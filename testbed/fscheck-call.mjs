@@ -3,13 +3,13 @@
 import { chromium } from 'playwright-core';
 
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const BASE = process.argv[2] || 'http://127.0.0.1:8794';
 const ROOM = 'fs' + Math.random().toString(36).slice(2, 8);
 const ARGS = [
   '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
-  '--use-file-for-fake-video-capture=/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg',
-  '--use-file-for-fake-audio-capture=/Users/earningsgpt/video calling/testbed/media/conv/A.wav',
+  '--use-file-for-fake-video-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg',
+  '--use-file-for-fake-audio-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav',
   '--autoplay-policy=no-user-gesture-required',
 ];
 

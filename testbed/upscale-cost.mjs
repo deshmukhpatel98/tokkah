@@ -5,9 +5,9 @@
 // The previous attempt compared a 720p synthetic fixture against a 1080p camera
 // fixture and got 14x. That was content, not resolution, and reporting it would
 // have been a confident wrong number.
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const TB = '/Users/earningsgpt/video calling/testbed';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const TB = '/Users/deveshpatel/Downloads/video calling/testbed';
 const SETTLE = 12000, WINDOW = 20000;
 
 // Build guard: a stale edge asset already cost one full run on this project.

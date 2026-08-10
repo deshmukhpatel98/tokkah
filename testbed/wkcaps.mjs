@@ -10,7 +10,7 @@
  * Apple-internal pieces, so a MISSING api here is suggestive and a PRESENT one is
  * strong. Confirm anything load-bearing on real Safari before shipping.
  */
-import { webkit } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { webkit } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 const wb = await webkit.launch();
 const ctx = await wb.newContext({ permissions: ['camera', 'microphone'], ignoreHTTPSErrors: true });
 const p = await ctx.newPage();

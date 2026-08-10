@@ -9,8 +9,8 @@
  * CONFIGURES and encodes, because isConfigSupported is allowed to lie by omission
  * (tape.js:285 already guards against a silently downgraded bitrateMode).
  */
-import { webkit, chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+import { webkit, chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 
 const run = async (name, ctx) => {
   const p = await ctx.newPage();

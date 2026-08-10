@@ -10,8 +10,8 @@
  * second is what says whether a rate is affordable. Also reports bytes/frame, since a
  * rate we cannot carry is as unusable as one we cannot encode.
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const b = await chromium.launch({ executablePath: CHROME });
 const ctx = await b.newContext({ ignoreHTTPSErrors: true });
 const p = await ctx.newPage();

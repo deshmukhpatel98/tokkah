@@ -10,7 +10,7 @@
  * Only the initial getUserMedia decides the rate — a live track's frame rate cannot be raised
  * by applyConstraints on this machine — so each rung is a fresh open.
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
 const ctx = await chromium.launchPersistentContext(process.argv[2], {
   executablePath: BRAVE, headless: false,

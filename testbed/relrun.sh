@@ -19,7 +19,7 @@
 # unquoted parameters, and that already cost one full 2x2 today.
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 K='RESULT|release \(ms/s\)|predicted hold|baseline depth|peak target|peak depth|added latency|excursion|recovered at|final target|frames concealed|─────|^ +A +B|scheduler|PASS|stimulus|Error|VOID|ABORT'
 
 echo "###################### real: A slow (1 ms/s) vs B fast (8 ms/s), isolated hole"

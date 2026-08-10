@@ -35,7 +35,7 @@ const WAV_A = args.wavA ? resolve(HERE, args.wavA) : join(HERE, 'media', 'conv',
 // directions translate concurrently, which is what a real call does.
 const WAV_B = args.wavB ? resolve(HERE, args.wavB) : null;
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 if (!existsSync(WAV_A)) { console.error(`no such wav: ${WAV_A}`); process.exit(2); }
 
 // B talks back silence: 5 s of 48 kHz s16le quiet, valid WAV.

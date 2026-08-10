@@ -41,7 +41,7 @@ import { createServer } from 'node:http';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const VSYNC_MS = 1000 / 60;
 const log = (s) => console.log(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

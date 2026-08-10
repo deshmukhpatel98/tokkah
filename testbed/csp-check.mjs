@@ -4,7 +4,7 @@
 // directive that blocked something. A silent pass on any one of the three is not
 // evidence.
 import { chromium } from './node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 
 const h = await fetch('https://room.tokkah.com/', { headers: { accept: 'text/html' } });
 const csp = h.headers.get('content-security-policy');
@@ -16,8 +16,8 @@ const mk = async () => {
   const c = await chromium.launchPersistentContext('', {
     executablePath: CHROME, headless: true,
     args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
-      '--use-file-for-fake-video-capture=/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg',
-      '--use-file-for-fake-audio-capture=/Users/earningsgpt/video calling/testbed/media/conv/A.wav',
+      '--use-file-for-fake-video-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg',
+      '--use-file-for-fake-audio-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav',
       '--autoplay-policy=no-user-gesture-required'], viewport: { width: 1280, height: 720 },
   });
   const p = await c.newPage();

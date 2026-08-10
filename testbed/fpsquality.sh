@@ -13,7 +13,7 @@
 # ([[stimulus-can-be-the-bottleneck]], fourth occurrence).
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 mkdir -p $S/fpsq
 
 have() { node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1]+"/run.json","utf8")).tag?0:1)}catch{process.exit(1)}' "$1"; }

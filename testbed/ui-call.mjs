@@ -19,7 +19,7 @@ import { chromium } from 'playwright-core';
 import { mkdirSync } from 'node:fs';
 
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const BASE = 'http://127.0.0.1:8794';
 const Q = 'tape=2&pcmaudio=1';
 const SHOTS = process.argv.find((a) => a.startsWith('--shots='))?.slice(8)
@@ -35,8 +35,8 @@ const RATIOS = [
 ];
 const ARGS = [
   '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
-  '--use-file-for-fake-video-capture=/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg',
-  '--use-file-for-fake-audio-capture=/Users/earningsgpt/video calling/testbed/media/conv/A.wav',
+  '--use-file-for-fake-video-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg',
+  '--use-file-for-fake-audio-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav',
   '--autoplay-policy=no-user-gesture-required',
 ];
 const CAM_ASPECT = 1920 / 1080;

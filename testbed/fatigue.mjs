@@ -27,13 +27,13 @@
  *
  *   node testbed/fatigue.mjs [--rtt=80] [--loss=5] [--sec=110] [--qs=...]
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import { startP2PSim } from './netsim.mjs';
 import { P2P_REWRITE } from './p2p-rewrite.mjs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const FIX = '/Users/earningsgpt/video calling/testbed/media/timecode720.y4m';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const FIX = '/Users/deveshpatel/Downloads/video calling/testbed/media/timecode720.y4m';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const arg = (k, d) => {
   const m = process.argv.find((a) => a.startsWith(`--${k}=`));

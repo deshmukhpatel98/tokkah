@@ -2,9 +2,9 @@
 // breaking. A reconfigure resets the encoder's reference chain, so the failure
 // mode to hunt is not "wrong size" — it is a frozen or black remote picture
 // while every counter still looks healthy. Check the PIXELS, not the state.
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const TB = '/Users/earningsgpt/video calling/testbed';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const TB = '/Users/deveshpatel/Downloads/video calling/testbed';
 
 const src = await (await fetch(`https://room.tokkah.com/tape.js?cb=${Math.random()}`)).text();
 if (!src.includes('tape-resize') || !src.includes('RESIZE_HOLD')) {

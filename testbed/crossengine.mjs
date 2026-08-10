@@ -28,12 +28,12 @@
  * this file exists to catch rendered a valid picture that was one black pixel while
  * every counter read healthy.
  */
-import { webkit, chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { webkit, chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
-const SHOTS = '/Users/earningsgpt/video calling/testbed/out';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
+const SHOTS = '/Users/deveshpatel/Downloads/video calling/testbed/out';
 
 // Unknown flags must be FATAL: `--secs=` silently never matched `--sec=` on this
 // project and every run took the default while reporting success.

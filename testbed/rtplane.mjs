@@ -20,7 +20,7 @@ import { chromium } from 'playwright-core';
 
 const CHROME =
   process.env.CHROME_PATH ||
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 
 const CODEC = process.argv[2] || 'video/VP8'; // try H264 with: node rtplane.mjs video/H264
 // --applike layers on the conditions the real app adds over this minimal probe:

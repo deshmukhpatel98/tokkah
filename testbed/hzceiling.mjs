@@ -11,8 +11,8 @@
  *
  * Run: node testbed/hzceiling.mjs
  */
-import { chromium, webkit } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+import { chromium, webkit } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 
 const MEASURE = async (ctx, label) => {
   const p = await ctx.newPage();
@@ -76,11 +76,11 @@ const MEASURE = async (ctx, label) => {
 for (const [label, exe, args] of [
   ['Chrome for Testing + 1080p file fixture', CHROME, [
     '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-    '--use-file-for-fake-video-capture=/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg',
+    '--use-file-for-fake-video-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg',
     '--allow-file-access-from-files']],
   ['Chrome for Testing + 1080p60 y4m fixture', CHROME, [
     '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-    '--use-file-for-fake-video-capture=/Users/earningsgpt/video calling/testbed/media/motion1080_60.y4m',
+    '--use-file-for-fake-video-capture=/Users/deveshpatel/Downloads/video calling/testbed/media/motion1080_60.y4m',
     '--allow-file-access-from-files']],
   ['Chrome for Testing + built-in synthetic camera', CHROME, [
     '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream']],

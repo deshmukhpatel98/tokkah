@@ -15,9 +15,9 @@ const REPS = Number(process.argv[2] ?? 2);
 const out = { cc: [], cw: [] };
 for (let r = 0; r < REPS; r++) {
   for (const eng of ['cc', 'cw']) {
-    const j = `/Users/earningsgpt/video calling/testbed/out/sab-${eng}-${r}.json`;
+    const j = `/Users/deveshpatel/Downloads/video calling/testbed/out/sab-${eng}-${r}.json`;
     try {
-      execFileSync('node', ['/Users/earningsgpt/video calling/testbed/rig.mjs',
+      execFileSync('node', ['/Users/deveshpatel/Downloads/video calling/testbed/rig.mjs',
         `--engines=${eng}`, '--sec=60', '--every=60', '--wait=400', `--json=${j}`],
         { stdio: 'ignore', timeout: 600000 });
     } catch { /* rig exits 1 on a failed picture gate; the json is still written */ }

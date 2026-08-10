@@ -37,12 +37,12 @@
  * Usage: node pcm-graphdelay.mjs [--delays=0,3] [--secs=30] [--base=URL] [--query=tape=2]
  * See also: testbed/pcm-origin.mjs, the deterministic model and the layer question.
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import os from 'node:os';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const KNOWN = new Set(['delays', 'secs', 'base', 'query']);
 for (const a of process.argv.slice(2)) {

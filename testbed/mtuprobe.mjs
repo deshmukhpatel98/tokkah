@@ -19,10 +19,10 @@
  *
  *   node testbed/mtuprobe.mjs
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import { startP2PSim } from './netsim.mjs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 // Sweep the boundary itself, not the decades. Baseline is ~1.5 datagrams/message
 // (one data packet plus SACK traffic), so fragmentation is >2.0, not >1.5.
 const arg = (k, d) => {

@@ -1,7 +1,7 @@
 // Round 2: what does each page's WS actually receive, and where does the
 // handshake stop? Filters telemetry for signaling events and reads pc states.
 import { spawn } from 'node:child_process';
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
 const PORT = 4757;
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';

@@ -1,7 +1,7 @@
 // Read the display refresh rate the way the app does, from the REAL browser on the REAL
 // screen. system_profiler reports what the OS drives the panel at; this reports what the
 // browser can actually present at, which is the number the send rate should follow.
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 const b = await chromium.connectOverCDP('http://127.0.0.1:9333');
 const p = (b.contexts()[0] ?? (await b.newContext())).pages()[0] ?? (await b.contexts()[0].newPage());
 await p.goto('https://room.tokkah.com/', { waitUntil: 'domcontentloaded' });

@@ -2,7 +2,7 @@
 // captures Brave console+pageerror, Safari window errors, both telemetry
 // `why` streams, and both pc/ice states. Goal: find where the handshake dies.
 import { spawn } from 'node:child_process';
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 
 const PORT = 4757;
 const BRAVE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';

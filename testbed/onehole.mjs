@@ -49,13 +49,13 @@
  *   node testbed/onehole.mjs [--hole=90] [--settle=25] [--recover=150]
  *                            [--query=tape=2] [--base=URL] [--json=PATH]
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const KNOWN = new Set(['hole', 'settle', 'recover', 'query', 'base', 'json', 'holes', 'gap']);
 for (const a of process.argv.slice(2)) {

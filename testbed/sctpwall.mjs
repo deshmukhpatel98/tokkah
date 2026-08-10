@@ -29,7 +29,7 @@ import { execSync } from 'node:child_process';
 import { startP2PSim } from './netsim.mjs';
 
 const CHROME =
-  '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const URL_BASE = 'http://127.0.0.1:8794';
 
 const args = Object.fromEntries(

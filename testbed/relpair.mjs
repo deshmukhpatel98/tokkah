@@ -45,14 +45,14 @@
  * --relA/--relB are ms of spread released per 250 ms tick; x4 for per-second.
  * 0.25 = 1 ms/s is what ships today.
  */
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-import { startP2PSim } from '/Users/earningsgpt/video calling/testbed/netsim.mjs';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+import { startP2PSim } from '/Users/deveshpatel/Downloads/video calling/testbed/netsim.mjs';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const CAM = '/Users/earningsgpt/video calling/testbed/media/cam1080.mjpeg';
-const AUD = '/Users/earningsgpt/video calling/testbed/media/conv/A.wav';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mjpeg';
+const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 const KNOWN = new Set(['relA', 'relB', 'hole', 'holes', 'gap', 'settle', 'recover', 'query', 'base', 'json',
                        'bw', 'loss', 'rtt', 'jitter', 'jbmaxA', 'jbmaxB', 'swA', 'swB']);

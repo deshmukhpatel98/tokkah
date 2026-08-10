@@ -13,7 +13,7 @@
 # faster release should LOSE if the original reasoning was right.
 set -e
 S=/private/tmp/claude-501/-Users-earningsgpt-video-calling/477cd6ea-c192-43a3-b107-a2011157fa96/scratchpad
-cd "/Users/earningsgpt/video calling"
+cd "/Users/deveshpatel/Downloads/video calling"
 K='RESULT|^  baseline|^  peak|^  cost:|excursion|concealment|RECOVERED|DID NOT RISE|scheduler lateness|stimulus CONFIRMED|VOID|Error'
 
 echo "=========== iso-slow  (1 hole, release 1 ms/s — the shipped default)"

@@ -6,9 +6,9 @@
 // Two paths, because they are different products in practice:
 //   HOST  — arrives at the bare domain with no link, needs a room to share.
 //   GUEST — arrives on someone's link, needs to be in the call.
-import { chromium } from '/Users/earningsgpt/video calling/testbed/node_modules/playwright-core/index.mjs';
-const CHROME = '/Users/earningsgpt/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
-const TB = '/Users/earningsgpt/video calling/testbed';
+import { chromium } from '/Users/deveshpatel/Downloads/video calling/testbed/node_modules/playwright-core/index.mjs';
+const CHROME = process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+const TB = '/Users/deveshpatel/Downloads/video calling/testbed';
 
 // Count every real user gesture the page receives, in the page, so nothing the
 // driver does can be missed or double-counted.
