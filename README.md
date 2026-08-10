@@ -39,6 +39,10 @@ The full lab notebook — including every experiment that **failed** — is
 | Scarcity | 6 wins / 1 tie / 0 losses at 0.7–0.8 Mbps — extra parity never feeds the queue |
 | Video | VMAF 99.7 (visually lossless) on Chromium; 30/48/72 fps quality exchange quantified |
 | Latency | ~45 ms audio buffer depth on clean links; concealment 0.08% |
+| Glass-to-glass | camera → remote screen p50 **~36 ms** on a live call (capture-read 0.2 + encode 5 + wire/decode 28 + present 8) |
+| Connect time | second joiner click→connected median **347 ms** live (WS pre-dial from the lobby: 565 → 347 ms, −39%) |
+| Echo | in-house PBFDAF canceller on the raw PCM lane: 62 dB ERLE, double-talk survives at 0.95 correlation, bit-exact passthrough when the far end is silent |
+| Heavy loss | above the parity ladder (~15%), every frame ships twice, 24 ms apart on opposite stripes — engages/disengages off live loss reads |
 
 Truly bit-exact **video** is physics-bound (1080p60 raw is ~1.5 Gbps), so the video bar
 is *visually* lossless, measured with VMAF against the camera's own frames.
