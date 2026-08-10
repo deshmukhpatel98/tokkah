@@ -654,7 +654,7 @@ if (ra.tapeMode?.wanted || rb.tapeMode?.wanted) {
     if (v.capLagP50 != null || v.fullAgeP50 != null || v.presentLagP50 != null) {
       log(
         `      #14  cap→read p50 ${v.capLagP50} (p95 ${v.capLagP95})  encode p50 ${v.encLatP50} (p95 ${v.encLatP95})` +
-          `  fullAge p50 ${v.fullAgeP50} (p95 ${v.fullAgeP95})  present p50 ${v.presentLagP50} (p95 ${v.presentLagP95}) ms`,
+          `  fullAge p50 ${v.fullAgeP50} (p95 ${v.fullAgeP95})  present p50 ${v.presentLagP50} (p95 ${v.presentLagP95}) ms  glassToGlass ${v.glassToGlassMs} ms`,
       );
     }
     // Lane 0 lever 3/4b: Lane B yield windows (count + total requested ms)

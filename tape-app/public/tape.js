@@ -2281,7 +2281,11 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   }
 
   function avEnqueue(frame) {
-    avq.push({ frame, avUs: frame.timestamp - peerAvDeltaUs });
+    // `at` = decode output (this is the decoder's frame callback path), for
+    // the #14 present probe — the avsync path is the DEFAULT presenter once
+    // engaged, and without this stamp presentLagMs went silent the moment
+    // avsync took over, leaving glassToGlass composed from warmup samples.
+    avq.push({ frame, avUs: frame.timestamp - peerAvDeltaUs, at: now() });
     if (avq.length > AVQ_MAX) {
       avq.shift().frame.close(); // oldest: the lane, not the sync, is behind
       avStats.drops++;
@@ -2308,7 +2312,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       if (dist < bestDist) { bestDist = dist; best = i; }
     }
     if (best < 0) { avStats.holds++; return; }
-    const { frame, avUs } = avq[best];
+    const { frame, avUs, at } = avq[best];
     // Everything older is superseded — closed, counted, never painted.
     for (let i = 0; i < best; i++) { avq[i].frame.close(); avStats.skips++; }
     avq.splice(0, best + 1);
@@ -2318,6 +2322,14 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     avStats.presents++;
     stats.presentAt.push(+lastDrawAt.toFixed(1));
     if (stats.presentAt.length > 1800) stats.presentAt.shift();
+    // #14 present probe: decode output → this draw. NOTE this path WAITS on
+    // purpose (frames present when the audio playhead reaches them), so its
+    // presentLag includes the A-V sync hold — that wait is real glass-to-
+    // glass the viewer experiences, not probe overhead.
+    if (at != null) {
+      stats.presentLagMs.push(+(lastDrawAt - at).toFixed(1));
+      if (stats.presentLagMs.length > 900) stats.presentLagMs.shift();
+    }
     // The applied offset: presented frame's audio-clock time minus the
     // playhead-at-the-ear. This is the number §3's 45 ms budget judges.
     const applied = (avUs - (ph.us + ph.outLatUs)) / 1000;
@@ -2371,7 +2383,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   let vpRunning = false;
   const vpStats = { presents: 0, holds: 0, drops: 0, skips: 0, resyncs: 0, early: 0 };
 
-  function vpPresent(frame, idx) {
+  function vpPresent(frame, idx, at) {
     vpLastK = idx;
     paintRemote(frame);
     frame.close();
@@ -2379,6 +2391,16 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     vpStats.presents++;
     stats.presentAt.push(+lastDrawAt.toFixed(1));
     if (stats.presentAt.length > 1800) stats.presentAt.shift();
+    // Present probe (#14): decode output → this draw. The v-presenter is the
+    // shipped present path, and until this line only the paint-on-arrival
+    // path fed presentLagMs — so the probe read null on every default call
+    // and glassToGlass could not be composed. `at` is stamped at enqueue,
+    // which is decode output by construction (vpEnqueue is called from the
+    // decoder's frame callback).
+    if (at != null) {
+      stats.presentLagMs.push(+(lastDrawAt - at).toFixed(1));
+      if (stats.presentLagMs.length > 900) stats.presentLagMs.shift();
+    }
   }
 
   function vpEnqueue(frame) {
@@ -2403,10 +2425,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // queue stops refilling — drop-oldest here was failure mode 2 above.
       const q = vpq.shift();
       vpStats.early++;
-      vpPresent(q.frame, q.idx);
+      vpPresent(q.frame, q.idx, q.at);
       if (vpShift > VP_SHIFT_LO) { vpT0 -= I_ms; vpShift--; vpStats.resyncs++; }
     }
-    vpq.push({ frame, idx });
+    vpq.push({ frame, idx, at: now() });
     if (!vpRunning) { vpRunning = true; requestAnimationFrame(vpTick); }
   }
 
@@ -2431,9 +2453,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       return;
     }
     for (let i = 0; i < best; i++) { vpq[i].frame.close(); vpStats.skips++; }
-    const { frame, idx } = vpq[best];
+    const { frame, idx, at } = vpq[best];
     vpq.splice(0, best + 1);
-    vpPresent(frame, idx);
+    vpPresent(frame, idx, at);
   }
 
   // ── §12–13: the stall machine ─────────────────────────────────────────────
@@ -3225,6 +3247,16 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         encLatP50: pct(stats.encLatMs, 50), encLatP95: pct(stats.encLatMs, 95),
         fullAgeP50: pct(stats.fullAgeMs, 50), fullAgeP95: pct(stats.fullAgeMs, 95),
         presentLagP50: pct(stats.presentLagMs, 50), presentLagP95: pct(stats.presentLagMs, 95),
+        // Glass-to-glass, the vision twin of the audio lane's mouthToEarMs:
+        // peer camera capture → this display presents, one number for the
+        // latency campaign. fullAge already spans capture→decode on the
+        // sender's own clock (offset-corrected), so + present lag completes
+        // the pipe. Null until both probe streams have data.
+        glassToGlassMs: (() => {
+          const f = pct(stats.fullAgeMs, 50);
+          const pl = pct(stats.presentLagMs, 50);
+          return f != null && pl != null ? +(f + pl).toFixed(1) : null;
+        })(),
         // #33: inter-present-interval distribution, from the presentAt stream
         // (every present site feeds it: v-presenter, avTick, paint-on-arrival,
         // lane-P stills). The cadence gate's number.
