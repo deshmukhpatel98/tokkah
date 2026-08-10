@@ -2054,6 +2054,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   return {
     stats,
     mode,
+    // The one-word answer to "how bad is my network right now", for consumers
+    // that must react faster than their own signals allow (the video lane's GCC
+    // estimate froze solid on the Aug 7 call while this lane's ladder read the
+    // loss within 250 ms). 2 = burst shield engaged (loss beyond the ladder's
+    // top rung); 1 = loss in the ladder's upper half; 0 = fine. Reads live
+    // state, never computes — safe at any call rate.
+    duress() {
+      if (stats.dupOn) return 2;
+      const cap = rungTop[Math.min(FEC_N_MAX, rungTop.length - 1)];
+      return (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
+    },
     // Lane 0 (§3.1 levers 3+4): policy lives in app.js (it owns the detector
     // state these decisions gate on); the wire mechanics live here.
     sendTurnEnd,

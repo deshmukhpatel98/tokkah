@@ -1451,7 +1451,7 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
  *   · and on the non-initiating side, route the 'tape-ctl-rtp' datachannel from
  *     ondatachannel into .adoptCtl(channel).
  */
-export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null }) {
+export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null, duress = null }) {
   const L = (tag, d) => { try { log?.(tag, d); } catch { /* never break the call */ } };
   const fail = (why, e) => {
     L('tape-fail', { lane: 'rtp', why, error: e ? String(e).slice(0, 160) : null });
@@ -1483,7 +1483,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // controller was allowed to spend after headroom and clamping, rcQp the live
     // quantizer, rcTargetBytes the per-frame budget it is steering toward. All
     // null on ?l2rc=0.
-    rcQp: null, rcBudgetMbps: null, rcEstMbps: null, rcTargetBytes: null, rcVbrBps: null,
+    rcQp: null, rcBudgetMbps: null, rcEstMbps: null, rcDuress: 0, rcTargetBytes: null, rcVbrBps: null,
     rateControl: null, // 'quantizer' | 'vbr' — a VBR call must never be read as fixed-QP
     // Lane 0 (§3.1 levers 3+4): onset yields (lever 3) and prediction
     // pre-stalls (lever 4b) — window counts and total requested ms, plus the
@@ -1671,6 +1671,17 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       : rcClamp(raw, cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
     stats.rcBudgetMbps = +rcBudgetMbps.toFixed(2);
     stats.rcEstMbps = est != null ? +(est / 1e6).toFixed(2) : null;
+    // Audio-lane duress overrides the estimate: GCC is exactly the instrument
+    // that failed on the Aug 7 call (froze at 37 Mbps on a drowning 4G link),
+    // while the audio ladder read the loss within 250 ms. Duress 2 (burst
+    // shield engaged) quarters the budget, 1 halves it — smaller frames that
+    // MOVE beat pristine frames that never arrive. The clamp floor keeps the
+    // encoder alive; recovery is automatic the moment duress reads 0.
+    const dd = duress?.() ?? 0;
+    if (dd) rcBudgetMbps = rcClamp(rcBudgetMbps * (dd === 2 ? 0.25 : 0.5), cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
+    if (dd !== stats.rcDuress) log?.('rc-duress', { level: dd, budgetMbps: +rcBudgetMbps.toFixed(2) });
+    stats.rcDuress = dd;
+    stats.rcBudgetMbps = +rcBudgetMbps.toFixed(2);
     rcVbrRetune();
   }
   // VBR is a fallback arm, not a lawless one. In fixed-QP mode the controller fits the

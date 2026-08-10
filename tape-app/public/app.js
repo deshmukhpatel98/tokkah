@@ -1570,6 +1570,7 @@ const PCM_CFG = {
   // driven off the same T_LOSS ladder as fecN.
   pcmSwStride: QS.get('pcmswstride') != null ? Number(QS.get('pcmswstride')) : undefined,
 };
+const L2_DURESS = QS.get('l2duress') !== '0'; // video ducks on audio-lane duress; `?l2duress=0` control
 let pcm = null;
 let pcmPcs = []; // stripe pcs for associations 1..N-1 (association 0 rides the main pc)
 let pcmIceServers = []; // the join-time /api/ice config, stashed by the welcome handler
@@ -1962,6 +1963,10 @@ function startTape(initiator) {
       tel?.log('tape-render', { attached: true, lane: wantTape });
     },
     onFail: (why) => fallbackToRtp(why),
+    // The audio lane's loss ladder is the fastest honest congestion signal in
+    // the app; the video budget listens to it (see rcPollBudget). Null keeps
+    // the old behaviour byte-for-byte.
+    duress: L2_DURESS ? () => pcm?.duress?.() ?? 0 : null,
     // §12–13: the video regime machine reports its state for the honest UI.
     // "held" → the remote video is VIDEO HELD (last frame + 1 fps stills);
     // anything else clears the badge unless HOLD owns it.
