@@ -43,6 +43,14 @@ export async function audioContext() {
   if (!ctx) {
     // Lane A (?pcmaudio=1) plays PCM straight out of a worklet on this context:
     // ask for the floor. With the flag off the hint is exactly what it was.
+    // KNOWN MISMATCH, deliberately unresolved: app.js made Lane A default ON
+    // (`!== '0'`, 2026-08-02) while this still wants an explicit =1, so
+    // default calls run at 'interactive' (~34 ms output latency measured)
+    // rather than the floor. A fix was tried live 2026-08-11 and the A/B was
+    // CONFOUNDED: outputLatency read ~300 ms in both arms because the Mac's
+    // output device changed mid-experiment (~300 ms is a Bluetooth sink, and
+    // the revert read the same). Re-run the A/B when the control arm reads
+    // ~34 ms again before touching this line.
     const pcm = new URLSearchParams(location.search).get('pcmaudio') === '1';
     ctx = new AudioContext({ sampleRate: 48000, latencyHint: pcm ? 0 : 'interactive' });
     moduleLoaded = addWorkletModule(ctx, WORKLET_URL);
