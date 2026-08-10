@@ -1562,6 +1562,7 @@ const PCM_CFG = {
   // decodes both unconditionally, so `?pcmsw=0` (the block-RS control arm)
   // still interoperates and one call can carry one arm per direction.
   pcmSw: QS.get('pcmsw') !== '0',
+  pcmDup: QS.get('pcmdup') ?? undefined, // burst shield: '0' never | '1' always | absent = auto
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',

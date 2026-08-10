@@ -253,6 +253,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     predSent: 0, predRecv: 0, predDup: 0,
     padBytesSent: 0, padMsgsSent: 0, padBytesRecv: 0, padMsgsRecv: 0,
     aec2: null,
+    dupOn: 0, dupSent: 0, dupBytes: 0, dupRecv: 0, dupSkipped: 0,
   };
   // Filled by the playout worklet's 1 Hz port tick.
   const wl = {
@@ -678,6 +679,30 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   const diagRecv = DIAG ? intervalRec() : null; // T_DATA arrival off the wire
 
   const SW = !!cfg.pcmSw;
+
+  // ── Burst shield (temporal duplication) ────────────────────────────────────
+  // Above the parity ladder's top rung, parity math stops paying: at 20%+ loss
+  // the odds of >n losses in a K-window exceed CONCEAL_TARGET for every n this
+  // lane can afford. Duplication does not care about loss patterns: the twin
+  // rides DUP_DELAY_F frames (24 ms) behind the original on a different
+  // association, so only a burst longer than 24 ms that spans both stripes
+  // kills a frame twice. Costs one extra audio lane (~0.75 Mbps) ONLY while
+  // engaged; `?pcmdup=0` never engages it, `?pcmdup=1` engages from the first
+  // frame, absent = auto on the same loss reads that drive the ladder.
+  const DUP_MODE = cfg.pcmDup; // '0' | '1' | undefined
+  let dupOn = DUP_MODE === '1';
+  stats.dupOn = dupOn ? 1 : 0; // forced-on must be visible from the first snapshot
+  let dupLowSince = 0;
+  // Auto-engage is deaf for the lane's first seconds: the sender SKIPS seqs
+  // while associations open (pickDataAssoc undefined / over-budget), and the
+  // peer's loss windows honestly read those holes as loss until they roll out
+  // (LOSS_LAG + LOSS_WIN ≈ 2.5 s). Measured live 2026-08-11: both engage
+  // variants fired on a pristine path at startup. The ladder owns the first
+  // seconds — it was built to eat exactly this ambiguity cheaply.
+  const DUP_WARMUP_MS = 6000;
+  const dupT0 = now();
+  const DUP_DELAY_F = 3;
+  const dupQ = []; // [{seq, msg}] — twin ArrayBuffers awaiting their send turn
   const SW_STRIDE_PIN = Number.isFinite(cfg.pcmSwStride) && cfg.pcmSwStride >= 0
     ? cfg.pcmSwStride : null;
   const swEnc = SW ? SwEncoder() : null;
@@ -748,6 +773,28 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // 2 s of history, so three dwells is not three independent confirmations.
       else if (now() - fecWantLowSince > 3000) { fecN = want; fecWantLowSince = 0; stats.fecNDown++; swSyncStride(); }
     } else fecWantLowSince = 0;
+
+    // Burst shield engage/disengage. Same asymmetry as the ladder — engaging
+    // early costs bytes, disengaging early costs speech — but NOT the same
+    // trigger: the fast window alone is too jumpy for a 0.75 Mbps decision
+    // (measured live 2026-08-11: stripe reordering at call start read as loss
+    // and engaged the shield for ~4 s on a pristine path). So the fast read
+    // may only engage when the slow, reorder-lagged window corroborates at
+    // half the cap; the slow window alone engages unconditionally. Disengage
+    // only after the slow window has read less than half cap for 3 s.
+    if (DUP_MODE === undefined && now() - dupT0 > DUP_WARMUP_MS) {
+      const cap = rungTop[Math.min(FEC_N_MAX, rungTop.length - 1)];
+      if (!dupOn && (pct > cap || (fastPct > cap && pct > cap / 2))) {
+        dupOn = true; dupLowSince = 0; stats.dupOn = 1;
+      } else if (dupOn) {
+        if (pct < cap / 2) {
+          if (!dupLowSince) dupLowSince = now();
+          else if (now() - dupLowSince > 3000) {
+            dupOn = false; dupLowSince = 0; stats.dupOn = 0; dupQ.length = 0;
+          }
+        } else dupLowSince = 0;
+      }
+    }
   }
 
   function rsClose() {
@@ -811,6 +858,22 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       if (a.dc.bufferedAmount <= backlogLimit(a)) return a;
     }
     return anyOpen ? null : undefined; // undefined: channel not up yet (silent, as today)
+  }
+
+  // The twin's home is offset half the stripe from the original's: on 6
+  // associations seq's data rides (seq % 6), its twin (seq+3) % 6 — maximally
+  // far in the round-robin, so one association's queue trouble cannot hold
+  // both copies. Falls forward like pickDataAssoc; over-budget everywhere
+  // drops the TWIN only (the original already went out — the shield is best-
+  // effort extra, never backpressure).
+  function pickTwinAssoc(seq) {
+    const home = (seq + Math.max(1, PAIRS >> 1)) % PAIRS;
+    for (let k = 0; k < PAIRS; k++) {
+      const a = assocs[(home + k) % PAIRS];
+      if (a.dc?.readyState !== 'open') continue;
+      if (a.dc.bufferedAmount <= backlogLimit(a)) return a;
+    }
+    return null;
   }
 
   function pickParityAssoc(base) {
@@ -1029,6 +1092,19 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     a.bytesSent += msg.byteLength;
     stats.framesSent++;
     stats.bytesSent += msg.byteLength;
+    // Burst shield: queue this frame's twin, and send the twin whose turn has
+    // come (DUP_DELAY_F frames of temporal diversity). Draining here — on the
+    // next frames' sends — needs no timer and dies with the lane.
+    if (dupOn) dupQ.push({ seq, msg });
+    while (dupQ.length && seq - dupQ[0].seq >= DUP_DELAY_F) {
+      const tw = dupQ.shift();
+      const ta = pickTwinAssoc(tw.seq);
+      if (!ta) { stats.dupSkipped++; continue; }
+      try { ta.dc.send(tw.msg); } catch { continue; }
+      ta.bytesSent += tw.msg.byteLength;
+      stats.dupSent++;
+      stats.dupBytes += tw.msg.byteLength;
+    }
     // Staged at its natural length; the group is padded to its own longest
     // frame when it closes. Rice decoding stops after 384 samples on its own,
     // so whatever padding remains is never read back and a repaired frame still
@@ -1488,6 +1564,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (stats.ageMs.length > 900) stats.ageMs.shift();
       }
       const payload = new Uint8Array(data, hdr);
+      // A seq already marked seen is a shield twin whose original made it (or the
+      // reverse) — counted so telemetry can say how much of the dup spend was
+      // redundant vs. how much silently replaced a loss.
+      if (seq <= seenHi && seenHi - seq < SEEN_N && seen[seq % SEEN_N] === 1) stats.dupRecv++;
       noteSeen(seq);
       ringWrite(seq, payload, capUs, zipped);
       // The window decoder runs UNCONDITIONALLY (the flag is the sender's):
