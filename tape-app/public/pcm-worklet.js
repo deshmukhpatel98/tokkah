@@ -30,6 +30,7 @@
 import { OnsetDetector } from './core/onset.js';
 import { TurnEndPredictor } from './core/turnend.js';
 import { createAec } from './core/aec-core.js';
+import { createPresence } from './core/presence-core.js';
 
 const FRAME = 384;          // 8 ms at 48 kHz — one frame is one datagram
 const RING_F = 64;          // 512 ms of ring — 4× the 120 ms D_max plus slack
@@ -230,6 +231,12 @@ class PcmPlayout extends AudioWorkletProcessor {
     this.capAnchorSeq = -1;
     this.capAnchorUs = 0;
 
+    // ?presence=1: the room renderer (presence-core.js). Constructed only on
+    // the flag — off-arm, `this.presence` is null and process() never takes
+    // the stereo branch, so playout stays byte-identical to the mono build.
+    // pcm.js opens the node with outputChannelCount [2] iff the flag is on.
+    this.presence = o.presence ? createPresence({ sampleRate }) : null;
+
     // Playout state. `pos` is a fractional absolute sample index — the
     // resample ratio moves it by slightly more or less than 1 per output
     // sample, which is how drift is absorbed without ever dropping one.
@@ -327,6 +334,13 @@ class PcmPlayout extends AudioWorkletProcessor {
       Atomics.store(this.aecHi, 0, k);
     }
     this.detect(out);
+    // Presence renders LAST: the AEC2 far-end ref and the remote onset
+    // detector above both saw the pristine mono block — the room exists only
+    // between here and the DAC. outL aliases `out` (the core reads each index
+    // before writing it, so in-place is safe); without a second channel the
+    // renderer is skipped even if constructed.
+    const outR = outputs[0]?.[1];
+    if (this.presence && outR) this.presence.render(out, out, outR);
     this.tick();
     return true;
   }
@@ -531,6 +545,7 @@ class PcmPlayout extends AudioWorkletProcessor {
       depthMs: this.started ? +((this._hiSeq() * FRAME - this.pos) / (sampleRate / 1000)).toFixed(1) : null,
       targetFrames: this._target(),
       playSeq: this.started ? Math.floor(this.pos / FRAME) : -1,
+      presence: this.presence ? this.presence.stats() : null,
     });
   }
 }

@@ -1460,6 +1460,7 @@ function xlateStop(fromPeer) {
 }
 const PCM_CFG = {
   aec2: QS.get('aec2') === '1',
+  presence: QS.get('presence') === '1', // stereo room image on playout (presence-core.js)
   echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms

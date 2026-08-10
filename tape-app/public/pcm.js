@@ -1927,12 +1927,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       playNode = new AudioWorkletNode(ctx, 'pcm-playout', {
         numberOfInputs: 0,
         numberOfOutputs: 1,
-        outputChannelCount: [1],
+        // ?presence=1 renders a stereo room image (presence-core.js) — two
+        // device channels. Off-arm keeps the original mono node untouched.
+        outputChannelCount: [cfg.presence ? 2 : 1],
         processorOptions: {
           sab: sab ?? undefined,
           targetFrames: cfg.targetFrames,
           driftPpm: cfg.driftPpm,
           aecSab: aecSab ?? undefined,
+          presence: cfg.presence ? true : undefined,
         },
       });
       playNode.port.onmessage = (e) => {
@@ -2145,6 +2148,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         depthMs: wl.depthMs,
         targetFrames: sab ? Atomics.load(ctl, SAB_TARGET) : target,
         driftPpm: wl.driftPpm,
+        presence: wl.presence ?? null, // ?presence=1 room renderer, null when off
+
         outputLatencyMs: ctx?.outputLatency != null ? +(ctx.outputLatency * 1000).toFixed(1) : null,
         buffered: assocs[0].dc?.bufferedAmount ?? null,
         groupsHeld: groups.size,
