@@ -5822,11 +5822,20 @@ safe(() => {
     }
     const p = window.__tape?.pcm;
     const played = p?.playedFrames, lost = p?.lostFrames;
+    // The presence-goal numbers ride the end beat: how far away the person
+    // FELT, fleet-wide, with nothing identifying — sound (mouth→ear), vision
+    // (glass→glass), and conversation (median human turn gap; face-to-face
+    // is ~208 ms, Zoom measured ~487 — FATIGUE.md).
+    const g = safe(() => window.__tape?.lane?.snapshot?.()?.glassToGlassMs ?? null, 'hb.glass') ?? null;
+    const hg = safe(() => window.__tape?.turns?.summary?.()?.humanMedian ?? null, 'hb.gap') ?? null;
     beat({
       evt: 'end', reason,
       durS: Math.round((performance.now() - connectedAt) / 1000),
       concealPct: played > 0 && lost != null ? +((100 * lost) / played).toFixed(2) : null,
       tape: window.__tape?.tapeMode?.running ? 1 : 0,
+      mouthToEarMs: p?.mouthToEarMs ?? null,
+      glassToGlassMs: g,
+      humanGapMs: hg,
     });
   };
   addEventListener('pagehide', () => window.__hbEnd?.('pagehide'));

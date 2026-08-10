@@ -1088,10 +1088,18 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   concealPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
   tape: (v) => v === 0 || v === 1,
   reason: (v) => typeof v === 'string' && HB_REASON.has(v),
+  // Presence-goal aggregates. Bounds are generous sanity caps, not targets:
+  // a Bluetooth sink alone reads ~300 ms of mouth→ear.
+  mouthToEarMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 10_000),
+  glassToGlassMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 10_000),
+  humanGapMs: (v) => v === null || (typeof v === 'number' && v > -10_000 && v < 60_000),
 };
 const HB_ALLOWED: Record<string, Set<string>> = {
   connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs']),
-  end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason']),
+  // mouthToEarMs / glassToGlassMs / humanGapMs: the presence-goal numbers
+  // (how far away did the person feel), aggregates with nothing identifying.
+  end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason',
+    'mouthToEarMs', 'glassToGlassMs', 'humanGapMs']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1114,6 +1122,13 @@ export class Health implements DurableObject {
         reason TEXT
       );
     `);
+    // Presence-goal columns, added 2026-08-11. CREATE IF NOT EXISTS cannot
+    // alter an existing table, so each column is its own idempotent ALTER —
+    // "duplicate column name" on a DO that already ran this is the expected
+    // no-op, not an error.
+    for (const col of ['mouth_to_ear_ms REAL', 'glass_to_glass_ms REAL', 'human_gap_ms REAL']) {
+      try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
+    }
     // Operator room registry. The health BEATS stay anonymous by design (no
     // room codes, ever) — this table is a separate, operator-only concern:
     // WHICH room was live WHEN, so a "yesterday's call was bad" report can be
@@ -1143,11 +1158,14 @@ export class Health implements DurableObject {
         if (!allowed.has(k) || !HB_FIELDS[k]?.(v)) return json({ error: 'rejected', field: k }, 400);
       }
       this.sql.exec(
-        `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason,
+                            mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
+        (beat.mouthToEarMs as number | null) ?? null, (beat.glassToGlassMs as number | null) ?? null,
+        (beat.humanGapMs as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
