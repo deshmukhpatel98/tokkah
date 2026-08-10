@@ -39,7 +39,9 @@ async function launch() {
 }
 
 async function runArm(mode) {
-  const q = mode === 'on' ? '&aec2=1' : '';
+  // aec2 is DEFAULT ON (2026-08-11): the on arm rides the default, the off
+  // arm is the explicit ?aec2=0 control.
+  const q = mode === 'on' ? '' : '&aec2=0';
   const ROOM = `aec2-${mode}-${Date.now().toString(36)}`;
   const A = await launch();
   const B = await launch();
@@ -54,6 +56,12 @@ async function runArm(mode) {
     const gotStats = await A.page
       .waitForFunction(() => window.__tape?.pcm?.aec2 != null, null, { timeout: 20000 })
       .then(() => true, () => false);
+    // Judge the SECOND ~5.5 s stats tick, not the first: fake devices feed
+    // both pages the same signal, so the canceller adapts against a spurious
+    // correlation and the first tick's erleDb can transiently read ≤ −5 dB
+    // (seen live 2026-08-11: −5.7 once, +0.06/null on rerun). One extra tick
+    // is enough for the misadaptation to wash out.
+    if (gotStats) await A.page.waitForTimeout(6000);
     const aec2Stats = gotStats ? await A.page.evaluate(() => window.__tape?.pcm?.aec2) : null;
     const pcmB = await B.page.evaluate(() => window.__tape?.pcm?.framesRecv ?? 0);
     const noErrors = A.errors.length === 0 && B.errors.length === 0;

@@ -44,7 +44,9 @@ async function launch() {
 }
 
 async function runArm(mode) {
-  const q = mode === 'on' ? '&presence=1' : '';
+  // presence is DEFAULT ON (2026-08-11): the on arm rides the default, the
+  // off arm is the explicit ?presence=0 control.
+  const q = mode === 'on' ? '' : '&presence=0';
   const ROOM = `presence-${mode}-${Date.now().toString(36)}`;
   const A = await launch();
   const B = await launch();

@@ -55,7 +55,11 @@ const micSettings = (page) =>
   });
 
 async function runArm(mode) {
-  const q = mode === 'off' ? '&aec=0' : mode === 'force' ? '&aec=1' : '';
+  // With aec2 default ON the echo-detected latch stands down to telemetry —
+  // every arm here pins ?aec2=0 because this rig tests the FALLBACK path
+  // (the Chrome-AEC latch), which must stay healthy for non-isolated pages
+  // where the SAB lane (and so aec2) cannot run.
+  const q = (mode === 'off' ? '&aec=0' : mode === 'force' ? '&aec=1' : '') + '&aec2=0';
   const ROOM = `ae-${mode}-${Date.now().toString(36)}`;
   const A = await launch();
   const B = await launch();

@@ -1459,8 +1459,10 @@ function xlateStop(fromPeer) {
   if (!fromPeer) send({ type: 'xlate-off' });
 }
 const PCM_CFG = {
-  aec2: QS.get('aec2') === '1',
-  presence: QS.get('presence') === '1', // stereo room image on playout (presence-core.js)
+  // Both DEFAULT ON (2026-08-11, operator decision: real calls must exercise
+  // the new audio path). `?aec2=0` / `?presence=0` are the control arms.
+  aec2: QS.get('aec2') !== '0', // in-house canceller; Chrome-AEC latch stands down to telemetry
+  presence: QS.get('presence') !== '0', // stereo room image on playout (presence-core.js)
   echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
