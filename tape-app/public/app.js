@@ -1571,6 +1571,7 @@ const PCM_CFG = {
   pcmSwStride: QS.get('pcmswstride') != null ? Number(QS.get('pcmswstride')) : undefined,
 };
 const L2_DURESS = QS.get('l2duress') !== '0'; // video ducks on audio-lane duress; `?l2duress=0` control
+const PREDIAL = QS.get('predial') !== '0'; // lobby pre-dials the room ws; `?predial=0` control
 let pcm = null;
 let pcmPcs = []; // stripe pcs for associations 1..N-1 (association 0 rides the main pc)
 let pcmIceServers = []; // the join-time /api/ice config, stashed by the welcome handler
@@ -4014,7 +4015,10 @@ async function join(room) {
     if (!s) { s = crypto.randomUUID(); sessionStorage.setItem('tape.sid', s); }
     return s;
   }, 'join.sid') ?? '';
-  ws = new WebSocket(
+  const adopted = PREDIAL && predial?.room === room && predial.ws.readyState <= WebSocket.OPEN
+    ? predial.ws : null;
+  if (adopted) predial = null;
+  ws = adopted ?? new WebSocket(
     `${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?lane=${wantTape}&pcm=${PCM_AUDIO ? 1 : 0}&sid=${encodeURIComponent(sid)}`,
   );
   // A room already holding two people rejects the upgrade with 409 — the room
@@ -4046,10 +4050,29 @@ async function join(room) {
     tel.log('ws-error', { opened: wsOpened ? 1 : 0 });
     if (!wsOpened) wsPreOpenFail?.(preOpenErr());
   };
+  if (adopted) {
+    const sendJoin = () => safe(() => ws.send(JSON.stringify({ type: 'join', lane: wantTape, pcm: PCM_AUDIO ? 1 : 0, sid })), 'predial.join');
+    if (ws.readyState === WebSocket.OPEN) { wsOpened = true; tel.log('predial-adopt', { open: 1 }); sendJoin(); }
+    else { ws.addEventListener('open', () => { tel.log('predial-adopt', { open: 0 }); sendJoin(); }); }
+  }
   ws.onmessage = async (ev) => {
     await safeAsync(async () => {
       const m = JSON.parse(ev.data);
       tel?.log('ws-rx', { type: m?.type, sig: pc?.signalingState });
+      if (m.type === 'full') {
+        // Pre-dial's rejection arrives as a MESSAGE on an already-open socket
+        // (the legacy path's 409 kills the upgrade before open). The server
+        // closes right after sending it — and an open-socket close would read
+        // as a mid-call network death and start recoverCall's rejoin loop
+        // against a room that is full. Detach the handlers first: this close
+        // is an answer, not an accident.
+        tel.log('room-full-msg', {});
+        ws.onclose = null;
+        ws.onerror = null;
+        wsPreOpenFail?.(new Error('this call may already have two people in it'));
+        safe(() => ws.close(), 'full.close');
+        return;
+      }
       if (m.type === 'welcome') {
         role = m.role;
         tel.role = role;
@@ -5161,6 +5184,24 @@ function prewarmRoom(room) {
   if (!room) return;
   safe(() => { fetch(`/api/room/${encodeURIComponent(room)}/summary`).catch(() => {}); }, 'prewarm');
 }
+
+// The second joiner's 241 ms click→welcome was the largest slice of
+// click→connected (measured, room log, 2026-08-11) — and the lobby knows
+// the room name as early as it knows to pre-warm the DO. The socket dials
+// in HOLD state (?hold=1): the room accepts but does not admit, so a lobby
+// lurker never occupies a slot; the click sends {type:'join'} and the
+// welcome arrives in ~one RTT. 120 s server timeout; a closed pre-dial
+// falls back to the fresh dial, losing nothing.
+let predial = null; // { room, ws }
+function predialWs(room) {
+  if (!PREDIAL || !room) return;
+  if (predial?.room === room && predial.ws.readyState <= WebSocket.OPEN) return;
+  safe(() => { predial?.ws.close(); }, 'predial.close');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const w = new WebSocket(`${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?hold=1`);
+  w.onclose = () => { if (predial?.ws === w) predial = null; };
+  predial = { room, ws: w };
+}
 $('join').onclick = async () => {
   const wanted = roomFromInput($('room').value);
   if (wanted === null) {
@@ -5545,12 +5586,13 @@ safe(() => {
   const urlRoom = location.pathname.match(/^\/([a-z]{3}-[a-z]{4}-[a-z]{3})$/)?.[1]
     ?? new URLSearchParams(location.search).get('r');
   prewarmRoom(urlRoom || pendingMint);
+  predialWs(urlRoom || pendingMint);
   let warmT = null;
   $('room').addEventListener('input', () => {
     clearTimeout(warmT);
     warmT = setTimeout(() => {
       const r = roomFromInput($('room').value);
-      if (r) prewarmRoom(r);
+      if (r) { prewarmRoom(r); predialWs(r); }
     }, 800);
   });
 }, 'prewarm.lobby');

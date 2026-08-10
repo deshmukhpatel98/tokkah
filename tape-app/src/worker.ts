@@ -86,6 +86,9 @@ export class Room implements DurableObject {
   private laneCaps = new Map<WebSocket, number>();
   private pcmCaps = new Map<WebSocket, number>();
   private sids = new Map<WebSocket, string>();
+  private held = new Set<WebSocket>();
+  private heldTimers = new Map<WebSocket, ReturnType<typeof setTimeout>>();
+  private roomCode = '';
   private sql: SqlStorage;
   // §10: the room's sole time authority. Stamped once at DO creation, persisted
   // so a DO restart keeps the epoch (a call's session clock must not rebase
@@ -266,28 +269,17 @@ export class Room implements DurableObject {
   }
 
   // ── Signaling ─────────────────────────────────────────────────────────────
-  private signal(request: Request): Response {
-    if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expected websocket' }, 426);
 
-    // Sweep sockets that died without telling us. `close`/`error` fire on a
-    // clean teardown, but a phone that sleeps, loses cellular, or has its tab
-    // killed leaves its entry behind — and two ghosts wedge the room at
-    // "room full" for everyone, forever, with no way for the occupants to
-    // clear it. The capacity check must count who is actually here.
+  // Shared admission gate: sweep dead sockets, evict a ghost with the same
+  // session id, and report whether the room is already full. Both the upgrade
+  // path and the hold-join path call this so the logic is in one place.
+  private evictAndCheckFull(sid: string | null): boolean {
     for (const [p] of this.peers) {
       if (p.readyState !== WebSocket.READY_STATE_OPEN) this.peers.delete(p);
     }
-    // Ghost eviction (task #50). A client whose NETWORK died mid-call leaves a
-    // socket that still reads OPEN here — nothing on either end closed it — and
-    // the sweep above cannot see that. When the same TAB rejoins (its `sid`
-    // survives the recovery reload in sessionStorage), the old socket is its
-    // own corpse: close it and admit the newcomer. Measured on the M13
-    // (WiFi cut → cellular, 2026-08-05): without this, the phone's rejoin
-    // 409'd against itself and the call was unrecoverable.
-    const upSid = new URL(request.url).searchParams.get('sid');
-    if (upSid) {
+    if (sid) {
       for (const [p] of this.peers) {
-        if (this.sids.get(p) === upSid) {
+        if (this.sids.get(p) === sid) {
           try { p.close(1000, 'replaced by same tab'); } catch { /* already dead */ }
           this.peers.delete(p);
           this.laneCaps.delete(p);
@@ -296,11 +288,14 @@ export class Room implements DurableObject {
         }
       }
     }
-    if (this.peers.size >= 2) return new Response('room full', { status: 409 });
+    return this.peers.size >= 2;
+  }
 
-    const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
-    server.accept();
+  // The admission logic: role assignment, cap registration, relay listener,
+  // teardown wiring, welcome message, and peer-joined broadcast. Extracted so
+  // the upgrade path and the hold-join path share it.
+  private admit(server: WebSocket, opts: { lane: number; pcm: number; sid: string | null; full: () => void }): void {
+    if (this.peers.size >= 2) { opts.full(); return; }
 
     // Take the FREE slot, not the next ordinal. `size === 0 ? 'a' : 'b'` looks
     // equivalent and is not: when the offerer reloads or reconnects, the
@@ -328,12 +323,10 @@ export class Room implements DurableObject {
     // client with the flag and a client without it produced a ONE-WAY call —
     // the flagged end was inaudible for its whole duration, silently. Same
     // failure shape as the video lane, one sense over.
-    const q = new URL(request.url).searchParams;
-    const lane = Number(q.get('lane')) || 0;
-    const pcm = Number(q.get('pcm')) || 0;
+    const { lane, pcm, sid } = opts;
     this.laneCaps.set(server, lane);
     this.pcmCaps.set(server, pcm);
-    if (upSid) this.sids.set(server, upSid);
+    if (sid) this.sids.set(server, sid);
     const peerCap = (m: Map<WebSocket, number>) => {
       for (const [p] of this.peers) if (p !== server) return m.get(p) ?? 0;
       return null; // nobody else here yet; `peer-joined` carries it when they arrive
@@ -394,6 +387,109 @@ export class Room implements DurableObject {
         }
       }
     }
+  }
+
+  private signal(request: Request): Response {
+    if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expected websocket' }, 426);
+
+    const q = new URL(request.url).searchParams;
+    const hold = q.get('hold') === '1';
+
+    // Persist the room code so hold-join admission can stamp the registry
+    // (the route knows the code; the DO learns it from the URL it receives).
+    // The route rewrites the DO request to https://do/ws — the pathname does
+    // not carry the room code. The route appends it as ?code= instead (see
+    // the ws route), because hold-join admission stamps the rooms registry
+    // from inside the DO and must know which room it is.
+    const codePart = q.get('code');
+    if (codePart) this.roomCode = codePart;
+
+    if (hold) {
+      // Hold-mode upgrade: accept the socket but do NOT admit. The lobby
+      // pre-dials the room WS before the click; the socket waits in `held`
+      // until the client sends {type:'join'}, at which point admission runs.
+      // A lurker never occupies a slot, never relays, and cannot inject.
+      const pair = new WebSocketPair();
+      const [client, server] = [pair[0], pair[1]];
+      server.accept();
+      this.held.add(server);
+
+      // 120 s idle timeout: a lobby tab that never clicks must not keep a
+      // socket open forever.
+      const timer = setTimeout(() => {
+        if (this.held.has(server)) {
+          this.held.delete(server);
+          this.heldTimers.delete(server);
+          try { server.close(1000, 'hold timeout'); } catch { /* gone */ }
+        }
+      }, 120_000);
+      this.heldTimers.set(server, timer);
+
+      let joined = false;
+      server.addEventListener('message', (e: MessageEvent) => {
+        // Once admitted, the hold listener is a no-op — the relay listener
+        // installed by admit() handles all post-admission traffic.
+        if (joined) return;
+        let m: Record<string, unknown>;
+        try { m = JSON.parse(e.data as string); } catch { return; }
+        if (m.type !== 'join') return; // held sockets ignore non-join messages
+        if (!this.held.has(server)) return;
+        this.held.delete(server);
+        const ht = this.heldTimers.get(server);
+        if (ht !== undefined) { clearTimeout(ht); this.heldTimers.delete(server); }
+        joined = true;
+
+        const lane = Number(m.lane) || 0;
+        const pcm = Number(m.pcm) || 0;
+        const sid = m.sid ? String(m.sid) : null;
+
+        if (this.evictAndCheckFull(sid)) {
+          server.send(JSON.stringify({ type: 'full' }));
+          server.close(1000, 'room full');
+          return;
+        }
+        this.admit(server, {
+          lane, pcm, sid,
+          full: () => {
+            server.send(JSON.stringify({ type: 'full' }));
+            server.close(1000, 'room full');
+          },
+        });
+        // Stamp the rooms registry — a hold-join is a real call start.
+        if (this.roomCode) {
+          this.env.HEALTH.get(this.env.HEALTH.idFromName('global'))
+            .fetch(new Request('https://do/room-seen', { method: 'POST', body: this.roomCode }))
+            .then(() => {}, () => {});
+        }
+      });
+
+      const holdTeardown = () => {
+        this.held.delete(server);
+        const ht = this.heldTimers.get(server);
+        if (ht !== undefined) { clearTimeout(ht); this.heldTimers.delete(server); }
+      };
+      server.addEventListener('close', holdTeardown);
+      server.addEventListener('error', holdTeardown);
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // Normal (non-hold) upgrade: evict + full-check inline before creating
+    // the pair, exactly as before — the 409 must remain an HTTP response,
+    // not an open-then-close.
+    const upSid = q.get('sid') || null;
+    if (this.evictAndCheckFull(upSid)) return new Response('room full', { status: 409 });
+
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+
+    this.admit(server, {
+      lane: Number(q.get('lane')) || 0,
+      pcm: Number(q.get('pcm')) || 0,
+      sid: upSid,
+      full: () => { /* unreachable: checked above */ },
+    });
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -1243,16 +1339,19 @@ export default {
       // yesterday was bad" can be answered from /api/health/rooms without
       // asking anyone for the link. Fire-and-forget: the registry must never
       // cost the join anything, so its failure is swallowed whole.
-      if (m[2] === 'ws' && request.headers.get('upgrade') === 'websocket') {
+      if (m[2] === 'ws' && request.headers.get('upgrade') === 'websocket' && url.searchParams.get('hold') !== '1') {
         ctx.waitUntil(
           env.HEALTH.get(env.HEALTH.idFromName('global'))
             .fetch(new Request('https://do/room-seen', { method: 'POST', body: code }))
             .then(() => {}, () => {}),
         );
       }
-      return env.ROOM.get(env.ROOM.idFromName(code)).fetch(
-        new Request(`https://do/${m[2]}${url.search}`, request),
-      );
+      // The DO's request URL is rewritten to https://do/<verb>, so the room
+      // code must ride along explicitly — hold-join admission stamps the
+      // rooms registry from inside the DO and needs to know which room it is.
+      const doUrl = new URL(`https://do/${m[2]}${url.search}`);
+      doUrl.searchParams.set('code', code);
+      return env.ROOM.get(env.ROOM.idFromName(code)).fetch(new Request(doUrl.toString(), request));
     }
 
     if (url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404);
