@@ -4232,3 +4232,9 @@ both tiles moving x3, 0 conceal, 0 errors. Prod source THREE_ENABLED stays false
 the flip is a deliberate product-shape decision, not an autonomous one. Still
 open before any prod flip: assertions 6/7/8 (reload, departure, legacy interop),
 real per-device uplink measurement (~22 Mbps predicted), a phone arm.
+
+call3.mjs complete: 9/9 assertions ALL PASS on staging incl reload, departure
+(frame-continuity proven), legacy interop. Known non-blocking bug: departure
+clears the peers MAP (∅) on survivors via the THREE && !m.peer clear-all branch
+while a<->b audio keeps flowing — fix before prod flip. Uplink is a lower bound
+(media pair ~4.3 Mbps up); exact ~22 Mbps mesh number needs a per-pair stat hook.
