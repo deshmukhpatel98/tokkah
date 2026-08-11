@@ -4212,3 +4212,8 @@ costs ~1.3 s host stalls in concealment rigs - shut it down first.
 
 Three phase 2 landed (client pairs, signaling-only, media single-pair; ?three=1
 default off). Live gates green on both arms; flag-off equivalence reviewed.
+
+Three phase 3 landed after the live gate REJECTED the first cut: a 250 Hz stats
+fold between capture drain and dc.send() cost 232-736 ms held concealment that
+five green unit suites could not see. Fixed, re-gated 0/0/0 x3 live. The lane is
+now a capture spine + per-peer halves; AEC2 far-end is an epoch-tagged accumulate.
