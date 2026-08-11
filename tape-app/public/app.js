@@ -1538,6 +1538,7 @@ const PCM_CFG = {
   // the new audio path). `?aec2=0` / `?presence=0` are the control arms.
   aec2: QS.get('aec2') !== '0', // in-house canceller; Chrome-AEC latch stands down to telemetry
   presence: QS.get('presence') !== '0', // stereo room image on playout (presence-core.js)
+  spatial: QS.get('spatial') !== '0', // placed voices when >1 remote (presence placement law)
   echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
   targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
@@ -3891,7 +3892,7 @@ function addPair(peerRole, lane, pcmCap) {
     // Phase 6: `pending` is the deferPair FIFO drained at `buildPair`; `pcmHalf`
     // is this pair's Lane A receive-half index (pcm.addPeer). Null on the media
     // pair, which uses the module-scope `pc`/`pcm` half 0.
-    pending: null, pcmHalf: null };
+    pending: null, pcmHalf: null, pcmDc: null };
   peers.set(peerRole, rec);
   // First peer learned owns the media. `welcome.peers` is ordered by the DO the
   // same way `peerLane`/`peerPcm` pick their subject — the FIRST other occupant
@@ -3973,20 +3974,67 @@ function buildPair(peerRole) {
   if (pcm && PCM_AUDIO && !pcmFellBack) {
     const half = pcm.addPeer();
     p.pcmHalf = half;
+    // `p.pcmDc` is kept ONLY so this pair's assoc-0 channel state is observable
+    // (`__tape.pairs[].pcmDc`, the 2 s `pcm-half-stats`). pcm.js owns the channel
+    // once attached; nothing here ever sends on it. A second half whose channel
+    // never reaches 'open' receives nothing and plays nothing while every pc
+    // reads `connected` — which is exactly the failure assertion 3 could not see.
     if (initiator) {
       const dc = p.pc.createDataChannel('pcm-audio', { ordered: false, maxRetransmits: 0 });
+      p.pcmDc = dc;
       pcm.attachChannel(dc, 0, half);
     } else {
       const prev = p.pc.ondatachannel;
       p.pc.ondatachannel = (e) => {
         try { prev?.call(p.pc, e); } catch { /* keep the tape-ctl chain intact */ }
-        if (e.channel.label === 'pcm-audio') pcm?.attachChannel(e.channel, 0, half);
+        if (e.channel.label === 'pcm-audio') {
+          p.pcmDc = e.channel;
+          pcm?.attachChannel(e.channel, 0, half);
+        }
       };
     }
     if (PCM_CFG.pairs > 1) startPcmStripes(peerRole, initiator, half);
   }
   tel?.log('pair-build', { peer: peerRole, initiator: initiator ? 1 : 0, half: p.pcmHalf ?? null });
   return p;
+}
+
+/**
+ * One pair's Lane A FLOW, off its own receive half's snapshot. The media pair is
+ * half 0 (`pcm.snapshot()`), which the 2 s tick already logs; a second pair is
+ * whatever `pcm.addPeer()` handed it. Returns null when this pair has no half.
+ *
+ * `played` is the only counter that answers "is this voice audible": a half can
+ * have a live playout node (presence rendering, azimuth moving) and still have
+ * played nothing, because presence renders whatever the ring holds — including
+ * silence. `recv`/`sent`/`skipped` say WHERE a zero came from: recv 0 with the
+ * peer's own sent > 0 is a receive-path break; sent 0 with skipped > 0 is our
+ * send gate finding no open association (pcm.js `pickDataAssoc`).
+ */
+function pcmHalfFlow(p) {
+  const n = p.media ? 0 : p.pcmHalf;
+  if (n == null || !pcm) return null;
+  const s = safe(() => pcm.snapshot(n), 'pcm.half-snap');
+  if (!s) return null;
+  return {
+    half: n,
+    played: s.playedFrames ?? s.wl?.playedFrames ?? null,
+    concealedMs: s.concealedMs ?? null,
+    recv: s.framesRecv ?? null,
+    sent: s.framesSent ?? null,
+    skipped: s.skipBuffered ?? null,
+    mode: s.mode ?? null,
+    // The three counters that separate "nothing arrived" from "everything
+    // arrived and the ring refused it" — pcm.js's ringWrite documents a MEASURED
+    // CLIFF where an audio graph slower than ~1.008 s to come up leaves the ring
+    // holding a stale window and rejecting every later frame as far-future,
+    // freezing playout with every transport counter green. Three playout
+    // worklets plus presence on one audio thread is exactly the load that makes
+    // that startup slower, so this is the discriminator for BOTH halves.
+    reseeds: s.ringReseeds ?? null,
+    farFuture: s.farFuture ?? null,
+    late: s.lateFrames ?? null,
+  };
 }
 
 /** Offer half for a non-media pair — `offer()` untouched (its media path stays literal). */
@@ -5159,6 +5207,17 @@ async function join(room) {
     srcProbeSample(); // task #37: camera-delivered fps, armed at join
     if (tape) tel?.log('tape-stats', tape.snapshot());
     if (pcm) tel?.log('pcm-stats', pcm.snapshot());
+    // Every SECOND pair's half, which `pcm-stats` (half 0) has never covered —
+    // so a silent second voice leaves a trace instead of needing a live console.
+    // THREE-only and only for a pair that actually has a half, so the flag-off
+    // and 1:1 arms log exactly what they logged before.
+    if (THREE && pcm) {
+      for (const p of peers.values()) {
+        if (p.media || p.pcmHalf == null) continue;
+        const f = pcmHalfFlow(p);
+        if (f) tel?.log('pcm-half-stats', { peer: p.role, dc: p.pcmDc?.readyState ?? null, ...f });
+      }
+    }
     if (tsync) tel?.log('timesync-stats', tsync.snapshot());
     stallPcmSample(); // §12–13: the HOLD classifier rides the 2 s stats cadence
     paintHud();
@@ -6497,6 +6556,9 @@ window.__tape = {
   get tapeMode() { return { wanted: TAPE, running: !!tape, fellBack: tapeFellBack }; },
   // Lane A's own counters — getStats() sees no audio at all on this path.
   get pcm() { return pcm?.snapshot() ?? null; },
+  // Per-half snapshot (phase 3 split): half 0 is the media pair; a 3-way
+  // call's second voice is half 1. The spatial rig reads its azimuthDeg here.
+  pcmHalf: (n) => pcm?.snapshot?.(n) ?? null,
   // Lane A's transport decision, the audio twin of tapeMode. `spare` is the one
   // that matters: the Opus sender's track is null while lane A carries the call
   // and non-null once the fallback has revived it, so a test can tell "silent
@@ -6556,6 +6618,15 @@ window.__tape = {
         // pcmLadder(role) — pcmConn reports its idx-0 (main) pc.
         conn: (p.media ? pc : p.pc)?.connectionState ?? null,
         pcmConn: (p.media ? pc : (pcmLadder(p.role)?.[0] ?? p.pc))?.connectionState ?? null,
+        // Lane A FLOW for this pair, not intent. `pcmHalf` is its receive-half
+        // index; `pcmDc` is assoc-0's channel state (null on the media pair,
+        // whose channel pcm.js owns from `startPcm`); `played`/`recv` come from
+        // that half's own snapshot. A pair can read conn 'connected' with
+        // pcmDc 'connecting' and played 0 — the second-voice-silent failure.
+        pcmHalf: p.pcmHalf,
+        pcmDc: p.pcmDc?.readyState ?? null,
+        played: pcmHalfFlow(p)?.played ?? null,
+        recv: pcmHalfFlow(p)?.recv ?? null,
       })),
     };
   },

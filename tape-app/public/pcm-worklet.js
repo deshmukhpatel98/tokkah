@@ -235,7 +235,11 @@ class PcmPlayout extends AudioWorkletProcessor {
     // the flag — off-arm, `this.presence` is null and process() never takes
     // the stereo branch, so playout stays byte-identical to the mono build.
     // pcm.js opens the node with outputChannelCount [2] iff the flag is on.
-    this.presence = o.presence ? createPresence({ sampleRate }) : null;
+    // azimuthDeg places THIS voice in the room (presence-core placement law:
+    // ITD + broadband ILD only, both lossless; 0 = centered = the original
+    // loop bit-exact). pcm.js sends 0 for the first voice always — placement
+    // exists only when a second voice does.
+    this.presence = o.presence ? createPresence({ sampleRate, azimuthDeg: o.azimuthDeg ?? 0 }) : null;
 
     // Playout state. `pos` is a fractional absolute sample index — the
     // resample ratio moves it by slightly more or less than 1 per output

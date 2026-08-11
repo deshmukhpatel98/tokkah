@@ -59,6 +59,15 @@ const snap = (pg) => pg.evaluate(() => {
     media: pj?.media ?? null,
     pcmRecv: pcm.framesRecv, conceal: pcm.concealedMs, mode: pcm.mode,
     aec2: pcm.aec2 ?? null,
+    // Per-HALF flow (assertion 4). `pairs[].played` is that pair's own receive
+    // half's playedFrames — half 0 for the media pair, `pcm.addPeer()`'s index
+    // for the second. Connection state cannot see a silent second voice: a half
+    // reads pc 'connected' and presence alive while playing nothing, because the
+    // playout worklet renders whatever the ring holds, including silence.
+    halves: (pj?.peers ?? []).map((p) => ({
+      role: p.role, media: !!p.media, half: p.pcmHalf ?? (p.media ? 0 : null),
+      dc: p.pcmDc ?? null, played: p.played ?? null, recv: p.recv ?? null,
+    })),
   };
 });
 
@@ -110,6 +119,37 @@ try {
   A(audioOk, `4 pristine: modes=${[sa, sb, sc].map((s) => s.mode).join(',')} conceal=${[sa, sb, sc].map((s) => s.conceal).join(',')}ms`);
   const aecOk = [sa, sb, sc].every((s) => s.aec2 && (s.aec2.gate === 0 || s.aec2.erleDb == null || s.aec2.erleDb > -5));
   A(aecOk, `4 AEC2 sane on all three: ${[sa, sb, sc].map((s) => s.aec2?.erleDb?.toFixed?.(1) ?? 'n/a').join(',')}`);
+
+  // 4b. BOTH halves actually PLAY — flow, not connection state. This is the
+  //     assertion whose absence let a silent second voice ship: assertion 3 only
+  //     ever read pc.connectionState, and a half with an unopened pcm-audio
+  //     channel reads 'connected' at the pc while its ring stays empty forever.
+  //     Sampled twice ~6 s apart so it proves ADVANCE, not a one-off total:
+  //     a half that played 247 frames and stopped fails this, a half that never
+  //     started fails it, and only a half carrying real audio passes.
+  const halvesOf = async () => Promise.all([pa, pb, pc].map((s) => snap(s.page).then((x) => x.halves)));
+  const h1 = await halvesOf();
+  await wait(6000);
+  const h2 = await halvesOf();
+  const fmt = (hs) => hs.map((h) => h.map((x) => `${x.role}${x.media ? '*' : ''}:h${x.half}=${x.played}${x.dc ? `/${x.dc}` : ''}`).join(' ')).join(' | ');
+  // Every page must hold two halves, and every half must advance > 500 frames
+  // (4 s of audio) across the ~6 s window.
+  const shapeOk = h2.every((h) => h.length === 2 && h.every((x) => x.half != null));
+  A(shapeOk, `4b two halves present per page: ${fmt(h2)}`);
+  const advances = h1.map((h, i) => h.map((x, j) => (h2[i][j]?.played ?? 0) - (x.played ?? 0)));
+  const flowOk = shapeOk && advances.every((row) => row.every((d) => d > 500));
+  A(flowOk, `4b BOTH halves playing (>500 frames/6s): deltas=${advances.map((r) => r.join('/')).join(', ')}  state=${fmt(h2)}`);
+  // Name the failing side explicitly — "the second voice is silent" is a
+  // different bug from "a pair never negotiated", and the dc state separates them.
+  if (!flowOk) {
+    for (let i = 0; i < h2.length; i++) {
+      for (let j = 0; j < h2[i].length; j++) {
+        const d = advances[i]?.[j] ?? 0;
+        if (d <= 500) console.log(`    SILENT half: page ${[pa, pb, pc][i].side} peer ${h2[i][j].role}`
+          + ` half=${h2[i][j].half} played+=${d} recv=${h2[i][j].recv} dc=${h2[i][j].dc}`);
+      }
+    }
+  }
 
   // 5. Both video tiles alive on every page.
   const tiles = await Promise.all([pa, pb, pc].map((s) => s.page.evaluate(() => {

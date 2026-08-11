@@ -391,7 +391,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
    * design, and collapsing it to a shared rate would make the good path pay the
    * bad path's parity.
    */
-  function createPeerHalf() {
+  function createPeerHalf({ azimuthDeg = 0 } = {}) {
     const stats = {
       // send
       captureFrames: 0, framesSent: 0, bytesSent: 0, paritySent: 0, parityBytes: 0,
@@ -1999,6 +1999,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           driftPpm: cfg.driftPpm,
           aecSab: aecSab ?? undefined,
           presence: cfg.presence ? true : undefined,
+          // Spatial placement: the FIRST voice is always centered (0 — the
+          // presence render loop is then bit-identical to the pre-placement
+          // build, so 1:1 is untouched). A later half (addPeer) sits to the
+          // right; ?spatial=0 pins every voice to center.
+          azimuthDeg: azimuthDeg || undefined,
         },
       });
       playNode.port.onmessage = (e) => {
@@ -2442,7 +2447,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // and a silent playout node. Phase 4/6 calls it once per extra peer and
     // then attaches that peer's channels with `attachChannel(dc, idx, n)`.
     addPeer() {
-      const h = createPeerHalf();
+      // Spatial law: voice 0 (the media pair) is centered; each ADDED voice
+      // sits at a distinct seat so a 3-way call reads as sitting between two
+      // people. One extra voice is the only case today: +28° (right). cfg
+      // gates it (?spatial=0 pins center; presence off = no renderer at all).
+      const az = cfg.presence && cfg.spatial !== false && halves.length >= 1 ? 28 : 0;
+      const h = createPeerHalf({ azimuthDeg: az });
       halves.push(h);
       h.attachGraph();
       return halves.length - 1;
