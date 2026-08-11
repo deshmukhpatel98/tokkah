@@ -138,6 +138,17 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   let wasConverged = false
   let dtHangover = 0
   let dtFrozenBlocks = 0
+  // Do-no-harm gate. A canceller with nothing to cancel can only do harm:
+  // on a path with zero acoustic coupling the filter adapts to spurious
+  // correlations, the DTD freezes the junk weights, and "cancellation" ADDS
+  // energy — measured live on iOS 2026-08-11 at −13 dB ERLE, output 20×
+  // the mic power. So subtraction must EARN its place: the filter always
+  // learns at full fidelity, but its output is only delivered while ERLE
+  // proves ≥3 dB of real help (closing again below 1 dB — hysteresis, no
+  // flapping). While closed, the mic passes through bit-exact; the moment
+  // real echo appears and ERLE climbs, delivery engages within the EMA's
+  // time constant.
+  let gateOpen = false
   let refSilentBlocks = 0
 
   function resetWeights() {
@@ -296,9 +307,10 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       }
 
       if (dtCount >= 3) {
-        // Double talk: freeze adaptation but keep subtracting
+        // Double talk: freeze adaptation but keep subtracting (gate deciding
+        // whether the subtraction is DELIVERED — see below)
         lastAdapting = false
-        for (let i = 0; i < L; i++) out[i] = e[i]
+        for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
         // Escape valve: a freeze that outlives any plausible unbroken
         // double-talk (6 s) is really a CHANGED echo path — the frozen filter
         // mispredicts, e stays large, and without this the freeze is
@@ -308,7 +320,7 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
         dtFrozenBlocks = 0
         // Single talk: adapt filter weights
         lastAdapting = true
-        for (let i = 0; i < L; i++) out[i] = e[i]
+        for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
 
         // Echo-to-error step scaling: once converged, an error block the echo
         // estimate cannot explain is near-end speech the binary DTD hasn't
@@ -379,6 +391,11 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       if (erleDbEma >= 6) {
         wasConverged = true
       }
+      // The harm gate's only inputs: proven help opens it, proven none
+      // closes it. Both thresholds live on the EMA, so one wild block moves
+      // nothing.
+      if (!gateOpen && erleDbEma >= 3) gateOpen = true
+      else if (gateOpen && erleDbEma < 1) gateOpen = false
     }
 
     // 8. Bulk-delay estimation (~every 250 blocks)
@@ -454,7 +471,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       erleDb: erleDbEma,
       delayBlocks: delayBlocks,
       adapting: lastAdapting,
-      converged: erleDbEma !== null && erleDbEma >= 12
+      converged: erleDbEma !== null && erleDbEma >= 12,
+      gate: gateOpen ? 1 : 0
     }
   }
 
