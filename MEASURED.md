@@ -4274,3 +4274,9 @@ pre-dial/latency-floor) live. Flipping THREE_ENABLED to true is now a literal
 one-line, one-place change — gated behind: the real-phone CPU/thermal verdict,
 and explicit acceptance of the permanent costs (worst-link-governs, translation-
 off-at-three, per-peer telemetry).
+
+One-line interpreter shipped: embed data-translate=<lang> -> live interpreter in
+the iframe (proven on prod: es session from the attribute alone, 25 caps + 25 TTS
+both ways). Per-room daily budget (xlateMeter, 600 s grains vs 7200 s default)
+proven on staging: second session visibly refused. Note: staging worker now
+carries flag-off + cap-1 build; redeploy before any call3 rerun.
