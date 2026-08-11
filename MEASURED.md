@@ -4187,3 +4187,7 @@ gap is ~2 ws RTTs of DO relay (A's own peer-joined->offer-tx gap is 5 ms), and t
 144 ms DTLS/stripe phase is handshake RTTs on 7 already-parallel connections.
 Neither is client work; shaving them means moving signaling off the DO round-trip
 path, which is not a low-hanging fruit. Recorded so nobody re-chases them.
+
+Away presence shipped: iOS backgrounding now NAMES itself at the peer (status +
+telemetry) instead of mystery silence. Verified live: sim HOME press -> desktop
+status flip <1 s -> clear on return. iOS-only find; desktop Safari never suspends.
