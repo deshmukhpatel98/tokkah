@@ -4163,3 +4163,7 @@ Correction to the iOS-call entry: the \"signaling timeout\" was NOT a pre-existi
 UX flaw - it was the pre-dial commit's own regression (adopted-OPEN sockets never
 fire onopen; the join gate awaited it). Fixed and verified live on both surfaces.
 Lesson recorded: rigs must read the words on the screen, not only pc state.
+
+AEC2 do-no-harm gate shipped same day: filter learns always, delivers only at
+ERLE >=3 dB (hysteresis at 1). Live iOS retest: gate 0, erle ~-0.8 shadow (was -13
+frozen), desktop concealment of iOS audio 4912 -> 32 ms. Gate-open awaits real air.
