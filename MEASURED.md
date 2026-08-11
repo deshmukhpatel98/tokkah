@@ -4177,3 +4177,7 @@ P0 found and fixed same day: the one-line embed NEVER worked - frame-ancestors
 'none' refused every embedding site since embed.js shipped. Now '*' (deliberate;
 see worker.ts comment), X-Frame-Options dropped, and embed-call.mjs holds the line:
 embedded iframe <-> app peer live on prod, 1503 frames, port mode, 32 ms conceal.
+
+10-min live soak on the latency-floor default: NO RATCHET. Depth held 13-21 ms
+(2-3f target) for the full 600 s, mouthToEar 43.7-51.5 ms, conceal 48-56 ms total
+(0.008%). The 2f posture is stable over long calls, not just 30 s rigs.
