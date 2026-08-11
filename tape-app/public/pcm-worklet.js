@@ -275,6 +275,13 @@ class PcmPlayout extends AudioWorkletProcessor {
     };
     if (o.aecSab) {
       this.aecHi = new Int32Array(o.aecSab, 0, 1);
+      // The slot's EPOCH, in the ring header beside `hi` — the block index the
+      // ring's current block belongs to. See process(): with more than one
+      // playout node alive the far-end reference has to be their SUM, and this
+      // word is how the first writer of a quantum is told apart from the rest.
+      // The header was 64 B with 15 words spare, so the ring is unmoved and
+      // unresized and its bytes are what they always were.
+      this.aecEpoch = new Int32Array(o.aecSab, 4, 1);
       this.aecRing = new Float32Array(o.aecSab, 64, 512 * 128);
     }
   }
@@ -329,8 +336,32 @@ class PcmPlayout extends AudioWorkletProcessor {
     if (!out) return true;
     this.fill(out);
     if (this.aecRing && out.length === 128) {
+      // ── The far-end reference is a SUM, not last-writer-wins (§5.2) ────────
+      // At three people there are two playout nodes and the Web Audio graph
+      // sums them at the destination, so what the speakers actually emit — the
+      // only signal a canceller can subtract — is that sum. A plain .set() here
+      // would leave the reference carrying whichever node the graph happened to
+      // run last, and the OTHER remote voice would come back as uncancelled
+      // echo with every counter green. That is the single most expensive
+      // failure in the three-person design, so the write is epoch-tagged: the
+      // block index k tags the slot, the first node to reach it this quantum
+      // WRITES, every later one ADDS.
+      //
+      // One epoch word covers all 512 slots because every playout node in a
+      // render quantum sees the same `currentFrame` and therefore the same k —
+      // the slot's identity IS k. The compareExchange claims k once; whoever
+      // loses the claim is a later writer by definition. These nodes share one
+      // audio thread, so this is ordering, not contention. At one node the
+      // claim always succeeds and the ring's bytes are what they were.
+      //
+      // Still BEFORE presence.render(): the canceller's reference must be the
+      // pristine mono lane, and the room exists only in the last metres.
       const k = (currentFrame / 128) | 0;
-      this.aecRing.subarray((k % 512) * 128, (k % 512) * 128 + 128).set(out);
+      const base = (k % 512) * 128;
+      const prev = Atomics.load(this.aecEpoch, 0);
+      const first = prev !== k && Atomics.compareExchange(this.aecEpoch, 0, prev, k) === prev;
+      if (first) this.aecRing.subarray(base, base + 128).set(out);
+      else for (let i = 0; i < 128; i++) this.aecRing[base + i] += out[i];
       Atomics.store(this.aecHi, 0, k);
     }
     this.detect(out);

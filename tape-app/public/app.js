@@ -1626,7 +1626,32 @@ const PREDIAL = QS.get('predial') !== '0'; // lobby pre-dials the room ws; `?pre
 // call, so the latch is honoured everywhere from that moment on.
 let THREE = QS.get('three') === '1';
 let pcm = null;
-let pcmPcs = []; // stripe pcs for associations 1..N-1 (association 0 rides the main pc)
+// §5.3: the stripe ladder is per PAIR, because the associations it holds are a
+// property of one DTLS relationship. Keyed by the peer's letter — except that a
+// welcome can arrive while we are alone in the room, where the media pair has no
+// letter yet and `mediaPeer` is null (and with THREE off it stays null for the
+// whole call). Those ladders live under `PCM_SOLO` and `pcmAdoptLadder` moves
+// one under its letter the moment the pair acquires one, so flag-off is a map
+// with exactly one entry read exactly where the array used to be read.
+const PCM_SOLO = '-';
+const pcmPcs = new Map(); // peer letter → stripe pcs indexed 1..N-1 (association 0 rides that pair's main pc)
+const pcmKey = (peerRole) => peerRole ?? PCM_SOLO;
+/**
+ * The ladder for a pair. The `PCM_SOLO` fallback is load-bearing and is NOT a
+ * convenience: `from` is server-stamped on every relayed frame the moment
+ * `THREE_ENABLED` flips (worker.ts §3.2) — including for a client whose own
+ * `?three=` is off, whose `mediaPeer` is therefore null and whose ladder is
+ * therefore under the placeholder. Without the fallback that build answers no
+ * `pcm-offer` and applies no `pcm-answer`, all N−1 stripes stay dead, and the
+ * entire ~1.8 Mbps lane crams onto association 0 — straight into the per-
+ * association SCTP ceiling the stripe exists to escape, which presents as
+ * held concealment on both sides with every transport counter green. The
+ * placeholder can only ever hold ONE ladder (pcmAdoptLadder moves it out the
+ * instant a pair acquires a letter), so falling back to it cannot cross pairs.
+ */
+const pcmLadder = (peerRole) => pcmPcs.get(pcmKey(peerRole)) ?? pcmPcs.get(PCM_SOLO) ?? null;
+/** Every stripe pc on the page, holes skipped — for teardown and audits. */
+const pcmAllPcs = () => [...pcmPcs.values()].flatMap((l) => l.filter(Boolean));
 let pcmIceServers = []; // the join-time /api/ice config, stashed by the welcome handler
 // Lane A's safety net. The mic is added to the pc even under ?pcmaudio=1 and then
 // immediately nulled: an audio m-line that is negotiated, costs nothing (measured
@@ -1871,7 +1896,7 @@ let welcomeAtMs = 0; // local wall ms when the welcome (and its epoch) arrived
  * channel simply stays quiet until both it and the graph are ready.
  */
 let aecLatched = false;
-function startPcm(initiator) {
+function startPcm(peerRole, initiator) {
   safe(() => {
     pcm = initPcmAudio({
       stream: localStream,
@@ -1932,7 +1957,8 @@ function startPcm(initiator) {
     // §17.12 striping: associations 1..N-1 ride their own data-channel-only
     // pcs, created HERE — synchronously, channels before any offer they make
     // (the no-renegotiation law applies to them exactly as to the main pc).
-    if (PCM_CFG.pairs > 1) startPcmStripes(initiator);
+    // One ladder per pair (§5.3); phase 3 builds exactly one, for `mediaPeer`.
+    if (PCM_CFG.pairs > 1) startPcmStripes(peerRole, initiator);
     tel?.log('pcm-start', { initiator, cfg: PCM_CFG });
   }, 'pcm.start');
 }
@@ -1942,32 +1968,41 @@ function startPcm(initiator) {
  * peer connections, set up once at join, never renegotiated, sharing the
  * join-time /api/ice config. Signalling is a namespaced parallel of the main
  * pc's: 'pcm-offer' / 'pcm-answer' / 'pcm-ice', each carrying the stripe idx.
- * Role 'a' offers (pcmStripeOfferAll is called from the same welcome /
- * peer-joined points as the main offer), role 'b' answers.
+ * The pair's offerer offers (pcmStripeOfferAll is called from the same welcome
+ * / peer-joined points as the main offer), the answerer answers.
+ *
+ * §5.3: the ladder and its signalling are per PAIR. `peerRole` says whose, `to`
+ * addresses the wire, and `half` says which of pcm.js's receive halves the
+ * channels belong to. Phase 3 builds one ladder, for `mediaPeer`, on half 0 —
+ * which with THREE off is the literal call that stood here before.
  */
-function startPcmStripes(initiator) {
+function startPcmStripes(peerRole, initiator, half = 0) {
+  const ladder = [];
   for (let idx = 1; idx < PCM_CFG.pairs; idx++) {
     const spc = new RTCPeerConnection({ iceServers: pcmIceServers, ...certArg() });
     spc.onnegotiationneeded = () =>
       tel?.log('pcm-stripe-neg', { idx, sig: spc.signalingState }); // observed, never acted on
-    spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate, ...addr(mediaPeer) });
+    spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate, ...addr(peerRole) });
     spc.oniceconnectionstatechange = () => tel?.log('pcm-stripe-ice', { idx, state: spc.iceConnectionState });
     spc.onconnectionstatechange = () => tel?.log('pcm-stripe-state', { idx, state: spc.connectionState });
     if (initiator) {
       const dc = spc.createDataChannel(`pcm-audio-${idx}`, { ordered: false, maxRetransmits: 0 });
-      pcm.attachChannel(dc, idx);
+      pcm.attachChannel(dc, idx, half);
     } else {
       spc.ondatachannel = (e) => {
-        if (e.channel.label === `pcm-audio-${idx}`) pcm?.attachChannel(e.channel, idx);
+        if (e.channel.label === `pcm-audio-${idx}`) pcm?.attachChannel(e.channel, idx, half);
       };
     }
-    pcmPcs[idx] = spc;
+    ladder[idx] = spc;
   }
+  pcmPcs.set(pcmKey(peerRole), ladder);
 }
 
 async function pcmStripeOfferAll(peerRole = mediaPeer) {
+  const ladder = pcmLadder(peerRole);
+  if (!ladder) return;
   for (let idx = 1; idx < PCM_CFG.pairs; idx++) {
-    const spc = pcmPcs[idx];
+    const spc = ladder[idx];
     if (!spc || spc.localDescription) continue; // set up once, never renegotiated
     await safeAsync(async () => {
       const o = await spc.createOffer();
@@ -2139,10 +2174,11 @@ function fallbackToOpus(why, quiet) {
   safe(() => {
     pcm?.stop();
     pcm = null;
-    // pcmPcs is indexed from 1 (association 0 rides the main pc), so slot 0 is
-    // always a hole — close only what exists, same as the teardown at leave.
-    for (const spc of pcmPcs) if (spc) safe(() => spc.close(), 'pcm.stripe-close');
-    pcmPcs = [];
+    // Each pair's ladder is indexed from 1 (association 0 rides that pair's main
+    // pc), so slot 0 is always a hole — `pcmAllPcs` skips the holes, same as the
+    // teardown at leave.
+    for (const spc of pcmAllPcs()) safe(() => spc.close(), 'pcm.stripe-close');
+    pcmPcs.clear();
     const mic = localStream?.getAudioTracks()[0];
     if (pcmSpareSender && mic) pcmSpareSender.replaceTrack(mic).catch(() => {});
     attachRemoteMedia();
@@ -3505,6 +3541,25 @@ function deferPair(m) {
 }
 
 /**
+ * The Lane A stripe ladder is built at `welcome`, which can happen while we are
+ * alone in the room — so the media pair has no letter to key it by yet. When
+ * the pair finally acquires one it is the SAME ladder, holding the same live
+ * pcs: move it under the letter rather than stranding it under the placeholder,
+ * where every `to`-addressed lookup would miss it and the stripes would never
+ * negotiate. Only reachable under THREE (addPair is the flag-on path); flag-off
+ * the ladder stays under `PCM_SOLO` for the whole call, which is where every
+ * flag-off lookup reads it.
+ */
+function pcmAdoptLadder(peerRole) {
+  if (!peerRole || peerRole === PCM_SOLO || pcmPcs.has(peerRole)) return;
+  const solo = pcmPcs.get(PCM_SOLO);
+  if (!solo) return;
+  pcmPcs.delete(PCM_SOLO);
+  pcmPcs.set(peerRole, solo);
+  tel?.log('pcm-ladder-adopt', { peer: peerRole, stripes: solo.filter(Boolean).length });
+}
+
+/**
  * Learn an occupant. Idempotent: `welcome`'s `peers` and a later `peer-joined`
  * can name the same letter, and the second must not orphan the first's state.
  */
@@ -3519,7 +3574,7 @@ function addPair(peerRole, lane, pcmCap) {
   // same way `peerLane`/`peerPcm` pick their subject — the FIRST other occupant
   // — so `mediaPeer` and the legacy fields describe the same peer, and the
   // laneAgree/pcmAgree calls below keep meaning what they said.
-  if (!mediaPeer) { mediaPeer = peerRole; rec.media = true; }
+  if (!mediaPeer) { mediaPeer = peerRole; rec.media = true; pcmAdoptLadder(peerRole); }
   tel?.log('pair-add', { peer: peerRole, media: rec.media ? 1 : 0, n: peers.size,
     offerer: offersTo(peerRole) ? 1 : 0 });
   return rec;
@@ -4283,7 +4338,7 @@ async function join(room) {
         // lane right back.
         if (PCM_AUDIO && !pcmFellBack) {
           pcmIceServers = ice?.iceServers ?? [];
-          startPcm(offersTo(mediaPeer));
+          startPcm(mediaPeer, offersTo(mediaPeer));
         }
         // TIME_SYNC starts when the ctl channel opens (avsync.onCtlOpen above);
         // it is constructed here so both roles share one instance.
@@ -4469,7 +4524,7 @@ async function join(room) {
         // ladder and indexing it with another pair's `idx` would answer a stripe
         // that pair never offered.
         if (!forMediaPair(m.from)) { deferPair(m); return; }
-        const spc = pcmPcs[m.idx];
+        const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
           const ans = await spc.createAnswer();
@@ -4478,11 +4533,11 @@ async function join(room) {
         }
       } else if (m.type === 'pcm-answer') {
         if (!forMediaPair(m.from)) { deferPair(m); return; }
-        const spc = pcmPcs[m.idx];
+        const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
       } else if (m.type === 'pcm-ice') {
         if (!forMediaPair(m.from)) { deferPair(m); return; }
-        await pcmPcs[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
+        await pcmLadder(m.from ?? mediaPeer)?.[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
         // consumed it is gone (2026-08-04).
@@ -5137,7 +5192,12 @@ function stopCallMachinery({ keepMedia = false } = {}) {
     remoteAttaching = false;
     pcm?.stop();
     tsync?.stop();
-    for (const spc of pcmPcs) spc?.close();
+    // Cleared, not just closed. The array this used to be was re-entered by
+    // index, so join() overwrote it; a map is keyed by the PAIR, and a reset
+    // that comes back paired with a different letter (or with none) would
+    // otherwise leave the spent ladder behind under the old key.
+    for (const spc of pcmAllPcs()) spc.close();
+    pcmPcs.clear();
     pc?.close();
     ws?.close();
     if (!keepMedia) for (const t of localStream?.getTracks() ?? []) t.stop();
@@ -5926,8 +5986,7 @@ window.__tape = {
     };
     const main = pc ? await one(pc) : null;
     const stripes = [];
-    for (const spc of pcmPcs) {
-      if (!spc) continue;
+    for (const spc of pcmAllPcs()) {
       const s = await one(spc);
       // "Not handshaked yet" and "different identity" are opposite findings and
       // must not collapse into one false. Only the second is a security problem.
@@ -5941,9 +6000,10 @@ window.__tape = {
     };
   },
   get security() {
-    // filter, not .length: pcmPcs is indexed from 1 (association 0 rides the main
-    // pc), so index 0 is a hole and .length overcounts the stripes by one.
-    return { code: safetyCode, sharedCert: !!sharedCert, stripes: pcmPcs.filter(Boolean).length };
+    // `pcmAllPcs`, not a length: every pair's ladder is indexed from 1
+    // (association 0 rides that pair's main pc), so index 0 is a hole and
+    // .length would overcount the stripes by one per pair.
+    return { code: safetyCode, sharedCert: !!sharedCert, stripes: pcmAllPcs().length };
   },
   // The reset/recovery state machine's inputs, readable from a live page. Added
   // while diagnosing the second-reset failure (2026-08-05): every one of these
