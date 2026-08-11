@@ -4172,3 +4172,8 @@ iOS soak, 2 min live: conceal 80 ms / 14976 frames (0.067%), depth 27-36 ms, gat
 closed throughout - mobile Safari is a healthy surface post-gate (was 15% conceal).
 Also: humanGapMs proven end-to-end on a 90 s conversation call (20 transitions,
 median 800 ms = the fixture's scripted pauses; beat accepted 200/200).
+
+P0 found and fixed same day: the one-line embed NEVER worked - frame-ancestors
+'none' refused every embedding site since embed.js shipped. Now '*' (deliberate;
+see worker.ts comment), X-Frame-Options dropped, and embed-call.mjs holds the line:
+embedded iframe <-> app peer live on prod, 1503 frames, port mode, 32 ms conceal.
