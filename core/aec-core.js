@@ -1,6 +1,36 @@
 /**
  * Partitioned-Block Frequency-Domain Adaptive Filter (PBFDAF) Acoustic Echo Canceller
  * 48 kHz voice lane linear DSP core.
+ *
+ * FOREGROUND / BACKGROUND (shadow) filter architecture.
+ *
+ * One adaptive filter cannot serve both masters on a real room. Measured, both
+ * failure modes on the same code: with a double-talk FREEZE it starves (room
+ * xow-offc-apz, cross-room bleed reads as permanent double-talk, ERLE never
+ * leaves ~0 dB); with the freeze relaxed to a 3% leak it ERODES (synthetic bleed
+ * pre-flight at equal near/echo level: ERLE 7 dB early, decaying to ~0–1.6 dB by
+ * 60 s as an independent near voice contaminates the gradient). Both are the same
+ * root cause — the weights that are DELIVERED are the weights being CORRUPTED.
+ *
+ * So split those two jobs onto two weight sets:
+ *
+ *   BACKGROUND (shadow): adapts EVERY block at FULL μ. No freeze, no leak, no
+ *     double-talk gating on its updates at all. Its corruption is harmless
+ *     because its output is never delivered — it is a hypothesis, not a product.
+ *   FOREGROUND: never adapted in place. It only ever receives the background's
+ *     weights, and only when the background PROVES itself better on the same
+ *     signal (ERLE comparison, below). Its error is what delivery uses.
+ *
+ * Comparison gating replaces double-talk gating: instead of guessing when an
+ * update would be harmful, we let the shadow take every update and then measure
+ * which weight set actually cancels this room. Corruption is detected by its
+ * effect, not predicted from a detector. The do-no-harm delivery gate is
+ * unchanged and still sits on the FOREGROUND — a filter must still earn its
+ * place in the audio path, now with proven-better weights behind it.
+ *
+ * The DTD machinery still runs, driven by the background (the direct successor
+ * of the old single filter), purely to keep the dtPct diagnostic comparable
+ * across builds. It no longer influences a single sample of audio.
  */
 
 export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } = {}) {
@@ -104,9 +134,14 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   const X_im = Array.from({ length: P }, () => new Float32Array(N))
   let xHead = 0
 
-  // Adaptive filter complex weights W (size P x N)
-  const W_re = Array.from({ length: P }, () => new Float32Array(N))
-  const W_im = Array.from({ length: P }, () => new Float32Array(N))
+  // BACKGROUND (shadow) filter weights — always adapting, never delivered.
+  const bgW_re = Array.from({ length: P }, () => new Float32Array(N))
+  const bgW_im = Array.from({ length: P }, () => new Float32Array(N))
+  // FOREGROUND filter weights — never adapted, only copied into from the
+  // background once the background has proven better. This is the weight set
+  // whose error reaches the far end.
+  const fgW_re = Array.from({ length: P }, () => new Float32Array(N))
+  const fgW_im = Array.from({ length: P }, () => new Float32Array(N))
 
   // Exponential moving average of reference power per bin Px_hat
   const Px_hat = new Float32Array(N)
@@ -124,7 +159,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   const scratchRe = new Float32Array(N)
   const scratchIm = new Float32Array(N)
   const delayedRef = new Float32Array(L)
-  const e = new Float32Array(L)
+  const e = new Float32Array(L)     // FOREGROUND error — the delivered signal
+  const bgE = new Float32Array(L)   // BACKGROUND error — drives adaptation only
   const out = new Float32Array(L)
 
   // State variables
@@ -132,12 +168,23 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   let lastBestLag = 0
   let hasDecisiveEstimate = false
   let blockCount = 0
+  // One ERLE EMA per filter. erleDbEma is the FOREGROUND's — the delivered
+  // filter — so every consumer of stats().erleDb keeps its original meaning
+  // (how much help the audio path is actually getting). bgErleDbEma is the
+  // shadow's, and the pair of them is the copy decision.
   let erleDbEma = null
+  let bgErleDbEma = null
   let lastAdapting = false
   let dtCount = 0
   let wasConverged = false
   let dtHangover = 0
-  let dtFrozenBlocks = 0
+  // Copy bookkeeping: bg -> fg promotions and the cooldown between them.
+  let copies = 0
+  let lastCopyBlock = -1e9
+  const COPY_COOLDOWN = 375 // ~1 s at 48 kHz / 128
+  // Escape-valve counter: consecutive blocks in which the foreground is NOT
+  // helping and the background has failed to beat it (see the valve below).
+  let stallBlocks = 0
   // Do-no-harm gate. A canceller with nothing to cancel can only do harm:
   // on a path with zero acoustic coupling the filter adapts to spurious
   // correlations, the DTD freezes the junk weights, and "cancellation" ADDS
@@ -148,32 +195,73 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   // flapping). While closed, the mic passes through bit-exact; the moment
   // real echo appears and ERLE climbs, delivery engages within the EMA's
   // time constant.
+  // UNCHANGED by the shadow rework, and now measuring the FOREGROUND only:
+  // the gate is the second of two independent proofs an audio path must
+  // survive (the copy rule proves better-than-what-we-have, the gate proves
+  // better-than-nothing). Same thresholds, same two-tier close, same dwell.
   let gateOpen = false
   let gateLowBlocks = 0
-  // Diagnostic counters: how much of this call the DTD held adaptation at the
-  // whisper rate. The bleed hypothesis (room xow-offc-apz: cross-room voices
-  // read as permanent double-talk) predicts dtPct near 100 on that setup —
-  // this number is how the next real call proves or refutes it.
+  // Diagnostic counters: the fraction of active blocks the DTD reads as
+  // double-talk. Meaning is unchanged from the build where this number gated
+  // adaptation — it is still the bleed discriminator (room xow-offc-apz:
+  // cross-room voices reading as permanent double-talk would put dtPct near
+  // 100) — but under the shadow architecture it is now purely an observation:
+  // the DTD's verdict no longer changes what the canceller does.
   let dtBlocks = 0
   let activeBlocks = 0
   let refSilentBlocks = 0
 
+  // Wipe the shadow. Called by the escape valve (background only: the
+  // foreground keeps its last PROVEN weights, which is the whole point of
+  // having a foreground) and by a bulk-delay re-alignment via
+  // resetWeightsBoth() below.
   function resetWeights() {
     for (let p = 0; p < P; p++) {
-      W_re[p].fill(0)
-      W_im[p].fill(0)
+      bgW_re[p].fill(0)
+      bgW_im[p].fill(0)
     }
     prevDelayedRef.fill(0)
     Px_hat.fill(0)
     dtCount = 0
     dtHangover = 0
-    dtFrozenBlocks = 0
+    stallBlocks = 0
     wasConverged = false
     // The ERLE EMA describes the weights that were just wiped. Left standing,
     // it re-latches wasConverged against a zeroed filter on the very next
-    // block (e ≈ mic), and the double-talk freeze then starves adaptation for
-    // seconds — measured: 1300 blocks frozen after a delay re-alignment.
+    // block (e ≈ mic), and the shadow's own convergence bookkeeping starts
+    // from a lie — measured on the pre-shadow build as 1300 frozen blocks
+    // after a delay re-alignment.
+    bgErleDbEma = null
+  }
+
+  // A bulk-delay re-alignment invalidates BOTH weight sets: every tap in each
+  // filter is indexed against the old delay, so the foreground's "proven"
+  // weights are proven against a reference history that no longer exists.
+  // Keeping them would deliver a confident misprediction until the ERLE EMA
+  // caught up. Zeroed foreground weights make the subtraction a literal no-op
+  // (mic − 0), so the audio path is safe while the shadow re-learns.
+  function resetWeightsBoth() {
+    resetWeights()
+    for (let p = 0; p < P; p++) {
+      fgW_re[p].fill(0)
+      fgW_im[p].fill(0)
+    }
     erleDbEma = null
+  }
+
+  // bg -> fg promotion. The foreground inherits the shadow's ERLE EMA along
+  // with its weights, because that EMA is the measurement that earned the
+  // copy: restarting it from the foreground's stale value would make the
+  // delivery gate wait out a time constant for news it already has.
+  function promote() {
+    for (let p = 0; p < P; p++) {
+      fgW_re[p].set(bgW_re[p])
+      fgW_im[p].set(bgW_im[p])
+    }
+    erleDbEma = bgErleDbEma
+    lastCopyBlock = blockCount
+    stallBlocks = 0
+    copies++
   }
 
   function reset() {
@@ -188,16 +276,40 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       X_im[p].fill(0)
     }
     xHead = 0
-    resetWeights()
+    resetWeightsBoth()
     delayBlocks = 0
     lastBestLag = 0
     hasDecisiveEstimate = false
     blockCount = 0
     erleDbEma = null
+    bgErleDbEma = null
     lastAdapting = false
     wasConverged = false
     dtHangover = 0
     refSilentBlocks = 0
+    copies = 0
+    lastCopyBlock = -1e9
+    stallBlocks = 0
+  }
+
+  // Synthesize one filter's echo estimate from the shared partition history.
+  // Result lands in fftOutRe: the time-domain estimate is its last L samples
+  // (overlap-save). Allocation-free; clobbers fftInRe/fftInIm/fftOutRe/fftOutIm.
+  function synthesize(wRe, wIm) {
+    fftInRe.fill(0)
+    fftInIm.fill(0)
+    for (let p = 0; p < P; p++) {
+      const pIdx = (xHead + p) % P
+      const xR = X_re[pIdx]
+      const xI = X_im[pIdx]
+      const wR = wRe[p]
+      const wI = wIm[p]
+      for (let k = 0; k < N; k++) {
+        fftInRe[k] += xR[k] * wR[k] - xI[k] * wI[k]
+        fftInIm[k] += xR[k] * wI[k] + xI[k] * wR[k]
+      }
+    }
+    ifft(fftInRe, fftInIm, fftOutRe, fftOutIm)
   }
 
   function process(mic, ref) {
@@ -231,29 +343,18 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
     X_re[xHead].set(fftOutRe)
     X_im[xHead].set(fftOutIm)
 
-    // 4. Synthesize echo estimate Y = sum_p X[p] * W[p]
-    fftInRe.fill(0)
-    fftInIm.fill(0)
-    for (let p = 0; p < P; p++) {
-      const pIdx = (xHead + p) % P
-      const xR = X_re[pIdx]
-      const xI = X_im[pIdx]
-      const wR = W_re[p]
-      const wI = W_im[p]
-      for (let k = 0; k < N; k++) {
-        fftInRe[k] += xR[k] * wR[k] - xI[k] * wI[k]
-        fftInIm[k] += xR[k] * wI[k] + xI[k] * wR[k]
-      }
-    }
+    // 4. Synthesize BOTH echo estimates from the SAME partition history:
+    //    Y = sum_p X[p] * W[p], once with the foreground weights (this is the
+    //    estimate that can reach the far end) and once with the background's
+    //    (this drives the shadow's own error and therefore its adaptation).
+    //    Both share every scratch buffer; the only per-block cost is the
+    //    second MAC sweep plus one extra IFFT.
+    synthesize(fgW_re, fgW_im)
 
-    // IFFT to get time-domain echo estimate (y is last L samples)
-    ifft(fftInRe, fftInIm, fftOutRe, fftOutIm)
-
-    // Compute error e = mic - y
+    // Foreground error e = mic - fgY  (the delivered residual)
     let micSumSq = 0
     let refSumSq = 0
     let eSumSq = 0
-    let ySumSq = 0
     for (let i = 0; i < L; i++) {
       const micVal = mic[i]
       const yVal = fftOutRe[L + i]
@@ -263,13 +364,26 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       micSumSq += micVal * micVal
       refSumSq += delayedRef[i] * delayedRef[i]
       eSumSq += eVal * eVal
-      ySumSq += yVal * yVal
+    }
+
+    synthesize(bgW_re, bgW_im)
+
+    // Background error bgE = mic - bgY  (never delivered)
+    let bgESumSq = 0
+    let bgYSumSq = 0
+    for (let i = 0; i < L; i++) {
+      const yVal = fftOutRe[L + i]
+      const eVal = mic[i] - yVal
+      bgE[i] = eVal
+      bgESumSq += eVal * eVal
+      bgYSumSq += yVal * yVal
     }
 
     const micPow = micSumSq / L
     const refPow = refSumSq / L
     const ePow = eSumSq / L
-    const yPow = ySumSq / L
+    const bgEPow = bgESumSq / L
+    const bgYPow = bgYSumSq / L
 
     // 5. Track block RMS history for bulk-delay estimation (raw ref)
     let rawRefSumSq = 0
@@ -280,7 +394,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
     if (rmsHistCount < maxRmsHist) rmsHistCount++
     blockCount++
 
-    // 6. Double-talk protection & Far-end silence check
+    // 6. Far-end silence check, shadow adaptation, and delivery
+    //    (double-talk detection survives here as a diagnostic only)
     // The bit-exact bypass gates on the whole FILTER SPAN being silent, not
     // the current block: the room's echo tail outlives the reference by tens
     // of ms, and a current-block gate leaked real echo unsubtracted at every
@@ -295,7 +410,13 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       dtHangover = 0
       for (let i = 0; i < L; i++) out[i] = mic[i]
     } else {
-      if (ePow > 0.5 * micPow) {
+      // Double-talk DETECTION, retained verbatim but now DIAGNOSTIC ONLY. It
+      // reads the BACKGROUND's residual, because the background is the direct
+      // successor of the old single filter (always adapting, converging on the
+      // same signal), which is what keeps dtPct comparable to every dtPct this
+      // project has logged. Nothing downstream of dtActive touches audio or
+      // adaptation any more — comparison gating replaced it.
+      if (bgEPow > 0.5 * micPow) {
         dtHangover = 0
         if (wasConverged) {
           dtCount++
@@ -316,46 +437,32 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       const dtActive = dtCount >= 3
       activeBlocks++
       if (dtActive) dtBlocks++
-      if (dtActive) {
-        // Double talk: adaptation drops to a WHISPER (below) but no longer
-        // freezes outright. The first long real call (room xow-offc-apz, two
-        // Macs one room apart) proved why: cross-room acoustic bleed of both
-        // voices into both mics reads as PERMANENT double-talk, the freeze
-        // starved adaptation for the whole call, ERLE never left ~0 dB and
-        // the person heard themselves. The harm gate is what makes leaking
-        // safe: a filter corrupted by real double-talk is never DELIVERED
-        // (gate stays shut, mic passes bit-exact — today's worst case),
-        // while any genuine convergence the leak buys gets delivered.
-        lastAdapting = false
-        for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
-        // Escape valve: a freeze that outlives any plausible unbroken
-        // double-talk (6 s) is really a CHANGED echo path — the frozen filter
-        // mispredicts, e stays large, and without this the freeze is
-        // permanent because release requires the very convergence it blocks.
-        if (++dtFrozenBlocks > 2250) resetWeights()
-      } else {
-        dtFrozenBlocks = 0
-        // Single talk: adapt filter weights
-        lastAdapting = true
-        for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
-      }
-      {
-        // Echo-to-error step scaling: once converged, an error block the echo
-        // estimate cannot explain is near-end speech the binary DTD hasn't
-        // caught yet (it needs 3 blocks), and a full-rate update on it
-        // corrupts the filter. μ shrinks with yPow/ePow, so those first
-        // blocks barely adapt. Never applied before convergence — y is still
-        // small then and the scale would starve the initial adaptation.
-        // During double-talk μ leaks at 3% instead of zero (see above): slow
-        // enough that the DT arm's near-voice survival holds, fast enough
-        // that a bleed-poisoned call accumulates real convergence over tens
-        // of seconds instead of never.
-        const muScale = (wasConverged ? Math.min(1, yPow / Math.max(ePow, 1e-12)) : 1)
-          * (dtActive ? 0.03 : 1)
 
-        // Zero-padded error FFT: E = FFT([0, ..., 0, e])
+      // Delivery is the foreground's error under the gate, unchanged, and now
+      // unconditional on double-talk: there is no longer a state in which the
+      // canceller behaves differently because a detector fired.
+      for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
+      // The shadow adapts on every active block, so "adapting" is now simply
+      // "the far end is not silent".
+      lastAdapting = true
+
+      {
+        // BACKGROUND UPDATE at FULL μ. No double-talk leak, no freeze: the
+        // shadow is allowed to be wrong, and being wrong costs nothing because
+        // it is never delivered and never promoted while it measures worse than
+        // what is already in the path.
+        //
+        // The echo-to-error step scaling stays, and it is NOT double-talk
+        // gating — it is the NLMS normalization that keeps a single
+        // unexplainable block from throwing the whole weight set (μ shrinks
+        // with y/e once there is a real echo estimate to compare against, and
+        // is inert before convergence when y is still small). It reads the
+        // BACKGROUND's own y and e, since these are the background's updates.
+        const muScale = wasConverged ? Math.min(1, bgYPow / Math.max(bgEPow, 1e-12)) : 1
+
+        // Zero-padded error FFT: E = FFT([0, ..., 0, bgE])
         ePaddedRe.fill(0)
-        for (let i = 0; i < L; i++) ePaddedRe[L + i] = e[i]
+        for (let i = 0; i < L; i++) ePaddedRe[L + i] = bgE[i]
         ePaddedIm.fill(0)
         fft(ePaddedRe, ePaddedIm, fftOutRe, fftOutIm)
 
@@ -393,8 +500,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
           }
           fft(scratchRe, scratchIm, dW_re, dW_im)
 
-          const wR = W_re[p]
-          const wI = W_im[p]
+          const wR = bgW_re[p]
+          const wI = bgW_im[p]
           for (let k = 0; k < N; k++) {
             wR[k] += dW_re[k]
             wI[k] += dW_im[k]
@@ -403,7 +510,10 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       }
     }
 
-    // 7. Update ERLE statistic
+    // 7. Update ERLE statistics — one EMA per filter, same signal, same
+    //    update gating, so the two numbers are directly comparable. This
+    //    comparison IS the architecture: it is how a hypothesis becomes the
+    //    delivered filter.
     if (refPow >= 1e-8 && micPow > 1e-8) {
       const instErleDb = 10 * Math.log10(micPow / Math.max(1e-12, ePow))
       if (erleDbEma === null) {
@@ -411,8 +521,56 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       } else {
         erleDbEma = 0.95 * erleDbEma + 0.05 * instErleDb
       }
-      if (erleDbEma >= 6) {
+      const bgInstErleDb = 10 * Math.log10(micPow / Math.max(1e-12, bgEPow))
+      if (bgErleDbEma === null) {
+        bgErleDbEma = bgInstErleDb
+      } else {
+        bgErleDbEma = 0.95 * bgErleDbEma + 0.05 * bgInstErleDb
+      }
+      // Convergence is a property of the ADAPTING filter (it scales the
+      // shadow's own step size and arms the DTD diagnostic).
+      if (bgErleDbEma >= 6) {
         wasConverged = true
+      }
+
+      // COPY RULE (bg -> fg). Two ways in:
+      //
+      //  1. PROVEN BETTER: the shadow beats the delivered filter by >= 3 dB
+      //     AND clears 3 dB of real help on its own, no sooner than ~1 s after
+      //     the last copy. The margin is what makes erosion impossible to
+      //     deliver — a contaminated shadow measures WORSE and simply never
+      //     arrives — and the cooldown stops two similar weight sets from
+      //     trading places every few blocks while EMAs jitter.
+      //  2. PROVEN HARM, immediate, no cooldown: the foreground is ADDING
+      //     energy (< -2 dB, an echo path that moved or vanished under an open
+      //     gate) and the shadow is at least not harmful (>= 0 dB). Waiting out
+      //     a cooldown here would mean knowingly delivering harm; the gate's
+      //     own instant harm-close has the same rationale.
+      const fgErle = erleDbEma
+      const bgErle = bgErleDbEma
+      const provenBetter = bgErle >= 3 && (bgErle - fgErle) >= 3 &&
+        (blockCount - lastCopyBlock) >= COPY_COOLDOWN
+      const rescue = fgErle < -2 && bgErle >= 0
+      if (provenBetter || rescue) {
+        promote()
+      } else if (copies > 0 && fgErle < 1) {
+        // ESCAPE VALVE, rewired for the shadow. The old trigger counted blocks
+        // of frozen adaptation — a state that no longer exists, since the
+        // shadow never freezes. What CAN still deadlock is this: the foreground
+        // holds weights that were genuinely proven once, the echo path has since
+        // moved, so the foreground mispredicts (< 1 dB of help), and yet the
+        // shadow cannot muster the 3 dB margin needed to replace it. That means
+        // the shadow is stuck too — poisoned by sustained corruption, or aimed
+        // at a bulk delay that no longer holds — and no amount of further
+        // gradient on the same wrong point of departure will fix it. After 6 s
+        // (the same limit, and still longer than any plausible unbroken
+        // double-talk) the shadow gets a clean restart from zero, which is the
+        // one state guaranteed not to be poisoned. The foreground is left
+        // alone: its weights are the best measurement we ever had, and the
+        // do-no-harm gate is already what protects the listener from them.
+        if (++stallBlocks > 2250) resetWeights()
+      } else {
+        stallBlocks = 0
       }
       // The harm gate's only inputs: proven help opens it, proven none
       // closes it. Both thresholds live on the EMA — and the CLOSE now has a
@@ -489,14 +647,14 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
             lastBestLag = bestLag
             delayBlocks = Math.max(0, bestLag - 2)
             hasDecisiveEstimate = true
-            resetWeights()
+            resetWeightsBoth()
           }
         } else {
           if (Math.abs(bestLag - lastBestLag) > 1 && maxCorr >= 1.5 * Math.max(0.1, currCorr) && maxCorr >= 0.25) {
             // Aim 2 blocks short to maintain causality against RMS block quantization and reverb tails
             lastBestLag = bestLag
             delayBlocks = Math.max(0, bestLag - 2)
-            resetWeights()
+            resetWeightsBoth()
           }
         }
       }
@@ -512,7 +670,13 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       adapting: lastAdapting,
       converged: erleDbEma !== null && erleDbEma >= 12,
       gate: gateOpen ? 1 : 0,
-      dtPct: activeBlocks ? +((100 * dtBlocks) / activeBlocks).toFixed(1) : null
+      dtPct: activeBlocks ? +((100 * dtBlocks) / activeBlocks).toFixed(1) : null,
+      // Shadow-filter observability: what the always-adapting hypothesis is
+      // achieving right now, and how many times it has won the comparison.
+      // bgErleDb >> erleDb means a promotion is pending or being blocked;
+      // copies climbing means the room is changing under the filter.
+      bgErleDb: bgErleDbEma,
+      copies: copies
     }
   }
 
