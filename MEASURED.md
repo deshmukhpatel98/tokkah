@@ -4138,3 +4138,8 @@ errors. Today's features are not Chromium-only.
 Same day, later: REAL Safari (safaridriver, remote automation enabled) <-> Chromium
 live on prod: PASS - connected, tape lane running (no fallback), conceal 0.091%,
 lossless lane 1.09 Mbps, real picture both ways.
+
+Same day: the latency-floor A/B re-ran clean (BT sink gone, control 26 ms) and WON:
+floor hint outputLatency 26->20 ms, age p95 8.2->4.6 (device buffer sets arrival
+spread), jitter target 3f->2f, mouthToEar 62.6->45.6 ms median, 0 concealment in all
+6 calls. Default flipped; ?lat=int is the control arm.
