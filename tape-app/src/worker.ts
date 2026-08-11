@@ -40,6 +40,13 @@ interface Env {
   ANTHROPIC_API_KEY?: string;
 }
 
+// §7.1: server-side master switch. Off → cap is constant 2 and the DO is
+// byte-identical to today, including the pre-open 409 at two occupants,
+// hold-socket semantics, ghost eviction, role slot reuse, and opaque relay.
+const THREE_ENABLED = false;
+
+const ROLES = ['a', 'b', 'c'] as const;
+
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
     status,
@@ -86,6 +93,10 @@ export class Room implements DurableObject {
   private laneCaps = new Map<WebSocket, number>();
   private pcmCaps = new Map<WebSocket, number>();
   private sids = new Map<WebSocket, string>();
+  // Wire version per socket — the admission gate of §3.4. v=1 (default, old
+  // clients) anywhere in the room caps it at 2; v≥2 everywhere + THREE_ENABLED
+  // lifts it to 3. Parallel to laneCaps/pcmCaps, torn down in the same places.
+  private vers = new Map<WebSocket, number>();
   private held = new Set<WebSocket>();
   private heldTimers = new Map<WebSocket, ReturnType<typeof setTimeout>>();
   private roomCode = '';
@@ -270,10 +281,24 @@ export class Room implements DurableObject {
 
   // ── Signaling ─────────────────────────────────────────────────────────────
 
+  // §3.4: effective room cap. With the flag off, constant 2 — the entire
+  // feature is inert. With it on, every occupant AND the arriving socket
+  // must be v≥2 for the cap to lift to 3; a single v1 anywhere drops it
+  // back so a third socket is never admitted alongside a client that cannot
+  // address messages.
+  private cap(vArriving: number): number {
+    if (!THREE_ENABLED) return 2;
+    if (vArriving < 2) return 2;
+    for (const v of this.vers.values()) {
+      if (v < 2) return 2;
+    }
+    return 3;
+  }
+
   // Shared admission gate: sweep dead sockets, evict a ghost with the same
   // session id, and report whether the room is already full. Both the upgrade
   // path and the hold-join path call this so the logic is in one place.
-  private evictAndCheckFull(sid: string | null): boolean {
+  private evictAndCheckFull(sid: string | null, v: number): boolean {
     for (const [p] of this.peers) {
       if (p.readyState !== WebSocket.READY_STATE_OPEN) this.peers.delete(p);
     }
@@ -285,17 +310,18 @@ export class Room implements DurableObject {
           this.laneCaps.delete(p);
           this.pcmCaps.delete(p);
           this.sids.delete(p);
+          this.vers.delete(p);
         }
       }
     }
-    return this.peers.size >= 2;
+    return this.peers.size >= this.cap(v);
   }
 
   // The admission logic: role assignment, cap registration, relay listener,
   // teardown wiring, welcome message, and peer-joined broadcast. Extracted so
   // the upgrade path and the hold-join path share it.
-  private admit(server: WebSocket, opts: { lane: number; pcm: number; sid: string | null; full: () => void }): void {
-    if (this.peers.size >= 2) { opts.full(); return; }
+  private admit(server: WebSocket, opts: { lane: number; pcm: number; sid: string | null; v: number; full: () => void }): void {
+    if (this.peers.size >= this.cap(opts.v)) { opts.full(); return; }
 
     // Take the FREE slot, not the next ordinal. `size === 0 ? 'a' : 'b'` looks
     // equivalent and is not: when the offerer reloads or reconnects, the
@@ -304,9 +330,11 @@ export class Room implements DurableObject {
     // two 'b's mean nobody offers and both sides sit on "connecting…" until
     // someone gives up — reproduced 100% of the time by one reload. Slot-based
     // assignment makes exactly one offerer an invariant of the room instead of
-    // an accident of arrival order.
+    // an accident of arrival order. With the pair-ordering law of §3.1, free-
+    // slot reuse is still what makes "exactly one offerer per pair" a property
+    // of the room rather than an accident of arrival order.
     const taken = new Set(this.peers.values());
-    const role = taken.has('a') ? 'b' : 'a';
+    const role = ROLES.find((r) => !taken.has(r)) ?? 'a';
     this.peers.set(server, role);
 
     // Which video transport this client can actually run, declared on the
@@ -323,16 +351,52 @@ export class Room implements DurableObject {
     // client with the flag and a client without it produced a ONE-WAY call —
     // the flagged end was inaudible for its whole duration, silently. Same
     // failure shape as the video lane, one sense over.
-    const { lane, pcm, sid } = opts;
+    const { lane, pcm, sid, v } = opts;
     this.laneCaps.set(server, lane);
     this.pcmCaps.set(server, pcm);
     if (sid) this.sids.set(server, sid);
+    this.vers.set(server, v);
     const peerCap = (m: Map<WebSocket, number>) => {
       for (const [p] of this.peers) if (p !== server) return m.get(p) ?? 0;
       return null; // nobody else here yet; `peer-joined` carries it when they arrive
     };
 
+    // §3.2 / §4: relay listener. When THREE_ENABLED, inbound messages are
+    // inspected: a JSON object with a string `to` field naming a valid role is
+    // forwarded to that one socket (addressed send); anything else — parse
+    // failure, missing/invalid `to`, binary — is broadcast to every other peer
+    // (the fan-out generalisation of today's relay). In both cases `from` is
+    // server-stamped with this socket's role so a client cannot impersonate
+    // another occupant's signaling. When the flag is off, relay stays exactly
+    // as it was: opaque forward to every other socket, no JSON inspection.
     server.addEventListener('message', (e: MessageEvent) => {
+      if (THREE_ENABLED && typeof e.data === 'string') {
+        let msg: Record<string, unknown> | null = null;
+        try { msg = JSON.parse(e.data) as Record<string, unknown>; } catch { /* unparseable → broadcast */ }
+        if (msg !== null && typeof msg === 'object') {
+          msg.from = role;
+          const stamped = JSON.stringify(msg);
+          if (typeof msg.to === 'string' && ROLES.includes(msg.to as typeof ROLES[number])) {
+            // Addressed send: forward to the single socket holding that role.
+            // If the target slot is empty, silently drop.
+            for (const [p, r] of this.peers) {
+              if (r === msg.to && p.readyState === WebSocket.READY_STATE_OPEN) {
+                try { p.send(stamped); } catch { /* reaped on close */ }
+              }
+            }
+            return;
+          }
+          // Parseable but no valid `to` → broadcast with the `from` stamp.
+          for (const [p] of this.peers) {
+            if (p !== server && p.readyState === WebSocket.READY_STATE_OPEN) {
+              try { p.send(stamped); } catch { /* reaped on close */ }
+            }
+          }
+          return;
+        }
+      }
+      // Flag off, binary data, or unparseable string → opaque broadcast,
+      // byte-identical to today's relay.
       for (const [p] of this.peers) {
         if (p !== server && p.readyState === WebSocket.READY_STATE_OPEN) {
           try {
@@ -345,13 +409,17 @@ export class Room implements DurableObject {
     });
 
     const teardown = () => {
+      const gone = this.peers.get(server);
       this.peers.delete(server);
       this.laneCaps.delete(server);
       this.pcmCaps.delete(server);
       this.sids.delete(server);
+      this.vers.delete(server);
       for (const [p] of this.peers) {
         try {
-          p.send(JSON.stringify({ type: 'peer-left' }));
+          // §4.5: `peer` is additive — old clients ignore it; new clients use
+          // it to tear down only the departed pair.
+          p.send(JSON.stringify({ type: 'peer-left', peer: gone }));
         } catch {
           /* ignore */
         }
@@ -360,13 +428,25 @@ export class Room implements DurableObject {
     server.addEventListener('close', teardown);
     server.addEventListener('error', teardown);
 
+    // Build the peers array for the welcome message — every other occupant's
+    // role and transport caps. Additive: old clients ignore it.
+    const peersArr: Array<{ role: string; lane: number; pcm: number }> = [];
+    for (const [p, r] of this.peers) {
+      if (p !== server) {
+        peersArr.push({ role: r, lane: this.laneCaps.get(p) ?? 0, pcm: this.pcmCaps.get(p) ?? 0 });
+      }
+    }
+
     server.send(
       JSON.stringify({
         type: 'welcome',
         role,
-        peerPresent: this.peers.size === 2,
+        peerPresent: this.peers.size >= 2,
         peerLane: peerCap(this.laneCaps),
         peerPcm: peerCap(this.pcmCaps),
+        // Additive fields — old clients ignore them.
+        cap: this.cap(v),
+        peers: peersArr,
         session_epoch_us: this.epochUs,
         // Occupants are the authorized readers of this room's log. Additive;
         // older clients ignore it and simply get 403 on GET /log or /summary
@@ -374,16 +454,15 @@ export class Room implements DurableObject {
         logToken: this.logToken,
       }),
     );
-    if (this.peers.size === 2) {
-      for (const [p] of this.peers) {
-        if (p !== server) {
-          try {
-            // The incumbent learns the arriver's transport here — its own
-            // `welcome` went out to an empty room and carried peerLane: null.
-            p.send(JSON.stringify({ type: 'peer-joined', peerLane: lane, peerPcm: pcm }));
-          } catch {
-            /* ignore */
-          }
+    // §4.6: on every admission, tell every other occupant about the arriver.
+    // The incumbent learns the arriver's transport here — its own `welcome`
+    // went out to an empty room and carried peerLane: null.
+    for (const [p] of this.peers) {
+      if (p !== server) {
+        try {
+          p.send(JSON.stringify({ type: 'peer-joined', peer: role, peerLane: lane, peerPcm: pcm }));
+        } catch {
+          /* ignore */
         }
       }
     }
@@ -442,14 +521,15 @@ export class Room implements DurableObject {
         const lane = Number(m.lane) || 0;
         const pcm = Number(m.pcm) || 0;
         const sid = m.sid ? String(m.sid) : null;
+        const hv = Number(m.v) || 1;
 
-        if (this.evictAndCheckFull(sid)) {
+        if (this.evictAndCheckFull(sid, hv)) {
           server.send(JSON.stringify({ type: 'full' }));
           server.close(1000, 'room full');
           return;
         }
         this.admit(server, {
-          lane, pcm, sid,
+          lane, pcm, sid, v: hv,
           full: () => {
             server.send(JSON.stringify({ type: 'full' }));
             server.close(1000, 'room full');
@@ -478,7 +558,8 @@ export class Room implements DurableObject {
     // the pair, exactly as before — the 409 must remain an HTTP response,
     // not an open-then-close.
     const upSid = q.get('sid') || null;
-    if (this.evictAndCheckFull(upSid)) return new Response('room full', { status: 409 });
+    const upV = Number(q.get('v')) || 1;
+    if (this.evictAndCheckFull(upSid, upV)) return new Response('room full', { status: 409 });
 
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
@@ -488,6 +569,7 @@ export class Room implements DurableObject {
       lane: Number(q.get('lane')) || 0,
       pcm: Number(q.get('pcm')) || 0,
       sid: upSid,
+      v: upV,
       full: () => { /* unreachable: checked above */ },
     });
 
