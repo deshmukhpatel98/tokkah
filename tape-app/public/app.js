@@ -6764,7 +6764,24 @@ safe(() => {
   window.__hbConnect = () => {
     if (connectedAt) return;
     connectedAt = performance.now();
-    beat({ evt: 'connect', ttcMs: joinAt ? Math.round(connectedAt - joinAt) : null });
+    // Device/environment class (directive 2026-08-11: know what hardware and
+    // networks real calls run on, anonymously, at zero latency). Every field
+    // is a synchronous property read at one event; every value is a COARSE
+    // device-class attribute, deliberately bucketed — the beacon's law is
+    // aggregates that cannot identify anyone, and precision here buys
+    // fingerprint surface, not engineering insight.
+    const vset = safe(() => localStream?.getVideoTracks?.()[0]?.getSettings?.(), 'hb.camset') ?? {};
+    const conn2 = navigator.connection ?? {};
+    beat({
+      evt: 'connect', ttcMs: joinAt ? Math.round(connectedAt - joinAt) : null,
+      cores: navigator.hardwareConcurrency ?? null,
+      mem: navigator.deviceMemory ?? null, // GB buckets, Chromium only (null elsewhere)
+      dlMbps: typeof conn2.downlink === 'number' ? +conn2.downlink.toFixed(1) : null,
+      rttEstMs: typeof conn2.rtt === 'number' ? conn2.rtt : null, // 25 ms-bucketed by the browser
+      camW: vset.width ?? null, camH: vset.height ?? null,
+      camFps: vset.frameRate ? Math.round(vset.frameRate) : null,
+      dpr: Math.round((window.devicePixelRatio ?? 1) * 2) / 2,
+    });
   };
   window.__hbEnd = (reason) => {
     if (hbDone) return;
