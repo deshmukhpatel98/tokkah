@@ -4134,3 +4134,7 @@ Cross-engine call WebKit<->Chromium on prod: connected, real picture both ways,
 conceal 0.11-0.29%. WebKit-side posture probe: mode sab (crossOriginIsolated true),
 presence rendering (576k samples), aec2 adapting, mouthToEar 54.7 ms, zero page
 errors. Today's features are not Chromium-only.
+
+Same day, later: REAL Safari (safaridriver, remote automation enabled) <-> Chromium
+live on prod: PASS - connected, tape lane running (no fallback), conceal 0.091%,
+lossless lane 1.09 Mbps, real picture both ways.
