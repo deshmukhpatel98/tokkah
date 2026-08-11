@@ -41,17 +41,18 @@ let moduleLoaded = null;
 /** Lazily create the one shared AudioContext. */
 export async function audioContext() {
   if (!ctx) {
-    // Lane A (?pcmaudio=1) plays PCM straight out of a worklet on this context:
-    // ask for the floor. With the flag off the hint is exactly what it was.
-    // KNOWN MISMATCH, deliberately unresolved: app.js made Lane A default ON
-    // (`!== '0'`, 2026-08-02) while this still wants an explicit =1, so
-    // default calls run at 'interactive' (~34 ms output latency measured)
-    // rather than the floor. A fix was tried live 2026-08-11 and the A/B was
-    // CONFOUNDED: outputLatency read ~300 ms in both arms because the Mac's
-    // output device changed mid-experiment (~300 ms is a Bluetooth sink, and
-    // the revert read the same). Re-run the A/B when the control arm reads
-    // ~34 ms again before touching this line.
-    const pcm = new URLSearchParams(location.search).get('pcmaudio') === '1';
+    // Lane A plays PCM straight out of a worklet on this context: ask for
+    // the latency floor, matching app.js's default-on test at last. The flip
+    // is earned, not assumed — live A/B 2026-08-11 (3 calls/arm, one build,
+    // ?lat=0 arm): floor cut outputLatency 26 -> 20 ms AND the smaller
+    // device buffer halved arrival spread (age p95 8.2 -> 4.6 ms), so the
+    // jitter target settled at 2f instead of 3f — mouth-to-ear 62.6 -> 45.6
+    // ms median, zero concealment in all six calls. (The first attempt at
+    // this flip A/B'd against a Bluetooth sink — ~300 ms both arms,
+    // confounded — which is why the experiment arm exists.) `?lat=int` is
+    // the control arm; a device where the floor misbehaves goes there.
+    const qs = new URLSearchParams(location.search);
+    const pcm = qs.get('lat') === 'int' ? false : (qs.get('pcmaudio') !== '0' || qs.get('lat') === '0');
     ctx = new AudioContext({ sampleRate: 48000, latencyHint: pcm ? 0 : 'interactive' });
     moduleLoaded = addWorkletModule(ctx, WORKLET_URL);
   }
