@@ -4158,3 +4158,8 @@ the lobby pre-dial adopted an open socket on iOS (predial-adopt {open:1}, welcom
   ticks) vs the desktop's healthy -0.28 adapting; desktop concealed 4.9 s of sim
   audio in the same call. Sim audio clocks are shaky — needs reproduction before
   judgement, but it gates real-iPhone speakerphone validation.
+
+Correction to the iOS-call entry: the \"signaling timeout\" was NOT a pre-existing
+UX flaw - it was the pre-dial commit's own regression (adopted-OPEN sockets never
+fire onopen; the join gate awaited it). Fixed and verified live on both surfaces.
+Lesson recorded: rigs must read the words on the screen, not only pc state.
