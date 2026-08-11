@@ -33,7 +33,7 @@
 import { attachDetector, audioConstraints, audioContext } from './onset-monitor.js';
 import { Telemetry, sampleStats } from './telemetry.js';
 import { TurnTaking, median } from './turntaking.js';
-import { startTapeVideo, startTapeRtp, prepareTapeRtp, tapeSupported, tapeRtpSupported } from './tape.js';
+import { startTapeVideo, startTapeRtp, prepareTapeRtp, createTapeLink, tapeSupported, tapeRtpSupported } from './tape.js';
 import { initPcmAudio } from './pcm.js';
 import { initTimeSync } from './timesync.js';
 
@@ -482,6 +482,36 @@ function startRemoteFill() {
       500,
     );
   }, 'fill.start');
+}
+
+/**
+ * The same 2 Hz sampler for the SECOND tile's wash (§6, phase 4). A separate
+ * timer rather than a second pass inside `startRemoteFill`: that callback
+ * early-returns on the first tile's `!w`, so folding tile 2 into it would tie
+ * one tile's wash to the other tile's first frame — and rewriting it to avoid
+ * that would change the code every existing call runs. This one only ever
+ * exists once a second pair does (startVideoPair calls it), so a 1:1 call has
+ * exactly the timers it had before.
+ */
+let fill2Timer = null;
+function startRemoteFill2() {
+  if (fill2Timer) return;
+  safe(() => {
+    const c = $('remoteFill2');
+    const ctx = c?.getContext?.('2d', { alpha: false });
+    if (!ctx) return;
+    fill2Timer = setInterval(
+      () => safe(() => {
+        const call = $('call');
+        const src = $('remoteCanvas2') ?? $('remote2');
+        const w = src.videoWidth ?? src.width;
+        if (!w) return;
+        if (!call.classList.contains('contain') || call.classList.contains('flat')) return;
+        ctx.drawImage(src, 0, 0, c.width, c.height);
+      }, 'fill2.sample'),
+      500,
+    );
+  }, 'fill2.start');
 }
 
 // ── What picture to ask for, and in what codec ────────────────────────────────
@@ -1625,6 +1655,29 @@ const PREDIAL = QS.get('predial') !== '0'; // lobby pre-dials the room ws; `?pre
 // out not to speak v2 (see 'three-downgrade'). Every reader below is a runtime
 // call, so the latch is honoured everywhere from that moment on.
 let THREE = QS.get('three') === '1';
+/**
+ * §6.1/§7.1 `?l23enc=`: how many video ENCODERS a three-person call runs.
+ *
+ *   1 (default) — one shared encode chain, one transport half per peer. The
+ *                 person on the worst connection sets the quality everyone
+ *                 sends, and the sender's CPU pays once.
+ *   2           — one whole `startTapeRtp` per peer: the naive-mesh control arm,
+ *                 2x encode CPU, strictly pairwise coupling. Needs no special
+ *                 code — it is today's construction, done twice, with no link.
+ *
+ * Read once, here, so the two arms differ by exactly one value: whether
+ * `startTape` passes a link. Phase 6's rig measures the CPU and quality
+ * difference rather than this comment asserting it.
+ */
+const L23ENC = QS.get('l23enc') === '2' ? 2 : 1;
+let tapeLink = null; // the shared encode chain; null on 1:1, on ?three=0 and on ?l23enc=2
+/**
+ * Does this page's video lane run behind a shared encoder? Only under THREE —
+ * so with the flag off `startTape` passes `link: null` and every aggregate
+ * reader inside `startTapeRtp` returns that instance's own value. That is the
+ * whole of the flag-off guarantee: not "equivalent to", but the same code.
+ */
+const tapeLinkOn = () => THREE && L23ENC === 1;
 let pcm = null;
 // §5.3: the stripe ladder is per PAIR, because the associations it holds are a
 // property of one DTLS relationship. Keyed by the peer's letter — except that a
@@ -2020,38 +2073,68 @@ async function pcmStripeOfferAll(peerRole = mediaPeer) {
  * at any stage, puts the ordinary RTP video track back on the peer connection and
  * renegotiates. The user loses the custom pipeline and keeps the call.
  */
-function startTape(initiator) {
+function startTape(initiator, ctx = null) {
   // Before `common` is built: the encoder's framerate and the pacer's opening rate are
   // read once from cfg, so this is the only moment they can be got right for free.
   syncTapeFps('tape-start');
+  // ── §6 phase 4: one lane per PAIR ────────────────────────────────────────
+  // `ctx` null means the media pair: the module-scope `pc` and `tapePre`, and
+  // remote tile 0. That is the literal call that stood here, so every existing
+  // call site — `startTape(offersTo(mediaPeer))` — is unchanged and a 1:1 call
+  // runs this function exactly as before. A second pair passes its own
+  // `{ pc, pre, slot, peer }` record and paints into the second tile set that
+  // index.html carries inert.
+  const pcx = ctx?.pc ?? pc;
+  const prex = ctx?.pre ?? tapePre;
+  const slot = ctx?.slot ?? 0;
+  // The id suffix for this tile set: '' for the first, '2' for the second —
+  // #remoteWrap2 / #remote2 / #remoteCanvas2 / #remoteFill2. Suffixed IDS, never
+  // a shared class: every CSS rule in index.html is keyed on an id, and the
+  // letterbox-wash regression came from a rule that spanned two canvases.
+  const sfx = slot ? String(slot + 1) : '';
+  const laneOf = () => (ctx ? ctx.tape : tape);
   // #14 canvas display: created eagerly so the decoder's first output already
   // has somewhere to land. Lives next to the <video> in #remoteWrap; the CSS
   // rule for it mirrors the video's (object-fit: cover works on canvas).
   const displayCanvas = (wantTape === 2 && TAPE_CFG.l2Canvas)
     ? (() => {
-        let c = $('remoteCanvas');
+        let c = $(`remoteCanvas${sfx}`);
         if (!c) {
           c = document.createElement('canvas');
-          c.id = 'remoteCanvas';
-          $('remoteWrap').appendChild(c);
+          c.id = `remoteCanvas${sfx}`;
+          $(`remoteWrap${sfx}`).appendChild(c);
         }
         return c;
       })()
     : null;
   const common = {
-    pc,
+    pc: pcx,
     track: localStream.getVideoTracks()[0],
     initiator,
-    pre: tapePre,
+    pre: prex,
     cfg: TAPE_CFG,
     displayCanvas,
+    // §6.1: the shared encode chain, created on first use. Null unless THREE is
+    // on and `?l23enc` is not the two-encoder control arm — so on today's path
+    // `startTapeRtp` gets `link: null` and runs the code that shipped.
+    link: tapeLinkOn() ? (tapeLink ??= createTapeLink()) : null,
     log: (t, d) => tel?.log(t, d),
     onRemote: (stream) => {
-      $('remote').srcObject = stream;
-      tape?.observeDisplay?.($('remote')); // #14 decode→present probe
-      tel?.log('tape-render', { attached: true, lane: wantTape });
+      $(`remote${sfx}`).srcObject = stream;
+      laneOf()?.observeDisplay?.($(`remote${sfx}`)); // #14 decode→present probe
+      tel?.log('tape-render', { attached: true, lane: wantTape, slot });
     },
-    onFail: (why) => fallbackToRtp(why),
+    // The media pair's failure is the call's failure and takes the whole page
+    // back to plain RTP. A SECOND pair has no fallback path yet — `fallbackToRtp`
+    // renegotiates the module-scope pc and repaints tile 0, which would be the
+    // wrong pc and the wrong tile — so it stops that one lane and says so.
+    // Phase 5 owns the per-tile "connection paused" state this should drive.
+    onFail: ctx
+      ? (why) => {
+          tel?.log('tape-fallback-pair', { peer: ctx.peer ?? null, slot, why });
+          safe(() => { ctx.tape?.stop(); ctx.tape = null; }, 'tape.pair-fail');
+        }
+      : (why) => fallbackToRtp(why),
     // The audio lane's loss ladder is the fastest honest congestion signal in
     // the app; the video budget listens to it (see rcPollBudget). Null keeps
     // the old behaviour byte-for-byte.
@@ -2059,16 +2142,25 @@ function startTape(initiator) {
     // §12–13: the video regime machine reports its state for the honest UI.
     // "held" → the remote video is VIDEO HELD (last frame + 1 fps stills);
     // anything else clears the badge unless HOLD owns it.
+    // `videoHeld` + `stallUi()` are the ROOM's one badge, and phase 5 replaces
+    // them with a state line per tile. Until it does, only the media pair may
+    // write them: a second pair's regime driving a badge that sits over the
+    // first pair's picture would name the wrong person's connection.
     onStall: STALL
-      ? (state, info) => {
-          videoHeld = state === 'held';
-          stallUi();
-          tel?.log('stall-state', { state, ...info });
-        }
+      ? ctx
+        ? (state, info) => tel?.log('stall-state', { state, slot, peer: ctx.peer ?? null, ...info })
+        : (state, info) => {
+            videoHeld = state === 'held';
+            stallUi();
+            tel?.log('stall-state', { state, ...info });
+          }
       : null,
     // §10 bundle: audio master clock probes + ctl hooks for TIME_SYNC. Null
     // unless lane 2 + PCM audio are both live — lane 1/stock RTP never sees it.
-    avsync: AV_SYNC && wantTape === 2
+    // One `tsync` instance exists and it is bound to the media pair's ctl
+    // channel; a second pair gets the paint-on-arrival / v-presenter path,
+    // which is the same one every call ran before the §10 bundle existed.
+    avsync: AV_SYNC && wantTape === 2 && !ctx
       ? {
           offsetMs: AV_OFFSET,
           audioClockUs: () => pcm?.audioClockUs?.() ?? null,
@@ -2078,18 +2170,145 @@ function startTape(initiator) {
         }
       : null,
   };
-  tape = safe(() => (wantTape === 2 ? startTapeRtp(common) : startTapeVideo(common)), 'tape.start') ?? null;
-  if (!tape) fallbackToRtp('start-threw');
+  const started = safe(() => (wantTape === 2 ? startTapeRtp(common) : startTapeVideo(common)), 'tape.start') ?? null;
+  if (ctx) ctx.tape = started; else tape = started;
+  if (!started) common.onFail('start-threw');
   // Lane 2's answering side receives the ctl channel rather than creating it.
-  if (tape && wantTape === 2 && !initiator) {
-    const prev = pc.ondatachannel;
-    pc.ondatachannel = (e) => {
-      try { prev?.call(pc, e); } catch { /* ignore */ }
-      if (e.channel.label === 'tape-ctl-rtp') tape?.adoptCtl(e.channel);
-      if (e.channel.label === 'tape-lanep') tape?.adoptLaneP?.(e.channel);
+  // Per pc: `pcx.ondatachannel` chains onto whatever this pair's pc already had,
+  // and the handles it feeds are this pair's — a second pair's ctl channel
+  // arrives on its own pc and can never reach the first pair's lane.
+  if (started && wantTape === 2 && !initiator) {
+    const prev = pcx.ondatachannel;
+    pcx.ondatachannel = (e) => {
+      try { prev?.call(pcx, e); } catch { /* ignore */ }
+      if (e.channel.label === 'tape-ctl-rtp') laneOf()?.adoptCtl(e.channel);
+      if (e.channel.label === 'tape-lanep') laneOf()?.adoptLaneP?.(e.channel);
     };
   }
-  tel?.log('tape-start', { initiator, lane: wantTape, up: !!tape, cfg: TAPE_CFG });
+  tel?.log('tape-start', { initiator, lane: wantTape, up: !!started, slot,
+    peer: ctx?.peer ?? null, l23enc: tapeLinkOn() ? 1 : L23ENC, cfg: TAPE_CFG });
+  return started;
+}
+
+/**
+ * Lane 2, offerer only: a recvonly video slot for the ANSWERER's carrier, so the
+ * first offer already has an m-line for it and the reoffer that used to carry it
+ * never needs to happen. That second negotiation lost the answerer's carrier at
+ * real RTTs — measured 6/7 dead answerer carriers at RTT 80 vs 0/6 on loopback,
+ * silently, no error event on either side; the answerer's tape encoder then pins
+ * at its inFlight cap for the rest of the call. Chrome's m-section matching never
+ * matched the answerer's pre-created sendonly carrier transceiver to an offered
+ * *sendonly* section (probe3, HANDOFF law 9), but a recvonly one is its
+ * direction's complement, so the answer carries the carrier sendonly and the race
+ * window — and one RTT of answerer-picture startup — is gone. If the match ever
+ * fails, the answerer's guarded reoffer still adds the carrier exactly as before:
+ * this removes a need, it adds no risk. A recvonly transceiver with no track
+ * costs nothing.
+ *
+ * Extracted from the welcome handler for phase 4 with the body unchanged: laws 2
+ * and 9 are properties of A pc, so each pair repeats this on its own pc rather
+ * than sharing anything.
+ */
+function tapeSlot(pcx, lane) {
+  safe(() => {
+    const slotTx = pcx.addTransceiver('video', { direction: 'recvonly' });
+    // The slot must negotiate VP8 — the lane's payloads ride the carrier
+    // opaquely and only VP8's packetizer leaves them intact (tape.js).
+    // The app's codec-pref pass keys on sender.track and the slot has
+    // none, so without this the OFFER leads with the engine's default
+    // codec, and the negotiated codec follows the offer: Chromium's
+    // default is VP8 (worked by luck), Safari's is H264 — measured
+    // 2026-08-04 (task #44): Safari-first calls negotiated the slot as
+    // H264, the answerer's frames arrived mangled, zero delivered, and
+    // the whole lane fell back within 5 s. The answerer's own
+    // setCodecPreferences in claimSlot does not override the offer's
+    // ordering, so the offerer is the only place this can be pinned.
+    const caps = RTCRtpReceiver.getCapabilities?.('video');
+    if (slotTx.setCodecPreferences && caps?.codecs) {
+      const rank = (c) => {
+        const n = (c.mimeType || '').toLowerCase();
+        if (n.includes('vp8')) return 0;
+        if (/rtx|red|ulpfec|flexfec/i.test(n)) return 9;
+        return 5;
+      };
+      slotTx.setCodecPreferences([...caps.codecs].sort((a, b) => rank(a) - rank(b)));
+    }
+    // Attach the receive transform NOW, at transceiver creation. The answer
+    // builds this receiver's pipeline inside setRemoteDescription(answer) —
+    // BEFORE ontrack fires — and an attach that lands after the build is
+    // routed around forever (measured, claim6: hooked at ontrack, 0 recv
+    // ticks, 0 lane frames, while the RTP level carried 22 MB). Same law as
+    // the sender side: the pipeline reads .transform at build time only.
+    lane?.attachReceiver(slotTx.receiver);
+  }, 'tape.slot');
+}
+
+/**
+ * ── The second video pair (§6, phase 4) ──────────────────────────────────────
+ *
+ * NOTHING CALLS THIS. That is deliberate and it is the same discipline phase 3
+ * used: the machinery is written, syntactically live and reachable only behind
+ * `THREE` plus an explicit call, so phase 5 (the two-tile UI) and phase 6 (the
+ * three-browser rig) turn it on in one place instead of writing it. Media on
+ * this page remains `mediaPeer`-only until they do — `offerToPairs` still
+ * records a second pair's offer as `owed` and sends nothing.
+ *
+ * What it builds, and why each piece is per pc rather than shared — every one of
+ * these is a HANDOFF law that applies PER pc and none of them relax at three:
+ *
+ *   law 2  the pipeline reads `.transform` at build time, so this pair's phase-A
+ *          attach must happen at ITS `addTransceiver`, before ITS negotiation;
+ *   law 9  a pre-created transceiver never matches an offered m-section, so this
+ *          pair needs its own recvonly slot (offerer) or its own `claimSlot`
+ *          (answerer) — the record carries the latter for the offer handler;
+ *   law 1  no runtime `setParameters` on this pc's video sender either: the
+ *          sender-params loop already skips video while `wantTape === 2`, and
+ *          this pc is in the same mode;
+ *   law 11 the orphan carrier transceiver is neutralized, never stopped —
+ *          `claimSlot` inside tape.js does that for whichever pc it is given;
+ *   law 12 lane 2 never renegotiates, so this pc gets the same hard-gated
+ *          `onnegotiationneeded` treatment the media pc has.
+ *
+ * The offerer is §3.1's predicate — `offersTo(peerRole)`, the letter that sorts
+ * first — never `role === 'a'`, because at {b,c} there is no `a`.
+ */
+function startVideoPair(peerRole) {
+  if (!THREE || wantTape !== 2 || !peerRole || peerRole === mediaPeer) return null;
+  const p = peers.get(peerRole);
+  if (!p || p.tape) return null;
+  return safe(() => {
+    const pcx = new RTCPeerConnection({ iceServers: pcmIceServers, ...certArg() });
+    // Law 12, per pc: processing a reoffer rebuilds the answerer's receive
+    // pipeline without the transform. Observed, never acted on — exactly the
+    // gate the media pc carries.
+    pcx.onnegotiationneeded = () => tel?.log('pair-neg', { peer: peerRole, sig: pcx.signalingState });
+    pcx.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate, ...addr(peerRole) });
+    pcx.ontrack = (e) => {
+      // Law 2 from the answerer's side: the recv transform must be installed
+      // SYNCHRONOUSLY inside ontrack, before any await.
+      if (e.track.kind === 'video') safe(() => p.tape?.attachReceiver(e.receiver), 'pair.attach-receiver');
+    };
+    // Phase A first and on this pc: the carrier's tick ceiling is fixed at
+    // captureStream() time and the send transform must be attached before the
+    // sender's pipeline is built (law 2).
+    p.pc = pcx;
+    p.slot = 1; // the second remote tile set
+    p.peer = peerRole;
+    p.pre = prepareTapeRtp(pcx, localStream.getVideoTracks()[0], (t, d) => tel?.log(t, d), TAPE_CFG);
+    if (!p.pre) { tel?.log('pair-video-fail', { peer: peerRole, why: 'no-transform' }); return null; }
+    const initiator = offersTo(peerRole);
+    const lane = startTape(initiator, p);
+    // Offerer: this pc's own recvonly slot for the answerer's carrier (law 9).
+    // Answerer: `p.pre.claimSlot` is what the offer handler must call with THIS
+    // pair's offer SDP before createAnswer — the record carries it so a phase-5
+    // handler needs no reach into module state.
+    if (initiator) tapeSlot(pcx, lane);
+    $('call').classList.add('three'); // the second tile stops being inert
+    startRemoteFill2();               // ...and its wash gets a sampler
+    tel?.log('pair-video-start', { peer: peerRole, offerer: initiator ? 1 : 0, slot: p.slot,
+      l23enc: tapeLinkOn() ? 1 : L23ENC });
+    return p;
+  }, 'pair.video-start') ?? null;
 }
 
 /**
@@ -3567,8 +3786,13 @@ function addPair(peerRole, lane, pcmCap) {
   if (!peerRole || peerRole === role) return null;
   const known = peers.get(peerRole);
   if (known) return known;
+  // `pc`/`pre`/`tape`/`slot` are §6's per-pair video fields (phase 4). Null on
+  // the media pair, which keeps using the module-scope `pc`/`tapePre`/`tape`
+  // and tile 0; `startVideoPair` fills them for a second pair. Declared here so
+  // the record's shape is one thing rather than something that grows silently.
   const rec = { role: peerRole, lane: lane ?? null, pcm: pcmCap ?? null, media: false,
-    offered: false, owed: false, deferred: 0 };
+    offered: false, owed: false, deferred: 0,
+    pc: null, pre: null, tape: null, slot: null };
   peers.set(peerRole, rec);
   // First peer learned owns the media. `welcome.peers` is ordered by the DO the
   // same way `peerLane`/`peerPcm` pick their subject — the FIRST other occupant
@@ -4367,39 +4591,10 @@ async function join(room) {
         // answerer-picture startup — is gone. If the match ever fails, the answerer's
         // guarded reoffer below still adds the carrier exactly as before: this removes a
         // need, it adds no risk. A recvonly transceiver with no track costs nothing.
-        if (wantTape === 2 && offersTo(mediaPeer)) {
-          safe(() => {
-            const slotTx = pc.addTransceiver('video', { direction: 'recvonly' });
-            // The slot must negotiate VP8 — the lane's payloads ride the carrier
-            // opaquely and only VP8's packetizer leaves them intact (tape.js).
-            // The app's codec-pref pass keys on sender.track and the slot has
-            // none, so without this the OFFER leads with the engine's default
-            // codec, and the negotiated codec follows the offer: Chromium's
-            // default is VP8 (worked by luck), Safari's is H264 — measured
-            // 2026-08-04 (task #44): Safari-first calls negotiated the slot as
-            // H264, the answerer's frames arrived mangled, zero delivered, and
-            // the whole lane fell back within 5 s. The answerer's own
-            // setCodecPreferences in claimSlot does not override the offer's
-            // ordering, so the offerer is the only place this can be pinned.
-            const caps = RTCRtpReceiver.getCapabilities?.('video');
-            if (slotTx.setCodecPreferences && caps?.codecs) {
-              const rank = (c) => {
-                const n = (c.mimeType || '').toLowerCase();
-                if (n.includes('vp8')) return 0;
-                if (/rtx|red|ulpfec|flexfec/i.test(n)) return 9;
-                return 5;
-              };
-              slotTx.setCodecPreferences([...caps.codecs].sort((a, b) => rank(a) - rank(b)));
-            }
-            // Attach the receive transform NOW, at transceiver creation. The answer
-            // builds this receiver's pipeline inside setRemoteDescription(answer) —
-            // BEFORE ontrack fires — and an attach that lands after the build is
-            // routed around forever (measured, claim6: hooked at ontrack, 0 recv
-            // ticks, 0 lane frames, while the RTP level carried 22 MB). Same law as
-            // the sender side: the pipeline reads .transform at build time only.
-            tape?.attachReceiver(slotTx.receiver);
-          }, 'tape.slot');
-        }
+        // Per pc (phase 4): the slot belongs to ONE pair's pc, and law 9 —
+        // Chrome's m-section matching never matches a pre-created transceiver —
+        // holds per pc, so every pair needs its own slot on its own pc.
+        if (wantTape === 2 && offersTo(mediaPeer)) tapeSlot(pc, tape);
         // Lane A stripes (§17.12): the offerer's N−1 extra pcs offer at exactly
         // the same moments the main pc does — gated on a peer being PRESENT,
         // exactly like the main offer. An ungated stripe offer fires into an
@@ -5951,6 +6146,16 @@ window.__tape = {
   // instead of re-implementing it. Re-implementing it is how the first version of
   // that test replaced the lane 2 carrier and called the result a mystery.
   adopt: (nv) => adoptVideoTrack(nv),
+  // §6 phase 4: build the SECOND video pair (its own pc, its own carrier and
+  // transport half, the second tile). Nothing in the app calls it — this is the
+  // explicit entry point phase 5's UI and phase 6's three-browser rig use, and
+  // exposing it here is what keeps the machinery exercisable before either
+  // lands. Returns null unless THREE is on and the letter names a real second
+  // occupant.
+  startVideoPair: (peerRole) => startVideoPair(peerRole),
+  // The shared encode chain's own view (§6.1): how many transport halves are
+  // attached and which one owns the encoder. Null on every 1:1 call.
+  get l23() { return tape?.snapshot?.()?.l23 ?? null; },
   // The shipped device-switch paths (§15 pickers), for the same reason as
   // `adopt`: the rig must drive what users get, not a re-implementation. A
   // fake-device browser has one mic, so the mic test switches to ITSELF —

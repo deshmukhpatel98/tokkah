@@ -20,7 +20,8 @@ import { mkdirSync } from 'node:fs';
 
 const CHROME =
   process.env.TESTBED_CHROME ?? (process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
-const BASE = 'http://127.0.0.1:8794';
+// Live-only law: prod is the default; the old local default hid behind a dead port.
+const BASE = process.env.TESTBED_BASE ?? 'https://room.tokkah.com';
 const Q = 'tape=2&pcmaudio=1';
 const SHOTS = process.argv.find((a) => a.startsWith('--shots='))?.slice(8)
   ?? '/private/tmp/claude-501/-Users-earningsgpt/a109f52c-5d0e-4a3b-86b5-31ee4739e8ef/scratchpad/ui-shots';

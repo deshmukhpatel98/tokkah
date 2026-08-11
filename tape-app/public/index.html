@@ -276,6 +276,61 @@
   #call.contain.flat #remoteFill { display: none; }
   #call.contain.flat #remoteWrap { background: #06080d; }
 
+  /* ── The SECOND remote tile (§6, phase 4) ────────────────────────────────
+     INERT until there is a second pair: `display: none` on the wrap costs no
+     layout, no paint, no compositing layer and no a11y node, and nothing sets
+     `#call.three` except startVideoPair(), which nothing calls yet. A 1:1 call
+     therefore renders exactly the tree it rendered before, plus one hidden div.
+
+     Every rule below is a COPY of the #remoteWrap block with the ids suffixed
+     `2`, written out rather than folded into a selector that spans both tiles.
+     That is the whole point: the letterbox-wash regression came from
+     `#remoteWrap canvas` outranking `#remoteFill`'s `object-fit: cover` and
+     making the 32x18 wash letterbox ITSELF, and any selector wide enough to
+     cover two tiles reopens exactly that class of collision. Two independent
+     id-keyed blocks cannot collide with each other, and neither can reach the
+     other's `:not()`. The three id selectors that must stay paired:
+
+       #remoteWrap2 canvas          <- must not outrank #remoteFill2's cover
+       #call.contain #remoteWrap2 canvas:not(#remoteFill2)   <- the :not() twin
+       #call.contain.flat #remoteFill2                        <- the flat arm
+
+     Every rig that reads the first tile does so by id (`#remoteWrap`,
+     `#remoteCanvas`, `#remoteFill`) or by `querySelector('#remoteWrap')`, which
+     is unchanged: the original set still comes first in the document. */
+  #remoteWrap2 { display: none; position: absolute; z-index: 0; overflow: hidden;
+    transition: filter .4s ease; }
+  #call.three #remoteWrap2 { display: block; }
+  #remoteWrap2 video, #remoteWrap2 canvas { display: block; width: 100%; height: 100%; object-fit: cover; background: transparent; }
+  #remoteWrap2 #remote2 { position: relative; z-index: 1; }
+  #remoteWrap2 canvas { position: absolute; inset: 0; z-index: 1; }
+  #remoteFill2 { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%;
+    object-fit: cover; display: none; filter: blur(28px) brightness(.42) saturate(1.25);
+    transform: scale(1.14); }
+  #call.contain.three #remoteFill2 { display: block; }
+  #call.contain #remoteWrap2 #remote2,
+  #call.contain #remoteWrap2 canvas:not(#remoteFill2) { object-fit: contain; }
+  #call.contain.flat #remoteFill2 { display: none; }
+  #call.contain.flat #remoteWrap2 { background: #06080d; }
+  /* Two equal tiles. PROVISIONAL — phase 5 owns the real two-tile layout (its
+     gate measures both tiles against the bar at every aspect ratio); this
+     exists so that the moment `#call.three` is set the tiles are side by side
+     rather than stacked on top of each other, and it is scoped to `.three` so
+     the single-tile geometry above is untouched without it. `!important`
+     matches the `#call.fill #remoteWrap` rule it has to outrank; the extra
+     class makes it the more specific of the two important declarations. */
+  #call.fill.three #remoteWrap { inset: 0 50% 0 0 !important; width: auto !important; height: auto !important; }
+  #call.fill.three #remoteWrap2 { inset: 0 0 0 50% !important; width: auto !important; height: auto !important; }
+  @media (orientation: portrait) {
+    #call.fill.three #remoteWrap { inset: 0 0 50% 0 !important; }
+    #call.fill.three #remoteWrap2 { inset: 50% 0 0 0 !important; }
+  }
+  /* The room-wide held/paused wash, on the second tile too. Phase 5 replaces
+     both with per-tile state; adding a rule here rather than editing the
+     existing selector list keeps those two lines exactly as they were. */
+  #call.held #remoteWrap2 { filter: saturate(.92); }
+  #call.paused #remoteWrap2 { filter: saturate(.72) brightness(.82); }
+
   /* Joined but peer not here yet: own camera fills the screen (task #28).
      Identical treatment to the remote view — cover, aspect preserved, mirrored. */
   #selfFull { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%;
@@ -505,6 +560,14 @@
   <div id="remoteWrap">
     <canvas id="remoteFill" width="32" height="18" aria-hidden="true"></canvas>
     <video id="remote" autoplay playsinline></video>
+  </div>
+  <!-- The second remote tile (§6, phase 4). `display: none` until #call gains
+       `.three`, which only startVideoPair() sets and nothing calls yet: no
+       layout, no paint, no decode, no a11y node. #remoteCanvas2 is created by
+       startTape() the same way #remoteCanvas is, next to this <video>. -->
+  <div id="remoteWrap2" aria-hidden="true">
+    <canvas id="remoteFill2" width="32" height="18" aria-hidden="true"></canvas>
+    <video id="remote2" autoplay playsinline></video>
   </div>
   <video id="selfFull" autoplay muted playsinline></video>
 

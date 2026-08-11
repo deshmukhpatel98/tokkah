@@ -1443,6 +1443,111 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
 }
 
 /**
+ * ── §6.1 phase 4: ONE encoder, N transport halves ────────────────────────────
+ *
+ * A naive mesh runs one whole `startTapeRtp` per peer: two encoders, two
+ * carriers, two governors. That is 2x encode CPU on a device where the encoder
+ * is already the next ceiling behind capture, and it doubles the `configure()`
+ * churn #44's rate control is careful about. The shipped shape instead keeps ONE
+ * capture->admission->encode chain and hands every encoded chunk to both peers'
+ * transport halves — each with its own carrier substitution, its own FEC window,
+ * its own re-splice ring, its own ctl channel and its own AIMD governor.
+ *
+ * What that costs, stated in the product's own voice rather than hidden: in a
+ * 3-person call **the person on the worst connection sets the video quality
+ * everyone sends**. The reference chain is shared, so a frame skipped for one
+ * peer is skipped for both — there is no such thing as a per-peer drop once one
+ * bitstream feeds two decoders. Hence:
+ *
+ *   · admission is the MIN over the peers' governors (`admitRate`), and a frame
+ *     is admitted only when EVERY half has an in-flight slot for it,
+ *   · rate control spends the MIN budget across the peers' paths,
+ *   · duress is the MAX across the audio lanes (app.js's callback already fans;
+ *     `rcPollBudget` consumes whatever it returns, unchanged),
+ *   · a keyframe request from EITHER peer arms the one encoder,
+ *   · a shed from EITHER peer stops admission for both.
+ *
+ * `?l23enc=2` is the control arm and needs nothing here: it simply builds two
+ * whole `startTapeRtp` instances with `link` null, which is today's code.
+ *
+ * THE FLAG-OFF PROPERTY, which is the reason this is a separate object rather
+ * than a rewrite of the instance: with `link` null every aggregate reader in
+ * `startTapeRtp` returns that instance's own value, so a 1:1 call runs the same
+ * encoder config, the same governor, the same wire bytes. Nothing branches on
+ * "are we three" inside the hot path; it branches on whether a link exists.
+ */
+export function createTapeLink() {
+  const halves = new Set();
+  let owner = null;
+  // The encoder's own self-description (`cfg`, `rot`). One encoder means one
+  // description, and a half whose ctl channel opens AFTER the encoder started
+  // would otherwise never hear it — its peer would sit with no decoder for the
+  // rest of the call. Replayed at that half's arm.
+  const desc = { cfg: null, rot: null };
+  return {
+    size: () => halves.size,
+    join(h) { halves.add(h); return halves.size; },
+    leave(h) {
+      halves.delete(h);
+      if (owner !== h) return;
+      owner = null;
+      // The encode half went with the pair that left. Hand it to a survivor
+      // rather than leaving the room's remaining leg with no picture.
+      for (const o of halves) { owner = o; o.startEncodeHalf(); break; }
+    },
+    /** First half to arm owns the encode chain; the rest are transport-only. */
+    claimEncoder(h) { if (!owner) owner = h; return owner === h; },
+    isOwner: (h) => owner === h,
+    /** §6.1: min over the peers' governors. `fallback` is used with no halves. */
+    admitRate(fallback) {
+      let v = Infinity;
+      for (const h of halves) v = Math.min(v, h.admitRate());
+      return Number.isFinite(v) ? v : fallback;
+    },
+    /** Admit only when every half has a slot: max of the per-peer depths. */
+    inFlight(fallback) {
+      let v = -1;
+      for (const h of halves) v = Math.max(v, h.inFlight());
+      return v < 0 ? fallback : v;
+    },
+    remoteReady(fallback) {
+      if (!halves.size) return fallback;
+      for (const h of halves) if (!h.remoteReady()) return false;
+      return true;
+    },
+    shedded(fallback) {
+      if (!halves.size) return fallback;
+      for (const h of halves) if (h.shedded()) return true;
+      return false;
+    },
+    /** Rate control follows the worst peer, for the shared-chain reason above. */
+    budgetMbps(fallback) {
+      let v = Infinity;
+      for (const h of halves) { const b = h.budgetMbps(); if (b != null) v = Math.min(v, b); }
+      return Number.isFinite(v) ? v : fallback;
+    },
+    /** A keyframe request from any peer arms the one encoder. */
+    wantKey() { owner?.setWantKey(); },
+    /**
+     * One encoded frame, N transports. Each worker gets its OWN copy: the buffer
+     * is transferred to the owner's worker (detached on arrival), and each half
+     * keeps its own FEC accumulator and retention ring over it.
+     */
+    fanEncoded(from, msg) {
+      for (const h of halves) {
+        if (h === from) continue;
+        try { h.acceptEncoded({ ...msg, buf: msg.buf.slice(0) }); } catch { /* one peer's transport is not the other's */ }
+      }
+    },
+    fanDesc(from, o) {
+      if (o?.t === 'cfg' || o?.t === 'rot') desc[o.t] = o;
+      for (const h of halves) { if (h !== from) h.ctlSend(o); }
+    },
+    replayDesc(h) { for (const k of ['cfg', 'rot']) { if (desc[k]) h.ctlSend(desc[k]); } },
+  };
+}
+
+/**
  * Phase B — same contract as startTapeVideo, but the caller must:
  *   · have added the video track to the pc (the carrier),
  *   · pass the `pre` handle from prepareTapeRtp (phase A),
@@ -1451,7 +1556,7 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
  *   · and on the non-initiating side, route the 'tape-ctl-rtp' datachannel from
  *     ondatachannel into .adoptCtl(channel).
  */
-export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null, duress = null }) {
+export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null, duress = null, link = null }) {
   const L = (tag, d) => { try { log?.(tag, d); } catch { /* never break the call */ } };
   const fail = (why, e) => {
     L('tape-fail', { lane: 'rtp', why, error: e ? String(e).slice(0, 160) : null });
@@ -1616,6 +1721,49 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // split for the same reason. Without it a single bad second cost 8 s of ramp.
   let paceRef = admitRate;
 
+  // ── §6.1 phase 4: this instance's TRANSPORT HALF, and the aggregate readers ─
+  //
+  // `link` null — every 1:1 call today, `?three=0`, and the `?l23enc=2` control
+  // arm — makes every reader below return this instance's own variable, so the
+  // hot path is the code that shipped rather than a special case of a new one.
+  // With a link the SAME readers answer for the room: min governor, max
+  // in-flight depth, all-ready, any-shed, min budget.
+  //
+  // Everything a transport half owns stays local and per-peer: `worker` (its own
+  // carrier substitution, FEC group state and 90-frame re-splice ring live
+  // inside it), `dcCtl`, the AIMD governor, the receive/decode/display chain and
+  // the stall machine. Only the encode chain is shared, and only one instance
+  // runs it (`link.claimEncoder`).
+  const half = link ? {
+    admitRate: () => admitRate,
+    inFlight: () => inFlight,
+    remoteReady: () => remoteReady,
+    shedded: () => shedded,
+    budgetMbps: () => rcBudgetMbps,
+    setWantKey: () => { wantKey = true; },
+    startEncodeHalf: () => startEncodeHalf(),
+    ctlSend: (o) => ctlSend(o),
+    // An encoded frame from the shared encoder, already copied for us. Counted
+    // into OUR in-flight depth: it is this peer's carrier that has to spend a
+    // tick on it, and the gate that stops the encoder running ahead of the
+    // carrier is per carrier.
+    acceptEncoded: (msg) => {
+      if (closed || !worker) return;
+      inFlight++;
+      worker.postMessage({ type: 'frame', ...msg }, [msg.buf]);
+    },
+  } : null;
+  const gAdmitRate = () => (link ? link.admitRate(admitRate) : admitRate);
+  const gInFlight = () => (link ? link.inFlight(inFlight) : inFlight);
+  const gRemoteReady = () => (link ? link.remoteReady(remoteReady) : remoteReady);
+  const gShedded = () => (link ? link.shedded(shedded) : shedded);
+  const gBudgetMbps = () => (link ? link.budgetMbps(rcBudgetMbps) : rcBudgetMbps);
+  // A keyframe request, a resume, or the dead-man switch arms THE encoder, which
+  // with a link may be another half's. Flag-off this is `wantKey = true`.
+  const armKey = () => { if (link) link.wantKey(); else wantKey = true; };
+  // The encoder's self-description. One encoder, one description, every peer.
+  const descSend = (o) => { ctlSend(o); if (link) link.fanDesc(half, o); };
+
   // ── #44 rate control: hold a bitrate budget with QP, not with frame rate ────
   //
   // `bitrateMode: 'quantizer'` gives constant QUALITY, so the bitrate is set by
@@ -1696,8 +1844,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // measurement hook, and a pinned arm must stay pinned.
   let rcVbrLastConfigAt = -Infinity;
   function rcVbrRetune() {
+    // §6.1: the budget and the admitted share are both the ROOM's, not this
+    // peer's — one encoder cannot track two links. With no link both readers
+    // return this instance's own values and the arithmetic below is unchanged.
+    const budgetMbps = gBudgetMbps();
     if (rateControl !== 'vbr' || cfg.l2VbrBps || !enc || enc.state !== 'configured'
-        || !encConfig || rcBudgetMbps == null) return;
+        || !encConfig || budgetMbps == null) return;
     const parityShare = stats.bytesSent > 0 ? stats.parityBytes / stats.bytesSent : 0.25;
     // The budget must follow the frames the pacer actually admits. A VBR encoder
     // budgets bits per unit TIME: hand it the full budget while the pacer admits
@@ -1718,9 +1870,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // and delivery got WORSE than the spiral this replaces). Steps land on
     // 1, ½, ¼, ⅛ of the budget, so the encoder is touched only when the pacer
     // regime genuinely moved, and at most once per 3 s.
-    const rawShare = cfg.l2VbrAdmit === false ? 1 : Math.min(1, admitRate / cfg.fps);
+    const rawShare = cfg.l2VbrAdmit === false ? 1 : Math.min(1, gAdmitRate() / cfg.fps);
     const admitShare = rawShare >= 0.75 ? 1 : rawShare >= 0.375 ? 0.5 : rawShare >= 0.1875 ? 0.25 : 0.125;
-    const want = Math.max(250_000, Math.round((rcBudgetMbps * 1e6 * admitShare) / (1 + parityShare)));
+    const want = Math.max(250_000, Math.round((budgetMbps * 1e6 * admitShare) / (1 + parityShare)));
     const cur = encConfig.bitrate || 0;
     // 35%, not the 15% the original tracker used: the GCC budget estimate
     // swings past 15% on nearly every 1 s poll, which put configure() back on
@@ -1735,7 +1887,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       encConfig = { ...encConfig, bitrate: want };
       enc.configure(encConfig);
       stats.rcVbrBps = want;
-      L('vbr-retune', { fromBps: cur, toBps: want, budgetMbps: rcBudgetMbps, admitFps: +admitRate.toFixed(1) });
+      L('vbr-retune', { fromBps: cur, toBps: want, budgetMbps, admitFps: +gAdmitRate().toFixed(1) });
     } catch (e) {
       L('vbr-retune-failed', { want, err: String(e).slice(0, 120) });
     }
@@ -1749,7 +1901,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   function rcOnEncoded(bytes, isKey) {
     if (!cfg.l2Rc || isKey) return;
     rcBytesEwma = rcBytesEwma == null ? bytes : 0.85 * rcBytesEwma + 0.15 * bytes;
-    if (rcBudgetMbps == null) return;
+    // §6.1: the worst peer's budget, because one bitstream feeds both decoders.
+    const budgetMbps = gBudgetMbps();
+    if (budgetMbps == null) return;
     // The divisor is the frame rate we WANT, never the one the pacer has been
     // forced down to. Dividing by the live admitRate was tried and measured
     // catastrophic: the pacer cuts fps, the smaller divisor hands the encoder a
@@ -1763,7 +1917,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // FEC parity is real traffic on this link (measured ~25% of payload), so the
     // budget the encoder gets is the link budget minus what redundancy will cost.
     const parityShare = stats.bytesSent > 0 ? stats.parityBytes / stats.bytesSent : 0.25;
-    rcTargetBytes = ((rcBudgetMbps * 1e6) / 8 / fps) / (1 + parityShare);
+    rcTargetBytes = ((budgetMbps * 1e6) / 8 / fps) / (1 + parityShare);
     // +6 QP ~ half the bits (H.264). Step-limited to +/-1.5 QP per frame so a
     // single large frame cannot visibly pump the picture; at 30 fps the
     // controller still crosses the whole 24-42 band in well under a second.
@@ -2142,7 +2296,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       case 'cfg': setupDecoder(m).catch((e) => fail('decoder-configure', e)); break;
       case 'rot': remoteRot = ((m.rot | 0) % 360 + 360) % 360; L('tape-rot', { lane: 'rtp', dir: 'recv', rot: remoteRot }); break;
       case 'ready': remoteReady = true; L('tape-remote-ready', { lane: 'rtp' }); break;
-      case 'key': stats.keyReqRecv++; wantKey = true; break;
+      // §6.1: either peer may ask, and there is one encoder to ask.
+      case 'key': stats.keyReqRecv++; armKey(); break;
       case 'fragreq': stats.fragReqRecv++; worker?.postMessage({ type: 'resplice', ids: m.ids }); break;
       case 'ping': ctlSend({ t: 'pong', a: m.a, b: now() }); break;
       case 'pong': {
@@ -2179,7 +2334,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         if (shedded) {
           shedded = false;
           sheddedAt = 0;
-          wantKey = true;
+          armKey();
           admitRate = cfg.l2PaceStart;
           paceTokens = 1;
           paceLastAt = now();
@@ -2828,8 +2983,11 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     L('tape-encoder', { lane: 'rtp', ...config, rateControl,
       rcForced: cfg.l2RcMode === 'vbr' ? 1 : 0,
       hw: sup.config?.hardwareAcceleration ?? null });
-    // See lane 1: announce what we encoded, not what we wanted.
-    ctlSend({ t: 'cfg', codec: cfg.codec, width: config.width, height: config.height, qp: cfg.qp });
+    // See lane 1: announce what we encoded, not what we wanted. `descSend` (not
+    // `ctlSend`) because with §6.1's shared encoder this one description is what
+    // EVERY peer's decoder is configured from — including one whose ctl channel
+    // opens after this line ran (the link replays it at that half's arm).
+    descSend({ t: 'cfg', codec: cfg.codec, width: config.width, height: config.height, qp: cfg.qp });
   }
 
   function onEncoded(chunk) {
@@ -2854,10 +3012,14 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     stats.framesEncoded++;
     encMeter.note();
     inFlight++; // counted before the round trip so the capture loop cannot slip one in
-    worker.postMessage(
-      { type: 'frame', id: frameId++, key: isKey, ts: chunk.timestamp, wall: now(), buf },
-      [buf],
-    );
+    // §6.1: one encoded bitstream, N transport halves. The fan runs FIRST because
+    // the postMessage below transfers `buf` — each peer's worker needs its own
+    // copy to XOR into its own parity window and hold in its own re-splice ring.
+    // With no link there is no fan and this is the single postMessage that
+    // shipped, byte for byte.
+    const msg = { type: 'frame', id: frameId++, key: isKey, ts: chunk.timestamp, wall: now(), buf };
+    if (link) link.fanEncoded(half, msg);
+    worker.postMessage(msg, [buf]);
     // ?sendnow=1 (task #41 lever 1): pull a carrier tick for the frame just
     // queued instead of waiting for the auto-capture phase. The postMessage
     // lands in the worker FIFO in <1 ms; the requested tick reaches the
@@ -2910,7 +3072,13 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // capture is admitted, no pacing token is spent — the wire goes quiet so
       // audio gets the pipe. Lane P keeps presence: one captured frame a
       // second becomes a crisp JPEG on the stills channel.
-      if (shedded) {
+      // §6.1: a shed from EITHER peer stops admission, because the reference
+      // chain is shared — a capture skipped for one is skipped for both. The
+      // dead-man switch below stays OUR OWN (`shedded &&`): a half that is not
+      // itself shed has `sheddedAt` 0, and firing its dead-man on someone else's
+      // shed would resume a peer that never asked. With no link `gShedded()` is
+      // `shedded` and `shedded &&` is true inside this branch — unchanged.
+      if (gShedded()) {
         // Dead-man switch. Being shed means we have stopped sending video and the
         // ONLY thing that starts us again is a ctl message from the peer. That is
         // a single point of failure with no timeout on it: if the peer decides it
@@ -2922,11 +3090,11 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // real (its 3 s dwell is what stops that from flapping). Belt and braces
         // for the stale-key exit fixed above: that bug is closed, this makes the
         // whole class of it survivable.
-        if (now() - sheddedAt > cfg.stallShedMaxMs) {
+        if (shedded && now() - sheddedAt > cfg.stallShedMaxMs) {
           shedded = false;
           sheddedAt = 0;
           stats.shedDeadman++;
-          wantKey = true;
+          armKey();
           admitRate = cfg.l2PaceStart;
           paceTokens = 1;
           paceLastAt = now();
@@ -2957,7 +3125,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // replaces the pacer's 1.44 s drop-ceiling queue.
       if (cfg.l2Pace) {
         const tNow = now();
-        paceTokens = Math.min(2, paceTokens + ((tNow - paceLastAt) / 1000) * admitRate);
+        // §6.1: MIN over the peers' governors. The worst link sets the rate,
+        // which is the honest price of one encoder (the alternative charges the
+        // sender's CPU instead). One half: this is `admitRate`.
+        paceTokens = Math.min(2, paceTokens + ((tNow - paceLastAt) / 1000) * gAdmitRate());
         paceLastAt = tNow;
         if (paceTokens < 1) {
           stats.skipPaced++;
@@ -2968,8 +3139,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         paceTokens--;
       }
       const maxInFlight = cfg.maxInFlight || 3;
-      if (inFlight >= maxInFlight || q > cfg.maxEncQueue || !remoteReady) {
-        if (remoteReady) { if (inFlight >= maxInFlight) stats.skipBuffered++; else stats.skipEncQueue++; }
+      // §6.1: admit only when EVERY peer's carrier has a slot (max depth) and
+      // every peer's decoder is up. A frame encoded for one peer and not the
+      // other would be a hole in the shared reference chain.
+      const nInFlight = gInFlight();
+      if (nInFlight >= maxInFlight || q > cfg.maxEncQueue || !gRemoteReady()) {
+        if (gRemoteReady()) { if (nInFlight >= maxInFlight) stats.skipBuffered++; else stats.skipEncQueue++; }
         stats.framesSkipped++;
         frame.close();
         continue;
@@ -3022,7 +3197,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         const rot = (((frame.rotation ?? 0) | 0) % 360 + 360) % 360;
         if (rot !== sentRot) {
           sentRot = rot;
-          ctlSend({ t: 'rot', rot });
+          // Same reasoning as the `cfg` above: one camera, one orientation,
+          // every peer — and replayed to a half that arms later.
+          descSend({ t: 'rot', rot });
           L('tape-rot', { lane: 'rtp', dir: 'send', rot });
         }
         if (rot === 0 && !rotWarned) {
@@ -3080,6 +3257,18 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     if (!wasLive) pumpCapture().catch((e) => fail('capture-readopt', e));
   }
 
+  /**
+   * The ENCODE half (§6.1): capture -> admission -> encode. Extracted from
+   * `arm()` unchanged so that exactly one instance can own it under a link, and
+   * so the link can hand it to a surviving half when the owner's pair leaves.
+   * With no link `arm()` calls it directly and these are the two statements that
+   * stood there.
+   */
+  function startEncodeHalf() {
+    setupEncoder().then(() => pumpCapture().catch((e) => fail('capture', e)))
+      .catch((e) => fail('encoder-setup', e));
+  }
+
   if (!pre?.worker) { fail('rtp-lane-setup', new Error('no prepared sender transform')); return null; }
   worker = pre.worker;
   worker.onmessage = (e) => { try { onWorkerMsg(e.data); } catch { /* ignore */ } };
@@ -3114,8 +3303,20 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         } catch (e) { L('stall-err', { e: String(e).slice(0, 120) }); }
       }, 500);
     }
-    setupEncoder().then(() => pumpCapture().catch((e) => fail('capture', e)))
-      .catch((e) => fail('encoder-setup', e));
+    // §6.1: a half joins the shared encoder when its TRANSPORT is live, not when
+    // it is constructed — joining at construction would make an armed peer wait
+    // on an unarmed one's `remoteReady` and stall a running call. The first half
+    // to arm owns the encode chain; later halves are transport-only and get the
+    // encoder's `cfg`/`rot` replayed, because the encoder described itself
+    // before their ctl channel existed.
+    if (link) {
+      link.join(half);
+      link.replayDesc(half);
+      if (link.claimEncoder(half)) startEncodeHalf();
+      else L('tape-link-transport-half', { halves: link.size() });
+    } else {
+      startEncodeHalf();
+    }
     pinger = setInterval(() => ctlSend({ t: 'ping', a: now() }), 2000);
     ctlSend({ t: 'ping', a: now() });
     try { avsync?.onCtlOpen?.(); } catch { /* TIME_SYNC must never break the lane */ }
@@ -3271,6 +3472,16 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         mbpsAtFps: mean(b) != null ? +((mean(b) * 8 * cfg.fps) / 1e6).toFixed(2) : null,
         buffered: null, decQueue: dec?.decodeQueueSize ?? null, encQueue: enc?.encodeQueueSize ?? null,
         pending: hold.size,
+        // §6.1 shared encoder. Null on every 1:1 call and on the ?l23enc=2
+        // control arm, so a snapshot from today's path is the same object it
+        // was. `encoder` says which half owns the one encode chain; `admitFps`
+        // beside it is this PEER's governor, and `admitShared` what the shared
+        // admission actually used — the pair the rig needs to see the min rule.
+        l23: link
+          ? { halves: link.size(), encoder: link.isOwner(half) ? 1 : 0,
+              admitShared: +gAdmitRate().toFixed(2), inFlightShared: gInFlight(),
+              budgetShared: gBudgetMbps() }
+          : null,
         // §10 A-V sync telemetry (null/absent when the bundle never engaged —
         // the paint-on-arrival path is then exactly §17.8's).
         avEngaged,
@@ -3292,6 +3503,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     },
     stop() {
       closed = true;
+      // Leave the shared encoder first: if this half owned the encode chain the
+      // link hands it to a survivor, so the room's other leg keeps its picture.
+      try { if (link) link.leave(half); } catch { /* teardown is never load-bearing */ }
       clearInterval(pinger);
       clearInterval(ageReporter);
       clearInterval(rcTimer); // #44 — a live getStats poll on a closed pc throws every second
