@@ -4339,6 +4339,12 @@ async function join(room) {
     }, 'ws.message');
   };
   await new Promise((res, rej) => {
+    // A pre-dialed socket adopted OPEN never fires onopen — waiting for it
+    // here rejected every adopted join with "signaling timeout" at t+12 s
+    // while the call itself (driven by onmessage) connected fine. Found by
+    // the first iOS simulator call's SCREENSHOT: the rigs watched
+    // pc.connectionState and never looked at the words on the screen.
+    if (ws.readyState === WebSocket.OPEN) { res(); return; }
     ws.onopen = res;
     wsPreOpenFail = rej; // the 409 "room full" path, wired at the handlers above
     setTimeout(() => rej(new Error('signaling timeout')), 12000);
