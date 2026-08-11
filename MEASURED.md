@@ -4167,3 +4167,8 @@ Lesson recorded: rigs must read the words on the screen, not only pc state.
 AEC2 do-no-harm gate shipped same day: filter learns always, delivers only at
 ERLE >=3 dB (hysteresis at 1). Live iOS retest: gate 0, erle ~-0.8 shadow (was -13
 frozen), desktop concealment of iOS audio 4912 -> 32 ms. Gate-open awaits real air.
+
+iOS soak, 2 min live: conceal 80 ms / 14976 frames (0.067%), depth 27-36 ms, gate
+closed throughout - mobile Safari is a healthy surface post-gate (was 15% conceal).
+Also: humanGapMs proven end-to-end on a 90 s conversation call (20 transitions,
+median 800 ms = the fixture's scripted pauses; beat accepted 200/200).
