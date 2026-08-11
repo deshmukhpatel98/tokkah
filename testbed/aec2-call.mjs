@@ -66,7 +66,13 @@ async function runArm(mode) {
     const pcmB = await B.page.evaluate(() => window.__tape?.pcm?.framesRecv ?? 0);
     const noErrors = A.errors.length === 0 && B.errors.length === 0;
     const validDelay = aec2Stats?.delayBlocks != null && aec2Stats.delayBlocks >= 0;
-    const validErle = aec2Stats != null && (aec2Stats.erleDb === null || aec2Stats.erleDb > -5);
+    // Since the do-no-harm gate: a bad SHADOW erle is fine while the gate is
+    // closed (nothing is delivered), and delivered output demands erle above
+    // the harm floor. Fake devices have no acoustic coupling, so the healthy
+    // posture here is gate 0 with any shadow value — judging shadow erle
+    // against -5 was flaking on exactly the calls the gate protects.
+    const validErle = aec2Stats != null && (aec2Stats.gate === 0
+      || aec2Stats.erleDb === null || aec2Stats.erleDb > -5);
     ok = gotStats && noErrors && pcmB > 100 && validDelay && validErle;
     detail = `aec2=${JSON.stringify(aec2Stats)} B.pcmRecv=${pcmB} errA=${A.errors.length} errB=${B.errors.length}`;
   } else {
