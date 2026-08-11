@@ -33,6 +33,9 @@ interface Env {
   // (one speech-to-speech session replaces the STT→MT→TTS chain). The legacy
   // ElevenLabs pipeline stays reachable via ?xlvendor=el for A/Bs.
   GEMINI_API_KEY?: string;
+  // Interpreter daily budget per room, in seconds (see xlateMeter). Unset =
+  // 7200; explicit '0' disables metering.
+  XLATE_DAY_SECONDS?: string;
   LOG_ADMIN_TOKEN?: string;
   ELEVENLABS_API_KEY?: string;
   // MT backend. Absent → passthrough (captions/TTS in the source language),
@@ -611,10 +614,14 @@ export class Room implements DurableObject {
     if (vendor === 'gemini') {
       const gk = this.env.GEMINI_API_KEY;
       if (!gk) return json({ error: 'translation not configured' }, 503);
+      const limited = await this.xlateMeter();
+      if (limited) return limited;
       return this.xlateGemini(role, lang, gk);
     }
     const key = this.env.ELEVENLABS_API_KEY;
     if (!key) return json({ error: 'translation not configured' }, 503);
+    const limitedEl = await this.xlateMeter();
+    if (limitedEl) return limitedEl;
 
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
@@ -764,6 +771,46 @@ export class Room implements DurableObject {
   // Same-language pair: echoTargetLanguage=false makes the model stay silent
   // and the transcripts still flow — captions only, no TTS parroting, same
   // behaviour the EL path implemented by hand.
+  // ── Interpreter metering ────────────────────────────────────────────────
+  // The interpreter is the one lane that costs real vendor money per minute,
+  // and the embed (data-translate) puts it one script tag away from any
+  // website — so a room's daily budget must exist before that ships. The
+  // meter charges a 600 s GRAIN at session START against XLATE_DAY_SECONDS
+  // (default 7200 s/room/UTC-day): coarse on purpose — sessions are long-
+  // lived with lazy reconnect, and wall-second accounting would need close
+  // hooks inside both vendor state machines for a precision the risk model
+  // does not need. Over budget: the socket is ACCEPTED, told why in a shape
+  // xlate.js renders as a caption, and closed — a refused upgrade is silent
+  // on the client (measured for the no-key 503), and a silent limit is a
+  // support ticket.
+  private async xlateMeter(): Promise<Response | null> {
+    const capSec = Number(this.env.XLATE_DAY_SECONDS ?? 7200);
+    if (!Number.isFinite(capSec) || capSec <= 0) return null; // 0/invalid = unmetered
+    const day = new Date().toISOString().slice(0, 10);
+    const k = `xl_sec_${day}`;
+    const used = (await this.state.storage.get<number>(k)) ?? 0;
+    if (used >= capSec) {
+      const pair = new WebSocketPair();
+      const [client, server] = [pair[0], pair[1]];
+      server.accept();
+      try {
+        server.send(JSON.stringify({
+          type: 'limit',
+          txt: 'translation limit reached for today — resets at midnight UTC',
+          usedSec: used, capSec,
+        }));
+      } catch { /* client gone */ }
+      server.close(1000, 'xlate daily cap');
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    await this.state.storage.put(k, used + 600);
+    // Yesterday's counters are dead weight in this room's storage forever if
+    // nothing sweeps them; one prefix-list per session start is cheap.
+    const old = await this.state.storage.list<number>({ prefix: 'xl_sec_' });
+    for (const kk of old.keys()) if (kk !== k) await this.state.storage.delete(kk);
+    return null;
+  }
+
   private xlateGemini(role: string, lang: string, key: string): Response {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];

@@ -77,6 +77,10 @@ Script tag (replaces itself with the call iframe, in place):
 <script src="https://room.tokkah.com/embed.js" data-room="my-room"></script>
 ```
 
+Add `data-translate="es"` (any language) and the embedded call opens with a live
+interpreter — you speak your language, they hear theirs. Each room carries a
+server-enforced daily interpreter budget, so a page can never overspend it.
+
 Programmatic:
 
 ```js

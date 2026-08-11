@@ -113,6 +113,14 @@ export async function start({ stream, room, role, lang, tel }) {
       return;
     }
     let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === 'limit') {
+      // The room's daily interpreter budget is spent (worker.ts xlateMeter).
+      // Say so where translations appear — a silent refusal reads as broken.
+      // The server closes right after; onclose only logs, so no retry loop.
+      showFin(m.txt || 'translation limit reached for today');
+      log('xlate-limit', { usedSec: m.usedSec ?? null, capSec: m.capSec ?? null });
+      return;
+    }
     if (m.type === 'cap') {
       if (!m.fin) { xs.partials++; live.textContent = m.txt; return; }
       live.textContent = '';

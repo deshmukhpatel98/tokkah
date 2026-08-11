@@ -45,9 +45,18 @@
   const build = (opts = {}) => {
     const base = (opts.base || DEFAULT_BASE).replace(/\/+$/, '');
     const room = opts.room || randomRoom();
-    const url = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(room)
+    let url = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(room)
       ? `${base}/${room}`
       : `${base}/?r=${encodeURIComponent(room)}`;
+    // data-translate="es" (or any primary language subtag): the embedded call
+    // opens with the live interpreter listening in that language — the whole
+    // "add an interpreter to any website" integration is this one attribute.
+    // The app's ?xlate= hook does the rest; the room's daily budget is
+    // enforced server-side (worker.ts xlateMeter), so a hostile page cannot
+    // spend more than the room's cap.
+    if (opts.translate) {
+      url += (url.includes('?') ? '&' : '?') + 'xlate=' + encodeURIComponent(String(opts.translate).slice(0, 8));
+    }
     const f = document.createElement('iframe');
     f.src = url;
     // The call needs the camera and mic INSIDE the frame; fullscreen and PiP
@@ -76,6 +85,7 @@
       width: OWN.dataset.width,
       height: OWN.dataset.height,
       base: OWN.dataset.base,
+      translate: OWN.dataset.translate,
     });
     OWN.parentNode.insertBefore(frame, OWN);
   }
