@@ -4225,3 +4225,10 @@ PASS x5 viewports. fscheck-call.mjs is stale from d846bf3 (#c-lifesize removed).
 Three phase 5 landed: two-tile UI (equal split, per-tile wash + state line, bar
 untouched, no talking-time motion). ui-call ALL PASS incl new three-mode section
 x5 viewports; 0 conceal. Worker deployed to staging, prod promotion done here.
+
+Three phase 6: full mesh works end-to-end. call3.mjs (3 real browsers, staging,
+THREE_ENABLED=true there) ALL PASS - abc admission, 4th refused, 6 media legs,
+both tiles moving x3, 0 conceal, 0 errors. Prod source THREE_ENABLED stays false;
+the flip is a deliberate product-shape decision, not an autonomous one. Still
+open before any prod flip: assertions 6/7/8 (reload, departure, legacy interop),
+real per-device uplink measurement (~22 Mbps predicted), a phone arm.
