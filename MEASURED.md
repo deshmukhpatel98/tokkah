@@ -4330,3 +4330,18 @@ dtPct discriminator shipped (bleed hypothesis testable on next real call). The
 gate close is now two-tier: instant on proven harm (<-2 dB), dwelled only in the
 ambiguous band - found because the live rig caught my own dwell delivering -6.6
 dB for 2 s under a collapsed spurious correlation. 6/6 arms; live arms OK x2.
+
+## Bleed pre-flight (synthetic, ENGINEERING ONLY — field verdict stays with dtPct)
+
+90 s synthetic arms, independent near voice mixed into the mic at echo-comparable
+levels: bleed at -6 dB → ERLE 12.5 dB SUSTAINED, gate open and stable (the leak
++ gate handles moderate bleed); bleed at 0 dB (equal level) → 7 dB early, eroding
+to ~0-1.6 by 60-90 s (heavy bleed still erodes the filter — matches "not there
+yet"). And the surprise: dtPct read 0 in EVERY arm — this synthetic bleed never
+triggered the DTD at all, so the "bleed poisons the DTD" theory did NOT reproduce
+here. Either real near speech is burstier/louder than the generator, or the xow
+mechanism is something else (e.g. the erosion seen in the 0 dB arm, no freeze
+needed). The next real call's dtPct now discriminates BETWEEN THEORIES, not just
+yes/no. (A no-bleed arm in this scratch rig collapsed after early convergence —
+likely a scratch-generator artifact; the guarantee rig's arm 1 with proper
+signals reads 62 dB, so not chased.)
