@@ -4127,3 +4127,10 @@ plain anyway: 340 ms mouth-to-ear was 305 ms Bluetooth + 36 ms pipeline — the 
 not the network, owns the latency on that setup. (2) The first health-beat probe
 watched only the send and missed the server 400 (allowlist knew the new fields,
 HB_FIELDS had no validators) — beacons are judged by response status now.
+
+Addendum, same day: the whole stack verified on WEBKIT live (Playwright WebKit —
+real Safari needs "Allow remote automation" enabled on this new Mac, still pending).
+Cross-engine call WebKit<->Chromium on prod: connected, real picture both ways,
+conceal 0.11-0.29%. WebKit-side posture probe: mode sab (crossOriginIsolated true),
+presence rendering (576k samples), aec2 adapting, mouthToEar 54.7 ms, zero page
+errors. Today's features are not Chromium-only.
