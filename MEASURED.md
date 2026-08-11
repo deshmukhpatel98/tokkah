@@ -4280,3 +4280,8 @@ the iframe (proven on prod: es session from the attribute alone, 25 caps + 25 TT
 both ways). Per-room daily budget (xlateMeter, 600 s grains vs 7200 s default)
 proven on staging: second session visibly refused. Note: staging worker now
 carries flag-off + cap-1 build; redeploy before any call3 rerun.
+
+Spatial voices shipped: second remote seats at +28 deg (ITD+ILD, lossless; az 0 =
+bit-identical original). call3 gains assertion 4b (both halves must FLOW) - the
+silent-voice scare was a still-priming snapshot, disproven by discriminators:
+750/750 frames per 6 s per half. Full rig ALL PASS; mesh uplink 11.7 Mbps.
