@@ -6438,6 +6438,22 @@ safe(() => { localStorage.removeItem('tape.log.mirror'); localStorage.removeItem
 
 window.__tape = {
   get pc() { return pc; },
+  // Every RTCPeerConnection this device holds, for the §2.2 uplink measurement:
+  // the media pair's module pc, its Lane A stripes, and each second pair's own
+  // video pc + stripes. call3.mjs sums candidate-pair bytesSent across these to
+  // turn the design's ~22 Mbps prediction into a measured number. Read-only.
+  async uplinkMbps(windowMs = 3000) {
+    const pcs = new Set();
+    if (pc) pcs.add(pc);
+    for (const ladder of pcmPcs.values()) for (const spc of ladder) if (spc) pcs.add(spc);
+    for (const p of peers.values()) if (p.pc) pcs.add(p.pc);
+    const read = async () => { let b = 0; for (const c of pcs) { try { (await c.getStats()).forEach((r) => {
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.bytesSent) b += r.bytesSent; }); } catch { /* closing */ } } return b; };
+    const b0 = await read();
+    await new Promise((r) => setTimeout(r, windowMs));
+    const b1 = await read();
+    return { pcs: pcs.size, upMbps: +(((b1 - b0) * 8) / (windowMs / 1000) / 1e6).toFixed(2) };
+  },
   // The live video lane. Exposed so the camera-swap regression (testbed/
   // flip-lane.mjs) can drive adoptTrack the way adoptVideoTrack does — the flip
   // button itself needs two cameras, which a fake-device browser does not have.

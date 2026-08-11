@@ -135,14 +135,10 @@ try {
   // over 3 s on page a's module pc (the media pair) — a LOWER BOUND, since the
   // second pair's pc lives in the peers map and isn't exposed as an object.
   // The honest full-mesh number needs a per-pair stat hook; flagged, not faked.
-  const uplink = await pa.page.evaluate(async () => {
-    const t = window.__tape; if (!t.pc) return { err: 'no pc' };
-    const read = async () => { let b = 0; (await t.pc.getStats()).forEach((r) => {
-      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.bytesSent) b += r.bytesSent; }); return b; };
-    const b0 = await read(); await new Promise((r) => setTimeout(r, 3000)); const b1 = await read();
-    return { mediaPairMbpsUp: +(((b1 - b0) * 8) / 3 / 1e6).toFixed(2) };
-  }).catch((e) => ({ err: String(e).slice(0, 80) }));
-  console.log(`  i   uplink (page a, MEDIA pair only, lower bound): ${JSON.stringify(uplink)} Mbps — full mesh ≈ 2× this; per-pair hook still needed for the exact §2.2 number`);
+  // Real full-mesh uplink: __tape.uplinkMbps sums bytesSent across EVERY pc
+  // this device holds (media pc + all Lane A stripes + both second pairs).
+  const uplink = await pa.page.evaluate(() => window.__tape.uplinkMbps(3000)).catch((e) => ({ err: String(e).slice(0, 80) }));
+  console.log(`  i   uplink (page a, FULL mesh, §2.2): ${JSON.stringify(uplink)} — design predicted ~22 Mbps; desktop-only iff a phone can't carry this`);
 
   // 6. Free-slot reuse: b reloads mid-call, comes back as b, and a & c do NOT
   //    reset (the hadPeer bug the design flags — a third arrival must never
