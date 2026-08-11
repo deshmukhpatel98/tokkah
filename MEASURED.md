@@ -4242,3 +4242,7 @@ while a<->b audio keeps flowing — fix before prod flip. Uplink is a lower boun
 Departure peer-map bug FIXED (server): non-idempotent DO teardown fired twice on
 abrupt drop, second broadcast a fieldless peer-left -> client clear-all. Guarded.
 call3 assertion 7: peers now b,a (was ∅,∅), audio continuous. Full rig ALL PASS.
+
+Full-mesh uplink MEASURED (staging, 3 browsers): 12 pcs, 10.62 Mbps up — half the
+~22 Mbps design prediction. Uplink is not the desktop-only disqualifier; the open
+phone question is CPU/thermal (2 video encodes + 12 ICE agents), needs a phone arm.
