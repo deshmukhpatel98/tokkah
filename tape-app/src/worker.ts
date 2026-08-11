@@ -1200,7 +1200,9 @@ export class Health implements DurableObject {
       const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days')) || 7));
       const since = Date.now() - days * 86_400_000;
       const rows = this.sql.exec(
-        `SELECT evt, engine, net, ttc_ms, dur_s, conceal_pct, reason FROM beats WHERE wall >= ? ORDER BY id DESC LIMIT 20000`,
+        `SELECT evt, engine, net, ttc_ms, dur_s, conceal_pct, reason,
+                mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms
+           FROM beats WHERE wall >= ? ORDER BY id DESC LIMIT 20000`,
         since,
       ).toArray() as Array<Record<string, unknown>>;
       const by = (f: (r: Record<string, unknown>) => unknown) => {
@@ -1221,6 +1223,11 @@ export class Health implements DurableObject {
         ttcMs: stats(nums('connect', 'ttc_ms')),
         durS: stats(nums('end', 'dur_s')),
         concealPct: stats(nums('end', 'conceal_pct')),
+        // The presence-goal numbers, fleet-wide: how far away did the person
+        // feel — sound, vision, conversation.
+        mouthToEarMs: stats(nums('end', 'mouth_to_ear_ms')),
+        glassToGlassMs: stats(nums('end', 'glass_to_glass_ms')),
+        humanGapMs: stats(nums('end', 'human_gap_ms')),
         failReasons: rows.filter((r) => r.evt === 'fail').reduce((m: Record<string, number>, r) => {
           const k = String(r.reason ?? '-'); m[k] = (m[k] ?? 0) + 1; return m;
         }, {}),
