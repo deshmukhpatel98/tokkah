@@ -128,6 +128,82 @@ try {
   A(errs.every((n) => n === 0), `9 zero page errors: ${errs.join(',')}`);
   if (errs.some((n) => n)) for (const s of [pa, pb, pc]) if (s.errors.length) console.log(`    ${s.side}:`, s.errors.slice(0, 2));
 
+  // §2.2 uplink — the design PREDICTED ~22 Mbps/device and could only guess
+  // until three real senders ran. True mesh uplink is transport-level bytes/s
+  // across BOTH pairs' pcs (audio stripes + video carrier both ride SCTP data
+  // channels). Measured here from getStats candidate-pair bytesSent deltas
+  // over 3 s on page a's module pc (the media pair) — a LOWER BOUND, since the
+  // second pair's pc lives in the peers map and isn't exposed as an object.
+  // The honest full-mesh number needs a per-pair stat hook; flagged, not faked.
+  const uplink = await pa.page.evaluate(async () => {
+    const t = window.__tape; if (!t.pc) return { err: 'no pc' };
+    const read = async () => { let b = 0; (await t.pc.getStats()).forEach((r) => {
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.bytesSent) b += r.bytesSent; }); return b; };
+    const b0 = await read(); await new Promise((r) => setTimeout(r, 3000)); const b1 = await read();
+    return { mediaPairMbpsUp: +(((b1 - b0) * 8) / 3 / 1e6).toFixed(2) };
+  }).catch((e) => ({ err: String(e).slice(0, 80) }));
+  console.log(`  i   uplink (page a, MEDIA pair only, lower bound): ${JSON.stringify(uplink)} Mbps — full mesh ≈ 2× this; per-pair hook still needed for the exact §2.2 number`);
+
+  // 6. Free-slot reuse: b reloads mid-call, comes back as b, and a & c do NOT
+  //    reset (the hadPeer bug the design flags — a third arrival must never
+  //    tear down a live call).
+  const aCPreReload = await Promise.all([pa, pc].map((s) => s.page.evaluate(() => window.__tape?.pc?.connectionState)));
+  await pb.page.reload({ waitUntil: 'domcontentloaded' });
+  await pb.page.click('#join').catch(() => {});
+  await pb.page.waitForFunction(() => window.__tape?.pc?.connectionState === 'connected', null, { timeout: 30000 }).catch(() => {});
+  await wait(4000);
+  const bBack = await pb.page.evaluate(() => window.__tape?.pairs?.us);
+  const aCPost = await Promise.all([pa, pc].map((s) => s.page.evaluate(() => window.__tape?.pc?.connectionState)));
+  A(bBack === 'b', `6 reload: b came back as b (was ${bBack})`);
+  A(aCPost.every((c) => c === 'connected') && aCPreReload.every((c) => c === 'connected'),
+    `6 a & c not reset by b's reload: ${aCPreReload.join(',')} -> ${aCPost.join(',')}`);
+
+  // 7. Departure — its OWN clean 3-person session (testing it on the post-
+  //    reload state above confounds the two events). c leaves; a and b keep
+  //    their a<->b call and lose only the c leg.
+  const R7 = `bot3D-${Date.now().toString(36)}`;
+  const dpar = async (side) => { const s = await launch(side); await s.page.goto(`${BASE}/?r=${R7}&three=1`, { waitUntil: 'domcontentloaded' }); return s; };
+  const d1 = await dpar('a'), d2 = await dpar('b'), d3 = await dpar('c');
+  await d1.page.click('#join'); await wait(600); await d2.page.click('#join'); await wait(600); await d3.page.click('#join');
+  await Promise.all([d1, d2, d3].map((s) => s.page.waitForFunction(() => window.__tape?.pc?.connectionState === 'connected', null, { timeout: 40000 }).catch(() => {})));
+  await wait(10000);
+  const recv0 = await Promise.all([d1, d2].map((s) => s.page.evaluate(() => window.__tape?.pcm?.framesRecv ?? 0)));
+  await d3.browser.close();
+  await wait(8000);
+  const afterC = await Promise.all([d1, d2].map((s) => s.page.evaluate(() => ({
+    conn: window.__tape?.pc?.connectionState,
+    recv: window.__tape?.pcm?.framesRecv ?? 0,
+    peers: (window.__tape?.pairs?.peers ?? []).map((p) => p.role).sort().join(''),
+  }))));
+  // The real test is CONTINUITY: a↔b must keep receiving audio frames across
+  // c's exit, not merely hold a connectionState that could be a zombie.
+  const flowing = afterC.every((x, i) => x.recv > recv0[i] + 200);
+  A(afterC.every((x) => x.conn === 'connected') && flowing,
+    `7 departure: a<->b audio flows through c's exit: recv ${recv0.join(',')} -> ${afterC.map((x) => x.recv).join(',')}`);
+  A(afterC.every((x) => !x.peers.includes('c')), `7 c pair gone from the table: peers now ${afterC.map((x) => x.peers || '∅').join(',')}`);
+  for (const s of [d1, d2]) await s.browser.close().catch(() => {});
+
+  // 8. Legacy interop: a room where one client is pinned ?three=0 (v=1) reads
+  //    cap 2 — a v1 anywhere caps the room, so the third join is refused and
+  //    the 1:1 it does hold is a normal call. Fresh room, its own browsers.
+  const R8 = `bot3L-${Date.now().toString(36)}`;
+  const legacy = async (side, q) => { const s = await launch(side, q); await s.page.goto(`${BASE}/?r=${R8}&${q}`, { waitUntil: 'domcontentloaded' }); return s; };
+  const l1 = await legacy('a', 'three=0'); // legacy client
+  const l2 = await legacy('b', 'three=1'); // new client
+  await l1.page.click('#join'); await wait(600); await l2.page.click('#join');
+  await Promise.all([l1, l2].map((s) => s.page.waitForFunction(() => window.__tape?.pc?.connectionState === 'connected', null, { timeout: 30000 }).catch(() => {})));
+  await wait(3000);
+  const l3 = await legacy('c', 'three=1'); // third join must be refused (v1 present caps at 2)
+  await l3.page.click('#join').catch(() => {});
+  const l3Status = await l3.page.waitForFunction(() => {
+    const s = document.getElementById('joinStatus')?.textContent ?? '';
+    return /two people|full|couldn/i.test(s) ? s : false;
+  }, null, { timeout: 12000 }).then((h) => h.jsonValue(), () => 'NOT REFUSED');
+  const l12 = await Promise.all([l1, l2].map((s) => s.page.evaluate(() => window.__tape?.pc?.connectionState)));
+  A(/two people|full/i.test(l3Status), `8 legacy caps at 2: 3rd refused "${String(l3Status).slice(0, 40)}"`);
+  A(l12.every((c) => c === 'connected'), `8 the 1:1 with a v1 client is a normal call: ${l12.join(',')}`);
+  for (const s of [l1, l2, l3]) await s.browser.close().catch(() => {});
+
   console.log(`\nverdict: ${fails === 0 ? 'ALL PASS' : `${fails} FAILED`}`);
 } finally {
   for (const s of [pa, pb, pc]) await s.browser.close().catch(() => {});
