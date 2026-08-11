@@ -74,6 +74,19 @@ let remoteMon = null;
 // attaching a detector. See the comment there.
 let remoteAttaching = false;
 let joined = false;
+// Tell the peer when this page backgrounds. iOS suspends a backgrounded
+// Safari page outright (measured 2026-08-11: frames freeze, the peer
+// accumulates silence-as-concealment with no explanation) — the platform
+// won't let the call continue, but it will let us say WHY it stopped. Sent
+// through the room's existing relay; older peers ignore the unknown type.
+document.addEventListener('visibilitychange', () => {
+  safe(() => {
+    if (!joined || ws?.readyState !== WebSocket.OPEN) return;
+    const on = document.hidden ? 1 : 0;
+    tel?.log('away', { on });
+    ws.send(JSON.stringify({ type: 'away', on }));
+  }, 'away.visibility');
+});
 let statsTimer = null;
 let lastStats = {};
 // Send-bitrate differencing state. bytesSent is cumulative, so only the delta means anything.
@@ -4319,6 +4332,14 @@ async function join(room) {
         void xlateStart(true);
       } else if (m.type === 'xlate-off') {
         xlateStop(true);
+      } else if (m.type === 'away') {
+        // The peer's page went to the background. iOS SUSPENDS a backgrounded
+        // Safari page outright (measured 2026-08-11: the peer's frames froze
+        // and 34 s of silence accumulated as concealment) — so without this
+        // message the other person gets mystery silence over frozen video.
+        // Naming the cause is the fix the web platform actually permits.
+        tel.log('peer-away', { on: m.on ? 1 : 0 });
+        setStatus(m.on ? 'they switched apps — audio is paused on their side' : 'connected');
       } else if (m.type === 'peer-left') {
         setStatus('they left');
         tel.log('peer-left', {});
