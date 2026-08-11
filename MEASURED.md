@@ -4246,3 +4246,16 @@ call3 assertion 7: peers now b,a (was ∅,∅), audio continuous. Full rig ALL P
 Full-mesh uplink MEASURED (staging, 3 browsers): 12 pcs, 10.62 Mbps up — half the
 ~22 Mbps design prediction. Uplink is not the desktop-only disqualifier; the open
 phone question is CPU/thermal (2 video encodes + 12 ICE agents), needs a phone arm.
+
+## Phone arm (iOS sim as the 3rd participant): connects, verdict inconclusive on ONE host
+
+iPhone sim (mobile Safari, ?three=1&synthmedia=real = the NASA interview as its
+camera) + two desktop peers, live 3-way on staging. Result: ALL SIX legs formed —
+both desktops connected to the sim (a↔c, b↔c) both video and pcm, media flowed
+both ways. So WebKit interops in the mesh; a phone-class client CAN be the third.
+BUT concealment read ~58% (11.6 s / 20 s) on both desktops — and that is the HOST,
+not the phone: `uptime` load hit 11.85 with the sim + 2 headless Chromes = SIX
+concurrent video encodes on one Mac. The CPU/thermal question a real phone poses
+(2 encodes + 12 ICE agents on its own silicon, its own radio) cannot be answered
+on a shared host — it needs a REAL phone. Recorded as the one open engineering
+input before a prod flip; not fakeable from this machine.
