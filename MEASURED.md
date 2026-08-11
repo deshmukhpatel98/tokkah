@@ -4345,3 +4345,8 @@ needed). The next real call's dtPct now discriminates BETWEEN THEORIES, not just
 yes/no. (A no-bleed arm in this scratch rig collapsed after early convergence —
 likely a scratch-generator artifact; the guarantee rig's arm 1 with proper
 signals reads 62 dB, so not chased.)
+
+SHADOW FILTER shipped: bg adapts fearlessly, fg inherits proof only, gate
+unchanged. Six arms pass, DT arm hugely better (1.0000 corr, 64.8 dB post-DT);
+harsh bleed: baseline went negative+flapped, shadow held stable. Cost 1.09x.
+The echo campaign now awaits one same-room call.
