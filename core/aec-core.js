@@ -307,9 +307,17 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
         }
       }
 
-      if (dtCount >= 3) {
-        // Double talk: freeze adaptation but keep subtracting (gate deciding
-        // whether the subtraction is DELIVERED — see below)
+      const dtActive = dtCount >= 3
+      if (dtActive) {
+        // Double talk: adaptation drops to a WHISPER (below) but no longer
+        // freezes outright. The first long real call (room xow-offc-apz, two
+        // Macs one room apart) proved why: cross-room acoustic bleed of both
+        // voices into both mics reads as PERMANENT double-talk, the freeze
+        // starved adaptation for the whole call, ERLE never left ~0 dB and
+        // the person heard themselves. The harm gate is what makes leaking
+        // safe: a filter corrupted by real double-talk is never DELIVERED
+        // (gate stays shut, mic passes bit-exact — today's worst case),
+        // while any genuine convergence the leak buys gets delivered.
         lastAdapting = false
         for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
         // Escape valve: a freeze that outlives any plausible unbroken
@@ -322,14 +330,20 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
         // Single talk: adapt filter weights
         lastAdapting = true
         for (let i = 0; i < L; i++) out[i] = gateOpen ? e[i] : mic[i]
-
+      }
+      {
         // Echo-to-error step scaling: once converged, an error block the echo
         // estimate cannot explain is near-end speech the binary DTD hasn't
         // caught yet (it needs 3 blocks), and a full-rate update on it
         // corrupts the filter. μ shrinks with yPow/ePow, so those first
         // blocks barely adapt. Never applied before convergence — y is still
         // small then and the scale would starve the initial adaptation.
-        const muScale = wasConverged ? Math.min(1, yPow / Math.max(ePow, 1e-12)) : 1
+        // During double-talk μ leaks at 3% instead of zero (see above): slow
+        // enough that the DT arm's near-voice survival holds, fast enough
+        // that a bleed-poisoned call accumulates real convergence over tens
+        // of seconds instead of never.
+        const muScale = (wasConverged ? Math.min(1, yPow / Math.max(ePow, 1e-12)) : 1)
+          * (dtActive ? 0.03 : 1)
 
         // Zero-padded error FFT: E = FFT([0, ..., 0, e])
         ePaddedRe.fill(0)
