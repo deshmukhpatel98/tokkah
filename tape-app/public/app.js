@@ -66,6 +66,18 @@ let localHz = null; // our own, measured from rAF spacing; sent to the peer
 // harness can tell "they never told us" apart from "they told us and we rejected it".
 let peerHzRaw = null;
 let role = null;
+// §3.1's corollary: `role` stops being a global property of the page and becomes
+// an index into a peer table. `role` above stays OUR letter; `peers` holds one
+// record per other occupant, keyed by theirs, and every "am I the offerer" test
+// becomes a question about a PAIR rather than about this page.
+//
+// Phase 2 builds the table and the per-pair signaling dispatch only. Media is
+// still single-pair: exactly one entry — the first peer we learn about — owns
+// `pc`, `tape`, `pcm` and the stripe pcs, and that is what `mediaPeer` names.
+// Pairs beyond it exist as signaling state and nothing else; phases 3–4 hang
+// per-pair pc construction off the same loops that already skip them here.
+const peers = new Map(); // peerRole → { role, lane, pcm, media, deferred }
+let mediaPeer = null;
 let tel = null;
 let turns = null;
 let localMon = null;
@@ -1605,6 +1617,14 @@ const PCM_CFG = {
 };
 const L2_DURESS = QS.get('l2duress') !== '0'; // video ducks on audio-lane duress; `?l2duress=0` control
 const PREDIAL = QS.get('predial') !== '0'; // lobby pre-dials the room ws; `?predial=0` control
+// §7.1: the client half of the three-person feature. Off, this page declares no
+// wire version, so the room's `cap()` sees a v1 occupant and pins the room at
+// two — the feature is inert from both ends at once, which is why the flag can
+// be read here and nowhere else needs a second gate.
+// Not `const`: the welcome handler downgrades it to false when the room turns
+// out not to speak v2 (see 'three-downgrade'). Every reader below is a runtime
+// call, so the latch is honoured everywhere from that moment on.
+let THREE = QS.get('three') === '1';
 let pcm = null;
 let pcmPcs = []; // stripe pcs for associations 1..N-1 (association 0 rides the main pc)
 let pcmIceServers = []; // the join-time /api/ice config, stashed by the welcome handler
@@ -1930,7 +1950,7 @@ function startPcmStripes(initiator) {
     const spc = new RTCPeerConnection({ iceServers: pcmIceServers, ...certArg() });
     spc.onnegotiationneeded = () =>
       tel?.log('pcm-stripe-neg', { idx, sig: spc.signalingState }); // observed, never acted on
-    spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate });
+    spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate, ...addr(mediaPeer) });
     spc.oniceconnectionstatechange = () => tel?.log('pcm-stripe-ice', { idx, state: spc.iceConnectionState });
     spc.onconnectionstatechange = () => tel?.log('pcm-stripe-state', { idx, state: spc.connectionState });
     if (initiator) {
@@ -1945,14 +1965,14 @@ function startPcmStripes(initiator) {
   }
 }
 
-async function pcmStripeOfferAll() {
+async function pcmStripeOfferAll(peerRole = mediaPeer) {
   for (let idx = 1; idx < PCM_CFG.pairs; idx++) {
     const spc = pcmPcs[idx];
     if (!spc || spc.localDescription) continue; // set up once, never renegotiated
     await safeAsync(async () => {
       const o = await spc.createOffer();
       await spc.setLocalDescription(o);
-      send({ type: 'pcm-offer', idx, sdp: spc.localDescription });
+      send({ type: 'pcm-offer', idx, sdp: spc.localDescription, ...addr(peerRole) });
     }, 'pcm.stripe-offer');
   }
 }
@@ -2128,7 +2148,9 @@ function fallbackToOpus(why, quiet) {
     attachRemoteMedia();
     // `quiet` is for the cases where the peer needs no telling: it never had a
     // lane (capability mismatch), or it is the one that told us.
-    if (!quiet) send({ type: 'audio-fallback', why });
+    // Pairwise (§3.2): the lane it retires is this pc's, so it is addressed
+    // rather than broadcast — a third occupant has its own lane A verdict.
+    if (!quiet) send({ type: 'audio-fallback', why, ...addr(mediaPeer) });
   }, 'pcm.fallback');
 }
 
@@ -2182,7 +2204,7 @@ function fallbackToRtp(why, quiet) {
   // a black 320x180 carrier for the rest of the call while Chromium reported
   // itself healthy. `quiet` is for the cases where the peer needs no telling:
   // it never had a lane, or it is the one that told us.
-  if (!quiet) send({ type: 'video-fallback', why });
+  if (!quiet) send({ type: 'video-fallback', why, ...addr(mediaPeer) });
   // TIME_SYNC rides lane 2's ctl channel, so the channel it pings over is about to
   // stop existing. Stopping it here is not tidiness: measured on the deployed build,
   // a Brave x Chromium call that fell back kept pinging at 5 Hz for the whole call
@@ -2197,11 +2219,12 @@ function fallbackToRtp(why, quiet) {
     $('remoteCanvas')?.remove(); // #14: the RTP fallback paints the <video> again
     const vt = localStream?.getVideoTracks()[0];
     // Lane 1 fallback: the video track was never on the pc, so add it and renegotiate.
-    // Only `a` renegotiates. Both sides offering at once is the glare case, and the
-    // recovery path is not the place to be resolving it.
+    // Only this pc's offerer renegotiates (§3.1 — the pc belongs to one pair, so
+    // "only `a`" was always the pair question). Both sides offering at once is the
+    // glare case, and the recovery path is not the place to be resolving it.
     if (vt && pc && !pc.getSenders().some((s) => s.track?.kind === 'video')) {
       pc.addTrack(vt, localStream);
-      if (role === 'a') offer();
+      if (offersTo(mediaPeer)) offer(mediaPeer);
     } else if (wantTape === 2 && pc) {
       // Lane 2 fallback: the carrier IS a real video sender — give it the camera.
       // The carrier clock runs on a tiny canvas track (tape.js), so "un-crippling"
@@ -2238,8 +2261,12 @@ function fallbackToRtp(why, quiet) {
         if (cs) cs.replaceTrack(null).catch(() => {});
         // Mid-call (the watchdog path) the mids are already assigned, so this
         // branch means a carrier that never negotiated and a call that is past
-        // its first exchange. That needs a new offer, and only `a` may make one.
-        if (pc.remoteDescription) { if (role === 'a') offer(); else send({ type: 'reoffer' }); }
+        // its first exchange. That needs a new offer, and only this pair's
+        // offerer may make one — the other end asks it to, by name (§3.1).
+        if (pc.remoteDescription) {
+          if (offersTo(mediaPeer)) offer(mediaPeer);
+          else send({ type: 'reoffer', ...addr(mediaPeer) });
+        }
       } else if (cs && cam) {
         cs.replaceTrack(cam).catch(() => {});
       }
@@ -3441,6 +3468,76 @@ const send = (m) => safe(() => {
   return ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m));
 }, 'send');
 
+// ── The pair table (§3.1, §3.2) ──────────────────────────────────────────────
+// Four one-liners carry the whole generalization, and each is written so that
+// with THREE off it evaluates to the LITERAL expression that stood at its call
+// site before — not to something merely equivalent. That matters at {b,c}: the
+// room's free-slot reuse can hand out b and c with no a, where today's
+// `role === 'a'` and `role === 'b'` are not each other's complement and nobody
+// offers. The flag-on arm closes that gap; the flag-off arm must keep it, or
+// "identical" stops being true for the case the letters were reused.
+
+/** Address an outbound pairwise frame. Absent `to` is the DO's broadcast path. */
+const addr = (peerRole) => (THREE && peerRole ? { to: peerRole } : {});
+
+/** §3.1: for any pair, the peer whose letter sorts first is that pair's offerer. */
+const offersTo = (peerRole) => (THREE && peerRole ? role < peerRole : role === 'a');
+
+/** The complement of `offersTo`, kept separate for the {b,c} reason above. */
+const answersTo = (peerRole) => (THREE && peerRole ? role > peerRole : role === 'b');
+
+/**
+ * Does this inbound frame belong to the pair that owns the media?
+ *
+ * `from` is server-stamped (§3.2) and never client-claimed, so this is a
+ * trustworthy sender test. Phase 2 carries one pc: applying a second pair's
+ * offer to it is precisely the "silent disaster" §3.4 describes, so anything
+ * from another pair is recorded and dropped rather than misrouted. With THREE
+ * off the field is ignored entirely and every frame is ours, as today.
+ */
+const forMediaPair = (from) => !THREE || !from || from === mediaPeer;
+
+/** Count a pairwise frame that has no pc behind it yet, so phase 3 can see it. */
+function deferPair(m) {
+  const p = peers.get(m.from);
+  if (p) p.deferred = (p.deferred ?? 0) + 1;
+  tel?.log('pair-deferred', { from: m.from ?? null, type: m.type ?? null });
+}
+
+/**
+ * Learn an occupant. Idempotent: `welcome`'s `peers` and a later `peer-joined`
+ * can name the same letter, and the second must not orphan the first's state.
+ */
+function addPair(peerRole, lane, pcmCap) {
+  if (!peerRole || peerRole === role) return null;
+  const known = peers.get(peerRole);
+  if (known) return known;
+  const rec = { role: peerRole, lane: lane ?? null, pcm: pcmCap ?? null, media: false,
+    offered: false, owed: false, deferred: 0 };
+  peers.set(peerRole, rec);
+  // First peer learned owns the media. `welcome.peers` is ordered by the DO the
+  // same way `peerLane`/`peerPcm` pick their subject — the FIRST other occupant
+  // — so `mediaPeer` and the legacy fields describe the same peer, and the
+  // laneAgree/pcmAgree calls below keep meaning what they said.
+  if (!mediaPeer) { mediaPeer = peerRole; rec.media = true; }
+  tel?.log('pair-add', { peer: peerRole, media: rec.media ? 1 : 0, n: peers.size,
+    offerer: offersTo(peerRole) ? 1 : 0 });
+  return rec;
+}
+
+/** Forget one occupant. Phase 5 replaces the caller's room-wide UI per tile. */
+function dropPair(peerRole) {
+  if (!peerRole) return false;
+  const wasMedia = peerRole === mediaPeer;
+  peers.delete(peerRole);
+  // The pc that pair owned is now spent, and a free `mediaPeer` is what tells
+  // `peer-joined` that the next arrival is refilling this slot rather than
+  // sitting down beside a live call.
+  if (wasMedia) mediaPeer = null;
+  tel?.log('pair-drop', { peer: peerRole, media: wasMedia ? 1 : 0, n: peers.size });
+  return wasMedia;
+}
+
 /**
  * Apply the video sender's encoding parameters. Extracted from join()'s one-shot loop
  * because that loop iterates `pc.getSenders()` a single time, and the RTP video sender
@@ -4003,7 +4100,9 @@ async function join(room) {
     layout();
   };
 
-  pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate });
+  // `mediaPeer` is read at fire time, not at wire-up time: candidates trickle
+  // after the welcome that names the pair this pc belongs to.
+  pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate, ...addr(mediaPeer) });
   pc.oniceconnectionstatechange = () => {
     tel.log('ice-state', { state: pc.iceConnectionState });
     if (pc.iceConnectionState === 'failed') {
@@ -4051,8 +4150,13 @@ async function join(room) {
   const adopted = PREDIAL && predial?.room === room && predial.ws.readyState <= WebSocket.OPEN
     ? predial.ws : null;
   if (adopted) predial = null;
+  // §3.4: the wire version is declared at ADMISSION, on the upgrade URL, because
+  // the cap that keeps an old client out of a 3-person room is server-enforced
+  // and evaluated there. Omitting the parameter is how a v1 client looks, so the
+  // flag-off arm sends the byte-identical URL it always sent.
+  const vArg = THREE ? '&v=2' : '';
   ws = adopted ?? new WebSocket(
-    `${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?lane=${wantTape}&pcm=${PCM_AUDIO ? 1 : 0}&sid=${encodeURIComponent(sid)}`,
+    `${proto}//${location.host}/api/room/${encodeURIComponent(room)}/ws?lane=${wantTape}&pcm=${PCM_AUDIO ? 1 : 0}&sid=${encodeURIComponent(sid)}${vArg}`,
   );
   // A room already holding two people rejects the upgrade with 409 — the room
   // DO caps at 2 by design, which IS the admission model (§7 item 32): the link
@@ -4084,7 +4188,12 @@ async function join(room) {
     if (!wsOpened) wsPreOpenFail?.(preOpenErr());
   };
   if (adopted) {
-    const sendJoin = () => safe(() => ws.send(JSON.stringify({ type: 'join', lane: wantTape, pcm: PCM_AUDIO ? 1 : 0, sid })), 'predial.join');
+    // The hold socket was accepted without being admitted, so its upgrade URL
+    // carried no caps at all — this join body IS its admission, and the wire
+    // version rides it beside lane/pcm/sid for the same reason (§3.4). Spread
+    // so the flag-off body keeps its exact shape and key order.
+    const vBody = THREE ? { v: 2 } : {};
+    const sendJoin = () => safe(() => ws.send(JSON.stringify({ type: 'join', lane: wantTape, pcm: PCM_AUDIO ? 1 : 0, sid, ...vBody })), 'predial.join');
     if (ws.readyState === WebSocket.OPEN) { wsOpened = true; tel.log('predial-adopt', { open: 1 }); sendJoin(); }
     else { ws.addEventListener('open', () => { tel.log('predial-adopt', { open: 0 }); sendJoin(); }); }
   }
@@ -4110,6 +4219,27 @@ async function join(room) {
         role = m.role;
         tel.role = role;
         tel.log('role', { role, peerPresent: m.peerPresent });
+        // §3.3: `peers` is the new truth and a `welcome` is the whole truth at
+        // the moment of admission — so the table is rebuilt from it, not merged
+        // into. That also makes the in-place reset and recoverCall correct for
+        // free: each of them lands on a fresh socket whose welcome re-states the
+        // room, and no state from the spent one survives.
+        // A welcome with no `peers` array is a room that does not speak v2 — the
+        // server flag is off, or this build predates phase 1. Declaring `v=2` at
+        // such a room costs nothing (an ignored query parameter), but running the
+        // per-pair paths against one would leave the table empty, so nothing
+        // would ever offer and the call would hang at "connecting…" with every
+        // counter green. Latch back to the single-peer arm and name it.
+        if (THREE && !Array.isArray(m.peers)) {
+          THREE = false;
+          tel.log('three-downgrade', { why: 'welcome-has-no-peers' });
+        }
+        if (THREE) {
+          peers.clear();
+          mediaPeer = null;
+          for (const p of m.peers ?? []) addPair(p.role, p.lane, p.pcm);
+          tel.log('pairs', { us: role, cap: m.cap ?? null, peers: [...peers.keys()], media: mediaPeer });
+        }
         // §10: the room Durable Object is the sole time authority. Its epoch
         // arrives in the welcome as an additive field (older clients ignore
         // it); local wall at arrival gives each peer a coarse mapping, biased
@@ -4137,7 +4267,13 @@ async function join(room) {
         // `#remoteCanvas`, and both ends went black again. `wantTape` deliberately
         // stays 2 through all of this; it still means "this pc has a carrier
         // transceiver", which the SDP munge and the setParameters skip both rely on.
-        if (wantTape && !tapeFellBack) startTape(role === 'a');
+        //
+        // `offersTo(mediaPeer)` and not `role === 'a'`: "who creates the tape
+        // channels" was always "the offerer for this pc", and the pc belongs to
+        // one pair. Alone in the room `mediaPeer` is null and this reads today's
+        // literal test, which is right for the only room the DO can produce —
+        // the first occupant of an empty room is always `a`.
+        if (wantTape && !tapeFellBack) startTape(offersTo(mediaPeer));
         // Lane A's channel rides the same first offer (synchronously created above
         // the offer call — see startPcm). The stripe pcs (pairs > 1) share the
         // join-time /api/ice config.
@@ -4147,7 +4283,7 @@ async function join(room) {
         // lane right back.
         if (PCM_AUDIO && !pcmFellBack) {
           pcmIceServers = ice?.iceServers ?? [];
-          startPcm(role === 'a');
+          startPcm(offersTo(mediaPeer));
         }
         // TIME_SYNC starts when the ctl channel opens (avsync.onCtlOpen above);
         // it is constructed here so both roles share one instance.
@@ -4176,7 +4312,7 @@ async function join(room) {
         // answerer-picture startup — is gone. If the match ever fails, the answerer's
         // guarded reoffer below still adds the carrier exactly as before: this removes a
         // need, it adds no risk. A recvonly transceiver with no track costs nothing.
-        if (wantTape === 2 && role === 'a') {
+        if (wantTape === 2 && offersTo(mediaPeer)) {
           safe(() => {
             const slotTx = pc.addTransceiver('video', { direction: 'recvonly' });
             // The slot must negotiate VP8 — the lane's payloads ride the carrier
@@ -4214,7 +4350,8 @@ async function join(room) {
         // exactly like the main offer. An ungated stripe offer fires into an
         // empty room and the once-guard (localDescription set) then starves the
         // real peer-joined round (measured, stripe3-loop: stripes never opened).
-        if (m.peerPresent && role === 'a') {
+        if (THREE) await offerToPairs('welcome');
+        else if (m.peerPresent && role === 'a') {
           await offer();
           if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll();
         }
@@ -4228,7 +4365,16 @@ async function join(room) {
         // happens in place — same clean slate, no reload — and the NEW
         // socket's welcome drives negotiation from there. The reload re-arm
         // stays as the fallback if the in-place path ever fails.
-        if (hadPeer) {
+        //
+        // §7.2/6, and the one line of this phase that is invariant-critical: the
+        // reset is about OUR media pair being spent, never about the room gaining
+        // an occupant. A third arrival beside a live call would otherwise trip
+        // `hadPeer` and tear that call down to make room for somebody who needed
+        // no room. `mediaPeer` is null exactly when the pair that owned the pc has
+        // gone (dropPair) or never formed — which, in a room that only ever holds
+        // one pair, is today's condition unchanged.
+        const mediaSlotFree = !THREE || !mediaPeer;
+        if (hadPeer && mediaSlotFree) {
           if (!(await resetForNextPeer(room))) {
             hadPeer = true; // reset cleared it, but a failed reset IS a spent page — reArm's precondition
             // Forced: a failed reset has no second recovery behind it, so the
@@ -4237,26 +4383,43 @@ async function join(room) {
           }
           return;
         }
+        // §3.3's additive `peer`. Learned before the lane agreement below, so
+        // `mediaPeer` is decided by the time anything asks which pair this is.
+        const joinedMedia = THREE ? addPair(m.peer, m.peerLane, m.peerPcm)?.media : true;
         sendDisplayHz();
         // The incumbent's own `welcome` reached an empty room, so this is the
         // first moment it can know what the arriving peer runs. Before the offer,
         // so a mismatched lane is already torn down when the SDP goes out.
-        laneAgree(m.peerLane, 'peer-joined');
-        pcmAgree(m.peerPcm, 'peer-joined');
+        //
+        // Guarded on the arrival being the media pair: lane agreement is a
+        // property of a pc, and a third occupant's caps must not step down the
+        // lane of a call that is already running on somebody else's.
+        if (joinedMedia) {
+          laneAgree(m.peerLane, 'peer-joined');
+          pcmAgree(m.peerPcm, 'peer-joined');
+        }
         // A peer who joins after we turned translation on was not there for
         // the original xlate-on — repeat it so they come up translated too.
+        // Room-wide by §3.2, so it stays unaddressed.
         if (xlateApi) send({ type: 'xlate-on' });
-        if (role === 'a') {
+        if (THREE) await offerToPairs('peer-joined');
+        else if (role === 'a') {
           await offer();
           if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll();
         }
       } else if (m.type === 'offer') {
+        // Every handler from here to `pcm-ice` is pairwise (§3.2) and therefore
+        // dispatches on the server-stamped sender before it touches anything.
+        // Phase 2 resolves that dispatch to one pc; phase 3 replaces the guard
+        // with a per-pair lookup and the bodies stop reading the module-scope
+        // `pc`/`pcmPcs` at all.
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         sdpProbe('offer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
         // Lane 2 answerer: put our carrier INTO this answer by claiming the offer's
         // carrier slot (tape.js claimSlot). This replaces the reoffer path, whose
         // answer was measured to vanish between relay and delivery at real RTTs.
-        if (wantTape === 2 && role === 'b' && tapePre?.claimSlot) {
+        if (wantTape === 2 && answersTo(mediaPeer) && tapePre?.claimSlot) {
           await safeAsync(() => tapePre.claimSlot(m.sdp?.sdp ?? m.sdp), 'tape.slot-claim');
         }
         // The answer needs the same treatment as the offer, not because of symmetry for its
@@ -4267,16 +4430,20 @@ async function join(room) {
         a.sdp = tuneVideoCarrier(tuneAudio(a.sdp));
         sdpProbe('answer.munged', a.sdp);
         await pc.setLocalDescription(a);
-        send({ type: 'answer', sdp: pc.localDescription });
+        send({ type: 'answer', sdp: pc.localDescription, ...addr(m.from ?? mediaPeer) });
       } else if (m.type === 'answer') {
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         sdpProbe('answer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
         sdpProbe('answer.applied', pc.localDescription?.sdp);
       } else if (m.type === 'ice') {
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         await pc.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'audio-fallback') {
         // The peer's lane A died. Its graph is both our playout and its capture,
         // so its failure is ours too — switch to Opus without re-broadcasting.
+        // Pairwise: only the pair that shares our lane A can retire it.
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         fallbackToOpus(`peer-${m.why || 'fallback'}`, true);
       } else if (m.type === 'video-fallback') {
         // The peer's lane 2 died and it is now on plain RTP. Our carrier is a
@@ -4285,26 +4452,36 @@ async function join(room) {
         // camera on the carrier's negotiated m-line, which is exactly the track
         // the peer's fallback display is watching. Guarded on wantTape: a side
         // that never ran the lane has no carrier to un-cripple.
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         if (wantTape) fallbackToRtp(`peer-${m.why || 'fallback'}`, true);
       } else if (m.type === 'reoffer') {
-        // The answerer added a sender mid-call and cannot offer for it. Only 'a'
-        // ever offers — that invariant is what keeps glare out of this codebase —
-        // so the answerer asks instead of racing.
-        if (role === 'a') await offer();
+        // The answerer added a sender mid-call and cannot offer for it. Exactly
+        // one end of a PAIR ever offers — that invariant is what keeps glare out
+        // of this codebase — so the answerer asks instead of racing. §3.1 gives
+        // it an address: the request names its offerer, and the offerer re-offers
+        // to that peer only rather than to everyone it is paired with.
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (offersTo(mediaPeer)) await offer(mediaPeer);
       } else if (m.type === 'pcm-offer') {
         // Lane A stripe answer (§17.12): one offer/answer round per stripe pc,
-        // no munging (data-only), never renegotiated.
+        // no munging (data-only), never renegotiated. §5.3: the stripes gain the
+        // same address the main pc's SDP does — `pcmPcs` is the media pair's
+        // ladder and indexing it with another pair's `idx` would answer a stripe
+        // that pair never offered.
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         const spc = pcmPcs[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
           const ans = await spc.createAnswer();
           await spc.setLocalDescription(ans);
-          send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription });
+          send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(m.from ?? mediaPeer) });
         }
       } else if (m.type === 'pcm-answer') {
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         const spc = pcmPcs[m.idx];
         if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
       } else if (m.type === 'pcm-ice') {
+        if (!forMediaPair(m.from)) { deferPair(m); return; }
         await pcmPcs[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
@@ -4361,8 +4538,15 @@ async function join(room) {
         tel.log('peer-away', { on: m.on ? 1 : 0 });
         setStatus(m.on ? 'they switched apps — audio is paused on their side' : 'connected');
       } else if (m.type === 'peer-left') {
+        // §3.3's additive `peer` names WHO left. Tear down that pair's state and
+        // nothing else — with three occupants a departure is not the end of the
+        // call, and the room-wide "they left" screen below belongs to the pair
+        // that owned the media. A non-media pair leaving is a table edit only;
+        // phase 5 moves this whole block to that peer's tile.
+        if (THREE && m.peer && !dropPair(m.peer)) return;
+        if (THREE && !m.peer) { peers.clear(); mediaPeer = null; }
         setStatus('they left');
-        tel.log('peer-left', {});
+        tel.log('peer-left', { peer: m.peer ?? null });
         // Back to the self-view lobby while we wait for them (or someone
         // else): own camera fills the screen again, waiting overlay returns.
         safe(() => {
@@ -4454,13 +4638,40 @@ async function join(room) {
   }, 2000);
 }
 
-async function offer() {
+async function offer(peerRole = mediaPeer) {
   const o = await pc.createOffer();
   sdpProbe('offer.raw', o.sdp);
   o.sdp = tuneVideoCarrier(tuneAudio(o.sdp));
   sdpProbe('offer.munged', o.sdp);
   await pc.setLocalDescription(o);
-  send({ type: 'offer', sdp: pc.localDescription });
+  send({ type: 'offer', sdp: pc.localDescription, ...addr(peerRole) });
+}
+
+/**
+ * The offer half of §3.1, run over the whole table: we offer to every occupant
+ * whose letter sorts after ours, once per pair. It replaces the single
+ * `if (role === 'a') await offer()` at both the welcome and peer-joined points,
+ * and it is gated the same way that line was — an empty table is an empty room,
+ * so nothing fires into one and the once-guards stay unspent.
+ *
+ * Phase 2 owns one pc, so only the media pair can actually carry SDP. The
+ * obligation to the others is real and is recorded rather than faked: sending
+ * an offer with no connection behind it would leave the far end waiting on an
+ * answer that cannot come. Phase 3 constructs that pair's pc at the `owed`
+ * branch and the loop stops skipping.
+ */
+async function offerToPairs(why) {
+  for (const p of peers.values()) {
+    if (!offersTo(p.role) || p.offered) continue;
+    if (p.role !== mediaPeer) {
+      p.owed = true;
+      tel?.log('pair-offer-deferred', { peer: p.role, why });
+      continue;
+    }
+    p.offered = true;
+    await offer(p.role);
+    if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll(p.role);
+  }
 }
 
 // ?sprobe=1 — per-m-section direction/port dump at every signaling stage, for the
@@ -5740,6 +5951,20 @@ window.__tape = {
   // them was observable without a rebuild.
   get callFlags() {
     return { hadPeer, joined, resettingInPlace, leavingDeliberately, activeRoom };
+  },
+  // The pair table, for the same reason `callFlags` exists: §7.2's assertions
+  // (one offerer per pair, a third arrival that does not reset the incumbent)
+  // are statements about this Map, and a rig that cannot read it can only infer
+  // them from symptoms. Empty on the flag-off arm, which is itself the check
+  // that the feature is inert there.
+  get pairs() {
+    return {
+      three: THREE, us: role, media: mediaPeer,
+      peers: [...peers.values()].map((p) => ({
+        role: p.role, lane: p.lane, pcm: p.pcm, media: p.media,
+        offerer: offersTo(p.role), offered: p.offered, owed: p.owed, deferred: p.deferred,
+      })),
+    };
   },
   get pcmMode() {
     return {
