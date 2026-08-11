@@ -4259,3 +4259,18 @@ concurrent video encodes on one Mac. The CPU/thermal question a real phone poses
 (2 encodes + 12 ICE agents on its own silicon, its own radio) cannot be answered
 on a shared host — it needs a REAL phone. Recorded as the one open engineering
 input before a prod flip; not fakeable from this machine.
+
+## Production carries the full three-person build — dormant, verified inert
+
+The design's rollout end-state ("client ships and sits inert; the feature turns
+on in ONE place"): prod (room.tokkah.com) now serves all six phases of the
+three-person client, with THREE_ENABLED=false in the worker. Verified live on
+prod after the deploy: 1:1 calls byte-clean (0 conceal, glassToGlass ~32 ms,
+connect ~1.2 s); a 3rd join — even with all three clients on ?three=1 — is
+refused with "two people" because the SERVER cap stays 2 while the flag is off;
+the two occupants are unaffected. Real users never pass ?three=1 and get an
+ordinary 1:1 with every shipped multiplier (presence/aec2/shield/duress/
+pre-dial/latency-floor) live. Flipping THREE_ENABLED to true is now a literal
+one-line, one-place change — gated behind: the real-phone CPU/thermal verdict,
+and explicit acceptance of the permanent costs (worst-link-governs, translation-
+off-at-three, per-peer telemetry).
