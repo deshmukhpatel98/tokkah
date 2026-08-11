@@ -4143,3 +4143,18 @@ Same day: the latency-floor A/B re-ran clean (BT sink gone, control 26 ms) and W
 floor hint outputLatency 26->20 ms, age p95 8.2->4.6 (device buffer sets arrival
 spread), jitter target 3f->2f, mouthToEar 62.6->45.6 ms median, 0 concealment in all
 6 calls. Default flipped; ?lat=int is the control arm.
+
+## First iOS call: mobile Safari (simulator) <-> desktop, live on prod (2026-08-11)
+
+iPhone 17 Pro simulator (iOS 26.5), mobile Safari, ?synthmedia=1; desktop Chromium
+peer; room ios-sim-first. CONNECTED: desktop received the sim's lossless lane (4067
+PCM frames, mode sab — SharedArrayBuffer WORKS on mobile Safari) and 1280x720 video;
+the lobby pre-dial adopted an open socket on iOS (predial-adopt {open:1}, welcome at
+1.6 s). Two real defects found, filed:
+- UX: the first joiner waiting ALONE >12 s is told "couldn't join: signaling
+  timeout" while still actually joined — the call formed fine when the peer arrived
+  at t=33 s. Likely the same experience behind the Aug 7 fleet give-ups.
+- AEC2 on iOS froze at erleDb -13.16 (adapting:false, value identical across
+  ticks) vs the desktop's healthy -0.28 adapting; desktop concealed 4.9 s of sim
+  audio in the same call. Sim audio clocks are shaky — needs reproduction before
+  judgement, but it gates real-iPhone speakerphone validation.
