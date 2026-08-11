@@ -4217,3 +4217,7 @@ Three phase 3 landed after the live gate REJECTED the first cut: a 250 Hz stats
 fold between capture drain and dc.send() cost 232-736 ms held concealment that
 five green unit suites could not see. Fixed, re-gated 0/0/0 x3 live. The lane is
 now a capture spine + per-peer halves; AEC2 far-end is an epoch-tagged accumulate.
+
+Three phase 4 landed (shared encoder behind per-peer transport halves, second
+tile inert at 0x0). Live gates: 0 conceal x4 both arms, g2g ~32 ms, ui-call ALL
+PASS x5 viewports. fscheck-call.mjs is stale from d846bf3 (#c-lifesize removed).
