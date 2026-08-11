@@ -4191,3 +4191,9 @@ path, which is not a low-hanging fruit. Recorded so nobody re-chases them.
 Away presence shipped: iOS backgrounding now NAMES itself at the peer (status +
 telemetry) instead of mystery silence. Verified live: sim HOME press -> desktop
 status flip <1 s -> clear on return. iOS-only find; desktop Safari never suspends.
+
+Testing-realism migration: all rigs now default to real talking-head fixtures
+(NASA public-domain interviews, media/real/fetch.sh). Two finds: URL.pathname
+percent-encoding silently killed the fake camera; and the aec auto arm's premise
+(beep periodicity as fake echo) does not survive real speech - inverted to a
+no-false-latch guarantee. Full suite green on real media, live.
