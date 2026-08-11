@@ -1559,3 +1559,31 @@ governs, translation-off-at-3, per-peer telemetry — needs explicit yes); real
 phone (mesh thermal + speakerphone AEC2/echo real-air verdicts); ears on
 presence/spatial; GitHub push (~65 commits local; gh authed as deveshpat which
 lacks perms — owner is deshmukhpatel98).
+
+## Session 2026-08-11 (final arc) — the echo campaign, driven by the first real calls
+
+The user's first real calls arrived (rooms eqx-oxuk-wnq, tgv-glvl-ppd,
+xow-offc-apz — two Macs one room apart). Verdict on record: beats Google Meet;
+competition is a real room. Their echo report + telemetry drove the arc:
+
+- ECHO OBSERVABILITY (end beat + fleet summary): echoCorrMax, aecGateOpenPct,
+  aecGateFlips, aecErleMaxDb, aecDtPct — all zero-latency accumulations of
+  numbers the audio thread already ships. DEVICE CENSUS on the connect beat:
+  cores/mem/downlink/rtt/camWxH@fps/dpr, coarse buckets.
+- duress() latches (35 flaps in a real call), gate close is two-tier (instant
+  on proven harm < -2 dB — the live rig caught my own dwell delivering -6.6 dB;
+  dwell only in the ambiguous band).
+- THE SHADOW FILTER (core/aec-core.js, Opus 5 Max worker): background adapts
+  every block at full mu (corruption harmless — never delivered), foreground
+  only inherits on proof (bg>=3 dB and bg-fg>=3 dB, 1 s cooldown; instant
+  rescue on fg harm), delivery gate unchanged. DT leak/freeze gone from
+  adaptation; DTD survives as dtPct only. Six arms pass, DT arm near-corr
+  1.0000 / post-DT 64.8 dB; cost 1.09x. Escape valve rewired (shadow restarts
+  when it can't earn a promotion against a mispredicting fg for 6 s).
+- Bleed pre-flight learning: moderate bleed fine, equal-level erodes single
+  filters; the DTD-poisoning theory did NOT reproduce synthetically — the
+  field dtPct discriminates between theories on the next same-room call.
+
+THE DECISIVE EXPERIMENT (waiting): one more call, same room, same Macs.
+Read aecGateOpenPct (was effectively 0), dtPct (theory pick), copies
+(promotions = shadow at work). Staging resynced to HEAD flag-off.
