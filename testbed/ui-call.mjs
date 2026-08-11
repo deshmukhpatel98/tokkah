@@ -472,6 +472,212 @@ for (const [i, r] of RATIOS.entries()) {
       else ok('A leave: Escape cancels');
     }
 
+    // ── 3c. two tiles (§6 phase 5, `#call.three`) ──────────────────────────
+    // Three people means two remote tiles, and the geometry that has to hold is
+    // NOT the geometry a 1:1 call is gated on: a full-bleed picture with chrome
+    // floating over it is right for one connection and wrong for two, because
+    // the bar would then sit over one person's tile and read as belonging to
+    // them. So this section drives the real class onto the real markup and
+    // measures the split against the same instruments section 3b uses.
+    //
+    // The class plus a picture in the second tile is the whole precondition —
+    // `window.__tape.startVideoPair()` builds a real second pc but needs a real
+    // third occupant, which is phase 6's rig, not this one. Nothing about the
+    // LAYOUT can tell the difference: the tiles are sized by CSS off `.three`,
+    // and the state lines are set through the shipped `setTileState` rather
+    // than by poking textContent (which would prove only that textContent
+    // exists).
+    {
+      const win = await a.evaluate(() => ({ w: innerWidth, h: innerHeight }));
+      await a.evaluate(() => {
+        const src = document.querySelector('#remote').srcObject
+          ?? document.querySelector('#selfFull').srcObject;
+        const v = document.querySelector('#remote2');
+        if (src) { v.srcObject = src; v.play?.().catch(() => {}); }
+        document.querySelector('#call').classList.add('three');
+        // Both state lines up at once: they are the thing most likely to be
+        // measured only in isolation and to collide in practice.
+        window.__tape.tileState(0, 'held');
+        window.__tape.tileState(1, 'paused');
+      });
+      // Chrome has to be UP for the tile × bar measurement to mean anything.
+      await a.mouse.move(win.w / 2, win.h / 2);
+      await a.mouse.move(win.w / 2 + 4, win.h / 2 + 4);
+      await a.waitForFunction(() => document.querySelector('#bar').classList.contains('show'), null, { timeout: 4000 })
+        .catch(() => fail('A three: bar would not come up for the two-tile measurement'));
+      await a.waitForTimeout(300);
+
+      const three = await a.evaluate((scanSrc) => {
+        const box = (el) => { const q = el.getBoundingClientRect(); return { x: q.x, y: q.y, w: q.width, h: q.height }; };
+        const tile = (sfx) => {
+          const wrap = document.querySelector(`#remoteWrap${sfx}`);
+          const media = document.querySelector(`#remoteCanvas${sfx}`) ?? document.querySelector(`#remote${sfx}`);
+          const fill = document.querySelector(`#remoteFill${sfx}`);
+          const line = document.querySelector(`#tileState${sfx}`);
+          const fs = getComputedStyle(fill);
+          const ls = getComputedStyle(line);
+          return {
+            wrap: box(wrap), wrapDisplay: getComputedStyle(wrap).display,
+            mediaFit: getComputedStyle(media).objectFit, showing: media.tagName.toLowerCase(),
+            fill: { rect: box(fill), fit: fs.objectFit, display: fs.display },
+            line: { rect: box(line), display: ls.display, text: line.textContent },
+          };
+        };
+        return {
+          t1: tile(''), t2: tile('2'),
+          bar: [...document.querySelectorAll('#bar .icon-btn')]
+            .filter((el) => { const cs = getComputedStyle(el); return cs.display !== 'none' && +cs.opacity > 0 && el.getBoundingClientRect().width > 1; })
+            .map((el) => ({ id: el.id, ...box(el) })),
+          barShown: document.querySelector('#bar').classList.contains('show'),
+          barPad: parseFloat(getComputedStyle(document.querySelector('#bar')).paddingBottom),
+          contain: document.querySelector('#call').classList.contains('contain'),
+          flat: document.querySelector('#call').classList.contains('flat'),
+          win: { w: innerWidth, h: innerHeight },
+          scrollW: document.documentElement.scrollWidth,
+          pip: !!document.querySelector('#selfWrap'),
+          stats: eval(`(${scanSrc})`)(),
+        };
+      }, statsScan.toString());
+
+      const tiles = [['tile 1', three.t1], ['tile 2', three.t2]];
+      // The overlap primitive the whole section shares. Same 0.5 px slack as
+      // the chrome cross-product above, for the same fractional-pixel reason.
+      const over = (p, q) => {
+        const ow = Math.min(p.x + p.w, q.x + q.w) - Math.max(p.x, q.x);
+        const oh = Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y);
+        return (ow > 0.5 && oh > 0.5) ? `${Math.round(ow)}×${Math.round(oh)} px` : null;
+      };
+
+      // Both tiles exist and are actually rendered.
+      for (const [name, t] of tiles) {
+        if (t.wrapDisplay === 'none' || t.wrap.w < 2 || t.wrap.h < 2) fail(`A three ${name}: not rendered (display ${t.wrapDisplay}, box ${JSON.stringify(t.wrap)})`);
+        else ok(`A three ${name}: rendered ${Math.round(t.wrap.w)}x${Math.round(t.wrap.h)}`);
+      }
+
+      // Fully on-screen. A tile that runs off the edge is a person with their
+      // head cropped by the device, which is the exact thing §5 forbids.
+      for (const [name, t] of tiles) {
+        const onscreen = t.wrap.x >= -1 && t.wrap.y >= -1
+          && t.wrap.x + t.wrap.w <= three.win.w + 1 && t.wrap.y + t.wrap.h <= three.win.h + 1;
+        if (!onscreen) fail(`A three ${name}: off-screen — ${JSON.stringify(t.wrap)} in ${three.win.w}x${three.win.h}`);
+        else ok(`A three ${name}: fully on-screen`);
+      }
+
+      // Side by side on landscape, stacked on portrait — and equal on whichever
+      // axis is being split, within a pixel. Not "roughly half": two tiles of
+      // visibly different size is a spotlight, and there is no spotlight here.
+      const sideBySide = three.t2.wrap.x >= three.t1.wrap.x + three.t1.wrap.w - 1;
+      const wantSide = three.win.w > three.win.h;
+      if (sideBySide !== wantSide) fail(`A three: ${sideBySide ? 'side-by-side' : 'stacked'} on a ${three.win.w}x${three.win.h} viewport — expected ${wantSide ? 'side-by-side' : 'stacked'}`);
+      else ok(`A three: ${wantSide ? 'side by side (landscape)' : 'stacked (portrait)'}`);
+      const axis = sideBySide ? 'w' : 'h';
+      const d = Math.abs(three.t1.wrap[axis] - three.t2.wrap[axis]);
+      if (d > 1) fail(`A three: tiles unequal on the split axis — ${three.t1.wrap[axis].toFixed(1)} vs ${three.t2.wrap[axis].toFixed(1)} (${d.toFixed(1)} px apart)`);
+      else ok(`A three: tiles equal on the split axis (${three.t1.wrap[axis].toFixed(1)} px, Δ${d.toFixed(2)})`);
+      const tt = over(three.t1.wrap, three.t2.wrap);
+      if (tt) fail(`A three: the two tiles overlap by ${tt}`);
+      else ok('A three: tiles do not overlap each other');
+
+      // NEITHER tile runs under the bar. Measured against the BUTTONS, exactly
+      // as the chrome cross-product is: #bar's own box is ~88 px tall because
+      // 26 px of it is the gradient that fades the video out, and that gradient
+      // is meant to lie over the picture.
+      if (!three.barShown || !three.bar.length) {
+        fail(`A three: bar never materialised for the tile × bar measurement (shown ${three.barShown}, ${three.bar.length} buttons)`);
+      } else {
+        const hits = [];
+        for (const [name, t] of tiles) {
+          for (const btn of three.bar) {
+            const o = over(t.wrap, btn);
+            if (o) hits.push(`${name}×${btn.id} by ${o}`);
+          }
+        }
+        if (hits.length) fail(`A three: tiles overlap the control bar → ${hits.join(', ')}`);
+        else ok(`A three: neither tile reaches the bar (${three.bar.length} buttons clear)`);
+      }
+      if (!(three.barPad >= 14)) fail(`A three: #bar padding-bottom is ${three.barPad} px — safe-area floor gone in two-tile mode`);
+      else ok(`A three: bar keeps its ${three.barPad} px safe-area floor`);
+
+      // Each tile's OWN wash covers its OWN tile with no gap at any edge, and
+      // is still painting `cover`. This is the selector-collision gate: a rule
+      // wide enough to span both tiles makes a 32×18 wash canvas letterbox
+      // itself and quietly reinstates the black bars the policy removed.
+      for (const [name, t] of tiles) {
+        if (!three.contain || three.flat) { ok(`A three ${name}: wash not expected (contain=${three.contain}, flat=${three.flat})`); continue; }
+        const f = t.fill.rect;
+        const covers = f.x <= t.wrap.x + 1 && f.y <= t.wrap.y + 1
+          && f.x + f.w >= t.wrap.x + t.wrap.w - 1 && f.y + f.h >= t.wrap.y + t.wrap.h - 1;
+        if (t.fill.display === 'none') fail(`A three ${name}: letterbox wash not displayed under contain`);
+        else if (t.fill.fit !== 'cover') fail(`A three ${name}: wash object-fit is ${t.fill.fit}, not cover — it will letterbox itself`);
+        else if (!covers) fail(`A three ${name}: wash ${JSON.stringify(f)} leaves a gap in tile ${JSON.stringify(t.wrap)}`);
+        else ok(`A three ${name}: wash fills its own tile, no gap at any edge`);
+        if (t.mediaFit !== 'contain') fail(`A three ${name}: media object-fit is ${t.mediaFit}, not contain — the other person is being cropped`);
+        else ok(`A three ${name}: contain-fit (${t.showing}), zero crop`);
+      }
+
+      // Each tile carries its own state line, inside its own tile, clear of the
+      // bar. Two lines up at once is the state that has to hold: one sentence
+      // over the middle of a split screen names neither person.
+      for (const [name, t, want] of [['tile 1', three.t1, 'holding · audio live'], ['tile 2', three.t2, 'connection paused']]) {
+        if (t.line.display === 'none' || t.line.rect.w < 2) { fail(`A three ${name}: state line not rendered`); continue; }
+        if (t.line.text !== want) fail(`A three ${name}: state line reads "${t.line.text}", expected "${want}"`);
+        else ok(`A three ${name}: state line reads "${t.line.text}"`);
+        const inside = t.line.rect.x >= t.wrap.x - 1 && t.line.rect.y >= t.wrap.y - 1
+          && t.line.rect.x + t.line.rect.w <= t.wrap.x + t.wrap.w + 1
+          && t.line.rect.y + t.line.rect.h <= t.wrap.y + t.wrap.h + 1;
+        if (!inside) fail(`A three ${name}: state line ${JSON.stringify(t.line.rect)} escapes its tile ${JSON.stringify(t.wrap)}`);
+        else ok(`A three ${name}: state line sits inside its own tile`);
+        const clash = three.bar.map((btn) => over(t.line.rect, btn) && `${btn.id}`).filter(Boolean);
+        if (clash.length) fail(`A three ${name}: state line collides with ${clash.join(', ')}`);
+      }
+
+      // The 1:1 gates that must survive the split, re-measured here rather than
+      // assumed: a two-tile screen is still a screen with no stats on it, no
+      // horizontal overflow, no self-view PiP, and controls at their promised
+      // size and fully on-screen.
+      commonAsserts(three, 'A three');
+      if (three.pip) fail('A three: #selfWrap back in the DOM (self-view PiP was removed)');
+      else ok('A three: no self-view PiP in the DOM');
+      const floor3 = three.win.w > 380 ? 48 : 44;
+      const under3 = three.bar.filter((t) => t.w < floor3 || t.h < floor3);
+      if (under3.length) fail(`A three: controls below the ${floor3} px this ${three.win.w} px viewport promises → ${under3.map((t) => `${t.id} ${Math.round(t.w)}x${Math.round(t.h)}`).join(', ')}`);
+      else ok(`A three: ${three.bar.length} controls all ≥ ${floor3} px`);
+      const off3 = three.bar.filter((t) => t.x < -1 || t.x + t.w > three.win.w + 1 || t.y + t.h > three.win.h + 1);
+      if (off3.length) fail(`A three: controls off-viewport → ${off3.map((t) => t.id).join(', ')}`);
+      else ok('A three: whole bar on-screen in two-tile mode');
+      await a.screenshot({ path: `${SHOTS}/${r.name}-6-three.png` });
+
+      // Back to 1:1 for section 4 — and the flag-off gate itself: with `.three`
+      // gone the second tile and both state lines must be unrenderable again.
+      await a.evaluate(() => {
+        window.__tape.tileState(0, null);
+        window.__tape.tileState(1, null);
+        document.querySelector('#call').classList.remove('three');
+        document.querySelector('#remote2').srcObject = null;
+      });
+      await a.waitForTimeout(200);
+      const back = await a.evaluate(() => {
+        const wrap = document.querySelector('#remoteWrap');
+        const q = wrap.getBoundingClientRect();
+        return {
+          wrap: { x: q.x, y: q.y, w: q.width, h: q.height },
+          win: { w: innerWidth, h: innerHeight },
+          tile2: getComputedStyle(document.querySelector('#remoteWrap2')).display,
+          lines: ['tileState', 'tileState2']
+            .map((id) => getComputedStyle(document.querySelector(`#${id}`)).display)
+            .filter((dsp) => dsp !== 'none'),
+        };
+      });
+      const full = Math.abs(back.wrap.x) < 1 && Math.abs(back.wrap.y) < 1
+        && Math.abs(back.wrap.w - back.win.w) < 1 && Math.abs(back.wrap.h - back.win.h) < 1;
+      if (!full) fail(`A three→1:1: first tile did not return to full-bleed ${JSON.stringify(back.wrap)}`);
+      else ok('A three→1:1: first tile back to full-bleed');
+      if (back.tile2 !== 'none') fail(`A three→1:1: second tile still rendering (display ${back.tile2})`);
+      else ok('A three→1:1: second tile inert again');
+      if (back.lines.length) fail(`A three→1:1: a tile state line still renders without .three (${back.lines.join(', ')})`);
+      else ok('A three→1:1: no tile state line can render without .three');
+    }
+
     // ── 4. peer-left returns to the self-view lobby (last ratio only) ───────
     if (i === RATIOS.length - 1) {
       await b.close();

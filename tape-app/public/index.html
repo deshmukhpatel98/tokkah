@@ -312,24 +312,75 @@
   #call.contain #remoteWrap2 canvas:not(#remoteFill2) { object-fit: contain; }
   #call.contain.flat #remoteFill2 { display: none; }
   #call.contain.flat #remoteWrap2 { background: #06080d; }
-  /* Two equal tiles. PROVISIONAL — phase 5 owns the real two-tile layout (its
-     gate measures both tiles against the bar at every aspect ratio); this
-     exists so that the moment `#call.three` is set the tiles are side by side
-     rather than stacked on top of each other, and it is scoped to `.three` so
-     the single-tile geometry above is untouched without it. `!important`
-     matches the `#call.fill #remoteWrap` rule it has to outrank; the extra
-     class makes it the more specific of the two important declarations. */
-  #call.fill.three #remoteWrap { inset: 0 50% 0 0 !important; width: auto !important; height: auto !important; }
-  #call.fill.three #remoteWrap2 { inset: 0 0 0 50% !important; width: auto !important; height: auto !important; }
-  @media (orientation: portrait) {
-    #call.fill.three #remoteWrap { inset: 0 0 50% 0 !important; }
-    #call.fill.three #remoteWrap2 { inset: 50% 0 0 0 !important; }
+
+  /* ── The two-tile layout (§6, phase 5) ───────────────────────────────────
+     Two EQUAL tiles: side by side when the viewport is wider than it is tall,
+     stacked when it is taller. No spotlight, no active-speaker swap, no
+     reordering — a tile that moves while someone is talking is the exact class
+     of motion UI-SPEC §1.1 exists to remove, so the only thing that ever moves
+     a tile here is a rotation of the device itself.
+
+     The tiles stop ABOVE the control bar rather than running under it. At 1:1 a
+     full-bleed picture with chrome floating over it is right (the bar is over
+     the room, and the room is the whole screen); with two tiles the bar would
+     sit over the bottom tile only, which reads as belonging to that person.
+     `--bar-reserve` is the bar's OWN geometry restated: circle height + the
+     `max(14px, env(safe-area-inset-bottom))` the bar pads itself off the edge,
+     + 10 px of air. It tracks the same `@media (max-width: 380px)` shrink the
+     circles do, so the two can only drift apart if someone edits one and not
+     the other — and the rig measures tile × button intersection directly.
+
+     Percentages in these calcs resolve against #call's own box (inset: 0, i.e.
+     the viewport), so both halves come out to the same number by construction:
+     each is `50% − reserve/2 − gap/2` on the split axis, whatever the odd
+     pixel. `!important` and the extra class are what outrank the
+     `#call.fill #remoteWrap { inset: 0 !important }` full-bleed rule above. */
+  #call.three { --tile-gap: 6px; --bar-reserve: calc(58px + max(14px, env(safe-area-inset-bottom)) + 10px); }
+  @media (max-width: 380px) {
+    #call.three { --bar-reserve: calc(52px + max(14px, env(safe-area-inset-bottom)) + 10px); }
   }
-  /* The room-wide held/paused wash, on the second tile too. Phase 5 replaces
-     both with per-tile state; adding a rule here rather than editing the
-     existing selector list keeps those two lines exactly as they were. */
-  #call.held #remoteWrap2 { filter: saturate(.92); }
-  #call.paused #remoteWrap2 { filter: saturate(.72) brightness(.82); }
+  #call.fill.three #remoteWrap {
+    inset: 0 calc(50% + var(--tile-gap) / 2) var(--bar-reserve) 0 !important;
+    width: auto !important; height: auto !important;
+  }
+  #call.fill.three #remoteWrap2 {
+    inset: 0 0 var(--bar-reserve) calc(50% + var(--tile-gap) / 2) !important;
+    width: auto !important; height: auto !important;
+  }
+  @media (orientation: portrait) {
+    #call.fill.three #remoteWrap {
+      inset: 0 0 calc(50% + var(--bar-reserve) / 2 + var(--tile-gap) / 2) 0 !important;
+    }
+    #call.fill.three #remoteWrap2 {
+      inset: calc(50% - var(--bar-reserve) / 2 + var(--tile-gap) / 2) 0 var(--bar-reserve) 0 !important;
+    }
+  }
+  /* The held/paused wash, per tile. Phase 4 put the room's `#call.held` on the
+     second tile too; that named the wrong person's connection the moment the
+     two pairs were in different states, which is the whole reason phase 5 owns
+     this. Same two filters, same 400 ms transition, now keyed on the tile whose
+     lane actually reported it. The room-wide `#call.held/.paused` rules below
+     are untouched and still own the 1:1 screen — app.js sets the room classes
+     OR the tile classes, never both. */
+  #remoteWrap.tHeld, #remoteWrap2.tHeld { filter: saturate(.92); }
+  #remoteWrap.tPaused, #remoteWrap2.tPaused { filter: saturate(.72) brightness(.82); }
+  /* Each tile's own state line — "they left", "holding · audio live",
+     "connection paused" — in the #status pill's exact recipe, because it is the
+     same kind of sentence about a smaller subject. Bottom-centred INSIDE its
+     tile: the top of a tile is where a face is, and top-centre already belongs
+     to #status and #elapsed for the room. Name-free by design (§ phase 5).
+     `#call:not(.three)` can never render one: a 1:1 call has one connection and
+     it already has the one badge that names it. */
+  .tileState {
+    position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 3;
+    font-size: 11px; padding: 5px 12px; border-radius: 999px; background: var(--glass-text);
+    -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-line); color: rgba(232,234,237,.92);
+    white-space: nowrap; max-width: 86%; overflow: hidden; text-overflow: ellipsis;
+    display: none; pointer-events: none;
+  }
+  .tileState.on { display: block; }
+  #call:not(.three) .tileState { display: none !important; }
 
   /* Joined but peer not here yet: own camera fills the screen (task #28).
      Identical treatment to the remote view — cover, aspect preserved, mirrored. */
@@ -560,14 +611,24 @@
   <div id="remoteWrap">
     <canvas id="remoteFill" width="32" height="18" aria-hidden="true"></canvas>
     <video id="remote" autoplay playsinline></video>
+    <!-- This tile's own state line (phase 5). Never rendered on a 1:1 call —
+         `#call:not(.three) .tileState` forbids it — so the single-connection
+         screen keeps the single #stallBadge it has always had. -->
+    <div id="tileState" class="tileState" role="status"></div>
   </div>
   <!-- The second remote tile (§6, phase 4). `display: none` until #call gains
        `.three`, which only startVideoPair() sets and nothing calls yet: no
        layout, no paint, no decode, no a11y node. #remoteCanvas2 is created by
        startTape() the same way #remoteCanvas is, next to this <video>. -->
-  <div id="remoteWrap2" aria-hidden="true">
+  <!-- `aria-hidden` came off the wrap in phase 5: `display: none` already keeps
+       the whole subtree out of the a11y tree while there is no second pair, and
+       once there IS one this tile is a person — hiding them from a screen reader
+       while their state line says "they left" would be the one place this app
+       lies. The 32×18 wash canvas keeps its own aria-hidden. -->
+  <div id="remoteWrap2">
     <canvas id="remoteFill2" width="32" height="18" aria-hidden="true"></canvas>
     <video id="remote2" autoplay playsinline></video>
+    <div id="tileState2" class="tileState" role="status"></div>
   </div>
   <video id="selfFull" autoplay muted playsinline></video>
 

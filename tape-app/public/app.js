@@ -1734,6 +1734,71 @@ const stallHoldWin = []; // { t, concealedMs } samples, ~8 s sliding
 let audioHold = false;
 let videoHeld = false; // the remote video is held (tape.js onStall)
 
+// ── Per-tile state lines (§6, phase 5) ───────────────────────────────────────
+// At 1:1 the room has one connection, so one badge in the middle of the screen
+// can name it without ambiguity. At three there are two, and a badge over the
+// middle of a split screen names neither — so each tile carries its own line,
+// in the #status pill's recipe, bottom-centred inside the tile it describes.
+// Name-free on purpose: the tile IS the name.
+const TILE_LINE = {
+  left: 'they left',
+  held: 'holding · audio live',
+  paused: 'connection paused',
+};
+// A pair whose lane FAILED outranks a pair whose lane is merely holding: the
+// stall stream keeps reporting regimes after the transport underneath it is
+// gone, and letting "holding · audio live" overwrite "connection paused" would
+// promise audio that is not arriving.
+const tileFailed = new Set();
+/** `kind` is one of TILE_LINE's keys, or null for "nothing to say". */
+function setTileState(slot, kind) {
+  safe(() => {
+    const sfx = slot ? String(slot + 1) : '';
+    const el = $(`tileState${sfx}`);
+    const wrap = $(`remoteWrap${sfx}`);
+    if (!el || !wrap) return;
+    const text = kind ? TILE_LINE[kind] ?? null : null;
+    el.textContent = text ?? '';
+    el.classList.toggle('on', !!text);
+    // The §15 desaturation, per tile rather than per room — same two filters the
+    // room-wide `#call.held/.paused` rules carry, on the tile whose lane
+    // actually reported the state.
+    wrap.classList.toggle('tHeld', kind === 'held');
+    wrap.classList.toggle('tPaused', kind === 'paused');
+  }, 'tile.state');
+}
+
+/**
+ * A second pair's person left. Its tile says so and NOTHING else on the screen
+ * moves — with three occupants a departure is not the end of the call, and the
+ * room-wide waiting/self-view screen belongs to the pair that owned the media.
+ *
+ * The tile then collapses after the same 3 s the room's own "they left" gets
+ * (TRANSIENT_STATUS): a dead black half of the screen is worse than the one
+ * motion it costs to remove it, and unlike a spotlight swap this motion happens
+ * after somebody left rather than while somebody is talking.
+ */
+function tileLeft(slot) {
+  if (!slot) return; // tile 0 is the media pair — the room-wide path owns it
+  safe(() => {
+    const sfx = String(slot + 1);
+    setTileState(slot, 'left');
+    tileFailed.delete(slot);
+    const v = $(`remote${sfx}`);
+    if (v) v.srcObject = null;
+    setTimeout(() => safe(() => {
+      // Somebody may already have sat down in that slot inside the 3 s. Their
+      // tile does not get torn out from under them by the last person's timer.
+      if ([...peers.values()].some((p) => p.slot === slot)) return;
+      setTileState(slot, null);
+      $('call')?.classList.remove('three');
+      $(`remoteCanvas${sfx}`)?.remove();
+      clearInterval(fill2Timer);
+      fill2Timer = null;
+    }, 'tile.collapse'), 3000);
+  }, 'tile.left');
+}
+
 function stallUi() {
   if (!STALL) return;
   let el = document.getElementById('stallBadge');
@@ -1750,6 +1815,17 @@ function stallUi() {
       '-webkit-backdrop-filter:var(--glass-blur);backdrop-filter:var(--glass-blur);' +
       'border-radius:999px;font-size:12px;color:#fff;display:none;z-index:6';
     document.getElementById('call')?.appendChild(el);
+  }
+  // §6 phase 5: with two tiles up, the one badge over the middle of the screen
+  // cannot say WHOSE connection it is talking about, so the words move to the
+  // media pair's own tile line and the room badge stays down. Without `.three`
+  // — every 1:1 call — none of this runs and the lines below are the code that
+  // shipped, unchanged.
+  if (document.getElementById('call')?.classList.contains('three')) {
+    el.style.display = 'none';
+    setTileState(0, audioHold ? 'paused' : videoHeld ? 'held' : null);
+    document.getElementById('call').classList.remove('paused', 'held');
+    return;
   }
   if (audioHold) {
     el.textContent = 'connection paused — reconnecting';
@@ -2125,14 +2201,17 @@ function startTape(initiator, ctx = null) {
       tel?.log('tape-render', { attached: true, lane: wantTape, slot });
     },
     // The media pair's failure is the call's failure and takes the whole page
-    // back to plain RTP. A SECOND pair has no fallback path yet — `fallbackToRtp`
+    // back to plain RTP. A SECOND pair has no fallback path — `fallbackToRtp`
     // renegotiates the module-scope pc and repaints tile 0, which would be the
-    // wrong pc and the wrong tile — so it stops that one lane and says so.
-    // Phase 5 owns the per-tile "connection paused" state this should drive.
+    // wrong pc and the wrong tile — so it stops that one lane and SAYS SO on
+    // that tile (phase 5): a picture that quietly stops updating is the one
+    // thing this app refuses to ship.
     onFail: ctx
       ? (why) => {
           tel?.log('tape-fallback-pair', { peer: ctx.peer ?? null, slot, why });
           safe(() => { ctx.tape?.stop(); ctx.tape = null; }, 'tape.pair-fail');
+          tileFailed.add(slot);
+          setTileState(slot, 'paused');
         }
       : (why) => fallbackToRtp(why),
     // The audio lane's loss ladder is the fastest honest congestion signal in
@@ -2142,13 +2221,16 @@ function startTape(initiator, ctx = null) {
     // §12–13: the video regime machine reports its state for the honest UI.
     // "held" → the remote video is VIDEO HELD (last frame + 1 fps stills);
     // anything else clears the badge unless HOLD owns it.
-    // `videoHeld` + `stallUi()` are the ROOM's one badge, and phase 5 replaces
-    // them with a state line per tile. Until it does, only the media pair may
-    // write them: a second pair's regime driving a badge that sits over the
-    // first pair's picture would name the wrong person's connection.
+    // `videoHeld` + `stallUi()` are the ROOM's one badge and only the media pair
+    // may write them — a second pair's regime driving a badge that sits over the
+    // first pair's picture would name the wrong person's connection. Phase 5
+    // gives the second pair the place it CAN say it: its own tile's line.
     onStall: STALL
       ? ctx
-        ? (state, info) => tel?.log('stall-state', { state, slot, peer: ctx.peer ?? null, ...info })
+        ? (state, info) => {
+            if (!tileFailed.has(slot)) setTileState(slot, state === 'held' ? 'held' : null);
+            tel?.log('stall-state', { state, slot, peer: ctx.peer ?? null, ...info });
+          }
         : (state, info) => {
             videoHeld = state === 'held';
             stallUi();
@@ -2305,6 +2387,9 @@ function startVideoPair(peerRole) {
     if (initiator) tapeSlot(pcx, lane);
     $('call').classList.add('three'); // the second tile stops being inert
     startRemoteFill2();               // ...and its wash gets a sampler
+    // A fresh occupant inherits no state from the last one who sat here.
+    tileFailed.delete(p.slot);
+    setTileState(p.slot, null);
     tel?.log('pair-video-start', { peer: peerRole, offerer: initiator ? 1 : 0, slot: p.slot,
       l23enc: tapeLinkOn() ? 1 : L23ENC });
     return p;
@@ -3804,10 +3889,16 @@ function addPair(peerRole, lane, pcmCap) {
   return rec;
 }
 
-/** Forget one occupant. Phase 5 replaces the caller's room-wide UI per tile. */
+/** Forget one occupant. The caller paints the tile (phase 5, `tileLeft`). */
 function dropPair(peerRole) {
   if (!peerRole) return false;
   const wasMedia = peerRole === mediaPeer;
+  // A non-media pair owns a whole pc and a whole lane of its own (§6 phase 4).
+  // Both are null on the media pair, which keeps using the module-scope ones,
+  // so this is a no-op on the 1:1 path.
+  const p = peers.get(peerRole);
+  safe(() => { p?.tape?.stop?.(); }, 'pair.drop-tape');
+  safe(() => { p?.pc?.close?.(); }, 'pair.drop-pc');
   peers.delete(peerRole);
   // The pc that pair owned is now spent, and a free `mediaPeer` is what tells
   // `peer-joined` that the next arrival is refilling this slot rather than
@@ -4791,11 +4882,20 @@ async function join(room) {
         // §3.3's additive `peer` names WHO left. Tear down that pair's state and
         // nothing else — with three occupants a departure is not the end of the
         // call, and the room-wide "they left" screen below belongs to the pair
-        // that owned the media. A non-media pair leaving is a table edit only;
-        // phase 5 moves this whole block to that peer's tile.
-        if (THREE && m.peer && !dropPair(m.peer)) return;
+        // that owned the media. A non-media pair leaving now clears ITS TILE and
+        // only its tile (phase 5): the remaining conversation does not flinch.
+        const leftSlot = (THREE && m.peer) ? peers.get(m.peer)?.slot ?? null : null;
+        if (THREE && m.peer && !dropPair(m.peer)) {
+          tileLeft(leftSlot ?? 1);
+          tel.log('peer-left', { peer: m.peer, slot: leftSlot, tile: 1 });
+          return;
+        }
         if (THREE && !m.peer) { peers.clear(); mediaPeer = null; }
         setStatus('they left');
+        // The media pair's tile says it too while the second tile is up — with a
+        // split screen the top-centre pill describes the room, not a person. A
+        // 1:1 call never enters this branch, so its screen is untouched.
+        if ($('call')?.classList.contains('three')) setTileState(0, 'left');
         tel.log('peer-left', { peer: m.peer ?? null });
         // Back to the self-view lobby while we wait for them (or someone
         // else): own camera fills the screen again, waiting overlay returns.
@@ -6153,6 +6253,12 @@ window.__tape = {
   // lands. Returns null unless THREE is on and the letter names a real second
   // occupant.
   startVideoPair: (peerRole) => startVideoPair(peerRole),
+  // §6 phase 5: one tile's state line, driven through the SHIPPED function.
+  // The two-tile geometry gate (testbed/ui-call.mjs) needs a second tile and a
+  // line on it without a third browser in the room; a rig that poked
+  // textContent would prove only that textContent exists. `kind` is
+  // 'left' | 'held' | 'paused' | null, `slot` is 0 or 1.
+  tileState: (slot, kind) => setTileState(slot, kind),
   // The shared encode chain's own view (§6.1): how many transport halves are
   // attached and which one owns the encoder. Null on every 1:1 call.
   get l23() { return tape?.snapshot?.()?.l23 ?? null; },
