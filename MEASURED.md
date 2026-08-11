@@ -4201,3 +4201,7 @@ no-false-latch guarantee. Full suite green on real media, live.
 synthmedia=real shipped: iOS/Safari test surface now feeds on the NASA interview
 via the same canvas/AudioContext hook (iOS-safe). Live iOS-vs-desktop call: 4475
 frames, 88 ms conceal, remote luma sd 46.5 - a real human on every test surface.
+
+Interpreter on iOS (simulator, mobile Safari, real-media hook): both directions
+opened (es<->en), 37 captions + 37 TTS segments delivered live on prod. The
+flagship feature runs on every surface we can drive.
