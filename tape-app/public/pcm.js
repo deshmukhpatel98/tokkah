@@ -817,6 +817,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let dupOn = DUP_MODE === '1';
     stats.dupOn = dupOn ? 1 : 0; // forced-on must be visible from the first snapshot
     let dupLowSince = 0;
+    // duress() latch (see the method): worst recent level + when the raw read
+    // last went below it. Flap fix from the first real marginal-link call.
+    let dLevel = 0;
+    let dLowSince = 0;
     // Auto-engage is deaf for the lane's first seconds: the sender SKIPS seqs
     // while associations open (pickDataAssoc undefined / over-budget), and the
     // peer's loss windows honestly read those holes as loss until they roll out
@@ -2047,9 +2051,23 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // top rung); 1 = loss in the ladder's upper half; 0 = fine. Reads live
       // state, never computes — safe at any call rate.
       duress() {
-        if (stats.dupOn) return 2;
+        // Latched, not instantaneous. The raw read flapped in the wild
+        // (room xow-offc-apz, 2026-08-11: 35 level transitions in 219 s on a
+        // marginal link — loss windows breathing around cap/2 whipsawed the
+        // video budget 2↔8 Mbps at up to 1 Hz, encoder-configure churn of
+        // exactly the class the VBR lesson forbids). Same asymmetry as the
+        // shield and the ladder: RISE instantly — under-reacting to real
+        // trouble costs speech-adjacent video — but FALL only after the raw
+        // read has held lower for a continuous 4 s. A marginal link now sits
+        // at its worst recent level instead of strobing through all three.
         const cap = rungTop[Math.min(FEC_N_MAX, rungTop.length - 1)];
-        return (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
+        const raw = stats.dupOn ? 2
+          : (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
+        if (raw >= dLevel) { dLevel = raw; dLowSince = 0; return dLevel; }
+        const t = now();
+        if (!dLowSince) dLowSince = t;
+        else if (t - dLowSince > 4000) { dLevel = raw; dLowSince = 0; }
+        return dLevel;
       },
       // Lane 0 (§3.1 levers 3+4): policy lives in app.js (it owns the detector
       // state these decisions gate on); the wire mechanics live here.
