@@ -1474,3 +1474,51 @@ went 3 → 6. Documented at the `bwMbps` definition in `netsim.mjs`.
 `setTimeout` send firing after the socket closed at teardown. It happens after
 the result line, so no rep was lost and all 8 counted in both arms, but it
 crashes the netsim process on the way out and should be guarded.
+
+## Session 2026-08-11 — the live-only marathon: 7 multipliers, 5 surfaces, the realism law
+
+New machine (deveshpatel; earningsgpt is gone — testbed paths were de-hardcoded,
+node/gh/ffmpeg installed per-user, wrangler OAuth re-authed, LOG_ADMIN_TOKEN
+rotated again: scratchpad log_admin_token.txt). Operator rules now in Claude's
+persistent memory: live-prod-calls-only testing, features default ON (?flag=0
+control), Claude orchestrates + agy(gemini-3.6-flash-high)/opus workers code,
+REAL talking-head media everywhere (never synthetic artifacts), never subagents
+except one sanctioned Opus 5 Max worker used sparingly.
+
+**Shipped, all live-verified:** presence stereo room renderer (presence-core.js,
+default on) · AEC2 default on + DO-NO-HARM GATE (delivery only at ERLE>=3 dB —
+iOS froze at -13 dB shadow without it) · burst shield (frame twins 24 ms apart
+above the parity ladder; two false-trigger bugs found live) · video duress
+coupling (pcm.duress() quarters the budget when the audio ladder reads trouble) ·
+WS pre-dial from the lobby (second joiner 565->347 ms, -39%; hold-state admission
+in the Room DO) · latency floor default (mouth-to-ear 62.6->45.6 ms; the first
+A/B was Bluetooth-confounded — the retry is in onset-monitor.js comments) ·
+embed UNBROKEN (frame-ancestors 'none' had blanked it since it shipped;
+now '*', X-Frame-Options gone, embed-call.mjs holds the line).
+
+**Instruments:** mouthToEarMs + glassToGlassMs + humanGapMs per call, on the
+anonymous beat, aggregated in /api/health/summary. The #14 present probe was
+silent on the real present paths (v-presenter, avTick) — both stamp now.
+
+**iOS Simulator is a first-class surface** (Xcode installed, iPhone 17 Pro
+'tokkah-iphone'; DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer).
+It found: the pre-dial timeout lie (adopted-OPEN sockets never fire onopen),
+the AEC2 freeze, and page suspension on backgrounding -> shipped 'away'
+presence (peer sees 'they switched apps'). ?synthmedia=real plays
+/testmedia/real720.mp4 through the test hook for engines without fake-device
+flags.
+
+**Testbed realism:** media/real/fetch.sh reproduces NASA-interview fixtures;
+all rigs default to them (decodeURIComponent the paths — the repo dir has a
+space). aec-call's auto arm now asserts NO false latch on real speech (the
+beep-periodicity fake-echo premise died with realism).
+
+**Deploy ritual:** env -u CLOUDFLARE_API_TOKEN npx -y wrangler@4.120.1 deploy
+-c wrangler.prod.jsonc (local node_modules wrangler 4.86.0 errors mutely);
+md5-settle 3 consecutive; edge POPs can lag each other (a sim fetched a
+one-deploy-stale bundle minutes after settle).
+
+**Waiting on the real world:** speakerphone call (AEC2 gate-open + echo-detect
+real trigger), ears on presence, a bad network for the shield. ~35 commits
+local-only: user deprioritized GitHub push (gh authed as deveshpat, which
+lacks repo perms — owner is deshmukhpatel98).
