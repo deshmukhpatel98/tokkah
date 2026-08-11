@@ -4238,3 +4238,7 @@ call3.mjs complete: 9/9 assertions ALL PASS on staging incl reload, departure
 clears the peers MAP (∅) on survivors via the THREE && !m.peer clear-all branch
 while a<->b audio keeps flowing — fix before prod flip. Uplink is a lower bound
 (media pair ~4.3 Mbps up); exact ~22 Mbps mesh number needs a per-pair stat hook.
+
+Departure peer-map bug FIXED (server): non-idempotent DO teardown fired twice on
+abrupt drop, second broadcast a fieldless peer-left -> client clear-all. Guarded.
+call3 assertion 7: peers now b,a (was ∅,∅), audio continuous. Full rig ALL PASS.
