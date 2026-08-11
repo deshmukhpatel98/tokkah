@@ -1522,3 +1522,40 @@ one-deploy-stale bundle minutes after settle).
 real trigger), ears on presence, a bad network for the shield. ~35 commits
 local-only: user deprioritized GitHub push (gh authed as deveshpat, which
 lacks repo perms — owner is deshmukhpatel98).
+
+## Session 2026-08-11 (later) — the interpreter ships, three-person exists, voices get seats
+
+**One-line interpreter (LIVE on prod):** `<script src=.../embed.js data-room=x
+data-translate=es>` opens the embedded call with the live interpreter (embed.js
+forwards to ?xlate=). Metered FIRST-CLASS: worker.ts xlateMeter charges 600 s
+grains vs XLATE_DAY_SECONDS/room/UTC-day (default 7200, '0' disables); over
+budget the socket is ACCEPTED, sends {type:'limit'} (xlate.js renders it as a
+caption), then closes. Proven live both ways (prod attribute flow; staging cap=1
+visible refusal).
+
+**Three-person rooms (BUILT, dormant, prod-safe):** all six design phases landed
+(testbed/specs/three-person-design.md). Prod serves the full client with
+THREE_ENABLED=false in worker.ts — verified inert live (3rd join refused, 1:1
+byte-clean). Staging (wrangler.jsonc → tokkah.deshmukh.workers.dev) is where the
+flag goes true for testing: perl-flip the const, deploy -c wrangler.jsonc,
+REVERT THE SOURCE IMMEDIATELY. testbed/call3.mjs is the gate: nine assertions +
+4b (per-half FLOW — connection state cannot see a silent voice), ALL PASS.
+Mesh uplink MEASURED 10.6-11.7 Mbps/device (half the design's guess): phones are
+not bandwidth-limited; CPU/thermal needs a REAL phone. Bugs the staging gate
+caught (all fixed): b<->c pair never formed (answerer built lazily, racing its
+own setup - both roles now build eagerly); 4th joiner hung on 'starting…' (full
+message raced the spent join-promise rejector - UI driven directly now); DO
+teardown double-fired on abrupt drop broadcasting a fieldless peer-left that
+cleared survivors' tables (idempotency guard).
+
+**Spatial voices (LIVE dormant):** presence-core placement — azimuthDeg via
+Woodworth ITD + <=2.2 dB broadband ILD (lossless; NO pinna filtering); az 0 IS
+the original loop (1:1 bit-identical). addPeer seats voice 2 at +28 deg;
+?spatial=0 pins center. Proven on staging 3-way; the 'silent second voice'
+scare was a still-priming snapshot, disproven by per-half flow discriminators.
+
+**Still gated on the human:** prod THREE_ENABLED flip (costs: worst-link-
+governs, translation-off-at-3, per-peer telemetry — needs explicit yes); real
+phone (mesh thermal + speakerphone AEC2/echo real-air verdicts); ears on
+presence/spatial; GitHub push (~65 commits local; gh authed as deveshpat which
+lacks perms — owner is deshmukhpatel98).
