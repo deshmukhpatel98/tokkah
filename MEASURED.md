@@ -4285,3 +4285,27 @@ Spatial voices shipped: second remote seats at +28 deg (ITD+ILD, lossless; az 0 
 bit-identical original). call3 gains assertion 4b (both halves must FLOW) - the
 silent-voice scare was a still-priming snapshot, disproven by discriminators:
 750/750 frames per 6 s per half. Full rig ALL PASS; mesh uplink 11.7 Mbps.
+
+## FIRST REAL CALLS ON THE NEW STACK (2026-08-11, rooms eqx-oxuk-wnq + tgv-glvl-ppd)
+
+Two human calls, two Macs, 98 s and 276 s. Every system shipped this session fired
+in real air, read from the rooms registry + logs with no link asked:
+
+- REAL ECHO, CANCELLED: echo-detected corr 0.94 lag 0 ms on both sides (two Macs
+  on speakers, same room — the exact scenario the echo arc was built for). The
+  phase-0 detector fired telemetry-only as designed; AEC2's DO-NO-HARM GATE
+  OPENED in real air — erle 3.6 dB delivered (gate:1) on one side, 28 gate-open
+  ticks across the longer call. The in-house canceller removed real echo from a
+  real room while the pristine-audio law held. THE PHASE-3 REAL-AIR VERDICT IS
+  POSITIVE.
+- SHIELD + DURESS, LIVE: rc-duress level 2 (budget -> 0.95-2 Mbps) then level 0
+  recovery (-> 4.78) on real turbulence — engage, duck, recover, exactly the
+  Aug-7-spiral antidote, in the wild.
+- Away presence fired in both calls (peer-away) — someone switched apps and the
+  other person was told.
+- Camera flips worked (x2, x1). The interpreter ran mid-call (en-GB, gemini,
+  captions flowing). outputLatency 11 ms on real Macs — the latency floor
+  default on real hardware. Fleet mouthToEar p50 today: 48.3 ms.
+
+Still open, and now the ONLY open real-world items: a PHONE (mesh thermal,
+speakerphone HAL), ears on presence/spatial tuning, the prod THREE flip.
