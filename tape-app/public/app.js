@@ -3837,10 +3837,20 @@ const answersTo = (peerRole) => (THREE && peerRole ? role > peerRole : role === 
  */
 const forMediaPair = (from) => !THREE || !from || from === mediaPeer;
 
-/** Count a pairwise frame that has no pc behind it yet, so phase 3 can see it. */
+/**
+ * Count a pairwise frame that has no pc behind it yet — AND hold it, so the pc's
+ * construction can drain it. `deferred` stays the running count the health
+ * beacon reads; `pending` is the FIFO of the frames themselves, drained by
+ * `drainPair` the moment `buildPair` gives this pair a pc (phase 6). Bounded so
+ * a pair whose offer never arrives cannot grow the queue without limit.
+ */
 function deferPair(m) {
   const p = peers.get(m.from);
-  if (p) p.deferred = (p.deferred ?? 0) + 1;
+  if (p) {
+    p.deferred = (p.deferred ?? 0) + 1;
+    (p.pending ??= []).push(m);
+    if (p.pending.length > 256) p.pending.shift();
+  }
   tel?.log('pair-deferred', { from: m.from ?? null, type: m.type ?? null });
 }
 
@@ -3877,7 +3887,11 @@ function addPair(peerRole, lane, pcmCap) {
   // the record's shape is one thing rather than something that grows silently.
   const rec = { role: peerRole, lane: lane ?? null, pcm: pcmCap ?? null, media: false,
     offered: false, owed: false, deferred: 0,
-    pc: null, pre: null, tape: null, slot: null };
+    pc: null, pre: null, tape: null, slot: null,
+    // Phase 6: `pending` is the deferPair FIFO drained at `buildPair`; `pcmHalf`
+    // is this pair's Lane A receive-half index (pcm.addPeer). Null on the media
+    // pair, which uses the module-scope `pc`/`pcm` half 0.
+    pending: null, pcmHalf: null };
   peers.set(peerRole, rec);
   // First peer learned owns the media. `welcome.peers` is ordered by the DO the
   // same way `peerLane`/`peerPcm` pick their subject — the FIRST other occupant
@@ -3898,6 +3912,21 @@ function dropPair(peerRole) {
   // so this is a no-op on the 1:1 path.
   const p = peers.get(peerRole);
   safe(() => { p?.tape?.stop?.(); }, 'pair.drop-tape');
+  // This pair's Lane A stripe pcs (idx 1..N-1) live in `pcmPcs` keyed by letter;
+  // idx-0's 'pcm-audio' rides `p.pc`, closed just below. Closing all of them
+  // starves this pair's pcm receive half of input — which is the most app.js can
+  // do to retire it, because pcm.js exposes no per-half teardown (editing it is
+  // out of scope here). The starved half then renders silence and reports
+  // duress 0, and nothing polls a non-media half's snapshot, so it is harmless.
+  // Media-pair only: its ladder is keyed under `mediaPeer` and torn down by the
+  // full "they left" reset, not here — matching phase 5, which left it alone.
+  if (!wasMedia) {
+    const ladder = pcmPcs.get(peerRole);
+    if (ladder) {
+      for (const spc of ladder) safe(() => spc?.close?.(), 'pair.drop-stripe');
+      pcmPcs.delete(peerRole);
+    }
+  }
   safe(() => { p?.pc?.close?.(); }, 'pair.drop-pc');
   peers.delete(peerRole);
   // The pc that pair owned is now spent, and a free `mediaPeer` is what tells
@@ -3906,6 +3935,144 @@ function dropPair(peerRole) {
   if (wasMedia) mediaPeer = null;
   tel?.log('pair-drop', { peer: peerRole, media: wasMedia ? 1 : 0, n: peers.size });
   return wasMedia;
+}
+
+/**
+ * ── Phase 6: build a SECOND pair's whole transport ───────────────────────────
+ *
+ * Idempotent, symmetric across the two roles (offerer vs answerer decided by
+ * §3.1's `offersTo`), and reachable only under THREE for a real non-media peer —
+ * so flag-off and the single-pair path never enter it and stay byte-identical.
+ *
+ * It mirrors, for one extra peer, exactly what `welcome` builds for the media
+ * pair — but on that pair's OWN video pc (`p.pc`, from `startVideoPair`) instead
+ * of the module-scope `pc`, and on its OWN Lane A receive half (`pcm.addPeer`,
+ * §5.1) instead of half 0:
+ *
+ *   · `startVideoPair` — this pair's video pc + tape lane + second tile (law 2
+ *     attach at ITS addTransceiver, law 9 its own slot/claimSlot, laws 1/11/12
+ *     per pc). Null unless `wantTape === 2`, in which case there is no carrier
+ *     pc for audio to ride either and the pair cannot form (the caller keeps
+ *     recording it as `owed`, exactly as phase 3 did).
+ *   · `pcm.addPeer()` — this peer's receive half (its own SAB ring, playout
+ *     node, FEC decode, ladder), summed at the destination with half 0 (§5.2).
+ *   · idx-0 'pcm-audio' channel on `p.pc`, wired like `startPcm`'s media-pair
+ *     channel but addressed to this half; the answerer chains its ondatachannel
+ *     onto whatever `startTape` already installed.
+ *   · `startPcmStripes` — idx 1..N-1 on this pair's own stripe pcs, keyed in
+ *     `pcmPcs` under this letter (no `pcmAdoptLadder`: it already has one).
+ */
+function buildPair(peerRole) {
+  if (!THREE || !peerRole || peerRole === mediaPeer) return null;
+  const p = peers.get(peerRole);
+  if (!p) return null;
+  if (p.pc) return p; // already built — idempotent across welcome/peer-joined/offer
+  const initiator = offersTo(peerRole);
+  startVideoPair(peerRole); // sets p.pc / p.pre / p.tape / p.slot; null unless wantTape===2
+  if (!p.pc) return null;
+  if (pcm && PCM_AUDIO && !pcmFellBack) {
+    const half = pcm.addPeer();
+    p.pcmHalf = half;
+    if (initiator) {
+      const dc = p.pc.createDataChannel('pcm-audio', { ordered: false, maxRetransmits: 0 });
+      pcm.attachChannel(dc, 0, half);
+    } else {
+      const prev = p.pc.ondatachannel;
+      p.pc.ondatachannel = (e) => {
+        try { prev?.call(p.pc, e); } catch { /* keep the tape-ctl chain intact */ }
+        if (e.channel.label === 'pcm-audio') pcm?.attachChannel(e.channel, 0, half);
+      };
+    }
+    if (PCM_CFG.pairs > 1) startPcmStripes(peerRole, initiator, half);
+  }
+  tel?.log('pair-build', { peer: peerRole, initiator: initiator ? 1 : 0, half: p.pcmHalf ?? null });
+  return p;
+}
+
+/** Offer half for a non-media pair — `offer()` untouched (its media path stays literal). */
+async function pairOffer(p) {
+  const o = await p.pc.createOffer();
+  o.sdp = tuneVideoCarrier(tuneAudio(o.sdp));
+  await p.pc.setLocalDescription(o);
+  send({ type: 'offer', sdp: p.pc.localDescription, ...addr(p.role) });
+}
+
+/**
+ * Route one inbound pairwise frame to its non-media pair. The offer is the
+ * answerer's cue to build the pair; anything that reaches us before that pair's
+ * pc exists is queued by `deferPair` and drained here, in arrival order, the
+ * instant it does.
+ */
+async function routePair(m) {
+  const p = peers.get(m.from);
+  if (!p) { deferPair(m); return; }
+  if (!p.pc && m.type === 'offer') buildPair(p.role);
+  if (!p.pc) { deferPair(m); return; }
+  await applyPairFrame(p, m);
+  await drainPair(p);
+}
+
+/** Replay the frames that arrived before this pair's pc existed, oldest first. */
+async function drainPair(p) {
+  const q = p.pending;
+  if (!q || !q.length) return;
+  p.pending = null;
+  for (const m of q) await applyPairFrame(p, m);
+}
+
+/**
+ * Apply one pairwise frame on a non-media pair's own pc / stripe ladder —
+ * the per-pair twin of the media handlers in the message loop, addressed with
+ * `to:` and keyed by `pcmLadder(p.role)`. The media path in the loop is left
+ * literally unchanged; this is only ever reached via `routePair`.
+ */
+async function applyPairFrame(p, m) {
+  const pcx = p.pc;
+  if (!pcx) { deferPair(m); return; }
+  const t = m.type;
+  if (t === 'offer') {
+    sdpProbe('pair-offer.recv', m.sdp?.sdp ?? m.sdp);
+    await pcx.setRemoteDescription(m.sdp);
+    if (wantTape === 2 && answersTo(p.role) && p.pre?.claimSlot) {
+      await safeAsync(() => p.pre.claimSlot(m.sdp?.sdp ?? m.sdp), 'tape.slot-claim');
+    }
+    const a = await pcx.createAnswer();
+    a.sdp = tuneVideoCarrier(tuneAudio(a.sdp));
+    await pcx.setLocalDescription(a);
+    send({ type: 'answer', sdp: pcx.localDescription, ...addr(p.role) });
+    // The one leg no local rig can reach (both ends are second-pair pcs): make
+    // its success explicit so the 3-browser run reads pass/fail off telemetry.
+    tel?.log('pair-answered', { peer: p.role, sig: pcx.signalingState, conn: pcx.connectionState });
+  } else if (t === 'answer') {
+    await pcx.setRemoteDescription(m.sdp);
+  } else if (t === 'ice') {
+    await pcx.addIceCandidate(m.candidate).catch(() => {});
+  } else if (t === 'reoffer') {
+    if (offersTo(p.role)) await pairOffer(p);
+  } else if (t === 'audio-fallback') {
+    // The peer's Lane A half toward us died. There is no per-half Opus rebuild
+    // (pcm.js is one instance), and the module-scope fallbackToOpus would retire
+    // the MEDIA pair's lane too — so this is per-pair telemetry only.
+    tel?.log('pair-audio-fallback', { peer: p.role, why: m.why ?? null });
+  } else if (t === 'video-fallback') {
+    // The peer's Lane 2 died; stop THIS pair's tape lane so it stops clocking a
+    // decoder that is gone. Per pair — the media pair's lane is untouched.
+    safe(() => p.tape?.stop?.(), 'pair.video-fallback');
+    tel?.log('pair-video-fallback', { peer: p.role, why: m.why ?? null });
+  } else if (t === 'pcm-offer') {
+    const spc = pcmLadder(p.role)?.[m.idx];
+    if (spc && !spc.remoteDescription) {
+      await spc.setRemoteDescription(m.sdp);
+      const ans = await spc.createAnswer();
+      await spc.setLocalDescription(ans);
+      send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(p.role) });
+    }
+  } else if (t === 'pcm-answer') {
+    const spc = pcmLadder(p.role)?.[m.idx];
+    if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
+  } else if (t === 'pcm-ice') {
+    await pcmLadder(p.role)?.[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
+  }
 }
 
 /**
@@ -4581,7 +4748,17 @@ async function join(room) {
         tel.log('room-full-msg', {});
         ws.onclose = null;
         ws.onerror = null;
+        // wsPreOpenFail rejects the join promise — but an ADOPTED pre-dial
+        // socket resolves that promise immediately (readyState OPEN), so by
+        // the time this message lands the rejector is already spent (nulled
+        // in .finally). Found on staging: a 3-full room left the 4th joiner
+        // stuck on "starting…" forever. So drive the refusal UI directly,
+        // the same recipe the join() catch uses, and only ALSO reject the
+        // promise for the not-yet-adopted path where it is still armed.
         wsPreOpenFail?.(new Error('this call may already have two people in it'));
+        $('joinStatus').textContent = "couldn't join: this call may already have two people in it";
+        $('join').disabled = false;
+        if (resumePending) { resumePending = false; clearLive(); }
         safe(() => ws.close(), 'full.close');
         return;
       }
@@ -4754,7 +4931,7 @@ async function join(room) {
         // Phase 2 resolves that dispatch to one pc; phase 3 replaces the guard
         // with a per-pair lookup and the bodies stop reading the module-scope
         // `pc`/`pcmPcs` at all.
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('offer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
         // Lane 2 answerer: put our carrier INTO this answer by claiming the offer's
@@ -4773,18 +4950,18 @@ async function join(room) {
         await pc.setLocalDescription(a);
         send({ type: 'answer', sdp: pc.localDescription, ...addr(m.from ?? mediaPeer) });
       } else if (m.type === 'answer') {
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('answer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
         sdpProbe('answer.applied', pc.localDescription?.sdp);
       } else if (m.type === 'ice') {
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         await pc.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'audio-fallback') {
         // The peer's lane A died. Its graph is both our playout and its capture,
         // so its failure is ours too — switch to Opus without re-broadcasting.
         // Pairwise: only the pair that shares our lane A can retire it.
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         fallbackToOpus(`peer-${m.why || 'fallback'}`, true);
       } else if (m.type === 'video-fallback') {
         // The peer's lane 2 died and it is now on plain RTP. Our carrier is a
@@ -4793,7 +4970,7 @@ async function join(room) {
         // camera on the carrier's negotiated m-line, which is exactly the track
         // the peer's fallback display is watching. Guarded on wantTape: a side
         // that never ran the lane has no carrier to un-cripple.
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         if (wantTape) fallbackToRtp(`peer-${m.why || 'fallback'}`, true);
       } else if (m.type === 'reoffer') {
         // The answerer added a sender mid-call and cannot offer for it. Exactly
@@ -4801,7 +4978,7 @@ async function join(room) {
         // of this codebase — so the answerer asks instead of racing. §3.1 gives
         // it an address: the request names its offerer, and the offerer re-offers
         // to that peer only rather than to everyone it is paired with.
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         if (offersTo(mediaPeer)) await offer(mediaPeer);
       } else if (m.type === 'pcm-offer') {
         // Lane A stripe answer (§17.12): one offer/answer round per stripe pc,
@@ -4809,7 +4986,7 @@ async function join(room) {
         // same address the main pc's SDP does — `pcmPcs` is the media pair's
         // ladder and indexing it with another pair's `idx` would answer a stripe
         // that pair never offered.
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
@@ -4818,11 +4995,11 @@ async function join(room) {
           send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(m.from ?? mediaPeer) });
         }
       } else if (m.type === 'pcm-answer') {
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
       } else if (m.type === 'pcm-ice') {
-        if (!forMediaPair(m.from)) { deferPair(m); return; }
+        if (!forMediaPair(m.from)) { await routePair(m); return; }
         await pcmLadder(m.from ?? mediaPeer)?.[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
@@ -5012,12 +5189,35 @@ async function offer(peerRole = mediaPeer) {
  */
 async function offerToPairs(why) {
   for (const p of peers.values()) {
-    if (!offersTo(p.role) || p.offered) continue;
     if (p.role !== mediaPeer) {
-      p.owed = true;
-      tel?.log('pair-offer-deferred', { peer: p.role, why });
+      // Phase 6: build this second pair's transport for BOTH roles here — the
+      // answerer included — not lazily on its first offer. The media pair gets a
+      // full network-RTT gap between `welcome` (which builds it) and the offer
+      // arriving, so its pc is fully initialised (encoder, transceivers, ctl
+      // channel) before it must answer; a pair built back-to-back with its own
+      // `createAnswer` inside `routePair` raced that init and never answered
+      // (staging: the b↔c pair, the one pair 'a' does not offer, never formed).
+      // Only the offerer sends; the answerer's pc simply waits, ready, for the
+      // offer — `routePair` still lazy-builds as a fallback if this did not run.
+      const built = buildPair(p.role);
+      if (!built || !built.pc) {
+        if (offersTo(p.role) && !p.offered) {
+          p.owed = true;
+          tel?.log('pair-offer-deferred', { peer: p.role, why });
+        }
+        continue;
+      }
+      await drainPair(built); // anything that beat the build, in arrival order
+      if (offersTo(p.role) && !p.offered) {
+        p.offered = true;
+        p.owed = false;
+        await pairOffer(built);
+        if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll(p.role);
+      }
       continue;
     }
+    // Media pair — literally unchanged from phase 2/3.
+    if (!offersTo(p.role) || p.offered) continue;
     p.offered = true;
     await offer(p.role);
     if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll(p.role);
@@ -6334,6 +6534,12 @@ window.__tape = {
       peers: [...peers.values()].map((p) => ({
         role: p.role, lane: p.lane, pcm: p.pcm, media: p.media,
         offerer: offersTo(p.role), offered: p.offered, owed: p.owed, deferred: p.deferred,
+        // Live per-pair connection state, so call3.mjs asserts on real legs
+        // rather than on intent. The media pair's video rides the module pc;
+        // a built second pair carries its own p.pc, and its audio stripes ride
+        // pcmLadder(role) — pcmConn reports its idx-0 (main) pc.
+        conn: (p.media ? pc : p.pc)?.connectionState ?? null,
+        pcmConn: (p.media ? pc : (pcmLadder(p.role)?.[0] ?? p.pc))?.connectionState ?? null,
       })),
     };
   },
