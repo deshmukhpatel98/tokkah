@@ -4221,3 +4221,7 @@ now a capture spine + per-peer halves; AEC2 far-end is an epoch-tagged accumulat
 Three phase 4 landed (shared encoder behind per-peer transport halves, second
 tile inert at 0x0). Live gates: 0 conceal x4 both arms, g2g ~32 ms, ui-call ALL
 PASS x5 viewports. fscheck-call.mjs is stale from d846bf3 (#c-lifesize removed).
+
+Three phase 5 landed: two-tile UI (equal split, per-tile wash + state line, bar
+untouched, no talking-time motion). ui-call ALL PASS incl new three-mode section
+x5 viewports; 0 conceal. Worker deployed to staging, prod promotion done here.
