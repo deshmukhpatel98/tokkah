@@ -1256,7 +1256,15 @@ const csp = (host: string) => [
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'self'",
-  "frame-ancestors 'none'",
+  // The one-line embed (embed.js) IS the product's distribution model, and it
+  // frames this page from arbitrary third-party origins — 'none' here made
+  // the README's headline integration a blank rectangle on every site that
+  // tried it (found live 2026-08-11; it can never have worked). '*' is the
+  // honest setting, not a concession: a param-gated variant would be theater
+  // (any framer can add the param), and the real clickjacking defense is the
+  // browser's own permission UX — camera/mic prompts inside a frame are
+  // attributed to the EMBEDDING origin, which the user sees and judges.
+  'frame-ancestors *',
 ].join('; ');
 
 export default {
@@ -1393,8 +1401,9 @@ export default {
     res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     if (asset.headers.get('content-type')?.includes('text/html')) {
       res.headers.set('Content-Security-Policy', csp(new URL(request.url).host));
-      // Defense in depth for pre-CSP2 browsers; frame-ancestors above wins elsewhere.
-      res.headers.set('X-Frame-Options', 'DENY');
+      // No X-Frame-Options: it cannot express "any ancestor" (its ALLOW-FROM
+      // died with IE) and DENY here silently vetoed the embed in pre-CSP2
+      // browsers exactly as frame-ancestors 'none' did everywhere else.
       // Lane A needs SharedArrayBuffer for its playout ring, which browsers only
       // grant to cross-origin-isolated documents. It is now on by default, so the
       // headers are unconditional — gating them on the query string would have
