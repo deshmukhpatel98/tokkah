@@ -4325,3 +4325,8 @@ Device census shipped: connect beat carries cores/mem/downlink/rtt/camera/dpr
 (coarse buckets, zero latency), fleet-aggregated. Leaky DT adaptation live (3%
 mu under double-talk; all six guarantee arms hold) - the convergence frontier
 awaits its field verdict via aecGateOpenPct/aecErleMaxDb on the next real call.
+
+dtPct discriminator shipped (bleed hypothesis testable on next real call). The
+gate close is now two-tier: instant on proven harm (<-2 dB), dwelled only in the
+ambiguous band - found because the live rig caught my own dwell delivering -6.6
+dB for 2 s under a collapsed spurious correlation. 6/6 arms; live arms OK x2.
