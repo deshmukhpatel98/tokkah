@@ -478,21 +478,35 @@ function startRemoteFill() {
 // The defaults are the ones that won on this machine; see §17.2.
 const QS = new URLSearchParams(location.search);
 
-// ── Synthetic media (test hook, ?synthmedia=1) ───────────────────────────────
+// ── Synthetic media (test hook, ?synthmedia=1 or ?synthmedia=real) ──────────
 // Real Safari has no fake-device flags (Chromium's --use-fake-device... has no
 // WebKit equivalent) and a WebDriver session cannot answer the camera/mic
-// permission prompt. This shim replaces getUserMedia wholesale with a canvas
-// capture + noise audio graph so the REAL engine's scheduling, worklets and
-// datachannel path can be measured end-to-end (task #42). It fakes the
-// stimulus, never the pipeline — everything downstream of the tracks is the
-// shipping code. Off unless the flag is present, so it cannot affect users.
-if (QS.get('synthmedia') === '1') {
+// permission prompt. This shim replaces getUserMedia wholesale so the REAL
+// engine's scheduling, worklets and datachannel path can be measured end-to-end.
+// `?synthmedia=real` delivers a real talking head (/testmedia/real720.mp4) per the
+// testing-realism law; `?synthmedia=1` stays byte-identical for rigs calibrated on
+// its gradient + noise output. Off unless the flag is present.
+const SYNTH_MODE = QS.get('synthmedia');
+if (SYNTH_MODE === '1' || SYNTH_MODE === 'real') {
   const cv = document.createElement('canvas');
   cv.width = 1280; cv.height = 720;
   const g = cv.getContext('2d');
+  let vid = null;
+  if (SYNTH_MODE === 'real') {
+    vid = document.createElement('video');
+    vid.src = '/testmedia/real720.mp4';
+    vid.muted = true;
+    vid.loop = true;
+    vid.playsInline = true;
+    vid.play().catch(() => {});
+  }
   let fr = 0;
   const draw = () => {
     fr++;
+    if (SYNTH_MODE === 'real' && vid && vid.readyState >= 2) {
+      g.drawImage(vid, 0, 0, cv.width, cv.height);
+      return;
+    }
     // Moving gradient + per-frame noise blocks: sd well above the harness's
     // "black/flat" threshold, and it never repeats a frame exactly.
     const grad = g.createLinearGradient((fr * 7) % cv.width, 0, ((fr * 7) % cv.width) + 640, cv.height);
@@ -512,20 +526,26 @@ if (QS.get('synthmedia') === '1') {
   // timers keep firing at full rate while the page is visible-but-occluded.
   setInterval(draw, 33);
   let synthCtx = null;
+  let vidAudioSrc = null;
   navigator.mediaDevices.getUserMedia = async (c = {}) => {
     const out = new MediaStream();
     if (c.video) for (const t of cv.captureStream(30).getVideoTracks()) out.addTrack(t);
     if (c.audio) {
       synthCtx ??= new (window.AudioContext ?? window.webkitAudioContext)({ sampleRate: 48000 });
       const dst = synthCtx.createMediaStreamDestination();
-      // Speech-band noise, not silence: the PCM lane's lossless coder would
-      // shrink silence to nothing and understate the real send rate.
-      const buf = synthCtx.createBuffer(1, synthCtx.sampleRate * 2, synthCtx.sampleRate);
-      const d = buf.getChannelData(0);
-      let s = 22222;
-      for (let i = 0; i < d.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; d[i] = (s / 0x3fffffff - 1) * 0.08; }
-      const src = synthCtx.createBufferSource();
-      src.buffer = buf; src.loop = true; src.connect(dst); src.start();
+      if (SYNTH_MODE === 'real') {
+        vidAudioSrc ??= synthCtx.createMediaElementSource(vid);
+        vidAudioSrc.connect(dst);
+      } else {
+        // Speech-band noise, not silence: the PCM lane's lossless coder would
+        // shrink silence to nothing and understate the real send rate.
+        const buf = synthCtx.createBuffer(1, synthCtx.sampleRate * 2, synthCtx.sampleRate);
+        const d = buf.getChannelData(0);
+        let s = 22222;
+        for (let i = 0; i < d.length; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; d[i] = (s / 0x3fffffff - 1) * 0.08; }
+        const src = synthCtx.createBufferSource();
+        src.buffer = buf; src.loop = true; src.connect(dst); src.start();
+      }
       // Safari suspends a context created without a user gesture; the join
       // click (a trusted WebDriver click counts) resumes it.
       if (synthCtx.state === 'suspended') addEventListener('click', () => synthCtx.resume(), { once: true });

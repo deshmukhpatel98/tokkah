@@ -19,3 +19,4 @@ fatigue-lab/runs/
 
 # Local dev secrets
 tape-app/.dev.vars
+tape-app/public/testmedia/
