@@ -4181,3 +4181,9 @@ embedded iframe <-> app peer live on prod, 1503 frames, port mode, 32 ms conceal
 10-min live soak on the latency-floor default: NO RATCHET. Depth held 13-21 ms
 (2-3f target) for the full 600 s, mouthToEar 43.7-51.5 ms, conceal 48-56 ms total
 (0.008%). The 2f posture is stable over long calls, not just 30 s rigs.
+
+Connect-time, the remaining slices, CLOSED as dead ends: the 75 ms welcome->offer
+gap is ~2 ws RTTs of DO relay (A's own peer-joined->offer-tx gap is 5 ms), and the
+144 ms DTLS/stripe phase is handshake RTTs on 7 already-parallel connections.
+Neither is client work; shaving them means moving signaling off the DO round-trip
+path, which is not a low-hanging fruit. Recorded so nobody re-chases them.
