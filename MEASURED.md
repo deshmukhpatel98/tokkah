@@ -4205,3 +4205,7 @@ frames, 88 ms conceal, remote luma sd 46.5 - a real human on every test surface.
 Interpreter on iOS (simulator, mobile Safari, real-media hook): both directions
 opened (es<->en), 37 captions + 37 TTS segments delivered live on prod. The
 flagship feature runs on every surface we can drive.
+
+Three-person phase 1 landed dormant (DO roles/relay/version-gate, THREE_ENABLED
+false = byte-identical; all gates green live). Ops lesson: a booted iOS simulator
+costs ~1.3 s host stalls in concealment rigs - shut it down first.
