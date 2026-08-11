@@ -4209,3 +4209,6 @@ flagship feature runs on every surface we can drive.
 Three-person phase 1 landed dormant (DO roles/relay/version-gate, THREE_ENABLED
 false = byte-identical; all gates green live). Ops lesson: a booted iOS simulator
 costs ~1.3 s host stalls in concealment rigs - shut it down first.
+
+Three phase 2 landed (client pairs, signaling-only, media single-pair; ?three=1
+default off). Live gates green on both arms; flag-off equivalence reviewed.
