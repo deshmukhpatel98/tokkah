@@ -4320,3 +4320,8 @@ dwell (xow flipped 12x = audible pumping). THE OPEN FRONTIER, named from real
 data: cross-room bleed reads as permanent double-talk, DTD freezes, canceller
 never converges on real rooms - the fleet fields are the progress meter.
 User verdict on record: beats Google Meet; competition is a real room.
+
+Device census shipped: connect beat carries cores/mem/downlink/rtt/camera/dpr
+(coarse buckets, zero latency), fleet-aggregated. Leaky DT adaptation live (3%
+mu under double-talk; all six guarantee arms hold) - the convergence frontier
+awaits its field verdict via aecGateOpenPct/aecErleMaxDb on the next real call.
