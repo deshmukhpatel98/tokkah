@@ -4313,3 +4313,10 @@ speakerphone HAL), ears on presence/spatial tuning, the prod THREE flip.
 FIRST REAL-CALL-DRIVEN FIX of the new era: duress() flapped on a marginal real
 link (35 transitions/219 s, budget 2<->8 Mbps whipsaw) - now latched (rise
 instant, fall after 4 s sustained). Live gates green. The telemetry loop works.
+
+ECHO OBSERVABILITY shipped (directive: track everything, zero latency): end beat
+carries corr/gateOpenPct/flips/erleMax, fleet-aggregated. Gate close gains a 2 s
+dwell (xow flipped 12x = audible pumping). THE OPEN FRONTIER, named from real
+data: cross-room bleed reads as permanent double-talk, DTD freezes, canceller
+never converges on real rooms - the fleet fields are the progress meter.
+User verdict on record: beats Google Meet; competition is a real room.
