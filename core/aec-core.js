@@ -150,6 +150,12 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   // time constant.
   let gateOpen = false
   let gateLowBlocks = 0
+  // Diagnostic counters: how much of this call the DTD held adaptation at the
+  // whisper rate. The bleed hypothesis (room xow-offc-apz: cross-room voices
+  // read as permanent double-talk) predicts dtPct near 100 on that setup —
+  // this number is how the next real call proves or refutes it.
+  let dtBlocks = 0
+  let activeBlocks = 0
   let refSilentBlocks = 0
 
   function resetWeights() {
@@ -308,6 +314,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       }
 
       const dtActive = dtCount >= 3
+      activeBlocks++
+      if (dtActive) dtBlocks++
       if (dtActive) {
         // Double talk: adaptation drops to a WHISPER (below) but no longer
         // freezes outright. The first long real call (room xow-offc-apz, two
@@ -417,7 +425,14 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       // near-threshold ERLE no longer toggles the ear.
       if (!gateOpen && erleDbEma >= 3) { gateOpen = true; gateLowBlocks = 0 }
       else if (gateOpen) {
-        if (erleDbEma < 1) { if (++gateLowBlocks > 750) { gateOpen = false; gateLowBlocks = 0 } }
+        // Two-tier close. PROVEN HARM (< -2 dB: the filter is adding energy —
+        // an echo path that vanished under an open gate, e.g. speaker muted
+        // or a spurious correlation collapsing) exits IMMEDIATELY: the live
+        // rig caught the dwell delivering -6.6 dB for its full 2 s, which is
+        // worse than the flip it prevents. AMBIGUITY (between -2 and 1 dB)
+        // keeps the dwell, because that band is where xow-offc-apz pumped.
+        if (erleDbEma < -2) { gateOpen = false; gateLowBlocks = 0 }
+        else if (erleDbEma < 1) { if (++gateLowBlocks > 750) { gateOpen = false; gateLowBlocks = 0 } }
         else gateLowBlocks = 0
       }
     }
@@ -496,7 +511,8 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
       delayBlocks: delayBlocks,
       adapting: lastAdapting,
       converged: erleDbEma !== null && erleDbEma >= 12,
-      gate: gateOpen ? 1 : 0
+      gate: gateOpen ? 1 : 0,
+      dtPct: activeBlocks ? +((100 * dtBlocks) / activeBlocks).toFixed(1) : null
     }
   }
 

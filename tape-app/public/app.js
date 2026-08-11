@@ -2029,7 +2029,7 @@ let aecLatched = false;
 // Per-call echo accumulator (see the aec2-stats tap below): what the end beat
 // reports so the fleet can see echo, not just the room log. corrMax comes from
 // echo-detected; the rest from the canceller's own 5.5 s ticks.
-const xaec = { ticks: 0, openTicks: 0, flips: 0, lastGate: null, erleMax: -Infinity, corrMax: 0 };
+const xaec = { ticks: 0, openTicks: 0, flips: 0, lastGate: null, erleMax: -Infinity, corrMax: 0, dtPct: null };
 function startPcm(peerRole, initiator) {
   safe(() => {
     pcm = initPcmAudio({
@@ -2054,6 +2054,7 @@ function startPcm(peerRole, initiator) {
           if (xaec.lastGate !== null && d.gate !== xaec.lastGate) xaec.flips++;
           xaec.lastGate = d.gate ?? null;
           if (typeof d.erleDb === 'number' && d.erleDb > xaec.erleMax) xaec.erleMax = d.erleDb;
+          if (typeof d.dtPct === 'number') xaec.dtPct = d.dtPct; // cumulative, last read = call total
         }
       },
       // The remote detector lives in the playout worklet now; its events are
@@ -6815,6 +6816,7 @@ safe(() => {
       aecGateOpenPct: xaec.ticks ? +((100 * xaec.openTicks) / xaec.ticks).toFixed(1) : null,
       aecGateFlips: xaec.ticks ? xaec.flips : null,
       aecErleMaxDb: Number.isFinite(xaec.erleMax) ? +xaec.erleMax.toFixed(1) : null,
+      aecDtPct: xaec.dtPct, // the bleed-hypothesis discriminator
     });
   };
   addEventListener('pagehide', () => window.__hbEnd?.('pagehide'));

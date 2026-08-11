@@ -1238,6 +1238,7 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   aecGateOpenPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
   aecGateFlips: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 100_000),
   aecErleMaxDb: (v) => v === null || (typeof v === 'number' && v > -100 && v < 100),
+  aecDtPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
   // Device/environment class (directive 2026-08-11) — coarse buckets only.
   cores: (v) => v === null || (typeof v === 'number' && v >= 1 && v <= 256),
   mem: (v) => v === null || (typeof v === 'number' && v >= 0.25 && v <= 64),
@@ -1255,7 +1256,7 @@ const HB_ALLOWED: Record<string, Set<string>> = {
   // (how far away did the person feel), aggregates with nothing identifying.
   end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason',
     'mouthToEarMs', 'glassToGlassMs', 'humanGapMs',
-    'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb']),
+    'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb', 'aecDtPct']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1285,7 +1286,7 @@ export class Health implements DurableObject {
     for (const col of ['mouth_to_ear_ms REAL', 'glass_to_glass_ms REAL', 'human_gap_ms REAL',
       'echo_corr_max REAL', 'aec_gate_open_pct REAL', 'aec_gate_flips REAL', 'aec_erle_max_db REAL',
       'cores REAL', 'mem REAL', 'dl_mbps REAL', 'rtt_est_ms REAL', 'cam_w REAL', 'cam_h REAL',
-      'cam_fps REAL', 'dpr REAL']) {
+      'cam_fps REAL', 'dpr REAL', 'aec_dt_pct REAL']) {
       try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // Operator room registry. The health BEATS stay anonymous by design (no
@@ -1320,8 +1321,8 @@ export class Health implements DurableObject {
         `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason,
                             mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms,
                             echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db,
-                            cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
@@ -1333,6 +1334,7 @@ export class Health implements DurableObject {
         (beat.dlMbps as number | null) ?? null, (beat.rttEstMs as number | null) ?? null,
         (beat.camW as number | null) ?? null, (beat.camH as number | null) ?? null,
         (beat.camFps as number | null) ?? null, (beat.dpr as number | null) ?? null,
+        (beat.aecDtPct as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
@@ -1370,7 +1372,7 @@ export class Health implements DurableObject {
         `SELECT evt, engine, net, ttc_ms, dur_s, conceal_pct, reason,
                 mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms,
                 echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db,
-                cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr
+                cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct
            FROM beats WHERE wall >= ? ORDER BY id DESC LIMIT 20000`,
         since,
       ).toArray() as Array<Record<string, unknown>>;
@@ -1402,6 +1404,7 @@ export class Health implements DurableObject {
         aecGateOpenPct: stats(nums('end', 'aec_gate_open_pct')),
         aecGateFlips: stats(nums('end', 'aec_gate_flips')),
         aecErleMaxDb: stats(nums('end', 'aec_erle_max_db')),
+        aecDtPct: stats(nums('end', 'aec_dt_pct')),
         // Device/environment class: what hardware and networks real calls run
         // on. byCores/byCam are population buckets; the rest percentiles.
         byCores: by((r) => (r.evt === 'connect' ? r.cores : null)),
