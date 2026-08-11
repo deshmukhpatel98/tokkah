@@ -2026,6 +2026,10 @@ let welcomeAtMs = 0; // local wall ms when the welcome (and its epoch) arrived
  * channel simply stays quiet until both it and the graph are ready.
  */
 let aecLatched = false;
+// Per-call echo accumulator (see the aec2-stats tap below): what the end beat
+// reports so the fleet can see echo, not just the room log. corrMax comes from
+// echo-detected; the rest from the canceller's own 5.5 s ticks.
+const xaec = { ticks: 0, openTicks: 0, flips: 0, lastGate: null, erleMax: -Infinity, corrMax: 0 };
 function startPcm(peerRole, initiator) {
   safe(() => {
     pcm = initPcmAudio({
@@ -2037,6 +2041,20 @@ function startPcm(peerRole, initiator) {
       log: (t, d) => {
         tel?.log(t, d);
         if (t === 'pcm-fail') fallbackToOpus(`pcm-fail-${d?.why ?? '?'}`);
+        // Echo observability (operator directive 2026-08-11: track everything,
+        // including echo, at zero latency cost). Every number here is already
+        // computed on the audio thread and shipped in this 5.5 s tick — this
+        // only ACCUMULATES on the main thread, so the call's end beat can say
+        // whether echo existed and whether the canceller actually helped.
+        // Room xow-offc-apz is why: the canceller never converged on a real
+        // room (ERLE ~0, gate flipped 12×) and nothing fleet-level could see it.
+        if (t === 'aec2-stats' && d) {
+          xaec.ticks++;
+          if (d.gate === 1) xaec.openTicks++;
+          if (xaec.lastGate !== null && d.gate !== xaec.lastGate) xaec.flips++;
+          xaec.lastGate = d.gate ?? null;
+          if (typeof d.erleDb === 'number' && d.erleDb > xaec.erleMax) xaec.erleMax = d.erleDb;
+        }
       },
       // The remote detector lives in the playout worklet now; its events are
       // the same shape onset-monitor.js produces, on the same shared context's
@@ -2053,6 +2071,7 @@ function startPcm(peerRole, initiator) {
       onPredict: LANE0 ? onPredict : null,
       onEchoDetected: ({ corr, lagMs }) => {
         if (PCM_CFG.aec2) {
+          if (corr > xaec.corrMax) xaec.corrMax = corr;
           tel?.log('echo-detected', { corr, lagMs, aec2: true });
           return;
         }
@@ -6772,6 +6791,13 @@ safe(() => {
       mouthToEarMs: p?.mouthToEarMs ?? null,
       glassToGlassMs: g,
       humanGapMs: hg,
+      // Echo, fleet-visible (directive 2026-08-11): did echo exist, and did
+      // the canceller actually help — the two questions room xow-offc-apz
+      // could only answer by an operator reading its log by hand.
+      echoCorrMax: xaec.corrMax > 0 ? +xaec.corrMax.toFixed(2) : null,
+      aecGateOpenPct: xaec.ticks ? +((100 * xaec.openTicks) / xaec.ticks).toFixed(1) : null,
+      aecGateFlips: xaec.ticks ? xaec.flips : null,
+      aecErleMaxDb: Number.isFinite(xaec.erleMax) ? +xaec.erleMax.toFixed(1) : null,
     });
   };
   addEventListener('pagehide', () => window.__hbEnd?.('pagehide'));

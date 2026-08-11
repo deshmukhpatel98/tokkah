@@ -1231,13 +1231,21 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   mouthToEarMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 10_000),
   glassToGlassMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 10_000),
   humanGapMs: (v) => v === null || (typeof v === 'number' && v > -10_000 && v < 60_000),
+  // Echo observability (directive 2026-08-11): did echo exist, did the
+  // canceller help. All accumulated client-side from numbers the audio
+  // thread already computes — zero added latency by construction.
+  echoCorrMax: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 1),
+  aecGateOpenPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
+  aecGateFlips: (v) => v === null || (typeof v === 'number' && v >= 0 && v < 100_000),
+  aecErleMaxDb: (v) => v === null || (typeof v === 'number' && v > -100 && v < 100),
 };
 const HB_ALLOWED: Record<string, Set<string>> = {
   connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs']),
   // mouthToEarMs / glassToGlassMs / humanGapMs: the presence-goal numbers
   // (how far away did the person feel), aggregates with nothing identifying.
   end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason',
-    'mouthToEarMs', 'glassToGlassMs', 'humanGapMs']),
+    'mouthToEarMs', 'glassToGlassMs', 'humanGapMs',
+    'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1264,7 +1272,8 @@ export class Health implements DurableObject {
     // alter an existing table, so each column is its own idempotent ALTER —
     // "duplicate column name" on a DO that already ran this is the expected
     // no-op, not an error.
-    for (const col of ['mouth_to_ear_ms REAL', 'glass_to_glass_ms REAL', 'human_gap_ms REAL']) {
+    for (const col of ['mouth_to_ear_ms REAL', 'glass_to_glass_ms REAL', 'human_gap_ms REAL',
+      'echo_corr_max REAL', 'aec_gate_open_pct REAL', 'aec_gate_flips REAL', 'aec_erle_max_db REAL']) {
       try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // Operator room registry. The health BEATS stay anonymous by design (no
@@ -1297,13 +1306,16 @@ export class Health implements DurableObject {
       }
       this.sql.exec(
         `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason,
-                            mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms,
+                            echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
         (beat.mouthToEarMs as number | null) ?? null, (beat.glassToGlassMs as number | null) ?? null,
         (beat.humanGapMs as number | null) ?? null,
+        (beat.echoCorrMax as number | null) ?? null, (beat.aecGateOpenPct as number | null) ?? null,
+        (beat.aecGateFlips as number | null) ?? null, (beat.aecErleMaxDb as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
@@ -1339,7 +1351,8 @@ export class Health implements DurableObject {
       const since = Date.now() - days * 86_400_000;
       const rows = this.sql.exec(
         `SELECT evt, engine, net, ttc_ms, dur_s, conceal_pct, reason,
-                mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms
+                mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms,
+                echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db
            FROM beats WHERE wall >= ? ORDER BY id DESC LIMIT 20000`,
         since,
       ).toArray() as Array<Record<string, unknown>>;
@@ -1366,6 +1379,11 @@ export class Health implements DurableObject {
         mouthToEarMs: stats(nums('end', 'mouth_to_ear_ms')),
         glassToGlassMs: stats(nums('end', 'glass_to_glass_ms')),
         humanGapMs: stats(nums('end', 'human_gap_ms')),
+        // Echo, fleet-wide: how often it exists and whether cancellation helps.
+        echoCorrMax: stats(nums('end', 'echo_corr_max')),
+        aecGateOpenPct: stats(nums('end', 'aec_gate_open_pct')),
+        aecGateFlips: stats(nums('end', 'aec_gate_flips')),
+        aecErleMaxDb: stats(nums('end', 'aec_erle_max_db')),
         failReasons: rows.filter((r) => r.evt === 'fail').reduce((m: Record<string, number>, r) => {
           const k = String(r.reason ?? '-'); m[k] = (m[k] ?? 0) + 1; return m;
         }, {}),

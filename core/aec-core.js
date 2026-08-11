@@ -149,6 +149,7 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
   // real echo appears and ERLE climbs, delivery engages within the EMA's
   // time constant.
   let gateOpen = false
+  let gateLowBlocks = 0
   let refSilentBlocks = 0
 
   function resetWeights() {
@@ -392,10 +393,19 @@ export function createAec({ sampleRate = 48000, block = 128, partitions = 24 } =
         wasConverged = true
       }
       // The harm gate's only inputs: proven help opens it, proven none
-      // closes it. Both thresholds live on the EMA, so one wild block moves
-      // nothing.
-      if (!gateOpen && erleDbEma >= 3) gateOpen = true
-      else if (gateOpen && erleDbEma < 1) gateOpen = false
+      // closes it. Both thresholds live on the EMA — and the CLOSE now has a
+      // dwell on top: the first long real call (room xow-offc-apz, two Macs
+      // one room apart, 2026-08-11) sat with ERLE breathing around the 1–3 dB
+      // band and flipped the gate 12 times — echo pumping in and out is worse
+      // to a listener than either steady state. Open stays instant (help
+      // proven = deliver now); close waits for the EMA to hold under 1 dB for
+      // 750 consecutive blocks (~2 s at 48 kHz/128) so one breath of
+      // near-threshold ERLE no longer toggles the ear.
+      if (!gateOpen && erleDbEma >= 3) { gateOpen = true; gateLowBlocks = 0 }
+      else if (gateOpen) {
+        if (erleDbEma < 1) { if (++gateLowBlocks > 750) { gateOpen = false; gateLowBlocks = 0 } }
+        else gateLowBlocks = 0
+      }
     }
 
     // 8. Bulk-delay estimation (~every 250 blocks)
