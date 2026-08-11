@@ -4197,3 +4197,7 @@ Testing-realism migration: all rigs now default to real talking-head fixtures
 percent-encoding silently killed the fake camera; and the aec auto arm's premise
 (beep periodicity as fake echo) does not survive real speech - inverted to a
 no-false-latch guarantee. Full suite green on real media, live.
+
+synthmedia=real shipped: iOS/Safari test surface now feeds on the NASA interview
+via the same canvas/AudioContext hook (iOS-safe). Live iOS-vs-desktop call: 4475
+frames, 88 ms conceal, remote luma sd 46.5 - a real human on every test surface.
