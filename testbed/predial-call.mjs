@@ -31,6 +31,11 @@ async function launch() {
     args: [
       '--use-fake-ui-for-media-stream',
       '--use-fake-device-for-media-stream',
+      // The testing-realism law (2026-08-11): real talking-head media, never
+      // synthetic artifacts — a fake device's beep-and-spinner exercises nothing
+      // a human call exercises. Fixtures: testbed/media/real/fetch.sh.
+      `--use-file-for-fake-audio-capture=${decodeURIComponent(new URL('./media/real/realA.wav', import.meta.url).pathname)}`,
+      `--use-file-for-fake-video-capture=${decodeURIComponent(new URL('./media/real/realA.mjpeg', import.meta.url).pathname)}`,
       '--autoplay-policy=no-user-gesture-required',
       '--alsa-output-device=null',
     ],

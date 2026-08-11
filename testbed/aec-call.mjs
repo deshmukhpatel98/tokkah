@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /**
- * AEC latch end-to-end. Chrome's fake audio device is a PERIODIC beep, so in a
- * two-Chromium call each side hears a beep train whose envelope correlates
- * with its own mic's beep train at a stable lag — which is indistinguishable
- * from acoustic echo to an envelope correlator, and that is exactly the point:
- * it drives the shipped detect → latch → reacquire chain in a real call
- * without needing real acoustics (fake devices cannot feed playout back into
- * capture, so genuine echo is impossible here).
+ * AEC latch end-to-end, on REAL speech (testing-realism law, 2026-08-11).
+ *
+ * History: this rig once drove the latch via Chrome's periodic fake beep,
+ * whose envelope self-correlation faked echo. Real conversation audio has no
+ * such periodicity, and fake devices cannot feed playout back into capture —
+ * so with realistic media, genuine echo is IMPOSSIBLE here, and the honest
+ * assertions invert:
  *
  * Arms:
- *   auto  — no flag: the detector must latch, and the mic track must come back
- *           with echoCancellation:true while NS/AGC stay false.
+ *   auto  — no flag: the detector must stay SILENT — no false latch on real
+ *           echo-free speech for 45 s, the exact guarantee headphone users
+ *           rely on (their pristine mic must never be reacquired "just in
+ *           case"). The latch's firing path is covered by the force arm and
+ *           the detector's own unit arms; its real-echo trigger gets its
+ *           verdict on a real speakerphone call.
  *   off   — ?aec=0: nothing may fire for the whole window and the mic stays raw.
  *   force — ?aec=1: echoCancellation:true from the FIRST getUserMedia.
  *
@@ -36,6 +40,11 @@ async function launch() {
     args: [
       '--use-fake-ui-for-media-stream',
       '--use-fake-device-for-media-stream',
+      // The testing-realism law (2026-08-11): real talking-head media, never
+      // synthetic artifacts — a fake device's beep-and-spinner exercises nothing
+      // a human call exercises. Fixtures: testbed/media/real/fetch.sh.
+      `--use-file-for-fake-audio-capture=${decodeURIComponent(new URL('./media/real/realA.wav', import.meta.url).pathname)}`,
+      `--use-file-for-fake-video-capture=${decodeURIComponent(new URL('./media/real/realA.mjpeg', import.meta.url).pathname)}`,
       '--autoplay-policy=no-user-gesture-required',
       '--alsa-output-device=null',
     ],
@@ -75,16 +84,11 @@ async function runArm(mode) {
     ok = s?.ec === true && s?.ns === false && s?.agc === false && s?.state === 'live';
     detail = JSON.stringify(s);
   } else if (mode === 'auto') {
-    // The detector needs ≥2 s of both envelopes plus 3 consecutive 500 ms polls;
-    // give it a wide margin, then require the reacquired track.
-    ok = await A.page
-      .waitForFunction(() => {
-        const s = document.getElementById('selfFull').srcObject?.getAudioTracks?.()[0]?.getSettings?.();
-        return s?.echoCancellation === true;
-      }, null, { timeout: 45000 })
-      .then(() => true, () => false);
+    // Real echo-free speech: the detector must NOT fire. Hold the same wide
+    // window the latch would have needed, then demand the mic is still raw.
+    await A.page.waitForTimeout(45000);
     const s = await micSettings(A.page);
-    ok = ok && s?.ns === false && s?.agc === false && s?.state === 'live';
+    ok = s?.ec === false && s?.ns === false && s?.agc === false && s?.state === 'live';
     detail = JSON.stringify(s);
   } else {
     // off: hold the same window the auto arm gets, then demand a raw mic.

@@ -218,7 +218,11 @@ async function launch(side, wav) {
             // compresses to a few hundred kbps, so it cannot tell you whether a bitrate ceiling is
             // honoured or whether quality is being limited — the two things the video path is about.
             // A Y4M of real (or high-entropy) content can, because it actually demands the bits.
-            ...(args.video ? [`--use-file-for-fake-video-capture=${args.video}`] : []),
+            // The testing-realism law (2026-08-11): the DEFAULT camera is a
+            // real talking head (media/real/fetch.sh), not Chrome's rolling
+            // pattern — an explicit --video= still overrides for bandwidth
+            // fixtures.
+            `--use-file-for-fake-video-capture=${args.video ?? decodeURIComponent(new URL('./media/real/realA.mjpeg', import.meta.url).pathname)}`,
             `--use-file-for-fake-audio-capture=${wav}`,
           ]),
       '--autoplay-policy=no-user-gesture-required',
