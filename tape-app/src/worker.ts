@@ -409,6 +409,15 @@ export class Room implements DurableObject {
     });
 
     const teardown = () => {
+      // Idempotent: an abrupt drop fires BOTH 'close' and 'error' on the same
+      // socket, so this runs twice. The first pass deletes `server` from
+      // `peers`; without this guard the second pass read `gone = undefined`
+      // and broadcast `peer-left` with NO `peer` field — which a three-person
+      // client reads as the room-wide clear-all (§3.3's `!m.peer` branch),
+      // emptying the survivors' peer table and nulling mediaPeer while their
+      // call was still live. Found by call3.mjs assertion 7 on staging: after
+      // one peer's abrupt exit, both survivors went to peers ∅ / media null.
+      if (!this.peers.has(server)) return;
       const gone = this.peers.get(server);
       this.peers.delete(server);
       this.laneCaps.delete(server);
