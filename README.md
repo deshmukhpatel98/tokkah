@@ -89,6 +89,13 @@ Omit `room` and a cryptographically random one is minted. Room ids are capabilit
 URLs — anyone with the link can join, like a meeting link. Point `data-base` at your
 own deployment to embed your fork instead of room.tokkah.com.
 
+One nuance: inside an iframe the audio lane runs its message-port path unless the
+*embedding* page opts into cross-origin isolation (`Cross-Origin-Opener-Policy:
+same-origin` + `Cross-Origin-Embedder-Policy: require-corp`) — then the embedded
+call gets the SharedArrayBuffer fast path too. Both are lossless; the difference is
+scheduling jitter under load. The embed is tested live on every change
+(`testbed/embed-call.mjs`).
+
 ## How it works (short version)
 
 - **Audio (Lane A)**: mic → AudioWorklet → 8 ms PCM frames → lossless Rice coding
