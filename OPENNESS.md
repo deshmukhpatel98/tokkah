@@ -9,7 +9,9 @@ when the score drops, that shows up in a diff like everything else.
 **Current score: 100 / 100** · last audited 2026-08-12 against commit `HEAD`
 
 Every row was verified by running something, not by remembering. Where a row
-says "verified", the command that verified it is written next to it.
+says "verified", the command that verified it is written next to it. Rows marked
+✓ are additional checks beyond the 100 points — they carry no score of their own,
+because a scorecard that inflates itself as it grows is not a scorecard.
 
 ---
 
@@ -22,6 +24,7 @@ says "verified", the command that verified it is written next to it.
 | 1.3 | Contributor terms stated before you contribute | 4/4 | [CONTRIBUTING.md](CONTRIBUTING.md) — DCO sign-off + the dual-licensing grant, in plain words, above the fold |
 | 1.4 | License history is honest (no silent relicensing) | 4/4 | The MIT era is named by commit in LICENSE-COMMERCIAL.md; that grant is acknowledged as irrevocable |
 | 1.5 | Third-party licenses accounted for | 4/4 | [NOTICE](NOTICE) — MediaPipe (Apache-2.0), fetch script only; **zero runtime dependencies** in the shipped app |
+| 1.6 | Attribution terms are explicit and modest | ✓ | [ATTRIBUTION.md](ATTRIBUTION.md) — AGPL §7 additional terms: one credit line in About/credits for products others use, nothing for private use, no badge over the video |
 
 ## 2. Can a stranger deploy it? — 20/20
 
@@ -32,14 +35,16 @@ says "verified", the command that verified it is written next to it.
 | 2.3 | Clean clone → install works | 4/4 | **Verified 2026-08-12**: `git clone && cd tape-app && npm ci` — 0 errors, 0 vulnerabilities. *(This failed before this audit: a committed `node_modules` symlink plus a dependency conflict broke `npm install` for everyone. Both fixed.)* |
 | 2.4 | Clean clone → deploy builds | 4/4 | **Verified**: `npx wrangler deploy --dry-run` from a fresh clone → "Total Upload: 59.93 KiB", both DO bindings resolved |
 | 2.5 | Reproducible installs | 4/4 | `tape-app/package-lock.json` committed; `npm ci` pins exact versions; CI runs the same command |
+| 2.6 | A fork carries a **real call** | ✓ | `testbed/forkdeploy-call.mjs` — clones the public repo, deploys under a throwaway name, runs real browsers with real talking-head media through it: **998 PCM frames received, 228 video frames decoded**. URL reachable 2 s after deploy, signalling live 1 s later |
+| 2.7 | Free-plan compatibility is enforced, not assumed | ✓ | `testbed/freetier-audit.mjs`, in CI: rejects paid-only bindings, key-value-backed DOs, oversized bundles, or a config needing a domain or secret. Current bundle: **52.6 KiB gzipped — 1.7% of the 3 MiB free-plan limit** |
 
 ## 3. Can I integrate it into what I already have? — 15/15
 
 | # | Criterion | Score | Evidence |
 |---|---|---|---|
-| 3.1 | Integration in one step | 5/5 | One `<script>` tag with a `data-room` attribute. No SDK, no API key, no account, no build step |
-| 3.2 | Works against *your* deployment, not only ours | 5/5 | Point the script `src` at your own Worker; the embed derives its origin from that URL |
-| 3.3 | Documented options, not source-diving | 5/5 | README "Embed API" documents every `data-*` attribute and the JS API |
+| 3.1 | Integration in one step | 5/5 | One `<script>` tag with a `data-room` attribute. No SDK, no API key, no account, no build step. **Verified on a real cross-origin page**: the tag replaces itself with the call iframe, which carries **747 PCM frames and 179 video frames** |
+| 3.2 | Works against *your* deployment, not only ours | 5/5 | Verified: a page on `http://127.0.0.1` embedding a **fork's** `embed.js` produced a working call against that fork, never touching room.tokkah.com |
+| 3.3 | Documented options, not source-diving | 5/5 | README "Embed API" documents every `data-*` attribute and the JS API; `Tokkah.join()` / `call.leave()` mount and unmount verified in the same rig |
 
 ## 4. Can I understand it? — 15/15
 
@@ -65,7 +70,7 @@ says "verified", the command that verified it is written next to it.
 
 | # | Criterion | Score | Evidence |
 |---|---|---|---|
-| 6.1 | CI runs on every pull request | 3/3 | `.github/workflows/ci.yml` — tests, type-check, and a credential-free deploy build |
+| 6.1 | CI runs on every pull request | 3/3 | `.github/workflows/ci.yml` — tests, type-check, credential-free deploy build, and the free-tier audit |
 | 6.2 | Tests exist and are runnable by anyone | 3/3 | `npm test` in `tape-app/`; live-call rigs under `testbed/` |
 | 6.3 | No secrets in the repo | 3/3 | Audited across all history-to-date diffs; only environment-variable *type declarations* match secret-like patterns |
 | 6.4 | Versioned releases and a changelog | 3/3 | [CHANGELOG.md](CHANGELOG.md) + tagged releases |
@@ -86,6 +91,8 @@ of unmeasured claim this project exists to avoid.
 
 ## How to re-audit
 
+0. `node testbed/freetier-audit.mjs` (static) and `node testbed/forkdeploy-call.mjs`
+   (deploys a throwaway fork and calls through it — needs a Cloudflare login).
 1. Clone into an empty directory, on a machine that has never built this.
 2. Follow only the README. Time yourself. Anything that makes you open a source
    file to proceed is a documentation bug — file it.

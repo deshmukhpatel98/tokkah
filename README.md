@@ -143,10 +143,15 @@ deploy or embed.
 Tokkah is **dual-licensed**, and for almost everyone the answer is "free, go ahead".
 
 **Free, under the [GNU AGPL v3](LICENSE)** — an OSI-approved open-source license.
-Use it, deploy it, fork it, sell a service built on it. The one obligation: if you
-modify Tokkah and serve those modifications to other people, you publish your
-modified source too. Deploying it unmodified satisfies that automatically, because
-the source is already right here.
+Use it, deploy it, fork it, sell a service built on it. Two obligations, both light:
+
+1. If you modify Tokkah and serve those modifications to other people, publish your
+   modified source too. Deploying it unmodified satisfies this automatically, because
+   the source is already right here.
+2. **Credit it** — one line in your About screen, credits page, or footer:
+   *"Built with Tokkah"*, linked. That is the entire ask, and it applies only to
+   products other people use; running it for yourself or your team requires nothing.
+   Details and examples: [ATTRIBUTION.md](ATTRIBUTION.md).
 
 **Commercially, under a paid license** — for the one case the AGPL does not cover:
 shipping Tokkah inside a **closed-source** product, or running a modified version as

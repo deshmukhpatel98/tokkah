@@ -42,10 +42,30 @@ optional TURN and custom-domain steps.
 1. **Run the tests**: `npm test` in `tape-app/`.
 2. **Check the types**: `npx tsc --noEmit`.
 3. **Verify a deploy still builds**: `npx wrangler deploy --dry-run`.
-4. **Describe the measurement.** What did you run, on what, and what were the
+4. **Keep it free-plan deployable**: `node testbed/freetier-audit.mjs` from the
+   repo root.
+5. **Describe the measurement.** What did you run, on what, and what were the
    numbers before and after?
 
-CI runs 1–3 automatically on every pull request. Step 4 is on you.
+CI runs 1–4 automatically on every pull request. Step 5 is on you.
+
+### The two promises that must never break
+
+This project promises anyone can **deploy it on a free Cloudflare account** and
+**embed it in any product**. Both are easy to break by accident, so both are
+tested rather than trusted:
+
+- `node testbed/freetier-audit.mjs` — static, credential-free, runs in CI. Fails
+  on paid-only bindings, key-value-backed Durable Objects, a bundle over the
+  free-plan size limit, or a config that needs a custom domain or a secret.
+- `node testbed/forkdeploy-call.mjs` — the full thing, run before a release:
+  clones the public repo, installs from the lockfile, deploys it under a
+  throwaway name, then runs **real browsers with real talking-head media**
+  through that fork — a direct call, and the same call embedded by a page on a
+  different origin. It needs a Cloudflare login and deletes the fork afterwards.
+
+If your change touches `wrangler.jsonc`, the Worker's routing, the CSP, or
+`embed.js`, run the fork test too.
 
 ## Sign-off: the DCO
 

@@ -4,9 +4,10 @@ Tokkah is dual-licensed.
 
 | | Open-source license | Commercial license |
 |---|---|---|
-| **Terms** | [GNU AGPL v3](LICENSE) | this document |
+| **Terms** | [GNU AGPL v3](LICENSE) + [attribution](ATTRIBUTION.md) | this document |
 | **Price** | free, forever | negotiated |
 | **You must publish your source** | yes, if you serve users a modified version | no |
+| **You must credit Tokkah** | yes — one line, in your About/credits, for products others use | negotiable (white-labelling is a normal ask) |
 | **Best for** | self-hosting, forks, research, internal tools, any project that is itself open source | closed-source products, SaaS, embedding Tokkah in something you sell |
 
 **You do not need to talk to us to use Tokkah.** Take it, deploy it, fork it,

@@ -2,8 +2,14 @@ Tokkah
 Copyright (c) 2026 Tokkah authors
 
 This product is licensed under the GNU Affero General Public License v3.0
-(see LICENSE), with a commercial license available as an alternative
+(see LICENSE), with additional attribution terms under AGPL section 7
+(see ATTRIBUTION.md), and a commercial license available as an alternative
 (see LICENSE-COMMERCIAL.md).
+
+If you ship a product built on Tokkah, keep this line where your users can
+find it:
+
+    Built with Tokkah — https://github.com/deshmukhpatel98/tokkah
 
 --------------------------------------------------------------------------
 Third-party components

@@ -40,3 +40,10 @@ jobs:
       # which is also the check that the project stays deployable by anyone.
       - name: Deploy build (no credentials)
         run: npx wrangler deploy --dry-run --outdir /tmp/dry
+
+      # The free-plan promise, enforced. One paid-only binding or one
+      # key-value-backed Durable Object would make this project undeployable
+      # for anyone without a paid account, and nothing else here would notice.
+      - name: Free-tier deployability audit
+        working-directory: .
+        run: node testbed/freetier-audit.mjs
