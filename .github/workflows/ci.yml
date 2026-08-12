@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: tests, types, deploy build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tape-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tape-app/package-lock.json
+
+      # `ci`, not `install`: exact versions from the lockfile, so a green run
+      # here means a green run on a stranger's clean clone.
+      - name: Install (locked)
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # Proves the Worker still builds and both Durable Object bindings
+      # resolve. --dry-run touches no account, so CI needs no credentials —
+      # which is also the check that the project stays deployable by anyone.
+      - name: Deploy build (no credentials)
+        run: npx wrangler deploy --dry-run --outdir /tmp/dry

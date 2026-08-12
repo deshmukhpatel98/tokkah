@@ -1,0 +1,75 @@
+name: Bug report
+description: Something behaved differently than it should have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Calls are hard to debug after the fact, so the
+        questions below are the ones that usually make the difference.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see or hear? Plain description is fine.
+      placeholder: The other person's voice cut out for about a second whenever I moved rooms.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browser
+    attributes:
+      label: Browser
+      options: [Chrome, Safari, Firefox, Edge, Other]
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Device and OS
+      placeholder: MacBook Air M2, macOS 15.6 — or Pixel 7, Android 15
+    validations:
+      required: true
+
+  - type: dropdown
+    id: demo
+    attributes:
+      label: Does it also happen on the live demo at room.tokkah.com?
+      description: This separates "bug in Tokkah" from "bug in this deployment".
+      options: ["Yes", "No", "I didn't try"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Numbers, logs, or console output
+      description: >
+        Optional but valuable. The in-call stats panel, browser console output,
+        or anything you measured. This project runs on measurements.
+      render: shell
+
+  - type: input
+    id: room
+    attributes:
+      label: Room code (optional)
+      description: >
+        Only if it was a test room. Never paste a link to a private
+        conversation — anyone reading this issue could open it.
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of conduct
+      options:
+        - label: I agree to follow this project's Code of Conduct.
+          required: true

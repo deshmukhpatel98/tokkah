@@ -140,4 +140,30 @@ deploy or embed.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Tokkah is **dual-licensed**, and for almost everyone the answer is "free, go ahead".
+
+**Free, under the [GNU AGPL v3](LICENSE)** — an OSI-approved open-source license.
+Use it, deploy it, fork it, sell a service built on it. The one obligation: if you
+modify Tokkah and serve those modifications to other people, you publish your
+modified source too. Deploying it unmodified satisfies that automatically, because
+the source is already right here.
+
+**Commercially, under a paid license** — for the one case the AGPL does not cover:
+shipping Tokkah inside a **closed-source** product, or running a modified version as
+a service without publishing your changes. That is the situation a large platform is
+usually in. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) — it starts with a
+table telling you whether you owe anything at all — or write to licensing@tokkah.com.
+
+Contributions are covered by a DCO sign-off plus a licensing grant, both explained
+in [CONTRIBUTING.md](CONTRIBUTING.md). Third-party components: [NOTICE](NOTICE).
+
+Everything published before commit `6375ae4` was MIT-licensed, and that grant stands
+permanently for those versions.
+
+## How open is this, really?
+
+[OPENNESS.md](OPENNESS.md) is a scorecard we grade ourselves against: can a stranger
+license it, deploy it on a **free** account, embed it, understand it, contribute to
+it, and trust it? Each row cites the command that proves it. The audit that created
+that file found the documented install was broken for every new user — that is
+exactly the sort of thing it exists to catch.

@@ -1,0 +1,50 @@
+name: Feature request
+description: Something Tokkah should do that it does not do yet
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One unusual question below: **how would we measure that it worked?**
+        This project only ships claims it can measure, so an idea with a test
+        attached moves much faster than one without.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where today's behaviour falls short.
+    validations:
+      required: true
+
+  - type: textarea
+    id: feel
+    attributes:
+      label: What would it feel like to use?
+      description: Describe the experience, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurement
+    attributes:
+      label: How would we measure that it worked?
+      description: >
+        A number that should move, and roughly how you would capture it on a
+        real call. "I'm not sure" is an acceptable answer — say so and we will
+        work it out together.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of conduct
+      options:
+        - label: I agree to follow this project's Code of Conduct.
+          required: true

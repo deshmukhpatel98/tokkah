@@ -1,0 +1,39 @@
+Tokkah
+Copyright (c) 2026 Tokkah authors
+
+This product is licensed under the GNU Affero General Public License v3.0
+(see LICENSE), with a commercial license available as an alternative
+(see LICENSE-COMMERCIAL.md).
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+The shipped application has ZERO runtime dependencies. Nothing is fetched
+from a third-party origin at call time; the Content-Security-Policy is
+`default-src 'self'` and would block it if anything tried.
+
+The following third-party assets are OPTIONAL. They are not present in this
+repository and are not downloaded by default. They are fetched only if you
+run tape-app/public/vendor/fetch.sh, and used only by the presence-window
+work, which is off unless explicitly enabled with `?window=1`:
+
+  MediaPipe Tasks-Vision (@mediapipe/tasks-vision)
+    Copyright 2023 The MediaPipe Authors
+    Licensed under the Apache License, Version 2.0
+    https://www.apache.org/licenses/LICENSE-2.0
+    https://github.com/google-ai-edge/mediapipe
+
+  MediaPipe face_landmarker and blaze_face_short_range models
+    Copyright 2023 The MediaPipe Authors
+    Licensed under the Apache License, Version 2.0
+    Model cards: https://developers.google.com/mediapipe/solutions
+
+--------------------------------------------------------------------------
+Test fixtures (not distributed)
+--------------------------------------------------------------------------
+
+The test rigs under testbed/ use public-domain NASA astronaut interview
+footage, fetched by testbed/media/real/fetch.sh. NASA material is generally
+not subject to copyright in the United States. The media files themselves
+are not included in this repository.

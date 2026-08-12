@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (privately)
+    url: https://github.com/deshmukhpatel98/tokkah/blob/main/SECURITY.md
+    about: Please do not open a public issue for security problems.
+  - name: Using Tokkah in a closed-source product
+    url: https://github.com/deshmukhpatel98/tokkah/blob/main/LICENSE-COMMERCIAL.md
+    about: Commercial licensing — and how to tell whether you even need it.
+  - name: Questions and ideas
+    url: https://github.com/deshmukhpatel98/tokkah/discussions
+    about: Discussions is the place for "how do I…" and "has anyone tried…".
