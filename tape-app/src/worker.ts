@@ -1248,15 +1248,24 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   camH: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 16_000),
   camFps: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 480),
   dpr: (v) => v === null || (typeof v === 'number' && v >= 0.5 && v <= 8),
+  // Device ladder tier the call ran at (aperture parallax gates on 'strong').
+  tier: (v) => v === null || (typeof v === 'string' && ['strong', 'weak', 'weaker'].includes(v)),
+  // Aperture-parallax panel (directive 2026-08-11: measure it, don't guess):
+  // which tracker actually ran, how much of the call it held a face, and the
+  // realized detector cadence. Client-side accumulation only — zero latency.
+  apTracker: (v) => v === null || v === 0 || v === 1 || v === 2 || v === 3, // 0 none, 1 mediapipe, 2 facedetector, 3 blazeface (low-end tier)
+  apTrackedPct: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100),
+  apHz: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 120),
 };
 const HB_ALLOWED: Record<string, Set<string>> = {
   connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs',
-    'cores', 'mem', 'dlMbps', 'rttEstMs', 'camW', 'camH', 'camFps', 'dpr']),
+    'cores', 'mem', 'dlMbps', 'rttEstMs', 'camW', 'camH', 'camFps', 'dpr', 'tier']),
   // mouthToEarMs / glassToGlassMs / humanGapMs: the presence-goal numbers
   // (how far away did the person feel), aggregates with nothing identifying.
   end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason',
     'mouthToEarMs', 'glassToGlassMs', 'humanGapMs',
-    'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb', 'aecDtPct']),
+    'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb', 'aecDtPct',
+    'apTracker', 'apTrackedPct', 'apHz']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1286,7 +1295,8 @@ export class Health implements DurableObject {
     for (const col of ['mouth_to_ear_ms REAL', 'glass_to_glass_ms REAL', 'human_gap_ms REAL',
       'echo_corr_max REAL', 'aec_gate_open_pct REAL', 'aec_gate_flips REAL', 'aec_erle_max_db REAL',
       'cores REAL', 'mem REAL', 'dl_mbps REAL', 'rtt_est_ms REAL', 'cam_w REAL', 'cam_h REAL',
-      'cam_fps REAL', 'dpr REAL', 'aec_dt_pct REAL']) {
+      'cam_fps REAL', 'dpr REAL', 'aec_dt_pct REAL',
+      'tier TEXT', 'ap_tracker REAL', 'ap_tracked_pct REAL', 'ap_hz REAL']) {
       try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // Operator room registry. The health BEATS stay anonymous by design (no
@@ -1321,8 +1331,9 @@ export class Health implements DurableObject {
         `INSERT INTO beats (wall, evt, engine, net, ttc_ms, wait_ms, dur_s, conceal_pct, tape, reason,
                             mouth_to_ear_ms, glass_to_glass_ms, human_gap_ms,
                             echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db,
-                            cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct,
+                            tier, ap_tracker, ap_tracked_pct, ap_hz)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
@@ -1335,6 +1346,8 @@ export class Health implements DurableObject {
         (beat.camW as number | null) ?? null, (beat.camH as number | null) ?? null,
         (beat.camFps as number | null) ?? null, (beat.dpr as number | null) ?? null,
         (beat.aecDtPct as number | null) ?? null,
+        (beat.tier as string | null) ?? null, (beat.apTracker as number | null) ?? null,
+        (beat.apTrackedPct as number | null) ?? null, (beat.apHz as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
@@ -1364,6 +1377,17 @@ export class Health implements DurableObject {
         last: new Date(r.last_wall).toISOString(),
         joins: r.joins,
       })));
+    }
+    // Operator-only raw tail of the beats table: the debugging loop "user
+    // reports X on their machine → read what their machine actually sent"
+    // needs rows, not aggregates. Same token that reads any room log.
+    if (url.pathname === '/recent' && request.method === 'GET') {
+      const t = url.searchParams.get('token');
+      if (!this.env.LOG_ADMIN_TOKEN || t !== this.env.LOG_ADMIN_TOKEN) return json({ error: 'admin token required' }, 403);
+      const n = Math.max(1, Math.min(50, Number(url.searchParams.get('n')) || 20));
+      const rows = this.sql.exec(`SELECT * FROM beats ORDER BY id DESC LIMIT ?`, n)
+        .toArray() as Array<Record<string, unknown>>;
+      return json(rows.map((r) => ({ ...r, wall: new Date(r.wall as number).toISOString() })));
     }
     if (url.pathname === '/summary' && request.method === 'GET') {
       const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days')) || 7));
@@ -1437,7 +1461,10 @@ export class Health implements DurableObject {
 // matched ws:/wss: against it.)
 const csp = (host: string) => [
   "default-src 'self'",
-  "script-src 'self'",
+  // 'wasm-unsafe-eval' admits WebAssembly.compile for the self-hosted
+  // MediaPipe face tracker (aperture parallax) — wasm only, no eval(); the
+  // binary itself still has to come from 'self'.
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'unsafe-inline'",
   "img-src 'self' data:", // data: is the inline SVG favicon
   `connect-src 'self' wss://${host} ws://${host}`,
@@ -1544,6 +1571,11 @@ export default {
     if (url.pathname === '/api/health/rooms' && request.method === 'GET') {
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/rooms${url.search}`),
+      );
+    }
+    if (url.pathname === '/api/health/recent' && request.method === 'GET') {
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request(`https://do/recent${url.search}`),
       );
     }
 

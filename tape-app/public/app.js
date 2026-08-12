@@ -1533,6 +1533,35 @@ function xlateStop(fromPeer) {
   tel.log('xlate-stop', { fromPeer: fromPeer ? 1 : 0 });
   if (!fromPeer) send({ type: 'xlate-off' });
 }
+
+// ── Frame Sense configuration (§spec frame-sense.md) ─────────────────────────
+// Transient peripheral edge cue + motion-breathing self-view. Default ON per
+// defaults law (`?frame=0` is the control arm). All work is main-thread-idle
+// + CSS compositing; audio/video pipeline is untouched.
+const FRAME_CFG = {
+  // Parked 2026-08-12 (operator directive): the frame-sense/aperture arc is
+  // on hold — OPT-IN via ?frame=1 while dormant, instead of default-on.
+  enabled: QS.get('frame') === '1',
+  // The breathing self-tile was rejected on its first live showing
+  // (2026-08-11): a flat PiP is not the self-presence the product wants.
+  // Kept behind an experiment flag while the literature-grounded design
+  // (head-coupled parallax / presence-window) is worked out.
+  tile: QS.get('fstile') === '1',
+};
+
+// ── Aperture Parallax configuration (testbed/specs/presence-window.md §1) ───
+// Head-coupled two-plane parallax. Default ON per defaults law (`?window=0` disables).
+// Gated on FaceDetector (Chrome), strong device tier, and PCM_CFG-style flag.
+const APERTURE_CFG = {
+  // Parked with FRAME_CFG (2026-08-12): opt-in via ?window=1 while the
+  // presence-window arc is on hold. No tracker download, no sampler cost.
+  enabled: QS.get('window') === '1',
+};
+
+function isApertureActive() {
+  return APERTURE_CFG.enabled;
+}
+
 const PCM_CFG = {
   // Both DEFAULT ON (2026-08-11, operator decision: real calls must exercise
   // the new audio path). `?aec2=0` / `?presence=0` are the control arms.
@@ -3279,6 +3308,845 @@ function lumaTick(track) {
       lumaNudge(track, y, base.y);
     }
   }, 'luma.tick');
+}
+
+// ── Frame Sense & Aperture Parallax unified sampler loop ──────────────────────
+// Runs at ~2 fps (500ms) when FrameSense alone is active, raised to ~10 Hz (100ms)
+// when Aperture Parallax is active. Both consumers are fed from a single detect() call.
+let frameSenseCanvas = null;
+let frameSenseCtx = null;
+let frameSensePrevLuma = null;
+let frameSenseFaceDetector = null;
+let mpLandmarker = null;
+let mpDetector = null;
+let mpLoadingStarted = false;
+let frameSenseLastMotionTs = 0;
+let frameSenseRunning = false;
+let fsFaceLastSeenTs = performance.now(); // seeded so load never opens "unseen"
+// Liveness trail: rolling ~3s of the chosen face box. See the gate at the
+// selection site for why (mural/poster faces). Cleared on tracking gaps so a
+// face switch starts a fresh warmup instead of inheriting stale motion.
+let fsLiveTrail = [];
+function faceIsLive(now, box) {
+  const last = fsLiveTrail[fsLiveTrail.length - 1];
+  if (last && now - last.t > 500) fsLiveTrail = [];
+  fsLiveTrail.push({ t: now, nx: box.noseX ?? (box.x + box.width / 2),
+    ny: box.noseY ?? (box.y + box.height / 2), w: box.width, blink: box.blink ?? 0 });
+  // 8s window: blinks are sparse (humans blink every 2-6s); motion uses the
+  // most recent 3s slice of the same trail.
+  while (fsLiveTrail.length && now - fsLiveTrail[0].t > 8000) fsLiveTrail.shift();
+  const spanS = (now - fsLiveTrail[0].t) / 1000;
+  if (fsLiveTrail.length < 8 || spanS < 2.5) return true; // warmup: presume live
+  // Signal 1: a blink anywhere in the window. Murals never blink.
+  for (const r of fsLiveTrail) if (r.blink > 0.4) return true;
+  // Signal 2: nose-tip drift over the last 3s, std normalized by face width.
+  // Breathing alone moves a live head 1-4% of face width; static-image
+  // landmark jitter on an interior point stays well under 0.5%.
+  const recent = fsLiveTrail.filter((r) => now - r.t <= 3000);
+  if (recent.length < 8) return true;
+  let mnx = 0, mny = 0, mw = 0;
+  for (const r of recent) { mnx += r.nx; mny += r.ny; mw += r.w; }
+  const n = recent.length;
+  mnx /= n; mny /= n; mw /= n;
+  let varSum = 0;
+  for (const r of recent) varSum += (r.nx - mnx) ** 2 + (r.ny - mny) ** 2;
+  const std = Math.sqrt(varSum / n);
+  return mw > 0 && (std / mw) > 0.005;
+}
+
+// Inline One-Euro filter for velocity-adaptive smoothing (minCutoff 1.0 Hz, beta 0.5, dCutoff 1.0)
+class OneEuroFilter {
+  constructor(minCutoff = 1.0, beta = 0.5, dCutoff = 1.0) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xPrev = null;
+    this.dxPrev = 0;
+  }
+
+  filter(x, dt) {
+    if (dt <= 0) return x;
+    if (this.xPrev === null) {
+      this.xPrev = x;
+      this.dxPrev = 0;
+      return x;
+    }
+
+    const dx = (x - this.xPrev) / dt;
+    const alphaD = this._alpha(dt, this.dCutoff);
+    const dxHat = this.dxPrev + alphaD * (dx - this.dxPrev);
+    this.dxPrev = dxHat;
+
+    const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+    const alpha = this._alpha(dt, cutoff);
+    const xHat = this.xPrev + alpha * (x - this.xPrev);
+    this.xPrev = xHat;
+    return xHat;
+  }
+
+  reset() {
+    this.xPrev = null;
+    this.dxPrev = 0;
+  }
+
+  _alpha(dt, cutoff) {
+    const tau = 1.0 / (2 * Math.PI * cutoff);
+    return 1.0 / (1.0 + tau / dt);
+  }
+}
+
+const apertureFilterX = new OneEuroFilter(1.0, 0.5, 1.0);
+const apertureFilterY = new OneEuroFilter(1.0, 0.5, 1.0);
+const apertureFilterW = new OneEuroFilter(1.0, 0.5, 1.0);
+
+function getApertureCadenceHz(now = performance.now()) {
+  if (!isApertureActive()) return 2;
+  const faceRecent = (apertureLastFaceTs > 0) && ((now - apertureLastFaceTs) <= 2000);
+  if (faceRecent) {
+    return (mpDetector && !mpLandmarker) ? 15 : 30;
+  }
+  return 10;
+}
+
+// Aperture Parallax state (testbed/specs/presence-window.md §1 & §3)
+let apertureLastFaceTs = 0;
+let apertureTracking = false;
+let apertureLastTickTs = 0;
+let apertureMeasuredHz = 0;
+
+// Multi-face hysteresis state
+let apertureLastSelectedArea = 0;
+let apertureLastSelectedCenterX = 0;
+let apertureLastSelectedCenterY = 0;
+
+// Neutral head position baseline (~10s low-pass)
+let apertureBaseHeadX = null;
+let apertureBaseHeadY = null;
+let apertureBaseFaceWidth = null;
+
+// Spring physics state (critically damped spring, zeta = 1.0)
+let apertureCurDx = 0; // % of viewport width
+let apertureCurDy = 2.0; // % of viewport height (includes static eye offset)
+let apertureCurS = 1.06; // total scale (overscan base 1.06)
+let apertureVDx = 0;
+let apertureVDy = 0;
+let apertureVS = 0;
+// Spring targets, written by the detector, chased by the render loop.
+let apertureTargetDx = 0;
+let apertureTargetDy = 2.0;
+let apertureTargetS = 1.06;
+// End-beat accumulator (apTracker/apTrackedPct/apHz): counted per sampler
+// tick while aperture is active, read once by the health beacon at call end.
+const apBeat = { ticks: 0, trackedTicks: 0, hzLast: 0 };
+
+// Debug surface container
+let apertureDebug = { hz: 0, cadenceHz: 2, unseen: false, headX: 0, headY: 0, dx: 0, dy: 2.0, s: 1.06, tracking: false, tracker: 'none' };
+
+function initFrameSense() {
+  if ((!FRAME_CFG.enabled && !isApertureActive()) || frameSenseRunning) return;
+  frameSenseRunning = true;
+
+  if (APERTURE_CFG.enabled && !mpLandmarker && !mpDetector && !mpLoadingStarted) {
+    mpLoadingStarted = true;
+    if (resolveDevTier() === 'strong') {
+      safeAsync(async () => {
+        const mod = await import('/vendor/mediapipe/vision_bundle.mjs');
+        const { FilesetResolver, FaceLandmarker } = mod;
+        const fileset = await FilesetResolver.forVisionTasks('/vendor/mediapipe/wasm');
+        try {
+          mpLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: '/vendor/mediapipe/face_landmarker.task', delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numFaces: 2,
+            minFaceDetectionConfidence: 0.6,
+            minFacePresenceConfidence: 0.6,
+            outputFaceBlendshapes: true,
+          });
+        } catch {
+          mpLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: '/vendor/mediapipe/face_landmarker.task', delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numFaces: 2,
+            minFaceDetectionConfidence: 0.6,
+            minFacePresenceConfidence: 0.6,
+            outputFaceBlendshapes: true,
+          });
+        }
+      }, 'aperture.mediapipe');
+    } else {
+      safeAsync(async () => {
+        const mod = await import('/vendor/mediapipe/vision_bundle.mjs');
+        const { FilesetResolver, FaceDetector } = mod;
+        const fileset = await FilesetResolver.forVisionTasks('/vendor/mediapipe/wasm');
+        mpDetector = await FaceDetector.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: '/vendor/mediapipe/blaze_face_short_range.tflite', delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          minDetectionConfidence: 0.6,
+        });
+      }, 'aperture.mediapipe.detector');
+    }
+  }
+
+  frameSenseCanvas = document.createElement('canvas');
+  frameSenseCanvas.width = 64;
+  frameSenseCanvas.height = 36;
+  frameSenseCtx = frameSenseCanvas.getContext('2d', { willReadFrequently: true });
+
+  scheduleFrameSenseTick();
+  startApertureRenderLoop();
+}
+
+function scheduleFrameSenseTick() {
+  if (!FRAME_CFG.enabled && !isApertureActive()) return;
+  const now = performance.now();
+  const cadence = getApertureCadenceHz(now);
+  const interval = cadence === 30 ? 33 : (cadence === 15 ? 67 : (cadence === 10 ? 100 : 500));
+
+  if (cadence === 30 || cadence === 15) {
+    // 30 Hz / 15 Hz adaptive cadence: plain setTimeout, do NOT wrap in requestIdleCallback
+    setTimeout(() => safe(sampleFrameSense, 'frameSense.sample'), cadence === 30 ? 33 : 67);
+  } else if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => safe(sampleFrameSense, 'frameSense.sample'), { timeout: interval });
+  } else {
+    setTimeout(() => safe(sampleFrameSense, 'frameSense.sample'), interval);
+  }
+}
+
+async function sampleFrameSense() {
+  const now = performance.now();
+  const dt = apertureLastTickTs ? (now - apertureLastTickTs) / 1000 : 0.033;
+  apertureLastTickTs = now;
+  const targetCadenceHz = getApertureCadenceHz(now);
+  apertureMeasuredHz = (dt > 0 && dt < 1.0) ? (1 / dt) : targetCadenceHz;
+
+  try {
+    if (!FRAME_CFG.enabled && !isApertureActive()) return;
+
+    // Local capture video element. Drop frame silently if not ready.
+    const video = $('selfSense') || $('preview') || $('selfFull');
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight || video.paused) {
+      if (isApertureActive()) {
+        const peerLive = (($('remote')?.videoWidth) || ($('remote2')?.videoWidth) || 0) > 0;
+        const isUnseen = peerLive && (!!mpLandmarker || !!mpDetector) && (now - fsFaceLastSeenTs > 1500);
+        $('frameSenseOverlay')?.classList.toggle('unseen', isUnseen);
+        updateAperturePhysics(now, dt, null, null, 'none', isUnseen);
+      }
+      return;
+    }
+
+    // Draw to tiny 64x36 offscreen canvas if FRAME_CFG enabled
+    if (FRAME_CFG.enabled && frameSenseCtx) {
+      frameSenseCtx.drawImage(video, 0, 0, 64, 36);
+    }
+
+    let faceFound = false;
+    let chosenFaceBox = null;
+    let inEdgeTop = false;
+    let inEdgeBottom = false;
+    let inEdgeLeft = false;
+    let inEdgeRight = false;
+    let isMoving = false;
+    let trackerUsed = 'none';
+
+    // Priority: (a) MediaPipe landmarker if ready, (b) else window.FaceDetector fallback
+    if (mpLandmarker) {
+      try {
+        const result = mpLandmarker.detectForVideo(video, performance.now());
+        if (result && result.faceLandmarks && result.faceLandmarks.length > 0) {
+          const boxes = [];
+          for (let fi = 0; fi < result.faceLandmarks.length; fi++) {
+            const landmarks = result.faceLandmarks[fi];
+            if (!landmarks || landmarks.length === 0) continue;
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            for (let i = 0; i < landmarks.length; i++) {
+              const lm = landmarks[i];
+              if (lm.x < minX) minX = lm.x;
+              if (lm.x > maxX) maxX = lm.x;
+              if (lm.y < minY) minY = lm.y;
+              if (lm.y > maxY) maxY = lm.y;
+            }
+            // Nose tip (landmark 1) rides along for the liveness gate: a
+            // single interior landmark is sub-pixel-stable on static content,
+            // unlike the min/max box whose extremes amplify jitter.
+            const bs = result.faceBlendshapes?.[fi]?.categories;
+            let blink = 0;
+            if (bs) {
+              for (const c of bs) {
+                if ((c.categoryName === 'eyeBlinkLeft' || c.categoryName === 'eyeBlinkRight') &&
+                    c.score > blink) blink = c.score;
+              }
+            }
+            boxes.push({
+              x: minX * video.videoWidth,
+              y: minY * video.videoHeight,
+              width: (maxX - minX) * video.videoWidth,
+              height: (maxY - minY) * video.videoHeight,
+              noseX: landmarks[1].x * video.videoWidth,
+              noseY: landmarks[1].y * video.videoHeight,
+              blink,
+            });
+          }
+
+          if (boxes.length > 0) {
+            faceFound = true;
+            trackerUsed = 'mediapipe';
+            if (boxes.length === 1) {
+              chosenFaceBox = boxes[0];
+            } else {
+              // Two faces: pick largest box with hysteresis
+              let maxAreaBox = boxes[0];
+              let maxArea = boxes[0].width * boxes[0].height;
+              for (let i = 1; i < boxes.length; i++) {
+                const a = boxes[i].width * boxes[i].height;
+                if (a > maxArea) {
+                  maxArea = a;
+                  maxAreaBox = boxes[i];
+                }
+              }
+              if (apertureLastSelectedArea > 0 && maxArea < 1.15 * apertureLastSelectedArea) {
+                let closestBox = maxAreaBox;
+                let minDist = Infinity;
+                for (const b of boxes) {
+                  const cx = b.x + b.width / 2;
+                  const cy = b.y + b.height / 2;
+                  const dist = Math.hypot(cx - apertureLastSelectedCenterX, cy - apertureLastSelectedCenterY);
+                  if (dist < minDist) {
+                    minDist = dist;
+                    closestBox = b;
+                  }
+                }
+                chosenFaceBox = closestBox;
+              } else {
+                chosenFaceBox = maxAreaBox;
+              }
+            }
+            apertureLastSelectedArea = chosenFaceBox.width * chosenFaceBox.height;
+            apertureLastSelectedCenterX = chosenFaceBox.x + chosenFaceBox.width / 2;
+            apertureLastSelectedCenterY = chosenFaceBox.y + chosenFaceBox.height / 2;
+
+            // Liveness gate (found live 2026-08-11: a studio-backdrop mural
+            // face held tracking=1 for the entire out-of-frame segment).
+            // Posters, framed photos and paused TVs detect as faces but a
+            // living head always drifts — breathing alone moves it a few px
+            // over 3s. NET deviation from the window mean discriminates:
+            // per-frame compression jitter cancels in the mean, real motion
+            // does not. Under 2% of face width for a full 3s window = furniture.
+            if (!faceIsLive(now, chosenFaceBox)) {
+              faceFound = false;
+              chosenFaceBox = null;
+              trackerUsed = 'none';
+            }
+          }
+
+          if (faceFound && chosenFaceBox) {
+            const leftNorm = chosenFaceBox.x / video.videoWidth;
+            const rightNorm = (chosenFaceBox.x + chosenFaceBox.width) / video.videoWidth;
+            const topNorm = chosenFaceBox.y / video.videoHeight;
+            const bottomNorm = (chosenFaceBox.y + chosenFaceBox.height) / video.videoHeight;
+            const centerXNorm = (leftNorm + rightNorm) / 2;
+            const centerYNorm = (topNorm + bottomNorm) / 2;
+
+            if (leftNorm < 0.12 || centerXNorm < 0.12) inEdgeLeft = true;
+            if (rightNorm > 0.88 || centerXNorm > 0.88) inEdgeRight = true;
+            if (topNorm < 0.12 || centerYNorm < 0.12) inEdgeTop = true;
+            if (bottomNorm > 0.88 || centerYNorm > 0.88) inEdgeBottom = true;
+          }
+        }
+      } catch {
+        faceFound = false;
+        chosenFaceBox = null;
+        trackerUsed = 'none';
+      }
+    } else if (mpDetector) {
+      try {
+        const result = mpDetector.detectForVideo(video, performance.now());
+        if (result && result.detections && result.detections.length > 0) {
+          const boxes = [];
+          for (let i = 0; i < result.detections.length; i++) {
+            const bb = result.detections[i].boundingBox;
+            if (!bb) continue;
+            const x = bb.originX ?? bb.x ?? 0;
+            const y = bb.originY ?? bb.y ?? 0;
+            boxes.push({
+              x,
+              y,
+              width: bb.width,
+              height: bb.height,
+            });
+          }
+
+          if (boxes.length > 0) {
+            faceFound = true;
+            trackerUsed = 'blazeface';
+            if (boxes.length === 1) {
+              chosenFaceBox = boxes[0];
+            } else {
+              // Two faces: pick largest box with hysteresis
+              let maxAreaBox = boxes[0];
+              let maxArea = boxes[0].width * boxes[0].height;
+              for (let i = 1; i < boxes.length; i++) {
+                const a = boxes[i].width * boxes[i].height;
+                if (a > maxArea) {
+                  maxArea = a;
+                  maxAreaBox = boxes[i];
+                }
+              }
+              if (apertureLastSelectedArea > 0 && maxArea < 1.15 * apertureLastSelectedArea) {
+                let closestBox = maxAreaBox;
+                let minDist = Infinity;
+                for (const b of boxes) {
+                  const cx = b.x + b.width / 2;
+                  const cy = b.y + b.height / 2;
+                  const dist = Math.hypot(cx - apertureLastSelectedCenterX, cy - apertureLastSelectedCenterY);
+                  if (dist < minDist) {
+                    minDist = dist;
+                    closestBox = b;
+                  }
+                }
+                chosenFaceBox = closestBox;
+              } else {
+                chosenFaceBox = maxAreaBox;
+              }
+            }
+            apertureLastSelectedArea = chosenFaceBox.width * chosenFaceBox.height;
+            apertureLastSelectedCenterX = chosenFaceBox.x + chosenFaceBox.width / 2;
+            apertureLastSelectedCenterY = chosenFaceBox.y + chosenFaceBox.height / 2;
+
+            if (!faceIsLive(now, chosenFaceBox)) {
+              faceFound = false;
+              chosenFaceBox = null;
+              trackerUsed = 'none';
+            }
+          }
+
+          if (faceFound && chosenFaceBox) {
+            const leftNorm = chosenFaceBox.x / video.videoWidth;
+            const rightNorm = (chosenFaceBox.x + chosenFaceBox.width) / video.videoWidth;
+            const topNorm = chosenFaceBox.y / video.videoHeight;
+            const bottomNorm = (chosenFaceBox.y + chosenFaceBox.height) / video.videoHeight;
+            const centerXNorm = (leftNorm + rightNorm) / 2;
+            const centerYNorm = (topNorm + bottomNorm) / 2;
+
+            if (leftNorm < 0.12 || centerXNorm < 0.12) inEdgeLeft = true;
+            if (rightNorm > 0.88 || centerXNorm > 0.88) inEdgeRight = true;
+            if (topNorm < 0.12 || centerYNorm < 0.12) inEdgeTop = true;
+            if (bottomNorm > 0.88 || centerYNorm > 0.88) inEdgeBottom = true;
+          }
+        }
+      } catch {
+        faceFound = false;
+        chosenFaceBox = null;
+        trackerUsed = 'none';
+      }
+    } else if ('FaceDetector' in window) {
+      try {
+        if (!frameSenseFaceDetector) {
+          frameSenseFaceDetector = new window.FaceDetector({ fastMode: true, maxFaces: 2 });
+        }
+        // Detect on full-res video element
+        const faces = await frameSenseFaceDetector.detect(video);
+        if (faces && faces.length > 0) {
+          faceFound = true;
+          trackerUsed = 'facedetector';
+          if (faces.length === 1) {
+            chosenFaceBox = faces[0].boundingBox;
+            apertureLastSelectedArea = chosenFaceBox.width * chosenFaceBox.height;
+            apertureLastSelectedCenterX = chosenFaceBox.x + chosenFaceBox.width / 2;
+            apertureLastSelectedCenterY = chosenFaceBox.y + chosenFaceBox.height / 2;
+          } else {
+            // Two faces: pick largest box with hysteresis
+            let maxAreaFace = faces[0];
+            let maxArea = faces[0].boundingBox.width * faces[0].boundingBox.height;
+            for (let i = 1; i < faces.length; i++) {
+              const a = faces[i].boundingBox.width * faces[i].boundingBox.height;
+              if (a > maxArea) {
+                maxArea = a;
+                maxAreaFace = faces[i];
+              }
+            }
+            if (apertureLastSelectedArea > 0 && maxArea < 1.15 * apertureLastSelectedArea) {
+              let closestFace = maxAreaFace;
+              let minDist = Infinity;
+              for (const f of faces) {
+                const cx = f.boundingBox.x + f.boundingBox.width / 2;
+                const cy = f.boundingBox.y + f.boundingBox.height / 2;
+                const dist = Math.hypot(cx - apertureLastSelectedCenterX, cy - apertureLastSelectedCenterY);
+                if (dist < minDist) {
+                  minDist = dist;
+                  closestFace = f;
+                }
+              }
+              chosenFaceBox = closestFace.boundingBox;
+            } else {
+              chosenFaceBox = maxAreaFace.boundingBox;
+            }
+            apertureLastSelectedArea = chosenFaceBox.width * chosenFaceBox.height;
+            apertureLastSelectedCenterX = chosenFaceBox.x + chosenFaceBox.width / 2;
+            apertureLastSelectedCenterY = chosenFaceBox.y + chosenFaceBox.height / 2;
+          }
+
+          const leftNorm = chosenFaceBox.x / video.videoWidth;
+          const rightNorm = (chosenFaceBox.x + chosenFaceBox.width) / video.videoWidth;
+          const topNorm = chosenFaceBox.y / video.videoHeight;
+          const bottomNorm = (chosenFaceBox.y + chosenFaceBox.height) / video.videoHeight;
+          const centerXNorm = (leftNorm + rightNorm) / 2;
+          const centerYNorm = (topNorm + bottomNorm) / 2;
+
+          if (leftNorm < 0.12 || centerXNorm < 0.12) inEdgeLeft = true;
+          if (rightNorm > 0.88 || centerXNorm > 0.88) inEdgeRight = true;
+          if (topNorm < 0.12 || centerYNorm < 0.12) inEdgeTop = true;
+          if (bottomNorm > 0.88 || centerYNorm > 0.88) inEdgeBottom = true;
+        }
+      } catch {
+        faceFound = false;
+        chosenFaceBox = null;
+        trackerUsed = 'none';
+      }
+    }
+
+    // "Outside the window" (peekaboo physics): with a real tracker loaded,
+    // >1.5s without a live face while the peer is up means the camera cannot
+    // see you — the window recedes (scale 1.06→1.045, dx/dy neutral) and the
+    // perimeter breathes; the instant the face returns it reblooms. Computed
+    // HERE, before the physics call, so the recede and the glow share one
+    // fact (it used to be computed after — the physics never saw it).
+    // peerLive counts the l2canvas paint path too: #remote carries no decoded
+    // frames when the canvas is the display surface.
+    if (faceFound) fsFaceLastSeenTs = now;
+    const peerLive = !!((($('remote')?.videoWidth) || ($('remote2')?.videoWidth) || 0) > 0 ||
+      $('remoteCanvas') || $('remoteCanvas2'));
+    const isUnseen = peerLive && (!!mpLandmarker || !!mpDetector) && !faceFound && (now - fsFaceLastSeenTs > 1500);
+    $('frameSenseOverlay')?.classList.toggle('unseen', isUnseen);
+
+    if (isApertureActive()) {
+      updateAperturePhysics(now, dt, video, faceFound ? chosenFaceBox : null, trackerUsed, isUnseen);
+    } else {
+      resetApertureTransform();
+    }
+
+    if (FRAME_CFG.enabled && frameSenseCtx) {
+      const imgData = frameSenseCtx.getImageData(0, 0, 64, 36);
+      const data = imgData.data;
+      const totalPixels = 64 * 36;
+      let movingPixels = 0;
+      let sumX = 0;
+      let sumY = 0;
+
+      let edgeTopOcc = 0;
+      let edgeBottomOcc = 0;
+      let edgeLeftOcc = 0;
+      let edgeRightOcc = 0;
+
+      if (!frameSensePrevLuma) {
+        frameSensePrevLuma = new Uint8Array(totalPixels);
+      }
+
+      for (let y = 0; y < 36; y++) {
+        for (let x = 0; x < 64; x++) {
+          const idx = y * 64 + x;
+          const pIdx = idx * 4;
+          const luma = (data[pIdx] * 77 + data[pIdx + 1] * 150 + data[pIdx + 2] * 29) >> 8;
+          const diff = Math.abs(luma - frameSensePrevLuma[idx]);
+          frameSensePrevLuma[idx] = luma;
+
+          if (diff > 15) {
+            movingPixels++;
+            sumX += x;
+            sumY += y;
+
+            if (y < 4) edgeTopOcc++;
+            if (y >= 32) edgeBottomOcc++;
+            if (x < 8) edgeLeftOcc++;
+            if (x >= 56) edgeRightOcc++;
+          }
+        }
+      }
+
+      const motionFrac = movingPixels / totalPixels;
+      if (motionFrac > 0.015) {
+        isMoving = true;
+        frameSenseLastMotionTs = Date.now();
+      }
+
+      if (!faceFound) {
+        if (movingPixels > 0) {
+          const centerXNorm = (sumX / movingPixels) / 64;
+          const centerYNorm = (sumY / movingPixels) / 36;
+
+          if (centerXNorm < 0.12 || edgeLeftOcc / (8 * 36) > 0.08) inEdgeLeft = true;
+          if (centerXNorm > 0.88 || edgeRightOcc / (8 * 36) > 0.08) inEdgeRight = true;
+          if (centerYNorm < 0.12 || edgeTopOcc / (64 * 4) > 0.08) inEdgeTop = true;
+          if (centerYNorm > 0.88 || edgeBottomOcc / (64 * 4) > 0.08) inEdgeBottom = true;
+        }
+      }
+
+      updateEdgeCues(peerLive && inEdgeTop, peerLive && inEdgeBottom,
+        peerLive && inEdgeLeft, peerLive && inEdgeRight);
+      updateSelfViewBreathing(peerLive &&
+        (isMoving || inEdgeTop || inEdgeBottom || inEdgeLeft || inEdgeRight));
+    }
+  } catch {
+    // sampler skips tick on error
+  } finally {
+    scheduleFrameSenseTick();
+  }
+}
+
+function updateAperturePhysics(now, dt, video, box, tracker = 'none', isUnseen = false) {
+  apBeat.ticks++;
+  if (box) apBeat.trackedTicks++;
+  apBeat.hzLast = apertureMeasuredHz;
+  const clampedDt = Math.max(0.001, Math.min(0.2, dt));
+  const targetCadenceHz = getApertureCadenceHz(now);
+
+  if (box && video && video.videoWidth && video.videoHeight) {
+    if (!apertureTracking) {
+      apertureFilterX.reset();
+      apertureFilterY.reset();
+      apertureFilterW.reset();
+    }
+    apertureLastFaceTs = now;
+    apertureTracking = true;
+
+    const normCamX = (box.x + box.width / 2) / video.videoWidth;
+    const normCamY = (box.y + box.height / 2) / video.videoHeight;
+    const faceWidthPx = box.width;
+
+    // Sign convention:
+    // The local video element is displayed mirrored (scaleX(-1)), but FaceDetector operates
+    // in raw camera image space. We define headX in the VIEWER's physical frame: when the
+    // viewer moves right, physical headX is positive. Moving right physically causes the face
+    // to move left in raw camera frame (normCamX < 0.5), so rawHeadX = -(normCamX - 0.5) = 0.5 - normCamX.
+    // Picture plane translates OPPOSITE the viewer's head translation (viewer right -> dx negative, picture shifts left).
+    const rawHeadX = 0.5 - normCamX;
+    const rawHeadY = normCamY - 0.5;
+
+    // PART A.2: One-Euro filter on rawHeadX, rawHeadY, faceWidthPx (minCutoff 1.0 Hz, beta 0.5, dCutoff 1.0)
+    const headX = apertureFilterX.filter(rawHeadX, clampedDt);
+    const headY = apertureFilterY.filter(rawHeadY, clampedDt);
+    const faceWidth = apertureFilterW.filter(faceWidthPx, clampedDt);
+
+    // PART A.4: Latency prediction via filtered velocity (extrapolated by 1 detector interval, clamped to 1% of frame)
+    const vX = apertureFilterX.dxPrev;
+    const vY = apertureFilterY.dxPrev;
+    const maxExtrap = 0.01; // 1% of frame
+    const extrapX = Math.max(-maxExtrap, Math.min(maxExtrap, vX * clampedDt));
+    const extrapY = Math.max(-maxExtrap, Math.min(maxExtrap, vY * clampedDt));
+    const predHeadX = headX + extrapX;
+    const predHeadY = headY + extrapY;
+
+    // Slow recentering: neutral head position is a ~10s low-pass filter of position
+    if (apertureBaseFaceWidth === null || apertureBaseFaceWidth === 0) {
+      apertureBaseHeadX = headX;
+      apertureBaseHeadY = headY;
+      apertureBaseFaceWidth = faceWidth;
+    } else {
+      const alphaSlow = 1 - Math.exp(-clampedDt / 10.0);
+      apertureBaseHeadX += (headX - apertureBaseHeadX) * alphaSlow;
+      apertureBaseHeadY += (headY - apertureBaseHeadY) * alphaSlow;
+      apertureBaseFaceWidth += (faceWidth - apertureBaseFaceWidth) * alphaSlow;
+    }
+
+    const dispX = predHeadX - apertureBaseHeadX;
+    const dispY = predHeadY - apertureBaseHeadY;
+    const dist = Math.hypot(dispX, dispY);
+
+    // PART A.2: Tiny residual dead zone of 0.4% after One-Euro filter
+    const deadZone = 0.004;
+    let targetDispX = 0;
+    let targetDispY = 0;
+    if (dist > deadZone) {
+      const factor = (dist - deadZone) / dist;
+      targetDispX = dispX * factor;
+      targetDispY = dispY * factor;
+    }
+
+    // Parallax displacement gain: max +-2.5% of viewport width/height for full
+    // excursion (~0.35). Sign: the picture translates WITH the viewer's head.
+    let targetDxPct = (targetDispX / 0.35) * 2.5;
+    targetDxPct = Math.max(-2.5, Math.min(2.5, targetDxPct));
+
+    let targetDyPct = (targetDispY / 0.35) * 2.5;
+    targetDyPct = Math.max(-2.5, Math.min(2.5, targetDyPct));
+
+    const EYE_OFFSET_PCT = 2.0;
+    const targetDyTotal = targetDyPct + EYE_OFFSET_PCT;
+
+    // Dynamic Z-scale: 1.0 +- 0.03 driven by face-width changes vs slow baseline
+    let targetS = 1.06;
+    if (apertureBaseFaceWidth > 0) {
+      const widthRatio = faceWidth / apertureBaseFaceWidth;
+      const zDelta = Math.max(-0.15, Math.min(0.15, widthRatio - 1.0));
+      const zScaleDyn = 1.0 + 0.2 * zDelta;
+      targetS = 1.06 * zScaleDyn;
+    }
+
+    apertureTargetDx = targetDxPct;
+    apertureTargetDy = targetDyTotal;
+    apertureTargetS = targetS;
+
+    apertureDebug = {
+      hz: Number(apertureMeasuredHz.toFixed(1)),
+      cadenceHz: targetCadenceHz,
+      unseen: isUnseen,
+      headX: Number(headX.toFixed(4)),
+      headY: Number(headY.toFixed(4)),
+      dx: Number(apertureCurDx.toFixed(3)),
+      dy: Number(apertureCurDy.toFixed(3)),
+      s: Number(apertureCurS.toFixed(4)),
+      tracking: true,
+      tracker: tracker,
+    };
+  } else {
+    // Tracker loss check (>400ms without face)
+    if (now - apertureLastFaceTs > 400) {
+      apertureTracking = false;
+    }
+
+    const EYE_OFFSET_PCT = 2.0;
+    const targetDxPct = 0;
+    const targetDyTotal = EYE_OFFSET_PCT;
+    // PART B.1: When unseen (>1.5s without face while peer live), scale target recedes from 1.06 to 1.045
+    const targetS = isUnseen ? 1.045 : 1.06;
+
+    apertureTargetDx = targetDxPct;
+    apertureTargetDy = targetDyTotal;
+    apertureTargetS = targetS;
+
+    apertureDebug = {
+      hz: Number(apertureMeasuredHz.toFixed(1)),
+      cadenceHz: targetCadenceHz,
+      unseen: isUnseen,
+      headX: 0,
+      headY: 0,
+      dx: Number(apertureCurDx.toFixed(3)),
+      dy: Number(apertureCurDy.toFixed(3)),
+      s: Number(apertureCurS.toFixed(4)),
+      tracking: apertureTracking,
+      tracker: 'none',
+    };
+  }
+}
+
+// Render loop, decoupled from detection (live feedback 2026-08-11: 10 Hz
+// position steps read as judder, "not as smooth as the real world"). The
+// detector keeps its idle-time 10 Hz cadence and only moves the TARGETS;
+// this loop integrates the spring toward them at display rate. Per frame it
+// is ~30 flops and one compositor-only style write — nothing here can touch
+// the AV pipeline, which is what the no-rAF rule for the sampler protects.
+let apertureRafOn = false;
+let apertureRafLastTs = 0;
+function apertureRenderLoop(ts) {
+  if (!isApertureActive()) { apertureRafOn = false; apertureRafLastTs = 0; return; }
+  const dt = apertureRafLastTs ? Math.max(0.001, Math.min(0.1, (ts - apertureRafLastTs) / 1000)) : 0.016;
+  apertureRafLastTs = ts;
+  const settled =
+    Math.abs(apertureCurDx - apertureTargetDx) < 0.001 &&
+    Math.abs(apertureCurDy - apertureTargetDy) < 0.001 &&
+    Math.abs(apertureCurS - apertureTargetS) < 0.0001 &&
+    Math.abs(apertureVDx) < 0.001 && Math.abs(apertureVDy) < 0.001;
+  if (!settled) {
+    stepCriticallyDampedSpring(dt, apertureTargetDx, apertureTargetDy, apertureTargetS);
+    applyApertureTransform(apertureCurDx, apertureCurDy, apertureCurS);
+  }
+  requestAnimationFrame(apertureRenderLoop);
+}
+function startApertureRenderLoop() {
+  if (apertureRafOn || !isApertureActive()) return;
+  apertureRafOn = true;
+  apertureRafLastTs = 0;
+  requestAnimationFrame(apertureRenderLoop);
+}
+
+function stepCriticallyDampedSpring(dt, targetDx, targetDy, targetS) {
+  // Critically damped spring (zeta = 1.0 exactly), natural frequency omega = 16.0 rad/s
+  const omega = 16.0;
+
+  const errX = apertureCurDx - targetDx;
+  const expX = Math.exp(-omega * dt);
+  apertureCurDx = targetDx + (errX + (apertureVDx + omega * errX) * dt) * expX;
+  apertureVDx = (apertureVDx - omega * (apertureVDx + omega * errX) * dt) * expX;
+
+  const errY = apertureCurDy - targetDy;
+  const expY = Math.exp(-omega * dt);
+  apertureCurDy = targetDy + (errY + (apertureVDy + omega * errY) * dt) * expY;
+  apertureVDy = (apertureVDy - omega * (apertureVDy + omega * errY) * dt) * expY;
+
+  const errS = apertureCurS - targetS;
+  const expS = Math.exp(-omega * dt);
+  apertureCurS = targetS + (errS + (apertureVS + omega * errS) * dt) * expS;
+  apertureVS = (apertureVS - omega * (apertureVS + omega * errS) * dt) * expS;
+
+  // Velocity hard cap
+  const MAX_VEL_TRANS = 25.0;
+  if (Math.abs(apertureVDx) > MAX_VEL_TRANS) apertureVDx = Math.sign(apertureVDx) * MAX_VEL_TRANS;
+  if (Math.abs(apertureVDy) > MAX_VEL_TRANS) apertureVDy = Math.sign(apertureVDy) * MAX_VEL_TRANS;
+
+  const MAX_VEL_SCALE = 0.5;
+  if (Math.abs(apertureVS) > MAX_VEL_SCALE) apertureVS = Math.sign(apertureVS) * MAX_VEL_SCALE;
+}
+
+function applyApertureTransform(dx, dy, s) {
+  const tf = `translate3d(${dx.toFixed(3)}%, ${dy.toFixed(3)}%, 0) scale(${s.toFixed(4)})`;
+
+  const remote = $('remote');
+  if (remote) remote.style.transform = tf;
+
+  const remoteCanvas = $('remoteCanvas');
+  if (remoteCanvas) remoteCanvas.style.transform = tf;
+
+  const remote2 = $('remote2');
+  if (remote2) remote2.style.transform = tf;
+
+  const remoteCanvas2 = $('remoteCanvas2');
+  if (remoteCanvas2) remoteCanvas2.style.transform = tf;
+}
+
+function resetApertureTransform() {
+  const remote = $('remote');
+  if (remote) remote.style.transform = '';
+
+  const remoteCanvas = $('remoteCanvas');
+  if (remoteCanvas) remoteCanvas.style.transform = '';
+
+  const remote2 = $('remote2');
+  if (remote2) remote2.style.transform = '';
+
+  const remoteCanvas2 = $('remoteCanvas2');
+  if (remoteCanvas2) remoteCanvas2.style.transform = '';
+
+  apertureDebug = { hz: 0, cadenceHz: 2, unseen: false, headX: 0, headY: 0, dx: 0, dy: 0, s: 1.0, tracking: false, tracker: 'none' };
+}
+
+function updateEdgeCues(top, bottom, left, right) {
+  const eTop = $('frameEdgeTop');
+  const eBottom = $('frameEdgeBottom');
+  const eLeft = $('frameEdgeLeft');
+  const eRight = $('frameEdgeRight');
+
+  if (eTop) eTop.classList.toggle('active', top);
+  if (eBottom) eBottom.classList.toggle('active', bottom);
+  if (eLeft) eLeft.classList.toggle('active', left);
+  if (eRight) eRight.classList.toggle('active', right);
+}
+
+function updateSelfViewBreathing(wantVisible) {
+  // #selfSense is the peripheral self-view: invisible at rest, breathes in on
+  // motion or an edge cue, back out after 2.5s of stillness. Never #selfFull —
+  // that is the full-screen waiting-alone layer, not a self-view tile.
+  const sv = $('selfSense');
+  if (!sv || !FRAME_CFG.tile) return;
+
+  const now = Date.now();
+  if (wantVisible) frameSenseLastMotionTs = now;
+  if (now - frameSenseLastMotionTs < 2500) {
+    sv.style.transition = 'opacity 300ms ease-out';
+    sv.style.opacity = '0.92';
+  } else {
+    sv.style.transition = 'opacity 1000ms ease-out';
+    sv.style.opacity = '0';
+  }
 }
 
 async function lumaNudge(track, y, baseY) {
@@ -5214,6 +6082,8 @@ async function join(room) {
       const sf = $('selfFull');
       sf.srcObject = localStream;
       sf.classList.add('on');
+      const ss = $('selfSense');
+      if (ss) ss.srcObject = localStream; // frame-sense sampler + breathing tile
     }
   }, 'selffull');
   $('shareUrl').value = roomUrl(room);
@@ -5554,6 +6424,7 @@ async function switchCameraTo(deviceId) {
   old?.stop(); // the wire is on the new sensor now; retire the old one
   applyMirror(nv);
   $('selfFull').srcObject = localStream;
+  { const ss = $('selfSense'); if (ss) ss.srcObject = localStream; }
   safe(() => localStorage.setItem('tape.cam', landedId), 'flip.remember');
   haptic();
   tel?.log('camera-flip', {
@@ -6516,6 +7387,7 @@ safe(() => {
 safe(() => { localStorage.removeItem('tape.log.mirror'); localStorage.removeItem('tape.cal'); }, 'legacy.clear');
 
 window.__tape = {
+  get aperture() { return apertureDebug; },
   get pc() { return pc; },
   // Every RTCPeerConnection this device holds, for the §2.2 uplink measurement:
   // the media pair's module pc, its Lane A stripes, and each second pair's own
@@ -6782,6 +7654,7 @@ safe(() => {
       camW: vset.width ?? null, camH: vset.height ?? null,
       camFps: vset.frameRate ? Math.round(vset.frameRate) : null,
       dpr: Math.round((window.devicePixelRatio ?? 1) * 2) / 2,
+      tier: safe(() => resolveDevTier(), 'hb.tier') ?? null,
     });
   };
   window.__hbEnd = (reason) => {
@@ -6817,7 +7690,43 @@ safe(() => {
       aecGateFlips: xaec.ticks ? xaec.flips : null,
       aecErleMaxDb: Number.isFinite(xaec.erleMax) ? +xaec.erleMax.toFixed(1) : null,
       aecDtPct: xaec.dtPct, // the bleed-hypothesis discriminator
+      // Aperture parallax, fleet-visible: which tracker ran on THIS machine,
+      // how much of the call it held a face, at what realized cadence — the
+      // three questions a "not smooth" report needs answered before tuning.
+      // apTracker mapping: 0=none, 1=mediapipe (FaceLandmarker), 2=facedetector (native), 3=blazeface (MediaPipe FaceDetector)
+      // Note: worker.ts validates apTracker (0..3).
+      apTracker: (() => {
+        const t = window.__tape?.aperture?.tracker;
+        return t === 'mediapipe' ? 1 : (t === 'facedetector' ? 2 : (t === 'blazeface' ? 3 : 0));
+      })(),
+      apTrackedPct: apBeat.ticks ? +((100 * apBeat.trackedTicks) / apBeat.ticks).toFixed(1) : null,
+      apHz: apBeat.hzLast ? +apBeat.hzLast.toFixed(1) : null,
     });
   };
   addEventListener('pagehide', () => window.__hbEnd?.('pagehide'));
 }, 'health.beacon');
+
+initFrameSense();
+
+// Hold-to-peek self-view (operator directive 2026-08-12): self-view on a call
+// is a deliberate act — press and hold the face button to see yourself,
+// release and it's gone. No persistent mirror (the #1 measured fatigue
+// driver), no ambient tile: you look exactly when you choose to, for exactly
+// as long as you choose to.
+safe(() => {
+  const btn = $('peek');
+  const sv = $('selfSense');
+  if (!btn || !sv) return;
+  const show = (on) => {
+    sv.classList.toggle('peeking', on);
+    btn.dataset.on = on ? '1' : '0';
+  };
+  btn.addEventListener('pointerdown', (e) => {
+    safe(() => btn.setPointerCapture(e.pointerId), 'peek.capture');
+    show(true);
+  });
+  btn.addEventListener('pointerup', () => show(false));
+  btn.addEventListener('pointercancel', () => show(false));
+  // Touch long-press must not open a context menu mid-peek.
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+}, 'peek');

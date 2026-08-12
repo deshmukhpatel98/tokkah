@@ -20,3 +20,14 @@ fatigue-lab/runs/
 # Local dev secrets
 tape-app/.dev.vars
 tape-app/public/testmedia/
+
+# Vendored third-party binaries (26 MB of MediaPipe wasm + face models).
+# Same rule as testbed/media: the FETCH SCRIPT is committed, the binaries are
+# not — a repo is source, not a CDN. tape-app/public/vendor/fetch.sh
+# reproduces them byte-for-byte, and wrangler uploads them from the working
+# tree at deploy time.
+tape-app/public/vendor/
+
+# Ad-hoc single-run rigs (dot-prefixed by convention). Durable rigs are
+# committed undotted; these are scratch and would rot in the repo.
+testbed/.*.mjs
