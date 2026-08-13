@@ -443,7 +443,9 @@ whole brief is a null and we stop.** Below one frame, the estimator's quantisati
 spend the win. Also record the *distribution*, not just the max — "2 of 6 lanes diverge"
 and "1 of 6 diverges" have different `MIN_FAST` implications.
 
-**Stage 1 — feedback only, no routing change.** `T_SKEW` on the wire, `peerSkewMs` on the
+**Stage 1 — feedback only, no routing change.** — SHIPPED 2026-08-13, live-verified: peerSkew matches the peer's own laneSkew within wire quantization both directions, framesSent unchanged.
+
+ `T_SKEW` on the wire, `peerSkewMs` on the
 sender, `nFast`/`fastOrder`/`peerSkewMax` in the snapshot, `laneSkewNow()` deduplicated,
 drift frozen on quiet lanes. Flag gates whether the report is *sent*. Rig gate: the
 sender's `peerSkewMs` matches the injected offsets within 2 ms (receiver-side detection
@@ -451,12 +453,16 @@ already scored ±1.5 ms), and `perAssoc[].framesSent` is **unchanged to the fram
 the control. This stage is where the `<9`-byte guard bug either bites or doesn't, in
 isolation, where it is trivial to see.
 
-**Stage 2 — demotion, opt-in `?pcmskewstripe=1`.** `MIN_FAST = 3`, demote ≥ 8 ms, promote
+**Stage 2 — demotion, opt-in `?pcmskewstripe=1`.** — SHIPPED 2026-08-13, 9/9 divergence + 7/7 same-route. m2e 118.3/120.2 vs 152.1/139.3ms; ring 50.0 vs 66.4; conceal 1464 vs 2208 (better, not merely no-worse); bytes +0.70%; post-demotion leakage 0.00%. Review found the pickers walking lane-index space on fall-forward (spilling onto demoted lanes under pressure) — now fastOrder space.
+
+ `MIN_FAST = 3`, demote ≥ 8 ms, promote
 ≤ 4 ms, 5 s dwell. Rig asserts 1–8 and 11. **Advance only if all three of: depth −6 ms or
 better, conceal ≤ control + 200 (and ideally ≤ 600), bytes within 2%.** Any one of those
 failing is the same kind of result de-skew produced, and the same response applies.
 
-**Stage 3 — flap and failure hardening.** Assert 9 and 10. Re-promotion warm-up via
+**Stage 3 — flap and failure hardening.** — IN PROGRESS. The rig found what §2.2 predicted and Stage 1 only half-fixed: a demoted lane carries zero frames, so its skew can never fall and demotion was PERMANENT (promotions=0, nFast stuck after the route healed). Fixed with an RTT probe on the ping that already visits every lane; first attempt compared instantaneous rttMs and oscillated (11 demotions/10 promotions), now a decaying minimum reset per state epoch (1 demotion on flap, 0 churn during hold, 1 probe promotion on heal). Also measured: degradation detection is drift-limited to ~24s (laneBase rises at +1ms/s) while recovery is instant — slow to condemn, quick to forgive.
+
+ Assert 9 and 10. Re-promotion warm-up via
 `sendPad` on a promoted lane; `baseRttMs`-based provisional promotion (§2.2). This is the
 stage that decides whether `MIN_FAST = 3` is right or whether it needs to be 4.
 
