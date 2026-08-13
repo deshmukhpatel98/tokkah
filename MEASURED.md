@@ -4488,3 +4488,45 @@ Full study, including why percentile sizing is rejected (a quantile q rejects
 clumps only up to (1-q)*D_WIN frames, and p95 *defines* 5% of arrivals as
 acceptable losses) and why stall suppression is staged behind measurement:
 testbed/specs/hold-release.md.
+
+## Stage 3: the ping answers what skew cannot — and a limit that is still open
+
+Skew is computed only from frames that ARRIVE. That makes it structurally blind
+to any lane that stops delivering, in both directions:
+
+  · a lane that RECOVERED — a demoted lane carries zero frames (measured), so
+    its skew freezes and demotion was PERMANENT (promotions=0, nFast stuck for
+    the rest of the call after the route healed);
+  · a lane that DIED — a blackholed-but-open association looks perfectly healthy
+    to the sender (unreliable SCTP never waits for an ack, bufferedAmount stays
+    empty) and emits no skew signal at all, so striping concentrated audio into
+    lanes it believed were fast.
+
+Both now read the ping, which visits every open association 4x/s regardless of
+whether it carries audio. Recovery: decaying-min RTT within 8ms of the fastest
+working lane for 3 consecutive ticks, reset per state epoch (an instantaneous
+comparison oscillated hard first — 11 demotions, 10 promotions in one run).
+Death: pong silent >2s, OR pong still returning but >300ms worse than the
+working lanes — the second case being what actually happens, since a lane 5s
+slow still answers pings while every audio frame on it misses the playout
+deadline and is discarded on arrival. Relative bound, so a genuinely long path
+where every lane sits at 250ms reads as healthy. MIN_FAST never rescues a dead
+lane: a floor made of dead lanes has no capacity.
+
+MEASURED, three lanes made hopelessly slow mid-call (n=5, live prod):
+  before detection   ON 1088-1212ms conceal vs OFF 436-472  — consistent FAIL
+  after detection    ON 900-1460ms  vs OFF 468-552          — straddles the bar
+
+And the asymmetry is the finding, not noise: one side lands at 48-256ms, an
+order of magnitude BETTER than the control, while the other stays at
+1752-2664ms. The residual has a mechanism: the RTT signal that detects a
+hopeless lane is itself delayed by the fault it detects — a ping into a +5s
+route reports back only after 10s, so ~10s of audio is posted into dead lanes
+before demotion engages, and 10s at 50% loss on a concentrated fast set is
+exactly the 1.7-2.6s of concealment seen. STILL OPEN. Next: sample the new
+stripe.dead counter in the rig to confirm the latency hypothesis directly, and
+find a faster mute path than a round trip that has to cross the fault twice.
+
+This is the measured cost against the 26ms win, and it is why striping stays
+opt-in: it concentrates traffic, which is exactly what earns the latency and
+exactly what raises the stakes when the lanes it concentrated onto fail.

@@ -467,7 +467,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // browsers' stamps are directly comparable on one machine.
       stalls: [],
       // timing
-      rttMs: null, baseRttMs: null, clockOffsetMs: null, ageMs: [],
+      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0, ageMs: [],
       t0: null,
       // Jitter-target control. painEvents counts every conceal that asked for a
       // bigger buffer; bumps counts the ones that got it (a call at the ceiling
@@ -500,7 +500,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       dc: null,
       framesSent: 0, bytesSent: 0, paritySent: 0, parityBytes: 0, skipBuffered: 0,
       framesRecv: 0, bytesRecv: 0, parityRecv: 0,
-      rttMs: null, baseRttMs: null, clockOffsetMs: null,
+      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0,
       padBytesSent: 0, padBytesRecv: 0, // Lane 0: pre-warm padding per association
     });
     const assocs = Array.from({ length: PAIRS }, newAssoc);
@@ -542,6 +542,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // association. Reset to Infinity whenever a lane changes state so each
     // epoch is judged on its own evidence.
     const laneRttBase = new Float64Array(PAIRS).fill(Infinity);
+    const laneDead = new Uint8Array(PAIRS);
     let lastOrderRecompute = 0;
     let stripeDemotions = 0;
     let stripePromotions = 0;
@@ -597,6 +598,32 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (laneState[k] === 0 && laneRttBase[k] < minFastRtt) minFastRtt = laneRttBase[k];
       }
 
+      // UNUSABLE, which is not the same as slow. Two ways a lane can carry no
+      // audio while looking healthy to every other check:
+      //
+      //   · the pong stops entirely — a true blackhole;
+      //   · the pong still comes back, but hundreds of milliseconds late. Then
+      //     every AUDIO frame on that lane misses the playout deadline and is
+      //     discarded on arrival, so the receiver logs no samples for it and its
+      //     SKEW FREEZES at whatever it was when the route was fine. The lane is
+      //     dead to audio and alive to the ping, and skew will never say so.
+      //
+      // The second is what the stall rig actually injects (+5 s of route delay,
+      // not a close), and it is why the first version of this check never fired.
+      // The bound is RELATIVE to the working lanes, so a genuinely long path —
+      // where every lane sits at 250 ms — reads as healthy; only a lane 300 ms
+      // worse than its own peers, far beyond any jitter and beyond the ring's
+      // deepest setting, counts as hopeless.
+      for (let k = 0; k < PAIRS; k++) {
+        const a = assocs[k];
+        const open = a?.dc?.readyState === 'open';
+        const lp = a?.lastPongT ?? 0;
+        const mute = open && lp > 0 && (tn - lp) > 2000;
+        const hopeless = open && a?.rttMs != null && minFastRtt !== Infinity
+          && (a.rttMs - minFastRtt) > 300;
+        laneDead[k] = (mute || hopeless) ? 1 : 0;
+      }
+
       // Evaluate desired states with 5 s dwell and hysteresis (spec §2.1)
       const desiredState = new Uint8Array(PAIRS);
       for (let k = 0; k < PAIRS; k++) {
@@ -604,6 +631,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const isWarm = (peerSkewWarm & (1 << k)) !== 0;
         const skew = peerSkewMs[k];
         const dwellOk = (tn - laneStateSince[k]) >= 5000;
+
+        // DEAD trumps everything, dwell included: a lane whose pong has not
+        // come back for 2 s is not slow, it is gone, and waiting out a dwell
+        // means 2 more seconds of audio posted into it. No dwell, no hysteresis,
+        // no MIN_FAST protection (see below) — the floor exists to keep capacity,
+        // and a floor made of dead lanes has none.
+        if (laneDead[k]) { desiredState[k] = 1; continue; }
 
         if (dwellOk) {
           if (laneState[k] === 0) { // FAST
@@ -646,7 +680,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // Find demoted candidates and sort by skew ascending (keep fastest in fast set)
         const demotedCandidates = [];
         for (let k = 0; k < PAIRS; k++) {
-          if (desiredState[k] === 1) {
+          // Never rescue a dead lane to satisfy the floor: it would restore the
+          // COUNT while restoring none of the capacity the count stands for, and
+          // audio would be posted straight back into the blackhole. If that
+          // leaves fewer than MIN_FAST lanes, fewer is the truth — fall-forward
+          // still reaches every open association as the last resort.
+          if (desiredState[k] === 1 && !laneDead[k]) {
             demotedCandidates.push({ k, skew: peerSkewMs[k] });
           }
         }
@@ -1869,6 +1908,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const b = dv.getFloat64(9);
         const nowMs = now();
         a.rttMs = +(nowMs - ts).toFixed(2);
+        // When the pong last came back. A lane can be OPEN, empty-buffered and
+        // completely dead: unreliable SCTP never waits for an ack, so a
+        // blackholed route looks perfectly healthy from the send side, and skew
+        // cannot see it either because skew is computed only from frames that
+        // ARRIVE — a lane delivering nothing emits no signal at all. The pong is
+        // the one thing that stops coming back. Measured cost of not using it:
+        // with three of six routes blackholed, striping concealed 2.6x the
+        // control (1168 vs 452 ms over 25 s, n=3) by concentrating audio into
+        // lanes it believed were fast.
+        a.lastPongT = nowMs;
         // Running minimum — the path's floor. Queueing inflates the latest
         // sample; only the floor is safe to budget in-flight bytes against.
         if (a.baseRttMs == null || a.rttMs < a.baseRttMs) a.baseRttMs = a.rttMs;
@@ -2678,6 +2727,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             demotions: stripeDemotions,
             promotions: stripePromotions,
             probePromotions: stripeProbePromotions,
+            dead: Array.from(laneDead).reduce((n, v) => n + v, 0),
             staleFailopen: stripeStaleFailopen,
           } : null,
           perAssoc: assocs.map((s, i) => ({
