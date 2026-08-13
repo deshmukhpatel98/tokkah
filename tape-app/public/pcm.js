@@ -535,10 +535,18 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let nFast = PAIRS;
     const laneState = new Uint8Array(PAIRS); // 0 = FAST, 1 = DEMOTED
     const laneStateSince = new Float64Array(PAIRS);
+    // Consecutive recompute ticks a DEMOTED lane's round trip has matched the
+    // working lanes. Reset by any tick that does not — see recomputeLaneOrder.
+    const laneRttOkStreak = new Uint16Array(PAIRS);
+    // Decaying-min round trip per lane, kept alive by the ping on every open
+    // association. Reset to Infinity whenever a lane changes state so each
+    // epoch is judged on its own evidence.
+    const laneRttBase = new Float64Array(PAIRS).fill(Infinity);
     let lastOrderRecompute = 0;
     let stripeDemotions = 0;
     let stripePromotions = 0;
     let stripeStaleFailopen = 0;
+    let stripeProbePromotions = 0;
     let isStaleFailopen = false;
 
     /**
@@ -573,6 +581,22 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       }
       isStaleFailopen = false;
 
+      // A FLOOR per lane, not the latest sample. Instantaneous rttMs swings tens
+      // of milliseconds under a heavy tail, so comparing samples promoted lanes
+      // that were genuinely slow and let skew re-demote them a second later:
+      // measured 11 demotions and 10 promotions in one 100 s run, nFast cycling
+      // 3-4-5-3. A decaying minimum over the lane's own pings is stable enough
+      // to compare, and it is reset on every state change (below) so a lane
+      // cannot be resurrected by how fast it used to be.
+      for (let k = 0; k < PAIRS; k++) {
+        const r = assocs[k]?.rttMs;
+        if (r != null && r < laneRttBase[k]) laneRttBase[k] = r;
+      }
+      let minFastRtt = Infinity;
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneState[k] === 0 && laneRttBase[k] < minFastRtt) minFastRtt = laneRttBase[k];
+      }
+
       // Evaluate desired states with 5 s dwell and hysteresis (spec §2.1)
       const desiredState = new Uint8Array(PAIRS);
       for (let k = 0; k < PAIRS; k++) {
@@ -585,7 +609,28 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           if (laneState[k] === 0) { // FAST
             if (isWarm && skew >= 8.0) desiredState[k] = 1; // DEMOTED
           } else { // DEMOTED
-            if (!isWarm || skew <= 4.0) desiredState[k] = 0; // FAST
+            // A demoted lane carries no audio (measured: exactly 0 frames after
+            // demotion), so its SKEW can never fall — the evidence needed to
+            // promote it only travels on the lane we stopped using. Left there,
+            // demotion is permanent, and a route that recovers is never
+            // forgiven: the flap rig measured promotions=0 and nFast stuck at 3
+            // for the rest of a call after the route was restored.
+            //
+            // The ping is the way out. It goes to EVERY open association 4x/s,
+            // demoted included, so rttMs keeps arriving for lanes that carry
+            // nothing. Require the round trip to sit within a frame and a half
+            // of the fastest working lane for 3 consecutive ticks (~3 s) before
+            // promoting: one sample is jitter, a streak is a route. If the lane
+            // is in fact still slow, it warms up and skew re-demotes it after
+            // the dwell — a bounded, self-correcting probe rather than a
+            // permanent verdict.
+            // 8 ms of round trip is the 4 ms one-way promote hysteresis seen
+            // from the sender's side, so the probe and the skew rule agree on
+            // where "fast again" begins.
+            const rttOk = laneRttBase[k] < Infinity && minFastRtt !== Infinity
+              && (laneRttBase[k] - minFastRtt) <= 8;
+            laneRttOkStreak[k] = rttOk ? laneRttOkStreak[k] + 1 : 0;
+            if (!isWarm || skew <= 4.0 || laneRttOkStreak[k] >= 3) desiredState[k] = 0; // FAST
           }
         }
       }
@@ -619,9 +664,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             stripeDemotions++;
           } else {
             stripePromotions++;
+            // Distinguish "the peer says it is fine again" from "we probed it
+            // back": only the latter is the escape from permanent demotion, and
+            // if it turns out to oscillate, this is the counter that shows it.
+            if (laneRttOkStreak[k] >= 3) stripeProbePromotions++;
           }
           laneState[k] = desiredState[k];
           laneStateSince[k] = tn;
+          laneRttOkStreak[k] = 0;
+          laneRttBase[k] = Infinity; // re-learn this epoch's floor from fresh pings
         }
       }
 
@@ -2597,6 +2648,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             fastOrder: Array.from(fastOrder.subarray(0, nFast)),
             demotions: stripeDemotions,
             promotions: stripePromotions,
+            probePromotions: stripeProbePromotions,
             staleFailopen: stripeStaleFailopen,
           } : null,
           perAssoc: assocs.map((s, i) => ({
