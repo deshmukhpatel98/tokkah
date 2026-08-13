@@ -219,3 +219,70 @@ Held at `vpd=2`. The flag ships so the trade can be priced properly: re-run with
 IPI p50/p95/p99 captured from the snapshot on both arms, and spend the 9.2 ms
 only if the cadence gate still holds — or if a real long path turns out worse
 than 1.25× and the margin is actually needed.
+
+## HYPOTHESIS #1 CONFIRMED: the relay is the shortcut
+
+`testbed/route-efficiency.mjs` times TCP handshakes to REGION-PINNED cloud
+endpoints (AWS regional hostnames resolve into that region's own address space,
+unlike a STUN or CDN probe which answers from the nearest edge and measures only
+the local ISP). Minimum of 7, because the floor is the path and everything above
+it is queueing.
+
+**Public internet, measured from Delhi:**
+
+| site | km | straight-line RTT | measured RTT | vs light |
+|---|---|---|---|---|
+| Singapore | 4,142 | 41.5 ms | 71.6 ms | 1.73× |
+| Sydney | 10,428 | 104.4 ms | 163.5 ms | 1.57× |
+| N. Virginia | 12,048 | 120.6 ms | 227.7 ms | 1.89× |
+| N. California | 12,416 | 124.2 ms | 252.5 ms | 2.03× |
+| London | 6,712 | 67.2 ms | 143.6 ms | 2.14× |
+| Oregon | 11,562 | 115.7 ms | 270.6 ms | 2.34× |
+| São Paulo | 14,428 | 144.4 ms | 346.8 ms | 2.40× |
+| Tokyo | 5,834 | 58.4 ms | 142.9 ms | 2.45× |
+
+**Median 2.14× the speed of light in fibre. Cloudflare's backbone, same
+yardstick: 1.20–1.29×.** The public internet from India is roughly TWICE as long
+as the glass it runs on.
+
+### What that does to the goal
+
+| route | direct P2P (video) | relay over backbone | winner |
+|---|---|---|---|
+| Singapore | 80.8 ms | **76.3 ms** | relay |
+| Tokyo | 116.5 ms | **86.9 ms** | relay |
+| London | 116.8 ms | **92.3 ms** | relay |
+| Sydney | 126.8 ms | **115.6 ms** | relay |
+| N. Virginia | 158.8 ms ✗ | **125.7 ms** | relay |
+| N. California | 171.2 ms ✗ | **128.0 ms** | relay |
+| Oregon | 180.3 ms ✗ | **122.7 ms** | relay |
+| São Paulo | 218.4 ms ✗ | **140.6 ms** | relay |
+
+**Direct P2P clears 150 ms on 4 of 8 routes. Relaying clears it on 8 of 8, and
+wins on every route including the short ones.**
+
+This is the opposite of the rule every WebRTC stack is built on. A relay is
+normally a penalty — an extra hop, taken only when NAT leaves no choice, and
+ICE priority is defined to avoid it. Over 12,000 km that logic breaks: the extra
+hop buys a private backbone, and a straight line on a good road beats a detour
+on a bad one. The relay is not the long way round. It IS the short way.
+
+**Honesty about what is measured vs modelled.** The P2P column is measured
+(TCP RTT over the real public internet). The relay column is MODELLED from two
+measured terms — first mile 2.7 ms one-way (STUN, real UDP) and backbone 1.25×
+(DO probe) — plus the assumption that TURN itself adds little. The direction is
+strongly evidenced; the exact figures still need a real relayed call to confirm,
+and the far-side first mile is assumed equal to ours.
+
+Caveat on the short routes: a TCP handshake carries fixed cost that inflates the
+ratio more when the distance is small, so Tokyo's 2.45× overstates the routing
+loss. The long-haul numbers (2.0–2.4×) are the ones that matter, and they are
+where the goal is won or lost.
+
+### Which makes the engineering direction concrete
+
+Prefer the relay on long paths. ICE will not do this by itself: candidate
+priority is specified to rank host and server-reflexive ABOVE relay, so the
+stack will choose the slow direct route precisely when the fast relayed one
+matters most. The work is to measure both and pick by latency instead of by
+category.
