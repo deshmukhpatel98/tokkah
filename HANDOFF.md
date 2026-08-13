@@ -1651,3 +1651,19 @@ default PATH, so a fresh shell will report docker as missing.
 
 With this, `wrangler containers build`/`push` work, and task #31 (a real browser
 peer on another continent) is unblocked end to end.
+
+**Peer image is in the registry:** `registry.cloudflare.com/<acct>/tokkah-peer:v2`
+(built from `testbed/peer/Dockerfile`). Two traps met on the way: re-tagging a
+pulled manifest gives Cloudflare an image with EMPTY platform metadata and the
+push is rejected with `Image platform (/)` — build with `--platform linux/amd64`
+instead; and the account had no non-Cloudflare registry configured, so pointing a
+container app straight at a public image fails with `IMAGE_REGISTRY_NOT_CONFIGURED`.
+Pushing into Cloudflare's own registry sidesteps that entirely.
+
+**Disk discipline (operator request):** always clear local images after a push —
+they are ~3.5 GB each and the registry already has them.
+
+    docker rmi <tags>; docker system prune -af --volumes
+
+Measured: 3.466 GB → 0 B. The colima VM file (`~/.colima`, 4.4 GB sparse against
+a 30 GB ceiling) is the only thing that persists, and `colima stop` frees its RAM.
