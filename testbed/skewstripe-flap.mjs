@@ -258,15 +258,41 @@ async function armRetryFlap(qs) {
 
 function checkValidity(armData) {
   const reasons = [];
-  for (const item of armData.timeline) {
-    const spreadA = item.pA.jitSpreadMaxRun ?? 0;
-    const spreadB = item.pB.jitSpreadMaxRun ?? 0;
-    if (spreadA > 300) {
-      reasons.push(`side A jitSpreadMaxRun ${spreadA} ms > 300 ms at t=${item.tSec}s`);
-      break;
+  // jitSpreadMaxRun is a cumulative max over the whole call and never decays,
+  // and the first sample is already at t=30. Testing its absolute value
+  // therefore condemned a run for any stall during warm-up -- three straight
+  // UNMEASURABLE verdicts came from stalls at t<=30 that the flap at t>=30
+  // could not possibly have been affected by. Since the hold ceiling shipped
+  // a stall's influence on the buffer is bounded to ~14 s, so a pre-flap stall
+  // is genuinely spent by flap time. What invalidates a run is the spread
+  // GROWING during the measurement window. The flap itself adds only ~64 ms
+  // of delay on one lane, so 300 ms of growth still cleanly separates "the
+  // stimulus we injected" from "this host stalled for a second".
+  const first = armData.timeline[0];
+  const growth = (side) => {
+    let base = first?.[side]?.jitSpreadMaxRun ?? 0;
+    let worst = 0, atSec = null;
+    for (const item of armData.timeline) {
+      const g = (item[side]?.jitSpreadMaxRun ?? 0) - base;
+      if (g > worst) { worst = g; atSec = item.tSec; }
     }
-    if (spreadB > 300) {
-      reasons.push(`side B jitSpreadMaxRun ${spreadB} ms > 300 ms at t=${item.tSec}s`);
+    return { worst, atSec };
+  };
+  const gA = growth('pA');
+  const gB = growth('pB');
+  if (gA.worst > 300) {
+    reasons.push(`side A jitSpreadMaxRun grew ${gA.worst.toFixed(1)} ms > 300 ms by t=${gA.atSec}s`);
+  } else if (gB.worst > 300) {
+    reasons.push(`side B jitSpreadMaxRun grew ${gB.worst.toFixed(1)} ms > 300 ms by t=${gB.atSec}s`);
+  }
+  // Growth alone has one blind spot: a stall at t~29 is already in the first
+  // sample, so it shows no growth, yet its hold is still decaying through the
+  // measurement window. A hold still in effect reads as an inflated ring at
+  // flap time -- steady state is ~18-20 ms and the ceiling is 112 ms.
+  for (const side of ['pA', 'pB']) {
+    const ring0 = first?.[side]?.ringDepthMs;
+    if (ring0 != null && ring0 > 60) {
+      reasons.push(`side ${side === 'pA' ? 'A' : 'B'} ring ${ring0.toFixed(1)} ms at flap time > 60 ms (stall still decaying)`);
       break;
     }
   }
