@@ -1692,3 +1692,29 @@ Container binding whose DO carries `locationHint: 'wnam'`. That is a
 container fetches a join script, drives Chromium into a room on room.tokkah.com,
 and Delhi ↔ that container is the real cross-planet call — run twice, default ICE
 and `?ice=relay`, and the 25-40 ms question is answered.
+
+### A browser container now runs ON ANOTHER CONTINENT, on demand (2026-08-14)
+
+`testbed/peer/` is a worker separate from tape-app (production must never break
+because an experiment's config was wrong). A container instance is owned by a
+Durable Object, so the DO's `locationHint` is what pins the browser's continent —
+the same mechanism `/api/probe` uses.
+
+    https://tokkah-peer-ctl.deshmukh.workers.dev/?region=wnam   -> start
+    https://tokkah-peer-ctl.deshmukh.workers.dev/stop?region=wnam -> destroy
+
+Verified: `{"region":"wnam","edgeColo":"DEL","roundTripMs":295,"container":{"running":true}}`
+— started cold in 595 ms, warm 295 ms, which matches the earlier wnam DO probe
+(303 ms) and so corroborates that it really is in North America rather than
+nearby. Regions accepted: wnam enam sam weur eeur apac oc afr me (remember
+`locationHint` is ADVISORY — `me` was demonstrably ignored by the probe).
+
+Stopped again immediately; an idle container bills continuously.
+
+**The remaining step, and it is the last one:** the container currently boots to
+`sleep infinity`. It needs to fetch a join script and drive Chromium into a room
+on room.tokkah.com with the fake-media flags already in its Dockerfile. Then
+Delhi ↔ wnam is a REAL cross-planet call: run it twice, default ICE and
+`?ice=relay`, read mouthToEarMs / glassToGlassMs / iceRttMs / icePath, and the
+25-40 ms question that decides the 150 ms goal is answered with a measurement
+instead of a model.
