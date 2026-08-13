@@ -189,21 +189,26 @@ async function armRetryStall(qs) {
   return s;
 }
 
+// The stage-2 gate does NOT transfer to this rig, and inheriting it made every
+// run unmeasurable: there, a >300 ms arrival spread means a host stall poisoned
+// the comparison; HERE it is the stimulus — blackholing three lanes for 5 s is
+// supposed to produce seconds of spread. Measured: four straight INVALIDs at
+// 837-2599 ms, all of them the injection working correctly.
+//
+// So spread is judged only BEFORE the injection (t=30, where a stall really is
+// contamination), and everything after is judged on what the rig does not
+// control: the emulator's own punctuality.
 function checkValidity(on, off) {
   const reasons = [];
   const checkArm = (label, armData) => {
-    const spreadA30 = armData.t30.pA.jitSpreadMaxRun ?? 0;
-    const spreadA55 = armData.t55.pA.jitSpreadMaxRun ?? 0;
-    const spreadB30 = armData.t30.pB.jitSpreadMaxRun ?? 0;
-    const spreadB55 = armData.t55.pB.jitSpreadMaxRun ?? 0;
-    const maxSpreadA = Math.max(spreadA30, spreadA55);
-    const maxSpreadB = Math.max(spreadB30, spreadB55);
+    const maxSpreadA = armData.t30.pA.jitSpreadMaxRun ?? 0;
+    const maxSpreadB = armData.t30.pB.jitSpreadMaxRun ?? 0;
 
     if (maxSpreadA > 300) {
-      reasons.push(`${label} side A jitSpreadMaxRun ${maxSpreadA} ms > 300 ms`);
+      reasons.push(`${label} side A pre-injection jitSpreadMaxRun ${maxSpreadA} ms > 300 ms`);
     }
     if (maxSpreadB > 300) {
-      reasons.push(`${label} side B jitSpreadMaxRun ${maxSpreadB} ms > 300 ms`);
+      reasons.push(`${label} side B pre-injection jitSpreadMaxRun ${maxSpreadB} ms > 300 ms`);
     }
     if (armData.latenessMax > 50) {
       reasons.push(`${label} sim lateness max ${armData.latenessMax} ms > 50 ms`);

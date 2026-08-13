@@ -312,7 +312,13 @@ console.log('skewstripe flap t=60 B:', JSON.stringify(runData.t60.pB));
 // whose flap produced a NEW slow lane in the peer's view.
 const flapDelivered = runData.flappedProxyIdx >= 0;
 console.log(`assert flap reached an audio lane: ${flapDelivered ? 'PASS' : 'FAIL'} (proxy #${runData.flappedProxyIdx}, delay -> ${runData.flappedNewDelay} ms at t=${runData.tFlapSec}s)`);
-const peerSkewPass = flapDelivered && (runData.t60.pA.peerSkew?.max >= 10) && (runData.t60.pB.peerSkew?.max >= 10);
+// EITHER side, unlike the stage-2 rig's `&&`: a flap changes ONE direction, and
+// this rig's gentler profile deliberately leaves the other side undiverged, so
+// demanding skew on both scores an undisturbed lane as a failure (measured:
+// A 9.5ms of pure jitter against B's 28ms real detection). flapDelivered already
+// proves a NEW slow lane appeared; this just confirms its size.
+const peerSkewPass = flapDelivered
+  && Math.max(runData.t60.pA.peerSkew?.max ?? 0, runData.t60.pB.peerSkew?.max ?? 0) >= 10;
 
 // Settled = the 10 s AFTER the flap's detection, not a fixed wall-clock time:
 // the flap can land later than t=30 s when earlier candidates were misses.
