@@ -7644,12 +7644,54 @@ safe(() => {
     } catch { /* a beacon must never break the call */ }
   };
   let joinAt = 0, connectedAt = 0, hbDone = false;
+  // ── What path does a REAL call take? (directive #7) ────────────────────────
+  // Every latency number this project owns was measured on ONE laptop against a
+  // SIMULATED network. This asks the same question of the wild, and it is the
+  // only way the "not noticeable on an India<->US-West call" bar can ever be
+  // scored: currentRoundTripTime is the network's own cost on the pair that
+  // actually carried the call, so it doubles as the distance measure — under
+  // 10 ms same-city, ~250 ms across the planet. No geography field needed, and
+  // none wanted: RTT answers "how far away, really" without locating anyone.
+  //
+  // relay vs srflx is the other half. TURN is offered on every call (Cloudflare
+  // Realtime, verified live), and a relayed pair adds a hop the direct path
+  // does not have — so a call that quietly relays can cost more than every
+  // millisecond this project has won at the transport layer. Today nothing
+  // records which one happened.
+  //
+  // SAMPLED, not read at the end: __hbEnd can fire during pagehide, where an
+  // async getStats loses the race and reports null forever. A 5 s poll off the
+  // hot path keeps a plain object the end beat reads synchronously. Cost is one
+  // getStats per 5 s on a connection already doing 48 kHz of audio.
+  let icePath = null, iceProto = null, iceRttMs = null, iceTimer = null;
+  const sampleIcePath = async () => {
+    if (!pc) return;
+    try {
+      const s = await pc.getStats();
+      let pair = null;
+      s.forEach((r) => {
+        // `nominated` is the pair in use; fall back to any succeeded pair so a
+        // browser that does not set it still reports something.
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) pair = r;
+      });
+      if (!pair) return;
+      const L = s.get(pair.localCandidateId), R = s.get(pair.remoteCandidateId);
+      if (L?.candidateType && R?.candidateType) icePath = `${L.candidateType}/${R.candidateType}`;
+      if (L?.protocol) iceProto = L.protocol;
+      if (typeof pair.currentRoundTripTime === 'number') iceRttMs = Math.round(pair.currentRoundTripTime * 1000);
+    } catch { /* a closing pc must never break the call */ }
+  };
   // Capture-phase listener: observes the same click the join handler consumes,
   // without touching that handler.
   $('join').addEventListener('click', () => { joinAt ||= performance.now(); }, true);
   window.__hbConnect = () => {
     if (connectedAt) return;
     connectedAt = performance.now();
+    // First sample now (the pair is nominated by the time we are connected),
+    // then every 5 s so the end beat reports the path the call SETTLED on
+    // rather than the one it started on — ICE can re-nominate mid-call.
+    sampleIcePath();
+    iceTimer = setInterval(sampleIcePath, 5000);
     // Device/environment class (directive 2026-08-11: know what hardware and
     // networks real calls run on, anonymously, at zero latency). Every field
     // is a synchronous property read at one event; every value is a COARSE
@@ -7673,6 +7715,7 @@ safe(() => {
   window.__hbEnd = (reason) => {
     if (hbDone) return;
     hbDone = true;
+    if (iceTimer) { clearInterval(iceTimer); iceTimer = null; }
     if (!connectedAt) {
       // Joined but the other side never appeared, or it never connected: only
       // a real attempt counts as a failure — an idle lobby close is not one.
@@ -7706,6 +7749,9 @@ safe(() => {
       stripeDemotions: p?.stripe?.demotions ?? null,
       glassToGlassMs: g,
       humanGapMs: hg,
+      // The real path this call took (see the sampler above): which candidate
+      // pair carried it, over what protocol, and the network's own round trip.
+      icePath, iceProto, iceRttMs,
       // Echo, fleet-visible (directive 2026-08-11): did echo exist, and did
       // the canceller actually help — the two questions room xow-offc-apz
       // could only answer by an operator reading its log by hand.

@@ -1266,6 +1266,16 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   // and demotion count over the call. Null on every call that never opted in.
   stripeNFast: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 16),
   stripeDemotions: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100_000),
+  // The path a REAL call took (directive #7, 2026-08-14). Every latency number
+  // this project owns came from one laptop against a simulated network; these
+  // three are the same questions asked of the wild. iceRttMs is the network's
+  // own round trip on the pair that actually carried the call, which is also
+  // the honest distance measure — under 10 ms same-city, ~250 ms across the
+  // planet. Deliberately NO geography field: RTT answers "how far away" without
+  // locating anybody, which keeps the beacon's aggregates-only law intact.
+  icePath: (v) => v === null || (typeof v === 'string' && /^(host|srflx|prflx|relay)\/(host|srflx|prflx|relay)$/.test(v)),
+  iceProto: (v) => v === null || (typeof v === 'string' && ['udp', 'tcp'].includes(v)),
+  iceRttMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 10_000),
 };
 const HB_ALLOWED: Record<string, Set<string>> = {
   connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs',
@@ -1276,7 +1286,7 @@ const HB_ALLOWED: Record<string, Set<string>> = {
     'mouthToEarMs', 'glassToGlassMs', 'humanGapMs',
     'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb', 'aecDtPct',
     'apTracker', 'apTrackedPct', 'apHz', 'laneSkewMaxMs', 'deskewApplied',
-    'stripeNFast', 'stripeDemotions']),
+    'stripeNFast', 'stripeDemotions', 'icePath', 'iceProto', 'iceRttMs']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1309,7 +1319,8 @@ export class Health implements DurableObject {
       'cam_fps REAL', 'dpr REAL', 'aec_dt_pct REAL',
       'tier TEXT', 'ap_tracker REAL', 'ap_tracked_pct REAL', 'ap_hz REAL',
       'lane_skew_max_ms REAL', 'deskew_applied REAL',
-      'stripe_n_fast REAL', 'stripe_demotions REAL']) {
+      'stripe_n_fast REAL', 'stripe_demotions REAL',
+      'ice_path TEXT', 'ice_proto TEXT', 'ice_rtt_ms REAL']) {
       try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // Operator room registry. The health BEATS stay anonymous by design (no
@@ -1346,8 +1357,9 @@ export class Health implements DurableObject {
                             echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db,
                             cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct,
                             tier, ap_tracker, ap_tracked_pct, ap_hz,
-                            lane_skew_max_ms, deskew_applied, stripe_n_fast, stripe_demotions)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            lane_skew_max_ms, deskew_applied, stripe_n_fast, stripe_demotions,
+                            ice_path, ice_proto, ice_rtt_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
@@ -1364,6 +1376,8 @@ export class Health implements DurableObject {
         (beat.apTrackedPct as number | null) ?? null, (beat.apHz as number | null) ?? null,
         (beat.laneSkewMaxMs as number | null) ?? null, (beat.deskewApplied as number | null) ?? null,
         (beat.stripeNFast as number | null) ?? null, (beat.stripeDemotions as number | null) ?? null,
+        (beat.icePath as string | null) ?? null, (beat.iceProto as string | null) ?? null,
+        (beat.iceRttMs as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });
