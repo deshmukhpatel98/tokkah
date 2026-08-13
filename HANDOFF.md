@@ -1587,3 +1587,45 @@ competition is a real room. Their echo report + telemetry drove the arc:
 THE DECISIVE EXPERIMENT (waiting): one more call, same room, same Macs.
 Read aecGateOpenPct (was effectively 0), dtPct (theory pick), copies
 (promotions = shadow at work). Staging resynced to HEAD flag-off.
+
+## Session 2026-08-14 — the 150 ms goal, and the budget that says it is close
+
+Goal set by the operator, standing until met: **any call anywhere on earth to
+anywhere on earth under 150 ms**, audio lossless and video visually lossless,
+full autonomy. `LATENCY-150.md` is the governing budget; read it first.
+
+**The finding: it is much closer than anyone had measured.** Every term is now
+a real number rather than an assumption.
+
+| term | measured | how |
+|---|---|---|
+| first mile | 5.37 ms RTT, 0% loss | `testbed/stun-rtt.mjs` — real STUN over UDP from Delhi |
+| backbone | 1.20–1.29× speed of light in fibre | `/api/probe?region=` pins a DO per continent, timed at the edge |
+| audio pipeline | 48 ms mouth-to-ear | loopback |
+| video pipeline | **45.4 ms** glass-to-glass | live prod, current build — the 56–59 ms in older notes is stale |
+
+Every route clears the bar on the SHIPPED build: Delhi→San Jose 128 ms video,
+Delhi→Sydney 116 ms, and near-antipodal Delhi→São Paulo 140.6 ms.
+
+**The one unproven assumption is the whole risk:** that a real WebRTC path routes
+as well as Cloudflare's backbone. Consumer-ISP P2P is often 2× the physics floor,
+which would put San Jose near 180 ms and fail. Hence **hypothesis #1: on long
+paths a relay over Cloudflare's backbone may BEAT direct P2P** — the inverse of
+the usual assumption. TURN is live on every call already, and the new
+`icePath`/`iceProto`/`iceRttMs` beat fields record which path each real call took.
+
+**Also shipped this session:** real-path telemetry (4-site beat plumbing, verified
+against prod with valid/invalid posts); `?vpd=N` makes the presenter anchor
+tunable — one slot instead of two is worth **9.2 ms** of glass-to-glass and was
+deliberately NOT taken, because that anchor is the fix for the operator's own
+smoothness complaint and `call.mjs` does not print the IPI gate it trades
+against. Earlier: a spurious-demotion fix on ordinary same-route calls (3-tick
+persistence), and three rig asserts that were scoring success as failure.
+
+**Next (task #31):** a real peer on another continent. Containers are enabled
+(`tokkah-lab`), instances bind to DOs so `locationHint` picks the region, and the
+fleet runner execs Python fetched from its coordinator — so Chromium can be
+installed at runtime without Docker, which this machine does not have.
+
+**Credentials:** `~/.config/tokkah/cf.env` (chmod 600, outside the repo; account-
+scoped token — verify at `/accounts/$CF_ACCOUNT_ID/tokens/verify`, NOT `/user/`).
