@@ -4369,3 +4369,29 @@ retries a null arm once rather than crying wolf.
 The win case (geo brief: 16–32 ms route divergence on long paths) is not yet
 measured — netsim gains per-lane offsets + heavy-tailed jitter next, and
 testbed/deskew-divergence.mjs carries the verdict.
+
+## De-skew divergence verdict: estimator-only correction LOSES — flipped to opt-in
+
+netsim gained per-lane structural offsets, one-sided heavy-tailed jitter, and
+mid-call route flap; testbed/deskew-divergence.mjs ran the A/B against DEPLOYED
+prod through local delay lines (24/12/24 ms offsets, 6 ms heavy tail, 60 s arms).
+
+Detection is exact: perLane read 25.5/11.6/25.3 against 24/12/24 injected. The
+buffer win is real: ring 31.1 vs 58.7 ms, m2e 118.4 vs 141.1. AND IT'S THE WRONG
+TRADE: concealment 4064 vs 3072 ms (repeatable: +472 ms on a second seed). The
+zero-divergence control (same heavy tail) concealed only 232-344 ms — divergence
+itself drives conceal 10x in BOTH arms.
+
+The mechanism, once measured, is obvious: de-skewing the ESTIMATOR cannot make
+slow-lane frames arrive earlier. Buffering for the slowest lane is not waste —
+it is the price of playing that lane's frames. The 16-32 ms is reclaimable only
+by acting on the skew at the SENDER: stripe less onto slow lanes, or recover
+their frames from fast-lane FEC before they arrive.
+
+Shipped instead: skew MEASUREMENT unconditional and fleet-visible (end beat
+laneSkewMaxMs + deskewApplied) — real-world divergence prevalence is the input
+that decides whether skew-aware striping gets built. Application is opt-in
+?deskew=1. Live re-verify post-flip: applied 1 vs 0, both arms measure ~1 ms
+same-route skew, 0 conceal, m2e 43.6/45.7.
+
+The rig that killed its own feature is the rig working.

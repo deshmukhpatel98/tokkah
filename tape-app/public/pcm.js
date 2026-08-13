@@ -1608,8 +1608,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // redundant vs. how much silently replaced a loss.
         if (seq <= seenHi && seenHi - seq < SEEN_N && seen[seq % SEEN_N] === 1) stats.dupRecv++;
         noteSeen(seq);
+        // Skew is MEASURED unconditionally — the fleet needs to know how much
+        // real-world route divergence exists — but APPLIED only behind the flag.
+        // Measured (deskew-divergence rig, 24/12/24 ms offsets, heavy tail):
+        // estimator de-skew cannot make slow-lane frames arrive earlier, so the
+        // shallower ring it buys (27.6 ms) is paid for in concealment (+1 s/min).
+        // Buffering for the slowest lane is the price of playing its frames;
+        // the real win needs skew-aware striping or FEC-side recovery first.
         let skewMs = 0;
-        if (DESKEW) {
+        {
           const tn = now();
           if (!laneEpoch) laneEpoch = tn - seq * FRAME_MS;
           const laneIdx = (typeof ai === 'number' && ai >= 0 && ai < PAIRS) ? ai : 0;
@@ -1644,7 +1651,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             skewMs = Math.max(0, laneBase[laneIdx] - minWarmBase);
           }
         }
-        ringWrite(seq, payload, capUs, zipped, skewMs);
+        ringWrite(seq, payload, capUs, zipped, DESKEW ? skewMs : 0);
         // The window decoder runs UNCONDITIONALLY (the flag is the sender's):
         // whether the peer protects its stream with RS or the window is its
         // choice, and this side must be able to decode either. frame() keeps a
@@ -1740,7 +1747,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // values. No hand-tuned shrink rate, and no ratchet, because rise and fall are
     // the same estimator read at different times.
     const JITTER_MEASURED = cfg.jitterMeasured !== false;
-    const DESKEW = cfg.deskew !== false;
+    // Opt-IN (=== true), unlike the flags around it: applying the correction was
+    // measured harmful on divergent routes (see the frame-path comment), so an
+    // embedder that says nothing gets the safe behavior. Skew is still measured
+    // and reported either way.
+    const DESKEW = cfg.deskew === true;
     // Window length is a tradeoff against SENDER CLOCK DRIFT, not just noise. d is
     // measured against our own clock, so a drifting sender makes d ramp steadily,
     // and a ramp inside the window reads as spread that no buffer needs to cover.
@@ -2311,9 +2322,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // numbers equal the aggregate above.
           pairs: PAIRS,
           laneSkew: (() => {
+            // Reported whether or not the correction is applied: `applied` says
+            // what the ring did, `max`/`perLane` say what the routes did. The
+            // fleet's divergence prevalence is what decides whether skew-aware
+            // striping is worth building.
             const perLane = [];
             let maxWarmSkew = 0;
-            if (DESKEW) {
+            {
               const tn = now();
               let numWarm = 0;
               let minWarmBase = Infinity;
@@ -2340,8 +2355,6 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
                   maxWarmSkew = skVal;
                 }
               }
-            } else {
-              for (let k = 0; k < PAIRS; k++) perLane.push(0);
             }
             return {
               max: +maxWarmSkew.toFixed(1),

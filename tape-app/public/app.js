@@ -1623,8 +1623,12 @@ const PCM_CFG = {
   // pain-counter law as the control arm — see the block above bumpTarget() in
   // pcm.js for what that law measured and why it was wrong.
   jitterMeasured: QS.get('pcmjit') !== '0',
-  // Per-lane arrival de-skew (§4.3 fix 2). `?deskew=0` is the control arm.
-  deskew: QS.get('deskew') !== '0',
+  // Per-lane arrival de-skew: flipped to OPT-IN (?deskew=1) after the
+  // divergence A/B measured the correction trading ring depth for concealment
+  // (+1 s/min at 24 ms divergence) — slow-lane frames can't be played before
+  // they arrive. Measurement/telemetry stays on for everyone; application
+  // waits for skew-aware striping or FEC-side recovery.
+  deskew: QS.get('deskew') === '1',
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',
@@ -7682,6 +7686,13 @@ safe(() => {
       concealPct: played > 0 && lost != null ? +((100 * lost) / played).toFixed(2) : null,
       tape: window.__tape?.tapeMode?.running ? 1 : 0,
       mouthToEarMs: p?.mouthToEarMs ?? null,
+      // Route divergence across the six lanes, fleet-visible. This number
+      // decides whether skew-aware striping is worth building: the divergence
+      // A/B (2026-08-13) showed 16-32 ms of reclaimable m2e IF the skew is
+      // acted on at the sender — prevalence in the wild is the missing input.
+      // deskewApplied says whether the (opt-in) ring correction ran.
+      laneSkewMaxMs: p?.laneSkew?.max ?? null,
+      deskewApplied: p?.laneSkew?.applied ?? null,
       glassToGlassMs: g,
       humanGapMs: hg,
       // Echo, fleet-visible (directive 2026-08-11): did echo exist, and did

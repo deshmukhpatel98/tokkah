@@ -135,6 +135,7 @@ export async function delayProxy({
   upstreamPort,
   delayMs = 0,
   jitterMs = 0,
+  jitterModel = 'uniform',
   lossPct = 0,
   seed = 1,
   host = '127.0.0.1',
@@ -147,6 +148,9 @@ export async function delayProxy({
   // slowly can only be caught by a run where the pain stops and you watch what happens
   // next; with loss fixed at construction, that run is impossible to write.
   let loss = lossPct;
+  // Delay is held in a cell for the same reason loss is: route-flap emulation needs to step
+  // the base delay during a call without rebuilding the proxy.
+  let delay = delayMs;
   // ── Why the buffers are set explicitly ───────────────────────────────────────────────
   // Node's default UDP buffers are small — tens of kilobytes. At the 12 Mbps this design
   // targets, in both directions, through two userspace hops, a few tens of kilobytes is a few
@@ -263,9 +267,12 @@ export async function delayProxy({
   let closed = false;
   const hold = (fn) => {
     if (closed) return;
-    // Jitter is symmetric around the mean, and clamped so it can never produce a negative
-    // delay — that would reorder in a way no network does and would flatter the result.
-    const d = Math.max(0, delayMs + (jitterMs ? (rnd() * 2 - 1) * jitterMs : 0));
+    // Real queueing jitter is one-sided (a packet can be late, never early) and heavy-tailed;
+    // symmetric uniform jitter flatters the estimator under test. Deterministic via the existing prng —
+    // same seed, same tail. Clamped so delay never goes below zero.
+    const d = jitterModel === 'heavy'
+      ? Math.min(delay + 8 * jitterMs, Math.max(0, delay + (jitterMs ? -Math.log(1 - rnd()) * jitterMs : 0)))
+      : Math.max(0, delay + (jitterMs ? (rnd() * 2 - 1) * jitterMs : 0));
     if (d === 0) return fn();
     if ((heldSeq++ & 63) === 0) {
       const t0 = performance.now();
@@ -335,6 +342,8 @@ export async function delayProxy({
     stats,
     setLoss: (pct) => { loss = pct; },
     get lossPct() { return loss; },
+    setDelay: (ms) => { delay = ms; },
+    get delayMs() { return delay; },
     close: () => {
       closed = true; // before any socket shuts, so in-flight timers become no-ops
       clearInterval(lagTimer);
@@ -391,13 +400,16 @@ export async function delayProxy({
 export async function startP2PSim({
   oneWayMs = 0,
   jitterMs = 0,
+  jitterModel = 'uniform',
   lossPct = 0,
   bwMbps = 0,
   queueMs = 100,
   seed = 1,
   host = '127.0.0.1',
+  laneOffsetsMs = [],
 }) {
   const proxies = new Map(); // "host:port" → proxy fronting that peer
+  const proxyList = [];
   return {
     /**
      * The proxy port that stands in for `peerHost:peerPort`. Idempotent: ICE offers the same
@@ -408,24 +420,41 @@ export async function startP2PSim({
       const key = `${peerHost}:${peerPort}`;
       let p = proxies.get(key);
       if (!p) {
+        // Creation order is NOT a stable lane identity — which physical lane lands on which proxy is
+        // arbitrary per run. The offsets create divergence; they do not target a named lane. That is
+        // sufficient for the A/B.
+        const n = proxies.size;
+        const offset = laneOffsetsMs.length ? laneOffsetsMs[n % laneOffsetsMs.length] : 0;
         p = await delayProxy({
           upstreamPort: peerPort,
           host: peerHost,
-          delayMs: oneWayMs,
+          delayMs: oneWayMs + offset,
           jitterMs,
+          jitterModel,
           lossPct,
           bwMbps,
           queueMs,
           // A distinct seed per direction. Sharing one would make both directions drop the same
           // packet indices, which is a correlated loss pattern no real path produces.
-          seed: seed + proxies.size * 977,
+          seed: seed + n * 977,
         });
         proxies.set(key, p);
+        proxyList.push(p);
       }
       return p.port;
     },
     get count() {
       return proxies.size;
+    },
+    laneDelays() {
+      return proxyList.map((p) => p.delayMs);
+    },
+    flap(index, deltaMs) {
+      const p = proxyList[index];
+      if (!p) return null;
+      const next = p.delayMs + deltaMs;
+      p.setDelay(next);
+      return next;
     },
     // ── Deliberately the same shape as startNetsim ────────────────────────────────────────
     // Both emulators are consumed by the same driver and written into the same `meta.json`, so
@@ -486,6 +515,7 @@ export async function startP2PSim({
     stop() {
       for (const p of proxies.values()) p.close();
       proxies.clear();
+      proxyList.length = 0;
     },
   };
 }

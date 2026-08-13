@@ -38,8 +38,11 @@ async function armRetry(qs) {
   if (s.framesRecv == null) { console.log(`[retry] arm '${qs || 'on'}' returned null pcm; retrying once`); s = await arm(qs); }
   return s;
 }
-const on = await armRetry('');
-const off = await armRetry('&deskew=0');
+// Flag flipped to opt-in 2026-08-13 (divergence A/B measured the correction
+// trading ring depth for concealment): ON is now ?deskew=1, bare URL is the
+// control. Skew is MEASURED in both arms — `applied` is what differs.
+const on = await armRetry('&deskew=1');
+const off = await armRetry('');
 console.log('deskew ON :', JSON.stringify(on));
 console.log('deskew OFF:', JSON.stringify(off));
 const skewMax = on.laneSkew?.max ?? null;
