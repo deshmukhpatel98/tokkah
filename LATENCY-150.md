@@ -320,3 +320,28 @@ eventual policy must pick by measured latency and not force relay everywhere.
 **A lever worth its own arc:** 6.6 ms of RTT bought 15 ms of buffer. The jitter
 buffer is that sensitive, so on real paths its behaviour may matter as much as
 the route. Worth measuring before it is tuned.
+
+## Status of the end-to-end proof (open)
+
+The relay result is measured on one side and modelled on the other, so it is not
+yet fact. Closing it needs a real browser on another continent. Progress and the
+exact obstacle, so the next attempt starts where this one stopped:
+
+- Containers are enabled on the account, and instances bind to Durable Objects —
+  so the same `locationHint` that pinned the region probes pins a container.
+  Placement is honoured for wnam/enam/sam/oc and demonstrably ignored for `me`.
+- This machine has no Docker, podman, colima or brew, so `wrangler containers
+  build` cannot run here.
+- Using a ready-made public image instead of building one was rejected:
+  `mcr.microsoft.com/playwright:v1.49.0-noble` → `IMAGE_REGISTRY_NOT_CONFIGURED`.
+  `wrangler containers registries configure <domain>` is the intended fix and
+  insists on `--secret-name` even with `-y`; whether a public no-auth registry is
+  accepted at all is the open question.
+- A path that needs no image: the existing ML fleet's runner execs Python fetched
+  from its coordinator at boot, so a job can `pip install playwright` and pull
+  Chromium at runtime. The container's network is outbound-only, which WebRTC
+  handles through STUN/TURN.
+
+Until that runs, the honest statement of where the goal stands is: **the budget
+says it is met on 8 of 8 routes via the backbone, on the build already shipped,
+and half of that claim is measured.**
