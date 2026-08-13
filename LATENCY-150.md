@@ -398,3 +398,32 @@ The gap has to come from somewhere real:
 The honest status of the goal: **met comfortably on Asia-Pacific routes, close
 on Sydney, and ~25–40 ms short on India↔US, which is the route the operator
 actually cares about.**
+
+## Where the missing 25–40 ms cannot come from
+
+The India↔US shortfall has to be found somewhere, so it is worth recording which
+doors are already shut.
+
+**Audio is at its floor.** The 48 ms decomposes as ~20 ms AudioContext
+outputLatency + ~16 ms jitter target (2 frames) + ~8 ms framing. Each was
+already won: a live A/B (2026-08-11, 3 calls/arm) took the latency hint to the
+floor, which cut outputLatency 26 → 20 ms and halved arrival spread, letting the
+jitter target settle at 2f instead of 3f — mouth-to-ear 62.6 → 45.6 ms. The
+remaining 20 ms is the operating system's output buffer, not ours, and the 16 ms
+is two 8 ms frames. Neither yields 25 ms without going lossy, which the goal
+forbids.
+
+**Video has ~9 ms available** behind `?vpd=1`, gated on the cadence check.
+
+So the device pipeline cannot close a 25–40 ms gap. **The gap has to come from
+the path** — which makes the unresolved question the only question:
+
+> Neither measurement taken so far is a real media path. A Durable Object round
+> trip is heavyweight control-plane RPC; a TCP handshake to AWS is the public
+> internet to a third party. TURN media is lean UDP forwarding between two
+> Cloudflare edges, and it has never been measured on a long route. It may be
+> materially faster than both columns — or it may not — and that single number
+> decides whether the goal is reachable on India↔US at all.
+
+Everything now points at the same experiment: a real peer on another continent,
+speaking real media, over both paths.
