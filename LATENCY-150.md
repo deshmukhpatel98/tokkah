@@ -427,3 +427,30 @@ the path** — which makes the unresolved question the only question:
 
 Everything now points at the same experiment: a real peer on another continent,
 speaking real media, over both paths.
+
+## CORRECTION 2: the 9.2 ms video saving is noise
+
+Re-ran the `?vpd` A/B with the cadence numbers the first attempt lacked, and the
+result reverses:
+
+| arm | glass-to-glass | IPI p99 |
+|---|---|---|
+| `vpd=2` (shipped) | 35.2 / 46.6 ms | 132.5 / 101.7 ms |
+| `vpd=1` (one slot) | 44.1 / 46.1 ms | 100.9 / 132.8 ms |
+
+The one-slot arm came out WORSE. Within a single arm, present p50 ranged 11.5 to
+22.7 ms — **run-to-run variance is larger than the ~9 ms effect**, so the first
+A/B's apparent saving was luck. Two samples per arm was never enough to see that;
+printing IPI is what made the spread visible.
+
+Now that IPI is printed, two more things show: p50 is 66.5 ms, so these rig calls
+present at **~15 fps**, and vp depth is **0** — the presenter anchor may not be
+engaging in this configuration at all, which would explain why changing it moves
+nothing.
+
+**The claim that ~9 ms sat behind this flag is withdrawn.** The flag stays: it
+costs nothing and prices the trade honestly. The win does not.
+
+That leaves the India↔US gap with no device-side lever at all — audio is at its
+floor, video offers nothing measurable — and the path as the only remaining
+source of 25–40 ms.
