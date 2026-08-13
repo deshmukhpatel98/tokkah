@@ -98,7 +98,10 @@ export class PeerContainer implements DurableObject {
     // answer survives the container exiting, which it does as soon as it is done.
     if (url.pathname === '/report' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
-      await this.state.storage.put('result', { at: Date.now(), ...(body as object) });
+      const prev = (await this.state.storage.get('result')) as { stages?: unknown[] } | undefined;
+      const stages = Array.isArray(prev?.stages) ? prev!.stages : [];
+      stages.push({ at: Date.now(), ...(body as object) });
+      await this.state.storage.put('result', { ...(prev ?? {}), stages: stages.slice(-12) });
       return Response.json({ stored: true });
     }
     if (url.pathname === '/result') {
@@ -123,7 +126,17 @@ export class PeerContainer implements DurableObject {
           // trap that broke the local half of this experiment twice. Errors are
           // echoed to stdout so a failure is visible in container logs instead
           // of arriving as a silent `pending` result forever.
-          'set -e; export NODE_PATH="$(npm root -g)"; curl -fsS "$JOIN_URL" -o /peer/join.js; cd /peer; node join.js 2>&1'],
+          // STAGED REPORTING. Four attempts were burned guessing at a silent
+          // `pending` because container stdout was never readable from here.
+          // Each step now posts before it runs, so the last stage that arrives
+          // names the step that failed -- a trace instead of silence.
+          'stage(){ curl -fsS -X POST "$REPORT_URL" -H "content-type: application/json" -d "{\"stage\":\"$1\",\"detail\":\"$2\"}" >/dev/null 2>&1 || true; }; '
+          + 'stage boot "entrypoint running"; '
+          + 'export NODE_PATH="$(npm root -g)"; stage nodepath "$NODE_PATH"; '
+          + 'curl -fsS "$JOIN_URL" -o /peer/join.js || { stage fetch-failed "cannot reach worker"; exit 1; }; '
+          + 'stage fetched "$(wc -c < /peer/join.js) bytes"; '
+          + 'cd /peer; OUT=$(node join.js 2>&1) || stage node-failed "$(echo "$OUT" | tail -c 400)"; '
+          + 'stage exited "$(echo "$OUT" | tail -c 200)"'],
         env: {
           JOIN_URL: `${self}/join.js`,
           REPORT_URL: `${self}/report?region=${url.searchParams.get('region') ?? 'wnam'}`,

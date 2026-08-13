@@ -1763,3 +1763,26 @@ Likely candidates once logs are visible: the container has NO public egress
 allow-list configured (`assign_ipv4: none`, mode private) so `curl` of JOIN_URL
 or the page load may be blocked; or chromium needs more shared memory than the
 default; or the join click selector differs on a cold lobby.
+
+**ROOT CAUSE FOUND (5th attempt): the entrypoint override never runs.**
+
+Staged reporting was added so the container posts before each step — `boot`,
+`nodepath`, `fetched`, `exited`. **Not even `boot` arrived**, and that is the
+first line of the entrypoint, before any network call to the worker except the
+stage post itself. Polled for 180 s: `{"pending": true}` throughout, while the
+container sat `active`.
+
+So the container is running its Dockerfile `CMD` (`sleep infinity`) and IGNORING
+the `entrypoint` passed to `container.start({entrypoint, env})`. That fits every
+symptom seen across five attempts: container starts fine, stays healthy, and
+never does anything.
+
+**The fix is to stop relying on the override.** Bake the work into the image:
+put the join logic in the Dockerfile's `CMD` and pass only ENV (`ROOM`, `BASE`,
+`REPORT_URL`, `EXTRA_QS`, `HOLD_S`) through `start({env})`, which is the half of
+that API we have no evidence against. Rebuild, push as `tokkah-peer:v3`, bump the
+image in `testbed/peer/wrangler.jsonc`, redeploy. Keep the staged `stage()` calls
+— they are what turned five blind attempts into one clear answer, and they cost
+nothing.
+
+Note the image already carries `PEER_FLAGS`; the same pattern works for the rest.
