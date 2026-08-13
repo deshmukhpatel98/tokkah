@@ -2099,6 +2099,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Where the knob is CONNECTED, fast wins everything measured: post-stall excursion
     // 1.8-6x smaller, 8/8 paired calls at 5% loss (p=0.0346), and direction at 2.5 Mbps.
     const JIT_RELEASE = cfg.jitterRelease ?? 2;
+    // Where the target saturates: ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES
+    // reaches maxTargetFrames here, so held spread above this is invisible to
+    // the output and costs only recovery time. Derived, not a constant, so it
+    // follows ?pcmjbmax instead of silently disagreeing with it.
+    const HOLD_CEIL = Math.max(FRAME_MS, (cfg.maxTargetFrames - D_MARGIN_FRAMES) * FRAME_MS);
+    const HOLD_CAP = cfg.holdCap !== false;
     let spreadHold = 0;
     // ── Latency governor (task #47, `?pcmgov=` ) ──────────────────────────────
     // The estimator sizes the buffer from arrival SPREAD; the governor audits the
@@ -2231,11 +2237,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // makes the estimator's memory an explicit number instead of an accident
       // of how long D_WIN happens to be.
       //
-      // SHIPPED RELEASE IS 0.25 ms/tick = 1 ms/s (JIT_RELEASE below, `?pcmjitrel=`
-      // to override). An earlier revision of this comment said 8 ms/s and was left
-      // in place after the constant changed, so the file described a 12 s memory
-      // while shipping a ~90 s one -- an 8x error in the single most important time
-      // constant in the estimator, sitting directly above the line it describes.
+      // SHIPPED RELEASE IS 2 ms/tick = 8 ms/s (JIT_RELEASE below, `?pcmjitrel=`
+      // to override). This comment has now been wrong in BOTH directions: it once
+      // said 8 ms/s while 0.25 shipped, was corrected, and then went stale again
+      // when the constant moved back to 2 on 2026-08-03 -- so the numbers below,
+      // taken under the 0.25 law, describe a decay 8x slower than anything that
+      // ships today. They are kept because the SHAPE of the failure is what
+      // matters and it is unchanged; only the timescale is now ~8x shorter. The
+      // lesson is that a measured constant and the prose describing it drift
+      // apart silently, which is why the ceiling below is derived rather than
+      // written down.
       //
       // MEASURED COST OF THAT MEMORY (testbed/onehole.mjs, clean same-engine call,
       // one 99.9 ms arrival hole injected by blocking the receiver's main thread):
@@ -2254,7 +2265,24 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // Release per 250 ms tick. Bursts on a shaped link are rare and brief
         // (bwQueue p95 5.6 ms against a max of 97.6), which is the argument for
         // holding the peak at all; how long to hold it is the open question.
+        // CEILING. Above HOLD_CEIL the target is already pinned at
+        // maxTargetFrames — `ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES` has
+        // saturated — so every further millisecond of hold is memory the
+        // estimator CANNOT ACT ON, and can only pay back at JIT_RELEASE on the
+        // way down. That makes recovery time proportional to the size of the
+        // event rather than to the buffer: a 1.3 s stall (measured in this
+        // project's own rigs, twice) holds the buffer at maximum depth for
+        // ~165 s, and a 9.6 s shaped-link opening for about twenty minutes,
+        // both producing the exact same 15-frame target as a 112 ms excursion.
+        //
+        // The clamp is bit-identical on every tick where the unclamped hold is
+        // >= HOLD_CEIL, because both sides saturate to the same target. It
+        // cannot change the RESPONSE to an event, only when the estimator stops
+        // responding to one that is over: any excursion now decays in <= 14 s.
+        // Raw magnitude is still observable — jitSpreadMaxRun records unclamped
+        // `spread`, which is what a stall's size should be read from anyway.
         spreadHold = Math.max(spread, spreadHold - JIT_RELEASE);
+        if (HOLD_CAP && spreadHold > HOLD_CEIL) spreadHold = HOLD_CEIL;
         if (spreadHold > stats.jitHoldMaxRun) stats.jitHoldMaxRun = +spreadHold.toFixed(1);
       } else spreadHold = spread;
       const raw = Math.max(cfg.targetFrames, Math.ceil(spreadHold / FRAME_MS) + D_MARGIN_FRAMES);
@@ -2542,6 +2570,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           jitSpreadMaxRun: stats.jitSpreadMaxRun, jitAboveFloorMs: stats.jitAboveFloorMs,
           jitWantMaxRun: stats.jitWantMaxRun, jitClampedTicks: stats.jitClampedTicks,
           jitHoldMaxRun: stats.jitHoldMaxRun, jitHold: JIT_HOLD, jitRelease: JIT_RELEASE,
+          holdCap: HOLD_CAP ? HOLD_CEIL : 0,
           // Read these TOGETHER with jitSpreadMaxRun. maxAt near 0 with maxLate far
           // below the max means a startup transient sized the whole call's buffer.
           // Arrival PATTERN, which spread cannot express. Read gapClumpPct together

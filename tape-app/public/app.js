@@ -1635,6 +1635,10 @@ const PCM_CFG = {
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',
+  // Ceiling on that hold at the point the target saturates: past there the
+  // held value cannot change the buffer, only how long it takes to come back.
+  // `?pcmholdcap=0` is the control arm.
+  holdCap: QS.get('pcmholdcap') !== '0',
   // Ladder tracks unplayable frames (loss + lateness) instead of loss alone.
   fecLate: QS.get('pcmfeclate') === '1',
   // ms of hold released per 250 ms tick. 2 = 8 ms/s.

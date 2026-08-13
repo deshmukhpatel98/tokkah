@@ -4457,3 +4457,34 @@ Still opt-in (?pcmskewstripe=1), deliberately against the default-ON law: the
 same class of change just measured harmful once, and the honest gate is a real
 long-path call, which needs a cloud vantage this machine cannot provide. Fleet
 laneSkewMaxMs is accumulating the prevalence data that decides the flip.
+
+## The hold ceiling: a 10-second network event cost twenty minutes of latency
+
+Found by an Opus design study commissioned to answer the estimator's own open
+question ("how long to hold it is the open question"), and the first thing it
+found was that the question was stale. The comment above JIT_RELEASE declares
+"SHIPPED RELEASE IS 0.25 ms/tick" while the code reads `?? 2` — 8x faster. That
+comment narrates fixing this exact error once before, then went stale again in
+the other direction when the constant moved back on 2026-08-03. MEASURED.md
+inherited it this morning, and so had testbed/onehole.mjs, which has been
+predicting an 8x slower decay than the code it measures. Both fixed.
+
+The real defect underneath: the buffer target saturates at maxTargetFrames once
+held spread reaches (maxTargetFrames - D_MARGIN_FRAMES) * FRAME_MS = 112 ms.
+Past that the hold keeps growing without limit while the OUTPUT cannot move —
+so recovery time becomes proportional to the size of the event instead of the
+size of the buffer. A 1.3 s stall (hit twice in this project's own rigs) pins
+the buffer at maximum depth for ~165 s. A 9.6 s shaped-link opening pins it for
+twenty minutes. All three produce the identical 15-frame target.
+
+Shipped: `spreadHold` clamped to that ceiling, derived from cfg so it follows
+?pcmjbmax rather than silently disagreeing with it. Default on, ?pcmholdcap=0
+is the control. Proven output-identical across all 10001 hold values from 0 to
+5000 ms — the clamp cannot change the RESPONSE to an event, only when the
+estimator stops responding to one that is over. Worst-case recovery goes from
+unbounded to 14 s. Raw stall magnitude stays observable in jitSpreadMaxRun.
+
+Full study, including why percentile sizing is rejected (a quantile q rejects
+clumps only up to (1-q)*D_WIN frames, and p95 *defines* 5% of arrivals as
+acceptable losses) and why stall suppression is staged behind measurement:
+testbed/specs/hold-release.md.

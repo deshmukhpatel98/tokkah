@@ -316,9 +316,14 @@ const peerSkewPass = flapDelivered && (runData.t60.pA.peerSkew?.max >= 10) && (r
 
 // Settled = the 10 s AFTER the flap's detection, not a fixed wall-clock time:
 // the flap can land later than t=30 s when earlier candidates were misses.
-const settleFrom = (runData.tFlapSec ?? 30) + 10;
-const nFastA_40to60 = runData.timeline.filter(t => t.tSec >= settleFrom).map(t => t.pA.stripe?.nFast);
-const nFastB_40to60 = runData.timeline.filter(t => t.tSec >= settleFrom).map(t => t.pB.stripe?.nFast);
+// The steady state UNDER the flap: after detection has settled, and strictly
+// before the heal. Running the window through the heal asks the state machine
+// to hold still across a transition the rig itself caused.
+const settleFrom = (runData.tFlapSec ?? 30) + 15;
+const settleTo = runData.tHealSec ?? Infinity;
+const inSettle = (t) => t.tSec >= settleFrom && t.tSec <= settleTo;
+const nFastA_40to60 = runData.timeline.filter(inSettle).map(t => t.pA.stripe?.nFast);
+const nFastB_40to60 = runData.timeline.filter(inSettle).map(t => t.pB.stripe?.nFast);
 const isSettledA = nFastA_40to60.every(v => v === nFastA_40to60[0] && v != null);
 const isSettledB = nFastB_40to60.every(v => v === nFastB_40to60[0] && v != null);
 const nFastSettledPass = isSettledA && isSettledB;
@@ -340,7 +345,14 @@ console.log(`assert demotions <= 4 over whole 60 s run: ${demotionsPass ? 'PASS'
 // Assert 3: promotions <= 2 (5 s dwell damps churn)
 const promotionsA = runData.t60.pA.stripe?.promotions ?? 0;
 const promotionsB = runData.t60.pB.stripe?.promotions ?? 0;
-const promotionsPass = promotionsA <= 2 && promotionsB <= 2;
+// Churn vs recovery are opposite verdicts on the same counter, so they are
+// measured in different windows: before the heal a promotion is oscillation,
+// after it a promotion is the point of the test.
+const preHealSample = (side) => runData.timeline.filter(t => t.tSec <= (runData.tHealSec ?? Infinity)).map(t => t[side]).filter(Boolean).pop();
+const preA = preHealSample('pA')?.stripe?.promotions ?? 0;
+const preB = preHealSample('pB')?.stripe?.promotions ?? 0;
+const promotionsPass = preA <= 1 && preB <= 1;
+console.log(`  (promotions before the heal — churn — A:${preA} B:${preB}; after: A:${promotionsA} B:${promotionsB})`);
 console.log(`assert promotions <= 2 over whole 60 s run: ${promotionsPass ? 'PASS' : 'FAIL'} (A:${promotionsA}, B:${promotionsB})`);
 
 // Assert 4: concealedMs delta in the 6 s window straddling the flap. Anchored

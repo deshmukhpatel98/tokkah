@@ -83,10 +83,14 @@ for (const [k, v, min] of [['hole', HOLE, 0], ['settle', SETTLE, 15], ['recover'
 }
 // The release rate is READ BACK OUT of the query the run will actually use, never
 // assumed. `?pcmjitrel=` sets ms of spread released per 250 ms tick, so x4 is per
-// second; app.js falls back to pcm.js's 0.25 default when it is absent or zero.
+// second; app.js falls back to pcm.js's default when it is absent or zero.
 // Printing a hardcoded "1 ms/s" while the page ran at 8 would make every prediction
 // in the report agree with itself and disagree with the software.
-const relPerTick = Number(new URLSearchParams(QUERY).get('pcmjitrel')) || 0.25;
+// The fallback tracked pcm.js's 0.25 era and went stale when the constant moved
+// back to 2 on 2026-08-03 — so this rig has been predicting an 8x slower decay
+// than the code it measures. Same failure as the comment above JIT_RELEASE, in
+// the instrument this time.
+const relPerTick = Number(new URLSearchParams(QUERY).get('pcmjitrel')) || 2;
 
 /** Reading a field that does not exist is a BUG, not a missing datum. */
 function need(o, k, where) {
