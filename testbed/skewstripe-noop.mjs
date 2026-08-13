@@ -35,6 +35,9 @@ async function arm(qs) {
       return {
         stripe: s.stripe ?? null,
         laneSkewMax: s.laneSkew?.max ?? null,
+        laneSkew: s.laneSkew?.perLane ?? null,
+        peerSkew: s.peerSkew?.perLane ?? null,
+        peerWarm: s.peerSkew?.warmMask ?? null,
         m2e: s.mouthToEarMs ?? null,
         ring: s.m2eParts?.ringDepthMs ?? null,
         framesRecv: window.__tape?.pcm?.framesRecv ?? null,

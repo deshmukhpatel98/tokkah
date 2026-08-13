@@ -103,7 +103,8 @@ const T_DATA_Z = 0x06;
 // it and stays at the fixed rate; nothing has to be negotiated.
 const T_LOSS = 0x07;
 // Skew report, 8 B at pairs=6, 4×/s: `u8 type | u8 warmMask | u8 skewQ[lanes]`,
-// lanes = byteLength - 2, skewQ = min(255, round(skew_ms * 2)) — 255 means
+// lanes = min(PAIRS, byteLength - 2) — the PAIRS clamp is what makes the same
+// parse read both the 8 B and 9 B forms. skewQ = min(255, round(skew_ms*2)); 255 means
 // "saturated at ≥127.5 ms", still a valid (and alarming) reading. warmMask bit
 // k says lane k's estimate is warm; a cold lane's 0 is "unknown", not "aligned",
 // and the mask is what keeps a striping policy from ever acting on it. Assumes
@@ -526,6 +527,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // the receiver is measuring without making routing changes yet.
     const peerSkewMs = new Float64Array(PAIRS);
     let peerSkewWarm = 0;
+    let peerLiveMask = 0xff;
     let peerSkewAt = 0;
 
     // Skew-aware striping (lane-skew Stage 2, opt-in ?pcmskewstripe=1).
@@ -543,11 +545,20 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // epoch is judged on its own evidence.
     const laneRttBase = new Float64Array(PAIRS).fill(Infinity);
     const laneDead = new Uint8Array(PAIRS);
+    // ONE definition, used by both the ping timer and the silence threshold that
+    // reads it. Written apart, they drift: the threshold started at a flat
+    // 2000 ms, which is exactly one ping period, so a lane sat "silent" for the
+    // instant before every ping and a recompute tick landing in that window
+    // condemned whichever lanes it caught. Measured on a clean same-route call
+    // with no stall and 1 ms of skew: 3 lanes demoted out of nowhere. Declared
+    // here, above every use, rather than beside the timer it feeds.
+    const PING_MS = 2000;
     let lastOrderRecompute = 0;
     let stripeDemotions = 0;
     let stripePromotions = 0;
     let stripeStaleFailopen = 0;
     let stripeProbePromotions = 0;
+    let deadGraceUntil = 0;
     let isStaleFailopen = false;
 
     /**
@@ -560,6 +571,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
      */
     function recomputeLaneOrder(tn = now()) {
       if (!SKEWSTRIPE) return;
+      // OUR OWN PUNCTUALITY, FIRST. Every "this lane is dead" signal below is
+      // really "we have not processed anything from it lately", and a frozen
+      // main thread produces that for ALL SIX AT ONCE while the network is
+      // perfectly fine. Measured on a same-route call with peer-reported skew of
+      // 1 ms on every lane: 6 demotions and 6 promotions, +20 ms of ring and
+      // ~1 s of concealment, entirely manufactured by this machine's own 1-2 s
+      // stalls. netsim learned the same lesson and reports its own lateness for
+      // exactly this reason: a ruler that cannot say "I was jostled" will report
+      // the jostling as a measurement.
+      const tickGap = lastOrderRecompute ? tn - lastOrderRecompute : 1000;
+      if (tickGap > 1500) deadGraceUntil = tn + 2000;
       if (tn - lastOrderRecompute < 1000) return;
       lastOrderRecompute = tn;
 
@@ -618,10 +640,47 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const a = assocs[k];
         const open = a?.dc?.readyState === 'open';
         const lp = a?.lastPongT ?? 0;
-        const mute = open && lp > 0 && (tn - lp) > 2000;
+        // The fast, one-way signal: the peer stopped receiving on a lane we are
+        // actively sending. Only meaningful for lanes we SEND on — a demoted
+        // lane is silent by design, and reading that as death would re-create
+        // the permanent-demotion trap the RTT probe exists to escape.
+        // The 2 s grace is load-bearing, not caution. A just-promoted lane has
+        // by definition delivered nothing yet, so the peer still reports it as
+        // not-live for up to a second, plus the report interval and transit.
+        // Without the grace that reads as death, the RTT probe revives it, and
+        // the two signals drive each other: measured on a SAME-ROUTE call,
+        // 6 demotions and 6 promotions in 45 s, frames 1016/832 across lanes,
+        // +26 ms of mouth-to-ear and 1224 ms of concealment against a control
+        // with zero. The feature was about to make every ordinary call worse.
+        const peerSaysGone = laneState[k] === 0
+          && (tn - laneStateSince[k]) > 2000
+          && (peerLiveMask & (1 << k)) === 0
+          && peerSkewAt > 0 && (tn - peerSkewAt) < 2000;
+        // 2.5 ping periods: long enough that normal cadence plus a round trip
+        // never trips it, short enough to notice a genuinely silent route.
+        const mute = open && lp > 0 && (tn - lp) > PING_MS * 2.5;
         const hopeless = open && a?.rttMs != null && minFastRtt !== Infinity
           && (a.rttMs - minFastRtt) > 300;
-        laneDead[k] = (mute || hopeless) ? 1 : 0;
+        // Nothing is declared dead while we are still recovering from a local
+        // freeze: the evidence for death and the evidence of our own stall are
+        // the same observation.
+        laneDead[k] = (tn >= deadGraceUntil && (peerSaysGone || mute || hopeless)) ? 1 : 0;
+      }
+
+      // GLOBAL OUTAGE IS NOT A ROUTE PROBLEM. The peer freezing sends neither
+      // pongs nor frames, which from this side is indistinguishable from the
+      // network dying — by signal. Not by SCOPE: a frozen peer silences all six
+      // lanes at once, while a real route failure takes a subset. Measured on a
+      // same-route call where the FAR side stalled: every lane read dead, all
+      // six were demoted, and since a dead lane is never rescued by MIN_FAST the
+      // stripe collapsed and churned (11 demotions, 8 promotions, 1240 ms of
+      // concealment) — all of it reshuffling that could not have helped, because
+      // there was no healthy lane to move to. The local-stall grace above cannot
+      // catch this: our own clock was perfectly punctual throughout.
+      let deadCount = 0;
+      for (let k = 0; k < PAIRS; k++) deadCount += laneDead[k];
+      if (deadCount >= PAIRS - 1) {
+        for (let k = 0; k < PAIRS; k++) laneDead[k] = 0;
       }
 
       // Evaluate desired states with 5 s dwell and hysteresis (spec §2.1)
@@ -664,7 +723,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             const rttOk = laneRttBase[k] < Infinity && minFastRtt !== Infinity
               && (laneRttBase[k] - minFastRtt) <= 8;
             laneRttOkStreak[k] = rttOk ? laneRttOkStreak[k] + 1 : 0;
-            if (!isWarm || skew <= 4.0 || laneRttOkStreak[k] >= 3) desiredState[k] = 0; // FAST
+            // Positive evidence only. `!isWarm` used to count as "fine again",
+            // but a demoted lane is silent and therefore never warm — so that
+            // clause promoted every demoted lane on every dwell expiry, which is
+            // the other half of the same-route cycling. Either the peer measures
+            // it fast, or the ping says the route came back.
+            if ((isWarm && skew <= 4.0) || laneRttOkStreak[k] >= 3) desiredState[k] = 0; // FAST
           }
         }
       }
@@ -766,10 +830,31 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       }
     }
 
+    // Warm = enough samples AND still delivering. The recency half is not a
+    // refinement, it is a correctness fix: a demoted lane goes silent, its base
+    // freezes (drift is frozen for quiet lanes on purpose), and within seconds
+    // every ACTIVE lane has drifted +1 ms/s past it. The frozen lane then wins
+    // min() and becomes the reference the others are judged against, so the
+    // working lanes read as 10 ms+ slow and get demoted in turn — measured on a
+    // same-route call as 12 demotions and 9 promotions in 45 s, with the ring
+    // 24 ms deeper than control. A lane that is not delivering has no opinion.
+    const laneWarmAt = (k, tn) => laneSamples[k] >= 50 && lastFrameT[k] > 0 && (tn - lastFrameT[k]) < 2000;
+
     function laneSkewNow(laneIdx, seq) {
       const tn = now();
       if (!laneEpoch) laneEpoch = tn - seq * FRAME_MS;
       const idx = (typeof laneIdx === 'number' && laneIdx >= 0 && laneIdx < PAIRS) ? laneIdx : 0;
+      // A lane resuming after a silence must RE-LEARN, not carry its old base
+      // across the gap. It already has its 50 samples banked, so without this it
+      // re-enters the reference set the instant it delivers one frame, holding a
+      // value that is stale by however much the two clocks drifted while it was
+      // quiet (up to 2 ms/s) — and a reference that is wrong-LOW makes every
+      // healthy lane read as slow. Same epoch-reset rule as laneRttBase.
+      if (lastFrameT[idx] > 0 && (tn - lastFrameT[idx]) > 2000) {
+        laneBase[idx] = Infinity;
+        laneSamples[idx] = 0;
+        laneLastT[idx] = 0;
+      }
       lastFrameT[idx] = tn;
       updateDrift(tn);
 
@@ -783,14 +868,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       let numWarm = 0;
       let minWarmBase = Infinity;
       for (let k = 0; k < PAIRS; k++) {
-        if (laneSamples[k] >= 50) {
+        if (laneWarmAt(k, tn)) {
           numWarm++;
           if (laneBase[k] < minWarmBase) {
             minWarmBase = laneBase[k];
           }
         }
       }
-      if (numWarm >= 2 && laneSamples[idx] >= 50) {
+      if (numWarm >= 2 && laneWarmAt(idx, tn)) {
         return Math.max(0, laneBase[idx] - minWarmBase);
       }
       return 0;
@@ -804,7 +889,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       let minWarmBase = Infinity;
       let warmMask = 0;
       for (let k = 0; k < PAIRS; k++) {
-        if (laneSamples[k] >= 50) {
+        if (laneWarmAt(k, tn)) {
           numWarm++;
           warmMask |= (1 << k);
           if (laneBase[k] < minWarmBase) {
@@ -817,12 +902,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       let maxWarmSkew = 0;
       for (let k = 0; k < PAIRS; k++) {
         let sk = 0;
-        if (numWarm >= 2 && laneSamples[k] >= 50) {
+        if (numWarm >= 2 && laneWarmAt(k, tn)) {
           sk = Math.max(0, laneBase[k] - minWarmBase);
         }
         const skVal = +sk.toFixed(1);
         perLane.push(skVal);
-        if (laneSamples[k] >= 50 && skVal > maxWarmSkew) {
+        if (laneWarmAt(k, tn) && skVal > maxWarmSkew) {
           maxWarmSkew = skVal;
         }
       }
@@ -1759,7 +1844,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       if (closed || !SKEWFB) return;
       const all = laneSkewAll();
       if (all.numWarm < 2) return;
-      const msg = new ArrayBuffer(2 + PAIRS);
+      const msg = new ArrayBuffer(3 + PAIRS);
       const dv = new DataView(msg);
       dv.setUint8(0, T_SKEW);
       dv.setUint8(1, all.warmMask & 0xff);
@@ -1767,6 +1852,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const skewVal = all.perLane[k] ?? 0;
         dv.setUint8(2 + k, Math.min(255, Math.round(skewVal * 2)));
       }
+      // Liveness: has this lane delivered a frame in the last second? A lane
+      // that has NEVER delivered reads as live — at call start nothing has
+      // arrived yet, and "unknown" must never be reported as "dead".
+      const tnow = now();
+      let liveMask = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        if (lastFrameT[k] === 0 || (tnow - lastFrameT[k]) < 1000) liveMask |= (1 << k);
+      }
+      dv.setUint8(2 + PAIRS, liveMask & 0xff);
       const target = assocs[0]?.dc?.readyState === 'open' ? assocs[0] : firstOpenAssoc();
       if (target?.dc?.readyState === 'open') {
         try { target.dc.send(msg); } catch { /* advisory telemetry report */ }
@@ -1867,6 +1961,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             peerSkewMs[k] = (mask & (1 << k)) ? dv.getUint8(2 + k) / 2 : 0;
           }
           peerSkewWarm = mask;
+          // Absent on an older peer's 8-byte report: assume every lane live, so
+          // a missing field can never cause a demotion.
+          peerLiveMask = data.byteLength >= 3 + PAIRS ? dv.getUint8(2 + PAIRS) : 0xff;
           peerSkewAt = now();
           if (SKEWSTRIPE) recomputeLaneOrder();
         }
@@ -2514,7 +2611,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         channel.onmessage = (e) => { try { onMessage(e.data, idx); } catch { /* one bad datagram is not a call-ending event */ } };
         channel.onopen = () => {
           L('pcm-dc-open', PAIRS > 1 ? { mode, assoc: idx, pairs: PAIRS } : { mode });
-          if (!pinger) pinger = setInterval(sendPing, 2000);
+          if (!pinger) pinger = setInterval(sendPing, PING_MS);
           // 250 ms, not the ping's 2 s: 2 s of under-protection after a burst
           // begins is 250 frames of audio, and the whole point of the ladder is
           // to have the parity already in flight when the loss arrives.
