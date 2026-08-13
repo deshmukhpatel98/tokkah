@@ -1718,3 +1718,22 @@ Delhi ↔ wnam is a REAL cross-planet call: run it twice, default ICE and
 `?ice=relay`, read mouthToEarMs / glassToGlassMs / iceRttMs / icePath, and the
 25-40 ms question that decides the 150 ms goal is answered with a measurement
 instead of a model.
+
+**Cross-planet call: infrastructure DONE, measurement NOT taken.** The container
+starts on demand in wnam and fetches its join script; what has not yet worked is
+the LOCAL half. `testbed/localjoin.mjs` failed twice — first with
+ERR_MODULE_NOT_FOUND because it was run from /tmp where `playwright` will not
+resolve, then again from the repo with an error the run's `tail -2` swallowed.
+The container's `/result` stayed `pending` both times, which is consistent with
+it holding for its full window and finding no peer.
+
+**Next session, do this first:** run `node testbed/localjoin.mjs` alone with FULL
+output (no tail) against any room and fix whatever it prints. It is a ~20-line
+script. Once it joins a room by itself, the cross-planet call is:
+
+    curl "https://tokkah-peer-ctl.deshmukh.workers.dev/call?region=wnam&room=<code>&hold=95"
+    ROOM=<code> HOLD_S=75 node testbed/localjoin.mjs
+    curl "https://tokkah-peer-ctl.deshmukh.workers.dev/result?region=wnam"
+
+Run it twice — once plain, once with `&qs=ice%3Drelay` — and the 25-40 ms
+question is answered. Everything is scaled to 0; `colima stop` has freed the VM.
