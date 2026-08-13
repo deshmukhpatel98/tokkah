@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { chromium } from 'playwright-core';
 const ROOM = process.env.ROOM, HOLD = Number(process.env.HOLD_S || 75);
 const CHROME = process.env.HOME + '/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
 const b = await chromium.launch({ executablePath: CHROME, args: [

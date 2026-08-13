@@ -1737,3 +1737,29 @@ script. Once it joins a room by itself, the cross-planet call is:
 
 Run it twice — once plain, once with `&qs=ice%3Drelay` — and the 25-40 ms
 question is answered. Everything is scaled to 0; `colima stop` has freed the VM.
+
+**Cross-planet call: 4 attempts, no measurement. Read the container logs first.**
+
+The apparatus works — container starts in wnam on demand, local half now runs
+(it needed `playwright-core`, not `playwright`, from `testbed/node_modules`, and
+room codes must match `[a-z]{3}-[a-z]{4}-[a-z]{3}`; digits 404 the page). What
+does not work is the call itself: the local side reports `framesRecv: 0` and the
+container's `/result` stays `pending` every time.
+
+Fixes already applied and still not sufficient: `NODE_PATH="$(npm root -g)"` in
+the container entrypoint (the Playwright image installs globally, so `node
+join.js` in /peer cannot resolve `require('playwright')` — the same trap that
+broke the local half twice), and `2>&1` on the node invocation.
+
+**The blocker is visibility, not logic.** Four attempts were spent guessing
+because container stdout was never read. Do this before touching the script
+again:
+
+    wrangler containers list          # find the tokkah-peer-ctl-peercontainer app
+    # then read that instance's logs, or add a step that POSTs early boot
+    # progress to /report so failure has a trace instead of silence.
+
+Likely candidates once logs are visible: the container has NO public egress
+allow-list configured (`assign_ipv4: none`, mode private) so `curl` of JOIN_URL
+or the page load may be blocked; or chromium needs more shared memory than the
+default; or the join click selector differs on a cold lobby.

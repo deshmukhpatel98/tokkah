@@ -117,7 +117,13 @@ export class PeerContainer implements DurableObject {
       // that never arrives — silence is the one outcome that teaches nothing.
       c.start({
         entrypoint: ['bash', '-lc',
-          'set -e; curl -fsS "$JOIN_URL" -o /peer/join.js; cd /peer; node join.js'],
+          // NODE_PATH from `npm root -g`: the Playwright image installs its
+          // packages GLOBALLY, so `node join.js` in /peer cannot resolve
+          // require('playwright') on its own -- the identical module-resolution
+          // trap that broke the local half of this experiment twice. Errors are
+          // echoed to stdout so a failure is visible in container logs instead
+          // of arriving as a silent `pending` result forever.
+          'set -e; export NODE_PATH="$(npm root -g)"; curl -fsS "$JOIN_URL" -o /peer/join.js; cd /peer; node join.js 2>&1'],
         env: {
           JOIN_URL: `${self}/join.js`,
           REPORT_URL: `${self}/report?region=${url.searchParams.get('region') ?? 'wnam'}`,
