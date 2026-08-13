@@ -4626,3 +4626,11 @@ STILL OPT-IN. Two of four scenarios are green on this build; flap and stall were
 not re-measured after a change that alters demote TIMING, and this host stalls
 1.2-2.9 s under two-browser load, which is exactly what those two rigs cannot
 tolerate. The flip waits for a quiet machine, not for a better argument.
+
+Flap, attempted twice more on the streak build: UNMEASURABLE both times, ring
+69.0 ms and 66.2 ms at flap time with the route search exhausting all 10
+candidates. Checked whether the streak itself caused those misses — it cannot.
+The rig detects a candidate on peerSkew.perLane >= 10, i.e. reported SKEW, and
+the streak gates DEMOTION, which is the thing that silences a lane and removes
+its skew from the report. Delaying demotion widens the rig's detection window,
+it does not narrow it. The misses are this host.
