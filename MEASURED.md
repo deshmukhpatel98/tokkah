@@ -4583,3 +4583,46 @@ AND A HALF fresh round trips, not three independent confirmations. Left as-is
 and recorded rather than tuned — promotion is the safe direction to be slow
 about, since the failure mode is a lane staying demoted. The demote side counts
 skew, which really does arrive 4x/s, so a 3-tick streak there is ~12 reports.
+
+## The demote streak: same-route noise gone, the divergence win untouched (2026-08-13)
+
+Demotion now requires skew over the threshold on THREE consecutive ticks. The
+defect it fixes was in the estimator, not the policy: laneBase is a running
+minimum per lane and skew is measured against the smallest of them, so early in
+a call the gap between two lanes is largely a question of which one has already
+sampled its own floor. Warm at 50 samples (~2.4 s), demotable at 5 s — the
+minima are still converging in that window, and the gap they show SHRINKS with
+more samples, which is the opposite of a real route difference.
+
+SAME ROUTE, n=3 on the deployed fix (was 1 spurious demotion in 3):
+
+  run 1   demotions 0   nFast 6   share 0.167   conceal 0   ring 21.2 / 13.8
+  run 2   demotions 0   nFast 6   share 0.167   conceal 0   ring 19.1 / 19.6
+  run 3   demotions 0   nFast 6   share 0.167   conceal 0   ring 18.1 / 17.8
+
+Run 1's ring assert failed at delta 7.4 ms and is CONFOUNDED, not a cost: its ON
+arm measured spreadMax 21.3 ms against the control's 7.1: ring depth tracks
+measured spread by design, the arms are sequential calls on a loaded host, and
+lane share was an even 0.167 so striping was concentrating nothing. Runs 2 and 3
+had spreads that matched between arms (6.8/6.6, 7.8/7.0) and both passed.
+
+DIVERGENT ROUTES, same build, all 9 asserts pass — the 3 s of extra patience
+costs nothing measurable:
+
+  mouth-to-ear   ON 115.5 / 115.0    OFF 156.3 / 134.0   -29.9 ms mean
+  ring depth     ON  43.8 /  47.9    OFF  67.3 /  61.5   -18.6 ms mean
+  concealment    ON 2448  / 2464     OFF 3960  / 2336    -692 ms mean
+  leakage 0.00% both sides, bytes within 0.24%
+
+And the run doubles as proof for the assert repaired earlier the same evening:
+it passed with residual peer skew of 1.0 and 2.5 ms. The old `peerSkew.max >= 10`
+would have scored this — a 30 ms win with zero leakage — as a FAILURE.
+
+Deliberately NOT in the fault path: laneDead short-circuits above the dwell
+block, so a lane that is gone is still demoted with no dwell, no hysteresis and
+no streak. Only "alive but slow" waits three ticks.
+
+STILL OPT-IN. Two of four scenarios are green on this build; flap and stall were
+not re-measured after a change that alters demote TIMING, and this host stalls
+1.2-2.9 s under two-browser load, which is exactly what those two rigs cannot
+tolerate. The flip waits for a quiet machine, not for a better argument.

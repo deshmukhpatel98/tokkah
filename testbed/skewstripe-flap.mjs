@@ -341,10 +341,31 @@ console.log(`assert flap reached an audio lane: ${flapDelivered ? 'PASS' : 'FAIL
 // EITHER side, unlike the stage-2 rig's `&&`: a flap changes ONE direction, and
 // this rig's gentler profile deliberately leaves the other side undiverged, so
 // demanding skew on both scores an undisturbed lane as a failure (measured:
-// A 9.5ms of pure jitter against B's 28ms real detection). flapDelivered already
-// proves a NEW slow lane appeared; this just confirms its size.
-const peerSkewPass = flapDelivered
-  && Math.max(runData.t60.pA.peerSkew?.max ?? 0, runData.t60.pB.peerSkew?.max ?? 0) >= 10;
+// A 9.5ms of pure jitter against B's 28ms real detection).
+//
+// Reading peerSkew at t=60 was the same mistake this rig's stage-2 sibling made:
+// by t=60 the flapped lane has been demoted for ~20 s, and a demoted lane sends
+// nothing, so it is excluded from the skew estimate and the reported max falls
+// back to the healthy lanes (measured 2.0 ms while detection was in fact
+// perfect). The assert demanded the symptom persist after the cure.
+//
+// Detection is the DEMOTION, and the timeline holds it directly: nFast must
+// fall below its pre-flap value while the route is bad. That is the thing the
+// feature is for, it cannot happen without skew crossing the threshold, and it
+// stays true after convergence.
+const nFastDuringFlap = (side) => runData.timeline
+  .filter(t => t.tSec > runData.tFlapSec && t.tSec <= (runData.tHealSec ?? Infinity))
+  .map(t => t[side]?.stripe?.nFast).filter(v => v != null);
+const nFastBeforeFlap = (side) => runData.timeline
+  .filter(t => t.tSec <= runData.tFlapSec)
+  .map(t => t[side]?.stripe?.nFast).filter(v => v != null).pop();
+const droppedOnSide = (side) => {
+  const before = nFastBeforeFlap(side);
+  const during = nFastDuringFlap(side);
+  if (before == null || during.length === 0) return false;
+  return Math.min(...during) < before;
+};
+const peerSkewPass = flapDelivered && (droppedOnSide('pA') || droppedOnSide('pB'));
 
 // Settled = the 10 s AFTER the flap's detection, not a fixed wall-clock time:
 // the flap can land later than t=30 s when earlier candidates were misses.
@@ -366,7 +387,7 @@ console.log(`nFast timeline side A: ${nFastTimelineAStr}`);
 console.log(`nFast timeline side B: ${nFastTimelineBStr}`);
 
 const detectionPass = flapDelivered && peerSkewPass && nFastSettledPass;
-console.log(`assert flapped lane detected & nFast settled within 10 s: ${detectionPass ? 'PASS' : 'FAIL'} (peerSkew max A:${runData.t60.pA.peerSkew?.max} B:${runData.t60.pB.peerSkew?.max}, settled 40-60s A:${isSettledA} B:${isSettledB})`);
+console.log(`assert flapped lane detected & nFast settled within 10 s: ${detectionPass ? 'PASS' : 'FAIL'} (nFast dropped under flap A:${droppedOnSide('pA')} B:${droppedOnSide('pB')}; pre-flap A:${nFastBeforeFlap('pA')} B:${nFastBeforeFlap('pB')}; settled A:${isSettledA} B:${isSettledB})`);
 
 // Assert 2: demotions <= 4 over the whole 60 s run (no oscillation)
 const demotionsA = runData.t60.pA.stripe?.demotions ?? 0;
