@@ -4395,3 +4395,18 @@ that decides whether skew-aware striping gets built. Application is opt-in
 same-route skew, 0 conceal, m2e 43.6/45.7.
 
 The rig that killed its own feature is the rig working.
+
+## Lane-skew Stage 1 shipped: the sender now KNOWS
+
+T_SKEW (0x09, 8 bytes, 4x/s on the loss-report timer): receiver's per-lane
+skew estimate flows back to the sender. Live rig (24/12/24ms divergence):
+peerSkew matches the peer's own laneSkew within the 0.5ms wire quantization
+in BOTH directions, warmMask full, report age ~220ms, and framesSent still
+dead-even across lanes — feedback with zero routing change, as staged.
+Review catch on the generated draft: the wire format had no warm bits and
+decoded a saturated (>=127.5ms) reading as zero — the one lane a demotion
+policy must see. Byte 1 is now the warm bitmask. The skew estimator is also
+deduplicated (one laneSkewNow/laneSkewAll) and drift freezes on lanes quiet
+>2s — the spec's re-promotion trap, closed before it could open.
+Next: Stage 2, demotion behind ?pcmskewstripe=1, gated on the divergence
+rig's depth/conceal/bytes triple.

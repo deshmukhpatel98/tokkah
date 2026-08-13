@@ -102,6 +102,14 @@ const T_DATA_Z = 0x06;
 // off the end of onMessage(), so a peer running an older build simply ignores
 // it and stays at the fixed rate; nothing has to be negotiated.
 const T_LOSS = 0x07;
+// Skew report, 8 B at pairs=6, 4×/s: `u8 type | u8 warmMask | u8 skewQ[lanes]`,
+// lanes = byteLength - 2, skewQ = min(255, round(skew_ms * 2)) — 255 means
+// "saturated at ≥127.5 ms", still a valid (and alarming) reading. warmMask bit
+// k says lane k's estimate is warm; a cold lane's 0 is "unknown", not "aligned",
+// and the mask is what keeps a striping policy from ever acting on it. Assumes
+// PAIRS ≤ 8 (it is 6). Receiver reports per-lane skew so the sender can make
+// skew-aware striping decisions (lane-skew Stage 1).
+const T_SKEW = 0x09;
 const HDR_DATA_C = 5, HDR_PAR_C = 8, HDR_ANCH = 21;
 // The largest RS symbol that still leaves parity inside one datagram:
 // 1160 - HDR_PAR_C. It is also exactly FRAME_BYTES, so uncompressed groups are
@@ -510,7 +518,99 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     const laneBase = new Float64Array(PAIRS).fill(Infinity);
     const laneSamples = new Uint32Array(PAIRS);
     const laneLastT = new Float64Array(PAIRS);
+    const lastFrameT = new Float64Array(PAIRS);
     let laneEpoch = 0;
+
+    // Sender-side mirror of the peer's measured arrival skew (lane-skew Stage 1).
+    // Advisory telemetry sent on T_SKEW every 250 ms so the sender can see what
+    // the receiver is measuring without making routing changes yet.
+    const peerSkewMs = new Float64Array(PAIRS);
+    let peerSkewWarm = 0;
+    let peerSkewAt = 0;
+
+    // Deduplicated arrival-skew estimator (lane-skew Stage 1a/1b).
+    // Decaying minima drift upward at +1 ms/s so link recovery is detected.
+    // Spec §2.2 fix: drift is FROZEN when a lane has received no frames in
+    // 2 s (lastFrameT) so a quiet/demoted lane's base does not rot upward
+    // and make demotion permanent by accident.
+    function updateDrift(tn) {
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneSamples[k] > 0 && laneLastT[k] > 0) {
+          if (lastFrameT[k] > 0 && (tn - lastFrameT[k]) <= 2000) {
+            laneBase[k] += (tn - laneLastT[k]) / 1000;
+          }
+          laneLastT[k] = tn;
+        }
+      }
+    }
+
+    function laneSkewNow(laneIdx, seq) {
+      const tn = now();
+      if (!laneEpoch) laneEpoch = tn - seq * FRAME_MS;
+      const idx = (typeof laneIdx === 'number' && laneIdx >= 0 && laneIdx < PAIRS) ? laneIdx : 0;
+      lastFrameT[idx] = tn;
+      updateDrift(tn);
+
+      const d_i = tn - laneEpoch - seq * FRAME_MS;
+      if (laneSamples[idx] === 0 || d_i < laneBase[idx]) {
+        laneBase[idx] = d_i;
+      }
+      if (laneSamples[idx] === 0) laneLastT[idx] = tn; // seed drift origin
+      laneSamples[idx]++;
+
+      let numWarm = 0;
+      let minWarmBase = Infinity;
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneSamples[k] >= 50) {
+          numWarm++;
+          if (laneBase[k] < minWarmBase) {
+            minWarmBase = laneBase[k];
+          }
+        }
+      }
+      if (numWarm >= 2 && laneSamples[idx] >= 50) {
+        return Math.max(0, laneBase[idx] - minWarmBase);
+      }
+      return 0;
+    }
+
+    function laneSkewAll() {
+      const tn = now();
+      updateDrift(tn);
+
+      let numWarm = 0;
+      let minWarmBase = Infinity;
+      let warmMask = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneSamples[k] >= 50) {
+          numWarm++;
+          warmMask |= (1 << k);
+          if (laneBase[k] < minWarmBase) {
+            minWarmBase = laneBase[k];
+          }
+        }
+      }
+
+      const perLane = [];
+      let maxWarmSkew = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        let sk = 0;
+        if (numWarm >= 2 && laneSamples[k] >= 50) {
+          sk = Math.max(0, laneBase[k] - minWarmBase);
+        }
+        const skVal = +sk.toFixed(1);
+        perLane.push(skVal);
+        if (laneSamples[k] >= 50 && skVal > maxWarmSkew) {
+          maxWarmSkew = skVal;
+        }
+      }
+      return {
+        perLane,
+        max: +maxWarmSkew.toFixed(1),
+        numWarm,
+        warmMask,
+      };
+    }
 
     // Sender-side mirror of the anchor: the least-delayed frame of the current
     // window (see onCaptureFrame). anchBestK is that frame's `wall - seq*8`.
@@ -1433,6 +1533,24 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       }
     }
 
+    function sendSkewReport() {
+      if (closed || !SKEWFB) return;
+      const all = laneSkewAll();
+      if (all.numWarm < 2) return;
+      const msg = new ArrayBuffer(2 + PAIRS);
+      const dv = new DataView(msg);
+      dv.setUint8(0, T_SKEW);
+      dv.setUint8(1, all.warmMask & 0xff);
+      for (let k = 0; k < PAIRS; k++) {
+        const skewVal = all.perLane[k] ?? 0;
+        dv.setUint8(2 + k, Math.min(255, Math.round(skewVal * 2)));
+      }
+      const target = assocs[0]?.dc?.readyState === 'open' ? assocs[0] : firstOpenAssoc();
+      if (target?.dc?.readyState === 'open') {
+        try { target.dc.send(msg); } catch { /* advisory telemetry report */ }
+      }
+    }
+
     // ── Lane 0 wire senders (§3.1 lever 4, §4) ────────────────────────────────
     // Both ride the EXISTING unreliable/unordered pcm-audio channel(s) — no new
     // channels, no renegotiation. Both are small, rare, and ungated (like
@@ -1513,6 +1631,22 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // build's behaviour rather than a broken one.
         const slow = dv.getUint8(1) / 4;
         onPeerLoss(slow, data.byteLength >= 3 ? dv.getUint8(2) / 4 : slow);
+        return;
+      }
+      if (t === T_SKEW) {
+        // Handled above the < 9 guard: at pairs=6 T_SKEW is 8 bytes.
+        if (data.byteLength >= 3) {
+          const mask = dv.getUint8(1);
+          const laneCount = Math.min(PAIRS, data.byteLength - 2);
+          for (let k = 0; k < laneCount; k++) {
+            // The value is kept even for saturated readings (255 → 127.5 ms:
+            // "at least this much"); the mask, not the value, says whether the
+            // reading is warm enough to act on.
+            peerSkewMs[k] = (mask & (1 << k)) ? dv.getUint8(2 + k) / 2 : 0;
+          }
+          peerSkewWarm = mask;
+          peerSkewAt = now();
+        }
         return;
       }
       if (data.byteLength < 9) return;
@@ -1615,42 +1749,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // shallower ring it buys (27.6 ms) is paid for in concealment (+1 s/min).
         // Buffering for the slowest lane is the price of playing its frames;
         // the real win needs skew-aware striping or FEC-side recovery first.
-        let skewMs = 0;
-        {
-          const tn = now();
-          if (!laneEpoch) laneEpoch = tn - seq * FRAME_MS;
-          const laneIdx = (typeof ai === 'number' && ai >= 0 && ai < PAIRS) ? ai : 0;
-          // Drift the decaying minima up at +1 ms/s. Guarded on laneLastT>0:
-          // a lane's first sample has no drift origin yet, and dividing from a
-          // zero laneLastT would add the wall-clock epoch (~1.7e12 ms) to the
-          // base in one step — the estimate would never recover.
-          for (let k = 0; k < PAIRS; k++) {
-            if (laneSamples[k] > 0 && laneLastT[k] > 0) {
-              laneBase[k] += (tn - laneLastT[k]) / 1000;
-              laneLastT[k] = tn;
-            }
-          }
-          const d_i = tn - laneEpoch - seq * FRAME_MS;
-          if (laneSamples[laneIdx] === 0 || d_i < laneBase[laneIdx]) {
-            laneBase[laneIdx] = d_i;
-          }
-          if (laneSamples[laneIdx] === 0) laneLastT[laneIdx] = tn; // seed drift origin
-          laneSamples[laneIdx]++;
-
-          let numWarm = 0;
-          let minWarmBase = Infinity;
-          for (let k = 0; k < PAIRS; k++) {
-            if (laneSamples[k] >= 50) {
-              numWarm++;
-              if (laneBase[k] < minWarmBase) {
-                minWarmBase = laneBase[k];
-              }
-            }
-          }
-          if (numWarm >= 2 && laneSamples[laneIdx] >= 50) {
-            skewMs = Math.max(0, laneBase[laneIdx] - minWarmBase);
-          }
-        }
+        const laneIdx = (typeof ai === 'number' && ai >= 0 && ai < PAIRS) ? ai : 0;
+        const skewMs = laneSkewNow(laneIdx, seq);
         ringWrite(seq, payload, capUs, zipped, DESKEW ? skewMs : 0);
         // The window decoder runs UNCONDITIONALLY (the flag is the sender's):
         // whether the peer protects its stream with RS or the window is its
@@ -1752,6 +1852,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // embedder that says nothing gets the safe behavior. Skew is still measured
     // and reported either way.
     const DESKEW = cfg.deskew === true;
+    // Gated default ON: telemetry weight (8 bytes / 250 ms) for per-lane skew
+    // feedback from receiver back to sender (lane-skew Stage 1).
+    const SKEWFB = cfg.skewfb !== false;
     // Window length is a tradeoff against SENDER CLOCK DRIFT, not just noise. d is
     // measured against our own clock, so a drifting sender makes d ramp steadily,
     // and a ramp inside the window reads as spread that no buffer needs to cover.
@@ -2151,7 +2254,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // 250 ms, not the ping's 2 s: 2 s of under-protection after a burst
           // begins is 250 frames of audio, and the whole point of the ladder is
           // to have the parity already in flight when the loss arrives.
-          if (!lossTimer) lossTimer = setInterval(sendLossReport, 250);
+          if (!lossTimer) {
+            lossTimer = setInterval(() => {
+              sendLossReport();
+              sendSkewReport();
+            }, 250);
+          }
           sendPing();
         };
         channel.onerror = (e) => L('pcm-dc-error', { assoc: idx, e: String(e?.error || e).slice(0, 120) });
@@ -2326,42 +2434,27 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // what the ring did, `max`/`perLane` say what the routes did. The
             // fleet's divergence prevalence is what decides whether skew-aware
             // striping is worth building.
-            const perLane = [];
-            let maxWarmSkew = 0;
-            {
-              const tn = now();
-              let numWarm = 0;
-              let minWarmBase = Infinity;
-              for (let k = 0; k < PAIRS; k++) {
-                if (laneSamples[k] > 0) {
-                  laneBase[k] += (tn - laneLastT[k]) / 1000;
-                  laneLastT[k] = tn;
-                }
-                if (laneSamples[k] >= 50) {
-                  numWarm++;
-                  if (laneBase[k] < minWarmBase) {
-                    minWarmBase = laneBase[k];
-                  }
-                }
-              }
-              for (let k = 0; k < PAIRS; k++) {
-                let sk = 0;
-                if (numWarm >= 2 && laneSamples[k] >= 50) {
-                  sk = Math.max(0, laneBase[k] - minWarmBase);
-                }
-                const skVal = +sk.toFixed(1);
-                perLane.push(skVal);
-                if (laneSamples[k] >= 50 && skVal > maxWarmSkew) {
-                  maxWarmSkew = skVal;
-                }
-              }
-            }
+            const all = laneSkewAll();
             return {
-              max: +maxWarmSkew.toFixed(1),
+              max: all.max,
               applied: DESKEW ? 1 : 0,
-              perLane,
+              perLane: all.perLane,
             };
           })(),
+          peerSkew: peerSkewAt > 0 ? {
+            perLane: Array.from(peerSkewMs).map(v => +v.toFixed(1)),
+            max: (() => {
+              let m = 0;
+              for (let k = 0; k < PAIRS; k++) {
+                if ((peerSkewWarm & (1 << k)) && peerSkewMs[k] > m) {
+                  m = peerSkewMs[k];
+                }
+              }
+              return +m.toFixed(1);
+            })(),
+            warmMask: peerSkewWarm,
+            ageMs: +(now() - peerSkewAt).toFixed(1),
+          } : null,
           perAssoc: assocs.map((s, i) => ({
             i,
             open: s.dc?.readyState === 'open',

@@ -1629,6 +1629,7 @@ const PCM_CFG = {
   // they arrive. Measurement/telemetry stays on for everyone; application
   // waits for skew-aware striping or FEC-side recovery.
   deskew: QS.get('deskew') === '1',
+  skewfb: QS.get('skewfb') !== '0',
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',
