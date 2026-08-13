@@ -1341,6 +1341,12 @@ export class Health implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // Region probe (150 ms goal). Answers nothing about health — it exists so
+    // an edge colo can time a round trip to a DO pinned on another continent,
+    // which is the only way to measure what Cloudflare's BACKBONE costs between
+    // two points on earth. Deliberately the cheapest possible handler: any work
+    // here would be measured as if it were network.
+    if (url.pathname === '/ping') return json({ t: Date.now() });
     if (url.pathname === '/ingest' && request.method === 'POST') {
       let beat: Record<string, unknown>;
       try { beat = (await request.json()) as Record<string, unknown>; } catch { return json({ error: 'bad json' }, 400); }
@@ -1595,6 +1601,59 @@ export default {
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/summary${url.search}`),
       );
+    }
+    // ── Region probe: what does the planet actually cost? (150 ms goal) ───────
+    // The whole 150 ms budget turns on one unknown: how much worse than the
+    // speed of light a real path is. Fibre carries light at c/1.468, so
+    // Delhi->San Jose is 85 ms one way at 1.25x routing and 102 ms at 1.5x --
+    // a 17 ms spread that dwarfs anything worth winning inside the encoder,
+    // and nothing in this project has ever measured which one we get.
+    //
+    // A DO pinned with locationHint lands on the named continent, so an edge
+    // colo can time a round trip to it. Measured HERE, at the edge, rather than
+    // from the laptop: this number is then the BACKBONE cost between two points
+    // on earth, with the client's own access link excluded instead of baked in.
+    // `colo` names the edge that did the timing, so the distance is knowable.
+    if (url.pathname === '/api/probe' && request.method === 'GET') {
+      const region = url.searchParams.get('region') ?? '';
+      const REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
+      // 'none' is the CALIBRATION arm and the most important one here. Without
+      // a hint the DO is created near whichever edge first asked for it, so the
+      // round trip is ~all dispatch overhead and ~no distance. Every other
+      // region's number is inflated by that same constant, and a ratio against
+      // the speed of light means nothing until it is subtracted. Measure the
+      // instrument before trusting the readings.
+      if (region !== 'none' && !REGIONS.has(region)) {
+        return json({ error: 'bad region', allowed: [...REGIONS, 'none'] }, 400);
+      }
+      const stub = region === 'none'
+        ? env.HEALTH.get(env.HEALTH.idFromName('probe-local'))
+        : env.HEALTH.get(
+          env.HEALTH.idFromName(`probe-${region}`),
+          { locationHint: region } as DurableObjectNamespaceGetDurableObjectOptions,
+        );
+      // Several round trips, report the MINIMUM. A single sample measures the
+      // path plus whatever queueing happened to be in front of it; the floor is
+      // the path. Same reasoning as the transport's decaying-min estimators.
+      const n = Math.max(1, Math.min(10, Number(url.searchParams.get('n')) || 5));
+      const samples: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const t0 = Date.now();
+        try {
+          await stub.fetch('https://do/ping');
+          samples.push(Date.now() - t0);
+        } catch { /* a probe must never take the worker down */ }
+      }
+      if (samples.length === 0) return json({ error: 'no samples', region }, 502);
+      samples.sort((a, b) => a - b);
+      return json({
+        region,
+        colo: (request.cf?.colo as string | undefined) ?? null,
+        minMs: samples[0],
+        medMs: samples[Math.floor(samples.length / 2)],
+        maxMs: samples[samples.length - 1],
+        n: samples.length,
+      });
     }
     // Operator-only: which rooms were live, when. Gated inside the DO on
     // LOG_ADMIN_TOKEN — the credential that already reads any room's log.

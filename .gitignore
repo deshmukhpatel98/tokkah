@@ -20,6 +20,17 @@ fatigue-lab/runs/
 # Local dev secrets
 tape-app/.dev.vars
 tape-app/public/testmedia/
+# Belt and braces. The real credentials live OUTSIDE this repo, in
+# ~/.config/tokkah/cf.env (chmod 600) — a repo is source, not a keyring, and
+# this project is AGPL-published, so a secret committed here is a secret
+# published. These patterns exist so an accidental `.env` in the tree can never
+# become a push.
+.env
+.env.*
+*.env
+!*.example.env
+.dev.vars
+.dev.vars.*
 
 # Vendored third-party binaries (26 MB of MediaPipe wasm + face models).
 # Same rule as testbed/media: the FETCH SCRIPT is committed, the binaries are
