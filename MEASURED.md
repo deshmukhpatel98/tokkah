@@ -4410,3 +4410,50 @@ deduplicated (one laneSkewNow/laneSkewAll) and drift freezes on lanes quiet
 >2s — the spec's re-promotion trap, closed before it could open.
 Next: Stage 2, demotion behind ?pcmskewstripe=1, gated on the divergence
 rig's depth/conceal/bytes triple.
+
+## Lane-skew Stage 2: skew-aware striping WINS — 26ms of mouth-to-ear on divergent routes
+
+What de-skew could not do by re-reading the clock, the sender does by not using
+the slow lane. Receiver reports per-lane skew (T_SKEW, Stage 1); sender demotes
+lanes ≥8ms slow (re-promote ≤4ms, 5s dwell, never below 3 fast lanes, fail-open
+to all-fast if feedback dies).
+
+Divergence A/B, live prod through local delay lines (24/12/24ms lane offsets,
+6ms one-sided heavy tail, 60s arms, 9/9 asserts):
+
+              mouth-to-ear    ring depth    concealed    bytes
+  striping ON  118.3/120.2ms   50.0ms mean  1464ms mean  +0.70%
+  control OFF  152.1/139.3ms   66.4ms mean  2208ms mean       —
+
+26ms of conversational latency reclaimed, and concealment got BETTER (-744ms),
+not merely no-worse — the assert de-skew failed by ~1000ms. Post-demotion
+leakage is exactly 0.00%: frame deltas between the 30s and 60s samples read
+[0,938,938,938,0,939] and [1250,0,1250,0,1251,0]. A demoted lane carries
+nothing.
+
+Same-route invariant, live prod (testbed/skewstripe-noop.mjs, 7/7): fastOrder
+is the identity [0,1,2,3,4,5], zero demotions, frames per lane
+[938,939,939,939,939,938] vs control [938,939,939,938,938,938], m2e 46.3 vs
+47.8, ring 16.1 vs 17.6, zero conceal both arms. The ordinary call pays nothing.
+
+REVIEW FIX, and it mattered: all four lane pickers walked lane-INDEX space on
+fall-forward, so with fast lanes [0,2,4] a frame blocked on lane 2 tried
+demoted lane 3 before fast lane 4 — spilling audio onto a structurally-slow
+lane under exactly the budget pressure the stripe exists to absorb. They now
+walk fastOrder space (fast lanes first, demoted last), which also makes the
+same-route reduction to `(seq % PAIRS + k) % PAIRS` exact by construction —
+verified over 120k cases and then live.
+
+RIG FIXES, because it reported two false failures first: it measured CUMULATIVE
+demoted-lane share, which counts the ~4-5s warm-up before demotion (1.83%,
+2.83%) instead of leakage after it (0.00%); and it delivered a verdict on a run
+contaminated by a single 1.3s host stall, which pcm.js's ~90s peak-hold memory
+turns into a call-long buffer inflation. It now gates validity (spread >300ms,
+or emulator lateness/loop-lag >50ms) and reports UNMEASURABLE (exit 2) rather
+than blaming the code for the host. A rig that cannot say "I could not measure
+this" will eventually say "your code is broken" instead.
+
+Still opt-in (?pcmskewstripe=1), deliberately against the default-ON law: the
+same class of change just measured harmful once, and the honest gate is a real
+long-path call, which needs a cloud vantage this machine cannot provide. Fleet
+laneSkewMaxMs is accumulating the prevalence data that decides the flip.

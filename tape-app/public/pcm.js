@@ -528,6 +528,138 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let peerSkewWarm = 0;
     let peerSkewAt = 0;
 
+    // Skew-aware striping (lane-skew Stage 2, opt-in ?pcmskewstripe=1).
+    // Sender demotes slow lanes based on receiver skew feedback (spec §2.1).
+    const fastOrder = new Int8Array(PAIRS);
+    for (let k = 0; k < PAIRS; k++) fastOrder[k] = k;
+    let nFast = PAIRS;
+    const laneState = new Uint8Array(PAIRS); // 0 = FAST, 1 = DEMOTED
+    const laneStateSince = new Float64Array(PAIRS);
+    let lastOrderRecompute = 0;
+    let stripeDemotions = 0;
+    let stripePromotions = 0;
+    let stripeStaleFailopen = 0;
+    let isStaleFailopen = false;
+
+    /**
+     * Skew-aware striping recompute (spec §2.1, §2.2, §2.5).
+     * Recomputes `fastOrder` and `nFast` from peerSkewMs/peerSkewWarm.
+     * Dwell guard: at most once per 1000 ms, and 5 s dwell per lane state change.
+     * Demote when warm & skew >= 8 ms; re-promote when warm & skew <= 4 ms.
+     * MIN_FAST = 3 (keep fastest demoted lanes in fast set if demotions exceed capacity).
+     * Fail-open: if peerSkewAt is > 2000 ms old (or 0), restore all lanes to fast.
+     */
+    function recomputeLaneOrder(tn = now()) {
+      if (!SKEWSTRIPE) return;
+      if (tn - lastOrderRecompute < 1000) return;
+      lastOrderRecompute = tn;
+
+      const isStale = peerSkewAt === 0 || (tn - peerSkewAt > 2000);
+      if (isStale) {
+        if (!isStaleFailopen && nFast < PAIRS) {
+          stripeStaleFailopen++;
+        }
+        isStaleFailopen = true;
+        for (let k = 0; k < PAIRS; k++) {
+          if (laneState[k] === 1) { // 1 = DEMOTED
+            laneState[k] = 0; // FAST
+            laneStateSince[k] = tn;
+            stripePromotions++;
+          }
+          fastOrder[k] = k;
+        }
+        nFast = PAIRS;
+        return;
+      }
+      isStaleFailopen = false;
+
+      // Evaluate desired states with 5 s dwell and hysteresis (spec §2.1)
+      const desiredState = new Uint8Array(PAIRS);
+      for (let k = 0; k < PAIRS; k++) {
+        desiredState[k] = laneState[k];
+        const isWarm = (peerSkewWarm & (1 << k)) !== 0;
+        const skew = peerSkewMs[k];
+        const dwellOk = (tn - laneStateSince[k]) >= 5000;
+
+        if (dwellOk) {
+          if (laneState[k] === 0) { // FAST
+            if (isWarm && skew >= 8.0) desiredState[k] = 1; // DEMOTED
+          } else { // DEMOTED
+            if (!isWarm || skew <= 4.0) desiredState[k] = 0; // FAST
+          }
+        }
+      }
+
+      // Count desired fast lanes and enforce MIN_FAST = 3 (spec §2.1)
+      let fastCount = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        if (desiredState[k] === 0) fastCount++;
+      }
+
+      const MIN_FAST = 3;
+      if (fastCount < MIN_FAST) {
+        // Find demoted candidates and sort by skew ascending (keep fastest in fast set)
+        const demotedCandidates = [];
+        for (let k = 0; k < PAIRS; k++) {
+          if (desiredState[k] === 1) {
+            demotedCandidates.push({ k, skew: peerSkewMs[k] });
+          }
+        }
+        demotedCandidates.sort((a, b) => a.skew - b.skew || a.k - b.k);
+        const needed = MIN_FAST - fastCount;
+        for (let i = 0; i < needed && i < demotedCandidates.length; i++) {
+          desiredState[demotedCandidates[i].k] = 0; // force FAST
+        }
+      }
+
+      // Apply state changes
+      for (let k = 0; k < PAIRS; k++) {
+        if (desiredState[k] !== laneState[k]) {
+          if (desiredState[k] === 1) {
+            stripeDemotions++;
+          } else {
+            stripePromotions++;
+          }
+          laneState[k] = desiredState[k];
+          laneStateSince[k] = tn;
+        }
+      }
+
+      // Rebuild fastOrder permutation (fast lanes first, demoted lanes after)
+      let fIdx = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneState[k] === 0) {
+          fastOrder[fIdx++] = k;
+        }
+      }
+      nFast = fIdx;
+      for (let k = 0; k < PAIRS; k++) {
+        if (laneState[k] === 1) {
+          fastOrder[fIdx++] = k;
+        }
+      }
+    }
+
+    /**
+     * Maps an ordinal/sequence number to a home POSITION IN `fastOrder`, not to
+     * a lane index (spec §2.1, §2.5). The pickers walk fastOrder-space from
+     * here, which is what makes fall-forward prefer the remaining FAST lanes
+     * and reach demoted ones only as a last resort — walking lane-index space
+     * instead would try lane 3 before lane 4 given fastOrder [0,2,4|1,3,5],
+     * spilling audio onto a structurally-slow lane under the exact budget
+     * pressure the stripe exists to absorb.
+     *
+     * `fastOrder` is a full permutation of all PAIRS lanes (fast first, then
+     * demoted), and it is the identity whenever striping is off or no lane is
+     * demoted — so `fastOrder[(lanePos(seq) + k) % PAIRS]` reduces to today's
+     * `(seq % PAIRS + k) % PAIRS` exactly, by construction rather than by test.
+     */
+    function lanePos(ordinal, isTwin = false) {
+      const N = (SKEWSTRIPE && nFast < PAIRS) ? nFast : PAIRS;
+      const off = isTwin ? Math.max(1, N >> 1) : 0;
+      return ((ordinal + off) % N + N) % N;
+    }
+
     // Deduplicated arrival-skew estimator (lane-skew Stage 1a/1b).
     // Decaying minima drift upward at +1 ms/s so link recovery is detected.
     // Spec §2.2 fix: drift is FROZEN when a lane has received no frames in
@@ -1062,10 +1194,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // the round-robin before anything is dropped — the stripe exists to absorb
     // exactly this (§17.12).
     function pickDataAssoc(seq) {
-      const home = seq % PAIRS;
+      const home = lanePos(seq);
       let anyOpen = false;
       for (let k = 0; k < PAIRS; k++) {
-        const a = assocs[(home + k) % PAIRS];
+        const a = assocs[fastOrder[(home + k) % PAIRS]];
         if (a.dc?.readyState !== 'open') continue;
         anyOpen = true;
         if (a.dc.bufferedAmount <= backlogLimit(a)) return a;
@@ -1080,9 +1212,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // drops the TWIN only (the original already went out — the shield is best-
     // effort extra, never backpressure).
     function pickTwinAssoc(seq) {
-      const home = (seq + Math.max(1, PAIRS >> 1)) % PAIRS;
+      const home = lanePos(seq, true);
       for (let k = 0; k < PAIRS; k++) {
-        const a = assocs[(home + k) % PAIRS];
+        const a = assocs[fastOrder[(home + k) % PAIRS]];
         if (a.dc?.readyState !== 'open') continue;
         if (a.dc.bufferedAmount <= backlogLimit(a)) return a;
       }
@@ -1095,9 +1227,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // measured at pairs=2: 100% of parity piled onto association 0, which
       // tipped it into the wall while association 1 idled. (base/RS_K) % N
       // stripes evenly for every N; at N=1 and N=3 it is the identical mapping.
-      const home = Math.floor(base / RS_K) % PAIRS;
+      const home = lanePos(Math.floor(base / RS_K));
       for (let k = 0; k < PAIRS; k++) {
-        const a = assocs[(home + k) % PAIRS];
+        const a = assocs[fastOrder[(home + k) % PAIRS]];
         if (a.dc?.readyState === 'open') return a;
       }
       return null;
@@ -1144,10 +1276,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       new Uint8Array(msg, HDR_PAR_SW).set(p.sym);
       // Stripe by parity ordinal — the same even mapping RS gets from
       // (base/RS_K) % N, without the degenerate base % N trap.
-      const home = p.s % PAIRS;
+      const home = lanePos(p.s);
       let a = null;
       for (let k = 0; k < PAIRS; k++) {
-        const c = assocs[(home + k) % PAIRS];
+        const c = assocs[fastOrder[(home + k) % PAIRS]];
         if (c.dc?.readyState === 'open') { a = c; break; }
       }
       if (!a) return;
@@ -1646,6 +1778,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           }
           peerSkewWarm = mask;
           peerSkewAt = now();
+          if (SKEWSTRIPE) recomputeLaneOrder();
         }
         return;
       }
@@ -1855,6 +1988,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Gated default ON: telemetry weight (8 bytes / 250 ms) for per-lane skew
     // feedback from receiver back to sender (lane-skew Stage 1).
     const SKEWFB = cfg.skewfb !== false;
+    // Opt-IN (=== true): Skew-aware striping (lane-skew Stage 2). Sender demotes
+    // slow lanes based on skew feedback.
+    const SKEWSTRIPE = cfg.skewStripe === true;
     // Window length is a tradeoff against SENDER CLOCK DRIFT, not just noise. d is
     // measured against our own clock, so a drifting sender makes d ramp steadily,
     // and a ramp inside the window reads as spread that no buffer needs to cover.
@@ -2258,6 +2394,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             lossTimer = setInterval(() => {
               sendLossReport();
               sendSkewReport();
+              if (SKEWSTRIPE) recomputeLaneOrder();
             }, 250);
           }
           sendPing();
@@ -2454,6 +2591,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             })(),
             warmMask: peerSkewWarm,
             ageMs: +(now() - peerSkewAt).toFixed(1),
+          } : null,
+          stripe: SKEWSTRIPE ? {
+            nFast,
+            fastOrder: Array.from(fastOrder.subarray(0, nFast)),
+            demotions: stripeDemotions,
+            promotions: stripePromotions,
+            staleFailopen: stripeStaleFailopen,
           } : null,
           perAssoc: assocs.map((s, i) => ({
             i,

@@ -1262,6 +1262,10 @@ const HB_FIELDS: Record<string, (v: unknown) => boolean> = {
   // whether skew-aware striping gets built.
   laneSkewMaxMs: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 10_000),
   deskewApplied: (v) => v === null || v === 0 || v === 1,
+  // Skew-aware striping (opt-in ?pcmskewstripe=1): fast-lane count at call end
+  // and demotion count over the call. Null on every call that never opted in.
+  stripeNFast: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 16),
+  stripeDemotions: (v) => v === null || (typeof v === 'number' && v >= 0 && v <= 100_000),
 };
 const HB_ALLOWED: Record<string, Set<string>> = {
   connect: new Set(['v', 'evt', 'engine', 'net', 'ttcMs',
@@ -1271,7 +1275,8 @@ const HB_ALLOWED: Record<string, Set<string>> = {
   end: new Set(['v', 'evt', 'engine', 'net', 'durS', 'concealPct', 'tape', 'reason',
     'mouthToEarMs', 'glassToGlassMs', 'humanGapMs',
     'echoCorrMax', 'aecGateOpenPct', 'aecGateFlips', 'aecErleMaxDb', 'aecDtPct',
-    'apTracker', 'apTrackedPct', 'apHz', 'laneSkewMaxMs', 'deskewApplied']),
+    'apTracker', 'apTrackedPct', 'apHz', 'laneSkewMaxMs', 'deskewApplied',
+    'stripeNFast', 'stripeDemotions']),
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
@@ -1303,7 +1308,8 @@ export class Health implements DurableObject {
       'cores REAL', 'mem REAL', 'dl_mbps REAL', 'rtt_est_ms REAL', 'cam_w REAL', 'cam_h REAL',
       'cam_fps REAL', 'dpr REAL', 'aec_dt_pct REAL',
       'tier TEXT', 'ap_tracker REAL', 'ap_tracked_pct REAL', 'ap_hz REAL',
-      'lane_skew_max_ms REAL', 'deskew_applied REAL']) {
+      'lane_skew_max_ms REAL', 'deskew_applied REAL',
+      'stripe_n_fast REAL', 'stripe_demotions REAL']) {
       try { this.sql.exec(`ALTER TABLE beats ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     // Operator room registry. The health BEATS stay anonymous by design (no
@@ -1340,8 +1346,8 @@ export class Health implements DurableObject {
                             echo_corr_max, aec_gate_open_pct, aec_gate_flips, aec_erle_max_db,
                             cores, mem, dl_mbps, rtt_est_ms, cam_w, cam_h, cam_fps, dpr, aec_dt_pct,
                             tier, ap_tracker, ap_tracked_pct, ap_hz,
-                            lane_skew_max_ms, deskew_applied)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            lane_skew_max_ms, deskew_applied, stripe_n_fast, stripe_demotions)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now(), evt, beat.engine ?? null, beat.net ?? null,
         beat.ttcMs ?? null, beat.waitMs ?? null, beat.durS ?? null,
         beat.concealPct ?? null, beat.tape ?? null, beat.reason ?? null,
@@ -1357,6 +1363,7 @@ export class Health implements DurableObject {
         (beat.tier as string | null) ?? null, (beat.apTracker as number | null) ?? null,
         (beat.apTrackedPct as number | null) ?? null, (beat.apHz as number | null) ?? null,
         (beat.laneSkewMaxMs as number | null) ?? null, (beat.deskewApplied as number | null) ?? null,
+        (beat.stripeNFast as number | null) ?? null, (beat.stripeDemotions as number | null) ?? null,
       );
       this.sql.exec(`DELETE FROM beats WHERE id <= (SELECT MAX(id) FROM beats) - ${HB_MAX_ROWS}`);
       return json({ ok: true });

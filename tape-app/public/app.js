@@ -1630,6 +1630,8 @@ const PCM_CFG = {
   // waits for skew-aware striping or FEC-side recovery.
   deskew: QS.get('deskew') === '1',
   skewfb: QS.get('skewfb') !== '0',
+  // Skew-aware striping (lane-skew Stage 2): opt-in demotion of slow lanes at sender.
+  skewStripe: QS.get('pcmskewstripe') === '1',
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',
@@ -7694,6 +7696,10 @@ safe(() => {
       // deskewApplied says whether the (opt-in) ring correction ran.
       laneSkewMaxMs: p?.laneSkew?.max ?? null,
       deskewApplied: p?.laneSkew?.applied ?? null,
+      // Skew-aware striping (opt-in): how many lanes were fast at call end and
+      // how many demotions the call saw. Null unless ?pcmskewstripe=1.
+      stripeNFast: p?.stripe?.nFast ?? null,
+      stripeDemotions: p?.stripe?.demotions ?? null,
       glassToGlassMs: g,
       humanGapMs: hg,
       // Echo, fleet-visible (directive 2026-08-11): did echo exist, and did
