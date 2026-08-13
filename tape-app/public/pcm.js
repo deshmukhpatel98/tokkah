@@ -2241,6 +2241,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             if (age == null || wl.depthMs == null || outL == null) return null;
             return +(8 + age + wl.depthMs + outL).toFixed(1);
           })(),
+          // Note: baseLatency is the AudioContext's processing latency (capture-side
+          // ADC latency is not exposed by browsers, so inputMs is a lower bound and
+          // is NOT added into mouthToEarMs, which stays exactly as it is).
+          m2eParts: {
+            frameMs: 8,
+            netAgeP50Ms: pct(stats.ageMs, 50),
+            netAgeP90Ms: pct(stats.ageMs, 90),
+            ringDepthMs: wl.depthMs ?? null,
+            outputMs: ctx?.outputLatency != null ? ctx.outputLatency * 1000 : null,
+            inputMs: ctx?.baseLatency != null ? ctx.baseLatency * 1000 : null,
+          },
           buffered: assocs[0].dc?.bufferedAmount ?? null,
           groupsHeld: groups.size,
           // §17.12 striping: per-association counters (ping/buffered/backpressure
