@@ -1623,6 +1623,8 @@ const PCM_CFG = {
   // pain-counter law as the control arm — see the block above bumpTarget() in
   // pcm.js for what that law measured and why it was wrong.
   jitterMeasured: QS.get('pcmjit') !== '0',
+  // Per-lane arrival de-skew (§4.3 fix 2). `?deskew=0` is the control arm.
+  deskew: QS.get('deskew') !== '0',
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',

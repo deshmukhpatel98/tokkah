@@ -497,6 +497,21 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     });
     const assocs = Array.from({ length: PAIRS }, newAssoc);
 
+    // ── Per-lane arrival DE-SKEW (latency-geo.md §4.3 fix 2) ──────────────────
+    // Audio frames stripe over `PAIRS` SCTP associations (six independent ECMP
+    // paths). On long/intercontinental routes, lanes have STRUCTURALLY different
+    // base delays (10–25 ms apart). The arrival-spread estimator (noteArrival →
+    // dRing) feeds ALL lanes into one window, reading constant lane offset as
+    // jitter and charging 16–32 ms of playout buffer for nothing.
+    //
+    // SAFETY INVARIANT: On a path where all lanes share one route (same-machine,
+    // same-city), laneBase values converge within noise, skew ≈ 0, and behavior
+    // is bit-identical to today. The change is a strict no-op absent real divergence.
+    const laneBase = new Float64Array(PAIRS).fill(Infinity);
+    const laneSamples = new Uint32Array(PAIRS);
+    const laneLastT = new Float64Array(PAIRS);
+    let laneEpoch = 0;
+
     // Sender-side mirror of the anchor: the least-delayed frame of the current
     // window (see onCaptureFrame). anchBestK is that frame's `wall - seq*8`.
     let lastCapSeqTx = -1, lastCapUsTx = 0, lastCapWallTx = 0;
@@ -614,7 +629,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Returns true when the frame actually landed in the ring — the FEC path
     // uses this to separate "repaired in time" from "repaired but the playhead
     // had already passed" (both are honest; only the first one was audible).
-    function ringWrite(seq, payload, capUs, zip) {
+    function ringWrite(seq, payload, capUs, zip, skewMs = 0) {
       if (startSeq < 0) {
         startSeq = seq;
         firstSeq = seq;
@@ -626,7 +641,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // and that is deliberate: a frame that only existed once its RS group closed
       // was genuinely available that late, and pretending otherwise would size the
       // buffer too small for exactly the frames FEC is there to save.
-      noteArrival(seq);
+      noteArrival(seq, skewMs);
       const samples = zip ? decodeZip(payload) : decodeFrame(payload);
       if (det) {
         let sumSq = 0;
@@ -1593,7 +1608,43 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // redundant vs. how much silently replaced a loss.
         if (seq <= seenHi && seenHi - seq < SEEN_N && seen[seq % SEEN_N] === 1) stats.dupRecv++;
         noteSeen(seq);
-        ringWrite(seq, payload, capUs, zipped);
+        let skewMs = 0;
+        if (DESKEW) {
+          const tn = now();
+          if (!laneEpoch) laneEpoch = tn - seq * FRAME_MS;
+          const laneIdx = (typeof ai === 'number' && ai >= 0 && ai < PAIRS) ? ai : 0;
+          // Drift the decaying minima up at +1 ms/s. Guarded on laneLastT>0:
+          // a lane's first sample has no drift origin yet, and dividing from a
+          // zero laneLastT would add the wall-clock epoch (~1.7e12 ms) to the
+          // base in one step — the estimate would never recover.
+          for (let k = 0; k < PAIRS; k++) {
+            if (laneSamples[k] > 0 && laneLastT[k] > 0) {
+              laneBase[k] += (tn - laneLastT[k]) / 1000;
+              laneLastT[k] = tn;
+            }
+          }
+          const d_i = tn - laneEpoch - seq * FRAME_MS;
+          if (laneSamples[laneIdx] === 0 || d_i < laneBase[laneIdx]) {
+            laneBase[laneIdx] = d_i;
+          }
+          if (laneSamples[laneIdx] === 0) laneLastT[laneIdx] = tn; // seed drift origin
+          laneSamples[laneIdx]++;
+
+          let numWarm = 0;
+          let minWarmBase = Infinity;
+          for (let k = 0; k < PAIRS; k++) {
+            if (laneSamples[k] >= 50) {
+              numWarm++;
+              if (laneBase[k] < minWarmBase) {
+                minWarmBase = laneBase[k];
+              }
+            }
+          }
+          if (numWarm >= 2 && laneSamples[laneIdx] >= 50) {
+            skewMs = Math.max(0, laneBase[laneIdx] - minWarmBase);
+          }
+        }
+        ringWrite(seq, payload, capUs, zipped, skewMs);
         // The window decoder runs UNCONDITIONALLY (the flag is the sender's):
         // whether the peer protects its stream with RS or the window is its
         // choice, and this side must be able to decode either. frame() keeps a
@@ -1689,6 +1740,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // values. No hand-tuned shrink rate, and no ratchet, because rise and fall are
     // the same estimator read at different times.
     const JITTER_MEASURED = cfg.jitterMeasured !== false;
+    const DESKEW = cfg.deskew !== false;
     // Window length is a tradeoff against SENDER CLOCK DRIFT, not just noise. d is
     // measured against our own clock, so a drifting sender makes d ramp steadily,
     // and a ramp inside the window reads as spread that no buffer needs to cover.
@@ -1775,7 +1827,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let govRingI = 0, govRingN = 0;
     let govTickMin = Infinity; // min slack seen since the last estimator tick
     let govPainSeen = 0; // late+conceal watermark; any advance zeroes this tick
-    function noteArrival(seq) {
+    function noteArrival(seq, skewMs = 0) {
       if (!dT0) dT0 = now();
       // ── inter-arrival GAPS, which answer a different question from spread ──
       // `spread` is (second-largest - min) of delay across the window: it says HOW
@@ -1808,7 +1860,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         }
       }
       gLast = tn;
-      dRing[dI] = now() - seq * FRAME_MS;
+      dRing[dI] = (tn - skewMs) - seq * FRAME_MS;
       dI = (dI + 1) % D_WIN;
       if (dN < D_WIN) dN++;
     }
@@ -2258,6 +2310,45 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // are per-association — the caveat). At pairs=1 this is one row whose
           // numbers equal the aggregate above.
           pairs: PAIRS,
+          laneSkew: (() => {
+            const perLane = [];
+            let maxWarmSkew = 0;
+            if (DESKEW) {
+              const tn = now();
+              let numWarm = 0;
+              let minWarmBase = Infinity;
+              for (let k = 0; k < PAIRS; k++) {
+                if (laneSamples[k] > 0) {
+                  laneBase[k] += (tn - laneLastT[k]) / 1000;
+                  laneLastT[k] = tn;
+                }
+                if (laneSamples[k] >= 50) {
+                  numWarm++;
+                  if (laneBase[k] < minWarmBase) {
+                    minWarmBase = laneBase[k];
+                  }
+                }
+              }
+              for (let k = 0; k < PAIRS; k++) {
+                let sk = 0;
+                if (numWarm >= 2 && laneSamples[k] >= 50) {
+                  sk = Math.max(0, laneBase[k] - minWarmBase);
+                }
+                const skVal = +sk.toFixed(1);
+                perLane.push(skVal);
+                if (laneSamples[k] >= 50 && skVal > maxWarmSkew) {
+                  maxWarmSkew = skVal;
+                }
+              }
+            } else {
+              for (let k = 0; k < PAIRS; k++) perLane.push(0);
+            }
+            return {
+              max: +maxWarmSkew.toFixed(1),
+              applied: DESKEW ? 1 : 0,
+              perLane,
+            };
+          })(),
           perAssoc: assocs.map((s, i) => ({
             i,
             open: s.dc?.readyState === 'open',
