@@ -1690,6 +1690,11 @@ const PCM_CFG = {
 };
 const L2_DURESS = QS.get('l2duress') !== '0'; // video ducks on audio-lane duress; `?l2duress=0` control
 const PREDIAL = QS.get('predial') !== '0'; // lobby pre-dials the room ws; `?predial=0` control
+// `?ice=relay` forces media through TURN; `?ice=all` (or unset) is today's
+// behaviour. See the RTCPeerConnection call for why a relay can be the FASTER
+// path on a long route. Only the two values WebRTC defines are accepted, so a
+// typo cannot silently produce a config the browser rejects.
+const ICE_POLICY = QS.get('ice') === 'relay' ? 'relay' : null;
 // §7.1: the client half of the three-person feature. Off, this page declares no
 // wire version, so the room's `cap()` sees a v1 occupant and pins the room at
 // two — the feature is inert from both ends at once, which is why the flag can
@@ -5214,7 +5219,25 @@ async function join(room) {
   let lastErr = null;
   for (const [name, servers] of iceTiers) {
     try {
-      pc = new RTCPeerConnection({ iceServers: servers, bundlePolicy: 'max-bundle', ...certArg() });
+      pc = new RTCPeerConnection({
+        iceServers: servers,
+        bundlePolicy: 'max-bundle',
+        // `?ice=relay` forces every candidate through TURN. Measured 2026-08-14:
+        // the public internet from Delhi runs at a median 2.14x the speed of
+        // light in fibre, while Cloudflare's backbone runs at 1.20-1.29x — so on
+        // a long path the relay is not the detour, it is the SHORT way. Modelled
+        // over eight regions, relaying wins on all eight and is the difference
+        // between 171 ms and 128 ms to California (LATENCY-150.md).
+        //
+        // ICE will never choose this on its own: RFC 8445 priority ranks host
+        // and server-reflexive ABOVE relay by TYPE, so the stack takes the slow
+        // direct route precisely when the fast relayed one matters most.
+        // This flag exists to PRICE that, not yet to ship it — forcing relay on
+        // a short path pays a real hop for nothing, and the eventual policy has
+        // to pick by measured latency rather than by category.
+        ...(ICE_POLICY ? { iceTransportPolicy: ICE_POLICY } : {}),
+        ...certArg(),
+      });
       iceTier = name;
       break;
     } catch (e) {

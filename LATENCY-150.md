@@ -286,3 +286,37 @@ priority is specified to rank host and server-reflexive ABOVE relay, so the
 stack will choose the slow direct route precisely when the fast relayed one
 matters most. The work is to measure both and pick by latency instead of by
 category.
+
+## What a relay actually costs (measured, `?ice=relay` on a live prod call)
+
+The relay column above was modelled. This prices its two components on a real
+call — loopback, so the only thing that changed is the path.
+
+| | direct (control) | forced relay |
+|---|---|---|
+| lane baseRtt | ~0.3 ms | **6.78 / 6.98 ms** |
+| mouth-to-ear | 48 ms | 65.5 / 67.8 ms |
+| glass-to-glass | 45.4 / 45.0 ms | 53.7 / 45.0 ms |
+| jitter buffer depth | ~20 ms | **37.3 / 34.9 ms** |
+
+**The raw path cost is small and the model was right:** 6.6 ms of added RTT is
+**~3.3 ms one way**, against the 2.7 ms predicted from the STUN first mile. TURN
+itself adds well under a millisecond; almost all of it is the trip to the edge.
+
+**But the buffer amplifies it 2.3×.** Mouth-to-ear rose ~18 ms, not ~3 ms,
+because the jitter buffer grew from ~20 ms to ~37 ms in response. That is the
+adaptive depth doing its job on a path it reads as worse.
+
+**Loopback overstates this badly, and the reason matters.** Here the relay
+competes against a 0.3 ms direct path — a route no real call ever has. On a
+Delhi→California call the direct path is ~250 ms RTT over public internet with
+public-internet jitter, while the relayed path is ~155 ms over a private
+backbone. The buffer would then grow on the DIRECT arm and shrink on the
+relayed one, so the amplification runs in the relay's favour rather than
+against it. Nothing here contradicts the 8-of-8 result; it does mean the margin
+on short paths is thinner than the model implies, which is exactly why the
+eventual policy must pick by measured latency and not force relay everywhere.
+
+**A lever worth its own arc:** 6.6 ms of RTT bought 15 ms of buffer. The jitter
+buffer is that sensitive, so on real paths its behaviour may matter as much as
+the route. Worth measuring before it is tuned.
