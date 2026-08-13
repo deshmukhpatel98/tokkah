@@ -1667,3 +1667,28 @@ they are ~3.5 GB each and the registry already has them.
 
 Measured: 3.466 GB → 0 B. The colima VM file (`~/.colima`, 4.4 GB sparse against
 a 30 GB ceiling) is the only thing that persists, and `colima stop` frees its RAM.
+
+**Peer container RUNS on Cloudflare** (verified 2026-08-14): app `tokkah-peer`,
+id `a03fcf26-8edb-4d9d-bde7-6bee5720a676`, image `tokkah-peer:v2`. Went
+`starting` → **`active`** in ~90 s, no errors. So the whole chain — install
+Docker without root, build, push, deploy, run — works end to end and needs no
+human.
+
+Constraint learned: **3 GiB of memory per vCPU** for the first 4 vCPUs. 2 vCPU /
+4096 MiB is rejected with `VALIDATE_INPUT`; 2 vCPU / 6144 MiB is accepted.
+
+**Scaled to 0 deliberately** — it had no work yet and an idle container bills
+continuously. Bring it back with:
+
+    curl -X PATCH .../containers/applications/a03fcf26-8edb-4d9d-bde7-6bee5720a676 \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H 'content-type: application/json' \
+      -d '{"instances":1,"max_instances":1}'
+
+**What is left for the deciding measurement (task #31):** this app has no region
+pin — `scheduling_policy: default`. Container instances bind to Durable Objects,
+so the region is chosen the way `/api/probe` chooses one: a Worker with a
+Container binding whose DO carries `locationHint: 'wnam'`. That is a
+`wrangler.jsonc` containers block plus a DO class, not more API calls. Then the
+container fetches a join script, drives Chromium into a room on room.tokkah.com,
+and Delhi ↔ that container is the real cross-planet call — run twice, default ICE
+and `?ice=relay`, and the 25-40 ms question is answered.
