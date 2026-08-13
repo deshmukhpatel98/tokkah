@@ -1629,3 +1629,25 @@ installed at runtime without Docker, which this machine does not have.
 
 **Credentials:** `~/.config/tokkah/cf.env` (chmod 600, outside the repo; account-
 scoped token — verify at `/accounts/$CF_ACCOUNT_ID/tokens/verify`, NOT `/user/`).
+
+### Docker now exists on this machine (2026-08-14) — no root, no admin password
+
+The container peer was blocked on "this Mac has no Docker". It does now, installed
+entirely from code into user-local paths:
+
+    curl -sL -o ~/.local/bin/colima https://github.com/abiosoft/colima/releases/latest/download/colima-Darwin-arm64
+    curl -sL https://download.docker.com/mac/static/stable/aarch64/docker-27.3.1.tgz   # docker CLI -> ~/.local/bin
+    curl -sL .../lima-vm/lima/releases/download/v2.2.0/lima-2.2.0-Darwin-arm64.tar.gz  # limactl -> ~/.local
+    export PATH="$HOME/.local/bin:$PATH"
+    colima start --vm-type=vz --cpu 4 --memory 8 --disk 30
+
+`--vm-type=vz` uses Apple's Virtualization framework, which is why no privilege
+escalation is needed. Verified: `docker info` reports Server Version 29.5.2.
+Colima needs limactl on PATH — without it the start fails with a bare "lima
+compatibility error", which is what the first attempt hit.
+
+**Always `export PATH="$HOME/.local/bin:$PATH"` first** — these are not on the
+default PATH, so a fresh shell will report docker as missing.
+
+With this, `wrangler containers build`/`push` work, and task #31 (a real browser
+peer on another continent) is unblocked end to end.
