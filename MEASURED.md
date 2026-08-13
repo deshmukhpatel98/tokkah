@@ -4502,8 +4502,11 @@ to any lane that stops delivering, in both directions:
     empty) and emits no skew signal at all, so striping concentrated audio into
     lanes it believed were fast.
 
-Both now read the ping, which visits every open association 4x/s regardless of
-whether it carries audio. Recovery: decaying-min RTT within 8ms of the fastest
+Both now read the ping, which visits every open association regardless of
+whether it carries audio — every 2 s per lane (PING_MS=2000), not the 4x/s this
+paragraph and the code comment beside it both claimed. The 8x error matters for
+reading the promote rule below: three consecutive ticks span about ONE AND A
+HALF fresh round trips, not three. Recovery: decaying-min RTT within 8ms of the fastest
 working lane for 3 consecutive ticks, reset per state epoch (an instantaneous
 comparison oscillated hard first — 11 demotions, 10 promotions in one run).
 Death: pong silent >2s, OR pong still returning but >300ms worse than the
@@ -4530,3 +4533,53 @@ find a faster mute path than a round trip that has to cross the fault twice.
 This is the measured cost against the 26ms win, and it is why striping stays
 opt-in: it concentrates traffic, which is exactly what earns the latency and
 exactly what raises the stakes when the lanes it concentrated onto fail.
+
+## Three asserts that scored success as failure, and a rig that could not return a verdict (2026-08-13)
+
+A rig that calls a working build broken is worse than no rig: it hides the win
+and invites you to "fix" what already works. Four of those in one evening, all
+in the striping harness, none in the product.
+
+  1. stage-2 `peerSkew.max >= 10` after convergence. A demoted lane sends
+     nothing, and a lane that sends nothing is excluded from the skew estimate,
+     so the peer's reported skew COLLAPSES once the policy has done its job.
+     Measured 26.5ms mid-convergence, 1.5-2.0ms after. The assert demanded the
+     symptom persist after the cure. The spec said so before it was written.
+  2. flap, same bug, same file family: read peerSkew at t=60 when the lane had
+     been demoted since t=40. Measured 2.0ms while detection was in fact
+     perfect. Both now assert the DEMOTION instead — it cannot happen without
+     skew crossing the threshold, and it stays true after convergence.
+  3. flap validity gate on `jitSpreadMaxRun`, which is a cumulative max that
+     never decays, sampled first at t=30. Any stall during WARM-UP condemned
+     every later sample, so the rig returned UNMEASURABLE three runs straight
+     over stalls at t<=30 that a flap at t>=30 could not have been affected by
+     — and since the hold ceiling shipped, a stall's influence on the buffer is
+     bounded to ~14s, so those runs were genuinely fine. Now gated on GROWTH
+     during the measurement window (the flap adds ~64ms on one lane; host
+     stalls run 1200-2900ms, so 300ms still separates them), plus a ring-depth
+     check at flap time for the one case growth alone misses: a stall at t~29
+     that is already in the first sample and still decaying through the window.
+
+The one VALID flap run on the shipped build, once assert 2 is corrected:
+
+  side B nFast  5 5 5 5 5 | 4 4 4 ... 4 | 5 5 5 5 5 5 5 5 5
+                flap t=38 ^     heal t=70 ^
+  demoted 2s after the flap, held the whole outage, re-promoted 4s after the
+  route healed, concealment delta in the 6s straddle window 0ms on BOTH sides.
+
+Side A correctly did nothing: each direction has its own proxies, and the
+flapped proxy only slowed A->B. A rig that demanded both sides react would have
+called that a failure too — it used to.
+
+## The ping is 0.5/s, not 4x/s — an 8x claim in the code and in this file
+
+`PING_MS = 2000`, `setInterval(sendPing, PING_MS)`, and sendPing writes to every
+open association. That is one round trip per lane every 2 s. Two comments and a
+paragraph of this document all claimed 4x/s, which is the T_SKEW report cadence
+(250ms) attached to the wrong message.
+
+It changes how the promote probe reads: "3 consecutive ticks" spans about ONE
+AND A HALF fresh round trips, not three independent confirmations. Left as-is
+and recorded rather than tuned — promotion is the safe direction to be slow
+about, since the failure mode is a lane staying demoted. The demote side counts
+skew, which really does arrive 4x/s, so a 3-tick streak there is ~12 reports.

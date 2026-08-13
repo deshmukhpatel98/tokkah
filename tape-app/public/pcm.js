@@ -540,6 +540,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Consecutive recompute ticks a DEMOTED lane's round trip has matched the
     // working lanes. Reset by any tick that does not — see recomputeLaneOrder.
     const laneRttOkStreak = new Uint16Array(PAIRS);
+    // Consecutive recompute ticks a FAST lane has looked slow. The mirror of
+    // laneRttOkStreak, and it exists for the same reason: one tick is a sample,
+    // a streak is a route. See the demote rule in recomputeLaneOrder.
+    const laneSkewHighStreak = new Uint16Array(PAIRS);
     // Decaying-min round trip per lane, kept alive by the ping on every open
     // association. Reset to Infinity whenever a lane changes state so each
     // epoch is judged on its own evidence.
@@ -700,7 +704,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
 
         if (dwellOk) {
           if (laneState[k] === 0) { // FAST
-            if (isWarm && skew >= 8.0) desiredState[k] = 1; // DEMOTED
+            // Skew has to HOLD, not just happen. laneBase is a running minimum
+            // per lane and skew is measured against the smallest of them, so
+            // early in a call the gap between two lanes is mostly a question of
+            // which one has already sampled its own floor: a lane is warm at 50
+            // samples (~2.4 s) but the dwell opens demotion at 5 s, and in that
+            // window minima are still converging. The gap that opens there is
+            // noise and it SHRINKS as samples accumulate — the opposite of a
+            // real route difference, which holds or grows.
+            //
+            // Measured on a clean same-route call: 1 run in 3 demoted 3 lanes
+            // to nothing but this, then probe-promoted all 3 back once the
+            // epoch reset relearned the bases. Zero concealment, but ~8 ms of
+            // buffer paid for a divergence that did not exist, on the ordinary
+            // network that most calls run over.
+            //
+            // Three consecutive ticks (~3 s) is the same bar the promote side
+            // already uses, and it costs a genuinely slow lane ~3 s of extra
+            // patience inside a window whose settle budget is 10 s.
+            laneSkewHighStreak[k] = (isWarm && skew >= 8.0) ? laneSkewHighStreak[k] + 1 : 0;
+            if (laneSkewHighStreak[k] >= 3) desiredState[k] = 1; // DEMOTED
           } else { // DEMOTED
             // A demoted lane carries no audio (measured: exactly 0 frames after
             // demotion), so its SKEW can never fall — the evidence needed to
@@ -709,7 +732,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // forgiven: the flap rig measured promotions=0 and nFast stuck at 3
             // for the rest of a call after the route was restored.
             //
-            // The ping is the way out. It goes to EVERY open association 4x/s,
+            // The ping is the way out. It goes to EVERY open association,
             // demoted included, so rttMs keeps arriving for lanes that carry
             // nothing. Require the round trip to sit within a frame and a half
             // of the fastest working lane for 3 consecutive ticks (~3 s) before
@@ -717,6 +740,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // is in fact still slow, it warms up and skew re-demotes it after
             // the dwell — a bounded, self-correcting probe rather than a
             // permanent verdict.
+            //
+            // Cadence, since this comment claimed 4x/s and the ping timer says
+            // otherwise: PING_MS is 2000, so RTT refreshes every 2 s per lane —
+            // 0.5/s, 8x slower than stated. Three ticks therefore span roughly
+            // ONE AND A HALF fresh round trips, not three, so the streak buys
+            // less independent evidence here than the same number does on the
+            // demote side, where the skew it counts arrives 4x/s on T_SKEW.
+            // The promote direction is the safe one to be slow about (a lane
+            // stays demoted), which is why this is recorded rather than tuned.
             // 8 ms of round trip is the 4 ms one-way promote hysteresis seen
             // from the sender's side, so the probe and the skew rule agree on
             // where "fast again" begins.
@@ -775,6 +807,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           laneState[k] = desiredState[k];
           laneStateSince[k] = tn;
           laneRttOkStreak[k] = 0;
+          laneSkewHighStreak[k] = 0; // a new epoch re-earns its own evidence
           laneRttBase[k] = Infinity; // re-learn this epoch's floor from fresh pings
         }
       }
