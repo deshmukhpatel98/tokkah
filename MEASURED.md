@@ -4350,3 +4350,22 @@ SHADOW FILTER shipped: bg adapts fearlessly, fg inherits proof only, gate
 unchanged. Six arms pass, DT arm hugely better (1.0000 corr, 64.8 dB post-DT);
 harsh bleed: baseline went negative+flapped, shadow held stable. Cost 1.09x.
 The echo campaign now awaits one same-room call.
+
+## Per-lane de-skew (latency arc)
+
+The six-lane stripe fed ONE arrival-spread estimator, so a structurally slower
+lane read as jitter and the ring buffered for skew that never varies. Now each
+lane carries a decaying min-baseline and its skew vs the fastest warm lane is
+subtracted from the spread samples only (gaps/stalls stay raw). ?deskew=0 is
+the control.
+
+Safety invariant, live prod, same-route call (testbed/deskew-noop.mjs): ON arm
+laneSkew max 1.1 ms across six lanes — de-skew correctly measures ~nothing when
+routes don't diverge — ring depth 16.3 vs 20.1 ms control (inside the 6 ms
+same-route bound), 5630 frames both arms, 0 concealed. One arm returned null
+PCM under four stacked headless Chromes and was clean alone; the rig now
+retries a null arm once rather than crying wolf.
+
+The win case (geo brief: 16–32 ms route divergence on long paths) is not yet
+measured — netsim gains per-lane offsets + heavy-tailed jitter next, and
+testbed/deskew-divergence.mjs carries the verdict.
