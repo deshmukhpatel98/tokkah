@@ -345,3 +345,56 @@ exact obstacle, so the next attempt starts where this one stopped:
 Until that runs, the honest statement of where the goal stands is: **the budget
 says it is met on 8 of 8 routes via the backbone, on the build already shipped,
 and half of that claim is measured.**
+
+## CORRECTION: the 8-of-8 relay result was wrong
+
+The section above compared a MODELLED relay path against a MEASURED direct one,
+and the model was over-generalised. I took 1.25× from the two best-placed
+regions (oc, sam) and applied it to every route — but the wnam probe measured
+1.95×, not 1.25×. A best case generalised into a rule, then scored against
+reality. That is the same error this project keeps catching in its rigs, made
+here in analysis instead.
+
+Measured against measured (Cloudflare DO RTT less the ~29 ms dispatch estimate,
+versus direct public-internet TCP RTT):
+
+| site | Cloudflare | direct | winner |
+|---|---|---|---|
+| Singapore | 52 ms | 71.6 ms | Cloudflare by 19.6 |
+| Sydney | 157 ms | 163.5 ms | Cloudflare by 6.5 |
+| São Paulo | 232 ms | 346.8 ms | **Cloudflare by 114.8** |
+| London | 173 ms | 143.6 ms | direct by 29.4 |
+| N. California | 274 ms | 252.5 ms | direct by 21.5 |
+| N. Virginia | 294 ms | 227.7 ms | direct by 66.3 |
+
+**Cloudflare wins 3 of 6, not 8 of 8. And on the US routes neither path reaches
+150 ms**: N. California is 182 ms via Cloudflare and 171 ms direct, against a
+45 ms video pipeline.
+
+### What survives the correction
+
+- The public internet really is ~2.14× the speed of light from Delhi. Measured.
+- Every pipeline number stands: 48 ms audio, 45 ms video, 5.4 ms first mile,
+  3.3 ms relay path cost. Measured.
+- Routing efficiency really does vary enormously by destination — São Paulo
+  differs by 115 ms between the two paths. **Which path is faster is a
+  per-route question with no general answer**, which kills "always relay" just
+  as firmly as it killed "never relay".
+
+### What this does to the goal
+
+On the routes that matter most (India↔US), **the goal is currently NOT met by
+either path** — roughly 170–190 ms against a 150 ms target, so ~25–40 ms short.
+The gap has to come from somewhere real:
+
+1. A better path than either measured here. Neither column is a fair proxy for
+   TURN media: a DO round trip is control-plane RPC, and TURN is lean UDP
+   forwarding at the edge. The relayed media path may well beat both, and that
+   is now an open question rather than a settled one.
+2. The jitter buffer, which turned 6.6 ms of RTT into 15 ms of depth. On a
+   250 ms path its behaviour is worth more than it is on loopback.
+3. The 9.2 ms sitting behind `?vpd=1`, if the cadence gate allows it.
+
+The honest status of the goal: **met comfortably on Asia-Pacific routes, close
+on Sydney, and ~25–40 ms short on India↔US, which is the route the operator
+actually cares about.**
