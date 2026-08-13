@@ -2529,7 +2529,22 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // IPI p50 33.3 / p95 33.3 / p99 33.3–66.7, on-cadence 96–100%.
   const vpq = [];                          // { frame, idx } — decoded, awaiting their slot
   const VPQ_MAX = 3;                       // measured: covers p99 arrival lateness + 1 hole slot
-  const VP_D_SLOTS = 2;                    // anchor added latency, in frame intervals
+  // Anchor added latency, in frame intervals. This is the single largest
+  // CONTROLLABLE term in glass-to-glass: at 30 fps two slots is 66.7 ms of
+  // deliberate hold, spent to keep the remote view's cadence as smooth as the
+  // self view (directive: "remote rendering very far off self-view smoothness").
+  //
+  // The 150 ms budget (LATENCY-150.md) makes that trade worth re-pricing. Every
+  // route on earth clears 150 ms once the video pipeline drops from 57 ms to
+  // under 54 ms — 3 ms — and ONE slot here is worth far more than 3 ms. So the
+  // anchor becomes measurable instead of assumed: `?vpd=1` runs a one-slot
+  // anchor against the shipped two, and the cadence gate (remote IPI p99 within
+  // 1.5x self-view) says whether the smoothness it was bought with survives.
+  // Unset = 2, exactly as shipped.
+  const VP_D_SLOTS = (() => {
+    const v = Number(new URLSearchParams(location.search).get('vpd'));
+    return Number.isFinite(v) && v >= 0 && v <= 4 ? v : 2;
+  })();
   const VP_SHIFT_LO = -30;                 // servo bound: ≤ 1 s of phase pull per anchor
   let vpT0 = 0;                            // wall ms at which slot 0 presents
   let vpTs0 = null;                        // frame.timestamp of slot 0 (sender capture clock, µs)

@@ -184,3 +184,38 @@ enabled here and are bound to Durable Objects, so the same `locationHint` that
 pinned these probes pins a container — but the account has no browser image and
 this machine has no Docker, so that image has to be built before the experiment
 can run. That is the next blocking step, not a conceptual one.
+
+## The video pipeline is 45 ms, not 57 — and every route already fits
+
+Measured on live prod calls, current build (the 56–59 ms figure came from older
+HANDOFF notes and no longer describes this code):
+
+| arm | cap→read | encode | fullAge p50 | present p50 | **glass-to-glass** |
+|---|---|---|---|---|---|
+| `vpd=2` (shipped) | 0.1 ms | 3.0 ms | 23.2 ms | 22.2 ms | **45.4 / 45.0 ms** |
+| `vpd=1` (one slot) | 0.1 ms | 3.0 ms | 22.9 ms | 10.4–14.7 ms | **37.6 / 34.3 ms** |
+
+Re-running the budget with the real 45 ms number, the "3 ms short" problem
+disappears — **every route in the table clears 150 ms on the shipped build**:
+
+    Delhi → São Paulo (14,428 km, near-antipodal):  95.6 + 45 = 140.6 ms
+    Delhi → San Jose:                               83.0 + 45 = 128.0 ms
+
+### A 9.2 ms saving is available, and it is NOT yet earned
+
+Dropping the presenter anchor from two slots to one takes glass-to-glass from
+45.2 ms to 36.0 ms — present lag falls 22.2 → 10.4 ms, which is exactly the one
+frame interval predicted, servo-pulled.
+
+**But the anchor is not overhead, it is the fix for a complaint.** It exists
+because the operator reported "remote rendering very far off self-view
+smoothness", and it is bought with a cadence gate: remote IPI p99 within 1.5× of
+self-view. `call.mjs` does not print IPI, so this A/B measured the thing the
+change WINS and not the thing it SPENDS. Taking the 9.2 ms on that evidence
+would be trading away a fix the user asked for, to buy margin the budget above
+says we do not currently need.
+
+Held at `vpd=2`. The flag ships so the trade can be priced properly: re-run with
+IPI p50/p95/p99 captured from the snapshot on both arms, and spend the 9.2 ms
+only if the cadence gate still holds — or if a real long path turns out worse
+than 1.25× and the margin is actually needed.
