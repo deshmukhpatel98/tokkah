@@ -660,6 +660,13 @@ if (ra.tapeMode?.wanted || rb.tapeMode?.wanted) {
         `      #14  cap→read p50 ${v.capLagP50} (p95 ${v.capLagP95})  encode p50 ${v.encLatP50} (p95 ${v.encLatP95})` +
           `  fullAge p50 ${v.fullAgeP50} (p95 ${v.fullAgeP95})  present p50 ${v.presentLagP50} (p95 ${v.presentLagP95}) ms  glassToGlass ${v.glassToGlassMs} ms`,
       );
+      // The CADENCE side of the trade. glassToGlass alone prices what a
+      // shorter presenter anchor WINS and says nothing about what it SPENDS —
+      // and the anchor exists to keep remote cadence as smooth as the self
+      // view. Without these three numbers the ?vpd A/B measures one half of a
+      // two-sided decision, which is how a latency win quietly becomes a
+      // smoothness regression.
+      log(`      #33  IPI p50 ${v.ipiP50} p95 ${v.ipiP95} p99 ${v.ipiP99} ms  (vp anchor ${v.vp?.dMs ?? '?'} ms, depth ${v.vp?.depth ?? '?'})`);
     }
     // Lane 0 lever 3/4b: Lane B yield windows (count + total requested ms)
     // and the worker-side count of carrier ticks that went out empty.
