@@ -126,3 +126,61 @@ Cloudflare Containers are enabled on this account (an ML fleet, `tokkah-lab`,
 Durable Objects — so the same `locationHint` that pinned these probes can pin a
 container running headless Chrome. India ↔ that container is a real
 cross-planet WebRTC call, on demand, as many times as we want.
+
+## The first mile is nearly free (measured, real UDP)
+
+`testbed/stun-rtt.mjs` speaks actual STUN over UDP — the same protocol, port and
+servers WebRTC itself uses to find a path — so the number is the one a call pays
+rather than a TCP proxy for it. From Delhi:
+
+| server | min RTT | p50 | p95 | loss |
+|---|---|---|---|---|
+| stun.cloudflare.com | **5.37 ms** | 8.86 ms | 24.59 ms | 0% |
+| stun.l.google.com | 5.01 ms | 8.83 ms | 19.33 ms | 0% |
+
+**~2.7 ms one way to leave the building.** The access link was a suspected term
+in the budget and it is not one. Both vendors land equally close, so this is the
+local ISP's distance to a peering point, not a Cloudflare-specific advantage.
+
+## The budget, with every term now measured
+
+first mile 2.7 ms one-way (STUN, real UDP) · backbone 1.25× the speed of light
+in fibre (DO probe, dispatch overhead subtracted) · pipeline 48 ms audio /
+57 ms video (loopback, so network ≈ 0 and these ARE the device cost)
+
+| route | km | propagation | + first mile | AUDIO | VIDEO | verdict |
+|---|---|---|---|---|---|---|
+| Delhi → Singapore | 4,142 | 25.9 | 31.3 | **79.3** | **88.3** | both pass |
+| Delhi → London | 6,712 | 42.0 | 47.3 | **95.3** | **104.3** | both pass |
+| Delhi → Sydney | 10,428 | 65.2 | 70.6 | **118.6** | **127.6** | both pass |
+| Delhi → Ashburn | 12,048 | 75.4 | 80.7 | **128.7** | **137.7** | both pass |
+| Delhi → San Jose | 12,416 | 77.7 | 83.0 | **131.0** | **140.0** | both pass |
+| Delhi → São Paulo | 14,428 | 90.2 | 95.6 | **143.6** | 152.6 | audio only |
+
+**The 150 ms goal is reachable on every major route with the code that exists
+today** — provided the media path achieves the 1.25× the backbone demonstrably
+does. The one failure is video on the near-antipodal route, and it misses by
+2.6 ms.
+
+### Which turns the goal into two specific pieces of work
+
+1. **Cut the video pipeline from 57 ms to under 54 ms.** That is the exact
+   figure that clears every route in the table, including São Paulo. Three
+   milliseconds, and the whole planet fits. Encode is 6.4 ms p50 measured, so
+   the rest is capture cadence, present scheduling and decode — and none of it
+   requires giving up visually-lossless.
+2. **Prove the path.** Everything above assumes a real call routes as well as
+   Cloudflare's backbone. Public-internet P2P between two consumer ISPs often
+   does NOT — 2× is common, which would put San Jose at ~180 ms and fail. This
+   is the central bet:
+
+   > **Hypothesis #1: on long paths, relaying through Cloudflare's backbone
+   > BEATS direct P2P**, inverting the usual assumption that a relay is always
+   > worse. TURN is already live on every call, and `icePath` / `iceRttMs`
+   > telemetry now records which path each real call took and what it cost.
+
+The instrument to settle it is a real peer on another continent. Containers are
+enabled here and are bound to Durable Objects, so the same `locationHint` that
+pinned these probes pins a container — but the account has no browser image and
+this machine has no Docker, so that image has to be built before the experiment
+can run. That is the next blocking step, not a conceptual one.
