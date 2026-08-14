@@ -42,3 +42,7 @@ tape-app/public/vendor/
 # Ad-hoc single-run rigs (dot-prefixed by convention). Durable rigs are
 # committed undotted; these are scratch and would rot in the repo.
 testbed/.*.mjs
+
+# Real talking-head media staged into the peer image build context.
+# Copies of testbed/media/real, ~96 MB -- fetched by media/real/fetch.sh, never committed.
+testbed/peer/media/

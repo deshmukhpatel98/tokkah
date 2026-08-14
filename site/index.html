@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Tokkah — a video call that does not invent your voice</title>
+  <meta name="description" content="48 kHz bit-exact audio. Visually lossless video. Every number measured on real browsers. Live at room.tokkah.com.">
+  <meta name="theme-color" content="#05060a">
+  <meta property="og:title" content="Tokkah">
+  <meta property="og:description" content="A video call that does not invent your voice. Bit-exact audio. Visually lossless video. Measured, not marketed.">
+  <meta property="og:image" content="img/orbs.jpg">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23f4f2ee'/%3E%3Cstop offset='1' stop-color='%23d8d4cc'/%3E%3C/linearGradient%3E%3ClinearGradient id='h' x1='1' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%2360a5fa'/%3E%3Cstop offset='1' stop-color='%233b82f6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='15' fill='%230a0c11'/%3E%3Ccircle cx='25.5' cy='32' r='13' fill='url(%23g)' opacity='.92'/%3E%3Ccircle cx='38.5' cy='32' r='13' fill='url(%23h)' opacity='.78'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.1/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.1/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="stage" aria-hidden="true"></canvas>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="vignette" aria-hidden="true"></div>
+
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <a class="mark" href="#top" aria-label="Tokkah">
+      <svg viewBox="0 0 64 64" width="22" height="22" aria-hidden="true">
+        <circle cx="25.5" cy="32" r="13" fill="#f4f2ee" opacity=".92"/>
+        <circle cx="38.5" cy="32" r="13" fill="#60a5fa" opacity=".78"/>
+      </svg>
+      <span>Tokkah</span>
+    </a>
+    <nav>
+      <a href="#numbers">Numbers</a>
+      <a href="#law">The law</a>
+      <a href="#proof">What exists</a>
+      <a href="#honest">What does not</a>
+    </nav>
+    <a class="nav-cta" href="https://room.tokkah.com" target="_blank" rel="noopener">Open a room</a>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <p class="eyebrow">Live · room.tokkah.com · measured, not marketed</p>
+      <h1>A video call that does not invent your voice.</h1>
+      <p class="lede">
+        Every mainstream product compresses you into a codec from 2010.
+        Tokkah sends the samples. 48&nbsp;kHz linear PCM, bit-exact.
+        The picture sits at the floor of visual losslessness.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="https://room.tokkah.com" target="_blank" rel="noopener">Start a call — one click</a>
+        <a class="btn ghost" href="https://github.com/deshmukhpatel98/tokkah" target="_blank" rel="noopener">Source &amp; lab notebook</a>
+      </div>
+      <p class="hint">Open it in two tabs. That is a call. No account.</p>
+    </section>
+
+    <section class="numbers" id="numbers">
+      <header class="sec-head">
+        <p class="eyebrow">Six numbers we can defend</p>
+        <h2>If it is not measured, it is not on this page.</h2>
+      </header>
+      <ol class="grid">
+        <li>
+          <span class="n">0.0%</span>
+          <span class="label">concealed speech on a clean path</span>
+          <span class="method">48 kHz / 24-bit PCM, bit-exact end to end. Concealment 0.0% on the clean path. Under 5% loss: 2.1%. Before the framing and stripe fixes: 36–41%.</span>
+        </li>
+        <li>
+          <span class="n">8<span class="u">ms</span></span>
+          <span class="label">to repair a lost audio packet</span>
+          <span class="method">Sliding-window FEC, p50 8 ms / p95 56 ms. A classic block code, RS(10,13), needs the whole 80 ms group. 8 of 8 paired calls at 5% loss: 5× less concealment and −44 ms end-to-end.</span>
+        </li>
+        <li>
+          <span class="n">23.0<span class="u">ms</span></span>
+          <span class="label">glass-to-glass, p50</span>
+          <span class="method">n=10, ±1.7 ms. Timecoded fixture. Receiver display minus sender preview. Both browsers on one machine — this is the pipeline floor, not a real-world route. Live production decomposition: ~36–45 ms.</span>
+        </li>
+        <li>
+          <span class="n">99.7</span>
+          <span class="label">VMAF at the design point</span>
+          <span class="method">Fixed QP24, 30 fps, Chromium, cam1080 fixture. The rig’s own transparency floor. Safari cannot run quantizer mode and uses VBR; that arm is scored separately and is not entitled to this number.</span>
+        </li>
+        <li>
+          <span class="n">347<span class="u">ms</span></span>
+          <span class="label">second person, click → connected</span>
+          <span class="method">Live A/B, 5 calls per arm. Lobby pre-dials in hold state. Was 565 ms (−39%). Host or guest: one click. Zero is illegal — getUserMedia needs a gesture.</span>
+        </li>
+        <li>
+          <span class="n">$0</span>
+          <span class="label">to run, below ~5,000 calls a month</span>
+          <span class="method">One Worker + one Durable Object. Media is peer-to-peer. Direct call ≈ $0.0001/min. Relayed minute $0.0075. Inside Cloudflare’s free tiers the bill is zero. Not “100× cheaper” — that claim was withdrawn.</span>
+        </li>
+      </ol>
+    </section>
+
+    <section class="law" id="law">
+      <p class="eyebrow">The inversion</p>
+      <blockquote>
+        <p>Quality is a constant. Time is the only shock absorber.</p>
+      </blockquote>
+      <p class="body">
+        Every calling stack built since 2011 spends picture quality when the network dips.
+        The voice goes thin. The codec invents syllables you never said. The face goes mushy.
+        That is not a bug. It is the architecture.
+      </p>
+      <p class="body">
+        Tokkah does not lower quality. When the link cannot carry a frame, the frame is
+        dropped <em>before</em> encode, so the reference chain has no holes. When a packet dies,
+        a sliding window rebuilds it in about eight milliseconds. When even that is not enough,
+        the call holds a pristine picture and says so. It never spends the face.
+      </p>
+    </section>
+
+    <section class="proof" id="proof">
+      <header class="sec-head">
+        <p class="eyebrow">What exists, today, in production</p>
+        <h2>Not a deck. A shipping call.</h2>
+      </header>
+
+      <div class="cards">
+        <article>
+          <h3>The voice is the recording.</h3>
+          <p>No Opus. No “HD voice.” Mic → 8 ms PCM frames → lossless Rice coding (~0.56× on speech) → six striped datachannels → sliding-window repair → playout. On a clean path the far end plays the bits you captured.</p>
+          <p class="fine">Lane rate ~0.73–0.94 Mbps after compression and group-sized parity. Encode 25 µs/frame.</p>
+        </article>
+        <article>
+          <h3>The picture is the camera’s.</h3>
+          <p>720p in is 720p out. 1080p in is 1080p out. We used to upscale everything to 1080. That spent 19% of the stream and 3.8 ms p50 for zero extra picture. The encoder now follows the sensor.</p>
+          <p class="fine">Under RTT 80 ms / 1% loss: held 1080p, 0 frames lost. Stock WebRTC on the same path collapsed to 720p, 460–468 packets lost, 2 freezes.</p>
+        </article>
+        <article>
+          <h3>The whole backend is one Worker.</h3>
+          <p>Signalling and (optionally) short-lived TURN credentials. Media never touches a server. Embed is one script tag. A stranger can clone, <code>npm&nbsp;ci</code>, and deploy on a free Cloudflare account. Bundle 52.6 KiB gzipped.</p>
+          <p class="fine">Zero runtime dependencies in the shipped app. AGPL v3, plus a commercial license for closed products.</p>
+        </article>
+        <article>
+          <h3>Self-view is off.</h3>
+          <p>You hold a button to peek. Chronic self-view is the strongest published correlate of video-call fatigue. The audio buffer used to ratchet after a bad patch and stay fat for minutes — the other person just seemed slow. It now measures arrival spread and gives the latency back.</p>
+          <p class="fine">We do not claim a validated fatigue-scale score. No published study links ZEF to measured delay. This is the delay-literature proxy, stated as such.</p>
+        </article>
+        <article>
+          <h3>Echo, in a real room.</h3>
+          <p>In-house canceller on the raw PCM lane. Lab: 62 dB ERLE, double-talk survives at 0.95 correlation, bit-exact passthrough when the far end is silent. First real calls (two Macs, one room, speakers): detector fired, do-no-harm gate opened, 3.6 dB delivered. Filter learns always; it only plays when ERLE ≥ 3 dB.</p>
+          <p class="fine">A canceller that cannot prove it is helping is not allowed to touch the lossless lane.</p>
+        </article>
+        <article>
+          <h3>You talk. They hear their language.</h3>
+          <p>One globe tap, or <code>data-translate="es"</code> on the embed. Gemini live translation is the default on production. Probe: end-of-phrase → translated audio 164 ms. The lossless lane is never touched — if the interpreter falls behind it degrades to captions, never to stalled sound.</p>
+          <p class="fine">Per-room daily budget, server-enforced. Over budget the socket is accepted, told, and closed.</p>
+        </article>
+      </div>
+
+      <figure class="embed-card">
+        <figcaption>The entire integration</figcaption>
+        <pre><code>&lt;script src="https://room.tokkah.com/embed.js" data-room="standup"&gt;&lt;/script&gt;</code></pre>
+        <p>No SDK. No API key. No account. No build step.</p>
+      </figure>
+    </section>
+
+    <section class="engines" id="engines">
+      <p class="eyebrow">Surfaces, not slides</p>
+      <ul>
+        <li><strong>Real Safari ↔ Chromium</strong> on production: custom video lane, no fallback, 0.091% concealment, lossless audio 1.09 Mbps, picture both ways.</li>
+        <li><strong>Mobile Safari</strong> (iOS simulator): SharedArrayBuffer path works. After the do-no-harm AEC gate, 0.067% concealment on a 2-minute soak.</li>
+        <li><strong>10-minute live soak</strong> on the latency-floor default: depth held 13–21 ms the whole way. Mouth-to-ear 43.7–51.5 ms. Concealment 0.008%. No ratchet.</li>
+        <li><strong>First human calls</strong> on the new stack, 2026-08-11: echo cancelled in air, burst shield and video-duress engaged and recovered, camera flips held, fleet mouth-to-ear p50 48.3 ms.</li>
+      </ul>
+    </section>
+
+    <section class="honest" id="honest">
+      <header class="sec-head">
+        <p class="eyebrow">What we will not say</p>
+        <h2>An investor who later reads the lab notebook should find nothing to unsay.</h2>
+      </header>
+      <ul class="wont">
+        <li>
+          <strong>We have not measured Zoom or Google Meet.</strong>
+          Their join is account-gated or bot-gated. The instrument exists and is validated against our own app (23.0 vs an independent 27.3 ms). We will not invent their number. A community Jitsi in Munich measured 179 ms — almost all of that is the round trip to Munich, not their pipeline. Against a well-sited SFU the routing advantage is single-digit milliseconds. Any real lead has to come from the pipeline, which we have not compared.
+        </li>
+        <li>
+          <strong>Anywhere-to-anywhere under 150 ms is the standing goal, not a trophy.</strong>
+          Device pipeline, loopback: 48 ms mouth-to-ear, 45 ms glass-to-glass. First mile from Delhi, real STUN: 5.37 ms RTT. India ↔ US is still roughly 25–40 ms short on the paths we have measured. A real cross-planet media call has been instrumented, not yet taken. We will not model that last hop into a headline.
+        </li>
+        <li>
+          <strong>Three-person rooms are built and verified. They are off in production.</strong>
+          Full mesh on staging: 9/9 assertions, 10.6–11.7 Mbps uplink per device. A third joiner on room.tokkah.com is refused. The flip is one line, and it stays a product decision — phones have not been thermally proven, and translation turns off at three.
+        </li>
+        <li>
+          <strong>We do not claim people are less tired.</strong>
+          Self-view is off because that is Bailenson’s published remedy. The buffer no longer stays fat after the network heals — measured. Video delay stays flat under 5% loss — measured. The ZEF scale has never been correlated with latency in the literature. We will not pretend it has.
+        </li>
+        <li>
+          <strong>Several numbers on this project were published and then withdrawn.</strong>
+          “2.4× better than same-city Zoom.” “100× cheaper.” “1920×1080 delivered” from a 720p camera. “6.6× lower latency than an SFU.” Each one is still in <a href="https://github.com/deshmukhpatel98/tokkah/blob/main/MEASURED.md">MEASURED.md</a>, marked untrue, with the method that killed it. That file is the product’s character.
+        </li>
+      </ul>
+    </section>
+
+    <section class="ask" id="close">
+      <p class="eyebrow">The ask</p>
+      <h2>The call is live. The source is public. The license is honest.</h2>
+      <p class="body">
+        AGPL v3 for almost everyone — use it, deploy it, fork it, sell a service on it.
+        A commercial license exists for exactly one case: shipping Tokkah inside a
+        closed-source product. Pricing scales with the product, not with a sales script.
+        Evaluating costs nothing and needs no permission.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="https://room.tokkah.com" target="_blank" rel="noopener">Use the product</a>
+        <a class="btn ghost" href="mailto:licensing@tokkah.com">licensing@tokkah.com</a>
+      </div>
+      <dl class="facts">
+        <div>
+          <dt>Product</dt>
+          <dd><a href="https://room.tokkah.com">room.tokkah.com</a></dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd><a href="https://github.com/deshmukhpatel98/tokkah">github.com/deshmukhpatel98/tokkah</a></dd>
+        </div>
+        <div>
+          <dt>Receipts</dt>
+          <dd><a href="https://github.com/deshmukhpatel98/tokkah/blob/main/MEASURED.md">MEASURED.md</a></dd>
+        </div>
+        <div>
+          <dt>License</dt>
+          <dd>AGPL v3 + commercial</dd>
+        </div>
+      </dl>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p>Tokkah. Two voices. The overlap is the conversation.</p>
+    <p class="fine">Every figure on this page is taken from the production lab notebook, with its method attached. Comparative claims against named commercial products are omitted because they have not been measured.</p>
+  </footer>
+
+  <script type="module" src="scene.js"></script>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

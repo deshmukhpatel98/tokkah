@@ -454,3 +454,88 @@ costs nothing and prices the trade honestly. The win does not.
 That leaves the India↔US gap with no device-side lever at all — audio is at its
 floor, video offers nothing measurable — and the path as the only remaining
 source of 25–40 ms.
+
+---
+
+## The path, finally measured (2026-08-14)
+
+Every latency number above this line came from one laptop against a simulated
+network, or from Cloudflare's control plane, or from third parties on the public
+internet. None of them was WebRTC media on a long route. That was the last
+unknown in the budget, and the budget's own conclusion — "the path as the only
+remaining source of 25–40 ms" — could not be checked without it.
+
+It is now measured, on a **live production call**, both ends driving the real
+join UI on room.tokkah.com, both ends carrying **real talking-head video and
+real speech** (side A from Delhi, side B from Seattle — two different speakers,
+as an actual conversation has).
+
+**Delhi ↔ Seattle (sea01), real WebRTC, UDP, two runs on separate fresh rooms:**
+
+| Run | State | Packets received | Jitter | Path | **RTT** |
+|---|---|---|---|---|---|
+| gen 7 | connected | 6 962 | 8 ms | relay ↔ prflx, udp | **305 ms** |
+| gen 8 (fresh room) | connected | 6 609 | 16 ms | relay ↔ prflx, udp | **337 ms** |
+
+Great-circle Delhi→Seattle is ~11 300 km. Light in fibre (c/1.468 = 199 862
+km/s) makes the physical floor **56.5 ms one-way, 113 ms round trip**. The
+measured 305–337 ms is **2.7–3.0× the speed of light in fibre** — squarely in
+the same band as the 2.14× this project already measured from Delhi over TCP,
+so the figure is consistent with the rest of the evidence rather than an outlier.
+
+### What that does to the goal
+
+One-way network on this route is **152–169 ms**. The audio pipeline is 48 ms and
+already at its floor (≈20 ms OS output buffer + 16 ms jitter target + 8 ms
+framing), and the video A/B found no device-side lever at all.
+
+> **The network alone exceeds 150 ms on India↔US, before the application does
+> anything.** Mouth-to-ear on this route lands at roughly **200–217 ms**.
+
+No device-side optimisation can close that, because the gap is not on the device.
+The 25–40 ms deficit the budget predicted is real and, if anything, understated.
+
+### The honest caveat
+
+The far end is a Cloudflare container behind carrier NAT with **no public IP**,
+so ICE had no direct candidate to offer and the call went over a **relay** —
+`local: relay`. This is therefore the RELAY-path number for this route. A human
+user on a normal home connection may negotiate a direct path, which could be
+faster. **This measures the worst realistic case, not the typical one.** The
+direct-path number for the same route is still unmeasured, and is now the single
+highest-value thing left to measure.
+
+### What made this measurable at all
+
+Seven attempts produced perfect silence. The causes, in the order they were
+peeled off, are worth keeping because every one of them presented identically:
+
+1. `container.start({entrypoint})` — **the override is silently discarded**. The
+   container runs its Dockerfile `CMD`. Staged reporting proved not even the
+   first line ran.
+2. The Playwright base image ships the **browsers but not the npm package**, so
+   `require('playwright')` died instantly. Found in ten seconds by running the
+   image locally — after four attempts guessing at it remotely.
+3. Stage details were interpolated into a JSON literal in bash, so any detail
+   containing a quote — i.e. **every stack trace** — broke the JSON and the
+   error was destroyed by the thing meant to carry it.
+4. `enableInternet` is **off by default**. The container had no outbound network
+   at all: `assign_ipv4: none, assign_ipv6: none, mode: private`.
+5. A container lives only as long as its Durable Object. Returning without
+   holding the DO awake left the instance `inactive`, location `-` — never
+   placed on hardware.
+6. `locationHint` is **advisory** and was ignored: a run hinted `wnam` was placed
+   in **bom10 (Mumbai)**, 1 200 km away, which would have quietly reported a
+   domestic call as a cross-planet one. `constraints.regions` is what binds.
+7. `max_instances: 1` is application-wide, so the alarm keeping one DO awake
+   blocked the next run from ever being placed.
+8. The container's `REPORT_URL` carried `region` but not `gen`, so a far peer
+   that ran perfectly in Seattle posted into the default Durable Object while
+   the experiment polled the one it had just created — **a working run read as
+   total silence**.
+
+The lesson under all eight: every failure mode here produced the same symptom, a
+silent `pending`. What broke the deadlock was not a better guess but a channel
+that could not lie — running the identical image locally, and reading the
+platform's own state (`containers instances`, `containers info`) instead of
+inferring it.

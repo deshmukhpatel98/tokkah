@@ -22,7 +22,11 @@ const REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'a
 // the ones our local rigs use, because two ends running different capture paths
 // is not a comparison.
 const JOIN_JS = String.raw`
-const { chromium } = require('playwright');
+// playwright-core first: the image installs THAT, because the base ships the
+// browsers already and the full package would re-download them. The fallback
+// keeps this script runnable against a plain playwright install too.
+const { chromium } = (() => { try { return require('playwright-core'); }
+                              catch (e) { return require('playwright'); } })();
 const ROOM = process.env.ROOM, BASE = process.env.BASE, QS = process.env.EXTRA_QS || '';
 const REPORT = process.env.REPORT_URL, HOLD = Number(process.env.HOLD_S || 75);
 const post = async (o) => { try {
@@ -32,8 +36,20 @@ const post = async (o) => { try {
   let b;
   try {
     b = await chromium.launch({ args: [
-      '--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream',
+      '--use-fake-ui-for-media-stream','--use-fake-device-for-media-stream',
+      // A REAL talking head and REAL speech as the camera and microphone, the
+      // same files and the same flags the local rig uses -- side B here against
+      // side A there, so the two ends carry different speakers the way an
+      // actual conversation does. Chromium's synthetic pattern and beep
+      // compress to almost nothing: a call carrying them measures an empty pipe
+      // on a long route and reports it as a video call.
+      '--use-file-for-fake-video-capture=/peer/media/realB.mjpeg',
+      '--use-file-for-fake-audio-capture=/peer/media/realB.wav',
       '--autoplay-policy=no-user-gesture-required','--no-sandbox',
+      // Headless Chrome may skip the audio render pipeline entirely without an
+      // output device, which would show up as silence for the wrong reason.
+      '--alsa-output-device=null',
+      '--disable-features=WebRtcHideLocalIpsWithMdns',
     ]});
     const p = await b.newPage();
     const url = BASE + '/' + ROOM + '?hb=1' + (QS ? '&' + QS : '');
@@ -60,15 +76,26 @@ const post = async (o) => { try {
     // The ICE pair is the whole point: which route carried it, and what the
     // network itself cost on that route.
     const ice = await p.evaluate(async () => {
-      const pc = window.__tapePc || null;
-      if (!pc || !pc.getStats) return null;
-      const st = await pc.getStats(); let pair = null;
-      st.forEach((r) => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) pair = r; });
-      if (!pair) return null;
+      // window.__tape.pc -- NOT window.__tapePc. The latter never existed, so
+      // this returned null on every attempt and a call that never connected was
+      // indistinguishable from one that connected and measured nothing.
+      const pc = (window.__tape && window.__tape.pc) || null;
+      if (!pc || !pc.getStats) return { pc: false };
+      const st = await pc.getStats(); let pair = null, inb = null;
+      st.forEach((r) => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) pair = r;
+        if (r.type === 'inbound-rtp' && r.kind === 'audio') inb = r;
+      });
+      // Connection state travels WITH the numbers, so a call that never
+      // connected reports as not-connected rather than as a tempting null.
+      const out = { conn: pc.connectionState, iceState: pc.iceConnectionState,
+                    pktsRecv: (inb && inb.packetsReceived) || null };
+      if (!pair) return out;
       const L = st.get(pair.localCandidateId), R = st.get(pair.remoteCandidateId);
-      return { local: L && L.candidateType, remote: R && R.candidateType, proto: L && L.protocol,
-               rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null };
-    }).catch(() => null);
+      return Object.assign(out, { local: L && L.candidateType, remote: R && R.candidateType,
+               proto: L && L.protocol,
+               rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null });
+    }).catch((e) => ({ err: String(e).slice(0, 120) }));
     await post({ ok: true, room: ROOM, qs: QS, snap, ice });
     console.log('reported', JSON.stringify(snap));
   } catch (e) {
@@ -80,11 +107,27 @@ const post = async (o) => { try {
 export class PeerContainer implements DurableObject {
   constructor(private state: DurableObjectState, private env: Env) {}
 
+  // Re-arms itself until the deadline. The only job is to exist: a Durable
+  // Object with a pending alarm stays alive, and a container outlives only as
+  // long as the DO that owns it.
+  async alarm(): Promise<void> {
+    const deadline = (await this.state.storage.get('deadline')) as number | undefined;
+    if (deadline && Date.now() < deadline) await this.state.storage.setAlarm(Date.now() + 20_000);
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const c = (this.state as unknown as { container?: {
       running: boolean;
-      start(opts?: { entrypoint?: string[]; env?: Record<string, string> }): void;
+      start(opts?: {
+        entrypoint?: string[];
+        env?: Record<string, string>;
+        // Off by default -- which is the whole reason six attempts saw silence.
+        enableInternet?: boolean;
+      }): void;
+      // Resolves when the container exits. Holding this keeps the DO alive, and
+      // a DO that goes idle takes its container down with it.
+      monitor(): Promise<unknown>;
       destroy(): Promise<void>;
     } }).container;
     if (!c) return Response.json({ error: 'no container binding on this class' }, { status: 500 });
@@ -97,7 +140,14 @@ export class PeerContainer implements DurableObject {
     // The container posts its result here; keeping it in DO storage means the
     // answer survives the container exiting, which it does as soon as it is done.
     if (url.pathname === '/report' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      // Two shapes arrive here. The shell's stage pings put the stage name in
+      // the query and the detail in a plain-text body -- because building JSON
+      // in bash destroyed every detail that contained a quote, which is every
+      // stack trace. join.js still posts real JSON.
+      const stageName = url.searchParams.get('stage');
+      const body = stageName
+        ? { stage: stageName, detail: (await request.text().catch(() => '')).slice(0, 500) }
+        : await request.json().catch(() => ({}));
       const prev = (await this.state.storage.get('result')) as { stages?: unknown[] } | undefined;
       const stages = Array.isArray(prev?.stages) ? prev!.stages : [];
       stages.push({ at: Date.now(), ...(body as object) });
@@ -113,36 +163,53 @@ export class PeerContainer implements DurableObject {
       const extra = url.searchParams.get('qs') ?? '';
       const hold = url.searchParams.get('hold') ?? '75';
       const self = url.searchParams.get('self') ?? '';
+      const gen = url.searchParams.get('gen') ?? '1';
       await this.state.storage.delete('result');
       if (c.running) await c.destroy();
-      // Fetch the script at boot and run it. `set -e` so a failed download is a
-      // failed container rather than a browser that never starts and a result
-      // that never arrives — silence is the one outcome that teaches nothing.
+      // ENV ONLY -- NO ENTRYPOINT.
+      //
+      // Five attempts died here passing `entrypoint`, and staged reporting
+      // finally proved why: the override is silently DISCARDED. Not even the
+      // first line of it ever ran, while the container reported itself healthy
+      // running the image's own CMD (`sleep infinity`) forever. So the work now
+      // lives in the image's CMD, where nothing can drop it, and this call
+      // passes only env -- the half of the API there is no evidence against.
+      //
+      // The script itself is still SERVED, not baked, so the experiment can
+      // change without rebuilding and re-pushing two gigabytes.
       c.start({
-        entrypoint: ['bash', '-lc',
-          // NODE_PATH from `npm root -g`: the Playwright image installs its
-          // packages GLOBALLY, so `node join.js` in /peer cannot resolve
-          // require('playwright') on its own -- the identical module-resolution
-          // trap that broke the local half of this experiment twice. Errors are
-          // echoed to stdout so a failure is visible in container logs instead
-          // of arriving as a silent `pending` result forever.
-          // STAGED REPORTING. Four attempts were burned guessing at a silent
-          // `pending` because container stdout was never readable from here.
-          // Each step now posts before it runs, so the last stage that arrives
-          // names the step that failed -- a trace instead of silence.
-          'stage(){ curl -fsS -X POST "$REPORT_URL" -H "content-type: application/json" -d "{\"stage\":\"$1\",\"detail\":\"$2\"}" >/dev/null 2>&1 || true; }; '
-          + 'stage boot "entrypoint running"; '
-          + 'export NODE_PATH="$(npm root -g)"; stage nodepath "$NODE_PATH"; '
-          + 'curl -fsS "$JOIN_URL" -o /peer/join.js || { stage fetch-failed "cannot reach worker"; exit 1; }; '
-          + 'stage fetched "$(wc -c < /peer/join.js) bytes"; '
-          + 'cd /peer; OUT=$(node join.js 2>&1) || stage node-failed "$(echo "$OUT" | tail -c 400)"; '
-          + 'stage exited "$(echo "$OUT" | tail -c 200)"'],
+        // A container gets NO outbound network unless this is set. Its config
+        // read back `assign_ipv4: none, assign_ipv6: none, mode: private`, which
+        // is why six attempts saw perfect silence: the image was fine, the CMD
+        // was fine, and every single thing it tried to reach was unreachable --
+        // including, fatally for a WEBRTC peer, the entire internet.
+        enableInternet: true,
         env: {
           JOIN_URL: `${self}/join.js`,
-          REPORT_URL: `${self}/report?region=${url.searchParams.get('region') ?? 'wnam'}`,
+          // `gen` MUST ride along. Without it the container posted to the
+          // default-generation DO while the experiment polled the one it had
+          // just created, so a far peer that ran perfectly in Seattle read as
+          // total silence -- a whole debugging arc spent reading an empty
+          // mailbox next to the full one.
+          REPORT_URL: `${self}/report?region=${url.searchParams.get('region') ?? 'wnam'}&gen=${gen}`,
           ROOM: room, BASE: base, EXTRA_QS: extra, HOLD_S: hold,
         },
       });
+      // A container's lifetime is its Durable Object's lifetime. Return without
+      // holding anything and the DO goes idle the moment this response is sent,
+      // taking the container with it -- which is why `containers instances`
+      // showed the instance `inactive` with location `-`, i.e. never placed on
+      // hardware at all. monitor() resolves when the container exits, so holding
+      // it keeps the DO awake exactly as long as the call needs and no longer.
+      this.state.waitUntil(c.monitor().catch(() => {}));
+      // Belt and braces on that: an alarm chain keeps this DO awake on its own
+      // schedule. monitor() alone is a single promise, and if it settles early
+      // -- which it can, on a container that has not been placed yet -- the DO
+      // goes idle in the middle of a cold image pull and the container is
+      // abandoned before it ever runs. A pull into a region that has never seen
+      // this image takes MINUTES, so that window is wide.
+      await this.state.storage.put('deadline', Date.now() + 15 * 60_000);
+      await this.state.storage.setAlarm(Date.now() + 20_000);
       return Response.json({ started: true, room, base, qs: extra });
     }
     if (!c.running) c.start();
@@ -160,8 +227,13 @@ export default {
     if (!REGIONS.has(region)) {
       return Response.json({ error: 'bad region', allowed: [...REGIONS] }, { status: 400 });
     }
+    // `gen` exists to force a FRESH Durable Object. Placement is decided once,
+    // when a DO is first created, so an instance already sitting in the wrong
+    // city stays there no matter what the config later says. Bumping gen is the
+    // only way to re-roll placement without deleting the namespace.
+    const gen = url.searchParams.get('gen') ?? '1';
     const stub = env.PEER.get(
-      env.PEER.idFromName(`peer-${region}`),
+      env.PEER.idFromName(`peer-${region}-${gen}`),
       { locationHint: region } as DurableObjectNamespaceGetDurableObjectOptions,
     );
     // The container needs an absolute URL to reach back to; it has outbound

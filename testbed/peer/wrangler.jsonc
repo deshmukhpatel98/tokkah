@@ -24,10 +24,34 @@
       "class_name": "PeerContainer",
       // Pushed 2026-08-14 from testbed/peer/Dockerfile. Playwright's image, so
       // the far peer drives the SAME Chromium our local rigs do.
-      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v2",
-      // One is all the experiment needs, and a cap of one is also the cheapest
-      // possible mistake if something ever loops.
-      "max_instances": 1,
+      //
+      // v3 moved the join logic into CMD, because v2 kept it in an entrypoint
+      // override that `container.start()` silently discarded. v4 adds what v3
+      // still lacked: the playwright npm package. The base image ships the
+      // BROWSERS but not the driver, so node died at require() before it could
+      // open anything -- found in ten seconds by running the image locally,
+      // after four attempts spent guessing at it remotely.
+      // v5 bakes in the real talking-head camera and speech for side B, so both
+      // ends of a cross-planet call carry real media rather than Chromium's
+      // rolling pattern and beep.
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v5",
+      // Two, not one. A cap of one is shared across the WHOLE application, and
+      // the alarm chain that keeps a Durable Object awake through a cold image
+      // pull also keeps its container holding that single slot -- so the next
+      // run could never be placed and looked, once again, like silence. Two
+      // gives a finishing run and a starting run room to overlap without
+      // letting anything actually fan out.
+      "max_instances": 2,
+
+      // THE HINT IS NOT ENOUGH. The DO carried locationHint "wnam" and the
+      // container was placed in bom10 -- MUMBAI, ~1200 km from this laptop,
+      // which would have quietly turned a cross-planet measurement into a
+      // domestic one and reported it as US West. locationHint is advisory
+      // (already proved once when `me` probed at 9.57x the speed of light);
+      // `constraints` is the part that actually binds.
+      //
+      // Change this region to move the far peer. That is the experiment's dial.
+      "constraints": { "regions": ["WNAM"] },
       // 3 GiB per vCPU is enforced: 2 vCPU with 4096 MiB is rejected outright
       // with VALIDATE_INPUT. 6 GiB is the floor that is accepted.
       "instance_type": { "vcpu": 2, "memory_mib": 6144, "disk_mb": 8000 }
