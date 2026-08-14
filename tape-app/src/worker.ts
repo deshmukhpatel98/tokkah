@@ -417,6 +417,27 @@ export class Room implements DurableObject {
     // another occupant's signaling. When the flag is off, relay stays exactly
     // as it was: opaque forward to every other socket, no JSON inspection.
     server.addEventListener('message', (e: MessageEvent) => {
+      // KEEPALIVE, and it TERMINATES HERE. After the offer/answer/ICE exchange
+      // the signaling socket goes completely silent for the rest of the call,
+      // and an idle TCP connection through a VPN or a corporate proxy gets
+      // reaped — measured as 37 `recover {why:"ws-close"}` events across the
+      // captured Delhi calls on 2026-08-14, each one previously ending the
+      // peer's call outright. Holding the departure announcement (see teardown)
+      // makes the drop survivable; this is the half that stops it happening.
+      //
+      // Answered here rather than relayed: the peer has no use for it, and a
+      // ping that reached the far end would be a second thing to get wrong.
+      // Placed above the THREE branch so it works on every path, and matched
+      // before any parse the relay does so it can never be broadcast.
+      if (typeof e.data === 'string' && e.data.length < 64 && e.data.includes('"ping"')) {
+        try {
+          const m = JSON.parse(e.data) as Record<string, unknown>;
+          if (m.type === 'ping') {
+            try { server.send(JSON.stringify({ type: 'pong', t: m.t ?? null })); } catch { /* closing */ }
+            return;
+          }
+        } catch { /* not our ping — fall through to the relay unchanged */ }
+      }
       if (THREE_ENABLED && typeof e.data === 'string') {
         let msg: Record<string, unknown> | null = null;
         try { msg = JSON.parse(e.data) as Record<string, unknown>; } catch { /* unparseable → broadcast */ }

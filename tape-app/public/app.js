@@ -5882,7 +5882,33 @@ async function join(room) {
   // so we cannot assert the reason — but failing in a second beats stalling for
   // the full twelve, and naming the likeliest cause beats "signaling timeout".
   let wsOpened = false;
-  ws.addEventListener('open', () => { wsOpened = true; });
+  // KEEP THE SIGNALING SOCKET WARM. Once the offer, answer and candidates are
+  // exchanged this socket says nothing for the rest of the call — and an idle
+  // TCP connection is exactly what a VPN, a phone NAT or a corporate proxy
+  // reaps. Measured across the captured Delhi calls on 2026-08-14:
+  // `recover {why:"ws-close"}` fired 37 times, and until today each of those
+  // ended the OTHER person's call outright ("they left", back to the lobby)
+  // while the media connection underneath was still carrying audio and video.
+  //
+  // The room answers this itself and never relays it, so the cost is two tiny
+  // frames a minute and the peer never sees them. 25 s clears the common idle
+  // reapers (30 s, 60 s, and Cloudflare's own) with room to spare. `?wsping=0`
+  // is the control; the interval is in seconds so it can be tuned live.
+  //
+  // Cleared on close below — a timer that outlives its socket would send into a
+  // dead handle forever, which is the shape of bug this file has already paid
+  // for in the lane watchdogs.
+  const pingSec = QS.get('wsping') == null ? 25 : Number(QS.get('wsping'));
+  let wsPing = null;
+  ws.addEventListener('open', () => {
+    wsOpened = true;
+    if (!pingSec) return;
+    clearInterval(wsPing);
+    wsPing = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      safe(() => ws.send(JSON.stringify({ type: 'ping', t: Date.now() })), 'ws.ping');
+    }, pingSec * 1000);
+  });
   // A pre-open failure has two very different causes the browser won't
   // distinguish: the room's 409 (full) and no network at all. Room vjj-spil-qli
   // (2026-08-06): a phone whose radio had just died was told the call "may
@@ -5893,6 +5919,7 @@ async function join(room) {
     ? 'no internet connection — check WiFi or mobile data'
     : 'this call may already have two people in it');
   ws.onclose = () => {
+    clearInterval(wsPing); // never outlive the socket it was keeping warm
     tel.log('ws-close', { opened: wsOpened ? 1 : 0 });
     if (!wsOpened) wsPreOpenFail?.(preOpenErr());
     // Task #50: a mid-call socket close is the first symptom of a network flip
@@ -5917,6 +5944,16 @@ async function join(room) {
   ws.onmessage = async (ev) => {
     await safeAsync(async () => {
       const m = JSON.parse(ev.data);
+      // The keepalive's answer, handled before the generic ws-rx line so a 25 s
+      // heartbeat does not bury the signaling trace. Kept rather than dropped
+      // because the round trip it measures is the CONTROL path — the socket the
+      // call is negotiated over — and nothing else in the app reports it. When
+      // this number is healthy and the media RTT is not, the two planes have
+      // diverged, which is worth being able to see.
+      if (m?.type === 'pong') {
+        if (typeof m.t === 'number') tel?.log('ws-ping', { rttMs: Date.now() - m.t });
+        return;
+      }
       tel?.log('ws-rx', { type: m?.type, sig: pc?.signalingState });
       if (m.type === 'full') {
         // Pre-dial's rejection arrives as a MESSAGE on an already-open socket
