@@ -539,3 +539,69 @@ silent `pending`. What broke the deadlock was not a better guess but a channel
 that could not lie — running the identical image locally, and reading the
 platform's own state (`containers instances`, `containers info`) instead of
 inferring it.
+
+---
+
+## The 2.7× is not routing waste — it is the shape of the ocean (2026-08-14)
+
+The cross-planet measurement above put Delhi↔Seattle at 2.7× the speed of light
+in fibre and read that as routing overhead to be reclaimed. **That reading was
+wrong, and the instrument to disprove it is a two-leg probe.**
+
+`/api/probe?region=X&via=Y` asks the Durable Object in Y to time its own hop to
+X, so a route can be decomposed into legs measured from inside the network.
+`&alt=1` targets a second DO in the SAME region — the calibration arm, covering
+dispatch and no distance.
+
+**Calibrate first.** DO→DO dispatch overhead: **1–3 ms** (apac→apac 2 ms,
+wnam→wnam 3 ms, oc→oc 1 ms). The legs below are therefore very nearly pure
+network. This also retires the old edge-side `region=none` calibration, which
+reported 109 ms — *more* than the 81 ms Singapore hop, proving that DO was never
+placed nearby and that every "overhead-subtracted" figure derived from it was
+built on a bad constant.
+
+| leg | measured (min of 10) |
+|---|---|
+| Delhi → Singapore | 81 ms |
+| Singapore → US-West | 202 ms |
+| **explicit two-leg total** | **283 ms** |
+| **direct Delhi → US-West** | **289 ms** |
+
+**The direct path costs the same as deliberately routing through Singapore.**
+That is the finding. It means the direct path *already* runs through Southeast
+Asia and across the Pacific — there is no shorter road being missed, and no
+intermediate hop left to exploit. Steering media through Singapore buys ~6 ms,
+which is noise.
+
+### Re-basing the ratio on the path light can actually take
+
+There is no direct India–US-West submarine cable. Traffic goes east through
+Singapore and across the Pacific: **~17,600 km**, not the 12,416 km great
+circle. The probe decomposition above is the evidence — a route that did not go
+that way could not cost the same as the route that explicitly does.
+
+    physical floor on the REAL cable path:  17,600 km / 199,862 km/s
+                                            = 88 ms one-way, 176 ms RTT
+
+| measurement | vs great circle | **vs real cable path** |
+|---|---|---|
+| DO probe, 289 ms | 2.33× | **1.64×** |
+| WebRTC media, 305 ms | 2.70× | **1.73×** |
+
+**1.64–1.73× of the achievable floor is respectable routing, not waste.** The
+2.7× headline was measuring against a straight line through the Earth's crust.
+
+### What this does to the goal
+
+The lever that looked biggest — "fix the bad route" — does not exist. What
+remains:
+
+    perfect routing (1.0×, unattainable):  88 ms one-way + 45 video = 133 ms  ✅
+    excellent routing (1.3×):             114 ms + 45 = 159 ms  ❌
+    excellent routing + 25 ms video:      114 ms + 25 = 139 ms  ✅
+    today (1.73×):                        152 ms + 45 = 197 ms  ❌
+
+So India↔US-West needs **both** a better path *and* a shorter video pipeline,
+and neither alone is enough. That is precisely why the video floor — the audio
+floor's twin, still unestablished — is now the critical path: it is the half of
+the budget we control outright.

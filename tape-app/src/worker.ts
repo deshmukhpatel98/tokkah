@@ -1290,6 +1290,10 @@ const HB_ALLOWED: Record<string, Set<string>> = {
   fail: new Set(['v', 'evt', 'engine', 'net', 'waitMs', 'reason']),
 };
 
+// The regions a probe may be pinned to. Shared by /api/probe and the Health
+// DO's /hop route so a two-leg measurement cannot validate its legs differently.
+const PROBE_REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
+
 export class Health implements DurableObject {
   private sql: SqlStorage;
   constructor(private state: DurableObjectState, private env: Env) {
@@ -1347,6 +1351,48 @@ export class Health implements DurableObject {
     // two points on earth. Deliberately the cheapest possible handler: any work
     // here would be measured as if it were network.
     if (url.pathname === '/ping') return json({ t: Date.now() });
+    // Times the hop from THIS Durable Object to one pinned in another region --
+    // a leg measured from inside the network rather than from the edge.
+    //
+    // Why this exists: Delhi->Sydney (10,428 km) costs 186 ms while
+    // Delhi->US-West (~12,400 km) costs 303 ms. Only 19% further, 63% more
+    // latency, same backbone, same origin -- so the US-West path is not paying
+    // for distance, it is paying for routing. If Delhi->Singapore (81 ms) plus
+    // Singapore->US-West beats 303 ms, then deliberately steering media through
+    // an intermediate hop is worth more than anything left inside the app.
+    // That question cannot be answered from the edge; it needs a DO to time its
+    // own onward leg.
+    if (url.pathname === '/hop') {
+      const to = url.searchParams.get('to') ?? '';
+      if (!PROBE_REGIONS.has(to)) return json({ error: 'bad to', allowed: [...PROBE_REGIONS] }, 400);
+      const n = Math.max(1, Math.min(10, Number(url.searchParams.get('n')) || 5));
+      // `alt` is the CALIBRATION arm, and nothing else here can be read without
+      // it. It targets a SECOND DO pinned to the same region, so the hop covers
+      // dispatch overhead and ~zero distance. Every other leg is inflated by
+      // that same constant, and a ratio against the speed of light is
+      // meaningless until it is subtracted -- the edge-side `region=none` arm
+      // cannot do this job, because it reported 109 ms, MORE than the 81 ms
+      // Singapore hop, which means that DO was never placed nearby at all.
+      // A distinct name, not a self-fetch: a DO fetching itself while inside
+      // its own request handler deadlocks.
+      const name = url.searchParams.get('alt') ? `probe-${to}-alt` : `probe-${to}`;
+      const peer = this.env.HEALTH.get(
+        this.env.HEALTH.idFromName(name),
+        { locationHint: to } as DurableObjectNamespaceGetDurableObjectOptions,
+      );
+      const samples: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const t0 = Date.now();
+        // MINIMUM, not mean: one sample measures the path plus whatever queueing
+        // sat in front of it; the floor is the path. Same reasoning as the
+        // transport's decaying-min RTT estimators.
+        try { await peer.fetch('https://do/ping'); samples.push(Date.now() - t0); } catch { /* never take the DO down for a probe */ }
+      }
+      if (!samples.length) return json({ error: 'no samples', to }, 502);
+      samples.sort((a, b) => a - b);
+      return json({ to, minMs: samples[0], medMs: samples[Math.floor(samples.length / 2)],
+                    maxMs: samples[samples.length - 1], n: samples.length });
+    }
     if (url.pathname === '/ingest' && request.method === 'POST') {
       let beat: Record<string, unknown>;
       try { beat = (await request.json()) as Record<string, unknown>; } catch { return json({ error: 'bad json' }, 400); }
@@ -1616,7 +1662,33 @@ export default {
     // `colo` names the edge that did the timing, so the distance is knowable.
     if (url.pathname === '/api/probe' && request.method === 'GET') {
       const region = url.searchParams.get('region') ?? '';
-      const REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
+      const REGIONS = PROBE_REGIONS;
+      // `via` measures the SECOND leg of a deliberately steered route: this
+      // worker asks the DO in `via` to time its own hop to `region`. Pair it
+      // with a plain probe of `via` (leg one) and a plain probe of `region`
+      // (the direct path) and the three numbers answer the only question that
+      // matters here -- whether Delhi->Singapore->US-West beats Delhi->US-West.
+      const via = url.searchParams.get('via');
+      if (via) {
+        if (!REGIONS.has(via)) return json({ error: 'bad via', allowed: [...REGIONS] }, 400);
+        if (!REGIONS.has(region)) return json({ error: 'bad region', allowed: [...REGIONS] }, 400);
+        const n = Math.max(1, Math.min(10, Number(url.searchParams.get('n')) || 5));
+        const hub = env.HEALTH.get(
+          env.HEALTH.idFromName(`probe-${via}`),
+          { locationHint: via } as DurableObjectNamespaceGetDurableObjectOptions,
+        );
+        const t0 = Date.now();
+        const alt = url.searchParams.get('alt') ? '&alt=1' : '';
+        const res = await hub.fetch(`https://do/hop?to=${region}&n=${n}${alt}`);
+        const leg2 = await res.json().catch(() => null);
+        return json({
+          mode: 'via', via, region, colo: (request.cf?.colo as string | undefined) ?? null,
+          // Leg one measured the same way the direct probe is, so the two are
+          // comparable; this call's own round trip is reported alongside it as
+          // a sanity check rather than as the leg.
+          edgeToViaMs: Date.now() - t0, leg2,
+        });
+      }
       // 'none' is the CALIBRATION arm and the most important one here. Without
       // a hint the DO is created near whichever edge first asked for it, so the
       // round trip is ~all dispatch overhead and ~no distance. Every other
