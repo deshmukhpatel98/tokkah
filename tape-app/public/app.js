@@ -5983,6 +5983,29 @@ async function join(room) {
         role = m.role;
         tel.role = role;
         tel.log('role', { role, peerPresent: m.peerPresent });
+        // DISTANCE-AWARE ICE, PHASE 1: RECORDED, NOT OBEYED. The room is the
+        // only party that has seen both occupants, so it is the only one that
+        // can say how far apart they are before either peer connection exists.
+        //
+        // Why this matters (LATENCY-150.md): Cloudflare's backbone runs
+        // 1.20-1.29x the speed of light in fibre and the public internet from
+        // India runs 2.14x, so past some distance the RELAY IS THE SHORT WAY.
+        // Modelled over eight regions it wins on all eight — direct P2P clears
+        // 150 ms on four of them, relaying on all eight. ICE will never find
+        // this itself: RFC 8445 ranks host and srflx above relay BY TYPE.
+        //
+        // Deliberately inert for now. A wrong distance that only shows up in
+        // telemetry costs nothing; a wrong distance that forces
+        // `iceTransportPolicy: 'relay'` costs a call — and forcing relay when
+        // /api/ice has fallen back to STUN-only (no TURN keys) means no
+        // candidates at all. `?icepolicy=1` opts in once the numbers are real.
+        if (m.kmApart != null || m.preferRelay != null) {
+          tel.log('ice-policy', {
+            kmApart: m.kmApart ?? null,
+            preferRelay: m.preferRelay ? 1 : 0,
+            applied: 0, // phase 2 flips this; nothing reads it to decide yet
+          });
+        }
         // §3.3: `peers` is the new truth and a `welcome` is the whole truth at
         // the moment of admission — so the table is rebuilt from it, not merged
         // into. That also makes the in-place reset and recoverCall correct for
@@ -6091,6 +6114,13 @@ async function join(room) {
           if (PCM_AUDIO && PCM_CFG.pairs > 1) await pcmStripeOfferAll();
         }
       } else if (m.type === 'peer-joined') {
+        // The distance, for the side whose welcome went out to an empty room.
+        // Same phase-1 contract as the welcome branch: recorded, not obeyed.
+        if (m.kmApart != null || m.preferRelay != null) {
+          tel.log('ice-policy', {
+            kmApart: m.kmApart ?? null, preferRelay: m.preferRelay ? 1 : 0, applied: 0, at: 'peer-joined',
+          });
+        }
         // Before anything else: an incumbent whose call is already spent must
         // become clean BEFORE negotiating — negotiating on a spent page is
         // what turned this into a ping-pong (the arriving peer reached

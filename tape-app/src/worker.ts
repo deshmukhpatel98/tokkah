@@ -65,6 +65,13 @@ const MAX_STRING_LEN = 512;
 // trips — 1.2 s at a 400 ms RTT) and send `join`; short enough that a genuine
 // exit is not stale on screen. See `teardown`.
 const LEAVE_GRACE_MS = 5000;
+// Kilometres between occupants past which relaying is expected to beat going
+// direct. From the eight-region model in LATENCY-150.md, relay wins on every
+// route measured — including Singapore at ~4,300 km from Delhi (76.3 ms relayed
+// vs 80.8 ms direct) — so the crossover is somewhere below that, and 2500 is a
+// deliberately conservative first cut for a signal that is only being REPORTED.
+// The number to move once phase 1 has real data behind it.
+const RELAY_KM = 2500;
 // Keys kept per object. Was 64, which silently truncated the audio lane's own
 // snapshot: `pcm.snapshot()` spreads the transport counters first and appends
 // the playout half after them, so every field past the 64th was dropped on
@@ -123,6 +130,12 @@ export class Room implements DurableObject {
   private laneCaps = new Map<WebSocket, number>();
   private pcmCaps = new Map<WebSocket, number>();
   private sids = new Map<WebSocket, string>();
+  // Approximate client coordinates from `request.cf`, used only to compute how
+  // far apart the two occupants are. City-level and often absent — never stored,
+  // never logged, never sent to the other peer. What LEAVES this map is one
+  // number (kilometres) and one boolean, because the only question being asked
+  // is "is this a long path?", and that is not a location.
+  private geo = new Map<WebSocket, { lat: number; lon: number }>();
   // Wire version per socket — the admission gate of §3.4. v=1 (default, old
   // clients) anywhere in the room caps it at 2; v≥2 everywhere + THREE_ENABLED
   // lifts it to 3. Parallel to laneCaps/pcmCaps, torn down in the same places.
@@ -330,6 +343,57 @@ export class Room implements DurableObject {
     return 3;
   }
 
+  /**
+   * Remember roughly where a socket connected from, for one purpose: deciding
+   * whether the two occupants are far enough apart that relaying beats going
+   * direct. Cloudflare's `cf.latitude/longitude` are city-level and frequently
+   * absent, which is fine — absent means "no opinion", and no opinion means
+   * today's behaviour.
+   */
+  private noteGeo(server: WebSocket, request: Request): void {
+    const lat = Number((request.cf as Record<string, unknown> | undefined)?.latitude);
+    const lon = Number((request.cf as Record<string, unknown> | undefined)?.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) this.geo.set(server, { lat, lon });
+  }
+
+  /**
+   * How far apart the two occupants are, in kilometres, or null when either
+   * side did not report a position. Great-circle: the relevant question is
+   * whether the media has an ocean to cross, and a few percent of error in the
+   * answer cannot change that.
+   *
+   * WHY THE ROOM ANSWERS THIS AND NOT THE CLIENT: the choice between relay and
+   * direct has to be made BEFORE the peer connection is built, and at that
+   * moment neither client knows anything about the other's location. The room
+   * is the only party that has seen both. It also keeps the policy in one place
+   * — tunable without shipping a client.
+   *
+   * The stakes, from LATENCY-150.md: Cloudflare's backbone runs 1.20-1.29x the
+   * speed of light in fibre while the public internet from India runs 2.14x, so
+   * on a long path the relay is the SHORT way. Modelled over eight regions,
+   * relaying wins on all eight — direct P2P clears 150 ms on four of them,
+   * relaying on all eight (N. California 171.2 ms direct vs 128.0 ms relayed).
+   * ICE cannot discover this on its own: RFC 8445 ranks host and srflx above
+   * relay BY TYPE, so the stack picks the slow road precisely when the fast one
+   * matters most.
+   */
+  private kmApart(server: WebSocket): number | null {
+    const mine = this.geo.get(server);
+    if (!mine) return null;
+    for (const [p] of this.peers) {
+      if (p === server) continue;
+      const theirs = this.geo.get(p);
+      if (!theirs) continue;
+      const R = 6371;
+      const rad = (d: number) => (d * Math.PI) / 180;
+      const dLat = rad(theirs.lat - mine.lat), dLon = rad(theirs.lon - mine.lon);
+      const a = Math.sin(dLat / 2) ** 2
+        + Math.cos(rad(mine.lat)) * Math.cos(rad(theirs.lat)) * Math.sin(dLon / 2) ** 2;
+      return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(a))));
+    }
+    return null;
+  }
+
   // Shared admission gate: sweep dead sockets, evict a ghost with the same
   // session id, and report whether the room is already full. Both the upgrade
   // path and the hold-join path call this so the logic is in one place.
@@ -345,6 +409,7 @@ export class Room implements DurableObject {
           this.laneCaps.delete(p);
           this.pcmCaps.delete(p);
           this.sids.delete(p);
+          this.geo.delete(p);
           this.vers.delete(p);
         }
       }
@@ -493,6 +558,7 @@ export class Room implements DurableObject {
       this.pcmCaps.delete(server);
       this.sids.delete(server);
       this.vers.delete(server);
+      this.geo.delete(server);
       const announce = () => {
         for (const [p] of this.peers) {
           try {
@@ -555,6 +621,16 @@ export class Room implements DurableObject {
         type: 'welcome',
         role,
         peerPresent: this.peers.size >= 2,
+        // PHASE 1: REPORTED, NOT ACTED ON. How far apart the two occupants are,
+        // and whether that is far enough for relaying to beat going direct.
+        // The client logs both and only changes its ICE policy behind
+        // `?icepolicy=1`, so this ships as a measurement first — a wrong
+        // distance that merely appears in telemetry costs nothing, while a
+        // wrong distance that forces `iceTransportPolicy: 'relay'` costs a call.
+        // Null whenever either side reported no position, which is common and
+        // simply means "no opinion".
+        kmApart: this.kmApart(server),
+        preferRelay: (this.kmApart(server) ?? 0) >= RELAY_KM,
         peerLane: peerCap(this.laneCaps),
         peerPcm: peerCap(this.pcmCaps),
         // Additive fields — old clients ignore them.
@@ -573,7 +649,19 @@ export class Room implements DurableObject {
     for (const [p] of this.peers) {
       if (p !== server) {
         try {
-          p.send(JSON.stringify({ type: 'peer-joined', peer: role, peerLane: lane, peerPcm: pcm }));
+          // The distance rides here too, and it has to. The incumbent's own
+          // `welcome` went out to an EMPTY room, so its `kmApart` was null —
+          // there was nobody to be far from yet. The incumbent is also role 'a',
+          // the only side that ever offers, so for phase 2 it is precisely the
+          // half that must know the answer before it builds a peer connection.
+          // Computed from `p`, not from `server`: each side is told how far away
+          // the OTHER one is, which for two occupants is the same number but
+          // stays correct if a third ever arrives.
+          const km = this.kmApart(p);
+          p.send(JSON.stringify({
+            type: 'peer-joined', peer: role, peerLane: lane, peerPcm: pcm,
+            kmApart: km, preferRelay: (km ?? 0) >= RELAY_KM,
+          }));
         } catch {
           /* ignore */
         }
@@ -604,6 +692,7 @@ export class Room implements DurableObject {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       server.accept();
+      this.noteGeo(server, request);
       this.held.add(server);
 
       // 120 s idle timeout: a lobby tab that never clicks must not keep a
@@ -677,6 +766,7 @@ export class Room implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     server.accept();
+    this.noteGeo(server, request);
 
     this.admit(server, {
       lane: Number(q.get('lane')) || 0,
