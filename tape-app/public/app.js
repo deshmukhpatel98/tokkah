@@ -272,8 +272,29 @@ const RECOVER_KEY = 'tape.recoverAt';
 const RECOVER_COOLDOWN_MS = 10_000; // per-tab, survives the reload it causes
 const RECOVER_MAX = 4; // within RECOVER_WINDOW_MS — then stop trying: this
 const RECOVER_WINDOW_MS = 3 * 60_000; // network is not coming back on its own
+// WAITING ALONE IS THE STATE THAT MOST NEEDS THIS, and until 2026-08-14 it was
+// the one state excluded from it. The guard below read `!hadPeer`, so recovery
+// ran only for a socket that died after a peer had already arrived. A socket
+// that dies while we are alone in the room took the early return and nothing
+// ever retried — and that failure is both terminal and invisible: the camera
+// preview is live, the audio graph runs, stats keep flowing, the status line
+// still says waiting. The page looks completely healthy while being deaf and
+// mute to signaling, so the peer can walk in and will never be seen.
+//
+// Caught on the real Delhi <-> Netherlands call (room ilx-swig-xox, 2026-08-14)
+// after a routine both-windows refresh:
+//   Safari +0.6s welcome, +1.7s ws-error, +1.7s ws-close -- then 12 minutes of
+//          floor/onset/stats with a dead socket and no recovery attempt
+//   Brave  joined 8 s later and was CORRECTLY told role a, peerPresent false:
+//          Safari really was gone from the room. Its own socket died at +604s
+//          and it too sat there. Two live-looking windows, no call, no error.
+//
+// `joined` is the right precondition: it means the server admitted us to a
+// room, so a close is loss rather than lobby noise. The attempt is still bounded
+// by RECOVER_MAX/WINDOW/COOLDOWN, and `wsOpened` still gates the caller, so a
+// socket that never opened goes to wsPreOpenFail as before.
 function recoverCall(why) {
-  if (leavingDeliberately || !hadPeer || !joined || !activeRoom) return;
+  if (leavingDeliberately || !joined || !activeRoom) return;
   const now = Date.now();
   const past = (safe(() => JSON.parse(sessionStorage.getItem(RECOVER_KEY) ?? '[]'), 'recover.read') ?? [])
     .filter((t) => now - t < RECOVER_WINDOW_MS);
