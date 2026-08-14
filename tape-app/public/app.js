@@ -1621,7 +1621,27 @@ const PCM_CFG = {
   // measured one -- on a bandwidth-constrained link the estimator asked for
   // 23-41 frames and was capped here without saying so. `?pcmjbmax=` makes
   // the ceiling A/B-able against the concealment it is causing.
-  maxTargetFrames: Number(QS.get('pcmjbmax')) || 15,
+  // CEILING, not target. The estimator asks for ceil(spread/8) + 1 frames and
+  // takes only what it measures, so a good link never touches this number.
+  //
+  // Raised 15 -> 32 on the evidence of a real Delhi<->Netherlands call
+  // (room ilx-swig-xox, 2026-08-14, Safari <-> Brave over a VPN):
+  //
+  //   Brave  jitSpreadMs 185.7 (max 220)  jitWant 15 == jitWantMaxRun 15  late 3115
+  //   Safari jitSpreadMs  57.8            jitWant  9                      late  300
+  //   BOTH sides: lossPct 0, peerLossPct 0
+  //
+  // Zero packet loss, and the audio still broke. 185.7 ms of arrival spread
+  // needs 24 frames; the buffer was allowed 15 (120 ms), so 3115 frames landed
+  // after their slot and became concealment -- which is what put "connection
+  // paused -- reconnecting" on screen. The estimator was asking for the right
+  // thing and being refused.
+  //
+  // 32 frames is 256 ms, enough for the 220 ms worst spread this path produced.
+  // It costs latency ONLY on a link that is genuinely that jittery, and on such
+  // a link the alternative is not lower latency, it is dropouts -- and audio
+  // stays lossless before it stays fast.
+  maxTargetFrames: Number(QS.get('pcmjbmax')) || 32,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
   // Backpressure is spent as a gap, never as queue: ~5 frames (~40 ms) of
   // bufferedAmount and a capture is dropped for the concealer to cover.
@@ -2558,18 +2578,70 @@ function laneAgree(peerLane, when) {
  *
  * The test is frames DECODED, not bytes received: the failure this exists for is
  * a lane that is busy and producing nothing.
+ *
+ * WHEN THE CLOCK STARTS IS THE WHOLE DESIGN. This was armed at `pc.ontrack` on
+ * a flat 4000 ms, on the belief stated in the caller's comment — "media is
+ * flowing at the RTP level as of now". That belief is false in Chromium:
+ * `ontrack` fires when the REMOTE DESCRIPTION is set, which is before ICE, DTLS,
+ * SCTP and the lane's own control channel. On a LAN the difference is ~200 ms
+ * and nobody noticed for months. On a real intercontinental call it is the
+ * entire budget:
+ *
+ *   Delhi <-> Netherlands, room ilx-swig-xox, 2026-08-14, Safari <-> Brave,
+ *   RTT 394 ms, zero packet loss:
+ *     Brave  +0.63s ontrack (watchdog armed)   +4.24s its OWN encoder ready
+ *            +4.63s watchdog fires, framesOut 0, lane killed
+ *     Safari +153.73s peer-joined              +157.50s its lane ready
+ *            +158.32s told by Brave: peer-no-frames
+ *
+ * Brave killed the lane 390 ms after its own encoder configured — less than one
+ * round trip — so no frame from Safari could physically have arrived yet. The
+ * handshake is ~9 round trips; at 394 ms each that is 3.6 s of a 4.0 s budget.
+ * This did not lose a race, it could not win one: EVERY long-haul call fell back
+ * to plain RTP video, which is why the 25.5 ms lane never appeared on one.
+ *
+ * So the clock now starts when there is something to judge — `laneReady()`, i.e.
+ * our ctl channel open AND the peer's 'ready' seen — and the pre-ready backstop
+ * scales with the measured path RTT instead of assuming a datacentre.
  */
 let laneWatchdog = null;
 function armLaneWatchdog() {
   clearTimeout(laneWatchdog);
   if (wantTape !== 2 || tapeFellBack) return;
-  laneWatchdog = setTimeout(() => {
+  const startedAt = performance.now();
+  let readyAt = 0;
+  const tick = () => {
     if (tapeFellBack || wantTape !== 2) return;
     const out = tape?.snapshot?.()?.framesOut ?? 0;
-    if (out > 0) return;
-    tel?.log('lane-watchdog', { framesOut: out });
-    fallbackToRtp('no-frames');
-  }, 4000);
+    if (out > 0) return; // delivering — nothing to police, and no re-arm
+    const now = performance.now();
+    if (!readyAt && tape?.laneReady?.()) readyAt = now;
+    // One RTT is the floor for a frame to exist at the far end and reach us, so
+    // the grace has to be a multiple of it, not a constant. 4 s covers any path
+    // up to ~1.3 s RTT, which is past geostationary.
+    const rtt = Number(lastStats?.pair?.rttMs) || 0;
+    const graceMs = Math.max(4000, 3 * rtt);
+    // The pre-ready backstop, for a peer whose lane never comes up at all: it
+    // must outlast a full handshake on THIS path (~9 RTT) or it just recreates
+    // the bug it replaced. Falls back to a generous constant before the first
+    // RTT sample exists.
+    const capMs = rtt ? Math.max(9000, 12 * rtt + 4000) : 12000;
+    const waited = now - startedAt;
+    if ((readyAt && now - readyAt >= graceMs) || waited >= capMs) {
+      tel?.log('lane-watchdog', {
+        framesOut: out, rttMs: rtt || null,
+        // `ready 0` is the honest signal that we never heard the peer's lane
+        // come up; `ready 1` means it did and still sent nothing.
+        ready: readyAt ? 1 : 0, waitedMs: Math.round(waited),
+        sinceReadyMs: readyAt ? Math.round(now - readyAt) : null,
+        graceMs, capMs,
+      });
+      fallbackToRtp('no-frames');
+      return;
+    }
+    laneWatchdog = setTimeout(tick, 500);
+  };
+  laneWatchdog = setTimeout(tick, 500);
 }
 
 /**
@@ -2633,17 +2705,48 @@ function pcmAgree(peerPcm, when) {
  * 6 s, not video's 4: the audio graph waits on worklet module fetch plus SAB
  * setup, and cutting over early would drop a working lane.
  */
+// Armed at the same `ontrack` as armLaneWatchdog and, until 2026-08-14, with the
+// same flat-timeout bug: 6000 ms starting before ICE/DTLS/SCTP had run. On the
+// Delhi <-> Netherlands call that diagnosed the video lane (RTT 394 ms) the six
+// audio associations opened at +4.0 to +4.6 s, so this fired with ~1.4 s to
+// spare — it happened not to trip, which is not the same as being correct. A
+// path only slightly longer, or one TURN allocation slower, and lossless audio
+// would have quietly become Opus with nothing in the log but 'no-audio'.
+//
+// Same correction as the video lane: judge only once there is something to
+// judge, and let the path's own RTT set the backstop.
 function armPcmWatchdog() {
   clearTimeout(pcmWatchdog);
   if (!PCM_AUDIO || pcmFellBack) return;
-  pcmWatchdog = setTimeout(() => {
+  const startedAt = performance.now();
+  let flowingAt = 0;
+  const tick = () => {
     if (pcmFellBack) return;
     const s = safe(() => pcm?.snapshot(), 'pcm.watchdog-snap');
     const played = s?.playedFrames ?? 0;
-    if (s?.started && played > 0) return;
-    tel?.log('pcm-watchdog', { started: !!s?.started, playedFrames: played, mode: s?.mode ?? null });
-    fallbackToOpus('no-audio');
-  }, 6000);
+    if (s?.started && played > 0) return; // audible — done, and no re-arm
+    const now = performance.now();
+    // Frames ARRIVING is the proof that transport works. From here on, silence
+    // is a playout defect and worth a fallback; before here it is a handshake.
+    if (!flowingAt && (s?.framesRecv ?? 0) > 0) flowingAt = now;
+    const rtt = Number(lastStats?.pair?.rttMs) || 0;
+    const graceMs = Math.max(6000, 3 * rtt);
+    const capMs = rtt ? Math.max(9000, 12 * rtt + 4000) : 12000;
+    const waited = now - startedAt;
+    if ((flowingAt && now - flowingAt >= graceMs) || waited >= capMs) {
+      tel?.log('pcm-watchdog', {
+        started: !!s?.started, playedFrames: played, mode: s?.mode ?? null,
+        rttMs: rtt || null, framesRecv: s?.framesRecv ?? 0,
+        // `flowing 0` means nothing ever arrived — a transport failure, not a
+        // playout one, and the two want different fixes.
+        flowing: flowingAt ? 1 : 0, waitedMs: Math.round(waited),
+      });
+      fallbackToOpus('no-audio');
+      return;
+    }
+    pcmWatchdog = setTimeout(tick, 500);
+  };
+  pcmWatchdog = setTimeout(tick, 500);
 }
 
 function fallbackToRtp(why, quiet) {
@@ -5648,8 +5751,9 @@ async function join(room) {
 
     peerArrived();
     setStatus('connected');
-    // Media is flowing at the RTP level as of now; if the lane has nothing to
-    // show a few seconds from here, it never will.
+    // NOT "media is flowing as of now" — that is what this comment used to say,
+    // and it is wrong: ontrack fires on setRemoteDescription, before ICE/DTLS/
+    // SCTP. The watchdog decides for itself when there is something to judge.
     armLaneWatchdog();
     armPcmWatchdog();
     layout();

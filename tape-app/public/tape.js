@@ -3578,6 +3578,21 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
 
   return {
     stats,
+    // THE WATCHDOG'S GATE. "No frames yet" is only evidence of a broken lane
+    // once both ends actually HAVE a lane to produce frames with: our ctl
+    // channel open (so we could hear the peer) and the peer's 'ready' received
+    // (so it has an encoder). Before that, zero frames is evidence of a
+    // handshake still in flight -- and on a long path the handshake is seconds.
+    //
+    // Measured on a real Delhi <-> Netherlands call (room ilx-swig-xox,
+    // 2026-08-14, Safari <-> Brave, RTT 394 ms): ICE + DTLS + SCTP + channel
+    // open took 3.6 s on the Brave side and 3.8 s on the Safari side, because
+    // that sequence is ~9 round trips and every one of them costs 394 ms.
+    // app.js armed a flat 4000 ms watchdog at pc.ontrack -- which in Chromium
+    // fires when the REMOTE DESCRIPTION is set, not when media flows -- so the
+    // whole budget was spent on the handshake and the lane was killed 390 ms
+    // after its own encoder configured. See armLaneWatchdog in app.js.
+    laneReady: () => !!(dcCtl && dcCtl.readyState === 'open' && gRemoteReady()),
     // §8: the camera changed under us (flip, or the stall machine's
     // re-acquire). Without this the pump dies with the old track.
     adoptTrack,
