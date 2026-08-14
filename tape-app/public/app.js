@@ -1833,6 +1833,15 @@ let pcm = null;
 // with exactly one entry read exactly where the array used to be read.
 const PCM_SOLO = '-';
 const pcmPcs = new Map(); // peer letter → stripe pcs indexed 1..N-1 (association 0 rides that pair's main pc)
+// The late candidate-pair reads scheduled by each stripe, so they can be
+// cancelled with the ladder rather than fired at a closed pc. This project has
+// already paid three times for a timer that outlived the thing it measured, so
+// the timers get a home next to what they belong to, not a closure.
+const stripePathTimers = new Map();
+const clearStripePathTimers = () => {
+  for (const t of stripePathTimers.values()) if (t !== true) clearTimeout(t);
+  stripePathTimers.clear();
+};
 const pcmKey = (peerRole) => peerRole ?? PCM_SOLO;
 /**
  * The ladder for a pair. The `PCM_SOLO` fallback is load-bearing and is NOT a
@@ -2304,36 +2313,66 @@ function startPcmStripes(peerRole, initiator, half = 0) {
     spc.onnegotiationneeded = () =>
       tel?.log('pcm-stripe-neg', { idx, sig: spc.signalingState }); // observed, never acted on
     spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate, ...addr(peerRole) });
+    // WHICH ROAD THIS STRIPE TOOK. Association 0 rides the MAIN pc; stripes
+    // 1..5 are separate peer connections that each run their own ICE, and on
+    // the real Delhi call their baseRtt sat 25-30 ms above association 0's,
+    // consistently, across 586 samples (374.9 vs 392-406 ms). Six lanes that
+    // are supposed to be interchangeable were not.
+    //
+    // That spread is not just latency, it is BUFFER: the jitter target is
+    // sized from arrival spread, so lanes that disagree by 31 ms inflate the
+    // depth for all of them. Before any of that can be fixed it has to be
+    // attributable — if the stripes are picking a different candidate type
+    // than the main pc, that is a policy bug with a policy fix; if they take
+    // the same road and are simply slower, it is the network and not ours.
+    //
+    // `at` exists because the first version of this reported ONCE, on the
+    // ice-connected transition, and that reading is worthless for the question
+    // it was built to answer. Measured over 3 trials x 12 associations on prod
+    // (testbed/icequeue.mjs): 15 of 36 associations nominate `host/prflx` at
+    // connect and ALL 36 read `host/host` fifteen seconds later. The prflx pair
+    // is a transient — ICE learns the peer from an inbound STUN probe (direct,
+    // sub-millisecond) before the peer's signalled candidate has finished its
+    // round trip through Cloudflare, nominates what it has, and converges once
+    // the real candidate lands. So the Delhi call's "stripes are on prflx" was
+    // a first-transition artefact and does NOT explain the 25-30 ms, and no
+    // amount of staring at the old logs could have said so, because the old
+    // logs only ever contained the transient.
+    const reportPath = (at) => safe(() => spc.getStats().then((st) => {
+      let best = null;
+      st.forEach((r) => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded'
+          && (r.nominated || !best)) best = r;
+      });
+      if (!best) return;
+      const L = st.get(best.localCandidateId), R = st.get(best.remoteCandidateId);
+      tel?.log('pcm-stripe-path', {
+        at,
+        idx,
+        path: L?.candidateType && R?.candidateType ? `${L.candidateType}/${R.candidateType}` : null,
+        proto: L?.protocol ?? null,
+        rttMs: best.currentRoundTripTime != null ? Math.round(best.currentRoundTripTime * 1000) : null,
+      });
+    }).catch(() => {}), 'stripe.path');
     spc.oniceconnectionstatechange = () => {
       tel?.log('pcm-stripe-ice', { idx, state: spc.iceConnectionState });
-      // WHICH ROAD THIS STRIPE TOOK. Association 0 rides the MAIN pc; stripes
-      // 1..5 are separate peer connections that each run their own ICE, and on
-      // the real Delhi call their baseRtt sat 25-30 ms above association 0's,
-      // consistently, across 586 samples (374.9 vs 392-406 ms). Six lanes that
-      // are supposed to be interchangeable were not.
-      //
-      // That spread is not just latency, it is BUFFER: the jitter target is
-      // sized from arrival spread, so lanes that disagree by 31 ms inflate the
-      // depth for all of them. Before any of that can be fixed it has to be
-      // attributable — if the stripes are picking a different candidate type
-      // than the main pc, that is a policy bug with a policy fix; if they take
-      // the same road and are simply slower, it is the network and not ours.
       if (spc.iceConnectionState !== 'connected') return;
-      safe(() => spc.getStats().then((st) => {
-        let best = null;
-        st.forEach((r) => {
-          if (r.type === 'candidate-pair' && r.state === 'succeeded'
-            && (r.nominated || !best)) best = r;
-        });
-        if (!best) return;
-        const L = st.get(best.localCandidateId), R = st.get(best.remoteCandidateId);
-        tel?.log('pcm-stripe-path', {
-          idx,
-          path: L?.candidateType && R?.candidateType ? `${L.candidateType}/${R.candidateType}` : null,
-          proto: L?.protocol ?? null,
-          rttMs: best.currentRoundTripTime != null ? Math.round(best.currentRoundTripTime * 1000) : null,
-        });
-      }).catch(() => {}), 'stripe.path');
+      // Keyed by PAIR and index: a 3-person room runs two ladders whose indices
+      // both start at 1, and a key of `idx` alone would have let the second
+      // ladder's stripe 1 believe the first ladder's had already reported.
+      const armed = `${pcmKey(peerRole)}#${idx}`;
+      if (stripePathTimers.has(armed)) return; // connected can fire more than once
+      reportPath(0);
+      // Two late reads, so a real call records whether the pair it settled on is
+      // the pair it started with. Three getStats calls per stripe for the whole
+      // call — the cost of never having to guess this again.
+      for (const at of [10000, 30000]) {
+        const t = setTimeout(() => {
+          if (spc.connectionState !== 'closed') reportPath(at);
+        }, at);
+        stripePathTimers.set(`${armed}@${at}`, t);
+      }
+      stripePathTimers.set(armed, true);
     };
     spc.onconnectionstatechange = () => tel?.log('pcm-stripe-state', { idx, state: spc.connectionState });
     if (initiator) {
@@ -2692,6 +2731,69 @@ function laneAgree(peerLane, when) {
  * our ctl channel open AND the peer's 'ready' seen — and the pre-ready backstop
  * scales with the measured path RTT instead of assuming a datacentre.
  */
+// ── Early ICE candidates (they used to be thrown away) ───────────────────────
+// `addIceCandidate` REJECTS if the remote description is not set yet, and both
+// ICE handlers ended in `.catch(() => {})` — so a candidate that arrived a few
+// milliseconds early was silently gone forever. There was no queue anywhere in
+// the app.
+//
+// The main pc mostly got away with it because its offer/answer completes before
+// anything else is negotiated. The five audio stripes do not: they are five
+// parallel negotiations, and on a real call their offers and their candidates
+// land in the same ~10 ms window, so a stripe candidate routinely arrives while
+// that stripe is still applying its remote description.
+//
+// What a dropped candidate costs is not a failed call — ICE recovers by
+// learning the peer from an incoming STUN probe instead, which produces a
+// PEER-REFLEXIVE pair. That is a route discovered by accident rather than the
+// one signalling offered, and it is measurably worse: on the real Delhi call
+// association 0 (the main pc, host/host) ran 25-30 ms BELOW stripes 1-5
+// (host/prflx) in baseRtt, consistently, across 586 samples. The gap is then
+// paid twice, because the jitter target is sized from arrival spread and six
+// lanes disagreeing by 31 ms inflate the buffer for all of them.
+//
+// Invisible on loopback, where every candidate pair is 0-1 ms and the six lanes
+// look identical — which is exactly why it survived this long.
+const pendingIce = new Map(); // key -> candidate[]
+const PENDING_ICE_MAX = 32; // a bounded buffer, never an unbounded one
+// Key is peer + lane, because a stripe's candidate can arrive before that
+// stripe's RTCPeerConnection is even constructed — so the queue cannot be
+// hung off the pc object, it has to outlive its absence.
+const iceKey = (peer, lane) => `${peer ?? '?'}#${lane}`;
+// Default on, `?icequeue=0` restores the old drop-on-the-floor behaviour. Kept
+// as a real switch and not a build-time constant because it is also the control
+// arm of the test: the claim "the stripes were losing candidates" is only worth
+// anything if the same rig, on the same build, can be made to reproduce the
+// prflx pairs by turning this off.
+const ICE_QUEUE = QS.get('icequeue') !== '0';
+async function addIceQueued(target, cand, key) {
+  if (!ICE_QUEUE) { await target?.addIceCandidate(cand)?.catch?.(() => {}); return; }
+  if (target && target.remoteDescription) {
+    // The description is in place, so a rejection here is the candidate's own
+    // fault — malformed, or naming an m-line that does not exist. Dropping it
+    // is correct; that was never the bug.
+    await target.addIceCandidate(cand).catch(() => {});
+    return;
+  }
+  const q = pendingIce.get(key) ?? [];
+  if (q.length >= PENDING_ICE_MAX) return; // a peer that floods gets ignored, not obeyed
+  q.push(cand);
+  pendingIce.set(key, q);
+}
+// Called immediately after any setRemoteDescription: everything held for this
+// pc is now applicable. Logged, because "how many candidates did we nearly
+// lose" is the number that says whether this was worth building.
+async function flushIce(target, key) {
+  const q = pendingIce.get(key);
+  if (!q || !q.length) return;
+  pendingIce.delete(key);
+  let ok = 0;
+  for (const c of q) {
+    try { await target.addIceCandidate(c); ok++; } catch { /* genuinely stale */ }
+  }
+  tel?.log('ice-flush', { key, held: q.length, applied: ok });
+}
+
 let laneWatchdog = null;
 function armLaneWatchdog() {
   clearTimeout(laneWatchdog);
@@ -2757,6 +2859,7 @@ function fallbackToOpus(why, quiet) {
     // teardown at leave.
     for (const spc of pcmAllPcs()) safe(() => spc.close(), 'pcm.stripe-close');
     pcmPcs.clear();
+    clearStripePathTimers();
     const mic = localStream?.getAudioTracks()[0];
     if (pcmSpareSender && mic) pcmSpareSender.replaceTrack(mic).catch(() => {});
     attachRemoteMedia();
@@ -5072,6 +5175,7 @@ function dropPair(peerRole) {
     }
   }
   safe(() => { p?.pc?.close?.(); }, 'pair.drop-pc');
+  for (const k of pendingIce.keys()) if (k.startsWith(`${peerRole}#`)) pendingIce.delete(k);
   peers.delete(peerRole);
   // The pc that pair owned is now spent, and a free `mediaPeer` is what tells
   // `peer-joined` that the next arrival is refilling this slot rather than
@@ -5224,6 +5328,7 @@ async function applyPairFrame(p, m) {
   if (t === 'offer') {
     sdpProbe('pair-offer.recv', m.sdp?.sdp ?? m.sdp);
     await pcx.setRemoteDescription(m.sdp);
+    await flushIce(pcx, iceKey(p.role, 'm'));
     if (wantTape === 2 && answersTo(p.role) && p.pre?.claimSlot) {
       await safeAsync(() => p.pre.claimSlot(m.sdp?.sdp ?? m.sdp), 'tape.slot-claim');
     }
@@ -5236,8 +5341,9 @@ async function applyPairFrame(p, m) {
     tel?.log('pair-answered', { peer: p.role, sig: pcx.signalingState, conn: pcx.connectionState });
   } else if (t === 'answer') {
     await pcx.setRemoteDescription(m.sdp);
+    await flushIce(pcx, iceKey(p.role, 'm'));
   } else if (t === 'ice') {
-    await pcx.addIceCandidate(m.candidate).catch(() => {});
+    await addIceQueued(pcx, m.candidate, iceKey(p.role, 'm'));
   } else if (t === 'reoffer') {
     if (offersTo(p.role)) await pairOffer(p);
   } else if (t === 'audio-fallback') {
@@ -5254,15 +5360,19 @@ async function applyPairFrame(p, m) {
     const spc = pcmLadder(p.role)?.[m.idx];
     if (spc && !spc.remoteDescription) {
       await spc.setRemoteDescription(m.sdp);
+      await flushIce(spc, iceKey(p.role, m.idx));
       const ans = await spc.createAnswer();
       await spc.setLocalDescription(ans);
       send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(p.role) });
     }
   } else if (t === 'pcm-answer') {
     const spc = pcmLadder(p.role)?.[m.idx];
-    if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
+    if (spc && !spc.remoteDescription) {
+      await spc.setRemoteDescription(m.sdp);
+      await flushIce(spc, iceKey(p.role, m.idx));
+    }
   } else if (t === 'pcm-ice') {
-    await pcmLadder(p.role)?.[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
+    await addIceQueued(pcmLadder(p.role)?.[m.idx], m.candidate, iceKey(p.role, m.idx));
   }
 }
 
@@ -6211,6 +6321,7 @@ async function join(room) {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('offer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
+        await flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
         // Lane 2 answerer: put our carrier INTO this answer by claiming the offer's
         // carrier slot (tape.js claimSlot). This replaces the reoffer path, whose
         // answer was measured to vanish between relay and delivery at real RTTs.
@@ -6230,10 +6341,11 @@ async function join(room) {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('answer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
+        await flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
         sdpProbe('answer.applied', pc.localDescription?.sdp);
       } else if (m.type === 'ice') {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
-        await pc.addIceCandidate(m.candidate).catch(() => {});
+        await addIceQueued(pc, m.candidate, iceKey(m.from ?? mediaPeer, 'm'));
       } else if (m.type === 'audio-fallback') {
         // The peer's lane A died. Its graph is both our playout and its capture,
         // so its failure is ours too — switch to Opus without re-broadcasting.
@@ -6267,6 +6379,7 @@ async function join(room) {
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
+          await flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
           const ans = await spc.createAnswer();
           await spc.setLocalDescription(ans);
           send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(m.from ?? mediaPeer) });
@@ -6274,10 +6387,14 @@ async function join(room) {
       } else if (m.type === 'pcm-answer') {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
-        if (spc && !spc.remoteDescription) await spc.setRemoteDescription(m.sdp);
+        if (spc && !spc.remoteDescription) {
+          await spc.setRemoteDescription(m.sdp);
+          await flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
+        }
       } else if (m.type === 'pcm-ice') {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
-        await pcmLadder(m.from ?? mediaPeer)?.[m.idx]?.addIceCandidate(m.candidate).catch(() => {});
+        await addIceQueued(pcmLadder(m.from ?? mediaPeer)?.[m.idx], m.candidate,
+          iceKey(m.from ?? mediaPeer, m.idx));
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
         // consumed it is gone (2026-08-04).
@@ -6984,6 +7101,11 @@ function stopCallMachinery({ keepMedia = false } = {}) {
     // otherwise leave the spent ladder behind under the old key.
     for (const spc of pcmAllPcs()) spc.close();
     pcmPcs.clear();
+    clearStripePathTimers();
+    // Same reasoning one line up, for the same reason: a recovery comes back
+    // with the SAME role letter, so a candidate held for the dead pc would be
+    // flushed into its replacement and point at a port nobody is listening on.
+    pendingIce.clear();
     pc?.close();
     ws?.close();
     if (!keepMedia) for (const t of localStream?.getTracks() ?? []) t.stop();
@@ -7734,6 +7856,11 @@ window.__tape = {
   // the media pair's module pc, its Lane A stripes, and each second pair's own
   // video pc + stripes. call3.mjs sums candidate-pair bytesSent across these to
   // turn the design's ~22 Mbps prediction into a measured number. Read-only.
+  // The media pair's stripe ladder, for rigs that need to ask each association
+  // what it nominated. Read-only and index-aligned (slot 0 is the hole where
+  // association 0 would be — it rides the main pc, exposed as `pc` above), so
+  // `pcmStripePcs()[3]` is association 3 and not the fourth non-null entry.
+  pcmStripePcs: () => [...(pcmLadder(mediaPeer) ?? [])],
   async uplinkMbps(windowMs = 3000) {
     const pcs = new Set();
     if (pc) pcs.add(pc);
