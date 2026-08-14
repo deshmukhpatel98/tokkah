@@ -2010,10 +2010,37 @@ function stopElapsed() {
   document.getElementById('elapsed')?.classList.add('gone');
 }
 
+// Has the far end's audio ever actually arrived? Reset with the lane, not with
+// the peer: what this gates is whether concealment MEANS anything yet.
+let stallAudioFlowing = false;
 function stallPcmSample() {
   if (!STALL || !pcm) return;
   const s = safe(() => pcm.snapshot(), 'stall.pcm-snap');
   if (!s?.started) return;
+  // A CALL THAT HAS NOT STARTED IS NOT A CALL THAT IS BROKEN. The playout
+  // worklet begins at join and conceals on every tick that finds no frame — so
+  // before the first frame ever arrives, concealment is 100% of wall time by
+  // construction. Feeding that to a detector whose entry threshold is 25% puts
+  // "connection paused — reconnecting" on screen for a call that is merely
+  // waiting, and then the 8 s window has to age it out before the 5% exit can
+  // fire.
+  //
+  // Measured on the real Delhi <-> Netherlands call (room ilx-swig-xox,
+  // 2026-08-14), both ends showing the banner at 0:19 with the call healthy:
+  //   Safari  joined +0.4s, audio channels open +4.6s
+  //           stall-hold ENTER +10.2s at frac 0.997  -> EXIT +106.6s (96 s on screen)
+  //   Brave   joined +1.3s, peer arrived +14.3s, channels open +18.1s
+  //           stall-hold ENTER +24.8s at frac 0.94   -> EXIT  +78.8s (54 s on screen)
+  // Brave's window at entry began 8 s before its peer's audio could exist. The
+  // detector was reporting the silence between two people joining.
+  if (!((s.framesRecv ?? 0) > 0)) { stallHoldWin.length = 0; return; }
+  // The transition itself, so the silent prologue cannot age through the window
+  // afterwards and read as breakage.
+  if (!stallAudioFlowing) {
+    stallAudioFlowing = true;
+    stallHoldWin.length = 0;
+    tel?.log('stall-armed', { framesRecv: s.framesRecv });
+  }
   const t = performance.now();
   stallHoldWin.push({ t, c: s.concealedMs });
   while (stallHoldWin.length > 1 && t - stallHoldWin[0].t > 8000) stallHoldWin.shift();

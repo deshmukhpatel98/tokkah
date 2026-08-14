@@ -60,6 +60,23 @@ const json = (body: unknown, status = 200): Response =>
 // is dropped rather than stored — see the header comment.
 const MAX_EVENTS_PER_BATCH = 2000;
 const MAX_STRING_LEN = 512;
+// Keys kept per object. Was 64, which silently truncated the audio lane's own
+// snapshot: `pcm.snapshot()` spreads the transport counters first and appends
+// the playout half after them, so every field past the 64th was dropped on
+// ingest — `started`, `playedFrames`, `concealedMs`, `heldMs`, `depthMs`,
+// `targetFrames`, `outputLatencyMs`, `driftPpm`, `ageP50`, and `mouthToEarMs`,
+// which is the single number the entire latency campaign exists to move.
+//
+// Nothing failed. The page had every field (that is why the harness prints
+// mouth-to-ear and why the stall detector works); only the UPLOADED copy was
+// short, so live-call diagnosis was blind to the whole playout side and had to
+// infer concealment from `stall-hold` events. Found 2026-08-14 while chasing
+// "connection paused — reconnecting" on a real Delhi <-> Netherlands call.
+//
+// The cap still exists — this is an unauthenticated POST endpoint and an
+// unbounded object is an abuse surface — but it is now above any real payload,
+// and truncation is RECORDED rather than silent (see `_truncKeys` below).
+const MAX_KEYS_PER_OBJECT = 192;
 const MAX_ROWS_PER_ROOM = 400_000; // ~an hour of dense telemetry from two peers
 // Ingest stays unauthenticated (a call must never lose its log to an auth
 // hiccup), so abuse is bounded instead: 1 MiB per POST body — a legit flush is
@@ -77,11 +94,16 @@ function sanitize(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.slice(0, 64).map((v) => sanitize(v, depth + 1));
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
+    const entries = Object.entries(value as Record<string, unknown>);
     let n = 0;
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (n++ >= 64) break;
+    for (const [k, v] of entries) {
+      if (n++ >= MAX_KEYS_PER_OBJECT) break;
       out[k.slice(0, 64)] = sanitize(v, depth + 1);
     }
+    // Say so, in the row itself. A cap that drops fields without a trace reads
+    // downstream as "the client never sent them", which is how the audio lane's
+    // playout half stayed missing from every query for a whole campaign.
+    if (entries.length > MAX_KEYS_PER_OBJECT) out._truncKeys = entries.length - MAX_KEYS_PER_OBJECT;
     return out;
   }
   return null; // functions, symbols, undefined
