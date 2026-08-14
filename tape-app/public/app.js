@@ -1432,6 +1432,21 @@ const TAPE_CFG = {
   // ?csvc=N -- period of the carrier service tick that carries parity, keyframe
   // duplicates and re-splices. Data frames emit on their own; these do not.
   l2CarrierSvcMs: QS.has('csvc') ? Number(QS.get('csvc')) : null,
+  // ?jbt=N -- what we ask WebRTC's video jitter buffer to hold, in ms.
+  //
+  // NOT defaulted to 0, despite the theory being good (this lane reorders,
+  // repairs and paces the picture itself, so the platform buffer smooths an
+  // already-smoothed stream). Measured on live prod it bought nothing: the
+  // send-transform-to-receive-transform term went 9.06/9.02 -> 8.88/8.61 ms and
+  // glass-to-glass did not improve. The buffer is not where that 9 ms lives, and
+  // it does real work on lossy networks the rig does not reproduce, so the
+  // platform keeps its own mind unless a caller asks otherwise.
+  l2JitterTargetMs: QS.has('jbt') ? Number(QS.get('jbt')) : null,
+  // ?maxbr=N (kbps) -- the sender's bitrate ceiling. Not a target: the encoder is
+  // quantizer-driven and sends what quality costs. This exists only to let the
+  // pacer probe above the ~6 Mbps it settles at, since pacing a 14.7 KB frame at
+  // that rate is the 9 ms sitting between the two transforms.
+  l2MaxBitrateKbps: QS.has('maxbr') ? Number(QS.get('maxbr')) : null,
   // ?l2rcmode=vbr forces the VBR rate-control arm even where fixed QP is available, so the
   // arm every Safari-family call actually runs can be scored with VMAF against the real
   // fixture. Unset means 'use fixed QP if the engine has it', which is the shipping path.

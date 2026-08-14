@@ -756,3 +756,45 @@ both tested on live prod and both rejected:
 Both levers stay, defaulted to today's values, because they price the trade
 honestly. The residual is neither the dummy frame's encode nor idle-tick
 contention, and it is still unnamed.
+
+### The residual, decomposed and cornered
+
+Reporting the tick wait as a MEAN was hiding its shape. Its percentiles:
+
+    tick wait   p50 2.78   p90 2.93   p99 3.21   mean 7.99
+
+The typical frame waits **2.8 ms**, not 8.5 — the mean was carried by rare
+stalls (qWaitMax reached 417 ms). The carrier is effectively solved. A second
+probe, stamping the sender's wall clock and reading it in the RECEIVE transform,
+places every remaining millisecond:
+
+| span | p50 |
+|---|---|
+| encode output → send transform | 2.9 ms |
+| **send transform → receive transform** | **9.0 ms** |
+| receive transform → deliver (reassembly + hop to main) | 0.8 ms |
+| decode | 1.3 ms |
+| present (vsync) | 8.8 ms |
+
+The 9.0 ms is measured on a rig where both browsers run on one machine and the
+audio lane's RTT is 0.24 ms, so essentially none of it is the wire. Four
+candidates, all rejected on live prod:
+
+| lever | result | reading |
+|---|---|---|
+| `?ccw=32` — smaller carrier frame | 24.2 / 25.1 vs 25.5 | not the dummy frame's encode |
+| `?csvc=50` — fewer idle service ticks | **27.0 / 26.8, worse** | starves parity, which then forces ahead of media |
+| `?jbt=0` — ask the jitter buffer for nothing | 8.88 / 8.61 vs 9.06 / 9.02 | not the jitter buffer |
+| `?maxbr=30000` — lift the pacer ceiling | estimate rose 6.3 → 11.5 Mbps; term 9.08 / 8.04 | not rate-limited serialization |
+
+That last one is the most informative. If the term were a 14.7 KB frame paced at
+the bandwidth estimate it would have fallen by nearly half when the estimate
+almost doubled. It did not move. A term that is flat against frame size, against
+tick supply, against buffer target and against bitrate looks like a fixed
+per-packet pipeline cost — packetize, encrypt, socket, depacketize, decrypt,
+reassemble, ~12 packets per frame — and there is no JS lever on any of it.
+
+**Video stands at 25.5 ms**, from 32. Of what remains, 8.8 ms is vsync and 9.0 ms
+is inside Chrome's RTP pipeline: **17.8 of 25.5 ms is platform, not ours.** All
+four levers above ship as flags, defaulted to today's values, so the trade stays
+priced rather than forgotten.

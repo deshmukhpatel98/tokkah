@@ -1040,6 +1040,19 @@ const l2WorkerSrc = `
   // a frame can be bumped past several of them.
   let qWaitSum = 0, qWaitN = 0, qWaitMax = 0;
   let xferSum = 0, xferN = 0, tickSum = 0, tickN = 0;
+  // A MEAN hides its own shape. qWaitMax reached 417 ms, so a handful of long
+  // stalls can carry an average that no frame actually experiences. Keep a
+  // bounded sample of tick waits and report percentiles, so 'reduce the wait'
+  // aims at the typical frame or the tail knowingly, not by accident.
+  const tickSamp = [];
+  // Receive side: sender stamp -> this transform. With age p50 at 12 ms and the
+  // tick wait only 2.8 ms, about 9 ms sits after the send transform on a rig
+  // with no network at all. This says how much of that is pacer plus wire,
+  // and by subtraction how much is worker reassembly and the hop to main.
+  const recvSamp = [];
+  const pctOf = (arr) => { if (!arr.length) return null; const v = arr.slice().sort((x, y) => x - y);
+    const at = (q) => +v[Math.min(v.length - 1, Math.floor(v.length * q))].toFixed(2);
+    return { p50: at(0.5), p90: at(0.9), p99: at(0.99) }; };
   // Ticks a pending parity has already yielded to fresh media. Bounds the
   // deferral so redundancy is delayed, never starved.
   let parityHeld = 0, parityDeferred = 0;
@@ -1103,6 +1116,7 @@ const l2WorkerSrc = `
             if (nCarrier % 90 === 1) postMessage({ type: 'tick', carrier: nCarrier, fromMain: nFromMain, hasQ: !!q, fecSent, yieldTicks,
               qWaitAvg: qWaitN ? +(qWaitSum / qWaitN).toFixed(2) : null, qWaitMax: +qWaitMax.toFixed(1), qWaitN,
               xferAvg: xferN ? +(xferSum / xferN).toFixed(2) : null, tickAvg: tickN ? +(tickSum / tickN).toFixed(2) : null,
+              tickPct: pctOf(tickSamp),
               parityDeferred });
             const car = new Uint8Array(frame.data);
             if (performance.now() < yieldUntil) {
@@ -1211,6 +1225,7 @@ const l2WorkerSrc = `
               if (xf != null && xf >= 0 && xf < 1000) { xferSum += xf; xferN++; }
               const tw = m.at != null ? nowW - m.at : null;
               if (tw != null && tw >= 0 && tw < 1000) { tickSum += tw; tickN++; }
+              if (tw != null && tw >= 0 && tw < 1000) { tickSamp.push(tw); if (tickSamp.length > 600) tickSamp.shift(); }
               fecIdleTicks = 0;
               const out = new Uint8Array(H + ${L2} + m.buf.byteLength);
               out.set(car.subarray(0, H));
@@ -1260,11 +1275,14 @@ const l2WorkerSrc = `
             await writer.write(frame);
           } else {
             nRecvCarrier++;
-            if (nRecvCarrier % 90 === 1) postMessage({ type: 'tick', side: 'recv', carrier: nRecvCarrier });
+            if (nRecvCarrier % 90 === 1) postMessage({ type: 'tick', side: 'recv', carrier: nRecvCarrier, recvPct: pctOf(recvSamp) });
             const buf = new Uint8Array(frame.data);
             if (buf.length >= H + ${L2}) {
               const dv = new DataView(frame.data);
               if (dv.getUint32(H) === MAGIC) {
+                const wallSent = dv.getFloat64(H + 20);
+                const rl = (performance.timeOrigin + performance.now()) - wallSent;
+                if (rl >= 0 && rl < 1000) { recvSamp.push(rl); if (recvSamp.length > 600) recvSamp.shift(); }
                 const data = frame.data.slice(H + ${L2});
                 postMessage({
                   type: 'recv', id: dv.getUint32(H + 4), flags: dv.getUint8(H + 8),
@@ -1503,6 +1521,29 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       fastFlicker: cfg.l2FastCarrier !== false && carrierTicksAsked > 60,
       cfgFps: cfg.fps, settings: carrierTrack.getSettings?.() ?? null });
     const tx = pc.addTransceiver(carrierTrack, { direction: 'sendonly' });
+    // ?maxbr=N (kbps) lifts the sender's ceiling so the PACER can run faster.
+    //
+    // The last big term in glass-to-glass is 9.0 ms between the send transform
+    // and the receive transform -- on a rig where both browsers are on one
+    // machine and the audio lane's RTT is 0.24 ms, so it is not the wire. It is
+    // serialization: availableOutgoingBitrate measured 5.5-6.3 Mbps, and a
+    // 14.7 KB frame paced at roughly that rate takes about 9 ms.
+    //
+    // The estimate is low for a reason worth stating: congestion control can
+    // only estimate from what it has seen sent, and we send 3.5 Mbps, so it
+    // settles just above that. Raising the ceiling is what makes Chrome probe
+    // upward. It cannot invent capacity -- GCC still backs off on a link that
+    // cannot carry it -- so this buys speed on a fat link and changes nothing
+    // on a thin one.
+    const maxbrKbps = Number(cfg.l2MaxBitrateKbps);
+    if (Number.isFinite(maxbrKbps) && maxbrKbps > 0) {
+      try {
+        const prm = tx.sender.getParameters();
+        prm.encodings = prm.encodings && prm.encodings.length ? prm.encodings : [{}];
+        prm.encodings[0].maxBitrate = Math.round(maxbrKbps * 1000);
+        tx.sender.setParameters(prm).catch(() => { /* a ceiling is a hint, never a requirement */ });
+      } catch { /* older stacks: the pacer keeps its own counsel */ }
+    }
     tx.sender.transform = new RTCRtpScriptTransform(worker, { role: 'send' });
     // ?cprobe=1 — diagnostic: name the stage that can starve the carrier encoder
     // (clone dead vs pacer starvation vs transform backpressure). Read-only.
@@ -2175,6 +2216,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       if (typeof m.qWaitMax === 'number') stats.qWaitMaxMs = m.qWaitMax;
       if (typeof m.xferAvg === 'number') stats.xferAvgMs = m.xferAvg;
       if (typeof m.tickAvg === 'number') stats.tickAvgMs = m.tickAvg;
+      if (m.tickPct) stats.tickPct = m.tickPct;
+      if (m.recvPct) stats.recvPct = m.recvPct;
       L('tape-worker', m);
     } else if (m.type === 'boot' || m.type === 'hooked') {
       L('tape-worker', m);
@@ -3567,6 +3610,23 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // routed around just the same — leave the working one in place.
     attachReceiver(receiver) {
       if (receiver.transform) return;
+      // ASK THE JITTER BUFFER FOR NOTHING. ?jbt=N overrides; 0 is the default.
+      //
+      // The receive transform fires only once a frame is COMPLETE, so anything
+      // WebRTC's video jitter buffer holds is inside the measured 9.0 ms between
+      // the send transform and the receive transform -- 9 ms on a rig where the
+      // two browsers are on one machine and the audio lane's RTT is 0.24 ms, so
+      // essentially none of it is the wire.
+      //
+      // We do not need that buffer: this lane runs its own reordering, its own
+      // FEC and its own presenter, and it anchors on capture timestamps carried
+      // inside the payload rather than on RTP arrival. Smoothing the same
+      // stream twice only costs latency.
+      const jbt = Number(cfg.l2JitterTargetMs);
+      if (Number.isFinite(jbt) && jbt >= 0 && jbt <= 500) {
+        try { receiver.jitterBufferTarget = jbt; }
+        catch { /* pre-114 Chrome and non-Chromium: the buffer keeps its own mind */ }
+      }
       try { receiver.transform = new RTCRtpScriptTransform(worker, { role: 'recv' }); }
       catch (e) { fail('attach-receiver', e); }
     },
@@ -3645,6 +3705,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // opaque 18.9 ms and every attempt to shrink it is a guess.
         qWaitAvgMs: stats.qWaitAvgMs ?? null, qWaitMaxMs: stats.qWaitMaxMs ?? null,
         xferAvgMs: stats.xferAvgMs ?? null, tickAvgMs: stats.tickAvgMs ?? null,
+        tickPct: stats.tickPct ?? null,
+        recvPct: stats.recvPct ?? null,
         presentLagP50: pct(stats.presentLagMs, 50), presentLagP95: pct(stats.presentLagMs, 95),
         // Glass-to-glass, the vision twin of the audio lane's mouthToEarMs:
         // peer camera capture → this display presents, one number for the
