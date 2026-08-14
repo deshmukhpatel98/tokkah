@@ -428,6 +428,140 @@ function refreshSafetyCode() {
 // while something still is. "they left" used to stay forever purely because the
 // fade was hard-coded to the literal string 'connected'.
 const TRANSIENT_STATUS = new Set(['connected', 'they left']);
+
+/**
+ * ── THE LIVE LABORATORY ─────────────────────────────────────────────────────
+ *
+ * Handles a `lab` frame relayed by the room (POST /api/room/:code/lab, gated on
+ * LAB_KEY server-side). It exists so a call that is ALREADY RUNNING between two
+ * real cameras on two continents can be measured and re-tuned without being
+ * torn down and rebuilt.
+ *
+ * Why that matters more than it sounds: every comparison this project has made
+ * so far has been between two SEPARATE calls, which means every number carries
+ * the difference between two networks, two CPU states and two ICE negotiations.
+ * On 2026-08-14 that noise invalidated three consecutive runs outright — the
+ * rig's own validity gate threw them away. A knob changed inside one live call
+ * compares a path against ITSELF, seconds apart, on the real route, with real
+ * cameras and a real person in frame. There is no cheaper way to buy that.
+ *
+ * THE SAFETY MODEL IS A WHITELIST, and it is the important part. This function
+ * must never become "set any variable the sender names" — that is a remote code
+ * execution surface on a live call between two people. Every knob is named
+ * here, range-checked here, and anything unrecognised is refused and logged.
+ * The server relays without interpreting, so what a lab frame can do is exactly
+ * and only what this list allows.
+ */
+async function handleLab(m) {
+  const op = String(m.op ?? '');
+  // Answers go back over the signaling socket, where the room buffers them for
+  // the operator to drain. Also mirrored into telemetry so a lab session leaves
+  // the same permanent record every other call does.
+  const reply = (data) => {
+    const body = { op, ...data };
+    tel?.log('lab-reply', body);
+    safe(() => send({ type: 'lab-reply', ...body }), 'lab.reply');
+  };
+
+  if (op === 'say') {
+    // Ask the human in front of the camera for an action ("wave", "cover the
+    // lens", "walk out of frame"). The whole point of a lab with a person in it.
+    setStatus(String(m.text ?? '').slice(0, 120));
+    reply({ said: 1 });
+    return;
+  }
+
+  if (op === 'snap') {
+    // One reading of every stage of the pipeline, into the room log where the
+    // driver can read it back. Deliberately assembled from the snapshots that
+    // already exist rather than new instrumentation — if a number is not
+    // already trustworthy enough to ship, it is not trustworthy enough to
+    // steer an experiment.
+    const v = safe(() => tape?.snapshot?.(), 'lab.video') ?? null;
+    const a = safe(() => pcm?.snapshot?.(), 'lab.audio') ?? null;
+    reply({
+      tag: m.tag ?? null,
+      video: v && {
+        qp: TAPE_CFG.qp, w: TAPE_CFG.width, h: TAPE_CFG.height,
+        // `mbpsAtFps` and NOT any "bytes sent" counter: it is bytes-per-frame
+        // times the frame rate actually ACHIEVED, so it answers "what does this
+        // quality cost on the wire" without flattering itself when the lane is
+        // delivering fewer frames than it asked for. That is exactly the
+        // question a quality/bitrate A/B is asking.
+        fps: v.achievedFps ?? null, mbps: v.mbpsAtFps ?? null,
+        capLagMs: v.capLagMs ?? null, encLatMs: v.encLatMs ?? null,
+        fullAgeMs: v.fullAgeMs ?? null, presentLagMs: v.presentLagMs ?? null,
+        glassToGlassMs: v.glassToGlassMs ?? null,
+      },
+      audio: a && {
+        mouthToEarMs: a.mouthToEarMs ?? null, ringDepthMs: a.m2eParts?.ringDepthMs ?? null,
+        concealedMs: a.concealedMs ?? null, framesRecv: a.framesRecv ?? null,
+        rttMs: a.rttMs ?? null, baseRttMs: a.baseRttMs ?? null,
+        latePct: a.latePct ?? null,
+      },
+      pair: lastStats?.pair ?? null,
+    });
+    return;
+  }
+
+  if (op === 'set') {
+    // The knobs that are genuinely live. `qp` is read per frame by the encoder
+    // and `width`/`height` by fitSize, both already, which is why these three
+    // can move mid-call without a reconfigure of anything else. Nothing is
+    // added to this list without first checking that the consumer re-reads it.
+    const applied = {};
+    const num = (v, lo, hi) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= lo && n <= hi ? n : null;
+    };
+    // QP, and it has to move BOTH quantizers or it silently does nothing on the
+    // path that actually ships. `cfg.qp` is the fixed-quality value, but with
+    // rate control on (the default) the encoder asks `rcQpNow()`, which returns
+    // the controller's own value clamped to [l2RcQpMin, l2RcQpMax] and ignores
+    // cfg.qp entirely. Setting cfg.qp alone echoed back a clean success and
+    // changed the bitrate by nothing — caught by lab-verify, which insists the
+    // knob be shown moving bits rather than merely being acknowledged.
+    //
+    // So `qp` pins the controller's band to the value as well. That deliberately
+    // takes the rate controller out of the loop for the duration, which is what
+    // an experiment wants and is not what a call wants — `rc=1` puts it back,
+    // and a reload restores everything from the query string regardless.
+    if (m.qp != null) {
+      const n = num(m.qp, 1, 51);
+      if (n != null) {
+        TAPE_CFG.qp = n;
+        TAPE_CFG.l2RcQpMin = n;
+        TAPE_CFG.l2RcQpMax = n;
+        applied.qp = n;
+      }
+    }
+    if (m.qpMin != null) { const n = num(m.qpMin, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMin = n; applied.qpMin = n; } }
+    if (m.qpMax != null) { const n = num(m.qpMax, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMax = n; applied.qpMax = n; } }
+    if (m.rc != null) { TAPE_CFG.l2Rc = String(m.rc) === '1'; applied.rc = TAPE_CFG.l2Rc ? 1 : 0; }
+    if (m.w != null) { const n = num(m.w, 160, 3840); if (n != null) { TAPE_CFG.width = n; applied.w = n; } }
+    if (m.h != null) { const n = num(m.h, 120, 2160); if (n != null) { TAPE_CFG.height = n; applied.h = n; } }
+    const asked = Object.keys(m).filter((k) => !['op', 'type', 'only', 'tag'].includes(k));
+    const refused = asked.filter((k) => !(k in applied));
+    reply({ applied, refused });
+    return;
+  }
+
+  if (op === 'reload') {
+    // Ship code into a call without ending it. The room already holds a
+    // departure for LEAVE_GRACE_MS (5 s) and cancels it when the same `sid`
+    // comes back, so a reload inside that window never reaches the peer as
+    // "they left" — the mechanism built for dying sockets turns out to be
+    // exactly the mechanism for shipping. `delayMs` is how the two ends are
+    // staggered: reload one, let it come back healthy, then the other, so the
+    // call is never down at both ends at once.
+    const delay = Math.max(0, Math.min(60000, Number(m.delayMs) || 0));
+    reply({ reloadingInMs: delay });
+    setTimeout(() => location.reload(), delay);
+    return;
+  }
+
+  reply({ error: 'unknown op' });
+}
 function setStatus(t) {
   safe(() => {
     const s = $('status');
@@ -6442,6 +6576,8 @@ async function join(room) {
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
         // consumed it is gone (2026-08-04).
+      } else if (m.type === 'lab') {
+        await handleLab(m);
       } else if (m.type === 'display') {
         // What the peer's screen can present. Their frames are OUR send problem, so
         // this arrives and immediately re-tunes our sender: anything above their

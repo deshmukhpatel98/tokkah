@@ -32,6 +32,10 @@ interface Env {
   // GEMINI_API_KEY present → Gemini 3.5 Live Translate is the default vendor
   // (one speech-to-speech session replaces the STT→MT→TTS chain). The legacy
   // ElevenLabs pipeline stays reachable via ?xlvendor=el for A/Bs.
+  // Live-laboratory channel (POST /api/room/:code/lab). UNSET = the endpoint
+  // answers 503 and no call can be reached from outside. Setting it is the
+  // deliberate act that opens the door, so a fresh deploy is closed by default.
+  LAB_KEY?: string;
   GEMINI_API_KEY?: string;
   // Interpreter daily budget per room, in seconds (see xlateMeter). Unset =
   // 7200; explicit '0' disables metering.
@@ -136,6 +140,9 @@ export class Room implements DurableObject {
   // number (kilometres) and one boolean, because the only question being asked
   // is "is this a long path?", and that is not a location.
   private geo = new Map<WebSocket, { lat: number; lon: number }>();
+  // What occupants said back to a lab frame. Bounded and drained on read — a
+  // buffer nobody empties is a memory leak with a nice name.
+  private labReplies: unknown[] = [];
   // Wire version per socket — the admission gate of §3.4. v=1 (default, old
   // clients) anywhere in the room caps it at 2; v≥2 everywhere + THREE_ENABLED
   // lifts it to 3. Parallel to laneCaps/pcmCaps, torn down in the same places.
@@ -201,7 +208,59 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/log') && request.method === 'GET') return this.dump(url);
     if (url.pathname.endsWith('/summary')) return this.summary(url);
     if (url.pathname.endsWith('/xlate')) return this.xlate(request);
+    if (url.pathname.endsWith('/lab') && request.method === 'POST') return this.lab(request);
     return this.signal(request);
+  }
+
+  /**
+   * THE LIVE LABORATORY CHANNEL — reach into a call that is already running.
+   *
+   * The instrument this project has been missing. Every measurement so far has
+   * been "start a call, measure, tear it down, change one thing, start another
+   * call" — which means every comparison carries the difference between two
+   * networks, two CPU states and two ICE negotiations, and today that noise
+   * invalidated three consecutive runs outright. A knob pushed into a call that
+   * is ALREADY UP compares the path against itself, seconds apart. That is a
+   * different class of evidence, and it is the only way to A/B a route between
+   * two continents without the route changing underneath the experiment.
+   *
+   * Authorisation is the whole risk. This endpoint mutates a live call between
+   * two real people, so:
+   *   · it is DISABLED unless LAB_KEY is configured — an unset secret is a
+   *     closed door, never an open one;
+   *   · the key is compared at full length (a room code is not a credential,
+   *     the same reasoning as tokenOk above);
+   *   · it can only ever RELAY. It sets nothing itself and knows nothing about
+   *     what the fields mean, so the blast radius is exactly what a client
+   *     chooses to honour, and the client honours nothing outside a fixed list.
+   */
+  private async lab(request: Request): Promise<Response> {
+    const key = this.env.LAB_KEY;
+    if (!key) return json({ error: 'lab channel not configured' }, 503);
+    const given = request.headers.get('x-lab-key') ?? '';
+    if (given.length !== key.length || given !== key) return json({ error: 'forbidden' }, 403);
+    let body: Record<string, unknown>;
+    try { body = (await request.json()) as Record<string, unknown>; } catch { return json({ error: 'bad json' }, 400); }
+    // `drain` is answered by the room itself rather than relayed: it collects
+    // what the occupants said back. Replies return THIS way, over the same
+    // key-gated channel, rather than through the telemetry log — reading that
+    // would have meant rotating LOG_ADMIN_TOKEN to a value I know, and rotating
+    // a live secret to read a debug field is a bad trade.
+    if (body.op === 'drain') {
+      const out = this.labReplies;
+      this.labReplies = [];
+      return json({ replies: out, peers: [...this.peers.values()] });
+    }
+    // `type` is ours to stamp; a caller cannot forge another message kind and
+    // ride this endpoint into the signaling chain.
+    const frame = JSON.stringify({ ...body, type: 'lab' });
+    let sent = 0;
+    const only = typeof body.only === 'string' ? body.only : null;
+    for (const [ws, role] of this.peers) {
+      if (only && role !== only) continue;
+      try { ws.send(frame); sent++; } catch { /* closing socket */ }
+    }
+    return json({ sent, peers: [...this.peers.values()] });
   }
 
   // The room code is user-chosen and can be a single character, so it is not a
@@ -494,6 +553,21 @@ export class Room implements DurableObject {
       // ping that reached the far end would be a second thing to get wrong.
       // Placed above the THREE branch so it works on every path, and matched
       // before any parse the relay does so it can never be broadcast.
+      // LAB REPLY, and it TERMINATES HERE TOO. An occupant answering a lab
+      // frame is talking to the operator, not to the other person in the call;
+      // relaying it would put a new message type on a peer's signaling chain
+      // for no reason, which is the exact mistake the keepalive below avoids.
+      // Bounded at 64 so a client that chatters cannot grow the room.
+      if (typeof e.data === 'string' && e.data.length < 8192 && e.data.includes('"lab-reply"')) {
+        try {
+          const m = JSON.parse(e.data) as Record<string, unknown>;
+          if (m.type === 'lab-reply') {
+            this.labReplies.push({ ...m, role: this.peers.get(server) ?? null, wall: Date.now() });
+            if (this.labReplies.length > 64) this.labReplies.splice(0, this.labReplies.length - 64);
+            return;
+          }
+        } catch { /* not JSON → fall through to the relay */ }
+      }
       if (typeof e.data === 'string' && e.data.length < 64 && e.data.includes('"ping"')) {
         try {
           const m = JSON.parse(e.data) as Record<string, unknown>;
@@ -1932,7 +2006,7 @@ export default {
     }
 
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary
-    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate)$/);
+    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab)$/);
     if (m) {
       const code = decodeURIComponent(m[1]);
       if (!ROOM_RE.test(code)) return json({ error: 'bad room code' }, 400);
