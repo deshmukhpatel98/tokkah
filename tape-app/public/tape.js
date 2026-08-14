@@ -1043,6 +1043,10 @@ const l2WorkerSrc = `
   // Ticks a pending parity has already yielded to fresh media. Bounds the
   // deferral so redundancy is delayed, never starved.
   let parityHeld = 0, parityDeferred = 0;
+  // NOTE for anyone tempted to time the carrier from inside this transform:
+  // frame.timestamp here is an RTCEncodedVideoFrame's RTP stamp in 90 kHz units,
+  // NOT the wall microseconds written on the VideoFrame. Subtracting it from a
+  // wall clock yields nonsense; that probe was tried and removed.
   // #23 retention ring + re-splice queue: the receiver asks for specific lost
   // ids (fragreq) when parity alone cannot close a gap (the parity packet died
   // with its data). Re-spliced frames keep their original id and wire format;
@@ -1362,7 +1366,15 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
     // so ~144 empty ticks/s is roughly 57 kbps and 4.6% of a core at the measured
     // 0.32 ms/frame — the reason a generous ceiling is affordable rather than tuned.
     const canvas = document.createElement('canvas');
-    canvas.width = 320; canvas.height = 180;
+    // ?ccw=N sizes the carrier's dummy picture. Its CONTENT is irrelevant -- the
+    // payload is replaced in the transform -- so the only thing this width buys
+    // is the cost of encoding it, which sits directly in the send path. 320 was
+    // chosen when the carrier was compositor-bound and its encode cost was
+    // hidden behind a 16.7 ms tick; now that the tick is gone, that cost is
+    // exposed and worth measuring.
+    const ccw = Number(cfg.l2CarrierW);
+    const cw = Number.isFinite(ccw) && ccw >= 16 && ccw <= 640 ? Math.round(ccw / 16) * 16 : 320;
+    canvas.width = cw; canvas.height = Math.round(cw * 9 / 16);
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1456,17 +1468,30 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       carrierTrack = gen;
       emitCarrier = () => {
         try {
-          // Microseconds, monotonic: the carrier's own timestamps are never read
-          // as media time (the receiver anchors on the capture timestamp carried
-          // INSIDE the payload), they only need to advance.
-          gw.write(new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) }));
+          // ABSOLUTE wall microseconds, not performance.now(). The carrier's own
+          // timestamps are never read as media time -- the receiver anchors on
+          // the capture timestamp carried INSIDE the payload -- which frees them
+          // to carry a measurement instead: the send transform subtracts this
+          // from its own wall clock to get the carrier's encode+delivery
+          // latency, the last unnamed term in glass-to-glass. Main and worker
+          // have different performance origins, so only an absolute stamp is
+          // subtractable across that boundary.
+          gw.write(new VideoFrame(canvas, {
+            timestamp: Math.round((performance.timeOrigin + performance.now()) * 1000),
+          }));
         } catch { /* a carrier hiccup must never take the call down */ }
       };
       // Parity, keyframe duplicates and re-splices are not triggered by an
       // encode, so they still need ticks of their own. Same ~60 Hz the auto
       // carrier ran at, so redundancy and GCC's view of the stream are
       // unchanged; the only difference is that a DATA frame no longer waits.
-      setInterval(() => { dirty(); emitCarrier(); }, 16);
+      // ?csvc=N sets that period. At 16 ms this puts ~62 idle carrier frames a
+      // second into the same encoder the data frames use, so every data frame
+      // may queue behind one. Redundancy needs far fewer ticks than that -- the
+      // question is whether the contention is what is left of the wait.
+      const svc = Number(cfg.l2CarrierSvcMs);
+      const svcMs = Number.isFinite(svc) && svc >= 8 && svc <= 200 ? Math.round(svc) : 16;
+      setInterval(() => { dirty(); emitCarrier(); }, svcMs);
     } else {
       carrierTrack = canvas.captureStream(carrierTicksAsked).getVideoTracks()[0];
       emitCarrier = () => {

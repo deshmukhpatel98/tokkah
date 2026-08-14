@@ -742,3 +742,17 @@ display. The carrier term is now ~8.5 ms and is **no longer a compositor
 artefact** — it is the service interval plus contention inside the transform,
 which means it is ordinary code and not a platform floor. That is the next
 target: if it reaches ~1 ms, glass-to-glass lands near **18 ms**.
+
+### Two more levers on the residual carrier term — both negative
+
+With the compositor gone, ~8.5 ms of carrier wait remains. Two candidate causes,
+both tested on live prod and both rejected:
+
+| lever | result vs 25.5 ms default | reading |
+|---|---|---|
+| `?ccw=32` — shrink the dummy frame 320→32 px wide | 24.2 / 25.1 — no change | the carrier's own encode cost is not the term |
+| `?csvc=50` — fewer idle service ticks (62/s → 20/s) | **27.0 / 26.8 — worse** | starving parity of ticks makes it force its way in front of media instead |
+
+Both levers stay, defaulted to today's values, because they price the trade
+honestly. The residual is neither the dummy frame's encode nor idle-tick
+contention, and it is still unnamed.

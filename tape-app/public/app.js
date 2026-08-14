@@ -1426,6 +1426,12 @@ const TAPE_CFG = {
   // Feature-detected in tape.js, so a browser without it (Safari has no
   // MediaStreamTrackGenerator) silently keeps today's canvas carrier.
   l2CarrierTrack: QS.get('ctrack') || 'gen',
+  // ?ccw=N -- carrier dummy-frame width. Its content never reaches anyone; only
+  // its encode cost does, and that cost is now in the critical path.
+  l2CarrierW: QS.has('ccw') ? Number(QS.get('ccw')) : null,
+  // ?csvc=N -- period of the carrier service tick that carries parity, keyframe
+  // duplicates and re-splices. Data frames emit on their own; these do not.
+  l2CarrierSvcMs: QS.has('csvc') ? Number(QS.get('csvc')) : null,
   // ?l2rcmode=vbr forces the VBR rate-control arm even where fixed QP is available, so the
   // arm every Safari-family call actually runs can be scored with VMAF against the real
   // fixture. Unset means 'use fixed QP if the engine has it', which is the shipping path.
