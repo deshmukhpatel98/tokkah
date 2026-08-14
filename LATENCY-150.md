@@ -879,3 +879,135 @@ behind carrier NAT on a relay-only route is not a stable enough peer to measure
 MEDIA QUALITY. Earlier runs connected cleanly (6962 packets); this one failed.
 **Whether lossless audio holds up at intercontinental distance is still
 unanswered**, and answering it needs a real second machine, not this container.
+
+## The lane was never running on a real long call (2026-08-14)
+
+Everything above this line measures a video pipeline that, on a real
+intercontinental call, **was not running.** The number was honest; the claim
+that it described a cross-planet call was not.
+
+Found by reading telemetry from an actual Delhi ↔ Netherlands call — room
+`ilx-swig-xox`, Safari 26.6 in Delhi against Brave/Chromium 151 in the
+Netherlands behind a VPN, RTT 394 ms, **zero packet loss on both sides**:
+
+```
+framesIn 0   framesEncoded 0   framesOut 0   fragsRecv 0     ← both ends
+Brave   tape-fallback { why: "no-frames",      quiet: false }
+Safari  tape-fallback { why: "peer-no-frames", quiet: true  }
+```
+
+Both ends had fallen back to plain RTP video. Not once during the call did the
+custom lane carry a frame.
+
+### The cause is a constant, and the constant is a distance limit
+
+`armLaneWatchdog` was armed from `pc.ontrack` with a flat 4000 ms budget, on the
+belief written into the caller's comment — *"media is flowing at the RTP level
+as of now."* In Chromium `ontrack` fires when the **remote description is set**:
+before ICE, before DTLS, before SCTP, before the lane's own control channel.
+
+That sequence is roughly nine round trips. At 394 ms each it costs 3.6 s:
+
+```
+BRAVE   +0.63s  ontrack — watchdog armed, 4000 ms budget starts
+        +1.90s  ICE checking
+        +2.47s  ICE connected
+        +3.44s  DTLS connected
+        +4.24s  tape-ctl-open — its OWN encoder configures
+        +4.63s  lane-watchdog framesOut:0 → lane killed
+SAFARI  +153.73s peer-joined
+        +157.50s its lane ready (3.77 s of handshake)
+        +158.32s told by Brave: peer-no-frames
+```
+
+Brave killed the lane **390 ms after its own encoder configured** — less than
+one round trip on a 394 ms path, so no frame from Safari could physically have
+arrived yet. This did not lose a race. **It could not win one.** Every long-haul
+call this project has ever made fell back to plain RTP video, silently, with the
+fallback logged as a media failure rather than as what it was: a timer that
+expired during a handshake.
+
+On a LAN the same handshake takes ~200 ms, so 4000 ms reads as 20× headroom.
+That is why it survived months of testing.
+
+`armPcmWatchdog` had the identical bug on a 6000 ms budget. It did **not** trip
+here — the six audio associations opened at +4.0 to +4.6 s, leaving 1.4 s of
+margin. Happening not to trip is not the same as being correct: a slightly
+longer path, or one slower TURN allocation, and lossless audio becomes Opus with
+nothing in the log but `no-audio`.
+
+### The fix, and the proof
+
+The clock now starts when there is something to judge. `tape.js` exposes
+`laneReady()` — our ctl channel open **and** the peer's `ready` received — and
+the grace runs from there. The pre-ready backstop scales with the measured path
+RTT (`12·rtt + 4000`) instead of assuming a datacentre. Both watchdogs now log
+`rtt`, whether readiness was ever reached, and how long they waited, so the next
+one of these is one query rather than a telemetry excavation.
+
+Verified on live prod at the distance that broke it — `call.mjs --rtt=394`
+against room.tokkah.com, two real browsers, real talking-head media both ends:
+
+```
+tape lane   recv 2964 frames   4057 frags   decodeErr 0
+            rtt 397.83 ms      age p50 223.8 ms
+            cap→read 0.1   encode 2.9   present 9.6 ms
+            glassToGlass 237.7 ms
+audio       6 associations open, target 20f, depth 128.5 ms
+```
+
+**2964 frames through the custom lane on the exact path that previously
+delivered zero.** The audio jitter buffer settling at 20–21 frames also shows
+the `maxTargetFrames` 15 → 32 raise from earlier the same day is load-bearing
+here rather than idle headroom — under the old ceiling it would have been pinned.
+
+### The law this leaves behind
+
+**Any constant compared against something that costs N round trips is a hidden
+distance limit.** Three were found in one day — the lane watchdog at 4000 ms, the
+pcm watchdog at 6000 ms, and the jitter-buffer ceiling at 15 frames — and all
+three were invisible on short paths, because all three present as *quality*
+symptoms (black video, choppy audio, "connection paused") and never as errors.
+
+And the corollary, which is the more expensive lesson: **before trusting any
+pipeline latency number, prove the pipeline was alive on the path being
+measured.** `tape-stats framesIn > 0` for video, absence of `pcm-fallback` for
+audio. Everything above this section was measured correctly and generalised
+wrongly.
+
+## A dead signaling socket while waiting alone is invisible and terminal (2026-08-14)
+
+Found on the same call, immediately after a routine refresh-both-windows:
+
+```
+SAFARI  +0.6s  ws-rx welcome
+        +1.7s  ws-error AND ws-close together
+        +2.0s  ws-tx display with readyState 3 — sending into a dead socket
+        then 12 MINUTES of floor/onset/stats, no recovery attempt
+BRAVE   joined 8 s later, told role a / peerPresent false — correctly, the
+        room really was empty. Its own socket died at +604s. Same silence.
+```
+
+Two windows, both looking completely alive — camera preview up, audio graph
+running, telemetry posting on cadence — with no call between them and no error
+on screen, for twelve minutes.
+
+`recoverCall`'s first guard read `!hadPeer`, so own-side recovery ran only for a
+socket that died *after* a peer had arrived. A socket that dies while waiting
+alone took the early return and nothing ever retried — and that is precisely the
+state that cannot heal by itself, because the signaling socket is the only way a
+peer can ever be learned about. The room can fill up and you will never know.
+
+The `ws-error` and `ws-close` firing together says this was an abrupt transport
+failure, not a server close, so the drop itself is the Delhi network and not
+something to fix in code. The defect was that nothing responded to it.
+
+`joined` is the correct precondition: it means the server admitted us to a room,
+so a close is loss rather than lobby noise. It is set only after the open promise
+resolves, so a 409 room-full rejection still cannot reach recovery; `wsOpened`
+still gates the caller for sockets that never opened; and RECOVER_MAX / WINDOW /
+COOLDOWN still bound the attempts.
+
+Worth stating plainly because it shaped a whole debugging session: **the user's
+own workflow is to refresh both windows after every deploy.** This bug sat
+directly on the hot path of how the project is tested.
