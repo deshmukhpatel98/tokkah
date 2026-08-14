@@ -798,3 +798,34 @@ reassemble, ~12 packets per frame — and there is no JS lever on any of it.
 is inside Chrome's RTP pipeline: **17.8 of 25.5 ms is platform, not ours.** All
 four levers above ship as flags, defaulted to today's values, so the trade stays
 priced rather than forgotten.
+
+## Audio's floor, tested rather than asserted (2026-08-14)
+
+Audio has been described as "at its floor" all session on the strength of an
+accounting identity: 20 ms OS output buffer + 16 ms jitter target + 8 ms framing
+= 44 ms, against 42.2-45.2 ms measured. An identity is not evidence. Each term
+was pushed:
+
+| term | can it move? | evidence |
+|---|---|---|
+| OS output buffer, 20 ms | **no** | already at Chrome's floor. `latencyHint: 0` was A/B'd on 2026-08-11 and shipped: outputLatency 26 → 20 ms, and the smaller device buffer halved arrival spread (age p95 8.2 → 4.6 ms). `?lat=int` is the control. |
+| jitter target, 16 ms (2 frames) | **no** | `?pcmjb=1` drops the FLOOR to one frame. Result: **concealment 328 ms and 448 ms** where every other call this session ran at zero, depth unchanged at 13.1/13.8 ms, mouth-to-ear unchanged at 43.3/44 ms — and the adaptive controller climbed back to 2f on its own. It cost audible damage and bought nothing. |
+| framing, 8 ms | not attempted | FRAME=384 at 48 kHz. Halving it would save 4 ms and double the packet rate, against a striping and FEC design built on this frame size. |
+| transport | 2.2 ms | already smaller than any other term. |
+
+**The jitter result is the useful one.** 2 frames is not a conservative guess, it
+is the point where this pipeline stops being lossless — and the controller
+knows it, because it raised the target back without being asked. Audio is at its
+floor for real.
+
+## Where the limit of light stands tonight
+
+    audio pipeline    42-45 ms   at floor, every term tested
+    video pipeline    25.5 ms    down from 32; 17.8 ms of it is platform
+                                 (8.8 vsync + 9.0 Chrome's RTP pipeline)
+    network one-way   ~152 ms    1.64x the real cable path; no hop beats it
+
+Of the ~178 ms a Delhi-Seattle glass-to-glass call costs, **88 ms is light** and
+must be paid. Of the remaining 90 ms, about 27 ms is ours to attack (7.7 ms of
+video outside the platform, ~20 ms of audio pipeline that is at its floor but
+not at zero) and roughly 64 ms is network overhead over the cable path.
