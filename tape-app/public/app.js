@@ -2744,16 +2744,13 @@ function laneAgree(peerLane, when) {
 // that stripe is still applying its remote description.
 //
 // What a dropped candidate costs is not a failed call — ICE recovers by
-// learning the peer from an incoming STUN probe instead, which produces a
-// PEER-REFLEXIVE pair. That is a route discovered by accident rather than the
-// one signalling offered, and it is measurably worse: on the real Delhi call
-// association 0 (the main pc, host/host) ran 25-30 ms BELOW stripes 1-5
-// (host/prflx) in baseRtt, consistently, across 586 samples. The gap is then
-// paid twice, because the jitter target is sized from arrival spread and six
-// lanes disagreeing by 31 ms inflate the buffer for all of them.
-//
-// Invisible on loopback, where every candidate pair is 0-1 ms and the six lanes
-// look identical — which is exactly why it survived this long.
+// learning the peer from an incoming STUN probe instead, producing a
+// peer-reflexive pair. Measured on prod, that recovery is transient and self-
+// healing (see the `at` note in startPcmStripes), so this is not a latency fix.
+// It is a correctness fix: signalling's candidates should be the ones ICE uses,
+// and on a path where the probe cannot arrive first — anything behind a NAT
+// that does not hairpin — a dropped candidate is a lost route, not a relabelled
+// one. 25-31 candidates per prod run were being thrown away.
 const pendingIce = new Map(); // key -> candidate[]
 const PENDING_ICE_MAX = 32; // a bounded buffer, never an unbounded one
 // Key is peer + lane, because a stripe's candidate can arrive before that
@@ -2766,13 +2763,44 @@ const iceKey = (peer, lane) => `${peer ?? '?'}#${lane}`;
 // anything if the same rig, on the same build, can be made to reproduce the
 // prflx pairs by turning this off.
 const ICE_QUEUE = QS.get('icequeue') !== '0';
-async function addIceQueued(target, cand, key) {
-  if (!ICE_QUEUE) { await target?.addIceCandidate(cand)?.catch?.(() => {}); return; }
+
+/**
+ * Apply one candidate and NEVER make the caller wait for it.
+ *
+ * This is the load-bearing part, and the first version of this file got it
+ * wrong. Adding a candidate is fire-and-forget by nature — nothing downstream
+ * reads its result, and ICE does not care what order candidates land in — but
+ * the handlers `await`ed it, which put a network-ish operation directly on the
+ * critical path of the offer/answer handshake, in a message loop that processes
+ * one frame at a time.
+ *
+ * Measured, and it is not theoretical: under the P2P sim (testbed/simconnect.mjs)
+ * where `addIceCandidate` is wrapped in an async proxy lookup that can stall,
+ * queueing made 0 of 3 calls connect while the control made 3 of 3. The
+ * answerer had received the offer and simply never sent its `answer` — parked
+ * inside a candidate, with the one message that must not be late stuck behind
+ * a message that does not matter at all. Head-of-line blocking on the handshake.
+ *
+ * The stall was the rig's (its proxy allocator has a check-then-act race across
+ * an await, so the extra candidates this queue replays make it build duplicate
+ * proxies). The vulnerability to it was ours, and a real network has its own
+ * ways to make a candidate slow.
+ */
+function applyIce(target, cand, done) {
+  try {
+    const p = target?.addIceCandidate(cand);
+    if (p && typeof p.then === 'function') p.then(() => done?.(true), () => done?.(false));
+    else done?.(!!p || !!target);
+  } catch { done?.(false); }
+}
+
+function addIceQueued(target, cand, key) {
+  if (!ICE_QUEUE) { applyIce(target, cand); return; }
   if (target && target.remoteDescription) {
     // The description is in place, so a rejection here is the candidate's own
     // fault — malformed, or naming an m-line that does not exist. Dropping it
     // is correct; that was never the bug.
-    await target.addIceCandidate(cand).catch(() => {});
+    applyIce(target, cand);
     return;
   }
   const q = pendingIce.get(key) ?? [];
@@ -2780,18 +2808,24 @@ async function addIceQueued(target, cand, key) {
   q.push(cand);
   pendingIce.set(key, q);
 }
+
 // Called immediately after any setRemoteDescription: everything held for this
-// pc is now applicable. Logged, because "how many candidates did we nearly
-// lose" is the number that says whether this was worth building.
-async function flushIce(target, key) {
+// pc is now applicable. Returns at once; the count is logged when the batch
+// settles, because "how many candidates did we nearly lose" is the number that
+// says whether this was worth building — but not at the cost of delaying the
+// answer by even one round trip.
+function flushIce(target, key) {
   const q = pendingIce.get(key);
   if (!q || !q.length) return;
   pendingIce.delete(key);
   let ok = 0;
+  let settled = 0;
   for (const c of q) {
-    try { await target.addIceCandidate(c); ok++; } catch { /* genuinely stale */ }
+    applyIce(target, c, (good) => {
+      if (good) ok++;
+      if (++settled === q.length) tel?.log('ice-flush', { key, held: q.length, applied: ok });
+    });
   }
-  tel?.log('ice-flush', { key, held: q.length, applied: ok });
 }
 
 let laneWatchdog = null;
@@ -5328,7 +5362,7 @@ async function applyPairFrame(p, m) {
   if (t === 'offer') {
     sdpProbe('pair-offer.recv', m.sdp?.sdp ?? m.sdp);
     await pcx.setRemoteDescription(m.sdp);
-    await flushIce(pcx, iceKey(p.role, 'm'));
+    flushIce(pcx, iceKey(p.role, 'm'));
     if (wantTape === 2 && answersTo(p.role) && p.pre?.claimSlot) {
       await safeAsync(() => p.pre.claimSlot(m.sdp?.sdp ?? m.sdp), 'tape.slot-claim');
     }
@@ -5341,9 +5375,9 @@ async function applyPairFrame(p, m) {
     tel?.log('pair-answered', { peer: p.role, sig: pcx.signalingState, conn: pcx.connectionState });
   } else if (t === 'answer') {
     await pcx.setRemoteDescription(m.sdp);
-    await flushIce(pcx, iceKey(p.role, 'm'));
+    flushIce(pcx, iceKey(p.role, 'm'));
   } else if (t === 'ice') {
-    await addIceQueued(pcx, m.candidate, iceKey(p.role, 'm'));
+    addIceQueued(pcx, m.candidate, iceKey(p.role, 'm'));
   } else if (t === 'reoffer') {
     if (offersTo(p.role)) await pairOffer(p);
   } else if (t === 'audio-fallback') {
@@ -5360,7 +5394,7 @@ async function applyPairFrame(p, m) {
     const spc = pcmLadder(p.role)?.[m.idx];
     if (spc && !spc.remoteDescription) {
       await spc.setRemoteDescription(m.sdp);
-      await flushIce(spc, iceKey(p.role, m.idx));
+      flushIce(spc, iceKey(p.role, m.idx));
       const ans = await spc.createAnswer();
       await spc.setLocalDescription(ans);
       send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(p.role) });
@@ -5369,10 +5403,10 @@ async function applyPairFrame(p, m) {
     const spc = pcmLadder(p.role)?.[m.idx];
     if (spc && !spc.remoteDescription) {
       await spc.setRemoteDescription(m.sdp);
-      await flushIce(spc, iceKey(p.role, m.idx));
+      flushIce(spc, iceKey(p.role, m.idx));
     }
   } else if (t === 'pcm-ice') {
-    await addIceQueued(pcmLadder(p.role)?.[m.idx], m.candidate, iceKey(p.role, m.idx));
+    addIceQueued(pcmLadder(p.role)?.[m.idx], m.candidate, iceKey(p.role, m.idx));
   }
 }
 
@@ -6321,7 +6355,7 @@ async function join(room) {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('offer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
-        await flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
+        flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
         // Lane 2 answerer: put our carrier INTO this answer by claiming the offer's
         // carrier slot (tape.js claimSlot). This replaces the reoffer path, whose
         // answer was measured to vanish between relay and delivery at real RTTs.
@@ -6341,11 +6375,11 @@ async function join(room) {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
         sdpProbe('answer.recv', m.sdp?.sdp ?? m.sdp);
         await pc.setRemoteDescription(m.sdp);
-        await flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
+        flushIce(pc, iceKey(m.from ?? mediaPeer, 'm'));
         sdpProbe('answer.applied', pc.localDescription?.sdp);
       } else if (m.type === 'ice') {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
-        await addIceQueued(pc, m.candidate, iceKey(m.from ?? mediaPeer, 'm'));
+        addIceQueued(pc, m.candidate, iceKey(m.from ?? mediaPeer, 'm'));
       } else if (m.type === 'audio-fallback') {
         // The peer's lane A died. Its graph is both our playout and its capture,
         // so its failure is ours too — switch to Opus without re-broadcasting.
@@ -6379,7 +6413,7 @@ async function join(room) {
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
-          await flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
+          flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
           const ans = await spc.createAnswer();
           await spc.setLocalDescription(ans);
           send({ type: 'pcm-answer', idx: m.idx, sdp: spc.localDescription, ...addr(m.from ?? mediaPeer) });
@@ -6389,11 +6423,11 @@ async function join(room) {
         const spc = pcmLadder(m.from ?? mediaPeer)?.[m.idx];
         if (spc && !spc.remoteDescription) {
           await spc.setRemoteDescription(m.sdp);
-          await flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
+          flushIce(spc, iceKey(m.from ?? mediaPeer, m.idx));
         }
       } else if (m.type === 'pcm-ice') {
         if (!forMediaPair(m.from)) { await routePair(m); return; }
-        await addIceQueued(pcmLadder(m.from ?? mediaPeer)?.[m.idx], m.candidate,
+        addIceQueued(pcmLadder(m.from ?? mediaPeer)?.[m.idx], m.candidate,
           iceKey(m.from ?? mediaPeer, m.idx));
       } else if (m.type === 'geom') {
         // Legacy peers still send face geometry; the life-size renderer that
