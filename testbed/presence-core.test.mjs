@@ -21,9 +21,14 @@
  *
  *   node testbed/presence-core.test.mjs
  */
-import { createPresence } from '../tape-app/public/core/presence-core.js';
+import { createPresence, LPF_HZ } from '../tape-app/public/core/presence-core.js';
 
 const SR = 48000;
+// What the wall-absorption lowpass does to an IMPULSE's peak: y[n] = b·x[n] +
+// a·y[n−1] with a = e^(−2π·fc/fs), so an impulse comes out as b·aⁿ and its peak
+// sample is b. Imported corner, derived here — never a second copy of 3800.
+const LPF_A = Math.exp((-2 * Math.PI * LPF_HZ) / SR);
+const IMPULSE_PEAK_DB = 20 * Math.log10(1 - LPF_A);
 const TAPS = [
   { ms: 7.9, db: -20, ear: 0 },
   { ms: 9.7, db: -20, ear: 1 },
@@ -83,7 +88,20 @@ const rng = (seed) => () => {
     for (let n = d - win; n <= d + win; n++) peak = Math.max(peak, Math.abs(ch[n]));
     const db = 20 * Math.log10(peak);
     details.push(`${t.ms}ms ${db.toFixed(1)}dB`);
-    if (Math.abs(db - t.db) > 1.5) geomOk = false;
+    // AN IMPULSE PEAK IS NOT THE TAP GAIN. Each tap multiplies the LOWPASSED
+    // input, and a one-pole lowpass fed an impulse emits b·aⁿ — so the peak
+    // sample is b (−8.14 dB at 3800 Hz / 48 kHz) while the energy is spread
+    // over the samples after it. Comparing that peak against the published
+    // broadband gain failed all six taps by exactly 8.1 dB, every time, for the
+    // whole life of this test. The delays and `stray` were always right, which
+    // is what said "measurement, not renderer" — a real geometry fault does not
+    // land on a constant offset.
+    //
+    // The renderer is correct and is proven so by the steady-state arm below:
+    // the lowpass has unity DC gain, so a real signal gets exactly the
+    // published −20/−23/−26 dB. Only the impulse peak is attenuated, and by an
+    // amount that is analytic rather than empirical.
+    if (Math.abs(db - (t.db + IMPULSE_PEAK_DB)) > 1.5) geomOk = false;
   }
   // Outside all windows (and past the direct sample), only lowpass smear far
   // below the quietest tap is allowed.
@@ -95,6 +113,30 @@ const rng = (seed) => () => {
     if (!inWindow(n, 1) && Math.abs(R[n]) > Math.pow(10, -32 / 20)) stray++;
   }
   arm('tap geometry', geomOk && stray === 0, `${details.join(', ')}; stray=${stray}`);
+}
+
+// ── 3b: the taps deliver their PUBLISHED gain to a real signal ───────────────
+// The arm that should have existed all along. `tap geometry` above measures an
+// impulse, which answers "where are the reflections and are they clean" but
+// cannot answer "how loud are they" — the lowpass spreads an impulse, so the
+// peak is 8 dB below the gain and that is correct rather than a fault. It was
+// the absence of THIS arm that let the impulse arm be misread as a level check
+// and then fail for the whole life of the file.
+//
+// A one-pole lowpass has unity DC gain (b/(1−a) = 1), so a settled steady input
+// puts each ear at exactly 1 + Σ(that ear's tap gains). That is a direct,
+// closed-form assertion on the number the design actually publishes.
+{
+  const N = SR; // 1 s — far past the 24.9 ms longest tap and the lowpass settle
+  const x = new Float32Array(N).fill(1);
+  const { L, R } = render(createPresence({ sampleRate: SR }), x);
+  const sumFor = (ear) => TAPS.filter((t) => t.ear === ear)
+    .reduce((s, t) => s + Math.pow(10, t.db / 20), 0);
+  const wantL = 1 + sumFor(0), wantR = 1 + sumFor(1);
+  const gotL = L[N - 1], gotR = R[N - 1];
+  const okL = Math.abs(gotL - wantL) < 0.002, okR = Math.abs(gotR - wantR) < 0.002;
+  arm('tap gain (steady)', okL && okR,
+    `L ${gotL.toFixed(6)} vs ${wantL.toFixed(6)}, R ${gotR.toFixed(6)} vs ${wantR.toFixed(6)}`);
 }
 
 // ── 4 + 5: speech-like noise ────────────────────────────────────────────────

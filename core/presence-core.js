@@ -53,7 +53,11 @@ const TAPS = [
 
 // Wall-absorption lowpass corner. High enough to keep the room "present",
 // low enough that reflections never read as a second, crisp voice.
-const LPF_HZ = 3800;
+// Exported so the test asserts against THIS number rather than a copy of it.
+// The arm that checks tap levels has to subtract the lowpass's impulse-peak
+// loss, and a duplicated constant there would drift silently the first time
+// this corner is retuned.
+export const LPF_HZ = 3800;
 
 export function createPresence({ sampleRate = 48000, azimuthDeg = 0 } = {}) {
   // Delay ring sized to the longest tap (24.9 ms = 1196 samples @48k) plus a
