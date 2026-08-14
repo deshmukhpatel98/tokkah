@@ -1085,3 +1085,97 @@ browsers — and each has the arm that could actually fail: that a *genuine*
 departure is still reported (else the "fix" merely deleted `peer-left`), and that
 the ping is never observed on the peer's socket (recorded by wrapping
 `WebSocket` before the app sees it).
+
+---
+
+## The six audio lanes are not equal, and the reason I gave was wrong
+
+On the real Delhi call, association 0 — the one that rides the main peer
+connection — ran **25-30 ms below stripes 1-5** in `baseRtt`, consistently,
+across 586 samples. Six lanes that are supposed to be interchangeable were not,
+and that spread is paid twice: once as latency and again as buffer, because the
+jitter target is sized from arrival spread and lanes that disagree by 31 ms
+inflate the depth for all of them.
+
+The instrumented run said the stripes were on peer-reflexive candidate pairs
+(`host/prflx`) while the main connection was on `host/host`, so I went looking
+for lost ICE candidates.
+
+**That explanation is wrong, and the instrument was why.** `pcm-stripe-path`
+fired **once**, on the `iceconnectionstate === 'connected'` transition. Every
+record I had was of the first instant of the call. Re-measured on prod with
+`getStats` at the end of the call — 36 associations over 3 trials:
+
+| | at ICE-connect | 15 s later |
+|---|---|---|
+| associations on `host/prflx` | 15 of 36 | **0 of 36** |
+
+The peer-reflexive pair is a **transient**. ICE learns the peer from an inbound
+STUN probe — direct, sub-millisecond — before the peer's *signalled* candidate
+has finished its round trip through Cloudflare, nominates what it has, and
+converges when the real candidate lands. It is inherent to signalling being
+slower than the data path, and it heals itself.
+
+`pcm-stripe-path` now reports at connect, 10 s and 30 s, so the next real call
+records what its lanes **settled on** rather than what they were born as. The
+lane-skew question is open again, and narrower: it is not candidate type.
+
+### Found by accident: there was no ICE candidate queue at all
+
+`addIceCandidate` rejects when the remote description is not yet set, and both
+handlers ended in `.catch(() => {})`. The stripe handler also had
+`pcmLadder(...)?.[idx]?.`, which discards a candidate for a stripe connection
+that does not exist yet without leaving a trace. Five stripes negotiate in
+parallel through one serialized message loop, so their offers and their
+candidates land in the same few milliseconds.
+
+Measured on prod: **25-31 candidates per run** were arriving early on the
+answerer and being thrown away. They are now held (bounded at 32 per lane) and
+replayed, logged as `ice-flush {held, applied}`. On loopback this changes
+nothing — the probe always wins the race there — but on any path where the probe
+*cannot* arrive first, a dropped candidate is a lost route rather than a
+relabelled one.
+
+### And then I broke prod with the fix
+
+The queue was correct; awaiting it was not. Applying a candidate is
+fire-and-forget — nothing downstream reads the result — but the handlers
+`await`ed it, putting a network-ish operation on the critical path of the
+offer/answer handshake, in a loop that processes one message at a time.
+
+    connected with queue ON : 0/3
+    connected with queue OFF: 3/3
+
+The answerer had the offer and simply never sent its `answer`: parked inside a
+candidate, with the one message that must not be late stuck behind a message
+that does not matter at all. Fixed by never awaiting candidate application
+anywhere. `testbed/simconnect.mjs` asks only "does it connect", both arms, N
+times — so this class of defect can never again be diagnosed from a single run
+of a five-minute rig that measures twenty other things.
+
+## Skew-aware striping: a 35 ms win it cannot yet keep
+
+With the lane skew now known to be real and not an artefact of candidate type,
+the remaining lever is the sender side: stop putting audio down lanes the
+receiver says are slow. That is built (`?pcmskewstripe=1`) and the gate for
+turning it on by default is four scenarios green on one build. Measured on
+prod build `7d76b969`:
+
+| scenario | verdict | |
+|---|---|---|
+| same route (no-op) | **PASS** | 6 lanes fast, 0 demotions, ring within 1 ms of control |
+| 24 ms divergence | **PASS** | ring 42.1 vs 65.3 ms · **m2e 104/115.6 vs 149.3/140.7 ms** · conceal 776 vs 2912 ms |
+| route flap | **PASS** | 1-2 demotions, re-promotes after the heal, no concealment spike |
+| 3 of 6 routes stalled | **FAIL** | conceal delta 1680/1800/2168 ms vs ~420 ms control, 3 runs of 3 |
+
+So it stays opt-in. A 35 ms mouth-to-ear win under realistic divergence does not
+buy the right to quadruple concealment when routes go bad.
+
+**Why it fails is the useful part.** The stall injects +5000 ms of delay, not a
+true blackhole — so the pongs still come back, and `dead` stays 0: the liveness
+signal added for exactly this case sees a perfectly healthy lane. Meanwhile the
+peer reports `peerSkew` of 0.5-1 ms, because skew is computed only from frames
+that *arrive*, and a route this bad contributes none. **A lane useless enough to
+quadruple concealment is invisible to both detectors at once.** The fix has to
+be a third signal — delivered-fraction per lane, or ring-arrival deadline misses
+attributed per lane — not a retune of the demote thresholds.
