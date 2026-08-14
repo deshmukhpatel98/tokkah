@@ -1031,6 +1031,18 @@ const l2WorkerSrc = `
   // The deadline is computed on the WORKER's own clock from a duration —
   // worker and main-thread performance.now() bases differ.
   let yieldUntil = 0, yieldTicks = 0;
+  // How long a data frame sits in q waiting for a carrier tick it is allowed to
+  // ride. This is the probe that decides where the 18.9 ms transport term lives:
+  // encode, decode and present are all at their floors, so transport is the only
+  // reducible part of glass-to-glass, and two guesses about it have already been
+  // wrong (?sendnow=1 changed nothing, a 120 Hz carrier made it worse). Ticks are
+  // not simply available -- keyDup, re-splice and parity all outrank q above, so
+  // a frame can be bumped past several of them.
+  let qWaitSum = 0, qWaitN = 0, qWaitMax = 0;
+  let xferSum = 0, xferN = 0, tickSum = 0, tickN = 0;
+  // Ticks a pending parity has already yielded to fresh media. Bounds the
+  // deferral so redundancy is delayed, never starved.
+  let parityHeld = 0, parityDeferred = 0;
   // #23 retention ring + re-splice queue: the receiver asks for specific lost
   // ids (fragreq) when parity alone cannot close a gap (the parity packet died
   // with its data). Re-spliced frames keep their original id and wire format;
@@ -1047,7 +1059,12 @@ const l2WorkerSrc = `
     // going missing, a hole the receiver can only repair with a keyframe.
     // 12 keeps the gate the only drop point through a 400 ms pre-stall
     // (~12 frames at 30 fps), which is exactly the case that stressed 6.
-    if (m.type === 'frame') { q.push(m); nFromMain++; if (q.length > 12) { q.shift(); dropped++; } }
+    // Stamp ARRIVAL. qWait alone cannot say whether a frame is waiting for a
+    // carrier tick or simply waiting to reach this worker at all -- and 31% of
+    // ticks go spare, so scarcity does not explain a 17.65 ms wait. Splitting it
+    // here separates the postMessage hop (main -> worker, across a thread that
+    // is also doing parity XOR and re-splice bookkeeping) from the tick wait.
+    if (m.type === 'frame') { m.at = performance.timeOrigin + performance.now(); q.push(m); nFromMain++; if (q.length > 12) { q.shift(); dropped++; } }
     else if (m.type === 'bypass') bypass = true;
     else if (m.type === 'yield') {
       // A new window starts only when the previous one has fully elapsed —
@@ -1079,7 +1096,10 @@ const l2WorkerSrc = `
           const H = frame.type === 'key' ? 10 : 3;
           if (role === 'send') {
             nCarrier++;
-            if (nCarrier % 90 === 1) postMessage({ type: 'tick', carrier: nCarrier, fromMain: nFromMain, hasQ: !!q, fecSent, yieldTicks });
+            if (nCarrier % 90 === 1) postMessage({ type: 'tick', carrier: nCarrier, fromMain: nFromMain, hasQ: !!q, fecSent, yieldTicks,
+              qWaitAvg: qWaitN ? +(qWaitSum / qWaitN).toFixed(2) : null, qWaitMax: +qWaitMax.toFixed(1), qWaitN,
+              xferAvg: xferN ? +(xferSum / xferN).toFixed(2) : null, tickAvg: tickN ? +(tickSum / tickN).toFixed(2) : null,
+              parityDeferred });
             const car = new Uint8Array(frame.data);
             if (performance.now() < yieldUntil) {
               // Lane 0 yield: this carrier tick goes out EMPTY (the same
@@ -1126,10 +1146,30 @@ const l2WorkerSrc = `
               out.set(new Uint8Array(m.buf), H + ${L2});
               frame.data = out.buffer;
               postMessage({ type: 'sent', retx: true, id: m.id, bytes: out.length });
-            } else if (car.length >= H && fecParityPending) {
-              // Parity outranks the next data frame: it repairs a loss up to one
-              // RTT sooner than the NACK/RTX running underneath us.
+            } else if (car.length >= H && fecParityPending && (!q.length || parityHeld >= 2)) {
+              // MEDIA BEFORE REDUNDANCY -- but never redundancy starved.
+              //
+              // Parity used to outrank the data queue unconditionally, on the
+              // reasoning that it repairs a loss a full RTT sooner than the
+              // NACK/RTX underneath. True, and it costs a frame interval of
+              // latency to every frame it displaces, which was never measured.
+              // It has been now: a carrier tick is 16.7 ms (real rate 59.7/s,
+              // capped by display refresh), an unobstructed frame should wait
+              // half of one -- 8.3 ms -- and frames were measured waiting
+              // 13.8-19.0 ms. That gap IS this branch, and it is the whole
+              // reducible part of a 32 ms glass-to-glass, since capture,
+              // encode, decode and present are all at their floors.
+              //
+              // So a fresh frame now goes first. Parity is not dropped, only
+              // deferred: 31% of carrier ticks go spare, which is where
+              // redundancy belongs. The parityHeld >= 2 test bounds it at two
+              // (NOTE: no backticks in this worker source -- it is itself a
+              // template literal, and a stray one ends it mid-function. That
+              // shipped a syntax error to production for one deploy.)
+              // ticks (~33 ms) so a burst of frames cannot starve it -- the
+              // repair still lands well inside the RTT it is racing.
               fecParityPending = false;
+              parityHeld = 0;
               const out = new Uint8Array(H + ${L2} + 21 + fecLen);
               out.set(car.subarray(0, H));
               const dv = new DataView(out.buffer);
@@ -1154,6 +1194,19 @@ const l2WorkerSrc = `
               fecEmittedBase = fecBase;
             } else if (q.length && car.length >= H) {
               const m = q.shift();
+              // Same wall base main used for m.wall, so this subtraction is a
+              // real duration and not two unrelated zeros.
+              // A fresh frame just took a tick parity wanted; remember that, so the
+              // bound above can force parity through if it happens twice running.
+              if (fecParityPending) { parityHeld++; parityDeferred++; }
+              const nowW = performance.timeOrigin + performance.now();
+              const qw = nowW - m.wall;
+              if (qw >= 0 && qw < 1000) { qWaitSum += qw; qWaitN++; if (qw > qWaitMax) qWaitMax = qw; }
+              // xfer = main -> worker hop; tick = waiting here for a rideable tick.
+              const xf = m.at != null ? m.at - m.wall : null;
+              if (xf != null && xf >= 0 && xf < 1000) { xferSum += xf; xferN++; }
+              const tw = m.at != null ? nowW - m.at : null;
+              if (tw != null && tw >= 0 && tw < 1000) { tickSum += tw; tickN++; }
               fecIdleTicks = 0;
               const out = new Uint8Array(H + ${L2} + m.buf.byteLength);
               out.set(car.subarray(0, H));
@@ -1322,9 +1375,29 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
     setInterval(dirty, 16); // hidden-tab floor; rAF below is the fast path
     // Twice the data rate covers the tick that each parity fragment spends. Asked, not
     // guaranteed: the compositor caps it at the display refresh regardless.
+    // ?ctickhz=N overrides the tick rate. It exists because the carrier tick is
+    // the largest remaining term in glass-to-glass and nothing else can test it.
+    //
+    // The decomposition (live prod, 2026-08-14): capture 0.1 + encode 3.2 +
+    // TRANSPORT 18.9 + decode 1.3 + present 8.8 = 32.3 ms. Encode, decode and
+    // present are at their floors (present 8.8 ms is half a 60 Hz refresh), so
+    // transport is the whole reducible budget -- and on a rig where the audio
+    // lane shows 2.2 ms on the same wire, 18.9 ms is not the wire.
+    //
+    // Its DISTRIBUTION names it: age p50 18.0, p95 33.5, against a 33.3 ms
+    // frame interval. A uniform wait on a periodic tick predicts p50 = half the
+    // period and p95 = 0.95 of it -- 16.7 and 31.6 for 30 Hz. That is a frame
+    // sitting until the carrier next ticks. (?sendnow=1 does NOT fix it:
+    // 3072 requestFrame calls moved age 18.9 -> 18.0, i.e. nothing.)
+    //
+    // If the wait is the tick, halving the period halves the wait. This is the
+    // lever that tests that claim and, if it holds, is also the fix.
+    const askedHz = Number(cfg.l2CarrierHz);
     const carrierTicksAsked = cfg.l2FastCarrier === false
       ? 60
-      : Math.min(240, Math.max(60, (cfg.fps || 30) * 2));
+      : Number.isFinite(askedHz) && askedHz >= 60 && askedHz <= 240
+        ? Math.round(askedHz)
+        : Math.min(240, Math.max(60, (cfg.fps || 30) * 2));
     // The rAF spin exists to lift ticks past the interval floor (~59.7/s measured
     // above) — needed only when the lane wants MORE than 60. When the negotiated
     // fps fits under the floor, spinning at display refresh buys zero extra ticks
@@ -2003,6 +2076,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       L('tape-worker-err', { e: m.e });
     } else if (m.type === 'tick') {
       if (typeof m.yieldTicks === 'number') stats.l0YieldTicks = m.yieldTicks;
+      // The send-queue wait, straight from the worker: how much of `age` is a
+      // frame waiting for a carrier tick it may ride, rather than time on wire.
+      if (typeof m.qWaitAvg === 'number') stats.qWaitAvgMs = m.qWaitAvg;
+      if (typeof m.qWaitMax === 'number') stats.qWaitMaxMs = m.qWaitMax;
+      if (typeof m.xferAvg === 'number') stats.xferAvgMs = m.xferAvg;
+      if (typeof m.tickAvg === 'number') stats.tickAvgMs = m.tickAvg;
       L('tape-worker', m);
     } else if (m.type === 'boot' || m.type === 'hooked') {
       L('tape-worker', m);
@@ -3462,6 +3541,11 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         capLagP50: pct(stats.capLagMs, 50), capLagP95: pct(stats.capLagMs, 95),
         encLatP50: pct(stats.encLatMs, 50), encLatP95: pct(stats.encLatMs, 95),
         fullAgeP50: pct(stats.fullAgeMs, 50), fullAgeP95: pct(stats.fullAgeMs, 95),
+        // Splits `age` into the part spent waiting for a carrier tick and the
+        // part actually on the wire. Without this the transport term is one
+        // opaque 18.9 ms and every attempt to shrink it is a guess.
+        qWaitAvgMs: stats.qWaitAvgMs ?? null, qWaitMaxMs: stats.qWaitMaxMs ?? null,
+        xferAvgMs: stats.xferAvgMs ?? null, tickAvgMs: stats.tickAvgMs ?? null,
         presentLagP50: pct(stats.presentLagMs, 50), presentLagP95: pct(stats.presentLagMs, 95),
         // Glass-to-glass, the vision twin of the audio lane's mouthToEarMs:
         // peer camera capture → this display presents, one number for the

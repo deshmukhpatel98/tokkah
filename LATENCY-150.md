@@ -605,3 +605,75 @@ So India↔US-West needs **both** a better path *and* a shorter video pipeline,
 and neither alone is enough. That is precisely why the video floor — the audio
 floor's twin, still unestablished — is now the critical path: it is the half of
 the budget we control outright.
+
+---
+
+## The video floor, named term by term (2026-08-14)
+
+Audio's floor is credible because every term in it has a name: 20 ms OS output
+buffer + 16 ms jitter target + 8 ms framing = 48 ms. Video had no such
+accounting — only a coarse "45 ms" that turned out to be stale. Measured on live
+prod calls, current build:
+
+| term | A | B | status |
+|---|---|---|---|
+| capture → read | 0.1 | 0.1 | floor |
+| encode | 3.2 | 3.2 | floor |
+| **transport** | **18.9** | **18.3** | **the whole reducible budget** |
+| decode | 1.3 | 1.4 | floor |
+| present (decode → painted) | 8.8 | 8.6 | floor: half a 60 Hz refresh |
+| **glass-to-glass** | **32.3** | **31.6** | |
+
+The old 45 ms figure is retired: glass-to-glass is **~32 ms**, and present lag is
+8.8 ms, not the 22.2 ms recorded earlier.
+
+### Where the transport term actually goes
+
+Not on the wire. The audio lane shows age p50 of 2.2 ms on the same call over the
+same link, and per-association RTT is 0.24–0.66 ms. Two probes split it:
+
+    main thread -> worker postMessage :  0.03-0.04 ms
+    waiting for a carrier tick        : 13.8-19.0 ms   <-- all of it
+
+Video does not ride a datachannel. Encoded frames are queued to a worker and
+splice into an outgoing RTP **carrier track** driven by canvas `captureStream`,
+so a frame waits for the next tick it is allowed to ride. Measured carrier rate:
+**59.7 ticks/s** — one tick per 16.7 ms, capped by display refresh.
+
+### Three levers tested, three answers
+
+| lever | result | verdict |
+|---|---|---|
+| `?sendnow=1` — pull an extra tick per frame | 3072 requestFrame calls; age 18.9 → **18.0** | no effect |
+| `?ctickhz=120` — halve the tick period | age 18.9 → **21.1** | **worse**: the display caps emission at ~60/s, so this only burned CPU |
+| media before parity in the send ladder | tick-wait −1.3 to −2.8 ms; g2g unchanged | **kept** — strictly better, bounded, but not the win |
+
+Parity used to outrank fresh media unconditionally. It now yields, bounded at two
+ticks so redundancy is deferred and never starved (299 deferrals in a 100 s call,
+zero frames lost or gapped). It only occupies 16% of ticks, which is why the
+gain is small — the opportunity was never large.
+
+### The floor
+
+    capture 0.1 + encode 3.2 + half a tick period 8.35 + wire ~1
+      + decode 1.3 + present 8.8  =  ~23 ms
+
+**Video's floor on a 60 Hz display is ~23 ms, and we are at ~32 ms.** The 9 ms
+gap is carrier-tick phase: a frame that finishes encoding just after a tick waits
+nearly a full period rather than half of one, and encode and tick are driven by
+the same compositor, so their phases are correlated rather than random.
+
+The structural point, and the direct analogue of audio's 20 ms OS output buffer:
+**17.2 ms of the 23 ms floor is pure display-refresh quantization** — 8.35 ms
+waiting for a carrier tick, 8.8 ms waiting for vsync to paint. Both are 60 Hz
+artefacts. Neither can be optimised away inside this architecture; they can only
+be escaped by not riding a display-driven carrier at all.
+
+### Cost of this session's error
+
+Ship discipline note: a comment containing backticks was added inside
+`l2WorkerSrc`, which is itself a template literal. The stray backticks ended the
+literal and **a syntax error reached production for one deploy cycle**. It was
+caught by parsing the deployed asset, not by any test. `node --input-type=module
+--check` against BOTH the local file and the fetched prod asset is now the
+minimum gate before calling a deploy done.

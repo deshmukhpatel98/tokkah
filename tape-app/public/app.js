@@ -1401,6 +1401,13 @@ const TAPE_CFG = {
   // 59.7 ticks/s and therefore capped the lane at ~45 fps. The control arm for the
   // carrier-tick A/B; see the measurement table in tape.js at the carrier canvas.
   l2FastCarrier: QS.get('ctick') !== '0',
+  // ?ctickhz=N (60-240) sets the carrier tick rate outright, instead of letting
+  // it fall out of fps*2. At the shipped 30 fps that formula asks for 60, and a
+  // frame then waits for the next tick -- which the latency decomposition
+  // measured as 18.9 ms of a 32.3 ms glass-to-glass, the single largest and
+  // only reducible term. This is the lever that tests whether shortening the
+  // tick period shortens that wait.
+  l2CarrierHz: Number(QS.get('ctickhz')) || null,
   // ?l2rcmode=vbr forces the VBR rate-control arm even where fixed QP is available, so the
   // arm every Safari-family call actually runs can be scored with VMAF against the real
   // fixture. Unset means 'use fixed QP if the engine has it', which is the shipping path.
