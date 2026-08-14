@@ -1011,3 +1011,77 @@ COOLDOWN still bound the attempts.
 Worth stating plainly because it shaped a whole debugging session: **the user's
 own workflow is to refresh both windows after every deploy.** This bug sat
 directly on the hot path of how the project is tested.
+
+## 150 ms met, and the pipeline is at its floor (2026-08-14)
+
+Measured on deployed prod with two real browsers and real talking-head media,
+at the true Delhi ↔ Netherlands distance — 156 ms RTT, which is Cloudflare's own
+APAC↔WEUR backbone measured this session against a same-region calibration arm
+that returned 0–1 ms:
+
+```
+mouth-to-ear      125.1 / 122.7 ms          the goal was 150
+  network one-way   81.0        (RTT/2 is 78 — the audio lane adds 3 ms over raw transit)
+  jitter buffer     16.1        (target 2 frames — the PROVEN floor)
+  device output     20.0        (Chrome's OS buffer, already at latencyHint 0)
+  framing            8.0        (design constant, 384 samples at 48 kHz)
+concealment            0 ms     across the whole call, both directions
+video glass-to-glass 103.8 ms   0 lost, 3 late, no stalls, no holds
+```
+
+**Ours is 44 ms of the 125, and every term of it is already at a floor that has
+been tested rather than assumed:** the buffer at 2 frames (1 frame was tried and
+cost 328/448 ms of concealment), the output buffer at Chrome's minimum, and
+framing fixed by the 8 ms frame. There is no remaining JS lever in the audio
+pipeline that does not cost more than it saves.
+
+That leaves the network as the only pool with room in it: 81 ms one-way where
+the fibre floor for Delhi↔Amsterdam is ~40 ms. That is Cloudflare's routing plus
+the relay hop, and the relay hop is now priced — 5 ms, measured.
+
+### Direct vs relay, at the same distance
+
+```
+direct   mouth-to-ear 127.1 / 124.9    depth 18.4    concealed 8 ms
+relay    mouth-to-ear 132.3 / 131.0    depth 23.6    concealed 0 ms
+```
+
+The relay costs ~5 ms and bought zero concealment for it. **This is the relay's
+PROCESSING cost only** — the delay line in the harness is local, so it says
+nothing about a relay in the wrong region, which remains unmeasured (task #32).
+
+Worth stating plainly because it is the reason the relay is not simply removed:
+on the long path measured earlier, Cloudflare's private backbone ran at **1.64×**
+the great-circle-corrected floor while public-internet transit from Delhi ran at
+**2.14×**. Five milliseconds of relay hop is cheap against a road that is 30%
+shorter. Between two peers in the same city it would not be, and ICE already
+prefers direct there — the app has always been `p2pOnly: false`, offering STUN
+and TURN and letting ICE choose.
+
+Every call now records which road it took (`pair.path`, `pair.proto`), so this
+stops being a question that needs a special run to answer.
+
+## Two reliability defects that were costing whole calls (2026-08-14)
+
+Neither is a latency bug and both were worth more than any millisecond left.
+
+**A signaling blip ended the other person's call.** `peer-left` was broadcast the
+instant a socket closed; the peer's handler treats that as the end — "they left",
+back to the lobby, clock stopped — while the media connection underneath was
+still connected and still carrying audio and video. Across the captured Delhi
+calls, `recover {why:"ws-close"}` fired **37 times**. The room now holds that
+announcement for 5 s and cancels it if the same tab returns (`sid` is in
+sessionStorage, so it survives the recovery reload). The slot itself frees
+immediately — only the message waits — so capacity and role reuse are unchanged.
+
+**And the socket had no keepalive at all.** After the offer, answer and
+candidates are exchanged it says nothing for the rest of the call, and an idle
+TCP connection is exactly what a VPN or proxy reaps. That is the simplest
+explanation for all 37. It now pings every 25 s; the room answers it and never
+relays it.
+
+`testbed/wsblip.mjs` and `testbed/wsping.mjs` assert both, on prod, with two real
+browsers — and each has the arm that could actually fail: that a *genuine*
+departure is still reported (else the "fix" merely deleted `peer-left`), and that
+the ping is never observed on the peer's socket (recorded by wrapping
+`WebSocket` before the app sees it).
