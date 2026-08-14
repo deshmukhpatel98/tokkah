@@ -1392,12 +1392,33 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
     //
     // If the wait is the tick, halving the period halves the wait. This is the
     // lever that tests that claim and, if it holds, is also the fix.
-    const askedHz = Number(cfg.l2CarrierHz);
+    // ?ctickhz=0 is MANUAL CARRIER, and it is the one that matters.
+    //
+    // Every auto-tick rate loses the same way: captureStream(N) emits on the
+    // compositor's clock, so a frame that finishes encoding must wait for the
+    // next tick -- 8.35 ms if its phase were random, 13.8-19.0 ms as measured,
+    // because encode and compositor are driven by the same clock and their
+    // phases are correlated. Raising N does not help: the display caps emission
+    // near 60/s, so ?ctickhz=120 only burned CPU and made it WORSE (21.1 ms).
+    //
+    // captureStream(0) emits NOTHING on its own -- a frame appears only when
+    // requestFrame() asks. So the tick stops being something to wait for and
+    // becomes something the encoder triggers, and the wait is not shortened but
+    // DELETED. Ordering is safe: main->worker postMessage measured 0.03 ms
+    // against a requested tick reaching the transform ~5 ms later, so the queue
+    // is always populated first.
+    // Number(null) is 0, not NaN -- so reading the flag naively made an ABSENT
+    // ctickhz look exactly like ctickhz=0 and put every default call into manual
+    // carrier mode by accident. Guard the null before coercing.
+    const askedHz = cfg.l2CarrierHz == null ? NaN : Number(cfg.l2CarrierHz);
+    const manualCarrier = askedHz === 0;
     const carrierTicksAsked = cfg.l2FastCarrier === false
       ? 60
-      : Number.isFinite(askedHz) && askedHz >= 60 && askedHz <= 240
-        ? Math.round(askedHz)
-        : Math.min(240, Math.max(60, (cfg.fps || 30) * 2));
+      : manualCarrier
+        ? 0
+        : Number.isFinite(askedHz) && askedHz >= 60 && askedHz <= 240
+          ? Math.round(askedHz)
+          : Math.min(240, Math.max(60, (cfg.fps || 30) * 2));
     // The rAF spin exists to lift ticks past the interval floor (~59.7/s measured
     // above) — needed only when the lane wants MORE than 60. When the negotiated
     // fps fits under the floor, spinning at display refresh buys zero extra ticks
@@ -1409,8 +1430,51 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       const spin = () => { dirty(); requestAnimationFrame(spin); };
       requestAnimationFrame(spin);
     }
-    const carrierTrack = canvas.captureStream(carrierTicksAsked).getVideoTracks()[0];
-    L('carrier-ticks', { asked: carrierTicksAsked,
+    // ── the carrier track ───────────────────────────────────────────────────
+    // ?ctrack=gen replaces canvas capture with a MediaStreamTrackGenerator.
+    //
+    // THE REASON, measured rather than assumed. A canvas carrier cannot emit
+    // faster than the compositor, and no setting escapes that:
+    //   auto 60 Hz          tick wait 13.8-19.0 ms
+    //   ?ctickhz=120        WORSE (21.1 ms) -- display caps emission near 60/s
+    //   ?ctickhz=0 + requestFrame per frame   16.3/10.9 ms, i.e. no better
+    // The last one is the proof. In manual mode the carrier ran at 67.8 ticks/s
+    // against ~62 from the service interval alone, even though 30 extra frames
+    // per second were requested: the compositor COALESCES requestFrame calls
+    // into its own frame boundary. Canvas capture is compositor-bound, full
+    // stop, and roughly half a refresh of latency is the price of admission.
+    //
+    // A track generator has no compositor in it. Writing a VideoFrame delivers
+    // it to the sink immediately, so the encoder drives the wire directly and
+    // the tick wait is not shortened but removed. Feature-detected, because the
+    // fallback is simply today's behaviour.
+    const genMode = cfg.l2CarrierTrack === 'gen' && typeof MediaStreamTrackGenerator === 'function';
+    let carrierTrack, emitCarrier;
+    if (genMode) {
+      const gen = new MediaStreamTrackGenerator({ kind: 'video' });
+      const gw = gen.writable.getWriter();
+      carrierTrack = gen;
+      emitCarrier = () => {
+        try {
+          // Microseconds, monotonic: the carrier's own timestamps are never read
+          // as media time (the receiver anchors on the capture timestamp carried
+          // INSIDE the payload), they only need to advance.
+          gw.write(new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) }));
+        } catch { /* a carrier hiccup must never take the call down */ }
+      };
+      // Parity, keyframe duplicates and re-splices are not triggered by an
+      // encode, so they still need ticks of their own. Same ~60 Hz the auto
+      // carrier ran at, so redundancy and GCC's view of the stream are
+      // unchanged; the only difference is that a DATA frame no longer waits.
+      setInterval(() => { dirty(); emitCarrier(); }, 16);
+    } else {
+      carrierTrack = canvas.captureStream(carrierTicksAsked).getVideoTracks()[0];
+      emitCarrier = () => {
+        try { carrierTrack.requestFrame?.(); } catch { /* older Chrome: auto cadence carries on */ }
+      };
+      if (manualCarrier) setInterval(() => { dirty(); emitCarrier(); }, 16);
+    }
+    L('carrier-ticks', { asked: carrierTicksAsked, manual: manualCarrier,
       fastFlicker: cfg.l2FastCarrier !== false && carrierTicksAsked > 60,
       cfgFps: cfg.fps, settings: carrierTrack.getSettings?.() ?? null });
     const tx = pc.addTransceiver(carrierTrack, { direction: 'sendonly' });
@@ -1504,6 +1568,10 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
     };
     return {
       worker, carrierTrack, claimSlot, carrierTicksAsked,
+      // The encoder calls this to put a frame on the wire. With a track
+      // generator it IS the transport; with a canvas it is a requestFrame hint
+      // the compositor may coalesce away.
+      emitCarrier, genMode,
       // The sender the carrier actually flows through: the claimed slot after a
       // claim, the original transceiver before it. The fallback needs it to put
       // the camera track where the carrier clock used to be.
@@ -3123,9 +3191,15 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // the frame rides the next auto tick — today's behaviour, never worse.
     // Key-dup/parity/re-splice latency is redundancy, not media — those keep
     // riding ordinary ticks.
-    if (SENDNOW) {
+    // In MANUAL carrier mode (?ctickhz=0) this is not an optimisation, it is the
+    // only thing that emits a frame at all: captureStream(0) produces nothing on
+    // its own. That is also, in hindsight, why ?sendnow=1 measured as a complete
+    // no-op -- 3072 requestFrame calls against an auto-cadence track, where the
+    // compositor was already going to tick anyway and the request bought nothing.
+    // The same call against a zero-rate track is the whole transport.
+    if (SENDNOW || cfg.l2CarrierHz === 0 || pre.genMode) {
       stats.sendNowReqs++;
-      try { pre.carrierTrack?.requestFrame?.(); } catch { /* older Chrome: the auto cadence carries on */ }
+      try { pre.emitCarrier?.(); } catch { /* the carrier must never take the call down */ }
     }
   }
 

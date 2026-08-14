@@ -1407,7 +1407,25 @@ const TAPE_CFG = {
   // measured as 18.9 ms of a 32.3 ms glass-to-glass, the single largest and
   // only reducible term. This is the lever that tests whether shortening the
   // tick period shortens that wait.
-  l2CarrierHz: Number(QS.get('ctickhz')) || null,
+  // `|| null` would be a bug here: Number('0') is 0, which is falsy, so the most
+  // important value of this flag -- 0, meaning MANUAL carrier, the encoder
+  // triggers every frame and nothing waits for a tick -- would silently become
+  // null and fall back to the auto cadence it is meant to replace.
+  l2CarrierHz: QS.has('ctickhz') ? Number(QS.get('ctickhz')) : null,
+  // DEFAULT ON. The carrier is a MediaStreamTrackGenerator, whose frames do not
+  // pass through the compositor; `?ctrack=canvas` is the control arm.
+  //
+  // Measured on live prod, two runs per arm: glass-to-glass 32.1/31.3 and
+  // 32.3/31.6 on canvas against 26.2/25.1 and 25.1/24.5 on the generator -- a
+  // 6-7 ms win against a ~1 ms run-to-run spread, at identical bitrate
+  // (3.5 vs 3.56 Mbps), identical cadence, and zero frames lost or gapped.
+  // The mechanism shows in the tick rate: 59.7/s on canvas, 91.8/s here,
+  // because canvas capture coalesces requests into compositor frames and a
+  // generator does not.
+  //
+  // Feature-detected in tape.js, so a browser without it (Safari has no
+  // MediaStreamTrackGenerator) silently keeps today's canvas carrier.
+  l2CarrierTrack: QS.get('ctrack') || 'gen',
   // ?l2rcmode=vbr forces the VBR rate-control arm even where fixed QP is available, so the
   // arm every Safari-family call actually runs can be scored with VMAF against the real
   // fixture. Unset means 'use fixed QP if the engine has it', which is the shipping path.

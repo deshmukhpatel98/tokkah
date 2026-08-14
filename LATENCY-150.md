@@ -677,3 +677,68 @@ literal and **a syntax error reached production for one deploy cycle**. It was
 caught by parsing the deployed asset, not by any test. `node --input-type=module
 --check` against BOTH the local file and the fetched prod asset is now the
 minimum gate before calling a deploy done.
+
+---
+
+## Video: 32 ms → 25.5 ms, by taking the compositor out of the path (2026-08-14)
+
+The video floor section above named the carrier tick as the whole reducible
+budget and guessed at two fixes that failed. The third worked, and it worked by
+removing the term rather than shrinking it.
+
+**What the failures taught.** A canvas carrier cannot emit faster than the
+compositor:
+
+| arm | tick wait | why |
+|---|---|---|
+| auto 60 Hz (shipped) | 13.8–19.0 ms | one compositor frame, phase-correlated with encode |
+| `?ctickhz=120` | **21.1 ms — worse** | display caps emission near 60/s; only burned CPU |
+| `?ctickhz=0` + `requestFrame()` per frame | 16.3 / 10.9 ms | no better |
+
+The third is the proof. In manual mode the carrier ran at **67.8 ticks/s**
+against ~62 from the service interval alone, despite ~30 extra frames per second
+being explicitly requested. **`requestFrame()` does not emit a frame — it marks
+the canvas for capture at the compositor's next commit, and repeated calls
+inside one commit coalesce into one.** Canvas capture is compositor-bound at any
+setting, and about half a refresh of latency is the entry fee.
+
+**The fix: `MediaStreamTrackGenerator` as the carrier.** Writing a `VideoFrame`
+to a track generator delivers it to the sink with no compositor involved, so the
+encoder drives the wire directly. Feature-detected; `?ctrack=canvas` is the
+control arm.
+
+Measured on live prod, two runs per arm, real talking-head media both ends:
+
+| arm | carrier rate | tick wait | age p50 | **glass-to-glass** | lost/gapped | bitrate |
+|---|---|---|---|---|---|---|
+| canvas | 59.7 /s | 15.1 / 12.8 | 18.1 / 17.1 | **32.1 / 31.3** | 0 / 0 | 3.50 Mbps |
+| canvas (run 2) | — | 19.0 / 13.8 | 18.9 / 18.3 | **32.3 / 31.6** | 0 / 0 | 3.53 Mbps |
+| **generator** | **91.8 /s** | 8.3 / 6.4 | 11.9 / 12.2 | **26.2 / 25.1** | 0 / 0 | 3.56 Mbps |
+| **generator (run 2)** | — | 8.9 / 5.1 | 11.7 / 11.8 | **25.1 / 24.5** | 0 / 0 | 3.51 Mbps |
+| **shipped default** | — | 9.1 / 8.1 | 12.0 / 11.5 | **25.5 / 25.5** | 0 / 0 | — |
+
+A 6–7 ms win against a ~1 ms run-to-run spread, at identical bitrate and
+cadence, with zero frames lost or gapped and audio untouched (mouth-to-ear
+44.4 / 51 ms, concealment 0). The carrier rate is the mechanism made visible:
+59.7/s versus 91.8/s.
+
+**Cross-engine verified.** WebKit has no `MediaStreamTrackGenerator`, so it takes
+the canvas path: a real WebKit↔Chromium prod call connected with both sides
+showing real picture, concealment 0.013%, `fellBack: false`.
+
+**Two bugs found on the way, both of the same shape — a falsy zero:**
+`Number(null)` is `0`, so an ABSENT `?ctickhz` read exactly like `?ctickhz=0` and
+put every default call into manual carrier mode by accident; and
+`Number(QS.get('ctickhz')) || null` would have turned the flag's most important
+value — 0 — back into null.
+
+### Where video stands now
+
+    capture 0.1 + encode 3.2 + carrier ~8.5 + wire ~1 + decode 1.3 + present 8.8
+      = 25.5 ms measured
+
+Present lag (8.8 ms) is vsync and cannot move while the frame is painted to a
+display. The carrier term is now ~8.5 ms and is **no longer a compositor
+artefact** — it is the service interval plus contention inside the transform,
+which means it is ordinary code and not a platform floor. That is the next
+target: if it reaches ~1 ms, glass-to-glass lands near **18 ms**.
