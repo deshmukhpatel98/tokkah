@@ -60,6 +60,11 @@ const json = (body: unknown, status = 200): Response =>
 // is dropped rather than stored — see the header comment.
 const MAX_EVENTS_PER_BATCH = 2000;
 const MAX_STRING_LEN = 512;
+// How long a departure is held before the peer is told. Long enough for a tab
+// to notice its socket died, re-open one (TCP + TLS + WS upgrade, ~3 round
+// trips — 1.2 s at a 400 ms RTT) and send `join`; short enough that a genuine
+// exit is not stale on screen. See `teardown`.
+const LEAVE_GRACE_MS = 5000;
 // Keys kept per object. Was 64, which silently truncated the audio lane's own
 // snapshot: `pcm.snapshot()` spreads the transport counters first and appends
 // the playout half after them, so every field past the 64th was dropped on
@@ -124,6 +129,11 @@ export class Room implements DurableObject {
   private vers = new Map<WebSocket, number>();
   private held = new Set<WebSocket>();
   private heldTimers = new Map<WebSocket, ReturnType<typeof setTimeout>>();
+  // A departure that has not been announced yet, keyed by the tab's session id.
+  // See LEAVE_GRACE_MS and `teardown` — a signaling socket that dies and comes
+  // straight back is a blip, not a departure, and the peer should never learn
+  // about it.
+  private pendingLeaves = new Map<string, ReturnType<typeof setTimeout>>();
   private roomCode = '';
   private sql: SqlStorage;
   // §10: the room's sole time authority. Stamped once at DO creation, persisted
@@ -348,6 +358,18 @@ export class Room implements DurableObject {
   private admit(server: WebSocket, opts: { lane: number; pcm: number; sid: string | null; v: number; full: () => void }): void {
     if (this.peers.size >= this.cap(opts.v)) { opts.full(); return; }
 
+    // This tab is back inside the grace window — cancel its unsent departure so
+    // the peer never learns it was gone. See `teardown` for why that matters.
+    // Deliberately BEFORE the role assignment below, because a cancelled leave
+    // and a fresh arrival must not race for the same slot.
+    if (opts.sid) {
+      const pend = this.pendingLeaves.get(opts.sid);
+      if (pend !== undefined) {
+        clearTimeout(pend);
+        this.pendingLeaves.delete(opts.sid);
+      }
+    }
+
     // Take the FREE slot, not the next ordinal. `size === 0 ? 'a' : 'b'` looks
     // equivalent and is not: when the offerer reloads or reconnects, the
     // answerer is still holding 'b', the room is down to one occupant, and the
@@ -444,20 +466,56 @@ export class Room implements DurableObject {
       // one peer's abrupt exit, both survivors went to peers ∅ / media null.
       if (!this.peers.has(server)) return;
       const gone = this.peers.get(server);
+      const sid = this.sids.get(server); // BEFORE the delete below
       this.peers.delete(server);
       this.laneCaps.delete(server);
       this.pcmCaps.delete(server);
       this.sids.delete(server);
       this.vers.delete(server);
-      for (const [p] of this.peers) {
-        try {
-          // §4.5: `peer` is additive — old clients ignore it; new clients use
-          // it to tear down only the departed pair.
-          p.send(JSON.stringify({ type: 'peer-left', peer: gone }));
-        } catch {
-          /* ignore */
+      const announce = () => {
+        for (const [p] of this.peers) {
+          try {
+            // §4.5: `peer` is additive — old clients ignore it; new clients use
+            // it to tear down only the departed pair.
+            p.send(JSON.stringify({ type: 'peer-left', peer: gone }));
+          } catch {
+            /* ignore */
+          }
         }
-      }
+      };
+      // THE SLOT FREES NOW; ONLY THE ANNOUNCEMENT WAITS. `peers` is already
+      // updated above, so capacity, role reuse and relay are unchanged — this
+      // delays one message and nothing else.
+      //
+      // Why: a signaling socket that dies and comes straight back is a blip, and
+      // announcing it costs the OTHER side its entire call. `peer-left` puts the
+      // peer on "they left", empties its screen back to the lobby and stops the
+      // clock; the returning tab then arrives as `peer-joined` and both ends
+      // renegotiate from nothing. Measured across the captured Delhi calls on
+      // 2026-08-14: `recover {why:"ws-close"}` fired 37 times. That is 37 calls
+      // visibly ended by a control channel hiccup while the media connection
+      // underneath was still alive and carrying audio and video.
+      //
+      // `sid` lives in sessionStorage, so it survives the reload the recovery
+      // performs — the returning tab is recognisable, and `admit` cancels this
+      // timer before it fires. The peer then sees only `peer-joined`, which it
+      // already handles in place via resetForNextPeer (no reload on that side).
+      //
+      // The cost is bounded and one-directional: a GENUINE departure is
+      // announced LEAVE_GRACE_MS late. Trading a few seconds of staleness on a
+      // real exit against not ending live calls on a blip is the right side of
+      // that deal, given how often the blip actually happens.
+      if (!sid) { announce(); return; }
+      // Already back — a new socket for this tab was admitted before this close
+      // event even ran (evictAndCheckFull closes the ghost, and close is async,
+      // so this ordering is normal rather than exceptional). Nothing to say.
+      for (const [p] of this.peers) if (this.sids.get(p) === sid) return;
+      const prev = this.pendingLeaves.get(sid);
+      if (prev !== undefined) clearTimeout(prev);
+      this.pendingLeaves.set(
+        sid,
+        setTimeout(() => { this.pendingLeaves.delete(sid); announce(); }, LEAVE_GRACE_MS),
+      );
     };
     server.addEventListener('close', teardown);
     server.addEventListener('error', teardown);
