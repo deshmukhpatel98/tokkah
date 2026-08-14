@@ -382,12 +382,28 @@ export async function sampleStats(pc) {
       if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null) {
         const rtt = r.currentRoundTripTime * 1000;
         if (out.pair.rttMs == null || rtt < out.pair.rttMs) {
+          // WHICH ROAD THE CALL TOOK. Without this a latency number is not
+          // interpretable: 366 ms means one thing over a relay and something
+          // very different peer-to-peer, and until 2026-08-14 nothing in the
+          // room log recorded it — the ICE path was computed only for the
+          // health beacon, which is flag-gated, so ordinary calls left no trace
+          // of their own route. `relay/relay` is Cloudflare's TURN carrying the
+          // media; `srflx`/`host` are direct. Two cheap fields that turn "is
+          // direct faster than the relay?" from an argument into a query.
+          const L = stats.get(r.localCandidateId);
+          const R = stats.get(r.remoteCandidateId);
           out.pair = {
             rttMs: num(rtt, 2),
             availableOutgoingBitrate: r.availableOutgoingBitrate,
             availableIncomingBitrate: r.availableIncomingBitrate,
             bytesSent: r.bytesSent,
             bytesReceived: r.bytesReceived,
+            path: L?.candidateType && R?.candidateType ? `${L.candidateType}/${R.candidateType}` : null,
+            proto: L?.protocol ?? null,
+            // The relay's own location, when the media rides one. A relay in the
+            // wrong region is a hidden distance limit of exactly the kind this
+            // codebase has already paid for three times today.
+            relayProto: L?.relayProtocol ?? null,
           };
         }
       }
