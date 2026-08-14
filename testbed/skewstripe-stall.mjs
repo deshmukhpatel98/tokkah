@@ -98,6 +98,18 @@ async function getSample(p) {
       // skew and liveness are both blind to a uniformly-delayed route, so the
       // rig has to be able to see the signal that is not.
       latePct: snap.latePct ?? null,
+      // Repair accounting, to settle WHY the control arm survives this scenario.
+      // Hypothesis under test: with striping off, the six lanes carry equal
+      // shares, so three bad routes lose an even 50% that RS(10,13) plus the
+      // burst shield can largely rebuild. Demotion concentrates the survivors
+      // onto three lanes and changes the loss from evenly-spread to bursty,
+      // which is the shape erasure coding is worst at. If that is right,
+      // `fecRepaired` is far higher in the OFF arm and the fix is not "demote
+      // harder" but "stop demoting once the loss is repairable".
+      fecRepaired: snap.fecRepaired ?? null,
+      fecRepairedLate: snap.fecRepairedLate ?? null,
+      fecFailed: snap.fecFailed ?? null,
+      dupRecv: snap.dupRecv ?? null,
       stripe: snap.stripe ?? null,
       jitSpreadMaxRun: snap.jitSpreadMaxRun ?? null,
       jitSpreadMaxLate: snap.jitSpreadMaxLate ?? null,
@@ -254,8 +266,25 @@ if (!valid) {
   process.exit(2);
 }
 
+// BOTH samples, not just the last one. The concealment assert is a DELTA across
+// the stall window, so printing only t=55 hid the half of the data that says
+// what each arm was doing before the routes went bad — and that turned out to
+// matter: on one run the control had already concealed 4184 ms before the stall
+// even started, against the striping arm's 2176 ms, so an arm that looked 4x
+// worse across the window was ahead over the whole call. A rig that computes a
+// delta must show both ends of it.
+console.log('skewstripe stall ON  t=30:', JSON.stringify(on.t30));
 console.log('skewstripe stall ON  t=55:', JSON.stringify(on.t55));
+console.log('skewstripe stall OFF t=30:', JSON.stringify(off.t30));
 console.log('skewstripe stall OFF t=55:', JSON.stringify(off.t55));
+// Whole-call concealment beside the windowed delta. Not a replacement for the
+// assert — a burst of glitches the moment a route fails is a real defect even
+// if the call totals well — but the gate is uninterpretable without it.
+for (const [label, arm] of [['ON ', on], ['OFF', off]]) {
+  const tot = (arm.t55.pA.concealedMs ?? 0) + (arm.t55.pB.concealedMs ?? 0);
+  const pre = (arm.t30.pA.concealedMs ?? 0) + (arm.t30.pB.concealedMs ?? 0);
+  console.log(`whole-call conceal ${label}: ${tot} ms total (${pre} ms before the stall, ${tot - pre} ms during)`);
+}
 
 // Asserts (spec assert 10)
 
