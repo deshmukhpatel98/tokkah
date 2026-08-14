@@ -386,9 +386,35 @@ class PcmPlayout extends AudioWorkletProcessor {
       if (start < 0) { out.fill(0); return; }
       // Prime: hold playout until `target` frames are buffered. Holes in the
       // priming window are fine — they will be concealed like any other gap.
-      const target = this._target();
+      //
+      // THE SCAN MUST BE AT LEAST AS WIDE AS THE TARGET IT IS TRYING TO SATISFY.
+      // This window was a hardcoded 16 while `target` comes from the adaptive
+      // controller, so the instant the controller asked for more than 16 frames
+      // `have` could not reach `target` and priming could NEVER complete. That
+      // was latent for as long as maxTargetFrames was 15 (15 < 16, always
+      // satisfiable) and went live the same day the ceiling was raised to 32 to
+      // survive a 185 ms-spread Delhi <-> Netherlands call.
+      //
+      // It does not fail quietly, it fails ESCALATINGLY. Measured live on that
+      // call (room ilx-swig-xox, both ends):
+      //   targetFrames 32, jitWantMaxRun 32 from the very first sample
+      //   playedFrames frozen at 21 (Brave) / 16 (Safari)
+      //   concealed climbing 1000 ms per second — 100% of wall time, all held
+      //   late climbing at exactly the arrival rate: every frame rejected
+      //   depthMs -8537, ringReseeds 0
+      // The playhead advances on its own clock while priming stalls, so
+      // `lo = max(startSeq, play)` outruns the stream; every arriving frame is
+      // then late, and every late frame calls bumpTarget('late'), which pins the
+      // target at the ceiling and keeps priming impossible. The one re-anchor
+      // path in pcm.js is gated on `play < 0` — unreachable once the playhead
+      // has moved — which is why ringReseeds stayed 0 while the lane starved.
+      //
+      // So the span follows the target, and the target is clamped to what the
+      // ring can actually hold: a future ceiling change cannot recreate this.
+      const target = Math.min(RING_F - 8, this._target());
+      const span = Math.min(RING_F, target + 16);
       let have = 0;
-      for (let f = start; f < start + 16 && have < target; f++) if (this._present(f)) have++;
+      for (let f = start; f < start + span && have < target; f++) if (this._present(f)) have++;
       if (have < target) { out.fill(0); return; }
       this.pos = start * FRAME;
       this.curFrame = -1;
