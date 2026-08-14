@@ -2304,7 +2304,37 @@ function startPcmStripes(peerRole, initiator, half = 0) {
     spc.onnegotiationneeded = () =>
       tel?.log('pcm-stripe-neg', { idx, sig: spc.signalingState }); // observed, never acted on
     spc.onicecandidate = (e) => e.candidate && send({ type: 'pcm-ice', idx, candidate: e.candidate, ...addr(peerRole) });
-    spc.oniceconnectionstatechange = () => tel?.log('pcm-stripe-ice', { idx, state: spc.iceConnectionState });
+    spc.oniceconnectionstatechange = () => {
+      tel?.log('pcm-stripe-ice', { idx, state: spc.iceConnectionState });
+      // WHICH ROAD THIS STRIPE TOOK. Association 0 rides the MAIN pc; stripes
+      // 1..5 are separate peer connections that each run their own ICE, and on
+      // the real Delhi call their baseRtt sat 25-30 ms above association 0's,
+      // consistently, across 586 samples (374.9 vs 392-406 ms). Six lanes that
+      // are supposed to be interchangeable were not.
+      //
+      // That spread is not just latency, it is BUFFER: the jitter target is
+      // sized from arrival spread, so lanes that disagree by 31 ms inflate the
+      // depth for all of them. Before any of that can be fixed it has to be
+      // attributable — if the stripes are picking a different candidate type
+      // than the main pc, that is a policy bug with a policy fix; if they take
+      // the same road and are simply slower, it is the network and not ours.
+      if (spc.iceConnectionState !== 'connected') return;
+      safe(() => spc.getStats().then((st) => {
+        let best = null;
+        st.forEach((r) => {
+          if (r.type === 'candidate-pair' && r.state === 'succeeded'
+            && (r.nominated || !best)) best = r;
+        });
+        if (!best) return;
+        const L = st.get(best.localCandidateId), R = st.get(best.remoteCandidateId);
+        tel?.log('pcm-stripe-path', {
+          idx,
+          path: L?.candidateType && R?.candidateType ? `${L.candidateType}/${R.candidateType}` : null,
+          proto: L?.protocol ?? null,
+          rttMs: best.currentRoundTripTime != null ? Math.round(best.currentRoundTripTime * 1000) : null,
+        });
+      }).catch(() => {}), 'stripe.path');
+    };
     spc.onconnectionstatechange = () => tel?.log('pcm-stripe-state', { idx, state: spc.connectionState });
     if (initiator) {
       const dc = spc.createDataChannel(`pcm-audio-${idx}`, { ordered: false, maxRetransmits: 0 });
