@@ -522,6 +522,44 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     const lastFrameT = new Float64Array(PAIRS);
     let laneEpoch = 0;
 
+    // ── The third lane-health signal: frames that arrive too late to play ──────
+    //
+    // Skew and liveness together have a hole big enough to drive the whole stall
+    // failure through, and it is not a threshold that wants nudging.
+    //
+    // Liveness asks "did a pong come back". A route delayed by five seconds is
+    // not a blackhole — the pongs DO come back, five seconds later — so `dead`
+    // stays 0 and the lane reads healthy.
+    //
+    // Skew asks "how far behind the fastest lane did this lane's frames land",
+    // measured as each lane's running MINIMUM delay, deliberately re-learned
+    // after a 2 s silence so a resuming lane cannot poison the reference. Both
+    // of those are right on their own terms and both are blind here: the lane
+    // re-learns the five-second delay as its own new normal and then reports
+    // being perfectly on time relative to it. Measured on the stall rig: peer
+    // skew 0.5-1 ms on lanes whose frames were arriving far too late to use.
+    //
+    // So a lane useless enough to quadruple concealment was invisible to BOTH
+    // detectors simultaneously, and the sender kept feeding it. This is the
+    // signal that cannot be fooled that way, because it is not relative to
+    // anything the lane itself controls: a frame is late when the playhead has
+    // already passed it. `ringWrite` has always known that (`seq < lo`) and has
+    // always thrown away WHICH LANE it came from. It stops throwing that away.
+    //
+    // Decayed rather than cumulative, so a lane is judged on the last ~10 s and
+    // can be forgiven when its route heals.
+    const laneLate = new Float64Array(PAIRS);
+    const laneOnTime = new Float64Array(PAIRS);
+    const LATE_DECAY = 0.975; // per 250 ms report tick — ~10 s of memory
+    const laneLatePct = (k) => {
+      const n = laneLate[k] + laneOnTime[k];
+      // Under 20 frames of evidence (160 ms of audio) a lane has not said
+      // enough to be condemned. Reported as 0 = healthy, never as "unknown",
+      // for the same reason liveness reports a never-heard-from lane as live:
+      // absence of evidence must not cause a demotion.
+      return n < 20 ? 0 : Math.round((100 * laneLate[k]) / n);
+    };
+
     // Sender-side mirror of the peer's measured arrival skew (lane-skew Stage 1).
     // Advisory telemetry sent on T_SKEW every 250 ms so the sender can see what
     // the receiver is measuring without making routing changes yet.
@@ -529,6 +567,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let peerSkewWarm = 0;
     let peerLiveMask = 0xff;
     let peerSkewAt = 0;
+    // What the peer says about OUR sending: percent of the frames we put down
+    // each lane that reached it too late to play. Zero on a peer too old to
+    // report it, which is the value that can never cause a demotion.
+    const peerLatePct = new Uint8Array(PAIRS);
 
     // Skew-aware striping (lane-skew Stage 2, opt-in ?pcmskewstripe=1).
     // Sender demotes slow lanes based on receiver skew feedback (spec §2.1).
@@ -544,6 +586,39 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // laneRttOkStreak, and it exists for the same reason: one tick is a sample,
     // a streak is a route. See the demote rule in recomputeLaneOrder.
     const laneSkewHighStreak = new Uint16Array(PAIRS);
+    // The same, for the peer's late-fraction report. Separate counter because it
+    // is a separate claim: skew says "this lane is behind the others", lateness
+    // says "this lane's frames were unusable when they got here", and a route
+    // can do the second without ever doing the first.
+    const laneLateHighStreak = new Uint16Array(PAIRS);
+    // Was this lane demoted for LATENESS rather than for skew? It decides which
+    // evidence is allowed to promote it back, and without it the new rule was
+    // self-defeating: warmth persists for 2 s after a lane stops carrying audio,
+    // and during that window a uniformly-delayed lane still reports the ~1 ms of
+    // skew that made it invisible in the first place — so the skew clause
+    // promoted it straight back. Measured as the churn it is: 18 demotions and
+    // 15 promotions on one side of a 60 s stall run.
+    //
+    // A lane condemned by the signal that skew cannot see must not be released
+    // by skew. Only the RTT probe can, because the ping reaches demoted lanes
+    // and so is the one piece of evidence that does not depend on the traffic we
+    // just took away.
+    const laneLateDemoted = new Uint8Array(PAIRS);
+    // Percent of frames arriving too late to play that condemns a lane.
+    //
+    // Set from the measurement, not from taste. On the stall rig at the moment
+    // of sampling, healthy lanes read 0-3% and the stalled routes read 16-17%
+    // — not the ~100% the injected 5 s delay suggests, because a lane that gets
+    // demoted stops carrying audio, its reading decays toward zero, and the
+    // number is therefore a time-average over demote/probe-promote cycles
+    // rather than an instantaneous verdict. The first version of this used 25
+    // and sat ABOVE both populations, so it almost never fired: a threshold has
+    // to be placed against what the signal actually reads, not against what the
+    // fault theoretically produces.
+    //
+    // 10 leaves 3x headroom over the worst healthy reading and 1.6x margin
+    // below the worst bad one.
+    const LATE_DEMOTE_PCT = 10;
     // Decaying-min round trip per lane, kept alive by the ping on every open
     // association. Reset to Infinity whenever a lane changes state so each
     // epoch is judged on its own evidence.
@@ -702,6 +777,23 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // and a floor made of dead lanes has none.
         if (laneDead[k]) { desiredState[k] = 1; continue; }
 
+        // LATENESS DOES NOT WAIT OUT THE DWELL EITHER, and for the same reason
+        // DEAD does not: this is not "slow", it is "the audio we put here did
+        // not arrive in time to be heard", and five seconds of dwell is five
+        // more seconds of speech posted into it. It keeps MIN_FAST protection
+        // (unlike DEAD) — a floor of merely-late lanes still carries audio, and
+        // under a problem that hits every route at once the right answer is to
+        // keep striping, not to collapse onto nothing.
+        //
+        // The streak is updated for FAST lanes only. A demoted lane sends
+        // nothing, so the peer measures nothing on it and reports 0, which
+        // resets the streak on its own — the signal cannot pin a lane down the
+        // way a cumulative counter would.
+        if (LATE_DEMOTE && laneState[k] === 0) {
+          laneLateHighStreak[k] = (peerLatePct[k] >= LATE_DEMOTE_PCT) ? laneLateHighStreak[k] + 1 : 0;
+          if (laneLateHighStreak[k] >= 2) { desiredState[k] = 1; laneLateDemoted[k] = 1; continue; }
+        }
+
         if (dwellOk) {
           if (laneState[k] === 0) { // FAST
             // Skew has to HOLD, not just happen. laneBase is a running minimum
@@ -724,6 +816,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // patience inside a window whose settle budget is 10 s.
             laneSkewHighStreak[k] = (isWarm && skew >= 8.0) ? laneSkewHighStreak[k] + 1 : 0;
             if (laneSkewHighStreak[k] >= 3) desiredState[k] = 1; // DEMOTED
+
+            // THE THIRD SIGNAL. Not gated on `isWarm`, and that is the whole
+            // point: warmth is a property of the SKEW estimator (50 samples and
+            // still delivering), and the case this exists for is a lane that is
+            // warm, live, and reporting ~1 ms of skew while every frame it
+            // carries lands after the playhead has gone past. Its own guard is
+            // the 20-frame floor inside laneLatePct, which reports "not enough
+            // evidence" as 0 rather than as a verdict.
+            //
+            // Two ticks, not three. A skew gap early in a call is genuinely
+            // ambiguous — minima are still converging and the gap shrinks as
+            // they do — so that rule buys patience. A frame that arrived after
+            // its own deadline is not ambiguous and does not get better with
+            // more samples; it is already lost audio, and every extra tick of
+            // patience is another 250 ms of audio posted into a lane that
+            // cannot deliver it.
+            //
+            // (The rule itself is applied above the dwell — see the block after
+            // the DEAD check. Only the comment lives here, beside the skew rule
+            // it should be read against.)
           } else { // DEMOTED
             // A demoted lane carries no audio (measured: exactly 0 frames after
             // demotion), so its SKEW can never fall — the evidence needed to
@@ -760,7 +872,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // clause promoted every demoted lane on every dwell expiry, which is
             // the other half of the same-route cycling. Either the peer measures
             // it fast, or the ping says the route came back.
-            if ((isWarm && skew <= 4.0) || laneRttOkStreak[k] >= 3) desiredState[k] = 0; // FAST
+            // `!laneLateDemoted[k]` on the skew clause: a lane taken out for
+            // lateness is exactly a lane whose skew reads fine, so letting skew
+            // release it is letting the blind signal overrule the one that saw.
+            // The probe still frees it the moment the route genuinely recovers,
+            // so this is a narrower door, not a locked one.
+            if ((!laneLateDemoted[k] && isWarm && skew <= 4.0) || laneRttOkStreak[k] >= 3) {
+              desiredState[k] = 0; // FAST
+            }
           }
         }
       }
@@ -782,10 +901,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // leaves fewer than MIN_FAST lanes, fewer is the truth — fall-forward
           // still reaches every open association as the last resort.
           if (desiredState[k] === 1 && !laneDead[k]) {
-            demotedCandidates.push({ k, skew: peerSkewMs[k] });
+            demotedCandidates.push({ k, skew: peerSkewMs[k], late: peerLatePct[k] });
           }
         }
-        demotedCandidates.sort((a, b) => a.skew - b.skew || a.k - b.k);
+        // Ranked by LATENESS first, then skew. Sorting on skew alone was an
+        // active trap once lateness could demote: a uniformly-delayed lane
+        // reports almost no skew, so it sorted to the FRONT and the floor
+        // rescued precisely the lanes that had just been proven unable to
+        // deliver on time. The floor exists to preserve capacity, and a lane
+        // whose frames miss the playhead has none to preserve — so it is the
+        // last one drafted back, not the first.
+        demotedCandidates.sort((a, b) => a.late - b.late || a.skew - b.skew || a.k - b.k);
         const needed = MIN_FAST - fastCount;
         for (let i = 0; i < needed && i < demotedCandidates.length; i++) {
           desiredState[demotedCandidates[i].k] = 0; // force FAST
@@ -808,6 +934,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           laneStateSince[k] = tn;
           laneRttOkStreak[k] = 0;
           laneSkewHighStreak[k] = 0; // a new epoch re-earns its own evidence
+          laneLateHighStreak[k] = 0;
+          if (desiredState[k] === 0) laneLateDemoted[k] = 0; // promoted: verdict spent
           laneRttBase[k] = Infinity; // re-learn this epoch's floor from fresh pings
         }
       }
@@ -1069,7 +1197,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Returns true when the frame actually landed in the ring — the FEC path
     // uses this to separate "repaired in time" from "repaired but the playhead
     // had already passed" (both are honest; only the first one was audible).
-    function ringWrite(seq, payload, capUs, zip, skewMs = 0) {
+    // `laneIdx` is which association delivered this frame, or -1 when nothing
+    // did — FEC repairs and window-decoder reconstructions come through here
+    // too, and a frame this side INVENTED must not be credited to, or held
+    // against, any lane's punctuality.
+    function ringWrite(seq, payload, capUs, zip, skewMs = 0, laneIdx = -1) {
       if (startSeq < 0) {
         startSeq = seq;
         firstSeq = seq;
@@ -1158,9 +1290,22 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // momentary hiSeq1 of 0 for no gain.
       }
       const lo = Math.max(startSeq, play);
-      if (seq < lo) { stats.late++; bumpTarget('late'); return false; }
+      if (seq < lo) {
+        stats.late++;
+        // The playhead has already passed this frame's slot, so it will never be
+        // heard however healthy the lane that carried it looked. Attributed, at
+        // last, to the lane that was too slow to make the deadline.
+        if (laneIdx >= 0) laneLate[laneIdx]++;
+        bumpTarget('late');
+        return false;
+      }
       if (seq >= lo + RING_F) { stats.farFuture++; return false; }
       if (Atomics.load(tags, seq % RING_F) === seq) { stats.dup++; return false; }
+      // Made the deadline. Counted here rather than at the top of the function so
+      // a lane cannot look punctual by delivering duplicates of frames another
+      // lane already landed — burst-shield twins are common and prove nothing
+      // about the twin's route.
+      if (laneIdx >= 0) laneOnTime[laneIdx]++;
       // Governor input (task #47): this frame's SLACK — how many frames ahead of
       // the playhead it landed. Exact counterfactual, not a model: had the buffer
       // been (lead − 1) frames shallower, this frame would still have played.
@@ -1877,7 +2022,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       if (closed || !SKEWFB) return;
       const all = laneSkewAll();
       if (all.numWarm < 2) return;
-      const msg = new ArrayBuffer(3 + PAIRS);
+      const msg = new ArrayBuffer(3 + 2 * PAIRS);
       const dv = new DataView(msg);
       dv.setUint8(0, T_SKEW);
       dv.setUint8(1, all.warmMask & 0xff);
@@ -1894,6 +2039,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (lastFrameT[k] === 0 || (tnow - lastFrameT[k]) < 1000) liveMask |= (1 << k);
       }
       dv.setUint8(2 + PAIRS, liveMask & 0xff);
+      // Per-lane percentage of frames that arrived too late to play, then decay.
+      // Written AFTER the reading is taken so the number sent is the one just
+      // measured; the decay is what makes the next report a fresh ~10 s window
+      // rather than a cumulative verdict a healed lane can never live down.
+      for (let k = 0; k < PAIRS; k++) {
+        dv.setUint8(3 + PAIRS + k, Math.min(255, laneLatePct(k)));
+        laneLate[k] *= LATE_DECAY;
+        laneOnTime[k] *= LATE_DECAY;
+      }
       const target = assocs[0]?.dc?.readyState === 'open' ? assocs[0] : firstOpenAssoc();
       if (target?.dc?.readyState === 'open') {
         try { target.dc.send(msg); } catch { /* advisory telemetry report */ }
@@ -1997,6 +2151,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // Absent on an older peer's 8-byte report: assume every lane live, so
           // a missing field can never cause a demotion.
           peerLiveMask = data.byteLength >= 3 + PAIRS ? dv.getUint8(2 + PAIRS) : 0xff;
+          // Per-lane late percentage. Absent on any peer older than 2026-08-14,
+          // and absent must read as 0 (perfectly punctual) for the same reason
+          // liveness defaults to all-live: a field the peer cannot send is not
+          // evidence against it.
+          const haveLate = data.byteLength >= 3 + 2 * PAIRS;
+          for (let k = 0; k < PAIRS; k++) {
+            peerLatePct[k] = haveLate ? dv.getUint8(3 + PAIRS + k) : 0;
+          }
           peerSkewAt = now();
           if (SKEWSTRIPE) recomputeLaneOrder();
         }
@@ -2114,7 +2276,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // the real win needs skew-aware striping or FEC-side recovery first.
         const laneIdx = (typeof ai === 'number' && ai >= 0 && ai < PAIRS) ? ai : 0;
         const skewMs = laneSkewNow(laneIdx, seq);
-        ringWrite(seq, payload, capUs, zipped, DESKEW ? skewMs : 0);
+        ringWrite(seq, payload, capUs, zipped, DESKEW ? skewMs : 0, laneIdx);
         // The window decoder runs UNCONDITIONALLY (the flag is the sender's):
         // whether the peer protects its stream with RS or the window is its
         // choice, and this side must be able to decode either. frame() keeps a
@@ -2221,6 +2383,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Opt-IN (=== true): Skew-aware striping (lane-skew Stage 2). Sender demotes
     // slow lanes based on skew feedback.
     const SKEWSTRIPE = cfg.skewStripe === true;
+    // The late-fraction signal is always MEASURED and always REPORTED; this
+    // gates only whether it may demote a lane. See cfg.lateDemote in app.js.
+    const LATE_DEMOTE = cfg.lateDemote === true;
     // Window length is a tradeoff against SENDER CLOCK DRIFT, not just noise. d is
     // measured against our own clock, so a drifting sender makes d ramp steadily,
     // and a ramp inside the window reads as spread that no buffer needs to cover.
@@ -2851,6 +3016,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             warmMask: peerSkewWarm,
             ageMs: +(now() - peerSkewAt).toFixed(1),
           } : null,
+          // What the peer says about OUR sending: percent of frames per lane that
+          // reached it too late to play, and what we say about ITS sending. Both
+          // directions, because the stall regression was one-sided and a
+          // single-ended reading would have hidden which end was misrouting.
+          // Reported whether or not striping is on — the fleet needs to know how
+          // much of this exists before the flag can be trusted.
+          latePct: {
+            weSend: Array.from(peerLatePct),
+            weRecv: Array.from({ length: PAIRS }, (_, k) => laneLatePct(k)),
+          },
           stripe: SKEWSTRIPE ? {
             nFast,
             fastOrder: Array.from(fastOrder.subarray(0, nFast)),

@@ -1729,6 +1729,16 @@ const PCM_CFG = {
   skewfb: QS.get('skewfb') !== '0',
   // Skew-aware striping (lane-skew Stage 2): opt-in demotion of slow lanes at sender.
   skewStripe: QS.get('pcmskewstripe') === '1',
+  // Act on the late-fraction signal (demote a lane whose frames keep missing
+  // the playhead). MEASURING it is unconditional — every call reports it, which
+  // is the point, because it is the one lane-health signal a uniformly-delayed
+  // route cannot hide from. ACTING on it is separate and off, because measured
+  // 2026-08-14 the action churns: it fixed nothing in the stall scenario it was
+  // built for and pushed stage2's post-demotion leakage from 0.00% to 4.32%,
+  // over a 0.5% bar. A signal that is right and a controller that is wrong are
+  // two different things, and shipping them on one switch would have buried the
+  // first under the second.
+  lateDemote: QS.get('pcmlatedemote') === '1',
   // Peak-hold on the measured spread, so a burst is not forgotten the moment
   // the 2.56 s window rolls past it. `?pcmjithold=0` is the control arm.
   jitterHold: QS.get('pcmjithold') !== '0',

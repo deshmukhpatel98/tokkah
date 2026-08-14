@@ -92,6 +92,12 @@ async function getSample(p) {
       concealedMs: window.__tape?.pcm?.concealedMs ?? snap.concealedMs ?? null,
       laneSkew: snap.laneSkew ?? null,
       peerSkew: snap.peerSkew ?? null,
+      // The third lane-health signal (2026-08-14). `weRecv[k]` is the percent of
+      // frames arriving on lane k that missed the playhead; `weSend[k]` is what
+      // the peer reports about the lane we send on. This scenario exists because
+      // skew and liveness are both blind to a uniformly-delayed route, so the
+      // rig has to be able to see the signal that is not.
+      latePct: snap.latePct ?? null,
       stripe: snap.stripe ?? null,
       jitSpreadMaxRun: snap.jitSpreadMaxRun ?? null,
       jitSpreadMaxLate: snap.jitSpreadMaxLate ?? null,
