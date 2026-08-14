@@ -829,3 +829,53 @@ Of the ~178 ms a Delhi-Seattle glass-to-glass call costs, **88 ms is light** and
 must be paid. Of the remaining 90 ms, about 27 ms is ours to attack (7.7 ms of
 video outside the platform, ~20 ms of audio pipeline that is at its floor but
 not at zero) and roughly 64 ms is network overhead over the cable path.
+
+## Two swings at the last big terms — both correctly dead (2026-08-14)
+
+### Video over datachannels instead of RTP: a loopback illusion
+
+Video's payload rides an RTP carrier and pays 9.0 ms in the platform pipeline,
+while the audio lane rides striped datachannels on the same machine and pays
+2.2 ms. `?tape=1` selects the datachannel video lane, and on the rig it looked
+like the win of the session:
+
+    tape=1, loopback:  video transport age p50 0.6 / 0.4 ms  (p95 1.2 / 0.8)
+    tape=2, loopback:  video transport age p50 12 ms
+
+Eleven milliseconds, same 3.5 Mbps, 3151 frames, zero lost. Then the same two
+arms over an emulated Delhi-Seattle path (300 ms RTT, 1% loss):
+
+| arm | video frames received | glass-to-glass | audio |
+|---|---|---|---|
+| `tape=1` datachannel | **8**, 11 lost, age p50 **5797 ms** | collapsed | concealed 6040 ms |
+| `tape=2` RTP carrier | **2851 / 2974** | 250.7 / 259.7 ms | also degraded |
+
+**The carrier's 9 ms is not waste, it is the price of a transport that survives a
+real path** — exactly the head-of-line hazard DESIGN.md predicted for a Lane B
+burst on a long fat path. The 0.6 ms was a loopback illusion. Idea closed.
+
+### What the container harness can and cannot measure
+
+The netsim arms also showed audio concealing badly at 300 ms even with NO loss
+(11.4 s concealed, drift estimator pinned at its 2000 ppm clamp — a distortion a
+real network does not produce). So the real question was put to the real path,
+with the local joiner fixed to read `window.__tape.pcm` and `.video` the way the
+rig does rather than through a `snapshot()` call that never existed.
+
+The answer is that the question cannot be asked this way yet:
+
+    LOCAL (Delhi):  tapeMode { wanted 2, running FALSE, fellBack TRUE }
+                    assoc RTTs 83-92 SECONDS, drift pinned, concealed 135 s
+    FAR (Seattle):  ice conn FAILED, iceState disconnected
+
+The far peer's ICE **failed mid-call**. Every derived audio number above is a
+lane whose clock never synced against a peer that went away, not a measurement
+of audio at distance.
+
+**So the harness's competence is now bounded, which is worth as much as a
+result:** it measures the PATH reliably — its 305 / 337 ms agrees with the
+independent Durable Object probe's 289–303 ms — but a 2-vCPU headless container
+behind carrier NAT on a relay-only route is not a stable enough peer to measure
+MEDIA QUALITY. Earlier runs connected cleanly (6962 packets); this one failed.
+**Whether lossless audio holds up at intercontinental distance is still
+unanswered**, and answering it needs a real second machine, not this container.

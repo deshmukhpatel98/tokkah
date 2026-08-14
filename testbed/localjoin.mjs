@@ -32,14 +32,32 @@ await p.goto(`https://room.tokkah.com/${ROOM}?hb=1${QS ? '&' + QS : ''}`,
 await p.click('#join', { timeout: 30000 }).catch(() => {});
 await p.waitForTimeout(HOLD * 1000);
 
+// Read the page EXACTLY the way call.mjs does: window.__tape.pcm and
+// window.__tape.video are plain properties, not snapshot() calls. Reading them
+// any other way is how the first cross-planet runs reported nulls and left the
+// question of whether audio survives 305 ms completely unanswered.
 const snap = await p.evaluate(() => {
-  const pcm = window.__tape && window.__tape.pcm;
-  const s = pcm && typeof pcm.snapshot === 'function' ? pcm.snapshot() : pcm;
-  const lane = window.__tape?.lane?.snapshot?.() ?? null;
-  return { mouthToEarMs: s?.mouthToEarMs ?? null, ringDepthMs: s?.m2eParts?.ringDepthMs ?? null,
-           framesRecv: s?.framesRecv ?? null, concealedMs: s?.concealedMs ?? null,
-           glassToGlassMs: lane?.glassToGlassMs ?? null, ipiP50: lane?.ipiP50 ?? null,
-           assocRtt: (s?.perAssoc ?? []).map(a => a.rttMs) };
+  const t = window.__tape;
+  if (!t) return { noTape: true };
+  const s = t.pcm, v = t.video;
+  return {
+    tapeMode: t.tapeMode ?? null,
+    // The lossless audio lane. Concealment is the number that matters most:
+    // it is the audio the listener did NOT get, and the whole design is built
+    // on never producing any.
+    mouthToEarMs: s?.mouthToEarMs ?? null, concealedMs: s?.concealedMs ?? null,
+    depthMs: s?.depthMs ?? null, targetFrames: s?.targetFrames ?? null,
+    framesRecv: s?.framesRecv ?? null, lostFrames: s?.lostFrames ?? null,
+    lateFrames: s?.lateFrames ?? null, fecRepaired: s?.fecRepaired ?? null,
+    agePcmP50: s?.ageP50 ?? null, agePcmP95: s?.ageP95 ?? null,
+    driftPpm: s?.driftPpm ?? null,
+    assocRtt: (s?.perAssoc ?? []).map((a) => a.rttMs),
+    // The video lane, same shape the rig prints.
+    glassToGlassMs: v?.glassToGlassMs ?? null, fullAgeP50: v?.fullAgeP50 ?? null,
+    presentLagP50: v?.presentLagP50 ?? null, ipiP50: v?.ipiP50 ?? null,
+    framesOut: v?.framesOut ?? null, framesLost: v?.framesLost ?? null,
+    mbpsAtFps: v?.mbpsAtFps ?? null,
+  };
 });
 
 // WHICH ROUTE CARRIED IT. On a long path this is the difference between a
