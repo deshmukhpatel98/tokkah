@@ -1406,6 +1406,16 @@ const TAPE_CFG = {
   // see on a 1:1 call, and beyond which we are just building queue.
   l2RcMinMbps: Number(QS.get('l2rcmin')) || 0.6,
   l2RcMaxMbps: Number(QS.get('l2rcmax')) || 8,
+  // Floor the video budget while the AUDIO lane reports the path is clean — GCC
+  // on a 320x180 synthetic carrier is not a measurement of the link, and on a
+  // live Delhi <-> Netherlands call the two ends of the same call disagreed 8x
+  // (WebKit 72 kbps vs Chromium 573 kbps, zero loss on both). See rcPollBudget
+  // in tape.js for the full evidence. `?l2rctrust=0` is the control.
+  //
+  // `== null` rather than `|| 1.5`: the flag's most important value is 0, and
+  // `Number(null)` is 0 — the exact falsy-zero trap that has already put every
+  // default call into manual carrier mode once today.
+  l2RcTrustMbps: QS.get('l2rctrust') == null ? 1.5 : Number(QS.get('l2rctrust')),
   // QP band. 24 stays the floor, so nothing gets WORSE than today's picture on a
   // link that can afford today's bitrate; 42 is the ceiling, soft but never
   // blocky at 1080p, and reached only when the alternative is a slideshow.

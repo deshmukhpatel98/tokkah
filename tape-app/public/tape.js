@@ -2034,6 +2034,32 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // encoder alive; recovery is automatic the moment duress reads 0.
     const dd = duress?.() ?? 0;
     if (dd) rcBudgetMbps = rcClamp(rcBudgetMbps * (dd === 2 ? 0.25 : 0.5), cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
+    // GCC ON A SYNTHETIC CARRIER IS NOT A MEASUREMENT OF THE LINK. The carrier is
+    // a 320x180 placeholder and its declared size has nothing to do with the bytes
+    // spliced through it, so libwebrtc allocates from the picture it believes it is
+    // sending. Measured on a live Delhi <-> Netherlands call (2026-08-14), the two
+    // ends of the SAME call disagreed by 8x:
+    //   Safari/WebKit  targetBitrate  72 kbps, estimate below the clamp floor
+    //                  -> admitFps 4.8, achievedFps 2.7, and 1279 of 1533
+    //                     captured frames discarded at admission
+    //   Chromium       targetBitrate 573 kbps, availableOutgoingBitrate 1.73 Mbps
+    //                  -> 22.7 fps
+    // Same path, same second, no loss on either side.
+    //
+    // This is not "trust GCC less" in general — it is that we have a BETTER
+    // instrument on this exact 5-tuple. Lane A was carrying 0.74 Mbps of
+    // uncompressed audio with lossPct 0 and peerLossPct 0 at the moment GCC said
+    // 0.6. Audio duress is what caught real congestion on the Aug 7 call when GCC
+    // froze at 37 Mbps on a drowning 4G link; the inverse holds equally — with
+    // duress 0 and the audio ladder clean, an estimate collapsed to the floor is
+    // the instrument failing, not the link closing. And if that judgement is ever
+    // wrong, the duress branch directly above corrects it within 250 ms and halves
+    // or quarters the budget: the same feedback loop that already protects Lane B.
+    // `?l2rctrust=0` disables, any number sets the floor in Mbps.
+    if (!dd && cfg.l2RcTrustMbps && rcBudgetMbps < cfg.l2RcTrustMbps) {
+      rcBudgetMbps = rcClamp(cfg.l2RcTrustMbps, cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
+      stats.rcTrusted = (stats.rcTrusted | 0) + 1;
+    }
     if (dd !== stats.rcDuress) log?.('rc-duress', { level: dd, budgetMbps: +rcBudgetMbps.toFixed(2) });
     stats.rcDuress = dd;
     stats.rcBudgetMbps = +rcBudgetMbps.toFixed(2);
