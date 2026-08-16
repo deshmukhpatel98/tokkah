@@ -29,7 +29,12 @@ const SAMPLE_MS = 2000;
 
 const ARMS = {
   // The shipped defaults: ladder + measured stepper + low-light + revival.
-  default: '',
+  // `rig=1` is not read by the app — any non-`r` query key marks the page as
+  // a harness and silences the fleet health beacon. The real phone drives
+  // Chrome over CDP with NO automation flag, so navigator.webdriver is false
+  // and, without this, every driven run would land in fleet stats as a real
+  // user's call (measured: the emulator lane put its 400-1000 ms m2e there).
+  default: 'rig=1',
   // Everything off. The control arm exists so a "fix" that changed nothing is
   // visible as changing nothing (measure-before-claiming).
   control: 'ladder=0&lowlight=0&revive=0',

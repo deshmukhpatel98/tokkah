@@ -25,7 +25,7 @@ const D = await chromium.launch({
 const d = await D.newPage();
 
 for (const [pg, who] of [[p, 'android'], [d, 'desktop']]) {
-  await pg.goto(`${BASE}/?r=${ROOM}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await pg.goto(`${BASE}/?r=${ROOM}&rig=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await pg.waitForSelector('#join', { timeout: 30000 });
   const cam = await pg.waitForFunction(() => /ready|blocked/.test(document.getElementById('previewBadge')?.textContent ?? ''), null, { timeout: 25000 })
     .then(() => pg.evaluate(() => document.getElementById('previewBadge')?.textContent)).catch(() => 'timeout');

@@ -54,7 +54,7 @@ const D = await chromium.launch({
 try {
   const d = await D.newPage();
   for (const [p, who] of [[a, 'android'], [d, 'desktop']]) {
-    await p.goto(`${BASE}/?r=${ROOM}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await p.goto(`${BASE}/?r=${ROOM}&rig=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await p.waitForSelector('#join', { timeout: 30000 });
     // The M13 lesson, and it holds on the emulator too: joining before the
     // lobby badge says 'camera ready' puts the app in audio-only for the whole

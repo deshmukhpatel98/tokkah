@@ -7,7 +7,7 @@ const ctx = b.contexts()[0];
 await ctx.grantPermissions(['camera', 'microphone'], { origin: 'https://room.tokkah.com' }).catch(() => {});
 const p = await ctx.newPage();
 p.on('response', (r) => { if (r.status() >= 400) console.log(`[http ${r.status()}] ${r.request().method()} ${r.url()}`); });
-await p.goto('https://room.tokkah.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+await p.goto('https://room.tokkah.com/?rig=1', { waitUntil: 'domcontentloaded', timeout: 60000 });
 await p.waitForTimeout(6000);
 const res = await p.evaluate(() => Promise.race([
   (async () => {
