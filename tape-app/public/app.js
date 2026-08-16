@@ -1072,6 +1072,17 @@ let lowlightResultTimer = null;
 let reviveTimes = []; // attempt timestamps inside the 60 s window
 let reviveStallMs = 0; // accumulated zero-delivery time
 let reviveBusy = false; // one revival/re-acquire in flight at a time
+// Hard-death recovery (the ilx-swig-xox call, 2026-08-16): a track whose
+// readyState went 'ended' — Android's "Source failed to restart" — used to
+// fall through reviveEval's live-track guard and stay dead for the rest of
+// the call. Now it re-acquires, with two protections: the ended state must
+// PERSIST (a camera flip legitimately ends the old track for a moment, and
+// racing its getUserMedia on one sensor is a known HAL killer), and failures
+// back off exponentially so a camera the OS still holds is asked again in
+// 5 s, not hammered every probe tick.
+let trackEndedMs = 0; // how long the current track has been 'ended'
+let reacquireNextAt = 0; // earliest time the next re-acquire may fire
+let reacquireDelayMs = 5000; // doubles per failure, capped at 30 s
 
 /** The constraint ask of the tier currently in effect (post any devstep). */
 function currentCaptureAsk() {
@@ -1217,10 +1228,23 @@ async function lowlightExit(track, luma, fpsBefore) {
 function reviveEval(fps, dtMs) {
   if (!REVIVE_ON || !srcProbe || reviveBusy || fps == null) return;
   const track = srcProbe.track;
+  // A dead track has nothing to revive — applyConstraints on it is a no-op.
+  // Re-acquire instead, once the death has persisted past any in-flight flip.
+  if (track.readyState === 'ended') {
+    reviveStallMs = 0;
+    trackEndedMs += dtMs;
+    if (trackEndedMs >= 4000 && performance.now() >= reacquireNextAt) {
+      reacquireNextAt = performance.now() + reacquireDelayMs; // set BEFORE the async work
+      tel?.log('stall-reacquire', { via: 'ended', endedMs: Math.round(trackEndedMs) });
+      reacquireCamera();
+    }
+    return;
+  }
+  trackEndedMs = 0;
   // A user-disabled track (cam OFF) delivers nothing ON PURPOSE — never fight
   // the toggle. Same warmup as the stepper: a slow-starting camera at join is
   // not a stalled one.
-  if (track.readyState !== 'live' || !track.enabled || performance.now() - srcProbe.t0 < DEV_STEP_WARMUP_MS) {
+  if (!track.enabled || performance.now() - srcProbe.t0 < DEV_STEP_WARMUP_MS) {
     reviveStallMs = 0;
     return;
   }
@@ -1290,10 +1314,17 @@ async function reacquireCamera() {
     for (const t of fresh.getAudioTracks()) t.stop();
     const nv = fresh.getVideoTracks()[0];
     if (!nv) {
-      tel?.log('stall-reacquire', { ok: 0, degraded: videoDegraded ?? 'none' });
-      return; // audio-only fallback, as-is
+      // Not a terminal state anymore: the OS may hand the camera back after a
+      // thermal event or app switch. reviveEval's ended-track path will ask
+      // again, at a widening interval.
+      reacquireDelayMs = Math.min(reacquireDelayMs * 2, 30000);
+      reacquireNextAt = performance.now() + reacquireDelayMs;
+      tel?.log('stall-reacquire', { ok: 0, degraded: videoDegraded ?? 'none', retryInMs: reacquireDelayMs });
+      return; // audio-only until the next attempt
     }
     await adoptVideoTrack(nv);
+    reacquireDelayMs = 5000;
+    trackEndedMs = 0;
     tel?.log('stall-reacquire', { ok: 1, settings: pick(nv.getSettings(), ['width', 'height', 'frameRate']) });
   }, 'revive.reacquire');
 }
@@ -8236,6 +8267,14 @@ window.__tape = {
   // The whole frame-rate decision, readable from a harness: our display, theirs, and
   // which of the three inputs actually bound the send rate.
   get hz() { return { local: localHz, peerHz, peerHzRaw, target: targetFps() }; },
+  // Test hook (testbed/camdeath.mjs): hard-kill the live camera the way
+  // Android's "Source failed to restart" does — readyState 'ended', with the
+  // user's cam toggle untouched. Recovery must come from the revive machinery.
+  killCam() {
+    const t = srcProbe?.track ?? localStream?.getVideoTracks()[0];
+    t?.stop();
+    return t?.readyState ?? null;
+  },
   get srcprobe() {
     if (!srcProbe) return null;
     // `settings` and `caps` ride here so `phone-test.sh` can read the camera's
