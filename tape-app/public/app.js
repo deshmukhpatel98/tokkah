@@ -1824,6 +1824,19 @@ const PCM_CFG = {
   // a link the alternative is not lower latency, it is dropouts -- and audio
   // stays lossless before it stays fast.
   maxTargetFrames: Number(QS.get('pcmjbmax')) || 32,
+  // The number above is where the buffer STARTS refusing, no longer where it
+  // ends: on a path where concealment keeps advancing at the ceiling, the
+  // ceiling itself stretches (+8 frames per 2 s of active pain, up to 48 of
+  // the ring's 64) and relaxes back after 30 s of calm. Born from a real call
+  // (tcu-eopa-dop, 2026-08-16): 53% of frames late while half the ring sat
+  // empty above the clamp. ?pcmelastic=0 is the control arm.
+  jitterElastic: QS.get('pcmelastic') !== '0',
+  // The elastic ceiling's other half: a raised target is worthless if depth
+  // can only build at the 0.2% clock-tracking bound (~170 s for a 32->48f
+  // raise — measured: concealment identical with and without the ceiling).
+  // Widens the SLOW-DOWN side of the resampler the same graded way the drain
+  // side already was, up to 2% while the deficit exceeds 25 ms. ?pcmbuild=0.
+  jitterBuildFast: QS.get('pcmbuild') !== '0',
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
   // Backpressure is spent as a gap, never as queue: ~5 frames (~40 ms) of
   // bufferedAmount and a capture is dropped for the concealer to cover.

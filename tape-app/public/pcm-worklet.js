@@ -194,6 +194,7 @@ class PcmPlayout extends AudioWorkletProcessor {
     // process() — draining a burst-inflated buffer and tracking a sender's clock
     // are two different jobs that used to share one bound.
     this.maxDrain = (o.drainPpm ?? 20000) / 1e6; // 2%
+    this.buildFast = o.buildFast !== false; // graded BUILD widening (see process)
     this.startTarget = o.targetFrames ?? 2;
 
     if (o.sab) {
@@ -492,7 +493,21 @@ class PcmPlayout extends AudioWorkletProcessor {
     const up = excessMs <= 25
       ? this.maxDrift
       : Math.min(this.maxDrain, this.maxDrift + ((excessMs - 25) * (this.maxDrain - this.maxDrift)) / 75);
-    this.ratio = r > 1 + up ? 1 + up : r < 1 - this.maxDrift ? 1 - this.maxDrift : r;
+    // The BUILD side gets the same graded widening, for the mirror-image reason.
+    // Measured (testbed/elasticring.mjs, 2026-08-16): the elastic ceiling raised
+    // the target 32->48f under recurring 320 ms bursts and concealment did not
+    // move AT ALL — identical 963 frames in both arms — because depth toward a
+    // raised target could only build at 0.2% (2 ms/s), i.e. ~170 s to honor a
+    // raise the bursts demanded NOW. A buffer that answers "grow" a scene later
+    // is a clamp with extra steps. Below 25 ms of deficit this is byte-for-byte
+    // the old behaviour, so steady-state clock tracking is untouched; only the
+    // response to a genuinely starved buffer changes, and it heals in seconds
+    // instead of minutes. Same graded shape and the same 2% cap as the drain.
+    const deficitMs = -excessMs;
+    const down = (!this.buildFast || deficitMs <= 25)
+      ? this.maxDrift
+      : Math.min(this.maxDrain, this.maxDrift + ((deficitMs - 25) * (this.maxDrain - this.maxDrift)) / 75);
+    this.ratio = r > 1 + up ? 1 + up : r < 1 - down ? 1 - down : r;
 
     // Ring overflow: the sender is persistently faster than us past the
     // resample bound. Skipping forward is honest (counted) — letting the

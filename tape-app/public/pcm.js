@@ -478,6 +478,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // Latency governor (task #47). govTrim/govFloor are the last tick's values;
       // govTrimTicks is lever authority (how often the trim actually bound).
       govTrim: 0, govFloor: null, govPops: 0, govTrimTicks: 0, govTrimMaxRun: 0,
+      elMax: 0, elMaxRun: 0, elUps: 0, // elastic ceiling: current, run peak, raises
       // Lane 0 (§3.1 levers 3+4) — all zero with cfg.lane0 off.
       predSent: 0, predRecv: 0, predDup: 0,
       padBytesSent: 0, padMsgsSent: 0, padBytesRecv: 0, padMsgsRecv: 0,
@@ -2450,6 +2451,25 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     const HOLD_CEIL = Math.max(FRAME_MS, (cfg.maxTargetFrames - D_MARGIN_FRAMES) * FRAME_MS);
     const HOLD_CAP = cfg.holdCap !== false;
     let spreadHold = 0;
+    // ── Elastic ceiling (`?pcmelastic=0` control) ─────────────────────────────
+    // The ceiling above is a POLICY number (256 ms); the ring is a STRUCTURAL one
+    // (512 ms). On tcu-eopa-dop (2026-08-16) a bursty 28 ms-RTT path put 53% of
+    // frames behind the playhead while half the ring sat empty above the clamp —
+    // the estimator asked, the ceiling refused, the user heard concealment. So
+    // the ceiling itself now yields, but only on the governor's standard of
+    // evidence: demand alone (spread says "grow") is not enough, because spread
+    // can be a startup transient or one clump; the ceiling rises 8 frames per
+    // 2 s ONLY while concealment/lateness is ACTIVELY advancing at the current
+    // ceiling — i.e. the clamp is provably costing audio right now. It falls
+    // back stepwise after 30 s of demand fitting under the configured max, so a
+    // one-burst call is not taxed forever. Hard cap 48 of the ring's 64: the 16
+    // frames (128 ms) above it are write headroom for early arrivals, and a
+    // buffer past 384 ms is a latency defect to fix in the path, not to hide.
+    const ELASTIC = cfg.jitterElastic !== false;
+    const ELASTIC_MAX_F = 48;
+    const ELASTIC_STEP_F = 8;
+    let maxEff = cfg.maxTargetFrames;
+    let elPainSeen = 0, elLastUp = 0, elCalmMs = 0;
     // ── Latency governor (task #47, `?pcmgov=` ) ──────────────────────────────
     // The estimator sizes the buffer from arrival SPREAD; the governor audits the
     // OUTCOME. Every accepted frame reports its slack (ringWrite above); the
@@ -2605,32 +2625,59 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // arrives in a clump, and since D = arrival - seq*FRAME_MS every frame in that
       // clump gets its own elevated D. Second-largest discards one anomalous ARRIVAL;
       // it cannot discard a hole.
+      //
+      // Release per 250 ms tick. Bursts on a shaped link are rare and brief
+      // (bwQueue p95 5.6 ms against a max of 97.6), which is the argument for
+      // holding the peak at all; how long to hold it is the open question.
+      // CEILING. Above the hold ceiling the target is already pinned at
+      // the max — `ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES` has
+      // saturated — so every further millisecond of hold is memory the
+      // estimator CANNOT ACT ON, and can only pay back at JIT_RELEASE on the
+      // way down. That makes recovery time proportional to the size of the
+      // event rather than to the buffer: a 1.3 s stall (measured in this
+      // project's own rigs, twice) holds the buffer at maximum depth for
+      // ~165 s, and a 9.6 s shaped-link opening for about twenty minutes,
+      // both producing the exact same 15-frame target as a 112 ms excursion.
+      //
+      // The clamp is bit-identical on every tick where the unclamped hold is
+      // >= the ceiling, because both sides saturate to the same target. It
+      // cannot change the RESPONSE to an event, only when the estimator stops
+      // responding to one that is over: any excursion now decays in <= 14 s.
+      // Raw magnitude is still observable — jitSpreadMaxRun records unclamped
+      // `spread`, which is what a stall's size should be read from anyway.
+      //
+      // The elastic ceiling moves BEFORE the clamps read it, and its trigger is
+      // the UNCLAMPED spread — spreadHold is capped at the ceiling, so a demand
+      // read from it can never exceed the ceiling it is asking to raise.
+      if (ELASTIC) {
+        const demandF = Math.ceil(spread / FRAME_MS) + D_MARGIN_FRAMES;
+        const elPain = stats.late + (wl.lateFrames ?? 0) + (wl.concealedFrames ?? 0);
+        const painAdvanced = elPain > elPainSeen;
+        elPainSeen = elPain;
+        const tn = now();
+        if (demandF > maxEff && painAdvanced && maxEff < ELASTIC_MAX_F && tn - elLastUp >= 2000) {
+          maxEff = Math.min(ELASTIC_MAX_F, maxEff + ELASTIC_STEP_F);
+          elLastUp = tn;
+          stats.elUps++;
+          stats.elMaxRun = Math.max(stats.elMaxRun, maxEff);
+        } else if (maxEff > cfg.maxTargetFrames) {
+          if (demandF <= cfg.maxTargetFrames && !painAdvanced) {
+            elCalmMs += 250;
+            if (elCalmMs >= 30000) { maxEff -= ELASTIC_STEP_F; elCalmMs = 0; }
+          } else elCalmMs = 0;
+        }
+        stats.elMax = maxEff;
+      }
+      const holdCeil = ELASTIC
+        ? Math.max(FRAME_MS, (maxEff - D_MARGIN_FRAMES) * FRAME_MS)
+        : HOLD_CEIL;
       if (JIT_HOLD) {
-        // Release per 250 ms tick. Bursts on a shaped link are rare and brief
-        // (bwQueue p95 5.6 ms against a max of 97.6), which is the argument for
-        // holding the peak at all; how long to hold it is the open question.
-        // CEILING. Above HOLD_CEIL the target is already pinned at
-        // maxTargetFrames — `ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES` has
-        // saturated — so every further millisecond of hold is memory the
-        // estimator CANNOT ACT ON, and can only pay back at JIT_RELEASE on the
-        // way down. That makes recovery time proportional to the size of the
-        // event rather than to the buffer: a 1.3 s stall (measured in this
-        // project's own rigs, twice) holds the buffer at maximum depth for
-        // ~165 s, and a 9.6 s shaped-link opening for about twenty minutes,
-        // both producing the exact same 15-frame target as a 112 ms excursion.
-        //
-        // The clamp is bit-identical on every tick where the unclamped hold is
-        // >= HOLD_CEIL, because both sides saturate to the same target. It
-        // cannot change the RESPONSE to an event, only when the estimator stops
-        // responding to one that is over: any excursion now decays in <= 14 s.
-        // Raw magnitude is still observable — jitSpreadMaxRun records unclamped
-        // `spread`, which is what a stall's size should be read from anyway.
         spreadHold = Math.max(spread, spreadHold - JIT_RELEASE);
-        if (HOLD_CAP && spreadHold > HOLD_CEIL) spreadHold = HOLD_CEIL;
+        if (HOLD_CAP && spreadHold > holdCeil) spreadHold = holdCeil;
         if (spreadHold > stats.jitHoldMaxRun) stats.jitHoldMaxRun = +spreadHold.toFixed(1);
       } else spreadHold = spread;
       const raw = Math.max(cfg.targetFrames, Math.ceil(spreadHold / FRAME_MS) + D_MARGIN_FRAMES);
-      const want = Math.min(cfg.maxTargetFrames, raw);
+      const want = Math.min(maxEff, raw);
       if (raw > stats.jitWantMaxRun) stats.jitWantMaxRun = raw;
       if (raw > cfg.maxTargetFrames) stats.jitClampedTicks++;
       // Published so the estimator can be audited from outside. A control law whose
@@ -2726,6 +2773,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           sab: sab ?? undefined,
           targetFrames: cfg.targetFrames,
           driftPpm: cfg.driftPpm,
+          buildFast: cfg.jitterBuildFast !== false,
           aecSab: aecSab ?? undefined,
           presence: cfg.presence ? true : undefined,
           // Spatial placement: the FIRST voice is always centered (0 — the
@@ -2936,7 +2984,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           stalls: stats.stalls,
           jitSpreadMaxAtMs: stats.jitSpreadMaxAtMs, jitWarmMs: JIT_WARM,
           jitSpreadMaxLate: stats.jitSpreadMaxLate, jitSpreadMaxLateAtMs: stats.jitSpreadMaxLateAtMs,
-          jitMaxTarget: cfg.maxTargetFrames,
+          // The LIVE ceiling (elastic), not the configured one — plus the run
+          // peak and raise count, so a call that stretched and came back is
+          // distinguishable from one that never needed to.
+          jitMaxTarget: maxEff, elMaxRun: stats.elMaxRun, elUps: stats.elUps,
           // Latency governor (task #47). govOn distinguishes "off" from "on but
           // never trimmed"; govTrimTicks is the authority check demanded by
           // [[the-contradiction-was-a-dead-knob]] — an A/B where this reads 0 in
