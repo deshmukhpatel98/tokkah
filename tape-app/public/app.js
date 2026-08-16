@@ -752,6 +752,121 @@ if (SYNTH_MODE === '1' || SYNTH_MODE === 'real') {
   };
 }
 
+// ── Sensor replayer (test hook, ?sensorsim=<trace>) ─────────────────────────
+// The camera pathologies that broke real calls — the dark-room fps collapse at
+// pinned exposure, the hard death, the exposure stretch — are SENSOR physics no
+// fake device reproduces and no emulator has. But every call RECORDS them
+// (srcprobe: fps/exposure/size every 2 s), so the traces of the real failures
+// are replayable: this shim serves a canvas camera that delivers frames at the
+// trace's recorded rate, reports the trace's getSettings(), dies where the
+// real sensor died, and refuses re-acquisition for a grace period the way a
+// HAL that still holds the device does. Controllers (revive, re-acquire,
+// stepper, low-light) then run against the exact failure a user actually had,
+// automatically, on every change. Traces: /testmedia/sensor-traces.json,
+// extracted from the 2026-08-16 calls. Test-only: off unless the flag is set.
+const SENSOR_SIM = QS.get('sensorsim');
+if (SENSOR_SIM) {
+  const HOLD_MS = Number(QS.get('sensorsimhold')) || 12000; // post-death gUM refusal
+  const cv = document.createElement('canvas');
+  cv.width = 1280; cv.height = 720;
+  const g = cv.getContext('2d');
+  let fr = 0;
+  const draw = () => {
+    fr++;
+    // Dim, noisy content — the dark-room look the traces were recorded in.
+    g.fillStyle = '#101418'; g.fillRect(0, 0, cv.width, cv.height);
+    for (let i = 0; i < 48; i++) {
+      g.fillStyle = `rgb(${(i * 13 + fr * 7) % 48},${(i * 29 + fr * 3) % 48},${(i * 7 + fr * 11) % 48})`;
+      g.fillRect((i * 149 + fr * 5) % (cv.width - 60), (i * 211) % (cv.height - 60), 60, 60);
+    }
+  };
+  let trace = null;
+  const traceReady = fetch('/testmedia/sensor-traces.json')
+    .then((r) => r.json())
+    .then((all) => { trace = all[SENSOR_SIM] ?? null; if (!trace) console.warn(`sensorsim: no trace "${SENSOR_SIM}"`); })
+    .catch((e) => console.warn('sensorsim: trace fetch failed', e));
+  // Piecewise sample lookup: the value in force at replay-time `el` ms. A
+  // trace that does NOT end in a death (`dies` in the JSON) LOOPS — the
+  // recording stopped because the call ended, not because the sensor did.
+  const at = (el) => {
+    const s = trace?.samples ?? [];
+    if (!s.length) return null;
+    const dur = s.at(-1).t + 2000;
+    const t = trace.dies ? el : el % dur;
+    let cur = s[0];
+    for (const x of s) { if (x.t <= t) cur = x; else break; }
+    return cur;
+  };
+  window.__sensorsim = { name: SENSOR_SIM, applied: [], gumAsks: 0, deaths: 0, t0: 0 };
+  let deadUntil = 0;
+  // After the OS "frees the camera" (the hold expires), the real M13's sensor
+  // came back healthy on re-acquisition — so post-death tracks deliver a
+  // steady 24 fps instead of replaying the corpse. Recovery is testable.
+  let everDied = false;
+  const realGum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = async (c = {}) => {
+    window.__sensorsim.gumAsks++;
+    await traceReady;
+    const out = new MediaStream();
+    if (c.audio) {
+      // Audio stays REAL (fake-device wav): the sensor sim is about video only.
+      const a = await realGum({ audio: c.audio });
+      for (const t of a.getAudioTracks()) out.addTrack(t);
+    }
+    if (c.video) {
+      if (performance.now() < deadUntil) {
+        if (!c.audio) throw new DOMException('Could not start video source', 'NotReadableError');
+        return out; // both-asked: degrade to audio-only, like a held camera does
+      }
+      const stream = cv.captureStream(0); // frames only when requestFrame() fires
+      const track = stream.getVideoTracks()[0];
+      const t0 = performance.now();
+      window.__sensorsim.t0 = t0;
+      const healthy = everDied; // re-acquired after a death: the sensor is back
+      const tick = setInterval(() => {
+        const el = performance.now() - t0;
+        if (healthy) { if (Math.random() < 24 / 30) { draw(); stream.requestFrame?.(); } return; }
+        const cur = at(el);
+        if (!cur) return;
+        // Death: only a trace that really ended in one kills the track, at the
+        // point the real probe stopped reporting.
+        const last = trace?.samples?.at(-1);
+        if (trace?.dies && last && el > last.t + 4000) {
+          clearInterval(tick);
+          window.__sensorsim.deaths++;
+          everDied = true;
+          deadUntil = performance.now() + HOLD_MS;
+          track.stop();
+          return;
+        }
+        // Deliver at the RECORDED rate: probabilistic per 33 ms slot so 4.8
+        // recorded fps really is ~4.8 delivered fps, not a rounded 0 or 30.
+        if (Math.random() < ((cur.fps ?? 0) / 30)) { draw(); stream.requestFrame?.(); }
+      }, 33);
+      const origSettings = track.getSettings.bind(track);
+      track.getSettings = () => {
+        const cur = at(performance.now() - t0) ?? {};
+        return { ...origSettings(), width: cur.w ?? 1280, height: cur.h ?? 720,
+          frameRate: cur.fr ?? 30, exposureTime: cur.exp ?? 0, exposureMode: 'continuous', facingMode: 'user' };
+      };
+      track.getCapabilities = () => ({
+        width: { min: 160, max: 1920 }, height: { min: 120, max: 1080 },
+        frameRate: { min: 1, max: 30 }, exposureTime: { min: 3, max: 1000 },
+        exposureMode: ['continuous', 'manual'], facingMode: ['user'],
+      });
+      const origApply = track.applyConstraints?.bind(track);
+      track.applyConstraints = async (k) => {
+        // Recorded for assertions; accepted but IGNORED — exactly what the
+        // M13 did: revive's applyConstraints succeeded, delivery stayed dead.
+        window.__sensorsim.applied.push(JSON.parse(JSON.stringify(k ?? {})));
+        void origApply;
+      };
+      out.addTrack(track);
+    }
+    return out;
+  };
+}
+
 // Phones get hard ceilings the desktop path does not (task #13, room log
 // 2026-08-06): receiver-driven resolution made an Android encode 1080p60 while
 // decoding ~1080p — the device melted (2–5 fps out, 30 s of freezes per
