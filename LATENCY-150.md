@@ -1200,3 +1200,23 @@ control depth 156 ms, pain 516. Clean call unharmed (m2e 44 ms, lab-verify 6/6).
 
 Lesson repeated twice in one day: an actuator that moves the *allowance* is not
 a fix until the rig shows the *resource* following it.
+
+## 2026-08-16 (evening): the Android lane — tested from this Mac, no cable
+
+Built the emulator lane the user asked for (Pixel 7 AVD, Android 15, real
+Android Chrome driven over CDP; `testbed/emu-boot.sh` + `emucall.mjs`). First
+contact found two real product holes, both now fixed on prod:
+
+1. **Old Android Chrome (124) never starts lane 2** — no RTCRtpScriptTransform.
+   The plain-RTP fallback catches it correctly (first live verification of that
+   path on Android). Auto-updated phones are unaffected.
+2. **An engine that can't decode H.264 lost the whole lossless lane** to one
+   hardcoded codec string. Now: encoder ladder (VP9/AV1 before lower H.264
+   profiles — they keep quantizer mode) + `cfg-nak` capability answer-back.
+   Emulator↔desktop runs VP9-quantizer both ways, 30 fps out of Android.
+
+Emulator limits, so nobody re-learns them: receive-side decode+paint is
+host-bound (~5-7 fps) and the audio stack adds ~400 ms — real-silicon numbers
+come from phone-test.sh (USB) or any phone simply opening a room (lab channel
+reads exposure/fps/every stage over prod). Regressions after the ladder:
+desktop↔desktop identical, WebKit lane up at 0.009% conceal.
