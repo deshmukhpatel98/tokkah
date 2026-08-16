@@ -8,12 +8,15 @@
  * budget with no QP room, which is exactly the dark-room phone's state.
  *
  * Arms:
- *   control (?bytepace=0)  must FLOOD — output well above budget, zero brake
- *                          skips. If this arm holds the budget, the defect is
- *                          not reproduced and the fix is unproven; say so.
- *   fixed   (default)      must HOLD — output within 1.5x of the 1 Mbps budget
- *                          over the settled window, brake skips > 0, and video
- *                          still moving (achievedFps >= 0.5, the 2 s relief).
+ *   res   (default)        the shipping fix: when QP pins and bytes stay over
+ *                          budget, the encoder SHRINKS RESOLUTION (÷2 then ÷4).
+ *                          Quarter pixels ≈ quarter bytes at fixed QP, cadence
+ *                          untouched. Must HOLD the budget within 1.5x AND keep
+ *                          fps >= 20 — the whole point over frame-dropping.
+ *   nores (&rcres=0)       actuator off: must FLOOD. If this arm holds the
+ *                          budget, the defect is not reproduced and the fix is
+ *                          unproven; say so.
+ *   brake (&bytepace=1&rcres=0)  the frame-drop disproof, kept pinned.
  *
  *   node testbed/bytepace.mjs
  */
@@ -37,7 +40,7 @@ const launch = (side) => chromium.launch({
 
 const QS = 'l2rcqpmin=16&l2rcqpmax=16&l2rcmin=1&l2rcmax=1';
 
-async function arm(label, extra) {
+async function arm(label, extra, settleMs = 25000) {
   const room = `bp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
   const A = await launch('A'), B = await launch('B');
   try {
@@ -51,18 +54,19 @@ async function arm(label, extra) {
     for (const p of [a, b]) {
       await p.waitForFunction(() => window.__tape?.pc?.connectionState === 'connected', null, { timeout: 60000 });
     }
-    await a.waitForTimeout(25000); // settle: rc, pacer and brake all converged
+    await a.waitForTimeout(settleMs); // settle: rc, pacer and any actuator converged
     const read = (p) => p.evaluate(() => {
       const v = window.__tape?.video ?? {};
       return {
         mbps: v.mbpsAtFps ?? null, fps: v.achievedFps ?? null,
         rcQp: v.rcQp ?? null, budget: v.rcBudgetMbps ?? null,
         braked: v.skipBytePaced ?? null, paced: v.skipPaced ?? null,
+        shrink: v.rcResShrink ?? null, w: v.w ?? null, h: v.h ?? null,
       };
     });
     const rA = await read(a), rB = await read(b);
     for (const [who, r] of [['A', rA], ['B', rB]]) {
-      console.log(`  [${label}] ${who} mbps=${r.mbps} fps=${r.fps} qp=${r.rcQp} budget=${r.budget} braked=${r.braked} paced=${r.paced}`);
+      console.log(`  [${label}] ${who} mbps=${r.mbps} fps=${r.fps} qp=${r.rcQp} budget=${r.budget} braked=${r.braked} shrink=${r.shrink} ${r.w}x${r.h}`);
     }
     return [rA, rB];
   } finally {
@@ -70,12 +74,15 @@ async function arm(label, extra) {
   }
 }
 
-// Arms renamed after the disproof (see the header): the brake is OPT-IN now,
-// so `control` is the shipping default — which still floods, documenting the
-// OPEN defect — and `brake` exists to keep the disproof pinned: if someone
-// re-enables frame-dropping at pinned QP, this rig fails them.
-const brake = await arm('brake  ', '&bytepace=1');
-const control = await arm('default', '');
+// Three arms since the resolution actuator shipped (default ON): `res` is the
+// shipping default and must hold the budget WITHOUT giving up frame rate;
+// `nores` reproduces the open defect the actuator exists for; `brake` keeps the
+// frame-dropping disproof pinned — if someone re-enables it at pinned QP, this
+// rig fails them. `res` gets a longer settle: two demote steps take 2 s of
+// pinned-and-over each, plus a resize/keyframe and a bitrate window per step.
+const res = await arm('res    ', '', 45000);
+const nores = await arm('nores  ', '&rcres=0');
+const brake = await arm('brake  ', '&bytepace=1&rcres=0');
 
 let fails = 0;
 const check = (name, ok, detail) => {
@@ -85,10 +92,17 @@ const check = (name, ok, detail) => {
 const flood = (rs) => rs.some((r) => r.mbps != null && r.mbps > 1.8);
 const held = (rs) => rs.every((r) => r.mbps == null || r.mbps <= 1.5);
 const brakedN = (rs) => rs.reduce((s, r) => s + (r.braked | 0), 0);
-const moving = (rs) => rs.every((r) => (r.fps ?? 0) >= 0.5);
+const fpsOk = (rs) => rs.every((r) => (r.fps ?? 0) >= 20);
+const shrunk = (rs) => rs.some((r) => (r.shrink ?? 1) > 1);
 
-check('the flood reproduces on the shipping default (OPEN DEFECT)', flood(control) && brakedN(control) === 0,
-  `default mbps=${control.map((r) => r.mbps).join('/')} vs budget 1, braked=${brakedN(control)}`);
+check('the flood reproduces with the actuator off (the defect)', flood(nores),
+  `nores mbps=${nores.map((r) => r.mbps).join('/')} vs budget 1`);
+check('the actuator engages (shrink > 1)', shrunk(res),
+  `res shrink=${res.map((r) => r.shrink).join('/')} size=${res.map((r) => `${r.w}x${r.h}`).join('/')}`);
+check('resolution holds the budget', held(res),
+  `res mbps=${res.map((r) => r.mbps).join('/')} vs budget 1 (allow 1.5x)`);
+check('and keeps the video MOVING (fps >= 20) — the point over frame-dropping', fpsOk(res),
+  `res fps=${res.map((r) => r.fps).join('/')}`);
 check('the brake fires when opted in', brakedN(brake) > 0, `${brakedN(brake)} captures braked`);
 // THE DISPROOF, PINNED. At pinned QP, frame-dropping does not reduce bytes on
 // motion (each surviving frame pays for the dropped motion) — measured 15.7/9.9
@@ -96,6 +110,5 @@ check('the brake fires when opted in', brakedN(brake) > 0, `${brakedN(brake)} ca
 // changed and the brake deserves a re-hearing; until then it stays opt-in.
 check('frame-dropping still fails to hold the budget (why it is off)', !held(brake),
   `brake mbps=${brake.map((r) => r.mbps).join('/')} — not a fix, as measured`);
-void moving;
 console.log(fails === 0 ? '\nVERDICT: PASS' : `\nVERDICT: FAIL (${fails})`);
 process.exit(fails ? 1 : 0);

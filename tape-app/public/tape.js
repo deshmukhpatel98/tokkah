@@ -1790,6 +1790,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     carrierDropped: 0, // encoded tape frames superseded before a carrier tick arrived
     skipPaced: 0, // captures the AIMD pacer withheld (invisible to the reference chain)
     skipBytePaced: 0, // captures the byte brake withheld (QP pinned AND over budget)
+    rcResShrink: 1, // encode-resolution divisor the rc actuator is applying now
     sendNowReqs: 0, // ?sendnow=1: carrier ticks requested at encode output (task #41)
     admitFps: null, // last AIMD admission rate, frames/s — the pacer-following signal
     // #44 rate control. rcEstMbps is the raw GCC estimate, rcBudgetMbps what the
@@ -2045,6 +2046,63 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   const bpFloor = () => -(rcBytesEwma ?? 50_000);
   const bpCeil = () => 2 * (rcBytesEwma ?? 50_000);
 
+  // ── The actuator with real authority: RESOLUTION (task #40) ────────────────
+  //
+  // When QP pins at its ceiling and the encoder is still over budget, the brake
+  // above was the obvious response and testbed/bytepace.mjs disproved it in an
+  // hour: at constant quality, dropping frames does not drop bytes on moving
+  // content — every surviving frame pays for the dropped motion (measured
+  // 15.7 Mbps at 1.8 fps braked vs 8.3 at 30 fps unbraked). Pixels are the
+  // lever that actually moves bytes at fixed QP: quarter the pixels, roughly
+  // quarter the bytes, and the CADENCE — the thing frame-dropping destroyed —
+  // is untouched.
+  //
+  // So: a shrink factor applied where the encoder fits the camera into the
+  // configured ceiling. Demote fast (2 s of pinned-and-over is already 2 s of
+  // flood), promote slowly and only on real evidence (QP has come well off the
+  // ceiling, meaning bytes have genuine headroom at the current size — 6 QP is
+  // one halving of bitrate, so promotion roughly pays for itself). The resize
+  // itself rides the existing RESIZE_HOLD + reconfigure + keyframe machinery,
+  // which the mid-call `set w/h` lab op already proved live.
+  // ?rcres=0 is the control arm.
+  let rcResShrink = 1;            // 1 | 2 | 4 — divisor on the encode size
+  let rcResBadMs = 0;             // pinned AND over budget, accumulated
+  let rcResGoodMs = 0;            // QP slack at this size, accumulated
+  let rcResLastT = 0;
+  function rcResEval(tn) {
+    if (!cfg.l2RcRes) return;
+    const dt = rcResLastT ? Math.min(500, tn - rcResLastT) : 0;
+    rcResLastT = tn;
+    const pinned = rcQp >= cfg.l2RcQpMax - 0.5;
+    const over = rcTargetBytes != null && rcBytesEwma != null && rcBytesEwma > rcTargetBytes * 1.5;
+    if (pinned && over) {
+      rcResGoodMs = 0;
+      rcResBadMs += dt;
+      if (rcResBadMs >= 2000 && rcResShrink < 4) {
+        rcResShrink *= 2;
+        rcResBadMs = 0;
+        stats.rcResShrink = rcResShrink;
+        L('rc-res', { shrink: rcResShrink, why: 'pinned-over', qp: +rcQp.toFixed(1), ewma: Math.round(rcBytesEwma), target: Math.round(rcTargetBytes) });
+      }
+    } else {
+      rcResBadMs = 0;
+      // QP well off the ceiling = bitrate headroom of at least one halving,
+      // which is what stepping back up will cost. 10 s, so one quiet moment
+      // in the content cannot pump the resolution up and down.
+      if (rcResShrink > 1 && rcQp <= cfg.l2RcQpMax - 6) {
+        rcResGoodMs += dt;
+        if (rcResGoodMs >= 10000) {
+          rcResShrink /= 2;
+          rcResGoodMs = 0;
+          stats.rcResShrink = rcResShrink;
+          L('rc-res', { shrink: rcResShrink, why: 'headroom', qp: +rcQp.toFixed(1) });
+        }
+      } else {
+        rcResGoodMs = 0;
+      }
+    }
+  }
+
   // The budget. `availableOutgoingBitrate` is Chrome's own GCC estimate for this
   // path — it has been probing since the call connected, which is strictly more
   // than we know — so use it and clamp into the configured band. Falling back to
@@ -2185,6 +2243,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     bpTokens = Math.max(bpFloor(), bpTokens - bytes);
     if (isKey) return;
     rcBytesEwma = rcBytesEwma == null ? bytes : 0.85 * rcBytesEwma + 0.15 * bytes;
+    rcResEval(now());
     // §6.1: the worst peer's budget, because one bitstream feeds both decoders.
     const budgetMbps = gBudgetMbps();
     if (budgetMbps == null) return;
@@ -3499,7 +3558,11 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // reconfigure storm, and skipped entirely under ?upscale=1 so the control
       // arm stays a true copy of the old behaviour.
       if (!UPSCALE && encConfig) {
-        const want = fitSize(frame.displayWidth, frame.displayHeight, cfg);
+        // rcResShrink divides the CAMERA size before it is fitted to the
+        // ceiling, so a demotion flows through the exact resize machinery a
+        // camera change would use — RESIZE_HOLD debounce, reconfigure,
+        // self-describing keyframe — rather than through a second path.
+        const want = fitSize(frame.displayWidth / rcResShrink, frame.displayHeight / rcResShrink, cfg);
         if (want.width !== encConfig.width || want.height !== encConfig.height) {
           if (++resizeHold >= RESIZE_HOLD) {
             resizeHold = 0;

@@ -1546,6 +1546,10 @@ const TAPE_CFG = {
   // bytes, same QP). OFF until that actuator exists; ?bytepace=1 keeps the
   // rig's reproduction arm alive.
   l2BytePace: QS.get('bytepace') === '1',
+  // The actuator that replaced it: shrink ENCODE RESOLUTION when QP pins at
+  // its ceiling and the encoder stays over budget. Pixels move bytes at fixed
+  // QP; frame rate does not (measured, testbed/bytepace.mjs). ?rcres=0 control.
+  l2RcRes: QS.get('rcres') !== '0',
   // Budget in Mbps. Seeded from the carrier's own GCC estimate when getStats
   // offers one — Chrome has already probed this path, so that is a measurement
   // rather than a guess — and clamped into this band. The ceiling is not a
