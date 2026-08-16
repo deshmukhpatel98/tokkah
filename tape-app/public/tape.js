@@ -1839,6 +1839,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
 
   let closed = false;
   let enc = null, dec = null, gen = null, writer = null;
+  // Codec capability negotiation (Android, 2026-08-16): what the PEER told us
+  // it can decode (cfg-nak), and the receiver-side timer that bounds how long
+  // we wait for a re-laddered cfg before conceding the lane.
+  let peerDecCan = null, decNakTimer = null;
   // Mid-call resize: the config last handed to the encoder, and how many
   // consecutive frames have disagreed with its dimensions.
   let encConfig = null;
@@ -2645,6 +2649,20 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     if (!m || typeof m.t !== 'string') return;
     switch (m.t) {
       case 'cfg': setupDecoder(m).catch((e) => fail('decoder-configure', e)); break;
+      case 'cfg-nak': {
+        // The peer cannot decode what we picked. Re-run the encoder ladder
+        // constrained to what it CAN, and open the new stream on a keyframe.
+        if (!Array.isArray(m.can) || !m.can.length) break;
+        peerDecCan = m.can.map(String);
+        L('tape-cfg-renegotiate', { peerCan: peerDecCan, had: encConfig?.codec ?? null });
+        if (encConfig && !peerDecCan.includes(encConfig.codec)) {
+          try { enc?.close(); } catch { /* already closed */ }
+          enc = null;
+          encConfig = null;
+          setupEncoder().then(() => armKey()).catch((e) => fail('encoder-setup', e));
+        }
+        break;
+      }
       case 'rot': remoteRot = ((m.rot | 0) % 360 + 360) % 360; L('tape-rot', { lane: 'rtp', dir: 'recv', rot: remoteRot }); break;
       case 'ready': remoteReady = true; L('tape-remote-ready', { lane: 'rtp' }); break;
       // §6.1: either peer may ask, and there is one encoder to ask.
@@ -3190,7 +3208,33 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       delete config.hardwareAcceleration;
       sup = await VideoDecoder.isConfigSupported(config);
     }
-    if (!sup?.supported) throw new Error(`decoder unsupported: ${m.codec}`);
+    if (!sup?.supported) {
+      // CAPABILITY ANSWER-BACK (found on Android, 2026-08-16: a build whose
+      // WebCodecs decodes VP9/AV1/VP8 but NO H.264 profile at all). The sender
+      // cannot know what we decode, so a bare failure here killed the whole
+      // lossless lane over one codec string. Instead: probe what we CAN
+      // decode, tell the sender over the same ctl channel, and give it 5 s to
+      // re-ladder before conceding the lane the old way.
+      const probe = [m.codec, 'vp09.00.10.08', 'av01.0.04M.08',
+        'avc1.4d0028', 'avc1.42e028', 'vp8'];
+      const can = [];
+      for (const c of [...new Set(probe)]) {
+        try {
+          const s = await VideoDecoder.isConfigSupported({ codec: c, codedWidth: 1920, codedHeight: 1080, optimizeForLatency: true });
+          if (s?.supported) can.push(c);
+        } catch { /* not this one */ }
+      }
+      if (can.length && !decNakTimer) {
+        L('tape-cfg-nak', { asked: m.codec, can });
+        ctlSend({ t: 'cfg-nak', can });
+        decNakTimer = setTimeout(() => {
+          if (!dec) fail('decoder-configure', new Error(`decoder unsupported: ${m.codec} (nak sent, no usable cfg followed)`));
+        }, 5000);
+        return;
+      }
+      throw new Error(`decoder unsupported: ${m.codec}`);
+    }
+    if (decNakTimer) { clearTimeout(decNakTimer); decNakTimer = null; }
     ctx2d = displayCanvas
       ? displayCanvas.getContext('2d', { alpha: false, desynchronized: true })
       : null;
@@ -3308,22 +3352,53 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // not what WebKit costs. Those are two questions and answering them together would leave
     // neither answered.
     let quantizerOk = cfg.l2RcMode !== 'vbr';
-    try {
-      if (!quantizerOk) throw new Error('forced vbr');
-      sup = await VideoEncoder.isConfigSupported(config);
-      if (!sup?.supported) quantizerOk = false;
-      else if (sup.config?.bitrateMode && sup.config.bitrateMode !== 'quantizer') quantizerOk = false;
-    } catch { quantizerOk = false; }
-    if (!quantizerOk && config.hardwareAcceleration && cfg.l2RcMode !== 'vbr') {
-      // Retry fixed QP without the hw hint before downgrading rate control:
-      // a hint the engine dislikes must not silently buy the VBR arm.
-      delete config.hardwareAcceleration;
-      try {
-        sup = await VideoEncoder.isConfigSupported(config);
-        quantizerOk = !!sup?.supported && (!sup.config?.bitrateMode || sup.config.bitrateMode === 'quantizer');
-      } catch { quantizerOk = false; }
+    // PROFILE LADDER (found on the Android emulator lane, 2026-08-16, and real
+    // for any device whose encoder tops out below High): the configured codec
+    // is avc1.640028 — H.264 High — and some MediaCodec encoders only offer
+    // Main or Constrained Baseline. Before this ladder, that single string
+    // rejection killed the ENTIRE lossless lane ("config unsupported even as
+    // VBR") and the call dropped to the plain-RTP picture (VMAF 77 vs 99.7).
+    // A lower profile costs some compression efficiency; losing the lane costs
+    // the picture. The receiver is told the NEGOTIATED codec (descSend below),
+    // so nothing downstream assumes High.
+    // Tier 1 is the configured codec — the proven default path stays
+    // byte-identical for every engine that supports it. Tier 2 exists for the
+    // engines that don't (or whose PEER said cfg-nak): VP9/AV1 come BEFORE the
+    // lower H.264 profiles because they were measured carrying quantizer mode
+    // where H.264 only offered VBR (Android, 2026-08-16) — and fixed QP is the
+    // mechanism this lane's quality comes from. The per-frame quantizer call
+    // already speaks all three codec dialects (see enc.encode below).
+    let codecLadder = [cfg.codec, 'vp09.00.10.08', 'av01.0.04M.08'];
+    if (/^avc1\./.test(cfg.codec)) {
+      const level = cfg.codec.slice(-2); // keep the configured level
+      codecLadder.push(`avc1.4d00${level}`, `avc1.42e0${level}`);
     }
-    if (!quantizerOk) {
+    codecLadder.push('vp8');
+    codecLadder = [...new Set(codecLadder)];
+    // A cfg-nak from the peer constrains the ladder to what it can decode.
+    if (peerDecCan) {
+      const allowed = codecLadder.filter((c) => peerDecCan.includes(c));
+      if (allowed.length) codecLadder = allowed;
+    }
+    const negotiate = async () => {
+      // Try fixed QP (with, then without, the hw hint), then VBR the same way.
+      let qOk = cfg.l2RcMode !== 'vbr';
+      try {
+        if (!qOk) throw new Error('forced vbr');
+        sup = await VideoEncoder.isConfigSupported(config);
+        if (!sup?.supported) qOk = false;
+        else if (sup.config?.bitrateMode && sup.config.bitrateMode !== 'quantizer') qOk = false;
+      } catch { qOk = false; }
+      if (!qOk && config.hardwareAcceleration && cfg.l2RcMode !== 'vbr') {
+        // Retry fixed QP without the hw hint before downgrading rate control:
+        // a hint the engine dislikes must not silently buy the VBR arm.
+        delete config.hardwareAcceleration;
+        try {
+          sup = await VideoEncoder.isConfigSupported(config);
+          qOk = !!sup?.supported && (!sup.config?.bitrateMode || sup.config.bitrateMode === 'quantizer');
+        } catch { qOk = false; }
+      }
+      if (qOk) return true;
       config.bitrateMode = 'variable';
       // Not a tuned number. It is the same 12 Mbps ceiling the RTP sender already
       // carries, so this arm is not quietly given a different budget than the one the
@@ -3334,8 +3409,24 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         delete config.hardwareAcceleration;
         sup = await VideoEncoder.isConfigSupported(config);
       }
-      if (!sup?.supported) throw new Error(`config unsupported even as VBR: ${cfg.codec}`);
+      return sup?.supported ? false : null; // false = vbr, null = this codec is out
+    };
+    let verdict = null;
+    for (const codec of codecLadder) {
+      // Each candidate starts from a clean slate — a prior VBR attempt must not
+      // leak its bitrateMode into the next codec's quantizer try.
+      config.codec = codec;
+      config.bitrateMode = 'quantizer';
+      delete config.bitrate;
+      if (cfg.l2Hw) config.hardwareAcceleration = cfg.l2Hw; else delete config.hardwareAcceleration;
+      verdict = await negotiate();
+      if (verdict !== null) {
+        if (codec !== cfg.codec) L('tape-codec-ladder', { asked: cfg.codec, using: codec });
+        break;
+      }
     }
+    if (verdict === null) throw new Error(`config unsupported even as VBR: ${codecLadder.join(', ')}`);
+    quantizerOk = verdict === true;
     rateControl = quantizerOk ? 'quantizer' : 'vbr';
     stats.rateControl = rateControl;
     enc = new VideoEncoder({
@@ -3353,7 +3444,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // `ctlSend`) because with §6.1's shared encoder this one description is what
     // EVERY peer's decoder is configured from — including one whose ctl channel
     // opens after this line ran (the link replays it at that half's arm).
-    descSend({ t: 'cfg', codec: cfg.codec, width: config.width, height: config.height, qp: cfg.qp });
+    // config.codec, NOT cfg.codec: the ladder may have negotiated a lower
+    // profile, and the receiver must configure its decoder for what will
+    // actually arrive.
+    descSend({ t: 'cfg', codec: config.codec, width: config.width, height: config.height, qp: cfg.qp });
   }
 
   function onEncoded(chunk) {
@@ -3481,6 +3575,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           continue;
         }
       }
+      // A cfg-nak renegotiation closes the encoder for a few microtasks; a
+      // frame arriving in that window is dropped, not a crash — the keyframe
+      // that reopens the stream makes the gap invisible.
+      if (!enc) { stats.framesSkipped++; frame.close(); continue; }
       // Admission: the carrier's consumption is the link signal on this lane (SCTP
       // bufferedAmount does not exist here). A capture is only admitted when the
       // carrier has already picked up the previous encoded frame, so every encoded
