@@ -19,7 +19,18 @@ ADB="$SDK/platform-tools/adb"
 EMU="$SDK/emulator/emulator"
 AVD="tokkah-a35"
 CDP_PORT="${CDP_PORT:-9223}"   # 9222 is the real phone's port; never collide
-PKG="com.android.chrome"
+# Prefer the sideloaded Chromium ToT (current WebCodecs — the lane under test);
+# the preinstalled Chrome 124 stays available as the old-Android arm via
+# PKG=com.android.chrome ./testbed/emu-boot.sh
+PKG="${PKG:-}"
+pick_pkg() {
+  if [ -n "$PKG" ]; then return; fi
+  if "$ADB" -s emulator-5554 shell pm path org.chromium.chrome >/dev/null 2>&1; then
+    PKG="org.chromium.chrome"
+  else
+    PKG="com.android.chrome"
+  fi
+}
 
 say() { printf '  %s\n' "$*"; }
 die() { printf '\n  x %s\n' "$1" >&2; exit "${2:-1}"; }
@@ -36,8 +47,19 @@ fi
 # ── 1. boot, unless already up ────────────────────────────────────────────────
 if ! "$ADB" devices | grep -q "^emulator-5554[[:space:]]*device"; then
   say "booting $AVD headless"
-  nohup "$EMU" -avd "$AVD" -no-window -no-audio -no-boot-anim \
-    -camera-back virtualscene -camera-front emulated \
+  # WEBCAM=1 passes the Mac's REAL sensor (webcam0) through Android's camera
+  # HAL as the front camera — real light, real auto-exposure, a real lens.
+  # OPT-IN, not default: booting with webcam0 while macOS denies the emulator
+  # camera access wedged the whole GUEST on 2026-08-16 — cameraserver hung,
+  # system_server crashed, and PackageManager answered "Activity class does
+  # not exist" for every app including preinstalled Chrome. Grant the
+  # emulator camera access (System Settings -> Privacy & Security -> Camera)
+  # BEFORE using WEBCAM=1.
+  FRONT="emulated"
+  [ "${WEBCAM:-0}" = "1" ] && FRONT="webcam0"
+  say "front camera: $FRONT"
+  nohup "$EMU" -avd "$AVD" -no-window -no-audio -no-boot-anim -no-snapshot-load \
+    -camera-back virtualscene -camera-front "$FRONT" \
     > /tmp/tokkah-emu.log 2>&1 &
   "$ADB" wait-for-device
 fi
@@ -50,6 +72,8 @@ done
 say "booted"
 
 # ── 2. Chrome: app permissions, first-run skip, one warm start ────────────────
+pick_pkg
+say "driving $PKG"
 for p in android.permission.CAMERA android.permission.RECORD_AUDIO; do
   "$ADB" -s emulator-5554 shell pm grant "$PKG" "$p" >/dev/null 2>&1 || true
 done

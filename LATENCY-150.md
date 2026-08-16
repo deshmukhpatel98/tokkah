@@ -1220,3 +1220,27 @@ host-bound (~5-7 fps) and the audio stack adds ~400 ms — real-silicon numbers
 come from phone-test.sh (USB) or any phone simply opening a room (lab channel
 reads exposure/fps/every stage over prod). Regressions after the ladder:
 desktop↔desktop identical, WebKit lane up at 0.009% conceal.
+
+## 2026-08-16 (night): real-sensor law + the emulator webcam dead end
+
+Ritesh's standing law recorded: camera fixes are verified on REAL sensors only
+(replayed traces demoted to pre-checks). Two real-sensor routes were attempted
+from this Mac:
+
+**Mac camera → emulator (dead end, documented so nobody retries it):** the
+guest requests frames and qemu answers "Unable to obtain video frame" — and
+macOS logs show qemu NEVER reaches the TCC permission layer, so no permission
+click can fix it. Reproduced on emulator stable 36.x AND canary 37.1.11, with
+Terminal-inherited camera permission, on Darwin 27 (macOS 26). The canary
+correctly ENUMERATES the camera (real frame dims) — capture itself is what's
+broken. Side casualty: booting webcam0 unpermissioned wedged the whole guest
+once (cameraserver hang → system_server crash → PackageManager answering
+"Activity class does not exist" for every app) — hence WEBCAM=1 is opt-in in
+emu-boot.sh and boots are cold (-no-snapshot-load).
+
+**Tethered phone (the lane):** USB watcher armed; phone-test.sh drives the
+real sensor the moment a device appears. Sideload note: Chromium ToT/dev APKs
+(153, 140) install but their activities resolve as "does not exist" on the
+Android 15 image after a reboot — the emulator lane pins the WORKING config
+(preinstalled Chrome 124 fallback arm + a stable-channel Chrome for the
+current arm, TBD) rather than dev snapshots.
