@@ -1179,3 +1179,24 @@ that *arrive*, and a route this bad contributes none. **A lane useless enough to
 quadruple concealment is invisible to both detectors at once.** The fix has to
 be a third signal — delivered-fraction per lane, or ring-arrival deadline misses
 attributed per lane — not a retune of the demote thresholds.
+
+## 2026-08-16 (later): both Sunday-call defects fixed and proven on prod
+
+**Video flood at pinned QP → resolution actuator.** Frame-dropping was disproven
+(bytes follow motion, not frame count, at fixed QP). Pixels are the lever: after
+2 s pinned-and-over-budget the encode size drops ÷2 then ÷4, riding the existing
+resize machinery, promoting back after 10 s of QP headroom. Default ON, `?rcres=0`.
+Three-arm rig (testbed/bytepace.mjs): res 0.63/0.49 Mbps @ 30 fps vs nores
+8.94/6.14 @ 30 fps vs brake 15.75/9.91 @ 1.8 fps. 6/6 PASS.
+
+**Bursty path past the 256 ms buffer clamp → elastic ring, in two halves.**
+The ceiling now stretches (8f/2s while concealment actively advances, to 48f of
+the 64f ring, `?pcmelastic=0`) — and its own rig disproved the ceiling alone:
+concealment was bit-identical (963=963) because depth builds at the 0.2% clock
+bound (~170 s for a 32→48f raise). The resampler's build side now widens to 2%
+past 25 ms of deficit, mirroring the drain side (`?pcmbuild=0`). Rig verdict
+from the 2nd half of 20 recurring 320 ms holes: elastic depth 325 ms, pain 0;
+control depth 156 ms, pain 516. Clean call unharmed (m2e 44 ms, lab-verify 6/6).
+
+Lesson repeated twice in one day: an actuator that moves the *allowance* is not
+a fix until the rig shows the *resource* following it.
