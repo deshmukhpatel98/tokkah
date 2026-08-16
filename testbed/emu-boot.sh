@@ -58,7 +58,7 @@ if ! "$ADB" devices | grep -q "^emulator-5554[[:space:]]*device"; then
   FRONT="emulated"
   [ "${WEBCAM:-0}" = "1" ] && FRONT="webcam0"
   say "front camera: $FRONT"
-  nohup "$EMU" -avd "$AVD" -no-window -no-audio -no-boot-anim -no-snapshot-load \
+  nohup "$EMU" -avd "$AVD" -no-window -no-boot-anim -no-snapshot-load \
     -camera-back virtualscene -camera-front "$FRONT" \
     > /tmp/tokkah-emu.log 2>&1 &
   "$ADB" wait-for-device

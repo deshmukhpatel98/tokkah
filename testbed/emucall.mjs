@@ -97,25 +97,59 @@ try {
     check('the Android side runs the real client (UA + PCM lane)', ra.ua === 'android' && ra.mode === true,
       `ua=${ra.ua}, pcm running=${ra.mode}`);
     const tm = await Promise.all([a, d].map((p) => p.evaluate(() => window.__tape?.tapeMode ?? null)));
-    check('the LOSSLESS lane runs on both sides (no fallback)',
-      tm.every((t) => t?.running === true && !t.fellBack),
-      `android=${JSON.stringify(tm[0])} desktop=${JSON.stringify(tm[1])}`);
-    check('video flows Android -> desktop at full rate', (rd.fps ?? 0) >= 10, `desktop receives ${rd.fps} fps`);
-    // The emulator DECODES + paints in software through QEMU; measured ~5 fps
-    // receive there while encoding 30 fps out. The full-rate receive bar
-    // belongs to real silicon (phone-test.sh / the lab) — here the assertion
-    // is that the direction WORKS, and the number is printed for drift.
-    check('video flows desktop -> Android (emulator decode is host-bound)', (ra.fps ?? 0) >= 2,
-      `android receives ${ra.fps} fps`);
-    // The emulator's audio stack (QEMU + no real output device) adds ~400 ms of
-    // reported output latency that no real phone carries — so the m2e bar here
-    // is 800, and the REAL quality signal is concealment staying near zero.
-    // Real-silicon m2e keeps its own bar in the phone/lab suites.
-    check('audio is live both ways, near-zero concealment',
-      (ra.recv ?? 0) > 1000 && (rd.recv ?? 0) > 1000
-      && ra.m2e != null && ra.m2e < 800 && rd.m2e != null && rd.m2e < 300
-      && (ra.conceal ?? 9e9) < 100,
-      `android m2e=${ra.m2e}ms conceal=${ra.conceal}, desktop m2e=${rd.m2e}ms, recv=${ra.recv}/${rd.recv}`);
+    // TWO ARMS, decided by what the Android engine actually supports. Old
+    // Android Chrome (no RTCRtpScriptTransform — e.g. the emulator image's
+    // preinstalled 124) must take the plain-RTP FALLBACK and still carry
+    // video; that path is exactly what un-updated real phones get, so it is
+    // asserted, not excused. Modern engines must run the lossless lane.
+    const modern = await a.evaluate(() => 'RTCRtpScriptTransform' in window);
+    if (modern) {
+      check('the LOSSLESS lane runs on both sides (no fallback)',
+        tm.every((t) => t?.running === true && !t.fellBack),
+        `android=${JSON.stringify(tm[0])} desktop=${JSON.stringify(tm[1])}`);
+      check('video flows Android -> desktop at full rate', (rd.fps ?? 0) >= 10, `desktop receives ${rd.fps} fps`);
+      // The emulator DECODES + paints in software through QEMU; measured ~5 fps
+      // receive there while encoding 30 fps out. The full-rate receive bar
+      // belongs to real silicon (phone-test.sh / the lab) — here the assertion
+      // is that the direction WORKS, and the number is printed for drift.
+      check('video flows desktop -> Android (emulator decode is host-bound)', (ra.fps ?? 0) >= 2,
+        `android receives ${ra.fps} fps`);
+    } else {
+      const rtp = await Promise.all([a, d].map((p) => p.evaluate(() => new Promise((res) => {
+        const vids = [...document.querySelectorAll('video')].filter((v) => v.srcObject && v.videoWidth > 0);
+        const v = vids.at(-1);
+        if (!v) return res({ w: 0, moving: false });
+        const t0 = v.currentTime;
+        setTimeout(() => res({ w: v.videoWidth, moving: v.currentTime > t0 }), 3000);
+      }))));
+      check('old-Android arm: the app falls back rather than breaking',
+        tm[0] && tm[0].running === false,
+        `android tapeMode=${JSON.stringify(tm[0])} (no RTCRtpScriptTransform on this Chrome)`);
+      check('old-Android arm: plain-RTP video still flows BOTH ways',
+        rtp.every((r) => r.w > 0 && r.moving),
+        `android sees ${rtp[0].w}px moving=${rtp[0].moving}, desktop sees ${rtp[1].w}px moving=${rtp[1].moving}`);
+    }
+    if (modern) {
+      // The emulator's audio stack (QEMU + virtual devices) adds ~400 ms of
+      // reported output latency that no real phone carries — so the m2e bar
+      // here is 800, and the REAL quality signal is concealment staying near
+      // zero. Real-silicon m2e keeps its own bar in the phone/lab suites.
+      check('audio is live both ways, near-zero concealment',
+        (ra.recv ?? 0) > 1000 && (rd.recv ?? 0) > 1000
+        && ra.m2e != null && ra.m2e < 800 && rd.m2e != null && rd.m2e < 300
+        && (ra.conceal ?? 9e9) < 100,
+        `android m2e=${ra.m2e}ms conceal=${ra.conceal}, desktop m2e=${rd.m2e}ms, recv=${ra.recv}/${rd.recv}`);
+    } else {
+      // The old-arm guest's clock JUMPS under QEMU (measured: desktop m2e
+      // −324 to −16797 ms — an impossible number that is the clock, not the
+      // pipe; task #47 makes the instrument refuse it). What the emulator can
+      // honestly assert here is LIVENESS and bounded concealment; latency is
+      // printed above as info only.
+      const cRate = (r) => (r.recv ? (r.conceal ?? 0) / r.recv : 1);
+      check('old-Android arm: audio live both ways, concealment bounded',
+        (ra.recv ?? 0) > 1000 && (rd.recv ?? 0) > 1000 && cRate(ra) < 0.3 && cRate(rd) < 0.3,
+        `recv=${ra.recv}/${rd.recv}, conceal ${(100 * cRate(ra)).toFixed(1)}%/${(100 * cRate(rd)).toFixed(1)}% (guest-clock m2e untrustworthy here)`);
+    }
     // Not a hard gate — the emulator adds its own latency — but the number
     // must be PRINTED so drift across sessions is visible.
     console.log(`  [info] android glass-to-glass ${ra.g2g}ms, mouth-to-ear ${ra.m2e}ms (emulator overhead included)`);
