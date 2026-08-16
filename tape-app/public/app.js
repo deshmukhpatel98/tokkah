@@ -1533,6 +1533,19 @@ const TAPE_CFG = {
   // resolve detail, and where dropped frames are most obvious. Frame rate
   // becomes the last thing to give, not the first.
   l2Rc: QS.get('l2rc') !== '0',
+  // Byte brake at admission: when the QP controller is pinned at its ceiling
+  // and encoder output still exceeds the budget, skip captures. Built for the
+  // three real Sun-16 calls that flooded 2.2-4.8 Mbps against a 0.6 budget —
+  // and then DISPROVEN BY ITS OWN RIG within the hour (testbed/bytepace.mjs):
+  // at a pinned QP, dropping frames does not drop bytes on moving content,
+  // because every surviving frame pays for the motion of the frames dropped
+  // before it. Measured: control arm floods at 8.3/6.1 Mbps; the brake arm
+  // made it 15.7/9.9 Mbps at 1.8 fps — strictly worse on both axes. Frame
+  // rate is the WRONG actuator at constant quality; when QP runs out the
+  // lever with real authority is RESOLUTION (quarter the pixels, quarter the
+  // bytes, same QP). OFF until that actuator exists; ?bytepace=1 keeps the
+  // rig's reproduction arm alive.
+  l2BytePace: QS.get('bytepace') === '1',
   // Budget in Mbps. Seeded from the carrier's own GCC estimate when getStats
   // offers one — Chrome has already probed this path, so that is a measurement
   // rather than a guess — and clamped into this band. The ceiling is not a

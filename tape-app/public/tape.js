@@ -1789,6 +1789,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     fragReqRecv: 0, // fragreq messages received from the peer
     carrierDropped: 0, // encoded tape frames superseded before a carrier tick arrived
     skipPaced: 0, // captures the AIMD pacer withheld (invisible to the reference chain)
+    skipBytePaced: 0, // captures the byte brake withheld (QP pinned AND over budget)
     sendNowReqs: 0, // ?sendnow=1: carrier ticks requested at encode output (task #41)
     admitFps: null, // last AIMD admission rate, frames/s — the pacer-following signal
     // #44 rate control. rcEstMbps is the raw GCC estimate, rcBudgetMbps what the
@@ -1999,6 +2000,51 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   let rcTargetBytes = null;       // budget expressed per frame, for the log
   const rcClamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+  // ── The brake for when the QP lever runs out (2026-08-16) ───────────────────
+  //
+  // The rate controller has exactly one actuator, QP, and it is bounded at
+  // l2RcQpMax. Measured on all three of the real Sunday-morning calls (rooms
+  // mza-aabt-hmk / syg-didh-xcv / ilx-swig-xox, Mac ↔ Android): a phone camera
+  // in a dark room delivers 2-7 fps of enormous frames — low-light noise plus
+  // whole-scene deltas, ~150 KB each even at QP 42 — so the controller slams to
+  // its ceiling and STAYS over budget, 2.2-4.8 Mbps against a duress budget of
+  // 0.6. Nothing anywhere dropped a frame in response: the AIMD pacer bites on
+  // receiver age (too late, the flood is already in the network), the SCTP
+  // bufferedAmount gate sees only the local queue, and rcOnEncoded can only ask
+  // for a QP it already has. The flood put ~1000 ms of queue under BOTH
+  // directions of the call and the audio spent the whole call in duress.
+  //
+  // So: a token bucket denominated in BYTES, refilled at the video budget,
+  // spent by actual encoder output. It gates ADMISSION, but only when the QP
+  // controller is pinned at its ceiling — while QP has room, the integral loop
+  // is the right actuator and a second one would fight it (that spiral was
+  // measured; see the divisor note in rcOnEncoded). Skipped captures never
+  // reach the encoder, so the reference chain stays hole-free — same law as
+  // every other skip in this file.
+  //
+  // Two deliberate reliefs:
+  //   · a keyframe request always passes — recovery must not queue behind the
+  //     brake that exists to make recovery possible;
+  //   · at most 2 s between admitted frames — a slideshow that MOVES is the
+  //     product working as intended on a starved sensor; a frozen tile is a
+  //     failure. 1 frame / 2 s at 150 KB is 0.6 Mbps, i.e. even the relief
+  //     valve respects the duress floor.
+  // ?bytepace=0 is the control arm.
+  let bpTokens = 0;               // bytes available to spend; deficit = over budget
+  let bpLastAt = 0;
+  let bpLastAdmitAt = 0;
+  const bpRefill = () => {
+    const b = gBudgetMbps();
+    if (b == null) return null;
+    const parityShare = stats.bytesSent > 0 ? stats.parityBytes / stats.bytesSent : 0.25;
+    return (b * 1e6) / 8 / (1 + parityShare); // bytes/s the encoder may emit
+  };
+  // Deficit floor: one worst-case frame beyond the budget, so a single huge
+  // frame costs a bounded pause (~one frame's refill time) rather than an
+  // unbounded debt that freezes video long after the flood stopped.
+  const bpFloor = () => -(rcBytesEwma ?? 50_000);
+  const bpCeil = () => 2 * (rcBytesEwma ?? 50_000);
+
   // The budget. `availableOutgoingBitrate` is Chrome's own GCC estimate for this
   // path — it has been probing since the call connected, which is strictly more
   // than we know — so use it and clamp into the configured band. Falling back to
@@ -2132,7 +2178,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // 5-10x a delta frame by nature, arrive every 5 s, and letting them drive the
   // controller would ratchet QP up on a schedule rather than on evidence.
   function rcOnEncoded(bytes, isKey) {
-    if (!cfg.l2Rc || isKey) return;
+    if (!cfg.l2Rc) return;
+    // Every encoded byte spends from the bucket, keyframes included — the
+    // network carries keyframes too. (The QP integrator below still skips
+    // keyframes: their size says "keyframe", not "wrong QP".)
+    bpTokens = Math.max(bpFloor(), bpTokens - bytes);
+    if (isKey) return;
     rcBytesEwma = rcBytesEwma == null ? bytes : 0.85 * rcBytesEwma + 0.15 * bytes;
     // §6.1: the worst peer's budget, because one bitstream feeds both decoders.
     const budgetMbps = gBudgetMbps();
@@ -3399,6 +3450,30 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           continue;
         }
         paceTokens--;
+      }
+      // The byte brake (see the block above rcPollBudget). Engages ONLY when
+      // the QP controller is pinned at its ceiling and the bucket is in
+      // deficit — while QP has room, QP is the actuator. wantKey passes so
+      // recovery never queues behind the brake, and the 2 s relief keeps a
+      // starved sensor's picture moving rather than frozen.
+      if (cfg.l2BytePace && cfg.l2Rc && rcQp >= cfg.l2RcQpMax - 0.5) {
+        const tNow = now();
+        const refill = bpRefill();
+        if (refill != null) {
+          if (bpLastAt) bpTokens = Math.min(bpCeil(), bpTokens + ((tNow - bpLastAt) / 1000) * refill);
+          bpLastAt = tNow;
+          if (bpTokens < 0 && !wantKey && bpLastAdmitAt && tNow - bpLastAdmitAt < 2000) {
+            stats.skipBytePaced++;
+            stats.framesSkipped++;
+            frame.close();
+            continue;
+          }
+          bpLastAdmitAt = tNow;
+        }
+      } else {
+        // Not pinned: keep the refill clock warm so a pin that starts mid-call
+        // opens with a current bucket, not a stale one plus a huge time delta.
+        bpLastAt = now();
       }
       const maxInFlight = cfg.maxInFlight || 3;
       // §6.1: admit only when EVERY peer's carrier has a slot (max depth) and
