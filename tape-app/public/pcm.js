@@ -446,6 +446,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
+      m2eRefused: 0, // impossible mouth-to-ear readings the instrument refused to publish
       // WHEN the run-max spread happened, and the same max ignoring the first
       // JIT_WARM ms. OBSERVABILITY ONLY — the control law does not read these.
       // A single 314 ms spread pins the target at its 15-frame ceiling and, at the
@@ -3022,8 +3023,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             const age = pct(stats.ageMs, 50);
             const outL = ctx?.outputLatency != null ? ctx.outputLatency * 1000 : null;
             if (age == null || wl.depthMs == null || outL == null) return null;
-            return +(8 + age + wl.depthMs + outL).toFixed(1);
+            const v = 8 + age + wl.depthMs + outL;
+            // An impossible reading is the CLOCK lying, not the pipe: a peer
+            // whose clock jumps (QEMU guest catchup, NTP steps, suspend-resume)
+            // drives the ping offset wrong and the composed sum negative —
+            // measured -324 to -16797 ms against emulator Android. Publishing
+            // it poisons every consumer, so the instrument REFUSES: null, plus
+            // a counter so "refused" is distinguishable from "not ready yet".
+            if (!(v >= 0) || v > 60000) { stats.m2eRefused++; return null; }
+            return +v.toFixed(1);
           })(),
+          m2eRefused: stats.m2eRefused,
           // Note: baseLatency is the AudioContext's processing latency (capture-side
           // ADC latency is not exposed by browsers, so inputMs is a lower bound and
           // is NOT added into mouthToEarMs, which stays exactly as it is).
