@@ -4777,7 +4777,7 @@ Staleness needs no timer and no keyframe forcing: the difference is measured aga
 
 **Instrument corrections this probe forced** (both had been silently corrupting results):
 - `video.mbpsAtFps` averages the last 900 encoded frames — **30 s at 30fps**. Read after a 12 s arm it is a blend of three arms, and it produced a table where `hold` cost 31% alone and saved 28% in combination. Added `encBytesTotal` / `encFramesTotal`, cumulative on both lanes; rigs difference them across the slot.
-- The fixture is a ~44 s clip Chrome loops forever, and 7 arms × 12 s made a cycle almost exactly two loops, so every arm landed on the same footage every round. The numbers repeated to two decimals and read as precision. Arms are now rotated each round.
+- The fixture is a **90 s** clip (`fetch.sh`: `-t 90`) that Chrome loops forever, and 7 arms × (12 s + ~1 s of tool overhead) made a cycle of ~91 s — one loop, near enough. Every arm landed on the same footage every round. The numbers repeated to two decimals and read as precision rather than as the confound they were. Arms are now rotated each round.
 - The rc resolution actuator fires in whichever arm is most expensive and quarters its pixels — a confound pointing the same direction as the effect. Rigs pin `rcres=0` and the sweep now declares itself VOID if the divisor differs across arms.
 
 Being inside one call was necessary and was never sufficient.
