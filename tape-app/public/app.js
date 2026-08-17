@@ -511,6 +511,28 @@ async function handleLab(m) {
         rttMs: a.rttMs ?? null, baseRttMs: a.baseRttMs ?? null,
         latePct: a.latePct ?? null,
       },
+      // The conversation itself. `humanMedian` is the response time with the
+      // network removed BY CONSTRUCTION — both its events are observed on this
+      // machine, so no RTT correction and no RTT estimation error — which makes
+      // it the one number here that measures presence rather than plumbing.
+      // `perceivedMedian` is the same transition with the round trip left in.
+      // `breathPct` is how often a turn opened on an audible inhale: if that
+      // collapses while the local rate holds, a turn-taking cue is being
+      // destroyed in transit, and that is a transport finding, not a human one.
+      turns: safe(() => {
+        const s = window.__tape?.turns?.summary?.();
+        return s && {
+          humanMedian: s.humanMedian ?? null, humanN: s.humanN ?? 0,
+          perceivedMedian: s.perceivedMedian ?? null, perceivedN: s.perceivedN ?? 0,
+          wordGapMedian: s.wordGapMedian ?? null,
+          breathRate: s.breathRate ?? null, breathRateLocal: s.breathRateLocal ?? null,
+          leadMedian: s.leadMedian ?? null, usable: s.usable ?? 0,
+        };
+      }, 'lab.turns') ?? null,
+      // The rate we are ASKING for. `video.fps` beside it is what was achieved;
+      // an experiment that moves this knob has to assert the two agree, or it is
+      // measuring a rate the camera never delivered.
+      askedFps: safe(() => targetFps().fps, 'lab.fps') ?? null,
       pair: lastStats?.pair ?? null,
     });
     return;
@@ -560,6 +582,15 @@ async function handleLab(m) {
     // stops drifting (the hold may earn less) — need the arms swapped inside
     // ONE call in front of ONE camera. Toggling it here is the whole lane: a
     // phone opens a room, and the comparison happens on its own sensor.
+    // Frame rate, live. Bounded at 72 for the same reason the ceiling is 72 and
+    // not 60: on a 144 Hz display, 60 fps is a ratio of 2.40, so frames are held
+    // for 2 or 3 refreshes in an uneven 2,2,3 pattern — visible judder with not
+    // one frame lost. An experiment that asked for 60 and got judder would
+    // measure the judder and blame the frame rate.
+    if (m.maxfps != null) {
+      const n = num(m.maxfps, 5, 72);
+      if (n != null) { labMaxFps = n; applied.maxfps = syncTapeFps('lab').fps; }
+    }
     if (m.pfilter != null) {
       const on = String(m.pfilter) === '1';
       const p = {};
@@ -3655,7 +3686,18 @@ const cadenceEven = (hz, f) => {
   return Math.abs(hz - Math.round(hz / f) * f) < 0.5;
 };
 
+// Frame rate as a LIVE knob, for the experiment the turn-taking instrument was
+// built to run. Our fleet's human response gap is ~578 ms against Boland's
+// ~297 ms face-to-face control — and that number has the network removed by
+// construction (both its events are observed locally), so it is not latency,
+// it is hesitation. The likeliest cause is that the cues people use to take a
+// turn — the inhale, the mouth opening, the eyebrow, the gaze shift — are fast,
+// and at 30 fps there are only a handful of samples of each. Settling that
+// needs the rate swapped INSIDE one conversation between two real people, which
+// a query parameter cannot do because a reload ends the conversation.
+let labMaxFps = null;
 function targetFps() {
+  if (labMaxFps) return { fps: labMaxFps, why: 'lab' };
   if (V_MAXFPS) return { fps: V_MAXFPS, why: 'forced' };
   const camFps = localStream?.getVideoTracks?.()[0]?.getSettings?.().frameRate ?? null;
   let fps = FPS_CEILING;
