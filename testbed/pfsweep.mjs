@@ -47,6 +47,9 @@ const QP = Number(arg('qp', 24));
 const ROUNDS = Number(arg('rounds', 4));
 const MEASURE = Number(arg('measure', 6));
 const SETTLE = Number(arg('settle', 2));
+// `maxfps` forces the rate rather than letting targetFps() negotiate one, so a
+// 30-vs-60 comparison is actually 30 vs 60 and not two different negotiations.
+const FPS = Number(arg('fps', 30));
 const OUT = arg('out', '/private/tmp/claude-501/-Users-deveshpatel-Downloads-video-calling/2cd64fea-5ae0-424e-909a-cfec3fc12a22/scratchpad/pfsweep');
 mkdirSync(OUT, { recursive: true });
 
@@ -110,7 +113,7 @@ try {
     // fires in whichever arm happens to be most expensive and then quarters
     // that arm's pixels — a confound pointing the same direction as the effect
     // being measured, which would credit the filter with the actuator's work.
-    await p.goto(`${BASE}/?r=${room}&l2rcqpmin=${QP}&l2rcqpmax=${QP}&qp=${QP}&rcres=0`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await p.goto(`${BASE}/?r=${room}&l2rcqpmin=${QP}&l2rcqpmax=${QP}&qp=${QP}&rcres=0&maxfps=${FPS}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await p.waitForSelector('#join', { timeout: 20000 });
     await p.click('#join').catch(() => {});
     if (who === 'A') await p.waitForTimeout(1200);
@@ -123,7 +126,7 @@ try {
     console.log('FAIL: this build has no encBytesTotal — deploy first, or the numbers will be windowed.');
     process.exit(1);
   }
-  console.log(`presence-filter sweep — quantizer pinned at ${QP}, one call, exact per-slot bytes`);
+  console.log(`presence-filter sweep — quantizer pinned at ${QP}, ${FPS}fps, exact per-slot bytes`);
   console.log(`${ROUNDS} rounds x ${ARMS.length} arms, ${SETTLE}s settle + ${MEASURE}s measured, room ${room}\n`);
   await a.waitForTimeout(20000);
 
@@ -188,11 +191,25 @@ for (const arm of ARMS) {
     `${(pick(rs, 'still') ?? 0).toFixed(2).padStart(6)}  ${arm.on ? `${pick(rs, 'pfMs')?.toFixed(2)}ms` : '—'}`);
 }
 const shrinks = [...new Set(ARMS.flatMap((a) => samples.get(a.name).map((r) => r.shrink)))];
-const ok = shrinks.length === 1;
+const resOk = shrinks.length === 1;
 console.log(`\n  resolution divisor across every arm: ${shrinks.join(', ')}` +
-  (ok ? '  (equal — the cuts are the filter, not pixels)' : '  UNEQUAL'));
+  (resOk ? '  (equal — the cuts are the filter, not pixels)' : '  UNEQUAL'));
+
+// Asking for a frame rate is not getting one. The fixtures are 30fps MJPEG
+// files, so `--fps=60` silently produced a 30fps run whose table looked
+// perfectly healthy and answered a question it had not tested. A rig that
+// cannot reach the operating point it was pointed at has to say so.
+const gotFps = med(ARMS.flatMap((a) => samples.get(a.name).map((r) => r.fps)));
+const fpsOk = gotFps != null && gotFps >= FPS * 0.9;
+if (!fpsOk) {
+  console.log(`  asked ${FPS}fps, captured ${gotFps?.toFixed(1)}fps — the source cannot supply it ` +
+    `(the fixtures are 30fps files; a real ${FPS}fps answer needs a real ${FPS}fps camera, ` +
+    `i.e. testbed/pfreal.mjs against a phone)`);
+}
 console.log(`  stills: ${OUT}`);
-// Not a footnote. Unequal resolution means the table above is measuring pixels
-// somewhere and the filter elsewhere, and every cut in it is uninterpretable.
-console.log(`VERDICT: ${ok ? 'MEASURED' : 'VOID — resolution differed across arms, the cuts above mean nothing'}`);
+// Not footnotes. Unequal resolution means the table is measuring pixels in one
+// arm and the filter in another; a missed frame rate means it is not the run
+// that was asked for. Either way the cuts above cannot be quoted.
+const ok = resOk && fpsOk;
+console.log(`VERDICT: ${ok ? 'MEASURED' : `VOID — ${!resOk ? 'resolution differed across arms' : `ran at ${gotFps?.toFixed(1)}fps, not ${FPS}`}`}`);
 process.exit(ok ? 0 : 1);

@@ -21,6 +21,14 @@
  *   1. On the device:  https://room.tokkah.com/?r=lab&pfilter=1&rcres=0&qp=24
  *   2. Here:           node testbed/pfreal.mjs --rounds=4
  *
+ * This is also the only way to answer the frame-rate question. The fixtures are
+ * 30fps files, so a 60fps sweep against them silently runs at 30 and reports a
+ * healthy-looking table for a rate it never reached. A phone camera really does
+ * 60, and the theory says the filter should earn MORE there, not less: grain is
+ * independent frame to frame, so doubling the rate exactly doubles the grain
+ * bill, while the motion bill grows sublinearly because consecutive frames are
+ * half as far apart. Add `&maxfps=60` to the URL above to test it.
+ *
  * Arms are swapped inside ONE call in front of ONE camera, so the comparison is
  * a path against itself seconds apart. Bytes come from cumulative counters
  * differenced across the slot, never from `mbps` — that field averages the last

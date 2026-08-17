@@ -187,9 +187,16 @@ export function createPresenceFilter(opts = {}) {
   // effectively on or off — the knob exists to run the control arm.
   // holdThresh is in luma units on a 3x3-averaged difference; 0.012 is ~3/255,
   // comfortably above sensor grain and below any change a person can see.
-  // holdRate 0.07 locks in ~14 frames (~0.45s at 30fps), slow enough that a
-  // slow pan is never mistaken for stillness.
-  let hold = 1.0, holdThresh = 0.012, holdRate = 0.07;
+  // The lock acquires over a fixed WALL-CLOCK time, not a fixed frame count.
+  // Frames are the wrong unit: at 60fps a per-frame rate would lock in half the
+  // time it does at 30, so the filter would behave like a different filter on a
+  // 60fps device — and the direction is the dangerous one, since faster
+  // acquisition means slow motion is more likely to be caught and held.
+  // 450 ms is long enough that a slow pan is never mistaken for stillness and
+  // short enough that a background is free within a second of settling.
+  let hold = 1.0, holdThresh = 0.012, holdLockMs = 450;
+  let holdRateOverride = null; // per-frame, set explicitly; disables the timing
+  let lastTsUs = null;
   // The threshold above is the grain floor of a CLEAN camera in good light. A
   // phone sensor in a dim room is several times noisier, and there the lock
   // would simply never engage — the saving would quietly evaporate on exactly
@@ -214,7 +221,8 @@ export function createPresenceFilter(opts = {}) {
       holdThresh = Math.min(0.1, Math.max(0, o.holdThresh));
       holdAdapt = false; // an explicitly set threshold is an instruction, not a hint
     }
-    if (Number.isFinite(o.holdRate)) holdRate = Math.min(1, Math.max(0.005, o.holdRate));
+    if (Number.isFinite(o.holdLockMs)) holdLockMs = Math.min(5000, Math.max(50, o.holdLockMs));
+    if (Number.isFinite(o.holdRate)) holdRateOverride = Math.min(1, Math.max(0.005, o.holdRate));
     if (typeof o.holdAdapt === 'boolean') holdAdapt = o.holdAdapt;
   };
   setParams(opts);
@@ -352,7 +360,7 @@ export function createPresenceFilter(opts = {}) {
         ? { x: box.x, y: box.y, w: box.w, h: box.h } : null;
     },
     setParams,
-    params: () => ({ denoise, soften, motionGain, hold, holdThresh, holdRate }),
+    params: () => ({ denoise, soften, motionGain, hold, holdThresh, holdLockMs }),
     stats,
     /**
      * Filter one frame. Returns a NEW VideoFrame the caller owns and must
@@ -405,9 +413,18 @@ export function createPresenceFilter(opts = {}) {
         gl.uniform1f(u.uDenoise, denoise);
         gl.uniform1f(u.uSoften, soften);
         gl.uniform1f(u.uMotionGain, motionGain);
+        // Frames arrive on the camera's clock, so the lock's step is derived
+        // from the ACTUAL interval between them rather than assumed. A dropped
+        // frame or a rate change then costs the lock nothing: it advances by
+        // the time that really passed. Clamped so a long gap (tab hidden, a
+        // stall) cannot lock the whole picture in one step.
+        const dtMs = lastTsUs != null ? (frame.timestamp - lastTsUs) / 1000 : 1000 / 30;
+        lastTsUs = frame.timestamp;
+        const rate = holdRateOverride
+          ?? Math.min(0.5, Math.max(0.005, (dtMs > 0 && dtMs < 500 ? dtMs : 1000 / 30) / holdLockMs));
         gl.uniform1f(u.uHold, hold);
         gl.uniform1f(u.uHoldThresh, holdThresh);
-        gl.uniform1f(u.uHoldRate, holdRate);
+        gl.uniform1f(u.uHoldRate, rate);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
         // Blit the result to the canvas — VideoFrame reads the drawing buffer,
