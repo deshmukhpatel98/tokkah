@@ -489,6 +489,18 @@ async function handleLab(m) {
         // delivering fewer frames than it asked for. That is exactly the
         // question a quality/bitrate A/B is asking.
         fps: v.achievedFps ?? null, mbps: v.mbpsAtFps ?? null,
+        // ...and the raw cumulative counters beside it, because `mbps` above is
+        // a mean over the last 900 encoded frames — THIRTY SECONDS at 30fps.
+        // For a within-call A/B that swaps arms faster than that, every reading
+        // is a blend of the current arm and the two before it; measured, it
+        // inverted a result outright (DESIGN.md §17.25). A driver differences
+        // these two across its slot and gets exact bytes for exactly that slot.
+        // `t` is sampled here so the three always agree with each other.
+        encBytesTotal: v.encBytesTotal ?? null, encFramesTotal: v.encFramesTotal ?? null,
+        t: Math.round(performance.now()),
+        pfStillMean: v.pfStillMean ?? null, pfFrames: v.pfFrames ?? null,
+        pfFallbacks: v.pfFallbacks ?? null, pfMs: v.pfMs ?? null,
+        rcResShrink: v.rcResShrink ?? null,
         capLagMs: v.capLagMs ?? null, encLatMs: v.encLatMs ?? null,
         fullAgeMs: v.fullAgeMs ?? null, presentLagMs: v.presentLagMs ?? null,
         glassToGlassMs: v.glassToGlassMs ?? null,
@@ -540,6 +552,24 @@ async function handleLab(m) {
     if (m.rc != null) { TAPE_CFG.l2Rc = String(m.rc) === '1'; applied.rc = TAPE_CFG.l2Rc ? 1 : 0; }
     if (m.w != null) { const n = num(m.w, 160, 3840); if (n != null) { TAPE_CFG.width = n; applied.w = n; } }
     if (m.h != null) { const n = num(m.h, 120, 2160); if (n != null) { TAPE_CFG.height = n; applied.h = n; } }
+    // Presence filter, and its three parameters. This is the knob that makes a
+    // REAL SENSOR reachable: every bitrate number the filter has is from
+    // already-compressed fixture video, whose grain is largely stripped before
+    // it arrives, and the two things that can only be settled on a real camera
+    // — stronger grain (denoise should earn more) and auto-exposure that never
+    // stops drifting (the hold may earn less) — need the arms swapped inside
+    // ONE call in front of ONE camera. Toggling it here is the whole lane: a
+    // phone opens a room, and the comparison happens on its own sensor.
+    if (m.pfilter != null) {
+      const on = String(m.pfilter) === '1';
+      const p = {};
+      for (const [k, lo, hi] of [['denoise', 0, 0.85], ['soften', 0, 1], ['motionGain', 1, 60],
+        ['hold', 0, 1], ['holdThresh', 0, 0.1]]) {
+        if (m[k] != null) { const n = num(m[k], lo, hi); if (n != null) p[k] = n; }
+      }
+      const r = safe(() => tape?.setPresenceFilter?.(on, p), 'lab.pfilter');
+      if (r != null) { applied.pfilter = r ? 1 : 0; Object.assign(applied, p); }
+    }
     const asked = Object.keys(m).filter((k) => !['op', 'type', 'only', 'tag'].includes(k));
     const refused = asked.filter((k) => !(k in applied));
     reply({ applied, refused });
