@@ -1791,6 +1791,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     skipPaced: 0, // captures the AIMD pacer withheld (invisible to the reference chain)
     skipBytePaced: 0, // captures the byte brake withheld (QP pinned AND over budget)
     rcResShrink: 1, // encode-resolution divisor the rc actuator is applying now
+    pfMs: null, pfFrames: 0, pfFallbacks: 0, // presence filter: cost, output, declines
     sendNowReqs: 0, // ?sendnow=1: carrier ticks requested at encode output (task #41)
     admitFps: null, // last AIMD admission rate, frames/s — the pacer-following signal
     // #44 rate control. rcEstMbps is the raw GCC estimate, rcBudgetMbps what the
@@ -1839,6 +1840,17 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
 
   let closed = false;
   let enc = null, dec = null, gen = null, writer = null;
+  // Presence filter (presence-filter.js): one GPU pass that removes grain where
+  // nothing moved and softens only what the eye cannot resolve, so the SAME
+  // encoder at the SAME quantizer spends fewer bits. Loaded lazily and
+  // dynamically on purpose — a bitrate experiment must not be able to keep the
+  // lane's module from loading at all.
+  // pfWanted is a live knob, not a start-up constant, so the filter can be A/B'd
+  // INSIDE one call. Sequential arms carry the difference between two networks,
+  // two CPU states and two positions in the fixture — the first run of
+  // testbed/pfilter.mjs showed an arm's bitrate moving 0.67 -> 1.56 Mbps in a
+  // direction the filter cannot cause, which is that noise, not a result.
+  let pFilter = null, pFilterArmed = false, pfWanted = cfg.presenceFilter === true;
   // Codec capability negotiation (Android, 2026-08-16): what the PEER told us
   // it can decode (cfg-nak), and the receiver-side timer that bounds how long
   // we wait for a re-laddered cfg before conceding the lane.
@@ -3714,6 +3726,32 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       const t = now();
       const key = wantKey || t - lastKeyAt > cfg.keyMs;
       if (key) { wantKey = false; lastKeyAt = t; }
+      // ── presence filter ─────────────────────────────────────────────────────
+      // Runs on the frame the encoder is about to see, never on what we store
+      // or show locally. `filtered` is ours to close; a null means the filter
+      // declined (unsupported, resized, threw) and the camera frame goes in
+      // unchanged — the pre-filter path can lose, but the picture cannot.
+      if (pfWanted && !pFilterArmed) {
+        pFilterArmed = true;
+        import('./presence-filter.js')
+          .then((m) => {
+            pFilter = m.createPresenceFilter({
+              denoise: cfg.pfDenoise, soften: cfg.pfSoften, motionGain: cfg.pfMotionGain,
+            });
+            L('presence-filter', { on: 1, denoise: cfg.pfDenoise ?? null, soften: cfg.pfSoften ?? null });
+          })
+          .catch((e) => L('presence-filter', { on: 0, err: String(e).slice(0, 80) }));
+      }
+      if (!pfWanted && pFilter) { // toggled off mid-call: drop the GPU context
+        try { pFilter.close(); } catch { /* teardown is never load-bearing */ }
+        pFilter = null; pFilterArmed = false;
+      }
+      const filtered = pFilter ? pFilter.process(frame) : null;
+      if (pFilter) {
+        stats.pfMs = pFilter.stats.lastMs;
+        stats.pfFallbacks = pFilter.stats.fallbacks;
+        stats.pfFrames = pFilter.stats.framesOut;
+      }
       try {
         encCallAt.push(t); // drained FIFO-order by onEncoded (#14 encode-latency probe)
         if (encCallAt.length > 64) encCallAt.splice(0, encCallAt.length - 64);
@@ -3724,10 +3762,13 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // rejected (measured: WebKit accepts the option and does nothing with it), so
         // passing it would leave the rate controller looking like it was in charge while
         // having no effect at all. Omit it and let the encoder's own control loop run.
-        enc.encode(frame, rateControl === 'vbr'
+        enc.encode(filtered ?? frame, rateControl === 'vbr'
           ? { keyFrame: key }
           : { keyFrame: key, avc: { quantizer: qpNow }, vp9: { quantizer: qpNow }, av1: { quantizer: qpNow } });
-      } catch (e) { fail('encode', e); frame.close(); return; }
+      } catch (e) { fail('encode', e); filtered?.close(); frame.close(); return; }
+      // Both are closed on every path: a VideoFrame holds a GPU buffer, and the
+      // filter doubles how many are in flight.
+      filtered?.close();
       frame.close();
     }
     // Reader ended. If nothing replaced the track it is genuinely gone and the
@@ -4038,11 +4079,22 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           : null,
       };
     },
+    /**
+     * Turn the presence filter on/off mid-call. The knob exists so the filter
+     * can be compared against ITSELF seconds apart on one call, one network,
+     * one position in the scene — the only way this comparison is worth
+     * anything (see pfWanted above). Takes effect on the next captured frame.
+     */
+    setPresenceFilter(on) {
+      pfWanted = !!on;
+      return pfWanted;
+    },
     stop() {
       closed = true;
       // Leave the shared encoder first: if this half owned the encode chain the
       // link hands it to a survivor, so the room's other leg keeps its picture.
       try { if (link) link.leave(half); } catch { /* teardown is never load-bearing */ }
+      try { pFilter?.close(); pFilter = null; } catch { /* teardown is never load-bearing */ }
       clearInterval(pinger);
       clearInterval(ageReporter);
       clearInterval(rcTimer); // #44 — a live getStats poll on a closed pc throws every second

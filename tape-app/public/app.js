@@ -1696,6 +1696,16 @@ const TAPE_CFG = {
   // its ceiling and the encoder stays over budget. Pixels move bytes at fixed
   // QP; frame rate does not (measured, testbed/bytepace.mjs). ?rcres=0 control.
   l2RcRes: QS.get('rcres') !== '0',
+  // Presence filter (presence-filter.js): remove grain where nothing moved,
+  // soften only what the eye cannot resolve, so the same encoder at the same
+  // quantizer spends fewer bits. OPT-IN while it is being measured — this one
+  // changes how a face LOOKS, and the house rule that new features ship on by
+  // default was written for changes that cannot. It flips to default-on when
+  // the presence measurement and the blind test say it may.
+  presenceFilter: QS.get('pfilter') === '1',
+  pfDenoise: Number(QS.get('pfdenoise')) || undefined,
+  pfSoften: Number(QS.get('pfsoften')) || undefined,
+  pfMotionGain: Number(QS.get('pfgain')) || undefined,
   // Budget in Mbps. Seeded from the carrier's own GCC estimate when getStats
   // offers one — Chrome has already probed this path, so that is a measurement
   // rather than a guess — and clamped into this band. The ceiling is not a
@@ -1983,6 +1993,14 @@ const PCM_CFG = {
   // Widens the SLOW-DOWN side of the resampler the same graded way the drain
   // side already was, up to 2% while the deficit exceeds 25 ms. ?pcmbuild=0.
   jitterBuildFast: QS.get('pcmbuild') !== '0',
+  // Post-start starvation re-anchor: a sender whose seq clock runs slower than
+  // wall time (measured live 2026-08-16: a CPU-crushed phone captured 54 of
+  // 125 frames/s and the receiver concealed 100% of the call) re-seeds the
+  // ring on the live stream instead of concealing forever. ?reanchor=0 is the
+  // control arm.
+  reAnchor: QS.get('reanchor') !== '0',
+  // TEST ONLY: simulate that slow sender clock (?pcmslowclock=0.43). Default off.
+  slowClock: Number(QS.get('pcmslowclock')) || 0,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
   // Backpressure is spent as a gap, never as queue: ~5 frames (~40 ms) of
   // bufferedAmount and a capture is dropped for the concealer to cover.
@@ -8217,6 +8235,9 @@ window.__tape = {
   // association 0 would be — it rides the main pc, exposed as `pc` above), so
   // `pcmStripePcs()[3]` is association 3 and not the fourth non-null entry.
   pcmStripePcs: () => [...(pcmLadder(mediaPeer) ?? [])],
+  // Presence filter, toggled live so it can be A/B'd inside ONE call against
+  // itself — same network, same scene, seconds apart (testbed/pfilter.mjs).
+  setPresenceFilter: (on) => tape?.setPresenceFilter?.(on) ?? null,
   async uplinkMbps(windowMs = 3000) {
     const pcs = new Set();
     if (pc) pcs.add(pc);
