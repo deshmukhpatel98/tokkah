@@ -383,6 +383,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // Object.assign only writes keys the stats literal already declares, so the
   // snapshot's field order and every derived expression below are untouched.
   const halves = [];
+  // Test-only slow sender clock (?pcmslowclock=0.43) — see onCaptureFrame.
+  const SLOW_CLOCK = +cfg.slowClock > 0 && +cfg.slowClock < 1 ? +cfg.slowClock : 0;
+  let slowLastTx = -1;
   const capStats = {
     captureFrames: 0,
     zipFrames: 0, shiftSum: 0, shift8: 0,
@@ -423,6 +426,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // transport counter read perfect. Both this and `farFuture` are published, because
       // `farFuture` counted every dropped frame of that outage and was never exposed.
       ringReseeds: 0,
+      // Post-start re-anchors: the playhead outran the stream (a starved sender's
+      // seq clock runs slower than wall time, or the sender restarted its seq)
+      // and the ring was re-seeded on the live stream instead of concealing
+      // forever. Distinct from ringReseeds, which can only happen pre-playout.
+      reAnchors: 0,
       portDropped: 0,
       fecRepaired: 0, fecRepairedLate: 0, fecFailed: 0, parityUnused: 0,
       // Adaptive code rate. lossPct is what WE measure on the inbound stream;
@@ -1134,6 +1142,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // forward and silence the lane permanently — a strictly WORSE failure than the one the
     // re-seed fixes, since before it a nonsense seq was simply ignored as far-future.
     let firstSeq = -1, firstSeqAt = 0;
+    // Post-start starvation re-anchor state (see the late branch in ringWrite).
+    // `lastRingWriteAt` is the wall time of the last frame that actually LANDED;
+    // `lastRejSeq` is the last rejected seq, for the two-coherent-frames guard;
+    // `reprime` is true between telling the worklet to re-prime and seeing its
+    // playhead actually reset — while it is set, SAB_PLAY is stale and must not
+    // define the accept window.
+    let lastRingWriteAt = 0, lastRejSeq = -1, reprime = false;
+    const RE_ANCHOR = cfg.reAnchor !== false; // ?reanchor=0 is the control arm
     const pendingPort = []; // frames arrived before the playout node existed (port mode)
 
     // int24 → float32 scratch
@@ -1208,6 +1224,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         startSeq = seq;
         firstSeq = seq;
         firstSeqAt = now();
+        lastRingWriteAt = firstSeqAt;
         if (sab) Atomics.store(ctl, SAB_START, seq);
       }
       const cap = capUsFor(seq, capUs);
@@ -1291,17 +1308,72 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // and the store below advances it correctly. Zeroing it first would publish a
         // momentary hiSeq1 of 0 for no gain.
       }
-      const lo = Math.max(startSeq, play);
+      // The re-prime handshake: after a re-anchor the worklet is told to reset its
+      // playhead over the port, but SAB_PLAY is written from the audio thread and
+      // stays stale-huge for a message round-trip. Until it reads as reset (or as
+      // inside the new window), the accept window is defined by startSeq alone —
+      // otherwise the very frames the re-anchor exists to accept would still be late.
+      if (reprime && (play < 0 || (play >= startSeq && play - startSeq < RING_F))) reprime = false;
+      const lo = reprime ? startSeq : Math.max(startSeq, play);
+      // ── Post-start starvation re-anchor ────────────────────────────────────────
+      // MEASURED LIVE (room ver-kbqe-zzs, 2026-08-16): a phone whose CPU was crushed
+      // by video encode captured audio at 54 of 125 frames/s — its seq clock ran at
+      // 0.43x wall time. The receiver's playhead runs at wall time, so within a
+      // second every arriving frame was behind it: late 6178 of 6150 recv, hiSeq
+      // frozen from priming, depth -111 s by call end, 13k+ frames concealed —
+      // 100% silence for the entire call while every transport counter read healthy.
+      // The one existing re-seed is gated on `play < 0` and can never fire again
+      // after playout starts. So: when nothing has landed in the ring for >1 s while
+      // coherent, advancing, wire-delivered frames keep arriving outside the window,
+      // the stream is real and the window is wrong — re-anchor the window on the
+      // stream and re-prime the playhead. This plays the audio that actually exists
+      // (intermittently, if the sender is slow — that is the honest best) instead of
+      // concealing forever.
+      //
+      // Guards, each against a real failure mode:
+      //   · laneIdx >= 0 — only a frame the WIRE delivered may move the window; an
+      //     FEC repair of an old seq during a drought would re-anchor into the past.
+      //   · two coherent frames — `seq` within 8 of the previous rejection, still
+      //     advancing; a single corrupt header cannot move the window (the same
+      //     reasoning as plausibleMax on the pre-playout re-seed above).
+      //   · far-future re-anchors additionally respect plausibleMax: a seq beyond
+      //     what wall time allows is a bogus header, exactly as before.
+      //   · the 1 s drought itself rate-limits: each re-anchor resets the clock.
+      const coherentAdvance = lastRejSeq >= 0 && seq > lastRejSeq && seq - lastRejSeq <= 8;
+      const starving = RE_ANCHOR && play >= 0 && !reprime && laneIdx >= 0 && coherentAdvance
+        && now() - lastRingWriteAt > 1000;
+      const reAnchor = () => {
+        stats.reAnchors++;
+        L('pcm-reanchor', { seq, play, startSeq, sinceWriteMs: +(now() - lastRingWriteAt).toFixed(0) });
+        tags.fill(-1);
+        startSeq = seq;
+        Atomics.store(ctl, SAB_START, seq);
+        // hiSeq1 must follow the window in BOTH directions here — frozen high it
+        // would keep depthMs lying, and on a sender seq restart it sits above the
+        // whole new stream. The write below advances it to seq + 1.
+        hiSeq1 = seq;
+        Atomics.store(ctl, SAB_HI, seq);
+        reprime = true;
+        lastRingWriteAt = now();
+        if (playNode) playNode.port.postMessage({ type: 'reprime' });
+      };
       if (seq < lo) {
-        stats.late++;
-        // The playhead has already passed this frame's slot, so it will never be
-        // heard however healthy the lane that carried it looked. Attributed, at
-        // last, to the lane that was too slow to make the deadline.
-        if (laneIdx >= 0) laneLate[laneIdx]++;
-        bumpTarget('late');
-        return false;
+        lastRejSeq = seq;
+        if (starving) reAnchor();
+        else {
+          stats.late++;
+          // The playhead has already passed this frame's slot, so it will never be
+          // heard however healthy the lane that carried it looked. Attributed, at
+          // last, to the lane that was too slow to make the deadline.
+          if (laneIdx >= 0) laneLate[laneIdx]++;
+          bumpTarget('late');
+          return false;
+        }
+      } else if (seq >= lo + RING_F) {
+        lastRejSeq = seq;
+        if (starving && seq <= plausibleMax) reAnchor();
+        else { stats.farFuture++; return false; }
       }
-      if (seq >= lo + RING_F) { stats.farFuture++; return false; }
       if (Atomics.load(tags, seq % RING_F) === seq) { stats.dup++; return false; }
       // Made the deadline. Counted here rather than at the top of the function so
       // a lane cannot look punctual by delivering duplicates of frames another
@@ -1315,10 +1387,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // with 2 frames of slack is 2 frames of slack, and trimming past it would
       // turn the repair inaudible-late. `play >= 0` because before the playhead
       // exists there is no deadline to have slack against.
-      if (JIT_GOV && play >= 0) {
+      if (JIT_GOV && play >= 0 && !reprime) {
         const lead = seq - play;
         if (lead < govTickMin) govTickMin = lead;
       }
+      lastRingWriteAt = now();
       ring.set(samples, (seq % RING_F) * 384);
       capTs[seq % RING_F] = cap;
       // Release-publish: the tag store is seq_cst, so a reader that sees the tag
@@ -3034,6 +3107,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             return +v.toFixed(1);
           })(),
           m2eRefused: stats.m2eRefused,
+          reAnchors: stats.reAnchors,
           // Note: baseLatency is the AudioContext's processing latency (capture-side
           // ADC latency is not exposed by browsers, so inputMs is a lower bound and
           // is NOT added into mouthToEarMs, which stays exactly as it is).
@@ -3200,6 +3274,18 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
    */
   function onCaptureFrame(seq, buf, capUs) {
     if (closed) return;
+    // TEST INSTRUMENTATION (?pcmslowclock=0.43, default off): reproduce a
+    // CPU-starved sender whose seq clock runs slower than wall time — the live
+    // phone defect of 2026-08-16 — by decimating capture frames and renumbering
+    // the survivors contiguously on the slow clock. Faithful to the real
+    // signature: contiguous seqs, seq+capUs in lockstep, advance rate < 1x wall.
+    if (SLOW_CLOCK) {
+      const tx = Math.floor(seq * SLOW_CLOCK);
+      if (tx === slowLastTx) return;
+      slowLastTx = tx;
+      seq = tx;
+      capUs = tx * 8000;
+    }
     diagCap?.hit(performance.now());
     capStats.captureFrames++;
     if (det) {

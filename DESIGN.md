@@ -4745,6 +4745,47 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.25 Presence filter — 61.5% fewer bits at the same quantizer, nothing blurred (2026-08-17, task #2)
+
+Question: the spine costs 12 Mbps on motion at QP24. How much of that is detail a person can actually see? **Answer: most of it is not, and removing it needs no new codec, no standard, and no decoder change.** `tape-app/public/presence-filter.js`, one WebGL2 pass in front of `VideoEncoder`, behind `?pfilter=1`.
+
+Three levers, measured separately because they carry completely different risk:
+
+| lever | what it does | can it cost the picture? |
+|---|---|---|
+| **denoise** | blend with the previous OUTPUT where nothing moved (an IIR) | no — averages the random part away, leaves the repeated part |
+| **hold** | where a region has been still ~0.45 s, emit the previous output **EXACTLY** | no — repeats a pixel the camera really saw; error bounded by its own threshold |
+| **soften** | 3×3 blur in proportion to local motion | **yes** — removes real detail on a claim about vision |
+
+**Measured (testbed/pfsweep.mjs, 4 rounds × 2 sides, one live call on room.tokkah.com, QP pinned 24 both arms, `rcres=0`, resolution divisor 1 everywhere):**
+
+| arm | A Mbps | B Mbps | cut | per-round spread |
+|---|---:|---:|---:|---|
+| off | 3.42 | 2.75 | — | — |
+| denoise | 1.98 | 1.51 | 43.0% | 27..56% |
+| soften | 2.96 | 2.23 | 14.0% | 7..25% |
+| hold | 1.99 | 1.52 | 42.5% | 22..53% |
+| denoise + hold | 1.30 | 1.12 | 59.3% | 50..69% |
+| **denoise 0.85 + hold** | **1.12** | **1.00** | **61.5%** | 59..72% |
+| + soften 0.7 | 1.10 | 0.91 | 65.5% | 60..73% |
+
+**The product answer is the second-to-last row.** The one lever that can damage the picture is worth 4 points on top of the two that cannot, and at soften 1.0 the softening is plainly visible in the receiver stills (face texture and nameplate lettering both go). So: **denoise + hold, soften OFF.** 30 fps held, g2g +1.5 ms, 0.14 ms/frame GPU.
+
+**Why the hold works, and why §17.24 Probe C concluded it wouldn't.** Probe C measured a *fully* static scene (1.74 Mbps) against a moving one (12.00) and wrote down "stillness is already cheap". True, and not the case a video call presents. A call is a **still background with a moving person in front of it** — and at fixed QP the still background is NOT cheap, because sensor grain is temporally random, so every block of a motionless wall carries a nonzero residual and gets re-bought thirty times a second for the length of the call. Denoise removes that grain; the hold then makes the region **bit-identical** frame to frame, which is what turns it into skip blocks. An 0.85 IIR alone cannot: it leaves 15% of fresh grain in every pixel, so the residual never reaches zero. Exact repetition is a step change, not a stronger blend — which is why `hold` (42.5%) and `denoise` (43.0%) are each worth about the same alone but 61.5% together.
+
+Staleness needs no timer and no keyframe forcing: the difference is measured against the HELD value, so a slow drift (auto-exposure creeping, room light changing) accumulates until it crosses the threshold and releases that pixel by itself. The held picture can never be further from the truth than the threshold — capped at 0.02 luma ≈ 5/255, below the visible step on any display. That cap IS the safety argument, which is why the threshold adapts upward only (toward a noisy phone sensor's real grain floor) and never downward.
+
+**Instrument corrections this probe forced** (both had been silently corrupting results):
+- `video.mbpsAtFps` averages the last 900 encoded frames — **30 s at 30fps**. Read after a 12 s arm it is a blend of three arms, and it produced a table where `hold` cost 31% alone and saved 28% in combination. Added `encBytesTotal` / `encFramesTotal`, cumulative on both lanes; rigs difference them across the slot.
+- The fixture is a ~44 s clip Chrome loops forever, and 7 arms × 12 s made a cycle almost exactly two loops, so every arm landed on the same footage every round. The numbers repeated to two decimals and read as precision. Arms are now rotated each round.
+- The rc resolution actuator fires in whichever arm is most expensive and quarters its pixels — a confound pointing the same direction as the effect. Rigs pin `rcres=0` and the sweep now declares itself VOID if the divisor differs across arms.
+
+Being inside one call was necessary and was never sufficient.
+
+**Not yet proven, and it is the part that matters:** every number above is on already-compressed fixture video, whose grain is mostly stripped before it reaches us. A real camera has more grain to remove (so denoise should earn MORE) and a real camera's auto-exposure never stops moving (so the hold may earn LESS until the threshold adapts). Per the real-sensor law this ships only after a tethered-phone run. `testbed/pfhold.mjs` is the rig that guards the failure mode a bitrate number cannot see — it derives where the person is from the control arm (the cells that change most ARE the person) and asserts those cells still change with the lock engaged, so a lock that eats a face fails even while bits fall.
+
+---
+
 ## 17.24 Codec frontier probe — AV1 and ROI measured against the spine, both rejected (2026-08-02, task #34)
 
 Question: can AV1 and/or face-aware ROI bit allocation deliver the spine's measured 99.7 VMAF at meaningfully fewer than its 12.0 Mbps-at-fps? **Answer: no, on both.**

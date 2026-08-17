@@ -200,6 +200,15 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
     // timing
     rttMs: null, clockOffsetMs: null, ageMs: [],
     qpBytes: [], // bytes per encoded frame, for the cost-of-quality question
+    // Cumulative, never windowed. `mbpsAtFps` above averages the last 900
+    // encoded frames — THIRTY SECONDS at 30fps — which makes it useless for any
+    // experiment that changes a setting and reads back sooner than that: the
+    // reading is a blend of the new arm and the two before it. A within-call
+    // A/B sweep read that way produced flatly contradictory results (one lever
+    // measured as costing 31% alone and saving 28% in combination) before the
+    // window, not the lever, turned out to be the thing being measured.
+    // Difference these across a slot for the exact bytes that slot cost.
+    encBytesTotal: 0, encFramesTotal: 0,
   };
 
   let closed = false;
@@ -311,6 +320,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
     if (isKey) stats.keyframesSent++;
     stats.qpBytes.push(n);
     if (stats.qpBytes.length > 900) stats.qpBytes.shift();
+    stats.encBytesTotal += n; stats.encFramesTotal++;
 
     const count = Math.max(1, Math.ceil(n / PAYLOAD));
     // 65535 fragments at 1100 B is 72 MB; a single frame that large means something is
@@ -1792,6 +1802,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     skipBytePaced: 0, // captures the byte brake withheld (QP pinned AND over budget)
     rcResShrink: 1, // encode-resolution divisor the rc actuator is applying now
     pfMs: null, pfFrames: 0, pfFallbacks: 0, // presence filter: cost, output, declines
+    pfStillMean: null, // 0..1 mean stillness — how much of the picture is held
+
     sendNowReqs: 0, // ?sendnow=1: carrier ticks requested at encode output (task #41)
     admitFps: null, // last AIMD admission rate, frames/s — the pacer-following signal
     // #44 rate control. rcEstMbps is the raw GCC estimate, rcBudgetMbps what the
@@ -1816,6 +1828,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     shedSent: 0, shedRecv: 0, resumeSent: 0, resumeRecv: 0,
     lpSent: 0, lpBytes: 0, lpRecv: 0, lpPainted: 0, lpAgeMs: [],
     rttMs: null, clockOffsetMs: null, ageMs: [], qpBytes: [],
+    encBytesTotal: 0, encFramesTotal: 0, // cumulative; see the lossless lane's note
     // ── #14 glass-to-glass decomposition probes ─────────────────────────────
     // The age clock above starts at ENCODE OUTPUT. The slices outside it:
     //   capLagMs    sender: capture timestamp → our code reads the frame
@@ -1851,6 +1864,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // testbed/pfilter.mjs showed an arm's bitrate moving 0.67 -> 1.56 Mbps in a
   // direction the filter cannot cause, which is that noise, not a result.
   let pFilter = null, pFilterArmed = false, pfWanted = cfg.presenceFilter === true;
+  let pfParams = {
+    denoise: cfg.pfDenoise, soften: cfg.pfSoften, motionGain: cfg.pfMotionGain,
+    hold: cfg.pfHold, holdThresh: cfg.pfHoldThresh,
+  };
   // Codec capability negotiation (Android, 2026-08-16): what the PEER told us
   // it can decode (cfg-nak), and the receiver-side timer that bounds how long
   // we wait for a re-laddered cfg before conceding the lane.
@@ -3480,6 +3497,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     if (isKey) stats.keyframesSent++;
     stats.qpBytes.push(chunk.byteLength);
     if (stats.qpBytes.length > 900) stats.qpBytes.shift();
+    stats.encBytesTotal += chunk.byteLength; stats.encFramesTotal++;
     rcOnEncoded(chunk.byteLength, isKey); // #44
     stats.framesEncoded++;
     encMeter.note();
@@ -3735,22 +3753,22 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         pFilterArmed = true;
         import('./presence-filter.js')
           .then((m) => {
-            pFilter = m.createPresenceFilter({
-              denoise: cfg.pfDenoise, soften: cfg.pfSoften, motionGain: cfg.pfMotionGain,
-            });
-            L('presence-filter', { on: 1, denoise: cfg.pfDenoise ?? null, soften: cfg.pfSoften ?? null });
+            pFilter = m.createPresenceFilter(pfParams);
+            L('presence-filter', { on: 1, ...pFilter.params() });
           })
           .catch((e) => L('presence-filter', { on: 0, err: String(e).slice(0, 80) }));
       }
       if (!pfWanted && pFilter) { // toggled off mid-call: drop the GPU context
         try { pFilter.close(); } catch { /* teardown is never load-bearing */ }
         pFilter = null; pFilterArmed = false;
+        stats.pfStillMean = null; // a stale lock reading would outlive the lock
       }
       const filtered = pFilter ? pFilter.process(frame) : null;
       if (pFilter) {
         stats.pfMs = pFilter.stats.lastMs;
         stats.pfFallbacks = pFilter.stats.fallbacks;
         stats.pfFrames = pFilter.stats.framesOut;
+        stats.pfStillMean = pFilter.stats.stillMean;
       }
       try {
         encCallAt.push(t); // drained FIFO-order by onEncoded (#14 encode-latency probe)
@@ -4085,8 +4103,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
      * one position in the scene — the only way this comparison is worth
      * anything (see pfWanted above). Takes effect on the next captured frame.
      */
-    setPresenceFilter(on) {
+    setPresenceFilter(on, params) {
       pfWanted = !!on;
+      if (params) { pfParams = { ...pfParams, ...params }; pFilter?.setParams(pfParams); }
       return pfWanted;
     },
     stop() {

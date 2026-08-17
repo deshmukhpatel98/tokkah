@@ -266,6 +266,11 @@ class PcmPlayout extends AudioWorkletProcessor {
     // uncounted, and it is not fixed until it is also observable.
     this.ringReseeds = 0;
     this.farFutureP = 0;
+    // Post-start re-anchors (both modes count here; SAB-mode ones are commanded
+    // by the writer over the port, port-mode ones are detected locally below).
+    this.reAnchorsW = 0;
+    this.lastWriteT = 0;
+    this.lastRejSeqP = -1;
 
     // The remote detector — on the exact output stream, post-concealment,
     // because "what the detector hears" must equal "what the ear hears".
@@ -277,6 +282,20 @@ class PcmPlayout extends AudioWorkletProcessor {
       const m = e.data;
       if (this.mode === 'port' && m?.type === 'frame') this.takeFrame(m.seq, m.samples, m.capUs);
       else if (m?.type === 'target') this.targetP = m.n;
+      // The writer re-anchored the ring on a stream the playhead had outrun
+      // (starved sender / sender seq restart — see ringWrite in pcm.js). Reset
+      // to un-started so the priming path re-seeds `pos` from the new SAB_START.
+      // SAB_PLAY is published as -1 IMMEDIATELY, not on the next process() —
+      // the writer's accept window is startSeq-only until it sees the reset.
+      else if (m?.type === 'reprime') {
+        this.started = false;
+        this.curFrame = -1;
+        this.reAnchorsW++;
+        if (this.mode === 'sab') {
+          Atomics.store(this.ctl, SAB_PLAY, -1);
+          this.pub[1] = -1;
+        }
+      }
     };
     if (o.aecSab) {
       this.aecHi = new Int32Array(o.aecSab, 0, 1);
@@ -310,13 +329,36 @@ class PcmPlayout extends AudioWorkletProcessor {
       this.startSeqP = seq;
     }
     const lo = this.started ? Math.floor(this.pos / FRAME) : this.startSeqP;
-    if (seq < lo) { this.lateFrames++; return; }
-    if (seq >= lo + RING_F) { this.farFutureP++; return; }
+    if (seq < lo || seq >= lo + RING_F) {
+      // Post-start starvation re-anchor, the port-mode twin of the one in
+      // pcm.js ringWrite (measured live: a starved sender's seq clock ran at
+      // 0.43x wall time, the playhead outran it, and every frame was late for
+      // the REST OF THE CALL — 100% concealment with healthy transport). When
+      // nothing has landed for >1 s while coherent advancing frames keep
+      // arriving outside the window, the window is what's wrong: re-seed on
+      // the live stream instead of concealing forever. Two coherent frames
+      // required so a single corrupt seq cannot move the window.
+      const coherent = this.lastRejSeqP >= 0 && seq > this.lastRejSeqP && seq - this.lastRejSeqP <= 8;
+      this.lastRejSeqP = seq;
+      if (this.started && coherent && currentTime - this.lastWriteT > 1) {
+        this.reAnchorsW++;
+        this.tags.fill(-1);
+        this.startSeqP = seq;
+        this.hiSeq1 = seq;
+        this.started = false;
+        this.curFrame = -1;
+        this.lastWriteT = currentTime;
+      } else {
+        if (seq < lo) this.lateFrames++; else this.farFutureP++;
+        return;
+      }
+    }
     if (this.tags[seq % RING_F] === seq) return;
     this.ring.set(samples, (seq % RING_F) * FRAME);
     this.tags[seq % RING_F] = seq;
     if (typeof capUs === 'number') this.capTs[seq % RING_F] = capUs;
     if (seq + 1 > this.hiSeq1) this.hiSeq1 = seq + 1;
+    this.lastWriteT = currentTime;
   }
 
   // Sender-audio-clock µs of the sample under the playhead (§10). The anchor
@@ -614,6 +656,7 @@ class PcmPlayout extends AudioWorkletProcessor {
       concealedFrames: this.concealedFrames,
       heldFrames: this.heldFrames,
       lateFrames: this.lateFrames,
+      reAnchorsW: this.reAnchorsW,
       overflowSkips: this.overflowSkips,
       ringReseeds: this.ringReseeds,
       farFutureP: this.farFutureP,

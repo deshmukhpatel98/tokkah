@@ -1706,6 +1706,11 @@ const TAPE_CFG = {
   pfDenoise: Number(QS.get('pfdenoise')) || undefined,
   pfSoften: Number(QS.get('pfsoften')) || undefined,
   pfMotionGain: Number(QS.get('pfgain')) || undefined,
+  // `?pfhold=0` is the control arm for the exact-repeat lock. Written as an
+  // explicit null-check because 0 is the meaningful value here and `|| undefined`
+  // would throw it away, silently leaving the lever on in its own control arm.
+  pfHold: QS.has('pfhold') ? Number(QS.get('pfhold')) : undefined,
+  pfHoldThresh: QS.has('pfholdt') ? Number(QS.get('pfholdt')) : undefined,
   // Budget in Mbps. Seeded from the carrier's own GCC estimate when getStats
   // offers one — Chrome has already probed this path, so that is a measurement
   // rather than a guess — and clamped into this band. The ceiling is not a
@@ -8237,7 +8242,7 @@ window.__tape = {
   pcmStripePcs: () => [...(pcmLadder(mediaPeer) ?? [])],
   // Presence filter, toggled live so it can be A/B'd inside ONE call against
   // itself — same network, same scene, seconds apart (testbed/pfilter.mjs).
-  setPresenceFilter: (on) => tape?.setPresenceFilter?.(on) ?? null,
+  setPresenceFilter: (on, params) => tape?.setPresenceFilter?.(on, params) ?? null,
   async uplinkMbps(windowMs = 3000) {
     const pcs = new Set();
     if (pc) pcs.add(pc);
