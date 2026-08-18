@@ -2147,10 +2147,34 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         laneLate[k] *= LATE_DECAY;
         laneOnTime[k] *= LATE_DECAY;
       }
-      const target = assocs[0]?.dc?.readyState === 'open' ? assocs[0] : firstOpenAssoc();
-      if (target?.dc?.readyState === 'open') {
-        try { target.dc.send(msg); } catch { /* advisory telemetry report */ }
+      // ON EVERY OPEN ASSOCIATION, not on lane 0. This is the same rule the
+      // ping and the loss report already follow, for the same reason their
+      // comments give — the report that matters most is the one from the link
+      // that is in trouble, and that is precisely the link most likely to eat
+      // it. The skew report was the one control message that did not get it,
+      // and it is the one carrying the lane-health verdict.
+      //
+      // What that cost, traced second by second on the 3-of-6-stalled scenario
+      // (testbed/skewstripe-stall.mjs): lane 0 is one of the stalled routes, so
+      // the instant the fault landed the CONTROL PLANE went down a five-second
+      // hole with it. The peer's peerSkewAt went stale after 2 s, it correctly
+      // fail-opened to all six lanes — and fail-open means posting audio
+      // straight back into the routes that had just been demoted for being
+      // unusable. The trace shows it exactly: t+2s the peer has moved off the
+      // bad lanes, t+3s `n6[012345] STALE1`, all six back in service.
+      //
+      // A lane-health signal that cannot be delivered by an unhealthy lane
+      // reports on every lane except the ones worth reporting on.
+      //
+      // Cost: 15 B at 4/s per association — 360 B/s across six lanes against a
+      // ~0.92 Mbps lane. The receiver overwrites from whichever copy lands, and
+      // the copies within a tick are identical, so duplicates are idempotent.
+      let sent = 0;
+      for (const a of assocs) {
+        if (a.dc?.readyState !== 'open') continue;
+        try { a.dc.send(msg); sent++; } catch { /* advisory telemetry report */ }
       }
+      stats.skewReportFanout = sent;
     }
 
     // ── Lane 0 wire senders (§3.1 lever 4, §4) ────────────────────────────────

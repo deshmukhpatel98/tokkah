@@ -190,7 +190,12 @@ async function armStall(qs) {
     for (let t = 0; t < 25; t++) {
       await pA.waitForTimeout(1000);
       const [ta, tb] = await Promise.all([pA, pB].map((p) => p.evaluate(() => {
-        const s = window.__tape?.pcm?.snapshot?.() ?? {};
+        // `__tape.pcm` is a GETTER that already returns the snapshot object, not
+        // the module — so `.snapshot()` on it is undefined and every field comes
+        // back null. getSample() above handles both spellings; this did not, and
+        // it silently traced 25 seconds of nulls through a full two-arm run.
+        const pc = window.__tape?.pcm;
+        const s = (typeof pc?.snapshot === 'function' ? pc.snapshot() : pc) ?? {};
         return {
           conceal: s.concealedMs ?? null, depth: s.m2eParts?.ringDepthMs ?? null,
           nFast: s.stripe?.nFast ?? null, order: s.stripe?.fastOrder ?? null,
@@ -201,6 +206,12 @@ async function armStall(qs) {
         };
       }).catch(() => null)));
       trace.push({ t: t + 1, a: ta, b: tb });
+      // Refuse to keep going if the very first sample is empty. A trace of
+      // nulls costs a full two-arm run (nearly four minutes) to discover, and
+      // it looks exactly like a trace of a call that is not doing anything.
+      if (t === 0 && (ta?.nFast == null && tb?.nFast == null) && qs) {
+        throw new Error('trace read no stripe state on either side — the snapshot spelling is wrong');
+      }
     }
     const fmt = (x) => x ? `n${x.nFast}[${(x.order ?? []).join('')}] d${x.dem}/p${x.pro}/pp${x.probe}`
       + `${x.dead ? ` DEAD${x.dead}` : ''}${x.stale ? ` STALE${x.stale}` : ''} cc${x.conceal} dep${Math.round(x.depth ?? 0)}` : '—';
