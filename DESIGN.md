@@ -4841,10 +4841,35 @@ is a denoiser. Measured on the filter's own motion statistic, **92.7% of that fi
 sits below the lock threshold**: the hold is being handed a picture that is nearly static already.
 `testbed/media/real/grain.sh` builds the stress case (temporal grain plus a ±10/255 auto-exposure hunt
 on a 25 s period, at MJPEG q2 so the grain survives to the filter), and on the same statistic it takes
-the lockable fraction from 92.7% down to **61.5%**. Synthetic grain is iid where a sensor's is not, so
-passing there licenses nothing — but failing there would be decisive, which is the point of running it.
+the lockable fraction from 92.7% down to **61.5%**.
 
-The **real-sensor law** still gates this and the filter stays behind `?pfilter=1`.
+**It earns more there, not less.** `testbed/pfhold.mjs --media=grain`, prod, quantizer pinned at 24
+both arms, 3 cycles inside one call:
+
+| | clean fixture | sensor-like fixture |
+|---|---:|---:|
+| filter off | 3.42 Mbps | **8.97 Mbps** |
+| denoise + hold | 1.12 | **1.25** |
+| cut | 61.5% | **86.1%** |
+
+The prediction was that a real sensor gives denoise more to remove, and this is that prediction
+surviving a test that could have killed it. The sharpest form of it is the middle row: the *unfiltered*
+cost nearly triples with grain while the *filtered* cost barely moves — 1.12 → 1.25 Mbps. **The filter's
+output price is close to independent of how noisy the input was**, which is the whole thesis stated as
+a measurement: it charges for what the camera saw and not for what the sensor invented.
+
+And it does not buy that by eating the person. The lock ran 423 frames with 0 declines, 30 fps held,
+same resolution both arms, and the two checks a bitrate number cannot make: **86% of the person's
+motion survives** (the busiest 15% of the picture changes 53% of frames against the control's 61%)
+while the quietest half settles from 75% to 59%, and high-frequency energy moves −4.4% — grain, given
+that the motion survived. The stills show eyelashes, individual hairline strands, skin texture and the
+earring all present at 1.25 Mbps.
+
+Synthetic grain is iid where a sensor's is correlated across the Bayer neighbourhood, stronger in
+shadow, and already shaped by the ISP's own denoiser — so passing here licenses nothing. The
+**real-sensor law** still gates this and the filter stays behind `?pfilter=1`. What this run does buy is
+that the two ways the filter could have died on a real camera — the lock thrashing under grain, or the
+hold going stale under a hunting exposure — have both been put to it, and neither happened.
 
 One number now rides every call so the failure cannot be silent: **`pfHoldThresh`**, the lock threshold
 after upward adaptation. It starts at 0.012 luma and ratchets toward this sensor's grain floor, capped
