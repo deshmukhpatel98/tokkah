@@ -4955,8 +4955,13 @@ fire correctly and only when intended, and nothing regressed (both runs' deltas
 straddle zero in at least one direction, so there is no evidence of harm either).
 
 **Inert on a healthy call by construction:** clean-path spread is under 10 ms
-against a 384 ms bound, so no sample is ever excluded and the set is bit-identical.
-`lab-verify` 6/6, m2e 42.4/44.6 against a 43.6/43.9 baseline.
+against the shipped 120 ms bound, so no sample is ever excluded and the set is
+bit-identical. `lab-verify` 6/6, m2e 42.4/44.6 against a 43.6/43.9 baseline.
+(This paragraph said "384 ms bound" until the default moved to 120 and the prose
+did not — the same drift this section's own neighbours keep getting caught by.
+The argument survives the correction with an order of magnitude to spare, but
+`jitFarSkipped` on a clean call is the measurement that settles it, not the
+inequality.)
 
 This is deliberately **not** the de-skew experiment recorded at the `ringWrite`
 call site, which moved ordinary 24 ms lane offsets and paid for a 27.6 ms
