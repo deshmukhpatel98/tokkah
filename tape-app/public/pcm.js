@@ -1280,7 +1280,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // amplifier only, and it does so without capping what a healthy call may
     // ask for, which is where holding the ceiling down by hand went wrong as a
     // shipping proposition.
-    const LATE_PIN_GUARD = cfg.latePinGuard !== false;
+    const LATE_PIN_GUARD = cfg.latePinGuard === true; // measured WORSE at rtt=180; ?pcmlatepin=1
     let lastFarFutureAt = 0;
     const pendingPort = []; // frames arrived before the playout node existed (port mode)
 

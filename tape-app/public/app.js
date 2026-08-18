@@ -2135,7 +2135,13 @@ const PCM_CFG = {
   // Lateness stops counting as "grow the buffer" while far-future rejections are
   // also arriving — a window rejecting at both ends is misplaced, not too small.
   // `?pcmlatepin=0` is the control arm.
-  latePinGuard: QS.get('pcmlatepin') !== '0',
+  // DEFAULT OFF: measured worse. 16 calls at rtt=180 --net=real, arms alternated —
+  // median m2e 162.1 ms with the guard against 155.2 ms without. It was built
+  // against the rtt=260 signature (late AND farFuture together, a misplaced
+  // window), and that is not what happens at 180: there the target legitimately
+  // needs to grow to 4-5f for real jitter, and suppressing late-bumps delays
+  // growth the call actually needs. `?pcmlatepin=1` re-enables.
+  latePinGuard: QS.get('pcmlatepin') === '1',
   // TEST ONLY: simulate that slow sender clock (?pcmslowclock=0.43). Default off.
   slowClock: Number(QS.get('pcmslowclock')) || 0,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
