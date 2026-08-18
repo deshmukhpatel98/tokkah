@@ -2271,6 +2271,17 @@ const PCM_CFG = {
   // spread is a few ms the margin IS most of the ring: 8 ms of a 43-47 ms
   // budget. `?pcmjitmargin=0` exists so that frame can be shown to be earned
   // rather than assumed — judged on latency AND concealment together.
+  //
+  // ASKED, 2026-08-18, and the answer was NO BENEFIT. m2e-ab, 3 paired rounds,
+  // arm order rotated, against the null A/B's +/-2.7 ms floor:
+  //     mouth-to-ear  median +0.1 ms   per-round -0.0, +4.0, +0.1  UNRESOLVED
+  //     ring depth    median +0.1 ms   per-round  0.0, +3.9, +0.1
+  //     concealed     median  0.0 ms   per-round  0.0,  0.0,  0.0
+  // Removing the margin does not make the ring shallower — one round was 4 ms
+  // WORSE — so the clean-call ring is not sitting on the margin at all; it is
+  // on the targetFrames floor beneath it. The 8 ms is not reclaimable here and
+  // the frame costs nothing to keep. Default stays 1, which is what the
+  // original "not tunable on purpose" note wanted; it now has the evidence.
   jitterMarginFrames: QS.get('pcmjitmargin') != null ? Number(QS.get('pcmjitmargin')) : 1,
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
