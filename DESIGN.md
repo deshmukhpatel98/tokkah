@@ -6945,12 +6945,46 @@ The queue gate (17.35) is part of it — tightening it cut lane backlog 14x and
 lane RTT 3.6x — but it left mouth-to-ear untouched, so it is downstream of
 whatever is actually stalling.
 
-### The next measurement
+### Answered — by an instrument that was already in the file
 
-Not another hypothesis. The instrument that would settle it: per-lane send
-timestamps versus arrival timestamps for the same sequence numbers, so the 1907
-ms of dispersion can be attributed to a specific hop — application write, SCTP
-queue, wire, or receive processing. Every cheaper proxy tried so far
-(datagram counts, keyframes, frame counts, reconnect counts) has been either
-confounded or blind, and two claims have already had to be withdrawn for
-resting on one of them.
+No new instrumentation was needed. `noteArrival` has recorded gap statistics all
+along, for exactly this question, with the criterion written next to them:
+*"Read gapClumpPct together with gapP95: both high means the sender batches (fix
+pacing); low clump with high p95 means gaps are uniformly stretched."* They were
+simply never printed.
+
+| | rtt=180 | rtt=300 |
+|---|---|---|
+| gap p50 | 7.75 ms | **1.47 ms** |
+| gap p95 | 15.69 ms | 25.43 ms |
+| gap maxRun | 48.3 ms | **691.8 / 1185.7 ms** |
+| clump (<1 ms) | 6.7% | **31.1%** |
+| stalls recorded | 5-7 | **128 (cap hit)** |
+
+Both high. **The delivery is batched, not stretched.** At rtt=300 a third of
+frames arrive in sub-millisecond clumps separated by silences of over a second,
+and the stall list hits its 128-entry cap. A 1.2 s hole in arrivals is what the
+48f target is correctly responding to — which closes the loop on 17.36: the
+estimator is not the defect, and neither is the queue gate downstream of it.
+
+The mechanism is a transport stall-then-burst: the association stops delivering
+for ~1 s, then releases everything at once. Consistent with cwnd collapse and
+RTO backoff on a long path, and consistent with the queue gate helping backlog
+and lane RTT without touching mouth-to-ear — the gate governs how much may
+queue, not whether delivery stops.
+
+Striping across six associations exists to survive exactly this, and does not,
+which means the six are stalling together — a shared cause (one bottleneck, one
+loss event pattern, or one pacer) rather than six independent ones.
+
+### A second defect visible in the same runs
+
+    rtt=180   offset  -3.99 / -2.28 ms     baseRtt 170
+    rtt=300   offset -290.7 / +280.84 ms   baseRtt 289
+
+The clock-offset estimate at rtt=300 is absorbing very nearly a full one-way
+delay, symmetrically and with opposite signs on the two sides. Since
+`d = (tn - skewMs) - seq*FRAME_MS`, a skew that wrong corrupts every age and
+spread reading on that side — the `age p50 671.9 ms` above is partly this, not
+purely arrival timing. This is a separate fault from the batching and needs to
+be fixed before any age-derived number at long RTT can be trusted.

@@ -828,6 +828,14 @@ if (ra.pcmAudio || rb.pcmAudio) {
     // was no way to tell whether spread had genuinely seen 168 ms of dispersion
     // or the demand had come from somewhere else entirely. Printing the raw
     // want, the held peak and the post-warm spread max separates those.
+    // Arrival PATTERN. Spread says how wide the dispersion is; this says what
+    // SHAPE it has, and the two have opposite fixes. High clump WITH high p95 is
+    // the sender or the transport delivering in batches (pacing); low clump with
+    // high p95 is the path stretching. This is the counter that separates them
+    // and it already existed -- it was simply never printed.
+    log(`      gaps p50 ${p.gapP50 ?? '?'} p95 ${p.gapP95 ?? '?'} p99 ${p.gapP99 ?? '?'} maxRun ${p.gapMaxRun ?? '?'} ms` +
+        `  clump ${p.gapClumpPct ?? '?'}%  stalls ${(p.stalls ?? []).length}` +
+        `  biggest ${(p.stalls ?? []).slice().sort((a, b) => b.g - a.g).slice(0, 3).map((x) => `${x.g}@${x.t}`).join(' ') || '-'}`);
     if (r.recovers) {
       const rc = r.recovers;
       log(`      recovers asked ${rc.asked ?? 0}  ran ${rc.ran ?? 0}  capped ${rc.capped ?? 0}  why ${JSON.stringify(rc.why ?? {})}`);
