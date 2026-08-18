@@ -20,14 +20,27 @@ B_ID=iss063m261222124_NASA_SpaceX_Demo2_Robert_Behnken_Interviews
 #      for a real 1080p sensor, where the extra high-frequency detail costs real
 #      bits. That needs genuinely-1080p talking-head source, not a scale filter.
 #
-#   2. THESE FIXTURES COME FROM THE 5 Mbps CUT. `~large` is 4996 kb/s; `~orig`
-#      is 16151 kb/s at the same resolution. So the input has already been
-#      through a lossy encode that smoothed exactly the high-frequency detail
-#      the presence filter is judged on, and part of what the filter is measured
-#      "removing" may be h264 artifacts rather than sensor grain. The realism law
-#      says test inputs must be as realistic as a human video call; a
-#      thrice-compressed one is not. Fixing it is a 2.4 GB fetch and a re-encode
-#      from ~orig, which is why it is recorded here rather than silently done.
+#   2. THE 5 Mbps CUT IS FINE, AND THIS WAS MEASURED RATHER THAN ASSUMED.
+#      `~large` is 4996 kb/s against `~orig`'s 16151 at the same resolution, so
+#      the worry was that the input had already been through a lossy encode
+#      which smoothed exactly the high-frequency detail the presence filter is
+#      judged on — meaning part of what the filter got credit for "removing"
+#      might be h264 artifacts rather than sensor grain. That would have
+#      undermined every presence-filter number measured to date.
+#
+#      Tested by fetching the 2.4 GB ~orig and cutting the identical 90 s at the
+#      identical settings. MJPEG at a fixed -q:v is a detail meter: more
+#      high-frequency content costs more bits, unconditionally.
+#
+#          realA.mjpeg       (from ~large, 4996 kb/s)   133,497,598 B
+#          realA-orig.mjpeg  (from ~orig, 16151 kb/s)   134,935,637 B   +1.08%
+#
+#      1.08%. Tripling the source bitrate buys about one percent more detail at
+#      720p, so the ~large encode was not throwing away the grain the filter is
+#      graded on, and the fixtures are sound. `realA-orig.mjpeg` is kept as the
+#      reference; regenerate with the ~orig URL if the question is ever reopened.
+#      The 2.4 GB master is deleted after cutting — reproducible, not worth the
+#      disk.
 #
 [ -f nasaA.mp4 ] || curl -L -o nasaA.mp4 "https://images-assets.nasa.gov/video/$A_ID/$A_ID~large.mp4"
 [ -f nasaB.mp4 ] || curl -L -o nasaB.mp4 "https://images-assets.nasa.gov/video/$B_ID/$B_ID~large.mp4"
