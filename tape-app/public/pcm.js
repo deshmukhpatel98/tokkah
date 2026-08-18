@@ -3359,6 +3359,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // cfg spread: a flag added only to `cfg` reaches app.js, survives the
           // deploy check, and silently does nothing in the worklet.
           drainKneeMs: cfg.drainKneeMs,
+          // Sent so the worklet can assert its own FRAME against ours. The two
+          // are declared separately and cannot be reconciled by construction
+          // (the worklet's feeds module-level constants), so they are reconciled
+          // by a throw instead. int24: 3 bytes per sample.
+          frameSamples: FRAME_BYTES / 3,
           buildFast: cfg.jitterBuildFast !== false,
           aecSab: aecSab ?? undefined,
           presence: cfg.presence ? true : undefined,

@@ -32,7 +32,20 @@ import { TurnEndPredictor } from './core/turnend.js';
 import { createAec } from './core/aec-core.js';
 import { createPresence } from './core/presence-core.js';
 
-const FRAME = 384;          // 8 ms at 48 kHz — one frame is one datagram
+// 8 ms at 48 kHz — one frame is one datagram.
+//
+// DECLARED TWICE. pcm.js has the same number as FRAME_BYTES (1152 = 384 x int24)
+// and FRAME_MS (8), and this file cannot import them: FRAME feeds module-level
+// constants (RING, CAP_FRAME_B) that are computed before any processor instance
+// exists, so it cannot become an instance field without restructuring both.
+//
+// So the two are reconciled by ASSERTION instead of by construction — pcm.js
+// sends `frameSamples` in processorOptions and the constructor below refuses to
+// run if it disagrees. That does not make drift impossible, it makes it LOUD,
+// which is the property that matters: the failure mode being guarded against is
+// two ends reading each other's datagrams at the wrong stride and reporting it
+// as a transport fault (§17.44).
+const FRAME = 384;
 const RING_F = 64;          // 512 ms of ring — 4× the 120 ms D_max plus slack
 const RING = FRAME * RING_F;
 const HIST = 2048;          // output history for the concealment search (~42 ms)
@@ -189,6 +202,14 @@ class PcmPlayout extends AudioWorkletProcessor {
   constructor(options) {
     super();
     const o = options?.processorOptions ?? {};
+    // FRAME-SHAPE ASSERTION. pcm.js owns FRAME_BYTES/FRAME_MS and this file owns
+    // FRAME; they must be the same number and nothing structurally enforces it.
+    // Throwing here is the correct severity: a stride mismatch does not degrade
+    // audio, it renders every frame meaningless, and it would otherwise surface
+    // as unexplained concealment that looks exactly like a network fault.
+    if (o.frameSamples != null && o.frameSamples !== FRAME) {
+      throw new Error(`pcm-worklet frame mismatch: worklet ${FRAME}, pcm.js ${o.frameSamples}`);
+    }
     this.maxDrift = (o.driftPpm ?? 2000) / 1e6;
     // A separate, wider bound for GIVING BACK latency. See the drift block in
     // process() — draining a burst-inflated buffer and tracking a sender's clock
