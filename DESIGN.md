@@ -4839,6 +4839,34 @@ than that one, but the concealment column has to be resolved before this is a
 finished result — that is what the live knob is for: sweep 80/120/160/200 and find
 where the curve turns.
 
+**FIVE ROUNDS, none dropped — the definitive measurement, and it corrects two
+earlier numbers of mine.**
+
+| | ON | OFF | median | per round |
+|---|---|---|---|---|
+| mouth-to-ear during fault | **167 ms** | 302 ms | **-136 ms** | -128, -136, -133, -152, -151 |
+| ring depth during fault | 79 ms | 217 ms | **-139 ms** | -132, -139, -135, -152, -152 |
+| conceal during stall | 492 ms | 424 ms | **+68 ms** | +76, +96, +68, +12, +8 |
+| conceal whole call | 2600 ms | 2056 ms | +440 ms | +912, +1168, -352, +440, -8 UNRESOLVED |
+
+Two corrections, both against my own earlier claims:
+
+1. **The concealment cost is REAL.** Two- and three-round samples showed -30 to
+   -46 ms and I wrote that "the feared concealment cost did not appear". At five
+   rounds it appears, positive in every single round: **+68 ms**. The de-skew
+   trade recorded at the `ringWrite` call site was right in kind; it is only the
+   magnitude that differs. The bound buys 136 ms of latency for 68 ms of
+   concealment, which on a goal that counts every non-light millisecond as a
+   defect is still clearly worth taking — but it is a trade, not a free win, and
+   it was described as free.
+
+2. **The fault-case absolute is 167 ms, not the 153 ms quoted from two rounds.**
+   Even allowing the rig's measured +4 ms headless-audio offset, that is ~163 in
+   a real browser. Not under 150.
+
+What is now beyond doubt is the effect size: -136 ms of mouth-to-ear, five
+rotated rounds, a 24 ms spread on a 136 ms effect.
+
 **The sweep, which closes the open question.** `?pcmjitfarms=80` against the
 shipped 120, 2 paired rounds:
 
