@@ -2132,6 +2132,10 @@ const PCM_CFG = {
   // 1-4) and the late-storm re-pins the target immediately, so clearing it buys
   // nothing. `?pcmreanchorreset=1` to re-enable for further work.
   reAnchorReset: QS.get('pcmreanchorreset') === '1',
+  // Lateness stops counting as "grow the buffer" while far-future rejections are
+  // also arriving — a window rejecting at both ends is misplaced, not too small.
+  // `?pcmlatepin=0` is the control arm.
+  latePinGuard: QS.get('pcmlatepin') !== '0',
   // TEST ONLY: simulate that slow sender clock (?pcmslowclock=0.43). Default off.
   slowClock: Number(QS.get('pcmslowclock')) || 0,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound

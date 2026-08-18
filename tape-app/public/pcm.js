@@ -430,7 +430,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // seq clock runs slower than wall time, or the sender restarted its seq)
       // and the ring was re-seeded on the live stream instead of concealing
       // forever. Distinct from ringReseeds, which can only happen pre-playout.
-      reAnchors: 0, reAnchorTargetResets: 0,
+      reAnchors: 0, reAnchorTargetResets: 0, latePinSuppressed: 0,
       portDropped: 0,
       fecRepaired: 0, fecRepairedLate: 0, fecFailed: 0, parityUnused: 0,
       // Adaptive code rate. lossPct is what WE measure on the inbound stream;
@@ -1259,7 +1259,29 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // define the accept window.
     let lastRingWriteAt = 0, lastRejSeq = -1, reprime = false;
     const RE_ANCHOR = cfg.reAnchor !== false; // ?reanchor=0 is the control arm
-    const REANCHOR_RESET = cfg.reAnchorReset !== false; // ?pcmreanchorreset=0 is the control arm
+    const REANCHOR_RESET = cfg.reAnchorReset === true; // ?pcmreanchorreset=1 re-enables; measured null
+    // ── DO NOT GROW A BUFFER TO FIX A MISPLACED WINDOW (`?pcmlatepin=0`) ──────
+    // A broken long-RTT call shows `late 708` AND `farFuture 624` at the same
+    // time: frames arriving BEFORE the accept window and frames arriving AFTER
+    // it, together. That combination cannot mean "the buffer is too small" —
+    // no depth accommodates both ends at once. It means the window is in the
+    // wrong PLACE, and the only cure for that is a re-anchor.
+    //
+    // Meanwhile every one of those late frames calls bumpTarget('late') and
+    // walks the target to the ceiling, which is what turns a 4-5 s concealment
+    // burst into a permanently slow call. Measured: identical bursts cost
+    // 460 ms of mouth-to-ear when the target pins and 206.8 ms when it happens
+    // not to — one run produced `concealed 4368 ms, target 2f, m2e 206.8` on
+    // its own and priced the whole thing.
+    //
+    // So lateness is ignored as target evidence while far-future rejections are
+    // also arriving. It is deliberately NOT a fix for the concealment burst —
+    // that is a separate defect and this changes none of it. It removes the
+    // amplifier only, and it does so without capping what a healthy call may
+    // ask for, which is where holding the ceiling down by hand went wrong as a
+    // shipping proposition.
+    const LATE_PIN_GUARD = cfg.latePinGuard !== false;
+    let lastFarFutureAt = 0;
     const pendingPort = []; // frames arrived before the playout node existed (port mode)
 
     // int24 → float32 scratch
@@ -1506,13 +1528,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // heard however healthy the lane that carried it looked. Attributed, at
           // last, to the lane that was too slow to make the deadline.
           if (laneIdx >= 0) laneLate[laneIdx]++;
-          bumpTarget('late');
+          // See LATE_PIN_GUARD. A window that is rejecting at BOTH ends is
+          // misplaced, and no target satisfies both ends at once.
+          if (!(LATE_PIN_GUARD && lastFarFutureAt && now() - lastFarFutureAt < 2000)) bumpTarget('late');
+          else stats.latePinSuppressed++;
           return false;
         }
       } else if (seq >= lo + RING_F) {
         lastRejSeq = seq;
         if (starving && seq <= plausibleMax) reAnchor();
-        else { stats.farFuture++; return false; }
+        else { stats.farFuture++; lastFarFutureAt = now(); return false; }
       }
       if (Atomics.load(tags, seq % RING_F) === seq) { stats.dup++; return false; }
       // Made the deadline. Counted here rather than at the top of the function so
@@ -3363,6 +3388,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           m2eRefused: stats.m2eRefused,
           reAnchors: stats.reAnchors,
           reAnchorTargetResets: stats.reAnchorTargetResets,
+          latePinSuppressed: stats.latePinSuppressed,
           // Note: baseLatency is the AudioContext's processing latency (capture-side
           // ADC latency is not exposed by browsers, so inputMs is a lower bound and
           // is NOT added into mouthToEarMs, which stays exactly as it is).
