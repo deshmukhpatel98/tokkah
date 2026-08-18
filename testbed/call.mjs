@@ -55,13 +55,53 @@ const PAGE_URL =
 // Emulated distance. `--rtt` is the round trip we want ICE to measure; netsim.mjs turns it
 // into a per-crossing delay in front of a local TURN relay. Zero means no simulator at all,
 // so the default run stays exactly as it was.
+// ── REALISM PROFILES, AND WHY BARE --rtt IS NOW AN ERROR ────────────────────
+// `--rtt` on its own leaves jitter 0, loss 0 and bandwidth unlimited: a
+// CONSTANT-DELAY PIPE, which is not a network and does not exist anywhere on
+// earth. A whole distance sweep was run that way and reported as "how far can a
+// call go" — every number optimistic by an unknown margin, because the one thing
+// a jitter buffer exists to absorb had been removed from the test.
+//
+// The knobs were always here. The failure was that the artificial condition was
+// the DEFAULT and cost nothing to reach, so it got reached. It now has to be
+// asked for by name, and the profile is stamped into the run tag so a number can
+// never be quoted without the conditions that produced it.
+//
+// The profile values are representative, NOT measured by this project — they are
+// the honest part of a simulation and are labelled so. `real` is a long
+// intercontinental leg on decent fixed line; `mobile` is a 4G handset; `poor` is
+// the congested wifi most complaints come from.
+const NET_PROFILES = {
+  real:     { jitter: 8,  loss: 0.3, bw: 0,   note: 'intercontinental fixed line' },
+  mobile:   { jitter: 30, loss: 1.0, bw: 3,   note: '4G handset' },
+  poor:     { jitter: 20, loss: 0.5, bw: 5,   note: 'congested wifi' },
+  puredelay:{ jitter: 0,  loss: 0,   bw: 0,   note: 'ARTIFICIAL: constant delay, no network' },
+};
+const NET = args.net ? String(args.net) : null;
+if (NET && !NET_PROFILES[NET]) {
+  console.error(`unknown --net=${NET}. known: ${Object.keys(NET_PROFILES).join(' ')}`);
+  process.exit(2);
+}
+const PROF = NET ? NET_PROFILES[NET] : null;
 const SIM_RTT = Number(args.rtt ?? 0);
-const SIM_JITTER = Number(args.jitter ?? 0);
-const SIM_LOSS = Number(args.loss ?? 0);
+const SIM_JITTER = Number(args.jitter ?? PROF?.jitter ?? 0);
+const SIM_LOSS = Number(args.loss ?? PROF?.loss ?? 0);
+if (SIM_RTT > 0 && !NET && args.jitter === undefined && args.loss === undefined) {
+  console.error(
+    `\n--rtt=${SIM_RTT} with no jitter and no loss is a CONSTANT-DELAY PIPE, not a network.\n`
+    + 'Numbers from it are optimistic by an unknown margin and must not be quoted as\n'
+    + 'real-world latency. Pick a profile:\n'
+    + Object.entries(NET_PROFILES).map(([k, v]) =>
+        `  --net=${k.padEnd(10)} jitter ${String(v.jitter).padStart(2)} ms, loss ${v.loss}%`
+        + `${v.bw ? `, ${v.bw} Mbps` : ''}   (${v.note})`).join('\n')
+    + '\n\nOr pass --jitter=/--loss= explicitly. --net=puredelay opts into the artificial\n'
+    + 'case on purpose, and stamps it into the run tag so nobody quotes it by mistake.\n');
+  process.exit(2);
+}
 // A capacity ceiling in Mbps, per participant per direction, and how much the bottleneck may
 // queue before it tail-drops. `--bw` alone is enough to make a run simulated: a slow link with
 // no added delay or loss is a perfectly real condition and the most common one users hit.
-const SIM_BW = Number(args.bw ?? 0);
+const SIM_BW = Number(args.bw ?? PROF?.bw ?? 0);
 const SIM_QUEUE = Number(args.queue ?? 100);
 // `--p2psim` emulates distance by rewriting candidates instead of routing through node-turn.
 // The relay is the ~40 s cliff, so this is the only way to take a trustworthy long run.
@@ -71,7 +111,11 @@ const CONV = join(HERE, 'media', args.conv ?? 'conv');
 const ROOM = args.room ?? `bot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 const TAG =
   args.tag ??
-  (args.ns ? 'ns-on' : args.relay ? 'relay' : SIMULATED ? `rtt${SIM_RTT}` : 'baseline');
+  (args.ns ? 'ns-on' : args.relay ? 'relay'
+    // The conditions travel WITH the run. A tag of "rtt260" says nothing about
+    // whether that run saw a network or a delay line.
+    : SIMULATED ? `rtt${SIM_RTT}-${NET ?? 'custom'}-j${SIM_JITTER}-l${SIM_LOSS}${SIM_BW ? `-bw${SIM_BW}` : ''}`
+    : 'baseline');
 const OUTDIR = join(HERE, 'runs', `${TAG}-${ROOM}`);
 const HEADED = !!args.headed;
 // `--realcam[=a|b]`: real camera + real mic instead of fake devices, on both sides
