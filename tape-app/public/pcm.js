@@ -3338,6 +3338,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           sab: sab ?? undefined,
           targetFrames: cfg.targetFrames,
           driftPpm: cfg.driftPpm,
+          // Explicit, because processorOptions is a hand-written list and not a
+          // cfg spread: a flag added only to `cfg` reaches app.js, survives the
+          // deploy check, and silently does nothing in the worklet.
+          drainKneeMs: cfg.drainKneeMs,
           buildFast: cfg.jitterBuildFast !== false,
           aecSab: aecSab ?? undefined,
           presence: cfg.presence ? true : undefined,

@@ -194,6 +194,16 @@ class PcmPlayout extends AudioWorkletProcessor {
     // process() — draining a burst-inflated buffer and tracking a sender's clock
     // are two different jobs that used to share one bound.
     this.maxDrain = (o.drainPpm ?? 20000) / 1e6; // 2%
+    // Where the graded drain STARTS (`?pcmdrainknee=N`, default 25 = shipped).
+    // Below the knee the drain runs at maxDrift, 0.2%, which is 2 ms per second.
+    // That was a deliberate "steady state untouched" choice and it is right for
+    // clock tracking -- but it also governs the small excesses, and at rtt=180
+    // the goal is depthMs < 30.4 against a 24 ms target, so the band that
+    // decides the goal is 0-19 ms of excess: entirely below the knee, draining
+    // at the slowest rate the code has. 18.7 ms of excess takes 9.4 s to clear
+    // on an estimator that lives ~16 s, which is why depth is observed sitting
+    // above target for whole calls (§17.41).
+    this.drainKneeMs = Math.max(0, o.drainKneeMs ?? 25);
     this.buildFast = o.buildFast !== false; // graded BUILD widening (see process)
     this.startTarget = o.targetFrames ?? 2;
 
@@ -532,9 +542,14 @@ class PcmPlayout extends AudioWorkletProcessor {
     // couple of percent far better than it tolerates a stale conversation —
     // Boland et al. 2022 put the cost of inflated gaps at 5-10x the raw delay.
     const excessMs = err / (sampleRate / 1000);
-    const up = excessMs <= 25
+    // Span shrinks with the knee so the ramp still reaches maxDrain at 100 ms of
+    // excess; lowering the knee alone would only flatten the ramp and give back
+    // most of what it bought.
+    const kneeUp = this.drainKneeMs;
+    const spanUp = Math.max(1, 100 - kneeUp);
+    const up = excessMs <= kneeUp
       ? this.maxDrift
-      : Math.min(this.maxDrain, this.maxDrift + ((excessMs - 25) * (this.maxDrain - this.maxDrift)) / 75);
+      : Math.min(this.maxDrain, this.maxDrift + ((excessMs - kneeUp) * (this.maxDrain - this.maxDrift)) / spanUp);
     // The BUILD side gets the same graded widening, for the mirror-image reason.
     // Measured (testbed/elasticring.mjs, 2026-08-16): the elastic ceiling raised
     // the target 32->48f under recurring 320 ms bursts and concealment did not

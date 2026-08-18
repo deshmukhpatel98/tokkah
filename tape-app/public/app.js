@@ -2247,6 +2247,8 @@ const PCM_CFG = {
   // spread that included startup contamination, so it may be paying twice.
   // Number() alone would swallow 0, which is the arm worth testing.
   jitterMarginFrames: QS.has('pcmjitmargin') ? Number(QS.get('pcmjitmargin')) : undefined,
+  // Where the worklet's graded drain starts, in ms of excess (§17.41). Default 25.
+  drainKneeMs: QS.has('pcmdrainknee') ? Number(QS.get('pcmdrainknee')) : undefined,
   // Queue allowance in ms above the BDP (§17.35). Unset = shipped BDP x 1.5.
   queueMs: Number(QS.get('pcmqms')) || undefined,
   // Latency governor (task #47): trims buffer depth the measured per-frame
