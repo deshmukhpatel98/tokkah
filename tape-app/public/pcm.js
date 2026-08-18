@@ -53,6 +53,15 @@ import { SwEncoder, SwDecoder, SW_STRIDE } from './core/pcmsw.js';
 import { packFrame, unpackFrame } from './core/pcmpack.js';
 
 const FRAME_BYTES = 1152; // 384 samples × int24
+// Samples per frame, DERIVED. Until 2026-08-18 this number was written out as a
+// literal at 14 executable sites in this file, including the SAB geometry at the
+// `new SharedArrayBuffer(816 + RING_F * ... * 4)` below and its paired view.
+// Changing FRAME_BYTES while those stayed at 384 would have given a ring whose
+// geometry disagreed with its contents — and the frame-shape assertion added in
+// 1ac6593 would NOT have caught it, because that compares pcm.js's declaration
+// against the worklet's and both stay internally consistent while the literals
+// are wrong. Silent corruption, not a throw. (int24: 3 bytes per sample.)
+const FRAME_SAMPLES = FRAME_BYTES / 3;
 const FRAME_MS = 8;       // 384 samples at 48 kHz — the seq→time constant
 
 /**
@@ -259,8 +268,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // for 10% redundancy, which is the common case (isolated datagram loss).
   const FEC_N_MIN = Number.isFinite(cfg.fecNMin)
     ? Math.max(0, Math.min(FEC_N_MAX, cfg.fecNMin)) : 0;
-  const zipIn = new Int32Array(384);              // samples in, for the encoder
-  const zipOut = new Uint8Array(1 + 384 * 3);     // packed bytes out
+  const zipIn = new Int32Array(FRAME_SAMPLES);              // samples in, for the encoder
+  const zipOut = new Uint8Array(1 + FRAME_SAMPLES * 3);     // packed bytes out
 
   // rungTop[n] = the highest loss %, in percent, that n parity symbols still
   // hold under CONCEAL_TARGET. Built once per call from RS_K; ~40 binomial
@@ -1265,14 +1274,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Layout (see pcm-worklet.js for the same map): 8×i32 ctl | 64×i32 tags |
     // 64×f64 capTs (sender-audio-clock µs per slot — the A-V sync anchor) |
     // 2×f64 playhead publish (seqlocked) | f32 ring.
-    const sab = sabOk ? new SharedArrayBuffer(816 + RING_F * 384 * 4) : null;
+    const sab = sabOk ? new SharedArrayBuffer(816 + RING_F * FRAME_SAMPLES * 4) : null;
     let ctl = null, tags = null, ring = null, capTs = null, pub = null;
     if (sab) {
       ctl = new Int32Array(sab, 0, 8);
       tags = new Int32Array(sab, 32, RING_F);
       capTs = new Float64Array(sab, 288, RING_F);
       pub = new Float64Array(sab, 800, 2);
-      ring = new Float32Array(sab, 816, RING_F * 384);
+      ring = new Float32Array(sab, 816, RING_F * FRAME_SAMPLES);
       Atomics.store(ctl, SAB_START, -1);
       Atomics.store(ctl, SAB_HI, 0);
       // -1, NOT 0. At 0 this field cannot distinguish "the playhead is on frame 0" from
@@ -1330,9 +1339,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     const pendingPort = []; // frames arrived before the playout node existed (port mode)
 
     // int24 → float32 scratch
-    const f32 = new Float32Array(384);
+    const f32 = new Float32Array(FRAME_SAMPLES);
     function decodeFrame(payload) {
-      for (let s = 0; s < 384; s++) {
+      for (let s = 0; s < FRAME_SAMPLES; s++) {
         const o = s * 3;
         let v = payload[o] | (payload[o + 1] << 8) | (payload[o + 2] << 16);
         if (v & 0x800000) v |= ~0xffffff;
@@ -1342,7 +1351,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     }
     // Compressed payload straight to float, without materialising the int24 bytes
     // in between — the ring only ever wanted samples.
-    const zipInts = new Int32Array(384);
+    const zipInts = new Int32Array(FRAME_SAMPLES);
     function decodeZip(payload) {
       unpackFrame(payload, zipInts);
       // ── the PEER's capture depth, measured here ─────────────────────────────
@@ -1354,7 +1363,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       if ((stats.rxProbeTick++ & 63) === 0) {
         stats.rxProbeFrames++;
         let m = 0, fit67 = 1;
-        for (let s = 0; s < 384; s++) {
+        for (let s = 0; s < FRAME_SAMPLES; s++) {
           m |= zipInts[s];
           const v = zipInts[s];
           if (fit67 && Math.round(Math.round((v * 32767) / 8388608) * (8388608 / 32767)) !== v) fit67 = 0;
@@ -1365,7 +1374,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (sh >= 8) stats.rxShift8++;
         stats.rxFit32767 += fit67;
       }
-      for (let s = 0; s < 384; s++) f32[s] = zipInts[s] / 8388608;
+      for (let s = 0; s < FRAME_SAMPLES; s++) f32[s] = zipInts[s] / 8388608;
       return f32;
     }
 
@@ -1602,7 +1611,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (lead < govTickMin) govTickMin = lead;
       }
       lastRingWriteAt = now();
-      ring.set(samples, (seq % RING_F) * 384);
+      ring.set(samples, (seq % RING_F) * FRAME_SAMPLES);
       capTs[seq % RING_F] = cap;
       // Release-publish: the tag store is seq_cst, so a reader that sees the tag
       // is guaranteed to see the samples (and vice versa on the acquire load).
@@ -3755,7 +3764,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     if (packSeq === seq) return packLen;
     packSeq = seq;
     const src = new Uint8Array(buf);
-    for (let i = 0, o = 0; i < 384; i++, o += 3) {
+    for (let i = 0, o = 0; i < FRAME_SAMPLES; i++, o += 3) {
       const v = src[o] | (src[o + 1] << 8) | (src[o + 2] << 16);
       zipIn[i] = (v & 0x800000) ? (v | ~0xffffff) : v;
     }
@@ -3773,7 +3782,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     if ((capStats.probeTick++ & 63) === 0) {
       capStats.probeFrames++;
       let fit67 = 1, fit68 = 1;
-      for (let i = 0; i < 384; i++) {
+      for (let i = 0; i < FRAME_SAMPLES; i++) {
         const v = zipIn[i];
         if (fit67 && Math.round(Math.round((v * 32767) / 8388608) * (8388608 / 32767)) !== v) fit67 = 0;
         if (fit68 && ((v & 0xff) !== 0)) fit68 = 0;
@@ -3828,13 +3837,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     if (det) {
       const u8 = new Uint8Array(buf);
       let sumSq = 0;
-      for (let i = 0, o = 0; i < 384; i++, o += 3) {
+      for (let i = 0, o = 0; i < FRAME_SAMPLES; i++, o += 3) {
         const v = u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16);
         const s = (v & 0x800000) ? (v | ~0xffffff) : v;
         const norm = s / 8388608;
         sumSq += norm * norm;
       }
-      det.mic(now(), Math.sqrt(sumSq / 384));
+      det.mic(now(), Math.sqrt(sumSq / FRAME_SAMPLES));
     }
     // Indexed, not `for…of`: this runs 125 times a second between the capture
     // drain and `dc.send()`, and an iterator object per frame is exactly the
