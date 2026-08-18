@@ -4745,6 +4745,63 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
+
+Found by following § 17.28's **negative** result. Tripling the speed of dead-lane
+detection moved the ring by nothing, which ruled out demotion speed and left the
+estimator itself.
+
+The estimator is **lane-blind**. `ringWrite` already receives `laneIdx` — it is in
+the signature, with a comment explaining why FEC repairs pass `-1` — and then
+calls `noteArrival(seq, skewMs)` and drops it. Every arrival is anonymous, so a
+frame that crawled out of a blackholed route five seconds late is indistinguishable
+from one that was merely jittery. `spread` is `s[dN-2] - s[0]`, one outlier
+rejected, against what this file already calls a multi-sample event.
+
+**The rule:** arrivals further past the window floor than the deepest target the
+ring can ever reach (`ELASTIC_MAX_F` = 48 frames = **384 ms**) no longer enter the
+sample set. The bound is derived, not tuned — such a frame could not have been
+played at maximum buffer, so growing to catch it catches nothing and costs the
+whole excursion, repaid at `JIT_RELEASE`'s 8 ms/s for ~20 s.
+
+**Measured**, 2 valid paired rounds with the arm order rotated (1 of 3 dropped by
+the rig's own noise gate and named), against the SHIPPING configuration:
+
+| | ON | OFF | median delta | per round |
+|---|---|---|---|---|
+| mouth-to-ear during fault | **196 ms** | 335 ms | **-139 ms** | -77, -201 |
+| ring depth during fault | **112 ms** | 247 ms | **-136 ms** | -76, -196 |
+| conceal whole call | 1892 ms | 2328 ms | **-436 ms** | -424, -448 |
+| conceal during stall | 450 ms | 486 ms | -36 ms | -72, 0 |
+
+Same sign every round on all four. The whole-call figure is the one to trust
+most — its two rounds landed 24 ms apart against a null-A/B floor of 1192 ms.
+`jitSpreadMaxRun` collapses 1515 -> 161 ms, which is the mechanism visible
+directly.
+
+**It does not trade concealment for latency.** That was the expected cost and the
+reason the bound is derived rather than chosen: the frames it stops waiting for
+were unplayable anyway, so declining to buffer for them loses no audio. Both
+concealment columns move the same way as latency.
+
+**Inert on a healthy call by construction:** clean-path spread is under 10 ms
+against a 384 ms bound, so no sample is ever excluded and the set is bit-identical.
+`lab-verify` 6/6, m2e 42.4/44.6 against a 43.6/43.9 baseline.
+
+This is deliberately **not** the de-skew experiment recorded at the `ringWrite`
+call site, which moved ordinary 24 ms lane offsets and paid for a 27.6 ms
+shallower ring with +1 s/min of concealment. Frames 24 ms late are worth buffering
+for; frames 5 s late are not, and the bound is exactly what separates them.
+
+**The escape hatch matters.** If the whole path steps later — a route change, not
+one bad lane — every sample sits beyond the floor, and rejecting them all would
+freeze the estimator on a floor that no longer exists: the "acting on a signal
+erases the signal" trap, hit three separate ways in this one file already. A
+rejection run longer than a quarter of the window means the floor is wrong, not
+the arrivals; it is dropped and re-learned (`jitFarRelearn`).
+
+`?pcmjitfar=0` is the control arm.
+
 ## 17.28 A blackhole took 8 s to notice, and the rig could not tell (2026-08-18)
 
 Two findings, and the second is the one that matters more.
