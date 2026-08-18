@@ -4759,36 +4759,48 @@ against netsim's `oneWayMs` propagation, via `call.mjs --rtt=N`:
 | 140 | 70 ms | 17.0 / 13.9 ms | 2f | **116.0 ms** |
 | 180 | 90 ms | 14.4 / 16.1 ms | 3f/2f | 136.1 ms |
 | 220 | 110 ms | 11.2 / 10.8 ms | 2f | **151.7 ms** |
-| 260 | 130 ms | 228 / 301 ms | 24f/32f | **388.9 / 461.6 ms** |
+| 240 | 120 ms | 15.7 ms | 2f | **166.6 ms** |
+| 260 | 130 ms | 18.9 ms | 2f | **179.5 ms** |
+| 260 | 130 ms | 228-301 ms | 24-32f | 389 / 401 / 462 ms — see below |
 
-Through 220 the line is m2e ≈ **48 + 0.94 x one-way**, and the slope being under
-1 is not noise: the ring SHRINKS as distance grows (16.6 -> 10.8 ms), because a
-longer path with the same jitter needs no more buffer and the estimator correctly
-declines to add any. The buffer is not paying for distance.
+The line is m2e ≈ **48 + 1.0 x one-way**, and it holds across the whole range
+(per-point slopes 0.94-1.03, mean 0.99). The ring SHRINKS as distance grows
+(16.6 -> 10.8 ms at 220) because a longer path with the same jitter needs no more
+buffer and the estimator correctly declines to add any. **The buffer does not pay
+for distance.**
 
-**The crossing is at about RTT 210**, i.e. ~105 ms of one-way propagation. In
-fibre (~204,000 km/s) that is ~21,400 km of PATH, and real routes run 1.4-1.5x
+**The crossing is at about RTT 205**, i.e. ~102 ms of one-way propagation. In
+fibre (~204,000 km/s) that is ~20,800 km of PATH, and real routes run 1.4-1.5x
 great-circle, so roughly **14,000-15,000 km of separation**. Delhi-Amsterdam is
 6,350 km; Delhi-New York 11,750; Delhi-Sao Paulo ~14,700. London-Sydney (17,000)
-is outside it. So: most of the planet, not all of it — and the honest statement
-is "under 150 ms for any path whose RTT is under ~210 ms", because real routing,
-not distance, is what decides that.
+is outside it. So: most of the planet, not all — and the honest statement is
+"under 150 ms for any path whose RTT is under ~205 ms", because real routing, not
+distance, decides that.
 
-**Where the 48 ms goes**, and by the goal's own standard every millisecond of it
-is a defect: `outputMs` 20 (the OS audio device, already at the Web Audio floor
-with `latencyHint: 0`, and ~4 ms of it is the testbed's non-real sink), ring
-~11-17, `frameMs` 8, and ~2-3 ms of arrival age over propagation. At RTT 220 the
-split is 110 ms of light and 42 ms of us.
+**Where the 48 ms goes**, and by the goal's own standard every millisecond is a
+defect: `outputMs` 20 (the OS audio device, already at the Web Audio floor with
+`latencyHint: 0`, ~4 ms of which is the testbed's non-real sink), ring ~11-17,
+`frameMs` 8, and ~2-3 ms of arrival age over propagation. At RTT 220 the split is
+110 ms of light and 42 ms of us.
 
-**And a cliff between 220 and 260.** m2e goes 151.7 -> 388.9/461.6, the target
-2f -> 24f/32f, depth 11 -> 228/301 ms. It is not the network: arrival age at 260
-is p50 132.5 / p95 135.3, i.e. **2.8 ms of spread** — the arrivals are punctual.
-It is not the drift estimator either, though it looks like it at first (4747 and
-6770 ppm against a 2000 ppm bound): that is the graded drain doing exactly what
-it was built to do, widening toward its 20000 ppm cap because the ring is
-overfull. Punctual arrivals plus a 228 ms ring means the buffer filled from
-something that is not jitter. Bracketing run in progress; until it reproduces,
-this is one observation and the rig is not yet ruled out as its author.
+**What looked like a cliff is an INTERMITTENT FAULT, and calling it a cliff was
+wrong.** The first rtt=260 pair read 389/462 ms and the obvious story — a hard
+distance limit, an RTT-blind threshold somewhere near 250 — was wrong. Bracketing
+killed it: rtt=240 is clean (166.6 ms, 2f, 16 ms concealed) and a REPEAT of
+rtt=260 is clean (179.5 ms, 2f, **0 ms concealed**), sitting exactly on the line.
+Same flag, same machine, two opposite outcomes.
+
+So the real finding is a stochastic failure that happened in 3 of 4 samples at
+260 and 0 of 4 at 220/240: concealment ~4.9 s, of which **3.6 s is `held`** rather
+than extrapolated, 48-78 FEC repairs where clean runs need none, and the ring
+pinned at 24-32f. Arrival age stays punctual throughout (p50 132.7 / p95 136.0 —
+**3.3 ms of spread**), so it is not the path. And the alarming 7602 ppm of drift
+is the graded drain doing its job against an overfull ring, not a broken clock.
+
+Punctual arrivals, no jitter, five seconds of HELD concealment, and a ring that
+fills anyway. Whatever this is, it is not distance — distance is only making it
+more likely to show up. Not yet diagnosed; the frequency-vs-RTT relationship is
+the next thing to establish, and the rig is not yet excluded as its author.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
