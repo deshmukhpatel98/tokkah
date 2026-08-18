@@ -7108,3 +7108,51 @@ sustains, without giving up losslessness.
 If Opus at rtt=300 is *also* broken, then the rate is not the limit and the
 fault is in how this code drives SCTP — which would be a genuine bug and the
 next thing to find.
+
+### The test ran, and it redirects the diagnosis
+
+`?pcmaudio=0` at rtt=300. **No mouth-to-ear was produced — that metric rides the
+PCM snapshot, so switching the lane off removes the instrument.** The comparison
+as designed cannot be made without adding an Opus-path latency measure, which is
+worth doing and was not done here.
+
+But the run answered a different question. With the lossless lane OFF the delay
+line still carried **825,415 datagrams / 856.2 MB**, against 662,509-976,665 with
+it on. Essentially unchanged. **The PCM lane is not the dominant load; video is**,
+at ~3 Mbps per side against PCM's 1.5.
+
+So "the audio bitrate is the distance limit" as stated in 17.37 is too narrow.
+The offered total is what matters, and audio is the minority of it.
+
+### Why a path with no bandwidth ceiling still collapses
+
+`--net=real` sets `bw: 0` — there is no bottleneck link to fill. That rules out
+a full pipe and leaves loss-driven congestion control, which has a closed form.
+Mathis: per-association throughput ~ MSS / (RTT x sqrt(p)).
+
+| rtt | per association | x6 lanes |
+|---|---|---|
+| 180 | ~0.97 Mbps | ~5.8 Mbps |
+| 300 | ~0.58 Mbps | ~3.5 Mbps |
+
+At 0.3% loss, **six associations carry ~5.8 Mbps at rtt=180 and ~3.5 Mbps at
+rtt=300** — and Mathis is the optimistic bound, ignoring timeouts. The offered
+load crosses that ceiling between 220 and 260 ms, which is exactly where the
+cliff is, and the 1/RTT term is why it is a cliff rather than a slope.
+
+This is not a bug. It is what a loss-based congestion controller does on a long
+lossy path, and no amount of further elimination will remove it. The three
+levers that actually exist:
+
+1. **Fewer bytes.** Lossless compression on the PCM lane (FLAC-class, ~50-60%
+   on speech) and a serious look at 3 Mbps of video against a ~1 Mbps goal.
+2. **More associations.** Throughput scales linearly with lane count while the
+   per-lane Mathis ceiling stays fixed; 6 -> 12 doubles the headroom. Cheap to
+   test, and `?pcmpairs=N` already exists.
+3. **Not being loss-based.** A delay-based or rate-paced controller does not
+   halve on a random 0.3% drop. Largest win, and the least available — SCTP's
+   controller is the browser's.
+
+Lever 2 is the immediate experiment: it is one flag, and if `pcmpairs=12`
+moves rtt=300 materially then the ceiling is confirmed quantitatively and the
+direction is settled.
