@@ -4792,6 +4792,24 @@ baseline — which is ~16 ms more, giving ~162 ms against a measured median of
 Heavy-tailed jitter genuinely requires a deeper buffer than a clean path, and 4f
 is the estimator correctly buying what the network costs.
 
+**And one more correction, from the same numbers.** The component sum is
+confirmed by the good runs, not just estimated: at rtt=180 under `--net=real`
+with heavy-tailed jitter, `depth 26.2 / 23.8, outLatency 20, frameMs 8` against
+90 ms of propagation gives 143 ms, and those runs measured **143.1 and 145.8 ms**.
+
+**So the pipeline reaches 143 ms at that distance — inside the goal.** The 165.8
+median is not a floor set by physics plus a correct buffer; it is the good case
+plus a variance tail. Across eight repeats at rtt=180 the spread was 149.5 to
+214.4, and the difference between the ends is entirely whether the target stayed
+at 3-4f or wandered to 5-22f.
+
+That re-elevates the defect rather than demoting it. It is not a rare curiosity
+sitting beside an unavoidable median — **it IS the median**, in the sense that
+removing it would move the typical call from 166 ms to ~145 ms and put this
+distance under the goal. The correction to make here is to my own last paragraph:
+attacking the 56 ms fixed overhead is the wrong target, because the fixed
+overhead is already small enough. What has to be attacked is the VARIANCE.
+
 So the framing in 17.31 conflated two different things:
 
 - **The median (165.8 ms) is mostly the honest price of a real network.** It is
