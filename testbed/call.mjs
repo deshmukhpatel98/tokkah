@@ -573,6 +573,10 @@ const grab = async (s) =>
               obs.push({
                 ssrc: r.ssrc, kind: r.kind ?? r.mediaType, active: r.active,
                 fe: r.framesEncoded, fs: r.framesSent, b: r.bytesSent, p: r.packetsSent,
+                // Retransmission accounting. Traffic was measured scaling 2.6x
+                // from rtt=180 to rtt=300 with no extra data offered, and these
+                // are the counters that say whether video RTX owns it.
+                nack: r.nackCount, rtxP: r.retransmittedPacketsSent, rtxB: r.retransmittedBytesSent,
                 ql: r.qualityLimitationReason, target: r.targetBitrate,
               });
             }
@@ -683,6 +687,7 @@ if (ra.tapeMode?.wanted || rb.tapeMode?.wanted) {
     log(
       `  ${side}: sent ${v.framesEncoded}/${v.framesIn} frames (${inRate}% admitted)` +
         `  ${(v.bytesSent / 1e6).toFixed(1)} MB  ${v.mbpsAtFps} Mbps-at-fps` +
+        `  RTX ${v.rtxP ?? '?'}p/${v.packetsSent ?? '?'}p ${(((v.rtxB ?? 0) / 1e6)).toFixed(1)}MB nack ${v.nack ?? '?'}` +
         `  key ${v.keyframesSent}` +
         (r.tapeMode?.fellBack ? '  — FELL BACK to RTP' : ''),
     );

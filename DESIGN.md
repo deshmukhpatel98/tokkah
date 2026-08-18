@@ -6861,28 +6861,38 @@ But that line contains the finding. **988.3 MB in 1,037,804 datagrams across a
 45 s call is ~176 Mbps and ~23,000 packets/second.** The audio path offers ~1,500
 pps. Whatever is generating the other ~21,500 pps at rtt=300 is a retransmission
 explosion, and it is orders of magnitude larger than anything the queue gate
-governs. Measured, same call length, same offered rate:
+governs. First pair measured 375,713 datagrams at rtt=180 against 976,665 at rtt=300 and
+**that 2.6x ratio does not reproduce** -- a second pair gave 615,162 vs 662,509,
+which is 1.08x. Run-to-run variance at rtt=300 is large enough that one pair
+proved nothing, and the scaling claim built on it is withdrawn. (Same mistake
+shape as 17.31's "cliff at 260" and the two rig-noise withdrawals: a single
+pair, an effect smaller than the variance, believed because it agreed with the
+hypothesis in hand.)
 
-| rtt | datagrams | bytes |
-|---|---|---|
-| 180 | 375,713 | 252.9 MB |
-| 300 | 976,665 | 882.1 MB |
+What IS large and consistent is the video line:
 
-**2.6x the packets and 3.5x the bytes purely for being further away.** Nothing
-in the application offers more data at 300 ms than at 180. Traffic that scales
-with round-trip time is the signature of spurious retransmission: a timer that
-fires before an acknowledgement has had time to arrive, so every packet is sent
-again, which is the RTT-blind-timeout class this project has hit three times
-already (`muteAfterMs`, the ICE gather deadline, the DTLS wait).
+| rtt | frames offered | bytes | keyframes |
+|---|---|---|---|
+| 180 | 346 | 4.0 MB | **4** |
+| 300 | 3133 | 44.7 MB | **24** |
 
-Corroborating: `FEC repaired` is ~30 at rtt=180 and 1072 at rtt=300, a 35x
-increase in reconstructions, while netsim injected 0.3% loss and reported zero
-accidental drops. **That loss is being generated inside the transport, not on
-the wire.**
+Nine times the frames and six times the keyframes for the same 45 s call.
+A keyframe count that high is not steady-state retransmission -- it is the
+signature of **repeated decoder resets, i.e. the connection breaking and
+re-establishing during the call.** It sits with the rest of the rtt=300
+evidence: `reAnchors` 5, concealment 9-26 s, lane RTT spiking to 1669 ms while
+baseRtt holds at ~290.
 
-Open question, and it decides the fix: SCTP's own RTO is browser-internal and
-not ours to set, so if the retransmits are SCTP's then the lever is the offered
-rate and the number of associations, not a timeout. If they are ours -- the FEC
-parity scheduler or the pad/keepalive path -- then it is a timer to correct.
-The per-lane `sent`/`recv` counters already distinguish these and were not read
-in this pass.
+So the working hypothesis is no longer "the transport retransmits too much" but
+**"the session does not stay up at 300 ms RTT"**, which would inflate every
+counter downstream of it and explain why the queue gate fixed its own metric
+without moving mouth-to-ear. Given three RTT-blind timeouts already found in
+this codebase, a fourth in the reconnect/ICE/DTLS path is the first place to
+look.
+
+Next measurement, and it must be several runs per point, not one: ICE
+connection-state transitions and DTLS restarts per call at rtt=180 vs 300. The
+`?` in the RTX columns above is a driver gap -- `nackCount` and
+`retransmittedPacketsSent` are collected per-report but not carried into the
+aggregate -- and that should be closed at the same time so retransmission can be
+ruled in or out properly rather than inferred.
