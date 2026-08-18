@@ -6861,7 +6861,28 @@ But that line contains the finding. **988.3 MB in 1,037,804 datagrams across a
 45 s call is ~176 Mbps and ~23,000 packets/second.** The audio path offers ~1,500
 pps. Whatever is generating the other ~21,500 pps at rtt=300 is a retransmission
 explosion, and it is orders of magnitude larger than anything the queue gate
-governs. That is the thing to measure next: the same counter at rtt=180 versus
-rtt=300, to establish whether this scales with distance or is a threshold
-effect, and which stream (audio stripes, video, or DTLS/SCTP retransmits) owns
-the packets.
+governs. Measured, same call length, same offered rate:
+
+| rtt | datagrams | bytes |
+|---|---|---|
+| 180 | 375,713 | 252.9 MB |
+| 300 | 976,665 | 882.1 MB |
+
+**2.6x the packets and 3.5x the bytes purely for being further away.** Nothing
+in the application offers more data at 300 ms than at 180. Traffic that scales
+with round-trip time is the signature of spurious retransmission: a timer that
+fires before an acknowledgement has had time to arrive, so every packet is sent
+again, which is the RTT-blind-timeout class this project has hit three times
+already (`muteAfterMs`, the ICE gather deadline, the DTLS wait).
+
+Corroborating: `FEC repaired` is ~30 at rtt=180 and 1072 at rtt=300, a 35x
+increase in reconstructions, while netsim injected 0.3% loss and reported zero
+accidental drops. **That loss is being generated inside the transport, not on
+the wire.**
+
+Open question, and it decides the fix: SCTP's own RTO is browser-internal and
+not ours to set, so if the retransmits are SCTP's then the lever is the offered
+rate and the number of associations, not a timeout. If they are ours -- the FEC
+parity scheduler or the pad/keepalive path -- then it is a timer to correct.
+The per-lane `sent`/`recv` counters already distinguish these and were not read
+in this pass.
