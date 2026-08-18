@@ -7522,9 +7522,35 @@ the 6.4 ms of headroom cannot be taken by forcing the existing loop harder. It
 has to come from needing less depth, which means less arrival dispersion, not
 faster drainage.
 
-Which points back at the one term nothing has touched: `age p50` is ~91.6 ms
-against an 85 ms one-way, so ~6.6 ms arrives before the buffer is even
-consulted. That, and the ~4 ms the headless testbed adds to `outputLatency`
-(20 reported, 16 in a real browser), are the two places the remaining 6.4 ms
-could plausibly come from — and the second one means the true figure in a real
-browser is already ~4 ms better than every number recorded in this file.
+Which pointed at `age p50` being ~91.6 ms against an 85 ms one-way — ~6.6 ms
+arriving before the buffer is consulted.
+
+**That 6.6 ms does not exist.** 85 came from `baseRtt/2`, and `baseRtt` is a
+RUNNING MINIMUM. Typical RTT in those runs was 178-185 ms, so typical one-way is
+89-92 ms, and an `age p50` of 91.6 is exactly typical one-way with nothing added.
+Comparing a typical against a minimum manufactured the gap.
+
+Sender pacing was checked too and is not a source: parity is paced, data frames
+are dispatched on completion, and the file already records that the parity
+schedule costs no latency.
+
+So the honest budget at rtt=180 is:
+
+    typical one-way   ~91.6   (physics + route)
+    frame               8.0   (by design)
+    depth              24-30  (3f target; the 17.42 loop sits a little above it)
+    outputLatency      20.0   (16 in a real browser; 4 is the headless testbed)
+    --------------------------------
+    measured here     143.6 - 149.6
+    real browser      139.6 - 145.6
+
+**Every absolute figure in this file is ~4 ms pessimistic**, and on that budget
+rtt=180 is at or under the goal whenever depth holds near its 3f target — which
+7/24 sides did (§17.40). The gap between 7/24 and 24/24 is depth variance, and
+§17.42 showed it cannot be closed by draining harder.
+
+That makes the next step a measurement, not a change: `outputLatency` on a real
+browser, which decides whether the ~4 ms is real and therefore whether the
+median is already under 150. It cannot be taken from this testbed — it needs the
+one thing this project has never had a route to, a real browser on a real
+sensor, which is [[no-camera-route-from-this-mac]]'s standing blocker.
