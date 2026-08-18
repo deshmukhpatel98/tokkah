@@ -26,10 +26,28 @@ const headed = process.argv.includes('--headed');
 
 const browser = await chromium.launch({
   executablePath: CHROME, headless: !headed,
-  args: ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
+  args: ['--use-fake-ui-for-media-stream',
+    // Brave holds the macOS camera grant and still hung on a fresh profile with
+    // the site permission granted through Playwright, so the auto-accept flag is
+    // not reaching the capture path. These are the two Brave-specific suspects:
+    // its fingerprinting defence intercepts media-device access, and the newer
+    // Chromium auto-accept switch is the one current builds actually read.
+    // Disabling Brave's shields by feature flag was tried and CRASHES it
+    // (SIGTRAP on launch), so that door is shut.
+    '--auto-accept-camera-and-microphone-capture',
+    '--autoplay-policy=no-user-gesture-required'],
 });
 try {
-  const page = await browser.newPage();
+  // GRANT THE SITE PERMISSION EXPLICITLY rather than trusting a launch flag.
+  // --use-fake-ui-for-media-stream is supposed to auto-accept the page prompt,
+  // and in Brave it evidently does not: Brave holds the macOS camera grant
+  // (verified in Privacy & Security > Camera) and the probe still hung at 45 s
+  // on a fresh Playwright profile, where the per-site permission is unset.
+  // grantPermissions sets it through the browser's own permission store, which
+  // does not depend on any Chromium flag surviving Brave's fork.
+  const ctx = await browser.newContext({ permissions: ['camera'] });
+  await ctx.grantPermissions(['camera'], { origin: 'https://room.tokkah.com' });
+  const page = await ctx.newPage();
   // Pin a room and wait for the app to settle. Landing on `/` makes the app
   // invent a room id and rewrite the URL, and that navigation destroys the
   // execution context mid-evaluate.
