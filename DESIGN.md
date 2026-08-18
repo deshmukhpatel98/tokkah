@@ -7672,3 +7672,37 @@ practice: the 4 ms is now worth buying, and buying it is a separate piece of
 work.** Note also that `b00ed4f`'s method — test the settable half first, decline
 the wire change on the result — is why this costs one paragraph to revisit rather
 than a rewrite to undo.
+
+### The hazard that makes it a project rather than an edit
+
+Surveyed before stopping, because "three constants" was an assumption:
+
+- The frame size is declared **twice, independently**: `pcm.js:55-56`
+  (`FRAME_BYTES = 1152`, `FRAME_MS = 8`) and `pcm-worklet.js:35` (`FRAME = 384`).
+  Nothing enforces agreement between them.
+- `FRAME_BYTES` has 9 dependents, including the **SAB ring geometry**
+  (`320 + CAP_RING_F * FRAME_BYTES`, and the slice offsets that read it), the
+  **RS symbol size** (the file notes the parity symbol "is also exactly
+  FRAME_BYTES"), `OFFER_BPS`, and `backlogLimit`.
+- **There is no wire-format version negotiation.** `pcmAgree` settles whether
+  both ends want the lossless lane, not what shape its frames are.
+
+That last point is the one that matters. Halving the frame is an **un-negotiated
+breaking change to a format two live peers must agree on**. Both ends load the
+same deploy, so steady state is fine — but a call in progress across a deploy,
+or one peer holding a cached bundle, gives two endpoints that mis-parse each
+other's audio with no version field to detect it.
+
+So the work is not "edit three constants". It is, in order:
+
+1. Add a frame-shape field to the lane handshake, so a mismatch is *detected*
+   rather than silently mis-parsed. Ship and verify this **first**, under the
+   current 8 ms frame, where it is a pure no-op.
+2. Derive `pcm-worklet.js`'s `FRAME` from the same source as `FRAME_BYTES` /
+   `FRAME_MS`, so the two declarations cannot drift.
+3. Only then change the value, with the SAB geometry and RS symbol size
+   re-derived rather than re-typed.
+
+Step 1 is independently worth having: a format both ends must agree on, with no
+field saying which format it is, is a defect on its own terms regardless of
+whether the frame ever changes.
