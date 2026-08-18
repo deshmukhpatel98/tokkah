@@ -4913,9 +4913,39 @@ essentially unchanged at 5688 ms. Two separate defects wearing one signature:
    the pin was caused by the very deadlock being broken, so carrying it across
    the re-anchor is what makes priming impossible afterwards.
 
-Splitting them is the useful move: (2) is fixable now and worth ~250 ms under
+Splitting them is the useful move: (2) looked fixable now and worth ~250 ms under
 fault, (1) needs its own hunt and the ceiling experiment has ruled the target
 machinery out as its cause.
+
+**The fix for (2) was built, measured, and does not work.** `reAnchor()` was made
+to clear `spreadHold`, `maxEff`, the elastic pain counters and the target itself,
+on the reasoning that the pin is a record of the fault being escaped rather than
+evidence about the network. 12 calls at rtt=260 with the arms alternated:
+
+| | broken-run m2e | target on broken runs |
+|---|---|---|
+| reset ON | 470, 468, 474, 413, 318, 461 | 16-33f |
+| reset OFF | 466, 475, 388, 463 | 24-34f |
+
+Indistinguishable. The reset fires — `reAnchors` 1-4 — and the target is back at
+32f anyway, because the late-storm that pinned it is still running when the
+rescue completes and simply pins it again. An earlier single sample at 338.9 ms
+looked like a win and was noise; this is the third time in this session that one
+sample has told a story that repeats demolished.
+
+Defaulted OFF (`?pcmreanchorreset=1` re-enables). The reasoning behind it still
+looks right and the implementation is kept for whoever picks this up, but a
+correct-sounding change to the most scarred subsystem in this codebase does not
+get to ship on reasoning alone.
+
+**What this leaves.** Holding the ceiling down by hand DOES work (206 ms vs
+389-471), so the latency amplifier is real and reachable — just not through the
+re-anchor. The difference between the two experiments is that the hand-cap holds
+the ceiling down for the WHOLE CALL while the reset lets it climb again within
+seconds. So the fix has to survive the storm, not precede it: rate-limit
+`bumpTarget('late')` during a storm, or refuse to let lateness raise the target
+while `farFuture` is also climbing (which is the signature that says the playhead
+is behind the stream, a situation more buffer cannot help). Untested.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 

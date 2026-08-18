@@ -2126,7 +2126,12 @@ const PCM_CFG = {
   // bumpTarget('late') pins it at the ceiling during the storm, and the worklet
   // then re-primes against that pin — needing 32 contiguous frames before audio
   // resumes. `?pcmreanchorreset=0` is the control arm.
-  reAnchorReset: QS.get('pcmreanchorreset') !== '0',
+  // DEFAULT OFF: measured and it does not work. 12 calls at rtt=260, arms
+  // alternated — broken-run m2e was 318-474 ms with the reset and 388-475 ms
+  // without, and the target reached 26-33f in BOTH. The reset fires (reAnchors
+  // 1-4) and the late-storm re-pins the target immediately, so clearing it buys
+  // nothing. `?pcmreanchorreset=1` to re-enable for further work.
+  reAnchorReset: QS.get('pcmreanchorreset') === '1',
   // TEST ONLY: simulate that slow sender clock (?pcmslowclock=0.43). Default off.
   slowClock: Number(QS.get('pcmslowclock')) || 0,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
