@@ -746,6 +746,16 @@ if (ra.tapeMode?.wanted || rb.tapeMode?.wanted) {
         ` (link ${v.skipBuffered}, encoder ${v.skipEncQueue}, peer-decoder ${v.skipDecodeStalled})` +
         `  frame bytes mean ${v.frameBytesMean} p95 ${v.frameBytesP95}`,
     );
+    // The RATE CONTROLLER's own inputs. Without these, an A/B on the budget is
+    // undiagnosable: a null result cannot be told apart from `est` being garbage
+    // and both arms clamping to the same ceiling. rcEst is GCC's estimate, which
+    // this file's own tape.js comment says is not a measurement of the link when
+    // it rides a synthetic carrier; rcAudio is the measured audio reservation
+    // (17.55) and is null on the control arm by construction.
+    log(
+      `      rc est ${v.rcEstMbps ?? '?'} Mbps  budget ${v.rcBudgetMbps ?? '?'} Mbps` +
+        `  audioReserve ${v.rcAudioMbps ?? '—'} Mbps  trusted ${v.rcTrusted ?? 0}`,
+    );
     log(
       `      recv ${v.framesOut} frames  ${v.fragsRecv} frags  lost ${v.framesLost} frames` +
         `  gapped ${v.framesGapped}  late ${v.fragsLate}` +

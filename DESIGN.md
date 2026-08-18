@@ -8264,3 +8264,69 @@ This is `measure-the-rig's-noise-first` and `green-metrics-can-hide-defects`
 arriving together: had `outputLatency` not been printed on every line, six runs
 of 320-512 ms mouth-to-ear would have read as a catastrophic regression in the
 build I had just shipped.
+
+## 17.56 The audio reservation is arithmetically correct and cannot help — #14 is gated on #15
+
+`?l2res=1` vs default, `--net=mobile` (3 Mbps ceiling), rtt=220 and 300,
+alternated, two rounds. Kept OFF.
+
+At rtt=220, where both arms produced audio stats (medians of four):
+
+| | ARM | CTL |
+|---|---|---|
+| concealed | 2260 ms | 3152 ms |
+| audio frames lost | 282 | 394 |
+| video admitted | 31 % | 31.5 % |
+| video Mbps-at-fps | 1.80 | 1.48 |
+
+The audio numbers favour the arm and the video number runs the wrong way for a
+tighter budget, which alone should stop anyone shipping this. The rate-control
+line added mid-run says why, and it is more useful than the A/B:
+
+    rc est 1.31 Mbps  budget 0.6 Mbps  audioReserve 1.139 Mbps  trusted 0
+    rc est 2.40 Mbps  budget 0.6 Mbps  audioReserve 0.939 Mbps  trusted 1
+
+**The audio lane measures 0.91-1.14 Mbps and GCC's estimate of the WHOLE path is
+1.0-2.4 Mbps.** Lossless audio is consuming between half and all of the
+estimated capacity on its own. Subtracting it therefore drives the video budget
+straight into its `l2RcMinMbps` clamp floor of 0.6, every poll. The reservation
+does exactly what it was built to do and there is nothing left to allocate.
+
+So the §17.55 hypothesis was right about the SHAPE (a percentage reserving a
+fixed cost is wrong, and at 12 Mbps it over-reserves while at 3 Mbps it
+under-reserves) and wrong about the CONSEQUENCE. Fixing the shape buys nothing
+when the fixed cost is most of the link. **You cannot reserve your way out of a
+pipe that audio nearly fills.** Keeping the flag off, keeping the code, because
+the same arithmetic becomes correct the moment the audio lane gets cheaper.
+
+Note also the lane costs MORE here than the 682 kbps measured at rtt=180 on a
+clean path: 0.91-1.14 Mbps once parity and retransmits are counted under 1%
+loss. The bandwidth axis of the goal has to be quoted under loss, not on a clean
+link, and this file has never done that before tonight.
+
+### What this actually settles
+
+**#14 is gated on #15.** The 3 Mbps collapse is not a missing control loop; it
+is an audio lane that is too expensive for the link. The two ways out are to
+make it genuinely cheaper (§17.54: if ~8 bits/sample really is capture-chain
+noise, this lane drops toward 0.3-0.6 Mbps and the whole picture changes), or to
+give up losslessness under sustained duress — which the goal forbids as a
+default and which the existing Opus fallback already does badly and by accident.
+
+And §17.54's open question decides which: if the 44.1 kHz host device is
+manufacturing that noise, real calls are already far cheaper than every number
+in this file and #14 may not exist off this Mac. That test needs the host output
+at 48 kHz and is the first thing to run in the morning.
+
+### Rig notes, recorded so tonight's numbers are not reused blindly
+
+- `outLatency` climbed again, 195 -> 302-305 ms. The Bluetooth output is getting
+  worse, not stable. Every absolute m2e tonight is void; only deltas were read.
+- Two of eight runs lost their audio stats to CSP `script-src` violations and a
+  403 on the log fetch. It hit both arms (rtt=300 ARM r1, rtt=300 CTL r2), so it
+  is not arm-specific, but it cost 25% of the sample and is unexplained.
+- The regime is the same one §17.51 already ruled outside the instrument's
+  domain: rtt readings of 1892-9646 ms against baseRtt ~200, drift railed at
+  -20000 ppm, clock offsets of thousands of ms. Nothing here should be treated
+  as a measurement of anything except the rate-control line, which is a direct
+  read of two configured quantities and survives the chaos.
