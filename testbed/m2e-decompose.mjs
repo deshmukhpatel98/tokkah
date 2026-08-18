@@ -6,6 +6,24 @@
  *   - netAgeP50Ms / netAgeP90Ms (network + queueing age)
  *   - ringDepthMs (playout ring depth)
  *   - outputMs (device output path latency)
+ *
+ * OUTPUT LATENCY IS 4 ms HIGHER HERE THAN IN A REAL BROWSER, measured
+ * 2026-08-18. This rig drives HEADLESS Chrome, which has no audio device and
+ * falls back to a null sink; that sink reports outputLatency 20.0 ms with zero
+ * run-to-run variance. A non-headless Chrome on the SAME Mac with the same
+ * audio hardware, same AudioContext construction (48 kHz, latencyHint 0), and
+ * audio actually rendering, reports 16.0 ms — stable across six samples 250 ms
+ * apart. (Read it only while sound is flowing: outputLatency sits at 0 until
+ * the first quantum reaches the sink, which is a good way to conclude a real
+ * device has no latency at all.)
+ *
+ * So every mouth-to-ear number this rig produces is inflated by ~4 ms against
+ * what a real browser on this machine would do: the 43-47 ms clean path is
+ * really about 39-43. The rig is not wrong about DELTAS — both arms of any A/B
+ * carry the same offset and it cancels — but it is wrong about the ABSOLUTE
+ * figure, which is the one being compared to a 150 ms goal. Neither the goal
+ * nor the remaining budget should be read off this number without subtracting
+ * it. outputMs is still the largest single component either way.
  *   - inputMs (AudioContext base processing latency, lower bound)
  *
  * Runs two headless Chrome peers in a room on https://room.tokkah.com (?r=m2e-<ts>).
