@@ -4745,6 +4745,48 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.32 Two fixes attempted for the distance defect, two measured failures (2026-08-18)
+
+Recorded because the negative results are the useful part, and because both were
+plausible enough to have shipped on reasoning alone.
+
+**1. Re-anchor target reset** (`?pcmreanchorreset=1`, default off). A re-anchor
+inherited the target the deadlock had pinned, so the worklet re-primed against a
+32f target and could never complete. Clearing it on re-anchor looked obviously
+right. 12 calls, arms alternated: median broken m2e **461.8 ms with, 463.5 ms
+without**. The reset fires (`reAnchors` 1-4) and the storm re-pins the target
+within seconds.
+
+**2. Late-pin guard** (`?pcmlatepin=1`, default off). A broken rtt=260 call
+reports `late 708` AND `farFuture 624` together — frames rejected at BOTH ends of
+the window, which no buffer depth satisfies, so the window is misplaced rather
+than too small and growing it is harmful. Suppressing `bumpTarget('late')` while
+far-future rejections are also arriving followed directly from that. 16 calls at
+rtt=180 `--net=real`, arms alternated: median **162.1 ms with, 155.2 ms
+without** — not a null, a small regression.
+
+The second failure is the more instructive one. The guard was correct about the
+case it was written for and was applied unconditionally, and at rtt=180 under
+heavy-tailed jitter the target LEGITIMATELY needs to grow to 4-5f. Suppressing
+late-bumps delayed growth the call genuinely needed. A rule derived from a
+pathological signature, shipped without a condition restricting it to that
+signature, made the ordinary case slower.
+
+**What both attempts have in common:** they are target-machinery tweaks, and the
+ceiling experiment already showed the target machinery is the AMPLIFIER, not the
+cause. Two failures is enough to stop trying to fix an amplifier and go after
+what drives it.
+
+**The lead that is left, and it is a good one: the ASYMMETRY.** Under real
+conditions one direction of a call inflates while the other does not — rtt=180
+gave side A 274.1 ms (depth 154.3, target 19f) against side B 157.0 ms (depth
+37.2, target 4f) in the same call, and rtt=220 gave the mirror image. Same host,
+same clock, same fixture, same network profile, opposite outcomes. That rules out
+everything global and localises the cause to per-direction receive state. It was
+structurally invisible on a delay line, where both directions saw an identical
+regular pipe, which is a second thing the rigged test cost beyond optimistic
+numbers.
+
 ## 17.31 The distance numbers were measured on a delay line — corrected (2026-08-18)
 
 17.30's sweep used `call.mjs --rtt=N`, which leaves **jitter 0, loss 0, bandwidth
