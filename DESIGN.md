@@ -7386,6 +7386,43 @@ Three things also argue against, all small and all pointing the same way:
 
 So: promising, underpowered, and cheap to settle — 12 usable rounds at rtt=180
 with the lag threshold enforced, scoring concealment and under-150 count
-alongside the median. If it holds, it is 8 of the 53 ms of overhead and it takes
-rtt=180 under the goal **with lossless audio**, which no configuration has yet
-done.
+alongside the median.
+
+### Settled: 12 usable rounds, and both objections inverted
+
+The rig enforced the discard rules **before** results were seen — a round was
+dropped if either arm produced no snapshot or ran past 100 ms of emulator loop
+lag. 2 of 14 attempts discarded. (A run discarded after seeing its result is a
+run discarded *for* its result.)
+
+Paired deltas: -34.8 +16.1 -44.2 +12.8 -14.5 -16.5 -0.3 -68.8 +58.3 -8.3 -5.3 +42.7
+
+**Median -6.82 ms against -8.0 predicted, favoured 8/12.**
+
+| | margin 0 | margin 1 |
+|---|---|---|
+| median | **155.8** | 159.4 |
+| mean | **165.0** | 170.3 |
+| max | **248.1** | 283.3 |
+| under 150 ms | **7/24** | 3/24 |
+| concealment total | **2816 ms** | 3336 ms |
+
+**Both objections from the two-round run inverted at n=24.** Concealment was
+"up 19%"; it is down 16%. Under-150 was "unchanged"; it more than doubled. That
+is the entire justification for re-running rather than shipping on a number that
+matched its prediction — the matching number was right, and both of the reasons
+to doubt it were noise.
+
+Defaulted ON (`?pcmjitmargin=1` restores the old behaviour). Mechanism
+understood, predicted magnitude matched, every aggregate agreeing, and the goal
+metric moving rather than just the median.
+
+### What it does not do
+
+The median is 155.8 ms, **still above 150.** Absolute figures drifted upward
+across this session as the machine accumulated load — the same control arm
+measured 152.7 ms earlier and 159.4 ms here — so cross-session absolutes are not
+comparable and only the paired deltas are. What can be said: 8 ms of the ~53 ms
+overhead is now gone, under-150 calls went from 1-in-8 to roughly 1-in-3.5, and
+the remaining overhead is ~20 ms output latency (platform floor, ~4 ms of it the
+headless testbed) plus ~25 ms of jitter buffer.

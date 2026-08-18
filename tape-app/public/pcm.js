@@ -2727,7 +2727,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // rounds against m2e-ab's measured +/-2.7 ms floor. A version of this that
     // reported only the milliseconds saved would be the hand-tuning the note
     // warned about, wearing a measurement's clothes.
-    const D_MARGIN_FRAMES = Math.max(0, cfg.jitterMarginFrames ?? 1);
+    // DEFAULT 0 since §17.40 (`?pcmjitmargin=1` restores the old behaviour).
+    // This frame was a safety margin sized when `spread` still carried startup
+    // contamination; §17.34 removed that, so it was insuring against a risk that
+    // no longer exists and charging 8 ms for it.
+    //
+    // 12 usable rounds at rtt=180 --net=real, arms alternated, rounds discarded
+    // BEFORE inspection when either arm was empty or ran past 100 ms of emulator
+    // loop lag (2 of 14 discarded):
+    //   paired median -6.82 ms vs -8.0 predicted, favoured 8/12
+    //                   margin 0     margin 1
+    //   median          155.8        159.4
+    //   max             248.1        283.3
+    //   under 150 ms    7/24         3/24
+    //   concealment     2816 ms      3336 ms
+    //
+    // Not a trade: concealment fell 16%. An earlier two-round run had it RISING
+    // 19% and the under-150 count flat, and both of those inverted at n=24 --
+    // which is the whole reason this was re-run instead of shipped on a number
+    // that happened to match the prediction.
+    const D_MARGIN_FRAMES = Math.max(0, cfg.jitterMarginFrames ?? 0);
     const JIT_HOLD = cfg.jitterHold !== false;
     // 0.25 ms per 250 ms tick = 1 ms/s: a ~98 ms burst stays remembered for most
     // of a call. Was 2 (8 ms/s, chosen to match the output decay by reasoning
