@@ -52,7 +52,7 @@ import { RsEncoder, rsDecode, RS_K, RS_P, setRsK } from './core/pcmrs.js';
 import { SwEncoder, SwDecoder, SW_STRIDE } from './core/pcmsw.js';
 import { packFrame, unpackFrame } from './core/pcmpack.js';
 
-const FRAME_BYTES = 1152; // 384 samples × int24
+const FRAME_BYTES = 576;  // 192 samples × int24 — 4 ms (§17.44 step 4)
 // Samples per frame, DERIVED. Until 2026-08-18 this number was written out as a
 // literal at 14 executable sites in this file, including the SAB geometry at the
 // `new SharedArrayBuffer(816 + RING_F * ... * 4)` below and its paired view.
@@ -62,7 +62,7 @@ const FRAME_BYTES = 1152; // 384 samples × int24
 // against the worklet's and both stay internally consistent while the literals
 // are wrong. Silent corruption, not a throw. (int24: 3 bytes per sample.)
 const FRAME_SAMPLES = FRAME_BYTES / 3;
-const FRAME_MS = 8;       // 384 samples at 48 kHz — the seq→time constant
+const FRAME_MS = 4;       // 192 samples at 48 kHz — the seq→time constant
 
 /**
  * The wire's frame shape, exported so the lane handshake can carry it.

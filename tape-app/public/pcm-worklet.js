@@ -45,7 +45,7 @@ import { createPresence } from './core/presence-core.js';
 // which is the property that matters: the failure mode being guarded against is
 // two ends reading each other's datagrams at the wrong stride and reporting it
 // as a transport fault (§17.44).
-const FRAME = 384;
+const FRAME = 192;
 const RING_F = 64;          // 512 ms of ring — 4× the 120 ms D_max plus slack
 const RING = FRAME * RING_F;
 const HIST = 2048;          // output history for the concealment search (~42 ms)
