@@ -2256,9 +2256,15 @@ const PCM_CFG = {
   // 43.6 was a low draw, not the flag. Clean-path m2e ranges 42.4-49.2 across
   // today's runs and a single reading per arm cannot resolve 4 ms of it.
   //
-  // So: no measured clean-path cost, a measured fault-path benefit, default
-  // stays 400. `?pcmpingms=` remains the control arm — and the next attempt at
-  // this question uses PAIRED REPEATS, the way the stall rig now does.
+  // SETTLED, with the paired rig that question forced into existence
+  // (testbed/m2e-ab.mjs, 3 rounds, arm order rotated, against a null A/B floor
+  // of +/-2.7 ms):
+  //     mouth-to-ear  median -0.2 ms   per-round 0.0, -0.2, -1.3
+  //     ring depth    median -0.1 ms   per-round 0.0, -0.1, -1.3
+  // Every round <= 0, so the fast ping costs nothing on the clean path and if
+  // anything is marginally ahead. Default 400: no clean-path cost measured, a
+  // fault-path benefit measured (detection 8.0 s -> 2.8 s). `?pcmpingms=` stays
+  // as the control arm.
   pingMs: Number(QS.get('pcmpingms')) || 400,
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
