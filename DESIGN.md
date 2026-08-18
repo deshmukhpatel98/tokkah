@@ -4885,8 +4885,37 @@ then re-primes against a `target` that the late-storm has already pinned at 32f,
 priming needs 32 present frames before playout resumes — a quarter of a second of
 audio that must land contiguously while the stream is still arriving a ring
 ahead. That would explain a rescue that fires, is correct in principle, and
-cannot complete in practice. Unverified: stated as the next thing to test, not as
-a result.
+cannot complete in practice.
+
+**Tested, and it splits the fault in two.** Four calls at 260 with the target
+ceiling held down (`?pcmelastic=0&pcmjbmax=8` — elastic off as well, because
+`maxEff` climbs to `ELASTIC_MAX_F` regardless of `maxTargetFrames`, which is why
+a first attempt with `pcmjbmax=8` alone still reached `target 30f`):
+
+| | default ceiling | ceiling pinned at 8 |
+|---|---|---|
+| broken runs | 6 / 10 | 1 / 4 |
+| m2e when broken | 389-471 ms | **206.1 ms** |
+| target when broken | 24-33f | **2f** |
+| concealed when broken | 4600-8904 ms | **5688 ms** |
+
+So the ceiling owns the LATENCY and not the CONCEALMENT. Capping it takes a
+broken run from 400-470 ms down to 206 ms and keeps the target at 2f — the ring
+never inflates, the drain never has to unwind it — while the concealment is
+essentially unchanged at 5688 ms. Two separate defects wearing one signature:
+
+1. **A concealment burst** at long RTT, cause still unknown, unaffected by the
+   ceiling. This is the real bug.
+2. **A latency amplifier**: that burst pins the target through
+   `bumpTarget('late')`, and the pin then costs ~250 ms of mouth-to-ear that
+   outlives the burst by the whole release time. This one is understood, and the
+   fix direction is that a re-anchor should reset the target it is escaping —
+   the pin was caused by the very deadlock being broken, so carrying it across
+   the re-anchor is what makes priming impossible afterwards.
+
+Splitting them is the useful move: (2) is fixable now and worth ~250 ms under
+fault, (1) needs its own hunt and the ceiling experiment has ruled the target
+machinery out as its cause.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
