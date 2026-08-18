@@ -8004,3 +8004,46 @@ gate is running at rtt=180 and rtt=220 now. The value 40 is the first one tried
 and is not yet justified against 20 or 80; -245 ms is large enough that finding
 the knee matters less than shipping the fix, but it should be recorded as
 unjustified rather than presented as tuned.
+
+## 17.50 The short-path gate passes, and the old collapse cannot come back
+
+`?pcmqms=40` vs default at rtt=180 and rtt=220, `--net=real`, order alternated,
+two rounds each:
+
+| | 180 ARM | 180 CTL | 220 ARM | 220 CTL |
+|---|---|---|---|---|
+| m2e median | **154.8** | 158.3 | **190.8** | 202.6 |
+| concealed median | **80 ms** | 152 ms | 240 ms | 176 ms |
+
+No regression at either distance. m2e is slightly better in both, concealment is
+better at 180, and at 220 the concealment difference runs the other way by
+64 ms of median. Each side has exactly one partial-collapse direction in the
+four (ARM 264.7 ms at depth 125.4, CTL 311.7 ms at depth 171.6), and four
+samples with an outlier apiece cannot separate a 64 ms concealment difference
+from noise. Recorded as "not shown harmful", not as "shown better".
+
+### The pcm-loss2 collapse cannot be reintroduced by this, and here is the arithmetic
+
+The code comment guarding this flag cites a measured collapse from making the
+gate too tight, so the value has to be checked against it rather than argued
+around. That run (`testbed/runs/pcm-loss2-.../meta.json`) was rtt=80, 1% loss.
+
+    bdp x 1.5  ==  bdp + 0.5 x bdp  ==  bdp + (rtt/2) ms of data
+
+So `QUEUE_MS = 40` is EXACTLY the current default at rtt=80. Below 80 it is more
+generous than today; above 80 it is tighter. At the precise conditions where the
+old collapse was measured, the two gates are byte-for-byte identical, and the
+crossover is a property of the value 40, not a coincidence -- QUEUE_MS = rtt/2
+is the identity, so any QUEUE_MS is "the default at rtt = 2 x QUEUE_MS".
+
+That also gives the honest way to describe the change: **the allowance stops
+growing past rtt=80.** It is not a tightening everywhere; it is a ceiling on a
+quantity that previously had none.
+
+### What is still untested
+
+Long path AND high loss together. Everything above is 0.3% loss with no
+bandwidth ceiling. A tight gate sheds frames the concealer must cover, and that
+cost should rise with loss, so `--net=mobile` (30 ms jitter, 1% loss, 3 Mbps
+ceiling against a 1.152 Mbps audio source plus video) at rtt=220 and rtt=300 is
+the last gate before this can default on.
