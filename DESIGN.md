@@ -8154,3 +8154,52 @@ transmits perfectly. If that holds, ~380 kbps of this lane is noise carried
 losslessly. Filed, not concluded: it needs the sent samples compared against the
 source, and a real microphone, since the fixture chain may not represent a real
 device.
+
+## 17.53 The drain clamp is railed and it does not matter — hypothesis rejected
+
+`?pcmdrift=8000` vs default 2000, rtt=180 and 220, `--net=real`, alternated,
+two rounds, four directions per cell:
+
+| | ARM (8000 ppm) | CTL (2000 ppm) |
+|---|---|---|
+| rtt=180 m2e median | 158.3 ms | **150.2 ms** |
+| rtt=180 concealed | 80 ms | 80 ms |
+| rtt=220 m2e median | 204.1 ms | 204.9 ms |
+| rtt=220 concealed | 300 ms | **236 ms** |
+
+**Rejected.** 8 ms WORSE at 180, indistinguishable at 220, and concealment worse
+at 220. The prediction was a gain of roughly 20 ms and the sign came out
+backwards.
+
+### What the argument got wrong
+
+The observation was sound: `r = 1 + err/(sampleRate*4)` saturates the 0.2% clamp
+at err = 384 samples = 8 ms, the target decays at 8 ms/s, and the drain follows
+at 2 ms/s, so the controller sits pinned. All of that is true and none of it was
+the binding constraint. **A saturated actuator is not automatically the limiting
+one** — that inference is the whole error, and it is worth naming because
+"the gauge is pegged" is exactly the kind of observation that feels like a
+diagnosis.
+
+The likely mechanism for the sign flip: `maxDrift` bounds BOTH directions
+(`up` and `down` both fall back to it inside the +-25 ms band). Raising it
+therefore does not just drain faster, it refills faster too. A proportional loop
+with a 4 s time constant and 4x the authority overshoots into deficit, the
+estimator sees underrun risk and bumps the target to cover it, and depth settles
+HIGHER on average than it did under a slow controller that simply sat still. A
+loop that hunts costs more than the standing excess it was meant to remove.
+
+So §17.13's 0.2% is not a timid bound that nobody revisited; it is doing work.
+The knee above 25 ms (which reaches 2%) is the right shape after all: be patient
+near the setpoint, aggressive only when genuinely far from it.
+
+### The number that matters is in the control column
+
+rtt=180 median **150.2 ms**, individual directions 142.9 / 146.6 / 153.8 / 154.0.
+Less the 4 ms this rig is known to overstate, that is **~146 ms on a real
+browser at rtt=180** — under the goal. The same distance measured 158.3 this
+morning with `bdp x 1.5`, so the queue cap of 17.49 is worth about 8 ms at 180
+as well, not only at the long distances it was built for.
+
+Under-150 now holds at rtt<=180 and fails beyond it. The remaining gap is not a
+control-loop gain; it is depth, propagation, and the 3 Mbps structural failure.
