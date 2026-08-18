@@ -430,7 +430,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // seq clock runs slower than wall time, or the sender restarted its seq)
       // and the ring was re-seeded on the live stream instead of concealing
       // forever. Distinct from ringReseeds, which can only happen pre-playout.
-      reAnchors: 0,
+      reAnchors: 0, reAnchorTargetResets: 0,
       portDropped: 0,
       fecRepaired: 0, fecRepairedLate: 0, fecFailed: 0, parityUnused: 0,
       // Adaptive code rate. lossPct is what WE measure on the inbound stream;
@@ -1259,6 +1259,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // define the accept window.
     let lastRingWriteAt = 0, lastRejSeq = -1, reprime = false;
     const RE_ANCHOR = cfg.reAnchor !== false; // ?reanchor=0 is the control arm
+    const REANCHOR_RESET = cfg.reAnchorReset !== false; // ?pcmreanchorreset=0 is the control arm
     const pendingPort = []; // frames arrived before the playout node existed (port mode)
 
     // int24 → float32 scratch
@@ -1464,6 +1465,36 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         Atomics.store(ctl, SAB_HI, seq);
         reprime = true;
         lastRingWriteAt = now();
+        // FORGET THE TARGET THIS DEADLOCK CAUSED (`?pcmreanchorreset=0`).
+        //
+        // The storm of rejected frames that makes a re-anchor necessary also
+        // calls bumpTarget('late') on the way past, so by the time the rescue
+        // runs the target is pinned at the ceiling — measured 24-33f on every
+        // broken long-RTT call. The worklet then re-primes against THAT, so
+        // playout cannot resume until 32 contiguous frames are present: a
+        // quarter-second of audio that has to land cleanly while the stream is
+        // still arriving a ring ahead. The rescue fires (reAnchors 1-2, both
+        // measured) and cannot complete.
+        //
+        // Carrying the pin across the re-anchor is what makes it unfinishable,
+        // and the pin is not evidence about the network — it is a record of the
+        // fault being escaped. A new epoch re-earns its own target, the same
+        // rule the lane state machine already applies to skew and RTT streaks
+        // on a state change.
+        //
+        // Worth 250 ms under fault, measured from the other direction: holding
+        // the ceiling down by hand (?pcmelastic=0&pcmjbmax=8) took broken runs
+        // from 389-471 ms of mouth-to-ear to 206 ms with the target at 2f. This
+        // reaches the same place without capping what a healthy call may ask
+        // for. It does NOT address the concealment burst itself — that survived
+        // the ceiling experiment unchanged at 5688 ms and is a separate defect.
+        if (REANCHOR_RESET) {
+          spreadHold = 0;
+          maxEff = cfg.maxTargetFrames;
+          elPainSeen = 0; elCalmMs = 0;
+          setTarget(cfg.targetFrames);
+          stats.reAnchorTargetResets++;
+        }
         if (playNode) playNode.port.postMessage({ type: 'reprime' });
       };
       if (seq < lo) {
@@ -3331,6 +3362,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           })(),
           m2eRefused: stats.m2eRefused,
           reAnchors: stats.reAnchors,
+          reAnchorTargetResets: stats.reAnchorTargetResets,
           // Note: baseLatency is the AudioContext's processing latency (capture-side
           // ADC latency is not exposed by browsers, so inputMs is a lower bound and
           // is NOT added into mouthToEarMs, which stays exactly as it is).

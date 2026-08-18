@@ -2122,6 +2122,11 @@ const PCM_CFG = {
   // ring on the live stream instead of concealing forever. ?reanchor=0 is the
   // control arm.
   reAnchor: QS.get('reanchor') !== '0',
+  // A re-anchor must not inherit the target the deadlock it is escaping created.
+  // bumpTarget('late') pins it at the ceiling during the storm, and the worklet
+  // then re-primes against that pin — needing 32 contiguous frames before audio
+  // resumes. `?pcmreanchorreset=0` is the control arm.
+  reAnchorReset: QS.get('pcmreanchorreset') !== '0',
   // TEST ONLY: simulate that slow sender clock (?pcmslowclock=0.43). Default off.
   slowClock: Number(QS.get('pcmslowclock')) || 0,
   driftPpm: Number(QS.get('pcmdrift')) || 2000, // §10's ±0.2% resample bound
