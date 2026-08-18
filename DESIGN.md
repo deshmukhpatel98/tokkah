@@ -7846,3 +7846,45 @@ localises it already exists — `age` itself, per direction, and it is wrong by
 almost exactly one one-way delay, which is a strong hint about which term.
 
 Prod is on 8 ms and verified. The branch stays unmerged.
+
+## 17.47 The 4 ms build works now — and the first pair does not show a win
+
+`bc68e61` fixed the seq->wall conversion (literal `8` -> `FRAME_MS`) and it is
+merged into `frame-4ms`. Deployed to prod, one call, restored 8 ms after:
+
+    age p50 92.1 / 93.0 ms   depth 33.3 / 37.9   target 6f   m2e 153.4 / 158.9
+
+**Age is positive and correct.** The negative-age defect of §17.46 is gone, and
+target 6f x 4 ms = 24 ms is the same buffer depth the 8 ms build reaches at 3f —
+so the estimator is sizing identically in real time, which is the right
+behaviour and a good sign the change is semantically clean.
+
+Against the 8 ms pair measured minutes earlier on the same host:
+
+| | 4 ms | 8 ms |
+|---|---|---|
+| m2e | 153.4 / 158.9 | 158.3 / 151.1 |
+| mean | 156.2 | 154.7 |
+| FEC repaired | 222 / 184 | 12 / 26 |
+| concealed | 296 / 216 ms | — |
+
+**No win in this pair, and a large cost visible.** FEC repairs are up roughly
+10x. That is the arithmetic working as expected — half the frame means twice the
+packets per second, so twice the exposure to a fixed per-packet loss rate — but
+it is much larger than the ~4 ms the change was bought for, and it is the
+bandwidth half of the goal being spent.
+
+One pair proves nothing either way; §17.45's alternating-deploy design is still
+what settles it. But the prior has moved: the expected gain was 4 ms of
+assembly plus some of the depth overshoot, and the depth overshoot did **not**
+appear — the target tracked to the same real-time depth, exactly as a correct
+estimator should. So the plausible prize is ~4 ms, against a measured 10x rise
+in repair traffic.
+
+That reframes the question from "does it buy 4 ms" to **"is 4 ms worth twice the
+packet rate"**, which the goal answers ambiguously: it wants under 150 ms *and*
+~1 Mbps. Nothing here has measured the exchange rate between them, and this is
+the first change where they pull against each other hard enough to matter.
+
+Prod is on 8 ms and verified. `frame-4ms` is functional, unmerged, and now
+worth A/B-ing on wire bytes as well as latency.
