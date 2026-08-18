@@ -7205,3 +7205,69 @@ condition is the thing to catch, not the steady state. Every number in 17.35-37
 taken from a single run at rtt=300 is a draw from a bimodal distribution and
 should be re-read that way, including the ones I used to build the ceiling
 argument.
+
+## 17.38 Why a tipped call never recovers: the source rate has no feedback
+
+17.37 established that rtt=300 is bistable — the same settings produce a healthy
+call (351/320 ms, clump 12-15%, stalls 58-63 ms, concealment under a second) or
+a collapsed one (550-990 ms, clump 25-34%, stalls to 1186 ms, concealment in
+tens of seconds), and once collapsed it stays collapsed for the whole call.
+
+A steady-state ceiling cannot produce that. A self-sustaining loop can:
+
+1. A loss burst (or an RTO) halves the association's congestion window.
+2. **The application keeps writing at exactly the same rate.** The PCM lane is
+   constant-bitrate by construction — 125 packets per second, always.
+3. cwnd is now below the offered rate, so the send queue grows.
+4. A growing queue means older frames, more timeouts, more loss signals.
+5. Go to 1.
+
+There is no arc back to health in that loop, which is precisely the observed
+behaviour: no run has ever been seen recovering mid-call. At rtt=180 step 3 is
+false — cwnd stays above the offered rate — so the loop never closes and the
+same code is stable. **The distance dependence is not that long paths are
+slower; it is that long paths make step 3 reachable.**
+
+### What this says about the fixes already tried
+
+It explains the shape of every result in 17.35-37:
+
+- The **queue gate** (`pcmqms=30`) attacks step 3 and only step 3. It cut
+  backlog 14x and lane RTT 3.6x — genuinely — and left mouth-to-ear alone,
+  because dropping the overflow does not restore cwnd. It converts queue into
+  concealment, which is the same loss wearing different clothes.
+- **More lanes** attacks nothing in the loop. It raises aggregate capacity,
+  which delays step 3's onset but does not change what happens after, and each
+  lane still runs its own copy of the loop. Hence UNRESOLVED with concealment
+  slightly worse.
+- The **jitter estimator** (17.33/17.34) is downstream of all of it and was
+  correctly sizing for the holes the loop creates.
+
+Three fixes, three partial or null results, one explanation for all three:
+**none of them touched the source rate, and the source rate is the only term in
+the loop the application controls.**
+
+### The fix that follows
+
+Close the loop: when the path cannot carry lossless PCM, stop offering it.
+Falling back to compressed audio (Opus at ~40 kbps, ~2% of the PCM rate) drops
+the offered rate far below any plausible collapsed cwnd, which breaks step 3 and
+lets cwnd recover.
+
+This trades the goal's "audio lossless" against its "under 150 ms" — but the
+trade is not real, because a collapsed call delivers **neither**: 550 ms of
+mouth-to-ear with 26 s of concealment is not lossless audio, it is badly
+damaged audio arriving late. Lossless is a property of calls that are working.
+The honest framing is that losslessness must be *conditional on the path being
+able to carry it*, and the current design asserts it unconditionally.
+
+Two things to measure before building it, in this order:
+
+1. **An Opus-path latency instrument.** `?pcmaudio=0` currently reports no
+   mouth-to-ear at all, because the metric rides the PCM snapshot. Until that
+   exists the fallback cannot be evaluated, and this is the blocking gap.
+2. **The entry condition.** `stats.stalls` already carries timestamped stalls,
+   so the first stall over ~300 ms can be located and whatever precedes it
+   inspected. If the tip is a single identifiable event rather than gradual
+   drift, detecting it is cheaper than tolerating it — and a fast switch at the
+   tip would cost far less audio than the collapse does.
