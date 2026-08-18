@@ -4745,6 +4745,51 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.30 How far around the earth is 150 ms? (2026-08-18)
+
+The goal is "any call, anywhere on earth, under 150 ms". That is a question with
+a number for an answer and nobody had asked it that way. Six real calls on prod —
+two real browsers, real recorded speech, real WebRTC, the shipping build —
+against netsim's `oneWayMs` propagation, via `call.mjs --rtt=N`:
+
+| sim RTT | one-way | ring depth | target | mouth-to-ear |
+|---|---|---|---|---|
+| 0 | 0 ms | 16.6 / 18.8 ms | 2f | **48.1 ms** |
+| 100 | 50 ms | 18.8 / 19.5 ms | 2f | 99.8 ms |
+| 140 | 70 ms | 17.0 / 13.9 ms | 2f | **116.0 ms** |
+| 180 | 90 ms | 14.4 / 16.1 ms | 3f/2f | 136.1 ms |
+| 220 | 110 ms | 11.2 / 10.8 ms | 2f | **151.7 ms** |
+| 260 | 130 ms | 228 / 301 ms | 24f/32f | **388.9 / 461.6 ms** |
+
+Through 220 the line is m2e ≈ **48 + 0.94 x one-way**, and the slope being under
+1 is not noise: the ring SHRINKS as distance grows (16.6 -> 10.8 ms), because a
+longer path with the same jitter needs no more buffer and the estimator correctly
+declines to add any. The buffer is not paying for distance.
+
+**The crossing is at about RTT 210**, i.e. ~105 ms of one-way propagation. In
+fibre (~204,000 km/s) that is ~21,400 km of PATH, and real routes run 1.4-1.5x
+great-circle, so roughly **14,000-15,000 km of separation**. Delhi-Amsterdam is
+6,350 km; Delhi-New York 11,750; Delhi-Sao Paulo ~14,700. London-Sydney (17,000)
+is outside it. So: most of the planet, not all of it — and the honest statement
+is "under 150 ms for any path whose RTT is under ~210 ms", because real routing,
+not distance, is what decides that.
+
+**Where the 48 ms goes**, and by the goal's own standard every millisecond of it
+is a defect: `outputMs` 20 (the OS audio device, already at the Web Audio floor
+with `latencyHint: 0`, and ~4 ms of it is the testbed's non-real sink), ring
+~11-17, `frameMs` 8, and ~2-3 ms of arrival age over propagation. At RTT 220 the
+split is 110 ms of light and 42 ms of us.
+
+**And a cliff between 220 and 260.** m2e goes 151.7 -> 388.9/461.6, the target
+2f -> 24f/32f, depth 11 -> 228/301 ms. It is not the network: arrival age at 260
+is p50 132.5 / p95 135.3, i.e. **2.8 ms of spread** — the arrivals are punctual.
+It is not the drift estimator either, though it looks like it at first (4747 and
+6770 ppm against a 2000 ppm bound): that is the graded drain doing exactly what
+it was built to do, widening toward its 20000 ppm cap because the ring is
+overfull. Punctual arrivals plus a 228 ms ring means the buffer filled from
+something that is not jitter. Bracketing run in progress; until it reproduces,
+this is one observation and the rig is not yet ruled out as its author.
+
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
 Found by following § 17.28's **negative** result. Tripling the speed of dead-lane
