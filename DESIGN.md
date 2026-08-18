@@ -4764,25 +4764,50 @@ sample set. The bound is derived, not tuned — such a frame could not have been
 played at maximum buffer, so growing to catch it catches nothing and costs the
 whole excursion, repaid at `JIT_RELEASE`'s 8 ms/s for ~20 s.
 
-**Measured**, 2 valid paired rounds with the arm order rotated (1 of 3 dropped by
-the rig's own noise gate and named), against the SHIPPING configuration:
+**Measured — and the first reading was wrong.** A 2-round run said mouth-to-ear
+-139 ms, ring -136 ms, whole-call concealment -436 ms, same sign every round. A
+3-round rerun did not reproduce any of it:
 
-| | ON | OFF | median delta | per round |
-|---|---|---|---|---|
-| mouth-to-ear during fault | **196 ms** | 335 ms | **-139 ms** | -77, -201 |
-| ring depth during fault | **112 ms** | 247 ms | **-136 ms** | -76, -196 |
-| conceal whole call | 1892 ms | 2328 ms | **-436 ms** | -424, -448 |
-| conceal during stall | 450 ms | 486 ms | -36 ms | -72, 0 |
+| | 2 rounds | 3 rounds |
+|---|---|---|
+| mouth-to-ear during fault | -139 ms (-77, -201) | **-35 ms** (+50, -35, -80) UNRESOLVED |
+| ring depth during fault | -136 ms (-76, -196) | **-37 ms** (+47, -37, -80) UNRESOLVED |
+| conceal whole call | -436 ms (-424, -448) | **+832 ms** (+832, +1512, -88) UNRESOLVED |
 
-Same sign every round on all four. The whole-call figure is the one to trust
-most — its two rounds landed 24 ms apart against a null-A/B floor of 1192 ms.
-`jitSpreadMaxRun` collapses 1515 -> 161 ms, which is the mechanism visible
-directly.
+Two rounds agreeing is not a result; § 17.28's null A/B said so and this is the
+second time the same lesson has been paid for in one day. **The latency claim is
+withdrawn.**
 
-**It does not trade concealment for latency.** That was the expected cost and the
-reason the bound is derived rather than chosen: the frames it stops waiting for
-were unplayable anyway, so declining to buffer for them loses no audio. Both
-concealment columns move the same way as latency.
+**The mechanism, by contrast, is unambiguous** — cumulative counters, every round,
+both sides:
+
+    far-arrivals skipped ON : 179/100 | 178/120 | 105/125
+    far-arrivals skipped OFF:   0/0   |   0/0   |   0/0
+    jitSpreadMaxRun      ON : 370.7/374.9 | 367.6/121.5 | 113.9/341.7
+    jitSpreadMaxRun      OFF: 2536/1234.6 | 1634.3/1153.8 | 1426.1/1191.9
+
+The rule fires, only in the treated arm, and the measured spread collapses by
+4-10x. So the estimator genuinely stops seeing the five-second arrivals, and the
+ring still does not follow.
+
+**Why, and it is an error in the bound.** `holdCeil` ALREADY clamps `spreadHold`
+at `(maxEff - D_MARGIN_FRAMES) * FRAME_MS` — 248 ms at the base
+`maxTargetFrames` of 32, 376 ms with the elastic ceiling fully expanded. The bound
+chosen here is `ELASTIC_MAX_F * FRAME_MS` = **384 ms**, which sits *above both*. A
+spread of 1500 ms and a spread of 370 ms therefore produce the same target,
+because the clamp had already discarded everything in between. The rule removes
+exactly what was already being thrown away.
+
+The reasoning that produced it — "a frame later than the deepest reachable target
+could not have been played" — is sound about PLAYABILITY and irrelevant to the
+TARGET, because the target was never allowed up there in the first place. To move
+the ring the bound has to be below the clamp, not level with it, and the honest
+place to derive it from is the 150 ms goal rather than the buffer's own maximum.
+Next step, named rather than guessed at.
+
+**What stands:** the estimator is no longer lane-blind, the rule is measured to
+fire correctly and only when intended, and nothing regressed (both runs' deltas
+straddle zero in at least one direction, so there is no evidence of harm either).
 
 **Inert on a healthy call by construction:** clean-path spread is under 10 ms
 against a 384 ms bound, so no sample is ever excluded and the set is bit-identical.
