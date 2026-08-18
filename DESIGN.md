@@ -6535,3 +6535,84 @@ cue damage behind Boland's unexplained residual (§1.1c). It is ~609 ms once the
 transmission delay is used; how much of it is recoverable is **unknown and unmeasured**. This
 document previously stated it as "179 ms," which was both wrong and falsely precise. See the risk
 entry in §17.
+
+## 17.33 The buffer inflation was the call's own startup
+
+Three fixes failed against this defect (17.32) because all three assumed the
+control law was over-reacting to something real. It was not. It was reacting
+correctly to a number that was never a measurement.
+
+### What was measured
+
+Four sides, `rtt=180 --net=real`, against prod:
+
+| spreadMax | when | post-warm max | window p90 / p99 / max |
+|---|---|---|---|
+| 405.4 ms | @3016 ms | 20.3 ms | 13.8 / 16.7 / 33.1 |
+| 194.5 ms | @2292 ms | 16.5 ms | 13.0 / 16.1 / 17.1 |
+| 170.6 ms | @2873 ms | 16.9 ms | 12.7 / 15.8 / 16.5 |
+| 146.5 ms | @2720 ms | 17.9 ms | 14.2 / 17.3 / 18.5 |
+
+Every peak inside the first three seconds. Every steady-state number ~17 ms.
+A statistic cannot report 405 from samples that top out at 33, so the peak is
+not dispersion — it is the estimator reading its own unconverged inputs.
+
+`D = (arrival - skewMs) - seq*FRAME_MS`. Two of those three terms are still
+settling at t=2.5 s: `skewMs` comes from the clock-offset estimator, which needs
+several ping/pong exchanges, and `dFloor` is a running minimum that has not yet
+met its minimum. Every `D` computed before they settle carries their error.
+
+### Why one bad window costs the whole call
+
+`JIT_RELEASE` is 2 ms per 250 ms tick — 8 ms/s. A 405 ms peak needs ~50 s to
+bleed off. A 45 s call never recovers, so the target measured at the end of the
+run is still being set by an event from second three.
+
+This is the mechanism §17.5 already documented as "one hiccup costs ~54 ms of
+added latency for ~90 s". What is new is that the hiccup is **the call's own
+startup — on every call, deterministically, 4-20x larger than the injected
+hole that study used.** The slow release is not the bug; it is deliberate, and
+it is what converts a three-second error into a whole-call error.
+
+### It explains the asymmetry
+
+17.32 localised the fault to per-direction receive state and stopped there: same
+host, same clock, same fixture, opposite outcomes. The explanation is that both
+directions run identical code and **which one inflates is decided by which one
+drew the worse startup transient.** Nothing in the steady-state law differs. That
+is precisely why re-anchor reset, the late-pin guard and a faster release all
+measured null or negative — each tuned the amplifier, none touched the input.
+
+It also explains the distance dependence. Longer RTT means slower clock-offset
+convergence, so the contaminated window is both longer and wronger. At `rtt=0`
+convergence is immediate and the defect has never been reproduced there — 0/4,
+recorded in 17.31 as evidence the harness was clean, which it was.
+
+### The fix
+
+A one-shot **convergence purge** at 4000 ms — after every observed peak
+(2292-3016 ms), well inside the 10 s observability warm. It drops the window,
+the floor and the hold, then re-derives from arrivals whose inputs have
+converged. Default ON; `?pcmjitpurge=0` is the control arm.
+
+The principle is general and worth stating on its own: **a statistic whose
+inputs have not converged is not a measurement, and must not be retained.**
+
+Cost: one window (2.56 s) of re-learning, during which the target sits at its
+floor. Acceptable because the value being discarded is provably built on
+unconverged inputs. A genuine burst at that instant is re-learned within the
+window.
+
+### A wrong theory, kept
+
+This work started from the theory that heavy-tailed jitter defeats one-outlier
+rejection by landing two excursions in one window, and `?pcmjitout=N` was built
+to test it. **The theory is wrong** — the window's own max never exceeded 33 ms
+while `spread` reported 405. The knob is kept as the control arm that proves it.
+
+The reason it took three sessions to see: **the target was a number with no
+provenance.** The driver printed `target 22f` and nothing about where 22 came
+from. Adding `spreadMax @when`, `wantMax`, and the window's own p90/p99/max made
+the answer visible in a single run. A control law whose input is not printed can
+only be debugged by changing it and re-running — which is exactly how three
+plausible-but-wrong fixes each consumed a full measurement cycle.
