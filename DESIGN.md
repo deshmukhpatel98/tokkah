@@ -8100,3 +8100,57 @@ assets. Live confirmation of the DEFAULT path (a call carrying no query string
 at all) is running -- the flag existing in the file is not proof the default
 branch works, and `?pcmqms=0` must reproduce the old collapse or the control is
 broken for every future A/B on this flag.
+
+## 17.52 Shipped and verified on the default path — -251 ms, 39x less concealment
+
+rtt=260, `--net=real`, live prod, after the deploy. The point of this run was
+not the effect size (17.49 measured that) but the two things a deployed file
+cannot prove about itself:
+
+| | default, NO query string | `?pcmqms=0` |
+|---|---|---|
+| m2e, four/two dirs | 230.0 246.4 249.1 310.9 | 496.4 501.4 |
+| **median** | **247.8 ms** | **498.9 ms** |
+| concealed median | **232 ms** | 9096 ms |
+| depth | 70.6-151.1 ms | 335.8 / 342.2 ms |
+| target | 11-17f | 36f / 37f |
+
+**1. The default branch actually fires.** A call carrying no flags at all now
+behaves like the treatment. The flag being present in the served asset proves
+the bytes shipped, not that the code path is reached, and those are different
+claims — this session already shipped a `drainKneeMs` that reached app.js,
+passed the deploy check, and did nothing.
+
+**2. `?pcmqms=0` is a real control.** It reproduces the collapse (496/501 ms,
+9096 ms concealed) rather than quietly re-running the treatment. That was a live
+risk, not a hypothetical: `app.js` read this flag as
+`Number(QS.get('pcmqms')) || undefined`, and `0 || undefined` is `undefined`, so
+before the `QS.has()` fix every future A/B on this flag would have compared the
+default against itself and reported "no difference" forever.
+
+One default direction ran to 310.9 ms at depth 151.1 — the collapse is reduced,
+not abolished, and the tail is still there. It sits far below the control's best
+direction (496.4), so it does not qualify the result, but it does say the
+remaining work at this distance is real.
+
+### The wire, measured for the first time
+
+The same runs print the bandwidth axis that 17.47 asked for:
+
+    wire 682 B/frame  682 kbps @8ms  parity 690 B  wastedShift 0  fit16 0/0%
+
+Two assumptions used freely in this file are now wrong. The audio lane costs
+**682 kbps, not the 1.152 Mbps design rate** used in every BDP and Mathis
+calculation here, because the lossless packer is already saving 41%. And
+`wastedShift 0` with `fit16 0/0%` **refutes the bit-depth theory outright** —
+there are no trailing zero bits to reclaim, on the wire or in the capture.
+
+But 682 B / 384 samples is 14.21 bits/sample, and the same speech content
+(`testbed/media/conv/A.wav`, 16-bit) compresses offline to 6.30 bits/sample with
+1st-order prediction and Rice coding. The 7.9 bit/sample gap is almost exactly
+the 24-16 gap, and both 16-bit hypotheses read 0%, so the capture chain is
+perturbing the low bits into incompressible noise that the packer then
+transmits perfectly. If that holds, ~380 kbps of this lane is noise carried
+losslessly. Filed, not concluded: it needs the sent samples compared against the
+source, and a real microphone, since the fixture chain may not represent a real
+device.

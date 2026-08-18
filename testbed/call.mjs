@@ -878,7 +878,11 @@ if (ra.pcmAudio || rb.pcmAudio) {
     log(
       `      wire ${p.bPerFrame ?? '?'} B/frame` +
         `  ${p.bPerFrame ? Math.round((p.bPerFrame * 8) / fms) : '?'} kbps @${fms}ms` +
-        `  parity ${p.bPerParity ?? '?'} B` +
+        `  parity ${p.bPerParity ?? '?'} B x ${p.framesSent ? (p.paritySent / p.framesSent).toFixed(2) : '?'}/frame` +
+        // TOTAL is what the goal's ~1 Mbps is measured against; the data lane
+        // alone (682 kbps observed) is only part of what goes on the wire, and
+        // FEC is ADAPTIVE so the parity share is not a constant to assume.
+        `  = ${p.bPerFrame && p.framesSent ? Math.round(((p.bPerFrame + (p.bPerParity ?? 0) * (p.paritySent / p.framesSent)) * 8) / fms) : '?'} kbps total` +
         `  wastedShift ${p.wastedShift ?? '?'} (>=8 on ${p.shift8Pct ?? '?'}%)` +
         `  fit16 ${p.fit32767Pct ?? '?'}/${p.fit32768Pct ?? '?'}%  rxWasted ${p.rxWastedShift ?? '?'}`,
     );
