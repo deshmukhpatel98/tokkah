@@ -3952,6 +3952,24 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // state these decisions gate on); the wire mechanics live here. Both fan
     // out — a prediction and a pre-warm are about OUR next turn, which every
     // peer in the room is waiting through.
+    // What this lane ACTUALLY costs the uplink, measured, summed across peers.
+    // The video budget reserves room for audio as a PERCENTAGE (headroom 0.85),
+    // but the audio lane is a near-constant ABSOLUTE — ~870 kbps with parity —
+    // so the reservation shrinks exactly when the link gets tight and has to be
+    // right. That is the same shape as the `bdp x 1.5` gate fixed in §17.49.
+    // Reported as a rate over the whole call rather than an instantaneous one:
+    // the consumer is a 250 ms budget poll and a jittery divisor would make the
+    // video budget hunt. Returns 0 before the first frame, which reads as
+    // "reserve nothing" — correct, because nothing has been sent yet.
+    audioBps() {
+      let bps = 0;
+      for (let i = 0; i < halves.length; i++) {
+        const st = halves[i].stats;
+        const ms = st?.t0 != null ? now() - st.t0 : 0;
+        if (ms > 1000) bps += ((st.bytesSent + st.parityBytes) * 8000) / ms;
+      }
+      return bps;
+    },
     sendTurnEnd() {
       let sent = 0;
       for (const h of halves) sent += h.sendTurnEnd();

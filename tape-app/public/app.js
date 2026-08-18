@@ -1797,6 +1797,8 @@ const TAPE_CFG = {
   // resolve detail, and where dropped frames are most obvious. Frame rate
   // becomes the last thing to give, not the first.
   l2Rc: QS.get('l2rc') !== '0',
+  l2Reserve: QS.get('l2res') === '1', // 17.55 arm: reserve measured audio bytes, not 15%
+
   // Byte brake at admission: when the QP controller is pinned at its ceiling
   // and encoder output still exceeds the budget, skip captures. Built for the
   // three real Sun-16 calls that flooded 2.2-4.8 Mbps against a 0.6 budget —
@@ -3045,6 +3047,10 @@ function startTape(initiator, ctx = null) {
     // the app; the video budget listens to it (see rcPollBudget). Null keeps
     // the old behaviour byte-for-byte.
     duress: L2_DURESS ? () => pcm?.duress?.() ?? 0 : null,
+    // Measured audio-lane cost, so the video budget can reserve BYTES instead of
+    // a percentage. Same fan-out shape as duress: reads live state, computes
+    // nothing. See 17.55 and pcm.js audioBps().
+    audioBps: () => pcm?.audioBps?.() ?? 0,
     // §12–13: the video regime machine reports its state for the honest UI.
     // "held" → the remote video is VIDEO HELD (last frame + 1 fps stills);
     // anything else clears the badge unless HOLD owns it.

@@ -1773,7 +1773,7 @@ export function createTapeLink() {
  *   · and on the non-initiating side, route the 'tape-ctl-rtp' datachannel from
  *     ondatachannel into .adoptCtl(channel).
  */
-export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null, duress = null, link = null }) {
+export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, onFail, displayCanvas, avsync = null, onStall = null, duress = null, audioBps = null, link = null }) {
   const L = (tag, d) => { try { log?.(tag, d); } catch { /* never break the call */ } };
   const fail = (why, e) => {
     L('tape-fail', { lane: 'rtp', why, error: e ? String(e).slice(0, 160) : null });
@@ -2157,8 +2157,29 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // Lane A (uncompressed audio) and the carrier's own overhead share this pipe.
     // Taking the whole estimate for video would starve them and then read the
     // resulting audio pain as video congestion.
+    //
+    // `?l2res=1` (17.55): reserve the audio lane's MEASURED bytes instead of a
+    // percentage. The 15% headroom below is a proportional allowance for a cost
+    // that is very nearly ABSOLUTE — the PCM lane runs ~870 kbps with parity
+    // whatever the link is doing — so at a 12 Mbps estimate it over-reserves
+    // 1.8 Mbps and at 3 Mbps it reserves 450 kbps against an 870 kbps need. The
+    // allowance is at its worst exactly where it matters. That is the same
+    // shape as the `bdp x 1.5` backlog gate fixed in §17.49, in a different
+    // costume, and it is the leading suspect for the 3 Mbps collapse (§17.51),
+    // where video was measured pushing 2.7-3.2 Mbps into a 3 Mbps ceiling while
+    // audio was already spending 0.87 of it.
+    //
+    // `audioBps()` is measured and returns 0 before the first frame, so the arm
+    // degrades to "reserve nothing" at call start rather than to a guess. The
+    // 1.10 multiplier is SCTP/DTLS per-message overhead on top of the payload
+    // bytes pcm.js counts, not a safety fudge.
     const headroom = 0.85;
-    const raw = est != null ? (est / 1e6) * headroom : null;
+    const aBps = cfg.l2Reserve ? (audioBps?.() ?? 0) : 0;
+    const raw = est == null ? null
+      : cfg.l2Reserve && aBps > 0
+        ? Math.max(cfg.l2RcMinMbps, (est - aBps * 1.10) / 1e6)
+        : (est / 1e6) * headroom;
+    if (cfg.l2Reserve) stats.rcAudioMbps = +(aBps / 1e6).toFixed(3);
     rcBudgetMbps = raw == null
       ? (rcBudgetMbps ?? (cfg.l2RcMinMbps + cfg.l2RcMaxMbps) / 2)
       : rcClamp(raw, cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
