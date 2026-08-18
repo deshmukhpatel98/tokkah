@@ -6977,14 +6977,30 @@ Striping across six associations exists to survive exactly this, and does not,
 which means the six are stalling together — a shared cause (one bottleneck, one
 loss event pattern, or one pacer) rather than six independent ones.
 
-### A second defect visible in the same runs
+### The broken clock offset is the SAME fault, counted twice
 
-    rtt=180   offset  -3.99 / -2.28 ms     baseRtt 170
-    rtt=300   offset -290.7 / +280.84 ms   baseRtt 289
+    rtt=180   offset  -3.99 / -2.28 ms     baseRtt 170   rtt 179-185
+    rtt=300   offset -290.7 / +280.84 ms   baseRtt 289   rtt 871-873
 
-The clock-offset estimate at rtt=300 is absorbing very nearly a full one-way
-delay, symmetrically and with opposite signs on the two sides. Since
-`d = (tn - skewMs) - seq*FRAME_MS`, a skew that wrong corrupts every age and
-spread reading on that side — the `age p50 671.9 ms` above is partly this, not
-purely arrival timing. This is a separate fault from the batching and needs to
-be fixed before any age-derived number at long RTT can be trusted.
+That looked like a second, independent defect. It is not, and the arithmetic
+says so exactly:
+
+    (871.04 - 289.4) / 2 = 290.8      observed offset -290.7
+
+The offset estimator splits the measured round trip symmetrically, which is the
+only thing it can do without an external clock. A stall that inflates one
+direction therefore lands as **half the excess** in the offset, with opposite
+signs at the two ends — precisely the symmetry observed. Same batching, measured
+a second way.
+
+This matters twice over. It means there is one root cause, not two. And it means
+`d = (tn - skewMs) - seq*FRAME_MS` inherits the error, so **every age and spread
+reading at rtt>=260 is inflated by roughly half of whatever the transport stall
+was** — the `age p50 671.9 ms` above is not purely arrival timing. Age-derived
+numbers at long RTT should not be trusted until the batching is fixed, and the
+fix will move them without anything in the estimator changing.
+
+Worth stating as a rule, since this project has now been fooled by the pattern
+several times: **a symptom that is exactly half of another symptom is not a
+second finding.** Check the arithmetic against the known one before opening a
+new line of investigation.
