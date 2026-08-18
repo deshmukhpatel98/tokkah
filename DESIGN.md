@@ -4867,6 +4867,34 @@ Two corrections, both against my own earlier claims:
 What is now beyond doubt is the effect size: -136 ms of mouth-to-ear, five
 rotated rounds, a 24 ms spread on a 136 ms effect.
 
+**UNDER 150 IS REACHABLE UNDER FAULT — AND IT IS NOT FREE.** `?pcmjitfarms=40`
+against the shipped 120, 5 rounds, none dropped:
+
+| | 40 ms | 120 ms | median | per round |
+|---|---|---|---|---|
+| **mouth-to-ear during fault** | **138 ms** | 154 ms | **-21 ms** | -23, -20, -39, -21, -5 |
+| ring depth during fault | 50 ms | 69 ms | -24 ms | -24, -20, -41, -26, -5 |
+| conceal during stall | 476 ms | 408 ms | +52 ms | +60, -16, +48, +132, +52 UNRESOLVED |
+| conceal whole call | 3168 ms | 1880 ms | +400 ms | +1472, +304, +1496, +400, -336 UNRESOLVED |
+
+138 ms, five rotated rounds, every delta negative — and ~134 in a real browser
+once the rig's measured +4 ms headless-audio offset is removed. Under a fault that
+blackholes half the routes with 5 s of delay, that is under the goal.
+
+**THE DEFAULT IS NOT BEING CHANGED, and the reason is the goal itself.** It asks
+for under 150 ms *and* lossless audio. This buys the first clause with the second:
+far-arrivals skipped rises from ~120/side to 400-1500/side, and concealment moves
++52 ms during the stall and +400 whole-call — both UNRESOLVED, i.e. large enough to
+matter and not yet pinned down. Shipping a latency number bought with unresolved
+audio damage would be picking one half of the goal over the other and calling it a
+win.
+
+What is honestly established: **the latency is reachable, the price is not yet
+known.** The next measurement is the concealment column at 40 vs 120 with enough
+rounds to resolve it — that is what decides whether 138 ms is a real result or a
+trade dressed as one. Under this fault neither arm is lossless anyway (both conceal
+400-500 ms), so the question is relative damage, not absolute.
+
 **The sweep, which closes the open question.** `?pcmjitfarms=80` against the
 shipped 120, 2 paired rounds:
 
