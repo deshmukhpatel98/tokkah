@@ -34,7 +34,7 @@ const arg = (k, d) => { const m = process.argv.find((a) => a.startsWith(`--${k}=
 const QP = Number(arg('qp', 24));
 const PERIOD = Number(arg('period', 14));
 const CYCLES = Number(arg('cycles', 3));
-const OUT = arg('out', '/private/tmp/claude-501/-Users-deveshpatel-Downloads-video-calling/2cd64fea-5ae0-424e-909a-cfec3fc12a22/scratchpad/pfhold');
+const OUT = arg('out', '/tmp/pfhold');
 mkdirSync(OUT, { recursive: true });
 
 const GW = 64, GH = 36;          // luminance grid the change map is built on
@@ -49,12 +49,18 @@ const ARMS = [
   { name: 'hold', on: true,  p: { denoise: 0.85, soften: 0, motionGain: 14, hold: 1 } },
 ];
 
+// `--media=grain` swaps in the sensor-like fixture (testbed/media/real/grain.sh).
+// This rig is the one that matters there: the clean fixture leaves 92.7% of the
+// picture below the lock's motion threshold and the grain fixture only 61.5%,
+// so the grain fixture is where the lock has to work for its living — and this
+// is the rig that asks whether it does so without eating the person.
+const SUFFIX = arg('media', '') === 'grain' ? '-grain' : '';
 const launch = (side) => chromium.launch({
   executablePath: CHROME, headless: true,
   args: [
     '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-    `--use-file-for-fake-video-capture=${media(`real${side}.mjpeg`)}`,
-    `--use-file-for-fake-audio-capture=${media(`real${side}.wav`)}`,
+    `--use-file-for-fake-video-capture=${media(`real${side}${SUFFIX}.mjpeg`)}`,
+    `--use-file-for-fake-audio-capture=${media(`real${side}${SUFFIX}.wav`)}`,
     '--autoplay-policy=no-user-gesture-required',
     '--disable-features=WebRtcHideLocalIpsWithMdns',
     '--use-gl=angle', '--enable-gpu',

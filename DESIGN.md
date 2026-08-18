@@ -4745,6 +4745,114 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.26 The filter under LIVE rate control — the same picture on a third of the link (2026-08-18, task #2)
+
+§17.25 priced the presence filter with the quantizer **pinned**: 61.5% fewer bits at QP 24. Pinning is
+the right way to price a filter — it holds quality fixed so the bits are free to move — but it is not
+how the product runs, and the shipping combination (filter + live rate controller + resolution
+actuator) was the one combination never tested. Testing it produced two results, and the first looks
+like a refutation until you notice which instrument is being read.
+
+**Under rate control the saving does not appear as bits.** `testbed/pfrc.mjs`, prod, budget clamped at
+1.5 Mbps, three cycles, arms rotated: **1.23 Mbps with the filter off, 1.21 with it on.** Under two
+percent. That is correct behaviour, not a null result — the controller targets a *bitrate*, so a
+cheaper picture cannot spend fewer bits; it spends the same bits at a **lower quantizer**. The rig
+recorded `rcQp` and never compared it, which is exactly how a working filter reads as a no-op. It
+compares it now. Its "the filter buys back resolution" check also no longer prints PASS when neither
+arm ever left /1: a question the run did not put to the system has no answer, and grading that green
+is the blind rig this project has already shipped a defect through.
+
+**So measure where the picture is forced to get worse.** `testbed/pffloor.mjs` walks the video budget
+down a ladder **inside one call**, arms rotated, two real browsers on room.tokkah.com. Inside one call
+matters: `l2rcmin`/`l2rcmax` were query-string only, so a ladder meant one page load — one whole call,
+fresh ICE, a fresh point in the 90 s fixture loop — per rung, and the quantity being compared is a few
+percent, which is smaller than the spread between two calls. The budget band is now a live lab knob
+(`rcMin`/`rcMax` on `handleLab`'s whitelist; `rcPollBudget` re-reads both bounds every second).
+
+**At the top rung neither arm is squeezed, both sit at the quantizer floor — identical quality by
+construction — and the bits are therefore directly comparable:**
+
+| budget 8 Mbps, both arms at QP 24 | video | + audio | = call |
+|---|---:|---:|---:|
+| filter off | 3.05 Mbps | 0.59 | **3.64 Mbps** |
+| filter on | **1.06 Mbps** | 0.59 | **1.65 Mbps** |
+| | **−65%** | | −55% |
+
+That reproduces §17.25's pinned-QP 61.5% by a completely different route — the controller arriving at
+the pin by itself — and it is the plain statement of what the filter is worth: **the same picture on a
+third of the link.** Note what the audio column now says: at a filtered video rate near 1 Mbps,
+uncompressed Lane A is **36% of the call**, and the next Mbps to find is there rather than in the video.
+
+Squeezed, the same saving arrives as quality instead (2 cycles, both sides, arms rotated):
+
+| budget | Mbps off → on | QP off → on |
+|---:|---|---|
+| 8 | 3.05 → 1.06 | 24.0 → 24.0 (both at the floor) |
+| 3 | 2.40 → 0.93 | 26.6 → 24.0 |
+| 1.4 | 1.13 → 1.06 | **29.9 → 24.1** |
+| 0.7 | 0.59 → 0.61 | 32.5 → 28.0 |
+| 0.35 | 0.31 → 0.32 | 35.9 → 32.8 |
+| 0.18 | 0.16 → 0.15 | 38.8 → 36.5 |
+
+Six QP is a factor of two in bits, so the 1.4 Mbps row reads: **at 1.4 Mbps the filtered call is already
+at the best quality the band allows, and the unfiltered one would need roughly 2.8 Mbps to get there.**
+5 rungs better, 0 worse, 30 fps at every rung, 0 frames declined.
+
+**The coupling defect the rig was built to find does not happen.** With the actuator live: 0 divisor
+changes per 20 s window in either arm, 0 declines across resolution changes, 87% of the picture still
+locked while resolution was moving. The filter's lock lives in a feedback texture sized to the frame
+and the actuator's whole job is resizing frames; they do not fight.
+
+**The pipeline holds full resolution and 30 fps down to 0.1 Mbps** on this fixture, losing /1 only at
+0.06. Both arms lose it at the same rung — by then both are pinned at QP 42 and there is nothing left
+to give — so the filter does not move the *pixel* floor. The floors are not where it earns; the
+quantizer column is.
+
+The one honest cost: the filter-on arm's worst rung reads **28.9 fps against the filter-off arm's 29.8**.
+The GPU pass costs a visible fraction of a frame at the top of the ladder, where frames are largest.
+
+### Measuring "not paid for with a softer picture" — three metrics, two of them wrong
+
+- **The probe was eating the thing it measured.** Reading back a full 1280×720 frame and sorting 920k
+  Laplacian magnitudes, six times a rung, on the same main thread that decodes and paints: fps read
+  26.6 and 28.0 where every other run of that call reads 30.0. Now a native-scale 512² crop (not a
+  downscale — a bilinear shrink is itself a low-pass filter and would hide exactly the blur being
+  looked for) and a 256-bin histogram instead of a sort. 3.6 ms per grab, and the rig asserts the cost
+  and the frame rate rather than trusting them.
+- **Top-decile edge energy scores grain removal as damage.** Its threshold is set by the distribution
+  itself, so removing a broadband noise floor moves the threshold, changes which pixels are in the
+  tail, and drags the number down on its own. It read −4.3% at the 8 Mbps rung, where the stills show
+  identical nameplate lettering and identical badge stitching beside visibly smoother fabric.
+- **A fixed |Laplacian| > 48 cut is better and still not clean** — grain sits on top of real edges and
+  pushes borderline ones over any fixed cut. And the deadband was guessed. Measured properly, the
+  **same arm** at the **same rung** in two different cycles moves this statistic by 0.2–4.1% at ordinary
+  rungs and 20.3% at the bottom. The bar is now that measured spread, not a number I chose.
+
+**What finally adjudicates it is persistence.** Structure — lettering, a seam, the edge of a chair —
+sits in the same pixels frame after frame; grain does not. Average the luma across the measurement
+window and grain averages toward its mean while structure survives, so the strong-edge statistic of the
+**time-averaged** picture is structure with the grain taken out. Falling raw edge count beside a held
+persistent-edge count is "the noise went and the detail stayed"; both falling is a blurred picture.
+
+### What this does not license
+
+Every number above is on `realA/realB.mjpeg` — twice-compressed NASA interview footage, and compression
+is a denoiser. Measured on the filter's own motion statistic, **92.7% of that fixture's picture already
+sits below the lock threshold**: the hold is being handed a picture that is nearly static already.
+`testbed/media/real/grain.sh` builds the stress case (temporal grain plus a ±10/255 auto-exposure hunt
+on a 25 s period, at MJPEG q2 so the grain survives to the filter), and on the same statistic it takes
+the lockable fraction from 92.7% down to **61.5%**. Synthetic grain is iid where a sensor's is not, so
+passing there licenses nothing — but failing there would be decisive, which is the point of running it.
+
+The **real-sensor law** still gates this and the filter stays behind `?pfilter=1`.
+
+One number now rides every call so the failure cannot be silent: **`pfHoldThresh`**, the lock threshold
+after upward adaptation. It starts at 0.012 luma and ratchets toward this sensor's grain floor, capped
+at 0.02. A saturated threshold beside a near-zero `pfStillMean` is the filter's quiet failure mode —
+the lock never engages, the saving evaporates, and every other number still looks fine.
+
+---
+
 ## 17.25 Presence filter — 61.5% fewer bits at the same quantizer, nothing blurred (2026-08-17, task #2)
 
 Question: the spine costs 12 Mbps on motion at QP24. How much of that is detail a person can actually see? **Answer: most of it is not, and removing it needs no new codec, no standard, and no decoder change.** `tape-app/public/presence-filter.js`, one WebGL2 pass in front of `VideoEncoder`, behind `?pfilter=1`.

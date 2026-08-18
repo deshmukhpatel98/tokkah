@@ -1803,6 +1803,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     rcResShrink: 1, // encode-resolution divisor the rc actuator is applying now
     pfMs: null, pfFrames: 0, pfFallbacks: 0, // presence filter: cost, output, declines
     pfStillMean: null, // 0..1 mean stillness — how much of the picture is held
+    pfHoldThresh: null, // the lock threshold in luma, after upward adaptation
 
     sendNowReqs: 0, // ?sendnow=1: carrier ticks requested at encode output (task #41)
     admitFps: null, // last AIMD admission rate, frames/s — the pacer-following signal
@@ -3769,6 +3770,13 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         stats.pfFallbacks = pFilter.stats.fallbacks;
         stats.pfFrames = pFilter.stats.framesOut;
         stats.pfStillMean = pFilter.stats.stillMean;
+        // The threshold the lock is actually using, not the one it was built
+        // with. It adapts UPWARD toward this sensor's grain floor and saturates
+        // at 0.02 — and if it saturates while stillMean stays near zero, the
+        // lock never engaged and the whole saving quietly evaporated on exactly
+        // the noisy devices that need it most. That is a silent failure unless
+        // the number is on the wire, so it is on the wire.
+        stats.pfHoldThresh = pFilter.stats.holdThresh;
       }
       try {
         encCallAt.push(t); // drained FIFO-order by onEncoded (#14 encode-latency probe)

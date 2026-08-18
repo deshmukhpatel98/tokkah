@@ -48,7 +48,7 @@ const media = (f) => decodeURIComponent(new URL(`./media/real/${f}`, import.meta
 const arg = (k, d) => { const m = process.argv.find((a) => a.startsWith(`--${k}=`)); return m ? m.slice(k.length + 3) : d; };
 const QP = Number(arg('qp', 24));
 const SECS = Number(arg('secs', 40));
-const OUT = arg('out', '/private/tmp/claude-501/-Users-deveshpatel-Downloads-video-calling/2cd64fea-5ae0-424e-909a-cfec3fc12a22/scratchpad/pfilter');
+const OUT = arg('out', '/tmp/pfilter');
 mkdirSync(OUT, { recursive: true });
 
 // QP pinned identically in both arms — see the header.

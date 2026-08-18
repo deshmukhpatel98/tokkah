@@ -8,7 +8,17 @@ tape-app/wrangler.prod.jsonc
 
 # Measurement-rig bulk: fixtures, captures, and run outputs (gigabytes).
 # The rig SCRIPTS are committed; their inputs/outputs are not.
-testbed/media/
+#
+# Spelled out rather than as a bare `testbed/media/`, because git does not
+# descend into an excluded DIRECTORY and a negation inside one is therefore
+# dead. fetch.sh only exists in the tree because it was force-added once, and
+# the next fixture script would have been silently dropped the same way — which
+# for a repo whose whole claim is reproducibility is the worst kind of quiet
+# failure. Excluding the CONTENTS keeps the negation live.
+testbed/media/*
+!testbed/media/real/
+testbed/media/real/*
+!testbed/media/real/*.sh
 testbed/runs/
 testbed/out/
 testbed/profiles/

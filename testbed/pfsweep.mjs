@@ -50,7 +50,7 @@ const SETTLE = Number(arg('settle', 2));
 // `maxfps` forces the rate rather than letting targetFps() negotiate one, so a
 // 30-vs-60 comparison is actually 30 vs 60 and not two different negotiations.
 const FPS = Number(arg('fps', 30));
-const OUT = arg('out', '/private/tmp/claude-501/-Users-deveshpatel-Downloads-video-calling/2cd64fea-5ae0-424e-909a-cfec3fc12a22/scratchpad/pfsweep');
+const OUT = arg('out', '/tmp/pfsweep');
 mkdirSync(OUT, { recursive: true });
 
 // Every filter arm names `hold` explicitly — it defaults ON, so an arm that

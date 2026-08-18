@@ -117,6 +117,7 @@ for (let r = 0; r < ROUNDS; r++) {
         mbps: (s1[i].encBytesTotal - s0[i].encBytesTotal) * 8 / dt / 1e6,
         fps: (s1[i].encFramesTotal - s0[i].encFramesTotal) / dt,
         still: s1[i].pfStillMean, shrink: s1[i].rcResShrink,
+        holdThresh: s1[i].pfHoldThresh,
         g2g: s1[i].glassToGlassMs, fallbacks: s1[i].pfFallbacks,
       });
     }
@@ -147,8 +148,16 @@ const mOn = med(samples.get('on').map((x) => x.mbps));
 console.log('\n══════ real sensor ══════');
 check('the filter ran clean', med(samples.get('on').map((x) => x.fallbacks)) === 0,
   `${med(samples.get('on').map((x) => x.fallbacks))} declines`);
+const thr = med(samples.get('on').map((x) => x.holdThresh));
 check('the lock found this sensor', (med(samples.get('on').map((x) => x.still)) ?? 0) > 0.10,
-  `${((med(samples.get('on').map((x) => x.still)) ?? 0) * 100).toFixed(0)}% of the picture below the motion threshold`);
+  `${((med(samples.get('on').map((x) => x.still)) ?? 0) * 100).toFixed(0)}% of the picture below the motion threshold`
+  + `, threshold ${thr ?? '—'}`
+  // The whole reason a fixture cannot answer this. The threshold adapts upward
+  // toward the sensor's grain floor and stops at 0.02; if it is sitting on the
+  // cap, this camera is noisier than the lock can follow and the cap — not the
+  // filter — is what is limiting the saving. That is a fixable number, and
+  // knowing which side of it we are on is the point of running on a sensor.
+  + (thr != null && thr >= 0.02 ? ' — SATURATED at the cap: this sensor out-noises the lock' : ''));
 check('bits went down', cuts.length > 0 && med(cuts) > 10,
   `${mOff?.toFixed(2)} -> ${mOn?.toFixed(2)} Mbps, ${med(cuts)?.toFixed(1)}% ` +
   `(per-round ${Math.min(...cuts).toFixed(0)}..${Math.max(...cuts).toFixed(0)}%)`);

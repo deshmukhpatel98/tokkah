@@ -505,6 +505,12 @@ async function handleLab(m) {
         t: Math.round(performance.now()),
         pfStillMean: v.pfStillMean ?? null, pfFrames: v.pfFrames ?? null,
         pfFallbacks: v.pfFallbacks ?? null, pfMs: v.pfMs ?? null,
+        // The single most diagnostic number a REAL sensor can return. The lock
+        // threshold starts at 0.012 luma and ratchets upward toward this
+        // camera's own grain floor, capped at 0.02. Saturated at the cap while
+        // pfStillMean sits near zero means the lock never engaged on this
+        // sensor — the saving is gone and nothing else in this payload says so.
+        pfHoldThresh: v.pfHoldThresh ?? null,
         rcResShrink: v.rcResShrink ?? null,
         capLagMs: v.capLagMs ?? null, encLatMs: v.encLatMs ?? null,
         fullAgeMs: v.fullAgeMs ?? null, presentLagMs: v.presentLagMs ?? null,
