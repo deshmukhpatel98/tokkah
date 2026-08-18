@@ -7752,3 +7752,52 @@ Step 3 is mechanical and individually safe, but it touches SAB geometry where a
 mistake is inaudible rather than loud, so it wants a session with room to verify
 each site rather than the tail of one. The counts above are the survey it needs;
 they are the thing that would otherwise be discovered halfway through.
+
+## 17.45 Step 4 cannot be A/B'd the way everything else was
+
+Steps 1-3 are shipped (`8a0836e`, `1ac6593`, `c8c7ed0`) and step 4 is written on
+branch `frame-4ms`, not deployed. But the verification plan written into that
+branch — "12 usable rounds against the 8 ms arm" — **cannot be executed as
+stated**, and noticing that is the last useful thing this session produced.
+
+Every A/B here has worked by putting both arms behind a query flag so they can
+alternate *within a round*: `?pcmjitmargin=`, `?pcmdrainknee=`, `?pcmqms=`,
+`?pcmpairs=`. That is what makes the comparison paired, and pairing is what
+survives the machine's load drifting over an afternoon.
+
+`FRAME_MS` cannot be a query flag without the restructure §17.44 step 2 declined:
+the worklet's `FRAME` feeds module-level `RING` and `CAP_FRAME_B`, evaluated
+before any processor instance exists. So both peers in a deploy necessarily get
+the same frame size, and there is no second arm to alternate against.
+
+**And plain before/after across two deploys is invalid here.** This session
+measured the *same* control arm at 152.7 ms early and 159.4 ms late as the host
+accumulated load — 6.7 ms of drift, against a 4 ms effect. A 4 ms result taken
+that way would be indistinguishable from the afternoon getting later.
+
+### The design that does work
+
+Alternate the DEPLOY, not a flag, and keep the pairing:
+
+    round r:  deploy 4 ms -> call -> deploy 8 ms -> call     (r odd)
+              deploy 8 ms -> call -> deploy 4 ms -> call     (r even)
+
+A deploy is ~40 s and a call ~75 s, so a round is ~4 min and 12 usable rounds is
+~50 min. Same discard rules as §17.40: drop the round if either arm produced no
+snapshot or ran past 100 ms of emulator loop lag, enforced before inspection.
+Score median AND concealment AND under-150 count — the last two are what caught
+both inversions this session.
+
+It is slower and clumsier than a flag, and it is the only valid form available.
+Writing "12 usable rounds against the 8 ms arm" without noticing there is no arm
+would have sent the next session into an invalid comparison whose result looked
+exactly like a real one.
+
+### The other reason not to rush it
+
+Halving the frame doubles packets per second and doubles the per-packet header
+share of the wire. `OFFER_BPS` derives from `FRAME_BYTES` so the internal budget
+tracks it, but the goal asks for ~1 Mbps and this spends against that. The
+measurement above should therefore record bytes on the wire alongside latency:
+**4 ms of mouth-to-ear bought with a materially fatter stream is not obviously
+the right trade, and this file has no measurement of the exchange rate.**
