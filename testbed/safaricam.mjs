@@ -52,7 +52,15 @@ let sid = null;
 try {
   say('safaricam: creating session');
   const v = await wd('POST', '/session', {
-    capabilities: { alwaysMatch: { browserName: 'safari', 'webkit:alwaysAllowAutoplay': true } },
+    // safaridriver turns MOCK CAPTURE DEVICES on for automation sessions by
+    // default — that is why the probe was handed "Mock video device 1" and why
+    // the visible Safari window shows colour bars instead of a face. WebKit's
+    // WebDriver exposes the switch as a capability, so the run can insist on
+    // real hardware itself rather than depending on a menu item staying
+    // unchecked between sessions.
+    capabilities: { alwaysMatch: { browserName: 'safari', 'webkit:alwaysAllowAutoplay': true,
+      'webkit:WebRTC': { MockCaptureDevicesEnabled: false, DisableInsecureMediaCapture: false,
+                         DisableICECandidateFiltering: true } } },
   }, 30000);
   sid = v?.sessionId;
   say(`safaricam: session ${sid ? 'created ' + sid.slice(0, 8) : 'FAILED — is "Allow remote automation" on in Safari > Develop?'}`);
