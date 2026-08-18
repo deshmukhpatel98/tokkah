@@ -2234,6 +2234,12 @@ const PCM_CFG = {
   // per the house rule; `?pcmfastdead=0` restores the old deadline as the
   // control arm, which is the only way to A/B it inside one build.
   fastDead: QS.get('pcmfastdead') !== '0',
+  // The jitter estimator is lane-blind, so under a partial blackhole a
+  // 5-second-late frame sizes the buffer for everyone. Arrivals further past
+  // the window floor than the deepest reachable target (48 frames = 384 ms)
+  // could not have been caught at any depth, so they no longer set it.
+  // `?pcmjitfar=0` is the control arm. Inert on a clean call by construction.
+  jitterFarSkip: QS.get('pcmjitfar') !== '0',
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',

@@ -454,6 +454,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
+      // Arrivals turned away as unplayable-at-any-depth, and which lane they
+      // came from. Cumulative counters, not gauges — a fault that is over by
+      // snapshot time still has to be visible in the snapshot.
+      jitFarSkipped: 0, jitFarRelearn: 0, jitFarByLane: [0, 0, 0, 0, 0, 0],
       m2eRefused: 0, // impossible mouth-to-ear readings the instrument refused to publish
       // WHEN the run-max spread happened, and the same max ignoring the first
       // JIT_WARM ms. OBSERVABILITY ONLY — the control law does not read these.
@@ -1329,7 +1333,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // and that is deliberate: a frame that only existed once its RS group closed
       // was genuinely available that late, and pretending otherwise would size the
       // buffer too small for exactly the frames FEC is there to save.
-      noteArrival(seq, skewMs);
+      noteArrival(seq, skewMs, laneIdx);
       const samples = zip ? decodeZip(payload) : decodeFrame(payload);
       if (det) {
         let sumSq = 0;
@@ -2660,8 +2664,39 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // one-burst call is not taxed forever. Hard cap 48 of the ring's 64: the 16
     // frames (128 ms) above it are write headroom for early arrivals, and a
     // buffer past 384 ms is a latency defect to fix in the path, not to hide.
+    // ── ARRIVALS THE BUFFER COULD NEVER HAVE CAUGHT (`?pcmjitfar=0`) ────────
+    // The estimator is LANE-BLIND: noteArrival records (arrival - skew) minus
+    // seq*FRAME_MS and never learns which of the six associations delivered it.
+    // Under a 3-of-6 blackhole that is how a 5-SECOND-late frame ends up sizing
+    // the buffer. `spread` rejects exactly one outlier (s[dN-2] - s[0]) and this
+    // file's own comment says why that is not enough: a stall is a multi-sample
+    // event, so second-largest "discards one anomalous ARRIVAL; it cannot
+    // discard a hole". Measured jitSpreadMaxRun 1515 ms, ring 220 ms, m2e 310.
+    //
+    // THE BOUND IS NOT A TUNING KNOB, it is derived. The deepest this ring can
+    // ever be is ELASTIC_MAX_F frames. A frame that arrives later than that
+    // past the window's floor is unplayable AT ANY BUFFER DEPTH WE WOULD EVER
+    // BUILD — so it cannot be "caught" by growing, and letting it set the
+    // target buys nothing while costing the whole excursion, paid back at
+    // JIT_RELEASE's 8 ms/s for ~20 s afterwards.
+    //
+    // It is inert on a healthy call by construction: clean-path spread is under
+    // 10 ms against a 384 ms bound, so nothing is ever excluded and the sample
+    // set is bit-identical. This is deliberately NOT the de-skew experiment
+    // recorded at the ringWrite call site — that one moved ordinary 24 ms lane
+    // offsets and paid for a 27.6 ms shallower ring with +1 s/min of
+    // concealment. Frames 24 ms late are worth buffering for; frames 5 s late
+    // are not, and the bound is what separates the two cases.
+    const FAR_SKIP = cfg.jitterFarSkip !== false;
+    let dFloor = null;        // window minimum, refreshed by the decay tick below
+    let farRejected = 0;      // consecutive samples turned away
     const ELASTIC = cfg.jitterElastic !== false;
     const ELASTIC_MAX_F = 48;
+    // DERIVED, not chosen: the deepest target the elastic ceiling can ever
+    // reach. An arrival further past the window floor than this could not have
+    // been played even at maximum buffer, so it is evidence about a lane's
+    // health and not about how deep this ring should be. See FAR_SKIP above.
+    const FAR_BOUND_MS = ELASTIC_MAX_F * FRAME_MS;
     const ELASTIC_STEP_F = 8;
     let maxEff = cfg.maxTargetFrames;
     let elPainSeen = 0, elLastUp = 0, elCalmMs = 0;
@@ -2693,7 +2728,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let govRingI = 0, govRingN = 0;
     let govTickMin = Infinity; // min slack seen since the last estimator tick
     let govPainSeen = 0; // late+conceal watermark; any advance zeroes this tick
-    function noteArrival(seq, skewMs = 0) {
+    function noteArrival(seq, skewMs = 0, laneIdx = -1) {
       if (!dT0) dT0 = now();
       // ── inter-arrival GAPS, which answer a different question from spread ──
       // `spread` is (second-largest - min) of delay across the window: it says HOW
@@ -2726,7 +2761,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         }
       }
       gLast = tn;
-      dRing[dI] = (tn - skewMs) - seq * FRAME_MS;
+      const d = (tn - skewMs) - seq * FRAME_MS;
+      // The gap statistics above are recorded unconditionally — they answer a
+      // different question (clumping vs stretching) and a rejected frame still
+      // ARRIVED. Only the spread's sample set is gated.
+      if (FAR_SKIP && dFloor != null && (d - dFloor) > FAR_BOUND_MS) {
+        farRejected++;
+        stats.jitFarSkipped++;
+        if (laneIdx >= 0) stats.jitFarByLane[laneIdx]++;
+        // UNLESS IT IS NOT AN OUTLIER ANY MORE. If the whole path steps later —
+        // a route change, not one bad lane — every sample is beyond the floor
+        // and rejecting them all would freeze the estimator on a floor that no
+        // longer exists, which is the "acting on a signal erases the signal"
+        // trap this codebase has already hit three times in one file. So a run
+        // of rejections longer than a quarter of the window means the floor is
+        // wrong, not the arrivals: drop it and re-learn from what is arriving.
+        if (farRejected > (D_WIN >> 2)) { dFloor = null; farRejected = 0; stats.jitFarRelearn++; }
+        return;
+      }
+      farRejected = 0;
+      dRing[dI] = d;
       dI = (dI + 1) % D_WIN;
       if (dN < D_WIN) dN++;
     }
@@ -2776,6 +2830,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // rather than max so one pathological arrival cannot pin the buffer for a
       // whole window; in effect, at most one frame in 320 may be late.
       const spread = s[Math.max(0, dN - 2)] - s[0];
+      // The floor the next interval's arrivals are judged against. Taken here
+      // because this tick already paid for the sort; recomputing it per frame
+      // would put an O(n log n) on the receive path to save nothing.
+      dFloor = s[0];
       // RAW is what the estimator actually asked for; `want` is what the ceiling
       // allowed. Keeping the raw run-max is the only way to know the ceiling ever
       // bound: `jitWant` is a snapshot of the trailing window, so on a run whose
@@ -3155,6 +3213,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // `portDropped` is the same class of silence on the non-SAB path.
           farFuture: stats.farFuture, ringReseeds: stats.ringReseeds, portDropped: stats.portDropped,
           jitSpreadMaxRun: stats.jitSpreadMaxRun, jitAboveFloorMs: stats.jitAboveFloorMs,
+          jitFarSkipped: stats.jitFarSkipped, jitFarRelearn: stats.jitFarRelearn,
+          jitFarByLane: [...stats.jitFarByLane],
           jitWantMaxRun: stats.jitWantMaxRun, jitClampedTicks: stats.jitClampedTicks,
           jitHoldMaxRun: stats.jitHoldMaxRun, jitHold: JIT_HOLD, jitRelease: JIT_RELEASE,
           holdCap: HOLD_CAP ? HOLD_CEIL : 0,
