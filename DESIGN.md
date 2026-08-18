@@ -4831,12 +4831,35 @@ other flat timeout this project has had to find. A late frame returns before
 updating `lastRingWriteAt`, so the drought should accumulate and fire — yet the
 damage runs to 5-7 s, far longer than one rescue should allow.
 
-So the decisive question is narrow: **does `reAnchors` fire at all in a broken
-run?** If it stays 0 the rescue is unreachable at this RTT; if it fires
-repeatedly, it is firing and losing the anchor again immediately. Those are
-different bugs with different fixes and the counter distinguishes them in one
-run. Measurement in flight — it was not captured in any of the 15 calls above,
-which is the gap in this write-up.
+**And the counters invert the story.** A broken run carries `farFuture 624` and
+`farFuture 16` beside `late 708 / 656 / 70 / 39 / 33 / 19`. farFuture is the
+`seq >= lo + RING_F` branch — frames arriving **past the end of the ring window**,
+which is not a playhead that outran the stream but a playhead the stream outran.
+The receiver is stuck far BEHIND, and the sender is a whole ring ahead of it. So
+the priming-side story above, which fits the `late` counter, cannot be the whole
+account; 624 farFuture rejections is the larger number and points the other way.
+
+**The rescue was reachable and did not fire, 624 times.** That branch reads
+`if (starving && seq <= plausibleMax) reAnchor(); else { stats.farFuture++; }`.
+`plausibleMax` is generous by construction — a whole ring plus a second past the
+nominal-rate estimate — so it is unlikely to be what refused. `starving` is the
+suspect, and specifically its drought clause:
+
+    now() - lastRingWriteAt > 1000
+
+`lastRingWriteAt` is refreshed by ANY successful write. A stream that is
+partly landing and partly far-future therefore never accumulates a full second of
+drought, so the deadlock-breaker is held shut by the very partial success that
+proves the deadlock. The rescue's trigger is masked by the thing it is supposed to
+rescue — the same shape as the three "acting on a signal erases the signal" traps
+already found in this file, and a fourth instance of a flat RTT-blind constant
+deciding behaviour.
+
+Stated as a hypothesis, not a finding: `reAnchors` itself is not in `call.mjs`'s
+printed output, so it was still not captured. Adding it to that output is the one
+cheap step that would settle whether the rescue never fired (`0`) or fired and
+immediately lost the anchor again (climbing). Those remain different bugs with
+different fixes.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
