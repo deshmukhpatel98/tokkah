@@ -6616,3 +6616,93 @@ from. Adding `spreadMax @when`, `wantMax`, and the window's own p90/p99/max made
 the answer visible in a single run. A control law whose input is not printed can
 only be debugged by changing it and re-running — which is exactly how three
 plausible-but-wrong fixes each consumed a full measurement cycle.
+
+## 17.34 Arm on the signal, and reset the target too
+
+17.33 established that the jitter estimator learns a 146-405 ms spread in the
+call's first three seconds, while its inputs are still converging, and that
+peak-hold at 8 ms/s then carries that value for the rest of the call. The first
+fix was a one-shot purge at 4000 ms.
+
+### The purge, measured
+
+12 calls at `rtt=180 --net=real`, arms alternated within each round:
+
+| round | ON | OFF | delta |
+|---|---|---|---|
+| r1 | 180.2 | 248.1 | -67.8 |
+| r2 | 149.9 | 181.2 | -31.3 |
+| r3 | 198.1 | 159.3 | **+38.8** |
+| r4 | 176.9 | 243.4 | -66.6 |
+| r5 | 202.6 | 214.9 | -12.3 |
+| r6 | 170.6 | 248.0 | -77.4 |
+
+Median **-48.9 ms**, 5/6 rounds favour ON. One round inverted, so the endpoint
+alone is not conclusive — a sign test on 5/6 is p~=0.11. The mechanism is the
+better witness: **target mean 11.8f -> 7.0f, worst case 32f -> 17f.** That is a
+direct measure of the thing being fixed rather than a difference of two noisy
+medians. Kept ON.
+
+### Why it was only half
+
+Two separate defects, and the purge addressed neither completely.
+
+**A fixed deadline is the wrong shape.** Every clean ON side had a whole-run
+spread max of ~19 ms; every inflated one hit 120-183 — contamination arriving
+*after* 4000 ms. Convergence is not a duration. It depends on when pongs land
+and whether the 0.3% loss ate one, so no constant catches every case.
+
+The signal is already in the estimator. `spread = s[k] - s[0]` is inflated
+exactly while the window minimum has not yet found the true floor: early on,
+`s[0]` is still falling, so every difference measured from it is too big. So
+**arm on floor stability, not on the clock** — track `spread` instantaneously
+until the running minimum of D stops improving (self-cleans within one window,
+cannot pin a peak), then begin holding, from zero.
+
+**The target keeps the damage.** The decay law is asymmetric by design — UP
+immediately, DOWN one frame per second — so clearing `spreadHold` leaves
+`target` wherever the contaminated band put it. The run that showed this:
+
+    bands 221.8 / 18.2 / 21.1 / 17.9 / 0 / 0
+    holdMax 21.1 ms   wantMax 29f   target 21f   m2e 278.6
+
+All contamination in band 0. Post-arm hold max 21.1 ms = 4f. Target 21f. Bands
+4 and 5 empty, so that estimator lived ~16 s: armed at 6957 ms, ~9 s left,
+decayed 9 frames, 29 -> 21. The arithmetic closes exactly. **The buffer served an
+event from second two for the entire call**, and would have needed a
+three-minute call to recover unaided.
+
+So the arm resets the target as well. That is safe precisely because the arming
+condition *is* "the floor stopped moving": post-arm spread is a real measurement
+(17.9-21.1 ms here) and the target re-derives within one window.
+
+### Two silent failure modes guarded
+
+- **D drifts monotonically** — 1196-2000 ppm measured being corrected — so a bare
+  running minimum improves forever, the arm timer never expires, and peak-hold
+  never engages for the whole call. 0.25 ms of hysteresis: track the floor
+  without re-arming on it. This would have shown up only as unexplained
+  concealment.
+- **A 20 s backstop**, so a path that never settles still gets peak-hold.
+
+The purge deadline is also RTT-relative now (8 pings + 4 RTTs, floored at 4000).
+A flat constant covering a handshake is a hidden distance limit; this project
+has shipped that bug three times. At `rtt=180` the floor governs, so the A/B
+above is unaffected.
+
+### Instrumentation, which is the real lesson
+
+Three fixes failed in 17.32 because **the target was a number with no
+provenance**. The driver printed `target 22f` and nothing about where 22 came
+from. What made 17.33 and this section possible, in order:
+
+1. `spreadMax @when` — every peak was at 2292-3016 ms. That alone was the diagnosis.
+2. The window's own p90/p99/max — proving `spread` reported values its sample set
+   could not contain (405 from samples topping out at 33).
+3. **4 s bands** — `jitSpreadMaxLate` covered only t>10 s, so the 4-10 s window,
+   where the residual target was being learned, had no instrument at all.
+4. `holdArmDroppedF` — and this one had a bug worth recording: it was captured
+   *after* the reset, so every run reported "from 2f" whether the reset had saved
+   27 frames or done nothing. An attribution counter that cannot distinguish
+   "fixed a fault" from "there was no fault" is worse than none, because it reads
+   as confirmation.
