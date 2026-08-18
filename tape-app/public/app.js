@@ -34,7 +34,7 @@ import { attachDetector, audioConstraints, audioContext } from './onset-monitor.
 import { Telemetry, sampleStats } from './telemetry.js';
 import { TurnTaking, median } from './turntaking.js';
 import { startTapeVideo, startTapeRtp, prepareTapeRtp, createTapeLink, tapeSupported, tapeRtpSupported } from './tape.js';
-import { initPcmAudio } from './pcm.js';
+import { initPcmAudio, FRAME_SHAPE } from './pcm.js';
 import { initTimeSync } from './timesync.js';
 
 const $ = (id) => document.getElementById(id);
@@ -3479,8 +3479,20 @@ function fallbackToOpus(why, quiet) {
  * fine — a one-way call, with no error on either side. Same bug as the video
  * lane's black screen, one sense over.
  */
-function pcmAgree(peerPcm, when) {
-  if (!PCM_AUDIO || peerPcm == null || peerPcm) return;
+function pcmAgree(peerPcm, when, peerFrameMs) {
+  if (!PCM_AUDIO) return;
+  // FRAME SHAPE FIRST. A peer that wants the lane but frames it differently is
+  // worse than one that does not want it at all: the lane comes up, both ends
+  // read each other's datagrams at the wrong stride, and every downstream
+  // counter reports a transport fault. Older peers omit the field entirely, so
+  // only a PRESENT and DIFFERENT value refuses -- absent means "before this
+  // existed" and is left to the checks below.
+  if (peerFrameMs != null && peerFrameMs !== FRAME_SHAPE.ms) {
+    tel?.log('pcm-frame-mismatch', { when, ours: FRAME_SHAPE.ms, theirs: peerFrameMs });
+    fallbackToOpus('peer-frame-shape', true);
+    return;
+  }
+  if (peerPcm == null || peerPcm) return;
   tel?.log('pcm-mismatch', { when, ours: 1, theirs: peerPcm });
   fallbackToOpus('peer-no-pcm', true);
 }
@@ -6696,7 +6708,10 @@ async function join(room) {
     // version rides it beside lane/pcm/sid for the same reason (§3.4). Spread
     // so the flag-off body keeps its exact shape and key order.
     const vBody = THREE ? { v: 2 } : {};
-    const sendJoin = () => safe(() => ws.send(JSON.stringify({ type: 'join', lane: wantTape, pcm: PCM_AUDIO ? 1 : 0, sid, ...vBody })), 'predial.join');
+    // `pcmFrame` rides alongside `pcm` so the shape is negotiated, not assumed.
+    // Imported from pcm.js rather than restated here -- restating it would
+    // recreate the exact drift this field exists to catch.
+    const sendJoin = () => safe(() => ws.send(JSON.stringify({ type: 'join', lane: wantTape, pcm: PCM_AUDIO ? 1 : 0, pcmFrame: FRAME_SHAPE.ms, sid, ...vBody })), 'predial.join');
     if (ws.readyState === WebSocket.OPEN) { wsOpened = true; tel.log('predial-adopt', { open: 1 }); sendJoin(); }
     else { ws.addEventListener('open', () => { tel.log('predial-adopt', { open: 0 }); sendJoin(); }); }
   }
@@ -6796,7 +6811,7 @@ async function join(room) {
         setStatus(m.peerPresent ? 'connecting…' : 'waiting for the other person');
         sendDisplayHz();
         laneAgree(m.peerLane, 'welcome');
-        pcmAgree(m.peerPcm, 'welcome');
+        pcmAgree(m.peerPcm, 'welcome', m.peerPcmFrame);
         // Interpreter rides beside the call, never inside it (Law 0): a
         // failure here logs and vanishes, the call proceeds untouched.
         // ?xlate= auto-starts (the rig's path); people use the 🌐 button.

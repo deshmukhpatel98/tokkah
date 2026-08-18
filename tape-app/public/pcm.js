@@ -54,6 +54,23 @@ import { packFrame, unpackFrame } from './core/pcmpack.js';
 
 const FRAME_BYTES = 1152; // 384 samples × int24
 const FRAME_MS = 8;       // 384 samples at 48 kHz — the seq→time constant
+
+/**
+ * The wire's frame shape, exported so the lane handshake can carry it.
+ *
+ * Both ends must agree on this or every datagram is mis-parsed, and until now
+ * NOTHING SAID WHICH SHAPE WAS IN USE: `pcmAgree` settles whether both peers
+ * want the lossless lane, not what the frames look like. Steady state is safe
+ * because both ends load one deploy — but a call live across a deploy, or a peer
+ * on a cached bundle, gives two endpoints mis-parsing each other with no field
+ * to detect it. A format two parties must agree on, with no version in it, is a
+ * defect on its own terms.
+ *
+ * Shipped under the CURRENT shape, where it is a no-op that can only refuse a
+ * pairing that was already broken. It exists so that changing FRAME_MS later
+ * (§17.44, the 4 ms halving) fails loudly instead of silently.
+ */
+export const FRAME_SHAPE = { ms: FRAME_MS, bytes: FRAME_BYTES };
 // 24-byte header: u8 type | u8 parity-idx | u16 bitmap | u32 seq/base |
 // f64 wall | f64 capUs (sender audio-clock µs of the frame's first sample —
 // §10's A-V sync anchor; spare in parity messages). capUs was added with

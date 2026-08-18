@@ -133,6 +133,13 @@ export class Room implements DurableObject {
   // untouched. Both maps are keyed by the socket and torn down together.
   private laneCaps = new Map<WebSocket, number>();
   private pcmCaps = new Map<WebSocket, number>();
+  // The lossless lane's FRAME SHAPE, relayed so the two ends can agree on it.
+  // pcmCaps says whether a peer wants the lane; nothing said what shape its
+  // frames are, so a shape change would have been mis-parsed silently at both
+  // ends with no field to detect it. Parallel to pcmCaps in every respect,
+  // including teardown. Additive: peers that never send it read as undefined,
+  // which the client treats as "before this existed" rather than a mismatch.
+  private pcmFrameCaps = new Map<WebSocket, number>();
   private sids = new Map<WebSocket, string>();
   // Approximate client coordinates from `request.cf`, used only to compute how
   // far apart the two occupants are. City-level and often absent — never stored,
@@ -467,6 +474,7 @@ export class Room implements DurableObject {
           this.peers.delete(p);
           this.laneCaps.delete(p);
           this.pcmCaps.delete(p);
+          this.pcmFrameCaps.delete(p);
           this.sids.delete(p);
           this.geo.delete(p);
           this.vers.delete(p);
@@ -479,7 +487,7 @@ export class Room implements DurableObject {
   // The admission logic: role assignment, cap registration, relay listener,
   // teardown wiring, welcome message, and peer-joined broadcast. Extracted so
   // the upgrade path and the hold-join path share it.
-  private admit(server: WebSocket, opts: { lane: number; pcm: number; sid: string | null; v: number; full: () => void }): void {
+  private admit(server: WebSocket, opts: { lane: number; pcm: number; pcmFrame?: number; sid: string | null; v: number; full: () => void }): void {
     if (this.peers.size >= this.cap(opts.v)) { opts.full(); return; }
 
     // This tab is back inside the grace window — cancel its unsent departure so
@@ -522,9 +530,10 @@ export class Room implements DurableObject {
     // client with the flag and a client without it produced a ONE-WAY call —
     // the flagged end was inaudible for its whole duration, silently. Same
     // failure shape as the video lane, one sense over.
-    const { lane, pcm, sid, v } = opts;
+    const { lane, pcm, pcmFrame, sid, v } = opts;
     this.laneCaps.set(server, lane);
     this.pcmCaps.set(server, pcm);
+    if (pcmFrame != null) this.pcmFrameCaps.set(server, pcmFrame);
     if (sid) this.sids.set(server, sid);
     this.vers.set(server, v);
     const peerCap = (m: Map<WebSocket, number>) => {
@@ -630,6 +639,7 @@ export class Room implements DurableObject {
       this.peers.delete(server);
       this.laneCaps.delete(server);
       this.pcmCaps.delete(server);
+      this.pcmFrameCaps.delete(server);
       this.sids.delete(server);
       this.vers.delete(server);
       this.geo.delete(server);
@@ -707,6 +717,7 @@ export class Room implements DurableObject {
         preferRelay: (this.kmApart(server) ?? 0) >= RELAY_KM,
         peerLane: peerCap(this.laneCaps),
         peerPcm: peerCap(this.pcmCaps),
+        peerPcmFrame: peerCap(this.pcmFrameCaps),
         // Additive fields — old clients ignore them.
         cap: this.cap(v),
         peers: peersArr,
@@ -734,6 +745,7 @@ export class Room implements DurableObject {
           const km = this.kmApart(p);
           p.send(JSON.stringify({
             type: 'peer-joined', peer: role, peerLane: lane, peerPcm: pcm,
+            peerPcmFrame: pcmFrame,
             kmApart: km, preferRelay: (km ?? 0) >= RELAY_KM,
           }));
         } catch {
@@ -796,6 +808,9 @@ export class Room implements DurableObject {
 
         const lane = Number(m.lane) || 0;
         const pcm = Number(m.pcm) || 0;
+        // undefined, not 0, when absent: a peer from before this field existed must
+        // read as "no opinion", and 0 is a real (wrong) frame size.
+        const pcmFrame = m.pcmFrame == null ? undefined : Number(m.pcmFrame) || undefined;
         const sid = m.sid ? String(m.sid) : null;
         const hv = Number(m.v) || 1;
 
@@ -805,7 +820,7 @@ export class Room implements DurableObject {
           return;
         }
         this.admit(server, {
-          lane, pcm, sid, v: hv,
+          lane, pcm, pcmFrame, sid, v: hv,
           full: () => {
             server.send(JSON.stringify({ type: 'full' }));
             server.close(1000, 'room full');
@@ -845,6 +860,7 @@ export class Room implements DurableObject {
     this.admit(server, {
       lane: Number(q.get('lane')) || 0,
       pcm: Number(q.get('pcm')) || 0,
+      pcmFrame: Number(q.get('pcmframe')) || undefined,
       sid: upSid,
       v: upV,
       full: () => { /* unreachable: checked above */ },
