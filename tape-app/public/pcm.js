@@ -2628,10 +2628,22 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // law consumed would need the same measured justification as D_WIN and
     // JIT_RELEASE, and this ships before that evidence exists.
     const JIT_WARM = cfg.jitterWarmMs ?? 10000;
-    // One frame of margin over the measured p99. Not tunable on purpose: the
-    // estimator is supposed to be the answer, and a knob here is how a measured
-    // control law quietly becomes a hand-tuned one again.
-    const D_MARGIN_FRAMES = 1;
+    // One frame of margin over the measured p99. The note that stood here said
+    // "not tunable on purpose: a knob here is how a measured control law
+    // quietly becomes a hand-tuned one again", and that warning is kept, not
+    // overridden — the DEFAULT IS STILL 1 and nothing about the shipped law
+    // changes. What the flag adds is the ability to ASK whether this frame is
+    // earned, which is the one thing the original note left undone: it is 8 ms
+    // of a 43-47 ms budget, the second-largest term after the 20 ms OS output
+    // buffer, and the largest one anything in this file can reach.
+    //
+    // The bar for ever moving it is deliberately high, and it is not a latency
+    // number. Margin buys the frames the estimator's p99 did not predict, so
+    // the only honest reading is latency AND concealment together, in paired
+    // rounds against m2e-ab's measured +/-2.7 ms floor. A version of this that
+    // reported only the milliseconds saved would be the hand-tuning the note
+    // warned about, wearing a measurement's clothes.
+    const D_MARGIN_FRAMES = Math.max(0, cfg.jitterMarginFrames ?? 1);
     const JIT_HOLD = cfg.jitterHold !== false;
     // 0.25 ms per 250 ms tick = 1 ms/s: a ~98 ms burst stays remembered for most
     // of a call. Was 2 (8 ms/s, chosen to match the output decay by reasoning

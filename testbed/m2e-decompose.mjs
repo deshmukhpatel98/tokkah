@@ -175,6 +175,10 @@ async function main() {
     console.log('M2ERESULT ' + JSON.stringify({
       m2eA, m2eB, ringA: ringDepthA, ringB: ringDepthB,
       outA: outputA, outB: outputB, netA: netAgeP50A, netB: netAgeP50B,
+      // Concealment travels WITH the latency, always. Any change that makes the
+      // ring shallower pays for it here, and a rig reporting only the
+      // milliseconds saved would hide the entire cost of the trade.
+      ccA: median(samplesA.map((x) => x?.concealedMs)), ccB: median(samplesB.map((x) => x?.concealedMs)),
     }));
 
     // Determine largest component of mouthToEarMs breakdown

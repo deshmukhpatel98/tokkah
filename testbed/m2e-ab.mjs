@@ -37,7 +37,8 @@ const runOne = (qs, label) => {
   const m2e = ((v.m2eA ?? NaN) + (v.m2eB ?? NaN)) / 2;
   const ring = ((v.ringA ?? NaN) + (v.ringB ?? NaN)) / 2;
   console.log(`m2e ${m2e.toFixed(1)} ms, ring ${ring.toFixed(1)} ms`);
-  return { m2e, ring, out: ((v.outA ?? NaN) + (v.outB ?? NaN)) / 2 };
+  const cc = ((v.ccA ?? 0) + (v.ccB ?? 0)) / 2;
+  return { m2e, ring, out: ((v.outA ?? NaN) + (v.outB ?? NaN)) / 2, cc };
 };
 
 const rounds = [];
@@ -59,7 +60,7 @@ const median = (xs) => {
   return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
 };
 console.log(`\n── ${rounds.length} paired round(s), ON=[${ON}] OFF=[${OFF}] ──`);
-for (const [name, key] of [['mouth-to-ear', 'm2e'], ['ring depth  ', 'ring'], ['output path ', 'out']]) {
+for (const [name, key] of [['mouth-to-ear', 'm2e'], ['ring depth  ', 'ring'], ['output path ', 'out'], ['concealed ms', 'cc']]) {
   const per = rounds.map((r) => r.on[key] - r.off[key]);
   const med = median(per);
   const straddles = Math.min(...per) < 0 && Math.max(...per) > 0;

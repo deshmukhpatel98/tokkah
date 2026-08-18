@@ -2266,6 +2266,12 @@ const PCM_CFG = {
   // fault-path benefit measured (detection 8.0 s -> 2.8 s). `?pcmpingms=` stays
   // as the control arm.
   pingMs: Number(QS.get('pcmpingms')) || 400,
+  // MEASUREMENT ARM ONLY — default 1 is today's exact shipped behaviour. The
+  // jitter target is ceil(spreadHold/FRAME_MS) + this, so on a clean call where
+  // spread is a few ms the margin IS most of the ring: 8 ms of a 43-47 ms
+  // budget. `?pcmjitmargin=0` exists so that frame can be shown to be earned
+  // rather than assumed — judged on latency AND concealment together.
+  jitterMarginFrames: QS.get('pcmjitmargin') != null ? Number(QS.get('pcmjitmargin')) : 1,
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',
