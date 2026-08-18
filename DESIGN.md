@@ -7620,3 +7620,55 @@ What remains is 1.8 ms of genuine buffer, on a control loop that measurably
 resists being tightened. The next honest step is a full call on a real browser
 with a real sensor — not because the arithmetic is in doubt, but because this
 testbed cannot produce the one number left.
+
+## 17.44 Frame-halving: the decision to decline it was right, and today changed its premise
+
+`b00ed4f` priced halving `FRAME_MS` 8 -> 4 and declined it. That was correct on
+the evidence then, and the reasoning is worth re-reading because the conclusion
+has now moved.
+
+The task assumed ~12 ms: 4 from the `frameMs` term plus 8 from a ring believed to
+be resting on the `targetFrames` floor. The floor half was testable without
+touching the wire, so it was tested — 3 paired rounds, `+0.1 ms` median,
+UNRESOLVED, and concealment positive in every round. **The ring was not on the
+floor.** That left only the 4 ms `frameMs` term, and the verdict was that 4 ms was
+"barely above the instrument's resolution" against a migration through
+`FRAME_BYTES`, the RS symbol size, pcmpack's block size and the SAB ring layout.
+Declined at zero risk.
+
+### What changed
+
+At the time the remaining gap to the goal was ~20 ms, so 4 ms was a rounding
+error against a wire-format rewrite. After §17.34 (startup contamination),
+§17.40 (margin frame) and §17.41 (real-browser `outputLatency` measured at 16 ms),
+**the gap at rtt=180 is ~1.8 ms of median.** The same 4 ms is now more than
+enough to close it.
+
+`FRAME_MS` also appears twice in the budget, which the original pricing counted
+once:
+
+    m2e = FRAME_MS + age + depthMs + outputLatency
+          ^^^^^^^^^                 assembly at the sender: 8 -> 4 saves 4 ms
+                        ^^^^^^^^    quantised in FRAME_MS units; depth sits
+                                    ~1.5 frames above target, so a smaller
+                                    frame makes the same overshoot cost less
+
+So the honest current estimate is 4 ms from the assembly term plus some part of
+the ~12 ms depth overshoot, against a need of 1.8. That is no longer a rounding
+error; it is the only priced route to the goal at this distance that does not
+require tightening a control loop §17.42 measured as resisting it.
+
+### Why it is not being started here
+
+A wire-format migration touching `FRAME_BYTES`, the RS symbol size, pcmpack's
+block size and the SAB ring layout is the largest change in this file, and it
+would be started at the end of a session that has already produced three
+instrument or arithmetic errors (§17.41-42, and the two blind instruments). The
+right conditions for it are a fresh start, and the pricing above so it is not
+re-litigated from scratch.
+
+**The recorded conclusion is therefore reversed in principle and unchanged in
+practice: the 4 ms is now worth buying, and buying it is a separate piece of
+work.** Note also that `b00ed4f`'s method — test the settable half first, decline
+the wire change on the result — is why this costs one paragraph to revisit rather
+than a rewrite to undo.
