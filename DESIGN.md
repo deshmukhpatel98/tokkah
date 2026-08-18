@@ -7953,3 +7953,54 @@ and left defaulted OFF. Acceptance requires concealment as well as m2e -- 17.42
 established that depth above target is load-bearing, so if the 300 ms queue is
 genuinely carrying audio the path cannot otherwise deliver, clamping it converts
 latency into dropouts and the goal asks for lossless.
+
+## 17.49 The distance queue was not load-bearing — capping it is -245 ms AND 29x less concealment
+
+`?pcmqms=40` against default, rtt=260, `--net=real`, order alternated per round,
+three rounds, concealment captured before inspection:
+
+| | ARM (bdp + 40 ms) | CTL (bdp x 1.5) |
+|---|---|---|
+| m2e, six/four dirs | 192.8 220.7 225.6 229.9 249.7 253.3 | 282.4 468.4 476.2 532.5 |
+| **m2e median** | **227.8 ms** | **472.3 ms** |
+| **concealed median** | **188 ms** | **5496 ms** |
+| FEC repaired | 45-175 | 336-796 |
+| overflowSkips / reAnchors | 0 / 0, every run | up to 8 / 3 |
+| PCM path | held all six | fell back to OPUS in round 1 |
+
+**-244.6 ms, and the audio got MORE lossless, not less.** Every axis moved the
+same way. There is no trade here to price.
+
+### 17.42 was right in general and wrong about this queue
+
+17.42 established that depth above target is load-bearing, and I opened this
+experiment expecting to pay concealment for latency. The opposite happened, by a
+factor of 29, and the reason is visible in the control's own numbers:
+`age p95 1326.3 ms` against `age p50 133.5`. Frames were sitting in the backlog
+until they were long past their play deadline, arriving too late to use and
+being concealed anyway. The queue was not protecting audio from jitter; it was
+manufacturing the lateness it then failed to cover. Bufferbloat, exactly.
+
+So the principle needs a boundary, and this is it: depth is load-bearing when it
+is covering measured dispersion, and pure damage when it exceeds the deadline
+the audio has to meet. `bdp x 1.5` cannot tell those apart because it is not
+denominated in time at all -- at rtt=260 it permits ~390 ms of standing backlog
+for no reason except that the path is long. A frame does not become less urgent
+because it travelled further.
+
+### Why the estimator recovered on its own
+
+Target fell 38-41f -> 5-15f in the arm with no estimator change whatsoever. The
+estimator was never the problem (17.48 said so and this confirms it): it was
+sizing correctly for dispersion that the queue itself was creating. Remove the
+manufactured lateness and the demand disappears. That is the strongest evidence
+that the causal arrow runs queue -> dispersion -> target, not the reverse.
+
+### Not yet defaulted
+
+`bdp + 40 ms` is TIGHTER than `bdp x 1.5` at every distance, not just 260, so
+the short paths have to be shown unharmed before this ships on by default. That
+gate is running at rtt=180 and rtt=220 now. The value 40 is the first one tried
+and is not yet justified against 20 or 80; -245 ms is large enough that finding
+the knee matters less than shipping the fix, but it should be recorded as
+unjustified rather than presented as tuned.
