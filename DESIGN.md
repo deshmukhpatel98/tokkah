@@ -4795,10 +4795,46 @@ mouth-to-ear and ring depth — under this fault the ring inflates to ~220 ms an
 m2e to ~310, and a fault concealed perfectly but converted into a third of a
 second of delay has not been survived.
 
-**What is claimed:** the mechanism. `muteAfterMs` 1478 vs 5000, deaths detected
-sooner, both directly observed, plus `lab-verify` 6/6 with m2e unmoved. **What is
-not claimed:** that calls conceal less. That sits under the instrument, and saying
-so is the finding.
+**The verdict, once the rig could give one.** 3 paired rounds, arm order rotated:
+
+| | ON | OFF | median delta | per round |
+|---|---|---|---|---|
+| conceal during stall | 804 ms | 836 ms | **-32 ms** | -20, -52, -32 |
+| conceal whole call | 2768 ms | 2872 ms | +16 ms | +16, +360, -240 → UNRESOLVED |
+| mouth-to-ear during | 303 ms | 321 ms | +9 ms | +9, -25, +10 → UNRESOLVED |
+| ring depth during | 222 ms | 242 ms | +8 ms | +8, -26, +9 → UNRESOLVED |
+
+So: a consistent sign on stall concealment across all three rotated rounds, worth
+**32 ms — about 4%**, not the 20% a single pair claimed. Everything else is under
+the instrument. No regression anywhere, and in particular the pre-stall regression
+suspected from one pair does not exist.
+
+**THE RESULT WORTH KEEPING IS THE NEGATIVE ONE.** Detection went from 8.0 s to
+2.8 s — nearly 3x — and the ring did not move. So **demotion speed was never what
+inflates the buffer**, and the remaining 220 ms of ring under this fault has to
+come from somewhere demotion cannot reach. It does, and the mechanism is already
+documented two ways in `pcm.js`:
+
+- The picker falls forward off a backed-up lane within `queueBytes` = 6144 B
+  (~43 ms) via `bufferedAmount`, long before any demotion. Audio stops going into
+  the hole almost immediately whatever the dead rule does.
+- But frames **already in flight** still arrive 5 s late, and `noteArrival` is
+  **lane-blind** — it records `(arrival - skew) - seq*FRAME_MS` with no idea which
+  lane it came from. The spread is `s[dN-2] - s[0]`, which rejects exactly ONE
+  outlier, and the file already says why that is not enough: *"A stall is
+  inherently a multi-sample event... Second-largest discards one anomalous
+  ARRIVAL; it cannot discard a hole."* `jitSpreadMaxRun` hit 1515 ms.
+- Then the peak-hold releases at 8 ms/s, so a spike to the ceiling takes ~20 s to
+  decay — longer than the 25 s measurement window itself.
+
+That is the next target, and it is a latency target rather than a concealment one:
+a fault concealed perfectly but converted into 310 ms of mouth-to-ear has not been
+survived. Scoped, not built.
+
+**What is claimed for this change:** the mechanism (`muteAfterMs` 1478 vs 5000,
+deaths detected sooner, both directly observed), `lab-verify` 6/6 with m2e unmoved,
+a consistent -32 ms on stall concealment, and no regression. **What is not
+claimed:** any effect on ring depth or mouth-to-ear.
 
 **Instruments added**, because none of the above was visible: `deadEvents` counts
 RISING EDGES (the pre-existing `dead` is `laneDead` summed at snapshot time and
