@@ -7801,3 +7801,48 @@ tracks it, but the goal asks for ~1 Mbps and this spends against that. The
 measurement above should therefore record bytes on the wire alongside latency:
 **4 ms of mouth-to-ear bought with a materially fatter stream is not obviously
 the right trade, and this file has no measurement of the exchange rate.**
+
+## 17.46 Step 4 measured: the 4 ms build runs and reports negative arrival age
+
+Deployed `frame-4ms` to prod, one call at rtt=180 `--net=real`, restored 8 ms
+immediately after. It is not a clean win and it is not a silent one:
+
+    depth 46.3 ms  target 6f  age p50 -99.6 ms  p95 62.6  mouthToEar null
+    depth 44.5 ms  target 6f  age p50 -85.1 ms  p95 57.7  mouthToEar null
+
+**The lane comes up.** Datachannels open, frames flow, the ring fills, the target
+settles at 6f. So the wire format, the SAB geometry, the RS symbol budget
+(`RS_SYM_MAX = 1160 - HDR_PAR_C` = 1152, a maximum that 576 fits inside) and the
+frame-shape guards from §17.44 all survive the change.
+
+**But arrival age is NEGATIVE**, about -100 ms against a one-way of ~91. Frames
+are being timestamped as arriving before they were captured. That is a seq->time
+conversion still assuming 8 ms per sequence number: at `FRAME_MS = 4` the
+sequence advances twice as fast, so anything still multiplying by 8 places every
+arrival a full one-way delay in the past.
+
+`mouthToEarMs` is `null` in both directions because the snapshot refuses
+impossible compositions — the `if (!(v >= 0) || v > 60000)` guard. **That guard
+is the reason this is a finding rather than a false result**: an m2e composed
+from a -99.6 ms age would have been ~44 ms, well under the 150 ms goal, and it
+would have looked exactly like success. The instrument declined to publish it.
+
+It is also why the A/B rig scored three consecutive rounds as "empty". The m2e
+was correctly withheld, not missing. The rig could not tell those apart, which
+is a gap in the rig, not in the app.
+
+### What this changes
+
+§17.44 said step 4 was three edits. It is not. The three edits are necessary and
+insufficient: `FRAME_BYTES`/`FRAME_MS`/`FRAME` propagate through everything that
+derives from them, and the de-literalisation (§17.44 step 3) covered every
+literal in pcm.js — but at least one seq->time path still carries 8 as a
+semantic constant rather than as `FRAME_MS`, and de-literalising `384` would not
+have touched it because the number there is `8`.
+
+That is the specific next task, and it is bounded: find the seq->wall-clock
+conversion that yields a negative age at `FRAME_MS = 4`. The counter that
+localises it already exists — `age` itself, per direction, and it is wrong by
+almost exactly one one-way delay, which is a strong hint about which term.
+
+Prod is on 8 ms and verified. The branch stays unmerged.
