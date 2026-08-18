@@ -280,88 +280,123 @@ function checkValidity(on, off) {
   return reasons;
 }
 
-let on = null;
-let off = null;
-let valid = false;
+// ── REPEATS, PAIRED, WITH THE ARM ORDER ROTATED ──────────────────────────────
+// One pair of calls cannot grade anything on this path, and for a while this
+// rig pretended otherwise. A NULL A/B — both arms given byte-identical flags —
+// returned a 452 ms gap in stall concealment and 1192 ms across the whole call,
+// from no difference whatsoever. Measured effects of 200 ms were being read off
+// a single pair and believed, in both directions: a change was credited with a
+// 20% improvement and, on the next run, suspected of a pre-stall regression.
+// Neither survived contact with the noise floor.
+//
+// So: N rounds, and the ARM ORDER ALTERNATES between them. Order matters
+// because the two calls in a pair are not exchangeable — the first pays for a
+// cold page, a cold encoder and a cold host, and whichever arm always goes
+// first always eats that. Rotating cancels it instead of hoping it is small.
+//
+// The verdict is the MEDIAN of the per-round deltas, and a delta whose rounds
+// straddle zero is reported as UNRESOLVED rather than as a number. That is the
+// honest output when the effect is smaller than the instrument: not a PASS, not
+// a FAIL, but "this rig cannot see it".
+const REPEAT = Math.max(1, Number(process.argv.find((a) => a.startsWith('--repeat='))?.slice(9)) || 1);
+const ON_FLAGS = process.argv.find((a) => a.startsWith('--on='))?.slice(5) ?? '&pcmskewstripe=1';
+// Default '' is NO STRIPING AT ALL, which makes this a stripe-on/stripe-off
+// test — useless for grading a change INSIDE the stripe, whose control needs a
+// lane order to compare against. For that, give both arms striping:
+//   --on='&pcmskewstripe=1' --off='&pcmskewstripe=1&pcmfastdead=0'
+const OFF_FLAGS = process.argv.find((a) => a.startsWith('--off='))?.slice(6) ?? '';
 
-for (let attempt = 0; attempt < 3; attempt++) {
-  // The ON arm's flags, overridable. The controller that acts on the third
-  // lane-health signal ships as a SEPARATE switch (?pcmlatedemote=1) precisely
-  // so this scenario can be re-run against it without rebuilding the rig, and
-  // hardcoding the arm here meant the one comparison the switch exists for
-  // needed a source edit every time.
-  //   --on='&pcmskewstripe=1&pcmlatedemote=1'
-  on = await armRetryStall(process.argv.find((a) => a.startsWith('--on='))?.slice(5) ?? '&pcmskewstripe=1');
-  off = await armRetryStall('');
-
-  const invalidReasons = checkValidity(on, off);
-  if (invalidReasons.length > 0) {
-    console.log(`INVALID: ${invalidReasons.join('; ')}`);
-    if (attempt < 2) {
-      console.log(`[retry] retrying two-arm comparison (attempt ${attempt + 2}/3)`);
-    }
+const rounds = [];
+const dropped = [];
+for (let r = 0; r < REPEAT; r++) {
+  let got = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Alternate which arm is measured first; see above.
+    const onFirst = r % 2 === 0;
+    const a = await armRetryStall(onFirst ? ON_FLAGS : OFF_FLAGS);
+    const b = await armRetryStall(onFirst ? OFF_FLAGS : ON_FLAGS);
+    const [rOn, rOff] = onFirst ? [a, b] : [b, a];
+    const invalidReasons = checkValidity(rOn, rOff);
+    if (invalidReasons.length === 0) { got = { on: rOn, off: rOff, onFirst }; break; }
+    console.log(`INVALID (round ${r + 1}/${REPEAT}): ${invalidReasons.join('; ')}`);
+    if (attempt < 2) console.log(`[retry] round ${r + 1}, attempt ${attempt + 2}/3`);
+  }
+  if (got) {
+    rounds.push(got);
+    console.log(`[round ${r + 1}/${REPEAT}] valid (${got.onFirst ? 'ON first' : 'OFF first'})`);
   } else {
-    valid = true;
-    break;
+    dropped.push(r + 1);
+    console.log(`[round ${r + 1}/${REPEAT}] DROPPED after 3 attempts`);
   }
 }
 
-if (!valid) {
+if (rounds.length === 0) {
   console.log('VERDICT: UNMEASURABLE (host too noisy)');
   process.exit(2);
 }
+// NEVER SILENTLY. A rig that bounds its own coverage has to say so, or the
+// reader takes "3 rounds requested" as "3 rounds measured".
+if (dropped.length) console.log(`NOTE: ${dropped.length} of ${REPEAT} rounds dropped as invalid (rounds ${dropped.join(', ')})`);
 
-// BOTH samples, not just the last one. The concealment assert is a DELTA across
-// the stall window, so printing only t=55 hid the half of the data that says
-// what each arm was doing before the routes went bad — and that turned out to
-// matter: on one run the control had already concealed 4184 ms before the stall
-// even started, against the striping arm's 2176 ms, so an arm that looked 4x
-// worse across the window was ahead over the whole call. A rig that computes a
-// delta must show both ends of it.
-console.log('skewstripe stall ON  t=30:', JSON.stringify(on.t30));
-console.log('skewstripe stall ON  t=55:', JSON.stringify(on.t55));
-console.log('skewstripe stall OFF t=30:', JSON.stringify(off.t30));
-console.log('skewstripe stall OFF t=55:', JSON.stringify(off.t55));
-// Whole-call concealment beside the windowed delta. Not a replacement for the
-// assert — a burst of glitches the moment a route fails is a real defect even
-// if the call totals well — but the gate is uninterpretable without it.
-for (const [label, arm] of [['ON ', on], ['OFF', off]]) {
-  const tot = (arm.t55.pA.concealedMs ?? 0) + (arm.t55.pB.concealedMs ?? 0);
-  const pre = (arm.t30.pA.concealedMs ?? 0) + (arm.t30.pB.concealedMs ?? 0);
-  console.log(`whole-call conceal ${label}: ${tot} ms total (${pre} ms before the stall, ${tot - pre} ms during)`);
+const median = (xs) => {
+  const s = [...xs].sort((x, y) => x - y);
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+const concealDelta = (arm) => (((arm.t55.pA.concealedMs ?? 0) - (arm.t30.pA.concealedMs ?? 0))
+  + ((arm.t55.pB.concealedMs ?? 0) - (arm.t30.pB.concealedMs ?? 0))) / 2;
+const wholeCall = (arm) => (arm.t55.pA.concealedMs ?? 0) + (arm.t55.pB.concealedMs ?? 0);
+const m2eDuring = (arm) => ((arm.t55.pA.mouthToEarMs ?? NaN) + (arm.t55.pB.mouthToEarMs ?? NaN)) / 2;
+const ringDuring = (arm) => ((arm.t55.pA.ringDepthMs ?? NaN) + (arm.t55.pB.ringDepthMs ?? NaN)) / 2;
+
+// The last round's raw snapshots, so a reader can still inspect one call in full.
+const last = rounds[rounds.length - 1];
+console.log('skewstripe stall ON  t=30:', JSON.stringify(last.on.t30));
+console.log('skewstripe stall ON  t=55:', JSON.stringify(last.on.t55));
+console.log('skewstripe stall OFF t=30:', JSON.stringify(last.off.t30));
+console.log('skewstripe stall OFF t=55:', JSON.stringify(last.off.t55));
+
+console.log(`\n── ${rounds.length} valid round(s), ON=[${ON_FLAGS}] OFF=[${OFF_FLAGS}] ──`);
+const report = [];
+for (const [name, fn, unit] of [
+  ['conceal during stall', concealDelta, 'ms'],
+  ['conceal whole call  ', wholeCall, 'ms'],
+  ['mouth-to-ear during ', m2eDuring, 'ms'],
+  ['ring depth during   ', ringDuring, 'ms'],
+]) {
+  const perRound = rounds.map((r) => fn(r.on) - fn(r.off));
+  const med = median(perRound);
+  const straddles = Math.min(...perRound) < 0 && Math.max(...perRound) > 0;
+  const onMed = median(rounds.map((r) => fn(r.on)));
+  const offMed = median(rounds.map((r) => fn(r.off)));
+  report.push({ name, med, straddles, perRound });
+  console.log(`${name}: ON ${onMed.toFixed(0)} ${unit} vs OFF ${offMed.toFixed(0)} ${unit}`
+    + `  ->  median delta ${med > 0 ? '+' : ''}${med.toFixed(0)} ${unit}`
+    + `  [per-round ${perRound.map((d) => (d > 0 ? '+' : '') + d.toFixed(0)).join(', ')}]`
+    + (rounds.length < 2 ? '  (1 round: NOT RESOLVABLE, see the null A/B note above)'
+      : straddles ? '  (UNRESOLVED: rounds straddle zero)' : ''));
 }
 
 // Asserts (spec assert 10)
+const livePass = rounds.every((r) => r.on.t55.pA.framesRecv != null && r.on.t55.pB.framesRecv != null
+  && r.off.t55.pA.framesRecv != null && r.off.t55.pB.framesRecv != null);
+console.log(`\nassert live snapshot reported in both arms: ${livePass ? 'PASS' : 'FAIL'}`);
 
-// Assert 1: Live snapshot in both arms (no crash)
-const livePass = (on.t55.pA.framesRecv != null) && (on.t55.pB.framesRecv != null) &&
-                 (off.t55.pA.framesRecv != null) && (off.t55.pB.framesRecv != null);
-console.log(`assert live snapshot reported in both arms: ${livePass ? 'PASS' : 'FAIL'}`);
+const framesDelta = (arm, side) => (arm.t55[side].framesRecv ?? 0) - (arm.t30[side].framesRecv ?? 0);
+const framesPass = rounds.every((r) => ['pA', 'pB'].every((s) => framesDelta(r.on, s) > 1000 && framesDelta(r.off, s) > 1000));
+console.log(`assert framesRecv advanced by > 1000 in BOTH arms, every round: ${framesPass ? 'PASS' : 'FAIL'}`
+  + ` (${rounds.map((r) => `ON ${framesDelta(r.on, 'pA')}/${framesDelta(r.on, 'pB')} OFF ${framesDelta(r.off, 'pA')}/${framesDelta(r.off, 'pB')}`).join(' | ')})`);
 
-// Assert 2: framesRecv advanced by > 1000 between t=30 and t=55 in BOTH arms (audio kept flowing on survivors)
-const onFramesDeltaA = (on.t55.pA.framesRecv ?? 0) - (on.t30.pA.framesRecv ?? 0);
-const onFramesDeltaB = (on.t55.pB.framesRecv ?? 0) - (on.t30.pB.framesRecv ?? 0);
-const offFramesDeltaA = (off.t55.pA.framesRecv ?? 0) - (off.t30.pA.framesRecv ?? 0);
-const offFramesDeltaB = (off.t55.pB.framesRecv ?? 0) - (off.t30.pB.framesRecv ?? 0);
+// Judged on the MEDIAN across rounds, not on one pair. The 500 ms allowance was
+// set when a single pair was the whole sample; it is roughly the null A/B's own
+// 452 ms gap, which is the right order for a tolerance and pure luck that it is.
+const medConceal = median(rounds.map((r) => concealDelta(r.on) - concealDelta(r.off)));
+const concealPass = medConceal <= 500;
+console.log(`assert median ON-OFF conceal delta <= +500 ms: ${concealPass ? 'PASS' : 'FAIL'} (${medConceal > 0 ? '+' : ''}${medConceal.toFixed(1)} ms)`);
 
-const framesPass = (onFramesDeltaA > 1000 && onFramesDeltaB > 1000) &&
-                   (offFramesDeltaA > 1000 && offFramesDeltaB > 1000);
-console.log(`assert framesRecv advanced by > 1000 in BOTH arms: ${framesPass ? 'PASS' : 'FAIL'} (ON A:${onFramesDeltaA} B:${onFramesDeltaB}, OFF A:${offFramesDeltaA} B:${offFramesDeltaB})`);
-
-// Assert 3: ON concealedMs delta <= OFF concealedMs delta + 500
-const onConcealDeltaA = (on.t55.pA.concealedMs ?? 0) - (on.t30.pA.concealedMs ?? 0);
-const onConcealDeltaB = (on.t55.pB.concealedMs ?? 0) - (on.t30.pB.concealedMs ?? 0);
-const offConcealDeltaA = (off.t55.pA.concealedMs ?? 0) - (off.t30.pA.concealedMs ?? 0);
-const offConcealDeltaB = (off.t55.pB.concealedMs ?? 0) - (off.t30.pB.concealedMs ?? 0);
-
-const meanOnConcealDelta = (onConcealDeltaA + onConcealDeltaB) / 2;
-const meanOffConcealDelta = (offConcealDeltaA + offConcealDeltaB) / 2;
-const concealPass = meanOnConcealDelta <= meanOffConcealDelta + 500;
-console.log(`assert ON concealedMs delta <= OFF concealedMs delta + 500: ${concealPass ? 'PASS' : 'FAIL'} (ON mean delta:${meanOnConcealDelta.toFixed(1)} ms [A:${onConcealDeltaA}, B:${onConcealDeltaB}], OFF mean delta:${meanOffConcealDelta.toFixed(1)} ms [A:${offConcealDeltaA}, B:${offConcealDeltaB}])`);
-
-// Assert 4: ON nFast >= 3 at the end (floor holds)
-const floorPass = (on.t55.pA.stripe?.nFast >= 3) && (on.t55.pB.stripe?.nFast >= 3);
-console.log(`assert ON nFast >= 3 at end: ${floorPass ? 'PASS' : 'FAIL'} (ON nFast A:${on.t55.pA.stripe?.nFast}, B:${on.t55.pB.stripe?.nFast})`);
+const floorPass = rounds.every((r) => (r.on.t55.pA.stripe?.nFast ?? 0) >= 3 && (r.on.t55.pB.stripe?.nFast ?? 0) >= 3);
+console.log(`assert ON nFast >= 3 at end, every round: ${floorPass ? 'PASS' : 'FAIL'}`
+  + ` (${rounds.map((r) => `${r.on.t55.pA.stripe?.nFast}/${r.on.t55.pB.stripe?.nFast}`).join(' | ')})`);
 
 const pass = livePass && framesPass && concealPass && floorPass;
+console.log(`\nVERDICT: ${pass ? 'PASS' : 'FAIL'}`);
 process.exitCode = pass ? 0 : 1;
