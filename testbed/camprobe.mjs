@@ -37,10 +37,32 @@ try {
   await page.waitForTimeout(3000);
   const r = await page.evaluate(async () => {
     const out = { ok: false, err: null, label: null, w: 0, h: 0, mean: 0, variance: 0, change: 0 };
+    // What the OS admits exists, before asking for it. Labels are blank without
+    // permission, but the COUNT is not, so this separates "this Mac has no
+    // camera" from "it has one and will not hand it over" — two findings that
+    // call for completely different next moves.
+    out.videoInputs = (await navigator.mediaDevices.enumerateDevices().catch(() => []))
+      .filter((d) => d.kind === 'videoinput').length;
+
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
-    } catch (e) { out.err = `${e.name}: ${e.message}`; return out; }
+      // A RACE, because the failure this probe exists to report does not
+      // reject. On this Mac (Darwin 27, headless Chrome for Testing, no TCC
+      // grant and no way to prompt for one) getUserMedia simply never settles:
+      // the first version of this file sat there for fifteen minutes and
+      // returned nothing at all. "No sensor" and "no answer" are both answers,
+      // and a probe that can only report success is not a probe.
+      stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('HUNG')), 20000)),
+      ]);
+    } catch (e) {
+      out.err = e.message === 'HUNG'
+        ? 'getUserMedia never settled in 20 s — macOS is holding the request, not refusing it'
+        : `${e.name}: ${e.message}`;
+      out.hung = e.message === 'HUNG';
+      return out;
+    }
     const track = stream.getVideoTracks()[0];
     out.label = track.label; out.state = track.readyState;
     const v = document.createElement('video');
@@ -77,7 +99,9 @@ try {
   console.log(JSON.stringify(r, null, 2));
   console.log(r.ok
     ? `\nREAL SENSOR: "${r.label}" ${r.w}x${r.h}, detail ${r.variance.toFixed(0)}, motion ${r.change.toFixed(2)}/px`
-    : `\nNO REAL SENSOR${r.err ? ` — ${r.err}` : ' — frames arrive but the picture is flat (macOS is denying the camera)'}`);
+    : `\nNO REAL SENSOR${r.err ? ` — ${r.err}` : ' — frames arrive but the picture is flat (macOS is denying the camera)'}`
+      + (r.videoInputs != null ? `\n  (the OS lists ${r.videoInputs} video input${r.videoInputs === 1 ? '' : 's'}`
+        + `${r.videoInputs && !r.ok ? ' — a sensor is present and unreachable, not absent' : ''})` : ''));
   process.exit(r.ok ? 0 : 1);
 } finally {
   await browser.close();
