@@ -4839,6 +4839,32 @@ than that one, but the concealment column has to be resolved before this is a
 finished result — that is what the live knob is for: sweep 80/120/160/200 and find
 where the curve turns.
 
+**The sweep, which closes the open question.** `?pcmjitfarms=80` against the
+shipped 120, 2 paired rounds:
+
+| | 80 ms | 120 ms | delta |
+|---|---|---|---|
+| mouth-to-ear during fault | 153 ms | 161 ms | -9 ms (-23, +5) UNRESOLVED |
+| ring depth during fault | 67 ms | 73 ms | -6 ms (-21, +8) UNRESOLVED |
+| conceal during stall | — | — | **-30 ms** |
+
+`jitSpreadMaxRun` 77-90 ms at the tighter bound against 109-118 at 120, so the
+rule is biting harder and the ring barely notices. **120 is at the knee**: the
+first move (384 -> 120) bought 142 ms, the second (120 -> 80) buys 9 and cannot be
+resolved. Default stays at 120 — shipping an unresolved change to this subsystem
+is how it got its scar tissue.
+
+**And the feared concealment cost did not appear.** The stall-window delta is
+-30 ms, i.e. the tighter bound conceals slightly LESS, not more. The +236 ms
+whole-call figure above was the rig's noise, consistent with its measured
+1192 ms floor. So this is not the de-skew trade after all: the frames being
+declined were genuinely unplayable, and declining them costs no audio.
+
+**Where the remaining fault-case latency actually is.** 153 ms m2e with a 67 ms
+ring leaves ~86 ms that is not buffer — `outputMs` 20 + `frameMs` 8 + a network
+age genuinely inflated by the injected 5 s blackhole. Further shrinking the ring
+cannot reach it. Under this fault the honest floor is set by the fault.
+
 **What stands:** the estimator is no longer lane-blind, the rule is measured to
 fire correctly and only when intended, and nothing regressed (both runs' deltas
 straddle zero in at least one direction, so there is no evidence of harm either).
