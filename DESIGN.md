@@ -7156,3 +7156,52 @@ levers that actually exist:
 Lever 2 is the immediate experiment: it is one flag, and if `pcmpairs=12`
 moves rtt=300 materially then the ceiling is confirmed quantitatively and the
 direction is settled.
+
+### It ran, and the prediction failed
+
+| round | P12 | P6 | delta |
+|---|---|---|---|
+| r1 | 553.2 | 779.7 | -226.5 |
+| r2 | 540.5 | 641.0 | -100.5 |
+| r3 | 418.1 | 335.9 | **+82.2** |
+
+Median -100.5 ms, but 2/3 with one inversion and a run-to-run spread (278-666 ms)
+that dwarfs the effect. **UNRESOLVED** by this project's own rule, and two
+aggregates argue against the mechanism outright:
+
+|  | P12 | P6 |
+|---|---|---|
+| concealment total | **74.3 s** | 69.1 s |
+| clump | **25.0%** | 24.6% |
+
+Concealment is *worse* with twice the lanes, and clumping is unchanged. If the
+binding constraint were per-association cwnd, doubling the associations should
+have halved the queueing and reduced the clumping. It did neither.
+**The Mathis linear-scaling prediction is not confirmed, so 17.37's arithmetic
+is at best incomplete.** Six associations do not behave like six independent
+pipes — which is also what "they stall together" said in 17.36, and I should
+have weighted that evidence against the ceiling hypothesis before testing it.
+
+### The finding that actually matters: rtt=300 is bistable, not capped
+
+r3's P6 run:
+
+    m2e 351.3 / 320.4   tgt 19f / 16f   clump 12.1 / 15.6%
+    maxRun 62.9 / 58 ms   conc 552 / 728 ms
+
+A **healthy** call at rtt=300 — clump near the rtt=180 baseline of 6%, stalls
+of 58-63 ms rather than 1146, concealment in hundreds of milliseconds rather
+than tens of seconds. Against a 203 ms floor that is +120 to +148, in the same
+band as rtt=220.
+
+So there is no capacity wall at this distance. The path can carry the load; it
+sometimes does and sometimes does not, and once it tips it stays tipped for the
+call. That is a **bistable** system — consistent with cwnd collapse that never
+recovers, and inconsistent with a steady-state throughput ceiling.
+
+Which reframes the question from "how do we fit under the ceiling" to **"what
+tips it, and why does it never recover within a call"** — and the entry
+condition is the thing to catch, not the steady state. Every number in 17.35-37
+taken from a single run at rtt=300 is a draw from a bimodal distribution and
+should be re-read that way, including the ones I used to build the ceiling
+argument.
