@@ -4772,7 +4772,37 @@ late-bumps delayed growth the call genuinely needed. A rule derived from a
 pathological signature, shipped without a condition restricting it to that
 signature, made the ordinary case slower.
 
-**What both attempts have in common:** they are target-machinery tweaks, and the
+**3. Faster peak-hold release** (`?pcmjitrel=8`, 4x the shipped 2 ms/tick). The
+heavy tail produces occasional large excursions, the peak-hold latches on them,
+and release at 8 ms/s means one excursion keeps the buffer elevated for ~20 s of
+a 90 s call — which would explain the alternating asymmetry as "whichever
+direction drew an excursion". 16 calls at rtt=180 `--net=real`: median **165.2 ms
+against 166.9 ms**. 1.6 ms. Null.
+
+**THREE FAILURES, AND THE THIRD ONE ANSWERS THE QUESTION.** All three attempts
+were about the target/buffer control law — when it grows, when it is cleared, how
+fast it decays — and not one of them moved the median. The control law is not
+what is costing the time.
+
+**The arithmetic I should have done before any of them.** At rtt=180 one-way
+propagation is 90 ms and the measured fixed overhead is 56 ms, so 146 ms is the
+floor. The runs sit at target 4f — a 32 ms ring against the 16 ms of the 2f
+baseline — which is ~16 ms more, giving ~162 ms against a measured median of
+166 ms. **The median is very nearly all accounted for, and it is legitimate.**
+Heavy-tailed jitter genuinely requires a deeper buffer than a clean path, and 4f
+is the estimator correctly buying what the network costs.
+
+So the framing in 17.31 conflated two different things:
+
+- **The median (165.8 ms) is mostly the honest price of a real network.** It is
+  over the 150 ms goal, but it is not a defect to be fixed in the buffer — it is
+  propagation plus a correct buffer plus a 20 ms audio device. Getting under 150
+  at this distance means attacking the 56 ms fixed overhead, not the ring.
+- **The runaway to 16-22f (247, 270, 278 ms) is the actual defect**, and it is
+  rarer than 17.31 implied — a minority of runs, not the normal case. That
+  correction matters because it changes what a fix is worth.
+
+**What both failed attempts have in common:** they are target-machinery tweaks, and the
 ceiling experiment already showed the target machinery is the AMPLIFIER, not the
 cause. Two failures is enough to stop trying to fix an amplifier and go after
 what drives it.
