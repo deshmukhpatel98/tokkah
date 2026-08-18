@@ -3652,6 +3652,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           presence: wl.presence ?? null, // ?presence=1 room renderer, null when off
 
           outputLatencyMs: ctx?.outputLatency != null ? +(ctx.outputLatency * 1000).toFixed(1) : null,
+          // The graph's ACTUAL rate. Logged to `pcm-graph` since forever, which
+          // means it was only ever visible in the browser console -- so a host
+          // whose devices run 44.1 kHz against this 48 kHz graph was invisible
+          // to every offline run. That mismatch forces a resampling of every
+          // sample, which is the leading suspect for the wire carrying ~8
+          // bits/sample of incompressible residue (17.54). Anything other than
+          // 48000 here invalidates the bit-depth reasoning for that run.
+          sampleRate: ctx?.sampleRate ?? null,
           // One-way mouth-to-ear estimate, the number the latency campaign must
           // move (ITU-T G.114: 0–150 ms transparent). Composed, not measured
           // end-to-end: 8 ms frame assembly + age p50 (capture→arrival, needs

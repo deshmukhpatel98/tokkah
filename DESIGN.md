@@ -8330,3 +8330,54 @@ at 48 kHz and is the first thing to run in the morning.
   -20000 ppm, clock offsets of thousands of ms. Nothing here should be treated
   as a measurement of anything except the rate-control line, which is a direct
   read of two configured quantities and survives the chaos.
+
+## 17.57 The 44.1 kHz theory is dead — the graph runs at 48 kHz, so the noise is upstream
+
+Added `sampleRate` to the snapshot (it had only ever been logged to `pcm-graph`,
+i.e. visible in a browser console and in no offline run ever taken) and read it
+live:
+
+    mode sab  rate 48000  outLatency 305 ms
+    wire 682 B/frame  871 kbps total  wastedShift 0  fit16 0/0%
+
+**`rate 48000`.** Chrome builds the graph at 48 kHz even though every device on
+this Mac reports 44.1, and resamples only at the OUTPUT boundary. The capture
+path and the fixture are both 48 kHz, so §17.54's leading suspect -- a
+capture-side rate conversion caused by the host device -- is refuted. Good: it
+was the comfortable answer, and it was wrong.
+
+That sharpens the question rather than closing it, because the conversion
+arithmetic is exact and should leave the low bits ZERO:
+
+    int16 k  ->  float32 k/32768   exact (|k| <= 32768, 24-bit mantissa)
+             ->  x 8388608         exact
+             ->  round()           = k x 256, low byte 0  ->  wastedShift 8
+
+It reads `wastedShift 0`. So something between the file and our encoder is
+perturbing every nonzero sample by less than a 16-bit LSB — a gain, a dither, or
+Chrome's own internal resample inside the fake-capture pipeline. All three would
+be properties of `--use-file-for-fake-audio-capture`, **which points at the rig
+rather than the product.**
+
+This cannot be settled with a file fixture, by construction: every path
+available to this rig goes through the same fake-capture pipeline that is now
+the suspect. It needs a **real microphone** — one call, reading `wastedShift`,
+`fit16` and `wire B/frame`. If a real mic reads `wastedShift 8`, the 682 kbps in
+this file is an artifact and the real lane is ~half that, which would also
+dissolve much of §17.56's problem. If it reads 0, the ~380 kbps is real and
+worth chasing.
+
+Recorded because the two outcomes point opposite ways and I have now been wrong
+about the cause twice: first the bit-depth theory (refuted by `wastedShift 0`
+and `fit16 0%`), then the 44.1 kHz device (refuted by `rate 48000`). The
+measurement is not in doubt — a pure sine costs 537 kbps, which is absurd — only
+its cause is.
+
+### A verification method that lied
+
+`curl -s ... | grep -c 'sampleRate: ctx?.sampleRate'` returned **0** on a deploy
+that was byte-identical to local. The `?.` was read as a regex, not a literal.
+`grep -cF` returns 1 and `cmp` says IDENTICAL. Sixth instrument fault of the
+day, and the first pointing the other way: it would have had me re-deploying a
+deploy that had already worked. Byte-compare with `cmp`, and use `-F` when the
+needle contains code.

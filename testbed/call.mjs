@@ -876,7 +876,7 @@ if (ra.pcmAudio || rb.pcmAudio) {
     log(
       `      depth ${p.depthMs} ms  target ${p.targetFrames}f  drift ${p.driftPpm} ppm` +
         `  age p50 ${p.ageP50} ms  p95 ${p.ageP95} ms  (rtt ${p.rttMs}, baseRtt ${p.baseRttMs}, offset ${p.clockOffsetMs})` +
-        `  mode ${p.mode}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
+        `  mode ${p.mode}  rate ${p.sampleRate ?? '?'}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
     );
     // The BANDWIDTH axis of the goal, which this rig has never printed. Every
     // number here was already in the snapshot; 17.47 asked for wire bytes
