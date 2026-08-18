@@ -7271,3 +7271,72 @@ Two things to measure before building it, in this order:
    inspected. If the tip is a single identifiable event rather than gradual
    drift, detecting it is cheaper than tolerating it — and a fast switch at the
    tip would cost far less audio than the collapse does.
+
+## 17.39 The source-rate loop is confirmed, and 150 ms is impossible at the antipodes
+
+### The blocked experiment, unblocked
+
+17.38 named the blocking gap: with `?pcmaudio=0` there was no mouth-to-ear at
+all, because that figure is composed inside pcm.js from its own counters. The
+driver now composes the same three terms from `getStats` — one-way, jitter
+buffer, output latency — so the two paths are directly comparable.
+
+The instrument was wrong on its first run and said so in a way that looked like
+a finding: it reported "no inbound audio stats" three times, which reads as "the
+Opus path carries no audio". It was placed **after** `browser.close()`. The
+pages were gone. Second blind-instrument bug of the session, same shape as the
+stdout grep for reconnects, and worth the repetition: *an instrument that cannot
+observe the event reports the same value as a negative result.*
+
+### Opus at rtt=300, six runs
+
+| m2e | one-way | jitter buffer | out |
+|---|---|---|---|
+| 215.0 | 151.0 | 44.0 | 20 |
+| 227.2 | 151.5 | 55.7 | 20 |
+| 207.6 | 152.0 | 35.6 | 20 |
+| 213.9 | 146.5 | 47.4 | 20 |
+| 204.3 | 151.5 | 32.8 | 20 |
+| 208.5 | 150.5 | 38.0 | 20 |
+
+**Six runs, zero collapses, 204-227 ms.** Jitter buffer 33-56 ms where the
+lossless lane needed 300+. Against PCM's bistable 320-990 ms at the same
+distance and the same profile.
+
+**The source-rate loop of 17.38 is confirmed.** Drop the offered rate to ~2% and
+step 3 — cwnd falling below the offered rate — becomes unreachable, the loop
+never closes, and the bistability disappears entirely. Not reduced: absent, in
+six consecutive runs of a configuration that collapsed in most runs before.
+
+### The thing that should have been said much earlier
+
+**One-way propagation at rtt=300 is 151 ms.** Mouth-to-ear under 150 ms is
+arithmetically impossible there before a single line of this code executes.
+
+Antipodal fiber runs roughly 1.5x great-circle, so ~30,000 km at ~200,000 km/s
+is ~150 ms one way. **"Under 150 ms anywhere on earth" cannot be met between
+antipodes by any implementation.** The goal's own wording resolves this — *every
+millisecond that is not the speed of light is a defect* — so the real target is
+propagation plus minimal overhead, and 150 ms is the figure for the routes where
+propagation leaves room for it.
+
+Measured overhead, which is the number the goal actually governs:
+
+| path | m2e | one-way | overhead |
+|---|---|---|---|
+| rtt=180, lossless PCM | 143.7 | 90 | **53.7** |
+| rtt=300, Opus | 204.3 | 151 | **53.3** |
+
+Consistent at ~53 ms, and it decomposes as ~20 output latency (at this
+platform's floor, ~4 ms of which is the headless testbed) + ~33 jitter buffer +
+frame. That is the surface left to attack, and it is the same surface at both
+distances.
+
+### What follows
+
+Losslessness has to become conditional on the path sustaining it. The current
+design asserts it unconditionally and the result is that the longest paths get
+neither losslessness nor usable latency — 550 ms with 26 s of concealment is
+damaged audio arriving late. A path that can carry 1.5 Mbps keeps PCM; one that
+cannot falls back and stays under ~210 ms. Both are now measurable on the same
+scale, which is what this section unblocked.

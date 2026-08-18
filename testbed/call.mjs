@@ -647,6 +647,36 @@ writeFileSync(join(OUTDIR, 'B.json'), JSON.stringify(rb, null, 1));
 if (serverLog.trim()) writeFileSync(join(OUTDIR, 'server.ndjson'), serverLog);
 writeFileSync(join(OUTDIR, 'truth.json'), JSON.stringify(truth, null, 1));
 
+// Opus-path mouth-to-ear, composed the same way pcm.js composes its own so the
+// two are comparable: one-way + jitter buffer + output latency. Only meaningful
+// with ?pcmaudio=0; with the lossless lane on there is no Opus audio to measure.
+for (const [who, r] of [['A', ra], ['B', rb]]) {
+  if (r.pcmAudio) continue; // lossless lane on; pcm.js already reported m2e
+  const m = await (who === 'A' ? A : B).page.evaluate(async () => {
+    const pc = window.__mediaPc;
+    if (!pc?.getStats) return null;
+    const s = await pc.getStats();
+    let jbDelay = 0, jbCount = 0, rtt = null, kind = null;
+    s.forEach((v) => {
+      if (v.type === 'inbound-rtp' && v.kind === 'audio') {
+        jbDelay = v.jitterBufferDelay ?? 0; jbCount = v.jitterBufferEmittedCount ?? 0; kind = 'audio';
+      }
+      if (v.type === 'candidate-pair' && v.nominated && v.currentRoundTripTime != null) rtt = v.currentRoundTripTime * 1000;
+    });
+    if (!kind || !jbCount) return null;
+    const ctx = window.__pcmCtx ?? null;
+    const outL = ctx?.outputLatency != null ? ctx.outputLatency * 1000 : 20; // 20 ms is this platform's floor
+    const jb = (jbDelay / jbCount) * 1000;
+    return { jbMs: +jb.toFixed(1), rttMs: rtt == null ? null : +rtt.toFixed(1), outMs: +outL.toFixed(1),
+             m2eMs: rtt == null ? null : +((rtt / 2) + jb + outL).toFixed(1) };
+  }).catch(() => null);
+  if (m) {
+    log(`  ${who}: OPUS mouthToEar ${m.m2eMs ?? '?'} ms  = oneWay ${m.rttMs == null ? '?' : (m.rttMs / 2).toFixed(1)}` +
+        ` + jitterBuffer ${m.jbMs} + out ${m.outMs}`);
+  } else {
+    log(`  ${who}: OPUS mouthToEar unavailable (no inbound audio stats)`);
+  }
+}
 await Promise.all([A.browser.close(), B.browser.close()]);
 if (sim) {
   log(

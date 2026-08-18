@@ -6568,6 +6568,14 @@ async function join(room) {
 
   // `mediaPeer` is read at fire time, not at wire-up time: candidates trickle
   // after the welcome that names the pair this pc belongs to.
+  // MEASUREMENT HANDLE. With `?pcmaudio=0` the lossless lane is off and the
+  // mouth-to-ear figure disappears entirely, because that metric is composed
+  // inside pcm.js from ITS OWN counters. So the one experiment that decides
+  // whether an Opus fallback is worth building -- does rtt=300 recover when the
+  // offered rate drops to ~2% -- could not be run at all. Exposing the pc lets
+  // the driver compose the same quantity from getStats: one-way + jitter buffer
+  // + output latency, the same three terms in the same order.
+  window.__mediaPc = pc;
   pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate, ...addr(mediaPeer) });
   pc.oniceconnectionstatechange = () => {
     tel.log('ice-state', { state: pc.iceConnectionState });
