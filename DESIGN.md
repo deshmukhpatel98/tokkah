@@ -4895,6 +4895,35 @@ rounds to resolve it — that is what decides whether 138 ms is a real result or
 trade dressed as one. Under this fault neither arm is lossless anyway (both conceal
 400-500 ms), so the question is relative damage, not absolute.
 
+**THE BILL, PAID. 9 rounds, all valid — and it settles the default at 120.**
+
+| | bound 40 | bound 120 | median | per round |
+|---|---|---|---|---|
+| mouth-to-ear during fault | **132 ms** | 164 ms | -34 ms | all 9 negative |
+| ring depth during fault | 46 ms | 77 ms | -31 ms | all 9 negative |
+| **conceal during stall** | 548 ms | 468 ms | **+112 ms** | **all 9 POSITIVE** |
+| conceal whole call | 3424 ms | 2496 ms | +632 ms | straddles, UNRESOLVED |
+
+The concealment column, unresolved at 5 rounds, is **resolved at 9**: positive in
+every round. So the marginal trade can finally be priced, and it has inverted:
+
+| step | latency bought | audio paid | ratio |
+|---|---|---|---|
+| 384 -> 120 | **-136 ms** | +68 ms | **0.5 ms damage per ms saved** |
+| 120 -> 40 | -34 ms | +112 ms | **3.3 ms damage per ms saved** |
+
+**120 is the knee, and it is now a measured knee rather than a guessed one.** The
+first step was six times more efficient than the second. Below 120 the estimator
+stops declining frames that were unplayable and starts declining frames that would
+have arrived — which is precisely the de-skew trade recorded at the `ringWrite`
+call site, rediscovered from the other direction.
+
+**So 132 ms under fault is reachable and is NOT taken.** The goal asks for under
+150 ms *and* lossless audio; buying 34 ms of the first with 112 ms of the second
+fails the goal as a whole while appearing to satisfy half of it. The honest record
+is that the latency target is achievable at this fault severity and that the price
+at 3.3:1 is too high — not that 150 ms is out of reach.
+
 **The sweep, which closes the open question.** `?pcmjitfarms=80` against the
 shipped 120, 2 paired rounds:
 
