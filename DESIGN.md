@@ -7477,3 +7477,54 @@ The instrument needed is a depth-versus-target trace over the call, not a
 snapshot: the snapshot says depth is high at the end, not whether it started
 high and never drained or drifted up late. `--trace` already exists for the
 level detector and the same 20 Hz cadence would answer this.
+
+## 17.42 The drain knee: rejected, and it corrects 17.41
+
+17.41 read depth-above-target as waste bleeding off too slowly, because below
+the graded drain's 25 ms knee the rate is `maxDrift` = 0.2% = 2 ms/s, so 18.7 ms
+of excess needs 9.4 s on an estimator that lives ~16 s. The knee was made
+configurable and tested at 4.
+
+12 usable rounds at rtt=180 `--net=real`, discard rules enforced before
+inspection (empty arm, or either arm past 100 ms emulator loop lag):
+
+    deltas: -10.6 +7.0 -12.6 +2.5 +12.6 +33.2 -19.3 -44.8 -7.2 +30.3 +8.7 -7.4
+    median -2.35 ms, favoured 6/12
+
+| | knee 4 | knee 25 |
+|---|---|---|
+| median | 155.8 | 157.7 |
+| max | 222.4 | **200.6** |
+| under 150 ms | **2/24** | **5/24** |
+| concealment | 3704 ms | **2872 ms** |
+
+6/12 is a coin flip, and the faster drain is **worse** where it counts:
+under-150 more than halved and concealment rose 29%. **Rejected; default stays
+at 25.**
+
+### What it corrects
+
+Two results now sit side by side and only one reading fits both:
+
+- Lowering the **target** (§17.40, margin frame 1 -> 0) *improved* under-150,
+  3/24 -> 7/24, with concealment *down* 16%.
+- Draining **depth** toward that target faster *worsened* under-150, 5/24 ->
+  2/24, with concealment *up* 29%.
+
+If depth above target were simply surplus, both should have helped. So depth
+running above target is **not dead weight** — pulling it down harder causes
+underruns, the underruns conceal, and concealment rebuilds the buffer larger
+than it started. A control loop overshooting, not a queue draining.
+
+17.41's framing — "the remaining defect is depth wandering above target" — is
+therefore wrong, or at least backwards: the depth is partly *load-bearing*, and
+the 6.4 ms of headroom cannot be taken by forcing the existing loop harder. It
+has to come from needing less depth, which means less arrival dispersion, not
+faster drainage.
+
+Which points back at the one term nothing has touched: `age p50` is ~91.6 ms
+against an 85 ms one-way, so ~6.6 ms arrives before the buffer is even
+consulted. That, and the ~4 ms the headless testbed adds to `outputLatency`
+(20 reported, 16 in a real browser), are the two places the remaining 6.4 ms
+could plausibly come from — and the second one means the true figure in a real
+browser is already ~4 ms better than every number recorded in this file.
