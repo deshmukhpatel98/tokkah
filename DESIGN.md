@@ -4927,9 +4927,23 @@ evidence about the network. 12 calls at rtt=260 with the arms alternated:
 | reset ON | 470, 468, 474, 413, 318, 461 | 16-33f |
 | reset OFF | 466, 475, 388, 463 | 24-34f |
 
-Indistinguishable. The reset fires — `reAnchors` 1-4 — and the target is back at
-32f anyway, because the late-storm that pinned it is still running when the
-rescue completes and simply pins it again. An earlier single sample at 338.9 ms
+Complete set: **median 461.8 ms with the reset (n=8) against 463.5 ms without
+(n=10)** — a difference of 1.7 ms. Indistinguishable. The reset fires —
+`reAnchors` 1-4 — and the target is back at 32f anyway, because the late-storm
+that pinned it is still running when the rescue completes and simply pins it
+again. One run of the twelve (ON r5) produced no output at all and is counted as
+dropped, not as clean.
+
+**And the fault is TIME-CORRELATED, which no earlier run could show.** The arms
+alternate within each round, so the two calls of a round are minutes apart at
+most. Round 2 was clean in BOTH arms (178.5/180.8 and 178.8/179.3); every other
+round was broken in both. If the fault were independent per call at the observed
+~70% rate, rounds would mix far more than that. So it is not a coin flip per
+call — something that varies over minutes has to be true as well as the long
+RTT, and rtt=0 never breaking says the RTT is still necessary. That pairs a
+host-or-network state with the distance, and it means any future A/B here MUST
+alternate arms within a round: a block of six ON followed by six OFF would have
+compared different weather and called it a result. An earlier single sample at 338.9 ms
 looked like a win and was noise; this is the third time in this session that one
 sample has told a story that repeats demolished.
 
