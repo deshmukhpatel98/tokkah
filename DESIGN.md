@@ -8381,3 +8381,47 @@ that was byte-identical to local. The `?.` was read as a regex, not a literal.
 day, and the first pointing the other way: it would have had me re-deploying a
 deploy that had already worked. Byte-compare with `cmp`, and use `-F` when the
 needle contains code.
+
+## 17.58 §17.40 never shipped — a duplicate key in one object literal ate it
+
+`PCM_CFG` in app.js declared `jitterMarginFrames` **twice**, 97 lines apart, in
+the same object literal:
+
+    2251:  jitterMarginFrames: QS.has('pcmjitmargin') ? Number(...) : undefined,
+    2348:  jitterMarginFrames: QS.get('pcmjitmargin') != null ? Number(...) : 1,
+
+JavaScript takes the last one. So the default was **1**, and pcm.js's
+`cfg.jitterMarginFrames ?? 0` — the actual §17.40 change — could never fire on a
+default call. §17.40's measured win (paired median -6.82 ms against a predicted
+-8.0, concealment down 16%, under-150 3/24 -> 7/24) was obtained through
+`?pcmjitmargin=0`, which sets both keys to zero and hides the conflict perfectly.
+**The flag path worked and the default path never did, which is the exact shape
+that lets a validated fix sit unshipped indefinitely.**
+
+Found from arithmetic, not from reading: a live run showed `jit spreadMax
+18.8 ms` and `wantMax 4f`, and `ceil(18.8 / 8) = 3`. The extra frame had nowhere
+to come from but `D_MARGIN_FRAMES`, and `targetFrames` is 2, so the floor was not
+it either. That one-frame discrepancy is 8 ms at the operating point.
+
+Confirmed after deleting the duplicate: **`target 3f`** in both directions at
+rtt=180, down from 4f.
+
+The two comments attached to these keys disagree with each other — the later one
+argues the margin is not reclaimable and "default stays 1", which was true when
+written and was superseded by §17.34 removing the startup contamination the
+margin had been sized against. Neither comment is wrong about its own moment;
+the file simply had no way to say which moment was current, because both keys
+were live and only one of them actually was.
+
+A duplicate key in an object literal is not a style issue. It is a silent
+override, resolved by source order rather than intent, and nothing in this
+toolchain warns about it. Worth a grep across the other config objects.
+
+### Caveat on tonight's confirmation
+
+`outLatency` is 305 ms (§17.54 — the host is on Bluetooth), so the absolute
+mouth-to-ear of 449/454.6 ms in that run is meaningless and is not quoted as a
+result. `target 3f` is a direct read of the estimator and is independent of the
+output device, which is why it is the thing being claimed here. The latency
+value of this change rests on §17.40's measurement, taken when the rig was
+sound; it has not been re-measured tonight and does not need to be.

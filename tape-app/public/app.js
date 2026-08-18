@@ -2343,9 +2343,24 @@ const PCM_CFG = {
   // Removing the margin does not make the ring shallower — one round was 4 ms
   // WORSE — so the clean-call ring is not sitting on the margin at all; it is
   // on the targetFrames floor beneath it. The 8 ms is not reclaimable here and
-  // the frame costs nothing to keep. Default stays 1, which is what the
-  // original "not tunable on purpose" note wanted; it now has the evidence.
-  jitterMarginFrames: QS.get('pcmjitmargin') != null ? Number(QS.get('pcmjitmargin')) : 1,
+  // the frame costs nothing to keep.
+  //
+  // SUPERSEDED by §17.40, and the key that used to live here is DELETED rather
+  // than edited, because it was a DUPLICATE of `jitterMarginFrames` above in
+  // this same object literal — so it silently won on key order and forced the
+  // margin to 1 no matter what the other key said. §17.34 removed the startup
+  // contamination this margin had been sized against, §17.40 re-measured with a
+  // clean estimator and got -6.82 ms (predicted -8.0) with concealment down 16%,
+  // and pcm.js was changed to default `?? 0`. That change has NEVER been in
+  // effect on a default call: 17.40's win was measured through the explicit
+  // `?pcmjitmargin=0` flag, which sets both keys to 0 and hides the conflict.
+  //
+  // Confirmed live before deleting rather than argued from the comments, which
+  // disagree with each other: at rtt=180, `jit spreadMax 18.8 ms` gives
+  // ceil(18.8/8) = 3 frames, and the run reported `wantMax 4f`. The +1 was real
+  // and shipping. A duplicate key in an object literal is not a style problem;
+  // it is a silent override that makes the file unreadable about its own
+  // behaviour, and no linter here caught it.
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',
