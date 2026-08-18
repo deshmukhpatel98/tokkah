@@ -4961,6 +4961,38 @@ seconds. So the fix has to survive the storm, not precede it: rate-limit
 while `farFuture` is also climbing (which is the signature that says the playhead
 is behind the stream, a situation more buffer cannot help). Untested.
 
+### 17.30a FEC is not the cause, and the split proves itself (2026-08-18)
+
+Broken runs repair 54-89 FEC frames where clean runs repair none, and 49 of 54 of
+those repairs arrive after the playhead. So FEC spends ~30% more bytes during the
+fault for no benefit, which at a high bandwidth-delay product is a plausible way
+to tip SCTP over. Tested with `?pcmfec=0`, 8 calls, arms alternated within each
+round (mandatory here — the fault is time-correlated):
+
+| arm | clean | broken m2e, median |
+|---|---|---|
+| FEC off | 2 / 8 | 424.7 ms |
+| control | **0 / 8** | 461.9 ms |
+
+**FEC is not the cause.** Six of eight still broke without it. The weak positive —
+two clean runs against none, and 37 ms off the median — is consistent with "fewer
+bytes helps a little", which supports a bandwidth/BDP story without naming a
+mechanism. Not worth acting on at that size.
+
+Two things worth more than the headline:
+
+**The control broke 8 times out of 8**, against ~70% across earlier sessions. The
+fault's rate moves between measurement windows, which is the time-correlation from
+17.30 showing up again and is the reason the arms must alternate within a round.
+
+**And one run split the two defects by accident, better than any flag did:**
+`concealed 4368 ms, target 2f, mouthToEar 206.8`. A full-sized concealment burst
+that did NOT pin the target, and the latency stayed at 207 ms instead of 460. That
+is the amplifier isolated in the wild — the burst costs the audio, the pin costs
+the quarter-second, and they are genuinely separable. It also sets the prize
+precisely: kill the pin and a broken call goes from ~460 ms to ~207 ms while still
+losing the same audio.
+
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
 Found by following § 17.28's **negative** result. Tripling the speed of dead-lane
