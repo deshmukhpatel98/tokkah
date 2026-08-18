@@ -833,6 +833,7 @@ if (ra.pcmAudio || rb.pcmAudio) {
     // the sender or the transport delivering in batches (pacing); low clump with
     // high p95 is the path stretching. This is the counter that separates them
     // and it already existed -- it was simply never printed.
+    log(`      mainthread lateMax ${p.tickLateMax ?? '?'} ms @${p.tickLateAtMs ?? '?'}  >100ms ${p.tickLate100 ?? '?'}/${p.tickN ?? '?'} ticks  >500ms ${p.tickLate500 ?? '?'}`);
     log(`      gaps p50 ${p.gapP50 ?? '?'} p95 ${p.gapP95 ?? '?'} p99 ${p.gapP99 ?? '?'} maxRun ${p.gapMaxRun ?? '?'} ms` +
         `  clump ${p.gapClumpPct ?? '?'}%  stalls ${(p.stalls ?? []).length}` +
         `  biggest ${(p.stalls ?? []).slice().sort((a, b) => b.g - a.g).slice(0, 3).map((x) => `${x.g}@${x.t}`).join(' ') || '-'}`);

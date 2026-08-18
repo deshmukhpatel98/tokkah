@@ -7004,3 +7004,41 @@ Worth stating as a rule, since this project has now been fooled by the pattern
 several times: **a symptom that is exactly half of another symptom is not a
 second finding.** Check the arithmetic against the known one before opening a
 new line of investigation.
+
+### The main thread is not it either
+
+Six independent transports do not synchronise their stalls by chance, so the
+cause is shared, and the most shared thing in a browser tab is the main thread.
+A ~1.2 s block there would batch every send and every receive at once — exactly
+the observed signature. Nothing in the file measured it, so the 250 ms decay
+tick now records how late it actually fires.
+
+| | rtt=180 | rtt=300 |
+|---|---|---|
+| tick lateness max | 6.9 / 6.7 ms | 6.0 / 7.1 ms |
+| ticks >100 ms | 0 / 53 | 0 / 76 |
+| ticks >500 ms | 0 | 0 |
+
+**Flat. The main thread is clean at both distances.** Hypothesis dead; the
+batching is below the application, in the transport or the wire scheduling.
+
+### rtt=300 is bimodal, which changes how it must be measured
+
+The same runs that killed the main-thread theory came back far milder than the
+earlier ones:
+
+    earlier   m2e 892.3 / 488.5   offset -290.7 / +280.84   rtt 871/873   stalls 128 (cap)
+    later     m2e 321.9 / 385.7   offset    3.4 / -0.7      rtt 302/300   stalls 37 / 9
+
+Same settings, same profile. In the mild mode the clock offset and lane RTT are
+both **normal**, which retroactively confirms 17.36's correction — the offset
+error tracks the stall and vanishes with it, rather than being an independent
+fault that would have persisted.
+
+But clump stays elevated even in the mild mode: **19-20% against 6% at rtt=180.**
+So the batching is always present at this distance and the catastrophic runs are
+its tail, not a different failure. That is the same shape as 17.32's finding
+about the median being a good case plus a tail — and it means **any single run
+at rtt=300 is uninformative.** Everything measured here from now on needs
+repeats, and the earlier single-run numbers (including the 941 ms in the sweep)
+should be read as draws from a wide distribution, not as the value.

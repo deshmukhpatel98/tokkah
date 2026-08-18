@@ -475,6 +475,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
       jitPurgedAtMs: null, jitPurgedSpread: null, holdArmedAtMs: null, holdArmDroppedF: null,
+      tickLateMax: 0, tickLateAtMs: null, tickLate100: 0, tickLate500: 0, tickN: 0,
       // Max spread per 4 s band since first arrival. jitSpreadMaxLate only covers
       // t>10 s, so the 4-10 s window -- the one right after the purge, where a
       // residual target was observed being learned -- had no instrument at all.
@@ -2980,7 +2981,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     }
 
     let lastDrop = 0;
+    // MAIN-THREAD LATENESS. This tick is asked for every 250 ms; how late it
+    // actually fires is how long the main thread was blocked, and nothing else
+    // in this file measures that. Needed because at rtt>=260 all six striped
+    // associations stall together (691-1186 ms) -- six independent transports
+    // do not synchronise by chance, so the cause is shared, and the main thread
+    // is the most shared thing there is. If it blocks, every send AND every
+    // receive batches at once, which is exactly the observed signature.
+    let tickLast = 0;
     const decayTimer = setInterval(() => {
+      {
+        const tnow = now();
+        if (tickLast) {
+          const late = tnow - tickLast - 250;
+          if (late > stats.tickLateMax) { stats.tickLateMax = +late.toFixed(1); stats.tickLateAtMs = dT0 ? Math.round(tnow - dT0) : null; }
+          if (late > 100) stats.tickLate100++;
+          if (late > 500) stats.tickLate500++;
+          stats.tickN++;
+        }
+        tickLast = tnow;
+      }
       if (closed) return;
       if (!JITTER_MEASURED) {
         // Legacy arm (`?pcmjit=0`). §12's shrink bound is ≤2 ms/s and this is
@@ -3524,7 +3544,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           jitPurgedAtMs: stats.jitPurgedAtMs, jitPurgedSpread: stats.jitPurgedSpread,
           jitBands: stats.jitBands.slice(),
           holdArmedAtMs: stats.holdArmedAtMs, holdArm: HOLD_ARM, holdArmMs: HOLD_ARM_MS,
-          holdArmDroppedF: stats.holdArmDroppedF, dMinRun: Number.isFinite(dMinRun) ? +dMinRun.toFixed(1) : null,
+          holdArmDroppedF: stats.holdArmDroppedF,
+          tickLateMax: stats.tickLateMax, tickLateAtMs: stats.tickLateAtMs,
+          tickLate100: stats.tickLate100, tickLate500: stats.tickLate500, tickN: stats.tickN, dMinRun: Number.isFinite(dMinRun) ? +dMinRun.toFixed(1) : null,
           jitPurge: JIT_PURGE, jitPurgeMs: JIT_PURGE_MS, jitPurgeDueMs: Math.round(purgeAtMs()),
           // Latency governor (task #47). govOn distinguishes "off" from "on but
           // never trimmed"; govTrimTicks is the authority check demanded by
