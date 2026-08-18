@@ -35,15 +35,27 @@ try {
   // execution context mid-evaluate.
   await page.goto('https://room.tokkah.com/?r=camprobe', { waitUntil: 'load', timeout: 60000 });
   await page.waitForTimeout(3000);
-  const r = await page.evaluate(async () => {
-    const out = { ok: false, err: null, label: null, w: 0, h: 0, mean: 0, variance: 0, change: 0 };
-    // What the OS admits exists, before asking for it. Labels are blank without
-    // permission, but the COUNT is not, so this separates "this Mac has no
-    // camera" from "it has one and will not hand it over" — two findings that
-    // call for completely different next moves.
-    out.videoInputs = (await navigator.mediaDevices.enumerateDevices().catch(() => []))
-      .filter((d) => d.kind === 'videoinput').length;
+  // THE TIMEOUT HAS TO LIVE OUT HERE. The first version had none and hung for
+  // fifteen minutes; the second raced a setTimeout INSIDE the page, which also
+  // hung — because whatever macOS does to a getUserMedia it will not answer
+  // blocks the renderer, and a blocked renderer never fires its own timer. Node
+  // is the only side that cannot be stalled by the thing being measured.
+  const withTimeout = (pr, ms, what) => Promise.race([
+    pr,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`HUNG: ${what} did not return in ${ms / 1000} s`)), ms)),
+  ]);
+  // ASKED SEPARATELY, and first, because the interesting failure kills whatever
+  // evaluate it is inside. enumerateDevices needs no permission and returns
+  // immediately; getUserMedia is the call that hangs. Bundled together, the
+  // count was lost every time the probe timed out — i.e. in exactly the case
+  // where "is there a camera at all" is the question worth answering.
+  const videoInputs = await withTimeout(page.evaluate(async () =>
+    (await navigator.mediaDevices.enumerateDevices().catch(() => []))
+      .filter((d) => d.kind === 'videoinput').length), 10000, 'enumerateDevices')
+    .catch(() => null);
 
+  const r = await withTimeout(page.evaluate(async () => {
+    const out = { ok: false, err: null, label: null, w: 0, h: 0, mean: 0, variance: 0, change: 0 };
     let stream;
     try {
       // A RACE, because the failure this probe exists to report does not
@@ -95,7 +107,11 @@ try {
     // proof of a real sensor is spatial detail AND frame-to-frame life.
     out.ok = out.variance > 25 && out.change > 0.2;
     return out;
-  });
+  }), 45000, 'the in-page camera probe').catch((e) => ({
+    ok: false, err: e.message, hung: /HUNG/.test(e.message),
+    label: null, w: 0, h: 0, mean: 0, variance: 0, change: 0,
+  }));
+  r.videoInputs = videoInputs;
   console.log(JSON.stringify(r, null, 2));
   console.log(r.ok
     ? `\nREAL SENSOR: "${r.label}" ${r.w}x${r.h}, detail ${r.variance.toFixed(0)}, motion ${r.change.toFixed(2)}/px`
