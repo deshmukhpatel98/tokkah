@@ -512,6 +512,15 @@ async function handleLab(m) {
         // sensor — the saving is gone and nothing else in this payload says so.
         pfHoldThresh: v.pfHoldThresh ?? null,
         rcResShrink: v.rcResShrink ?? null,
+        // The CONTROLLER's quantizer, next to `qp` above which is the configured
+        // one. They are different numbers and only this one moves: with rate
+        // control on (the default) the encoder asks rcQpNow() and ignores
+        // cfg.qp entirely. A real-sensor run with the controller LIVE has to
+        // read this, because under rate control the filter's saving does not
+        // appear as bits at all — the controller holds the bitrate and takes
+        // the saving as quantizer instead (DESIGN.md 17.26). Reading `qp` there
+        // returns a constant and the arm reads as a no-op.
+        rcQp: v.rcQp ?? null, rcBudgetMbps: v.rcBudgetMbps ?? null,
         capLagMs: v.capLagMs ?? null, encLatMs: v.encLatMs ?? null,
         fullAgeMs: v.fullAgeMs ?? null, presentLagMs: v.presentLagMs ?? null,
         glassToGlassMs: v.glassToGlassMs ?? null,

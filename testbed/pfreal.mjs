@@ -87,9 +87,16 @@ console.log(`${SETTLE}s settle + ${MEASURE}s measured per arm\n`);
 
 const first = await snap();
 if (!first.length) {
-  console.log('No one is in the room. Open this on the device whose camera you want measured:');
-  console.log(`  ${BASE}/?r=${ROOM}&pfilter=1&rcres=0&qp=24&l2rcqpmin=24&l2rcqpmax=24`);
-  console.log('\nThen run this again. Two devices give two sensors; one is enough.');
+  console.log('No one is in the room. Open ONE of these on the device whose camera you want');
+  console.log('measured, then run this again. Two devices give two sensors; one is enough.\n');
+  console.log('  the quantizer pinned — asks "how many bits does this sensor cost":');
+  console.log(`    ${BASE}/?r=${ROOM}&pfilter=1&rcres=0&qp=24&l2rcqpmin=24&l2rcqpmax=24\n`);
+  // The second URL exists because of DESIGN.md 17.26: with the controller live
+  // the saving stops being visible as bits and becomes quantizer instead. The
+  // pinned URL is the cleaner measurement of the filter; this one is the
+  // measurement of the PRODUCT, and they answer different questions.
+  console.log('  the controller live — asks "what does a real call on this sensor look like":');
+  console.log(`    ${BASE}/?r=${ROOM}&pfilter=1`);
   process.exit(3);
 }
 if (first[0].encBytesTotal == null) {
@@ -117,7 +124,7 @@ for (let r = 0; r < ROUNDS; r++) {
         mbps: (s1[i].encBytesTotal - s0[i].encBytesTotal) * 8 / dt / 1e6,
         fps: (s1[i].encFramesTotal - s0[i].encFramesTotal) / dt,
         still: s1[i].pfStillMean, shrink: s1[i].rcResShrink,
-        holdThresh: s1[i].pfHoldThresh,
+        holdThresh: s1[i].pfHoldThresh, rcQp: s1[i].rcQp,
         g2g: s1[i].glassToGlassMs, fallbacks: s1[i].pfFallbacks,
       });
     }
@@ -144,6 +151,12 @@ let fails = 0;
 const check = (name, ok, detail) => { if (!ok) fails++; console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`); };
 const mOff = med(samples.get('off').map((x) => x.mbps));
 const mOn = med(samples.get('on').map((x) => x.mbps));
+// Under a LIVE controller the bitrate is held and the quantizer moves, so the
+// "bits went down" check below is the wrong instrument and would read as a
+// no-op. Report both and say which one this run was.
+const qOff = med(samples.get('off').map((x) => x.rcQp));
+const qOn = med(samples.get('on').map((x) => x.rcQp));
+const pinned = qOff != null && qOn != null && Math.abs(qOff - qOn) < 0.2 && Math.abs(qOff - 24) < 0.2;
 
 console.log('\n══════ real sensor ══════');
 check('the filter ran clean', med(samples.get('on').map((x) => x.fallbacks)) === 0,
@@ -158,6 +171,11 @@ check('the lock found this sensor', (med(samples.get('on').map((x) => x.still)) 
   // filter — is what is limiting the saving. That is a fixable number, and
   // knowing which side of it we are on is the point of running on a sensor.
   + (thr != null && thr >= 0.02 ? ' — SATURATED at the cap: this sensor out-noises the lock' : ''));
+if (qOff != null) {
+  console.log(`  quantizer ${qOff.toFixed(1)} -> ${qOn?.toFixed(1)}`
+    + (pinned ? '  (pinned — the bitrate below is the measurement)'
+      : '  (LIVE controller — the quantizer is the measurement, not the bitrate)'));
+}
 check('bits went down', cuts.length > 0 && med(cuts) > 10,
   `${mOff?.toFixed(2)} -> ${mOn?.toFixed(2)} Mbps, ${med(cuts)?.toFixed(1)}% ` +
   `(per-round ${Math.min(...cuts).toFixed(0)}..${Math.max(...cuts).toFixed(0)}%)`);

@@ -4769,6 +4769,19 @@ fresh ICE, a fresh point in the 90 s fixture loop — per rung, and the quantity
 percent, which is smaller than the spread between two calls. The budget band is now a live lab knob
 (`rcMin`/`rcMax` on `handleLab`'s whitelist; `rcPollBudget` re-reads both bounds every second).
 
+**And on the sensor-like fixture, under the live controller, the same ladder reads:**
+
+| budget 20 Mbps, both arms at QP 24 | video | + audio | = call |
+|---|---:|---:|---:|
+| filter off | 7.97 Mbps | 0.56 | **8.53 Mbps** |
+| filter on | **0.93 Mbps** | 0.56 | **1.49 Mbps** |
+| | **−88%** | | −83% |
+
+The filtered arm holds QP 24 all the way down to the 3 Mbps rung and 24.2 at 1.4, where the control is
+at 29.9. And below that the sign of the grain column **flips**: at 0.7 and 0.35 Mbps the filtered
+picture carries *more* high-frequency energy than the control, because the control is being blurred by
+its own quantizer and the filtered one is not.
+
 **At the top rung neither arm is squeezed, both sit at the quantizer floor — identical quality by
 construction — and the bits are therefore directly comparable:**
 
@@ -4828,11 +4841,30 @@ The GPU pass costs a visible fraction of a frame at the top of the ladder, where
   **same arm** at the **same rung** in two different cycles moves this statistic by 0.2–4.1% at ordinary
   rungs and 20.3% at the bottom. The bar is now that measured spread, not a number I chose.
 
-**What finally adjudicates it is persistence.** Structure — lettering, a seam, the edge of a chair —
-sits in the same pixels frame after frame; grain does not. Average the luma across the measurement
-window and grain averages toward its mean while structure survives, so the strong-edge statistic of the
-**time-averaged** picture is structure with the grain taken out. Falling raw edge count beside a held
-persistent-edge count is "the noise went and the detail stayed"; both falling is a blurred picture.
+**The bar is now calibrated against a real blur.** `--soften=1` turns on the one lever that provably
+destroys detail the camera saw, and run deliberately it costs the strong-edge fraction **−69.0% and
+−70.1%**. The shipping configuration costs 5–9%. An order of magnitude apart, so a 25% line is one
+neither can reach by accident — and the rig can honestly certify "nothing was grossly softened" while
+declining to adjudicate the 5–9%. Three calibration points, all behaving:
+
+| arm | strong edges | total energy | verdict |
+|---|---:|---:|---|
+| shipping, clean fixture | −4.8% | −6.1% | PASS, ratio silent — nothing substantial was removed |
+| shipping, grain fixture | −5.2% | −27.2% | PASS, **3.2× — the signature of noise removal** |
+| `--soften=1` | **−69%** | −32.7% | **FAIL, 0.4× — the signature of blur** |
+
+That last column is the discriminator: blur drags edges down *faster* than total energy, removing noise
+does the opposite. It is gated on total energy having moved at least 15%, because ungated it called
+BLUR on the clean fixture's shipping arm at a ratio of 0.7 — two small numbers whose quotient means
+nothing, beside stills showing crisp nameplate lettering next to a `soften=1` arm that has visibly lost
+it.
+
+**Persistence was tried as the adjudicator and does not work.** Structure — lettering, a seam, the edge of a chair —
+sits in the same pixels frame after frame; grain does not. The idea was sound — structure sits in the same
+pixels frame after frame and grain does not, so averaging the window should leave structure alone.
+Built and measured: on moving footage its own cycle-to-cycle spread is **40–105%**, because what it
+actually measures is how much the subject happened to move in that window. Removed. A statistic
+noisier than its effect is worse than none, because it will either be ignored or believed.
 
 ### What this does not license
 

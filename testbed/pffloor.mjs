@@ -59,7 +59,13 @@ mkdirSync(OUT, { recursive: true });
 // The filter's shipping parameters: soften OFF (it is the only lever that
 // removes detail the camera saw, and it was worth 4 points against two that do
 // not), denoise and hold at the values pfhold.mjs measured.
-const PF = { denoise: 0.85, soften: 0, motionGain: 14, hold: 1 };
+// `--soften=1` is the CALIBRATION arm, not a shipping configuration. The edge
+// check below needs a bar, and a bar nobody has measured is a guess. Soften is
+// the one lever that provably removes detail the camera saw — DESIGN.md 17.25
+// records that at 1.0 the face texture and the nameplate lettering both visibly
+// go — so running it deliberately is how to learn what real softening costs the
+// statistic, and therefore where to put the line.
+const PF = { denoise: 0.85, soften: Number(arg('soften', 0)), motionGain: 14, hold: 1 };
 const ARMS = [{ name: 'off', on: false }, { name: 'on', on: true }];
 
 // `--media=grain` swaps in the sensor-like fixture (testbed/media/real/grain.sh:
@@ -259,7 +265,8 @@ try {
     await p.waitForFunction(() => window.__tape?.pc?.connectionState === 'connected', null, { timeout: 60000 });
   }
   console.log(`budget ladder inside ONE call — qp band ${QPMIN}-${QPMAX}, actuator LIVE`
-    + (SUFFIX ? '  [SENSOR-LIKE FIXTURE: grain + hunting auto-exposure]' : ''));
+    + (SUFFIX ? '  [SENSOR-LIKE FIXTURE: grain + hunting auto-exposure]' : '')
+    + (PF.soften ? `  [CALIBRATION: soften=${PF.soften}, deliberately damaging the picture]` : ''));
   console.log(`rungs ${RUNGS.join(' / ')} Mbps, ${DWELL}s each, ${CYCLES} cycles, room ${room}\n`);
   await a.waitForTimeout(20000); // let the controller find its level at the top rung
 
@@ -434,6 +441,7 @@ const nullSpread = (g) => {
 console.log('\n  per rung (median of both sides, all cycles, same divisor across every sample):');
 console.log('    rung   Mbps off->on    qp off->on   /div  fps     grain hf      strong edges');
 let qpWins = 0, qpLoses = 0, edgeLoses = 0, edgeSeen = 0;
+const edgeRatios = [];
 const pct = (o, n) => (o && n != null ? `${n > o ? '+' : ''}${(100 * (n / o - 1)).toFixed(1)}%` : '  —  ');
 for (const g of shared) {
   const qo = at('off', g, 'qp'), qn = at('on', g, 'qp');
@@ -443,16 +451,39 @@ for (const g of shared) {
   const ho = at('off', g, 'hf'), hn = at('on', g, 'hf');
   const eo = at('off', g, 'edgeFrac'), en = at('on', g, 'edgeFrac');
   if (qn != null && qo != null) { if (qn < qo - 0.3) qpWins++; else if (qn > qo + 0.3) qpLoses++; }
-  // The bar is the arm's OWN cycle-to-cycle spread, not a number I chose. A
-  // fixed 5% deadband was tried and it is meaningless here: measured on the
-  // same rung, same arm, two cycles, the strong-edge fraction moves 0.2-4.1%
-  // at ordinary rungs and 20% at the bottom. Anything inside that is the
-  // fixture, and a deadband that ignores it is either blind or crying wolf
-  // depending on the rung. `null` when there is only one cycle to compare.
+  // THE BAR IS CALIBRATED AGAINST A REAL BLUR, not guessed and not set to the
+  // noise floor. `--soften=1` turns on the one lever that provably destroys
+  // detail the camera saw, and run deliberately it costs this statistic
+  // -69.0% and -70.1% at two rungs. The shipping configuration costs 5-9%.
+  // An order of magnitude apart, so 25% is a line neither can be near by
+  // accident: it certifies "nothing was grossly softened", which is what this
+  // rig can honestly issue, and it would catch soften being left on.
+  //
+  // It deliberately does NOT try to adjudicate the 5-9%. Three attempts failed
+  // and the reason is structural: everything the filter removes — sensor grain,
+  // coding noise, held-block residual — is broadband and lives in the same
+  // statistic as fine detail. See the header.
   const nul = nullSpread(g);
-  if (eo != null && en != null && nul != null) {
+  if (eo != null && en != null) {
     edgeSeen++;
-    if (en < eo * (1 - Math.max(nul, 0.01))) edgeLoses++;
+    if (en < eo * 0.75) edgeLoses++;
+    // The one thing the pair of numbers CAN say, calibrated on both sides:
+    // blur drags edges down FASTER than it drags total energy (soften=1 reads
+    // -32.7% hf against -69% edges, a ratio of 0.5), while removing noise does
+    // the opposite (grain fixture: -27.2% hf against -5.2% edges, ratio 5.2).
+    //
+    // GATED ON THERE BEING SOMETHING TO DIVIDE. Ungated, this called BLUR on
+    // the clean fixture's shipping arm at a ratio of 0.7 — where hf had moved
+    // 6% and edges 5%, two small numbers whose quotient means nothing, and
+    // where the stills beside it show crisp nameplate lettering next to a
+    // soften=1 arm that has visibly lost it. 15% of total energy is the bar:
+    // above it something substantial was removed and the ratio can speak to
+    // what; below it the honest answer is silence. All three calibration
+    // points sit cleanly on one side or the other.
+    if (ho && hn && eo && en && en < eo && (1 - hn / ho) >= 0.15) {
+      const rat = (1 - hn / ho) / (1 - en / eo);
+      if (Number.isFinite(rat)) edgeRatios.push({ g, rat });
+    }
   }
   console.log(`    ${String(g).padStart(4)}   ${mo?.toFixed(2)}->${mn?.toFixed(2)}    `
     + `${qo?.toFixed(1)}->${qn?.toFixed(1)}   /${so}   ${fo?.toFixed(0)}/${fn?.toFixed(0)}   `
@@ -467,9 +498,19 @@ check('the filter never costs quality at a shared rung', qpLoses === 0,
   `${qpWins} rungs better, ${qpLoses} worse (0.3 QP deadband)`);
 // The check that stops "fewer bits" from being bought with a softer picture.
 // The strong EDGES have to survive; the grain is allowed — expected — to go.
-check('the edges survive in the decoded picture', edgeSeen === 0 ? null : edgeLoses === 0,
-  edgeSeen === 0 ? 'no decoded frames were grabbed or only one cycle ran'
-    : `strong-edge fraction held on ${edgeSeen - edgeLoses}/${edgeSeen} rungs, each against its own cycle-to-cycle spread`);
+check('nothing was grossly softened', edgeSeen === 0 ? null : edgeLoses === 0,
+  edgeSeen === 0 ? 'no decoded frames were grabbed'
+    : `strong-edge fraction inside 25% on ${edgeSeen - edgeLoses}/${edgeSeen} rungs `
+      + '(a real blur, measured with --soften=1, costs 69%)');
+if (edgeRatios.length) {
+  const r = med(edgeRatios.map((x) => x.rat));
+  console.log(`  ....  on ${edgeRatios.length} rung(s) something substantial was removed: total energy fell `
+    + `${r?.toFixed(1)}x as fast as the edges — `
+    + `${r > 2 ? 'the signature of NOISE REMOVAL' : r < 0.8 ? 'the signature of BLUR — look at the stills' : 'ambiguous'}`
+    + ' (blur calibrates at 0.5, grain removal at 5.2)');
+} else {
+  console.log('  ....  no rung removed enough total energy (15%) for the noise-vs-blur ratio to mean anything');
+}
 check('frame rate held everywhere', shared.every((g) => Math.abs((at('on', g, 'fps') ?? 0) - (at('off', g, 'fps') ?? 0)) < 2),
   shared.map((g) => `${at('off', g, 'fps')?.toFixed(0)}/${at('on', g, 'fps')?.toFixed(0)}`).join(' '));
 check('the filter never declined a frame', (med(rows.filter((r) => r.arm === 'on').map((r) => r.fallbacks)) ?? 1) === 0,
