@@ -824,7 +824,7 @@ if (ra.pcmAudio || rb.pcmAudio) {
         `  elMaxRun ${p.elMaxRun ?? "?"}f  painEvents ${p.painEvents ?? '?'}` +
         `  window[p90 ${p.jitP90Ms ?? '?'} p99 ${p.jitP99Ms ?? '?'} max ${p.jitMaxMs ?? '?'}]` +
         `  purge ${p.jitPurge === false ? 'OFF' : `@${p.jitPurgedAtMs ?? 'never'}`}` +
-        `  holdArm ${p.holdArm === false ? 'OFF' : `@${p.holdArmedAtMs ?? 'NEVER'}`}` +
+        `  holdArm ${p.holdArm === false ? 'OFF' : `@${p.holdArmedAtMs ?? 'NEVER'} from ${p.holdArmDroppedF ?? '?'}f`}` +
         `  bands ${(p.jitBands ?? []).join('/')}`,
     );
     // Lane 0 (§3.1 lever 4) wire counters: T_PRED pairs sent/received (+ the

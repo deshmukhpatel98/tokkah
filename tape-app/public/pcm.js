@@ -454,7 +454,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
-      jitPurgedAtMs: null, jitPurgedSpread: null, holdArmedAtMs: null,
+      jitPurgedAtMs: null, jitPurgedSpread: null, holdArmedAtMs: null, holdArmDroppedF: null,
       // Max spread per 4 s band since first arrival. jitSpreadMaxLate only covers
       // t>10 s, so the 4-10 s window -- the one right after the purge, where a
       // residual target was observed being learned -- had no instrument at all.
@@ -3149,6 +3149,31 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         holdArmed = true;
         spreadHold = 0; // start holding from clean, not from whatever startup left
         stats.holdArmedAtMs = dT0 ? Math.round(now() - dT0) : null;
+        // AND THE TARGET, which is the half that actually costs latency. Clearing
+        // the hold alone leaves `target` sitting wherever the contaminated band
+        // put it, and the decay law is deliberately asymmetric -- UP immediately,
+        // DOWN one frame per second. A 29f target learned from a 221.8 ms band-0
+        // spread therefore needs 25 s to unwind on its own.
+        //
+        // MEASURED: bands 221.8 / 18.2 / 21.1 / 17.9 / 0 / 0 -- bands 4 and 5
+        // empty, so that run's estimator only lived ~16 s. Armed at 6957 ms, it
+        // had ~9 s left, decayed 9 frames, and ended at 21f against a hold whose
+        // max was 21.1 ms (= 4f). The buffer was serving an event from second two
+        // for the entire call and would have needed a three-minute call to
+        // recover on its own. That is why clearing spreadHold alone measured as
+        // only a partial win.
+        //
+        // Dropping straight to the floor is safe precisely because the arming
+        // condition is "the floor stopped moving": post-arm spread is a real
+        // measurement (17.9-21.1 ms here, = 4f) and the target re-derives from it
+        // within one window. Draining the surplus is the worklet's job and it is
+        // bounded by maxDrain, so this is not an audible step.
+        // Record what it dropped FROM, before the reset. Recording it after was
+        // useless in exactly the way that matters: every run reported "from 2f"
+        // whether the reset had saved 27 frames or done nothing at all, so the
+        // fix could not be told apart from a call that was never broken.
+        stats.holdArmDroppedF = target;
+        setTarget(cfg.targetFrames);
       }
       if (JIT_HOLD && (!HOLD_ARM || holdArmed)) {
         spreadHold = Math.max(spread, spreadHold - JIT_RELEASE);
@@ -3478,7 +3503,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           painEvents: stats.painEvents,
           jitPurgedAtMs: stats.jitPurgedAtMs, jitPurgedSpread: stats.jitPurgedSpread,
           jitBands: stats.jitBands.slice(),
-          holdArmedAtMs: stats.holdArmedAtMs, holdArm: HOLD_ARM, holdArmMs: HOLD_ARM_MS, dMinRun: Number.isFinite(dMinRun) ? +dMinRun.toFixed(1) : null,
+          holdArmedAtMs: stats.holdArmedAtMs, holdArm: HOLD_ARM, holdArmMs: HOLD_ARM_MS,
+          holdArmDroppedF: stats.holdArmDroppedF, dMinRun: Number.isFinite(dMinRun) ? +dMinRun.toFixed(1) : null,
           jitPurge: JIT_PURGE, jitPurgeMs: JIT_PURGE_MS, jitPurgeDueMs: Math.round(purgeAtMs()),
           // Latency governor (task #47). govOn distinguishes "off" from "on but
           // never trimmed"; govTrimTicks is the authority check demanded by
