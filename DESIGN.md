@@ -6706,3 +6706,55 @@ from. What made 17.33 and this section possible, in order:
    27 frames or done nothing. An attribution counter that cannot distinguish
    "fixed a fault" from "there was no fault" is worse than none, because it reads
    as confirmation.
+
+### Measured
+
+14 calls at `rtt=180 --net=real`, arms alternated, purge ON in **both** arms so
+this isolates arming's marginal contribution over the config already at -49 ms.
+
+| round | ARM | CTL | delta |
+|---|---|---|---|
+| r1 | 161.1 | 162.4 | -1.3 |
+| r2 | 150.4 | 267.2 | -116.8 |
+| r3 | 144.1 | 252.9 | -108.9 |
+| r4 | 152.8 | 162.8 | -10.1 |
+| r5 | 162.6 | 146.2 | **+16.3** |
+| r6 | 153.2 | 228.2 | -75.1 |
+| r7 | 151.8 | 173.6 | -21.8 |
+
+Median **-21.8 ms**, 6/7 favour ARM.
+
+| | ARM | CTL |
+|---|---|---|
+| m2e median | **152.7** | 169.0 |
+| m2e mean | **153.7** | 199.1 |
+| m2e **max** | **169.9** | **337.4** |
+| target median / max | 4f / **7f** | 5f / **33f** |
+| concealment total | **1080 ms** | 2096 ms |
+| under 170 ms | **14/14** | 8/14 |
+
+**The round delta is the wrong statistic and the data shows why.** The fault's
+magnitude varies per call and the arms draw independently, so r5 inverted purely
+because CTL drew band0 34.8/17.9 against ARM's 82.2/95.7. Since band0 is now
+measured per side, stratify on it instead:
+
+| | clean start (band0<80) | bad start (band0>=80) |
+|---|---|---|
+| CTL | 4.5f, 157.2 ms | **14.1f, 230.5 ms** |
+| ARM | 4.3f, 150.6 ms | **4.7f, 165.0 ms** |
+
+A bad startup costs CTL **9.6 extra frames** of buffer. It costs ARM **0.4**.
+That is the actual claim — contamination no longer propagates to the buffer —
+and unlike the round delta it does not depend on which arm drew the harder call.
+
+**Not a trade.** Concealment halved, 2096 -> 1080 ms. Cutting a buffer normally
+buys latency with dropouts; this removed a buffer that was never needed, so both
+improved together. That is the signature of fixing a defect rather than moving a
+tuning knob, and it is the check that would have caught this as a regression.
+
+17.32 argued the median was "a good case plus a variance tail, not a floor".
+Max mouth-to-ear **337.4 -> 169.9 ms** is that tail being removed. Best sides now
+measure **143.7 / 144.4 ms** against the arithmetic floor for this distance:
+90 propagation + 25 ring + 20 audio + 8 frame = 143.
+
+Remaining at this distance: median 152.7 ms against a 150 ms goal, 5/14 under.
