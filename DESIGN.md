@@ -4745,6 +4745,68 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.28 A blackhole took 8 s to notice, and the rig could not tell (2026-08-18)
+
+Two findings, and the second is the one that matters more.
+
+**The deadline was an accident.** The rule that declares a lane dead read
+`PING_MS * 2.5`. `PING_MS` is 2000, so the deadline was 5 s — while the comment
+directly above it said *"a lane whose pong has not come back for 2 s is not slow,
+it is gone."* The comment was true when written. The constant was denominated in
+ping periods, so raising the cadence moved the deadline from 2 s to 5 s and
+nothing pointed at the rule to say so. Evaluated on a 1 s recompute against pongs
+only 0.5/s fresh, worst case was **8.0 s** from route death to demotion.
+
+Now `3 * PING_MS + 3 * baseRtt` with `PING_MS` at 400: **1.35 s** local, **1.65 s**
+on a Delhi–Amsterdam leg, worst case **2.8 s**. RTT-relative because a flat
+allowance is a hidden distance limit, which is a bug class this project has now
+found three times (§ see `rtt-blind-timeouts`).
+
+The third change is the load-bearing one. The silence test is relative to **the
+freshest pong on any lane**, not to the clock. An absolute deadline cannot
+distinguish a dead route from *our own renderer stalling*: a 1.5 s main-thread
+freeze stops the answers on all six lanes simultaneously and condemns every one
+of them. Observed on the first A/B — 3 dead events on side A before the fault was
+injected, on healthy lanes. Relative, a local freeze moves every lane's
+`lastPongT` together, the difference stays near zero, and nothing is condemned.
+This is the same shape as `hopeless`, which is already relative to `minFastRtt`,
+and as the global-outage guard: **a detector of remote failure must not fire on
+local failure.**
+
+**The rig could not grade any of it.** A null A/B — both arms byte-identical
+flags — returned a **452 ms** gap in stall concealment and **1192 ms** whole-call,
+from no difference at all. The effects measured for the change were 192 and
+224 ms. On single pairs that change had been credited with a 20% improvement and,
+one run later, suspected of a pre-stall regression; both were the instrument. The
+tell was in the data: two arms differing only in `muteAfterMs` reported different
+counts of `hopeless`, a cause that does not read that flag.
+
+Worse, the rig was structurally incapable of the comparison. Its control arm was
+`''` — no striping at all — so it was a stripe-on/stripe-off test, and the control
+carried `"stripe": null`: no lane order, no demotions, no dead rule to compare
+against.
+
+So the rig now takes `--repeat=N` paired rounds **with the arm order alternated**
+(the first call of a pair eats the cold page, cold encoder and cold host; a fixed
+order hands that entirely to one arm), reports the median of per-round deltas with
+every round printed, prints **UNRESOLVED** when rounds straddle zero, names dropped
+rounds, and takes `--off=` so both arms can stripe. It also finally prints
+mouth-to-ear and ring depth — under this fault the ring inflates to ~220 ms and
+m2e to ~310, and a fault concealed perfectly but converted into a third of a
+second of delay has not been survived.
+
+**What is claimed:** the mechanism. `muteAfterMs` 1478 vs 5000, deaths detected
+sooner, both directly observed, plus `lab-verify` 6/6 with m2e unmoved. **What is
+not claimed:** that calls conceal less. That sits under the instrument, and saying
+so is the finding.
+
+**Instruments added**, because none of the above was visible: `deadEvents` counts
+RISING EDGES (the pre-existing `dead` is `laneDead` summed at snapshot time and
+`laneDead` is rebuilt every tick, so a blackhole caught at t+2 s reads 0 by t+25 s
+— a birth certificate read as a health record); `deadCause {mute, peer, hopeless}`
+attributes each death; `deadFirstMs` and `muteAfterMs` make a snapshot
+self-identifying as to which arm produced it.
+
 ## 17.27 Skew-aware striping — the control plane rode the lane it was reporting on (2026-08-18)
 
 Skew-aware striping is worth **35 ms of mouth-to-ear** under realistic route divergence (§ the Stage 2
