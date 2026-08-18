@@ -7580,3 +7580,43 @@ browser, and the best sides move from 143.7 to ~139.7. Still not a median under
 What is still unproven is the whole-call figure on a real browser with a real
 sensor, which remains [[no-camera-route-from-this-mac]]'s blocker. This
 measurement narrows what that test has to show, it does not substitute for it.
+
+## 17.43 The metric is honest — the last 1.8 ms cannot be recovered by re-reading it
+
+Before attributing the remaining gap to the control loop, the obvious cheaper
+explanation had to be ruled out: that `mouthToEarMs` double-counts, and the
+call is already under 150. It does not.
+
+    m2e = 8 + age + depthMs + outputLatency
+
+| term | where | measures |
+|---|---|---|
+| `8` | constant | frame assembly at the sender (FRAME_MS) |
+| `age` | pcm.js:2553, `now() - wall - clockOffsetMs`, at ARRIVAL | capture -> arrival |
+| `depthMs` | worklet:679, `(hiSeq*FRAME - pos)/(sampleRate/1000)` | arrival -> playout |
+| `outputLatency` | AudioContext | playout -> speaker |
+
+Four non-overlapping spans covering capture to speaker exactly once. `age` is
+recorded in the receive handler, not at playout, so it does not include buffer
+time — which is the double-count that would have made the figure overstated.
+And `depthMs` is true occupancy measured from the newest fully-received frame,
+not an estimate that could include a partial one.
+
+**So the ~1.8 ms of median above the goal at rtt=180 is real latency.** It is
+control-loop overshoot: depth runs ~1.5 frames above a target that is itself
+correct for the measured 17-21 ms arrival spread, and §17.42 measured that
+forcing it down costs more than it returns (under-150 2/24 against 5/24,
+concealment +29%).
+
+This is a negative result worth recording. Every remaining route to "actually we
+are under 150" — a mis-summed metric, a phantom overhead, a testbed penalty
+larger than measured — has now been checked and closed:
+
+- the ~4 ms testbed penalty is real but measured, and already applied (§17.41)
+- the 6.6 ms "hidden overhead" was a typical compared against a minimum (§17.41)
+- the metric does not double-count (this section)
+
+What remains is 1.8 ms of genuine buffer, on a control loop that measurably
+resists being tightened. The next honest step is a full call on a real browser
+with a real sensor — not because the arithmetic is in doubt, but because this
+testbed cannot produce the one number left.
