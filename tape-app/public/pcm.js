@@ -454,7 +454,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
-      jitPurgedAtMs: null, jitPurgedSpread: null,
+      jitPurgedAtMs: null, jitPurgedSpread: null, holdArmedAtMs: null,
+      // Max spread per 4 s band since first arrival. jitSpreadMaxLate only covers
+      // t>10 s, so the 4-10 s window -- the one right after the purge, where a
+      // residual target was observed being learned -- had no instrument at all.
+      // Bands answer "when does this estimator become trustworthy" by measurement
+      // instead of by the guess baked into the purge deadline.
+      jitBands: [0, 0, 0, 0, 0, 0],
       // Arrivals turned away as unplayable-at-any-depth, and which lane they
       // came from. Cumulative counters, not gauges — a fault that is over by
       // snapshot time still has to be visible in the snapshot.
@@ -2723,9 +2729,43 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     const JIT_OUTLIERS = Math.max(1, Math.min(16, cfg.jitterOutliers ?? 1));
     // Default ON (`?pcmjitpurge=0` is the control arm). 4000 ms sits after every
     // observed peak (2292-3016 ms) and well inside the 10 s observability warm.
+    //
+    // FLOOR, NOT A DEADLINE. What the purge waits for is the clock-offset
+    // estimator to converge, and that takes ping/pong exchanges -- so a flat
+    // constant here would be a hidden distance limit, which is a bug this
+    // project has now shipped three times (see `muteAfterMs` above, same fix).
+    // Fire too early on a long path and the purge re-learns from inputs that
+    // are still settling, which is the defect it exists to remove.
+    //
+    // 8 pings plus 4 RTTs of settling. At rtt=180 that is 3200+720 < 4000, so
+    // the floor governs and this is a no-op at the distance the A/B measured;
+    // it only extends further out, where convergence genuinely takes longer.
     const JIT_PURGE = cfg.jitterPurge !== false;
     const JIT_PURGE_MS = Math.max(500, cfg.jitterPurgeMs ?? 4000);
+    const purgeAtMs = () =>
+      Math.max(JIT_PURGE_MS, 8 * PING_MS + 4 * (stats.baseRttMs ?? 0));
     let jitPurged = false;
+    // ── HOLD ARMING (§17.34) ──────────────────────────────────────────────
+    // The purge above needs a deadline, and every fixed deadline is wrong for
+    // somebody: convergence is not a duration, it is an event that depends on
+    // when pongs land and whether loss ate one. Measured across 10 purge-ON
+    // sides, the runs that stayed clean had a whole-run spread max of ~19 ms
+    // while the runs that inflated hit 120-183 -- contamination arriving AFTER
+    // the 4000 ms purge, which no choice of constant would have caught.
+    //
+    // So arm on the signal instead of the clock. `spread = s[k] - s[0]` is
+    // inflated exactly while the window minimum has not yet found the true
+    // floor: early on, s[0] is still falling, so every difference measured from
+    // it is too big. Once the running minimum of D stops improving, the floor
+    // is found and the spread is a real measurement.
+    //
+    // Until then, do not HOLD anything -- track `spread` instantaneously, which
+    // self-cleans within one window (2.56 s) and cannot pin a bad peak. Hold
+    // begins the moment the floor is stable, starting from zero.
+    let dMinRun = Infinity, dMinAt = 0, holdArmed = false;
+    const HOLD_ARM = cfg.holdArm !== false;
+    const HOLD_ARM_MS = Math.max(500, cfg.holdArmMs ?? 2560); // one window
+    const HOLD_ARM_MAX_MS = Math.max(HOLD_ARM_MS, cfg.holdArmMaxMs ?? 20000);
     // Where the target saturates: ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES
     // reaches maxTargetFrames here, so held spread above this is invisible to
     // the output and costs only recovery time. Derived, not a constant, so it
@@ -2885,6 +2925,14 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         return;
       }
       farRejected = 0;
+      // HYSTERESIS, NOT `d < dMinRun`. D = (arrival - skewMs) - seq*FRAME_MS
+      // drifts monotonically with the clocks -- this run measured 1196-2000 ppm
+      // being corrected -- so a bare running minimum keeps improving by microns
+      // forever, dMinAt never stops moving, and the hold would NEVER arm. That
+      // fails silently in the worst direction: no peak-hold for the whole call,
+      // visible only as extra concealment nobody attributes to this.
+      if (d < dMinRun - 0.25) { dMinRun = d; dMinAt = tn; }
+      else if (d < dMinRun) dMinRun = d; // track the floor, don't re-arm on it
       dRing[dI] = d;
       dI = (dI + 1) % D_WIN;
       if (dN < D_WIN) dN++;
@@ -2981,7 +3029,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // costs one window (2.56 s) of re-learning, during which the target sits at
       // its floor -- acceptable because the pre-purge target is provably built on
       // garbage. A genuine burst at that instant is re-learned within the window.
-      if (JIT_PURGE && !jitPurged && dT0 && now() - dT0 >= JIT_PURGE_MS) {
+      // `stats.baseRttMs != null` also gates on having heard at least one pong:
+      // with no RTT sample there is nothing to size the wait from, and purging
+      // on a silent link would just discard the window for no reason.
+      if (JIT_PURGE && !jitPurged && dT0 && stats.baseRttMs != null
+          && now() - dT0 >= purgeAtMs()) {
         jitPurged = true;
         // Read the discarded value from the sorted window BEFORE zeroing dN, and
         // never from `spread` -- that binding is declared below this block, so
@@ -3089,7 +3141,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       const holdCeil = ELASTIC
         ? Math.max(FRAME_MS, (maxEff - D_MARGIN_FRAMES) * FRAME_MS)
         : HOLD_CEIL;
-      if (JIT_HOLD) {
+      // ...and a backstop regardless, so a pathological path that never settles
+      // still gets peak-hold rather than running without it indefinitely.
+      if (HOLD_ARM && !holdArmed && dMinAt
+          && (now() - dMinAt >= HOLD_ARM_MS
+              || (dT0 && now() - dT0 >= HOLD_ARM_MAX_MS))) {
+        holdArmed = true;
+        spreadHold = 0; // start holding from clean, not from whatever startup left
+        stats.holdArmedAtMs = dT0 ? Math.round(now() - dT0) : null;
+      }
+      if (JIT_HOLD && (!HOLD_ARM || holdArmed)) {
         spreadHold = Math.max(spread, spreadHold - JIT_RELEASE);
         if (HOLD_CAP && spreadHold > holdCeil) spreadHold = holdCeil;
         if (spreadHold > stats.jitHoldMaxRun) stats.jitHoldMaxRun = +spreadHold.toFixed(1);
@@ -3116,6 +3177,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         stats.jitSpreadMaxRun = +spread.toFixed(1);
         stats.jitSpreadMaxAtMs = Math.round(sinceT0);
       }
+      const band = Math.min(5, Math.floor(sinceT0 / 4000));
+      if (spread > stats.jitBands[band]) stats.jitBands[band] = +spread.toFixed(1);
       if (sinceT0 >= JIT_WARM && spread > stats.jitSpreadMaxLate) {
         stats.jitSpreadMaxLate = +spread.toFixed(1);
         stats.jitSpreadMaxLateAtMs = Math.round(sinceT0);
@@ -3414,7 +3477,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // estimator, not the pain path -- and vice versa.
           painEvents: stats.painEvents,
           jitPurgedAtMs: stats.jitPurgedAtMs, jitPurgedSpread: stats.jitPurgedSpread,
-          jitPurge: JIT_PURGE, jitPurgeMs: JIT_PURGE_MS,
+          jitBands: stats.jitBands.slice(),
+          holdArmedAtMs: stats.holdArmedAtMs, holdArm: HOLD_ARM, holdArmMs: HOLD_ARM_MS, dMinRun: Number.isFinite(dMinRun) ? +dMinRun.toFixed(1) : null,
+          jitPurge: JIT_PURGE, jitPurgeMs: JIT_PURGE_MS, jitPurgeDueMs: Math.round(purgeAtMs()),
           // Latency governor (task #47). govOn distinguishes "off" from "on but
           // never trimmed"; govTrimTicks is the authority check demanded by
           // [[the-contradiction-was-a-dead-knob]] — an A/B where this reads 0 in

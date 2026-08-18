@@ -2227,6 +2227,10 @@ const PCM_CFG = {
   // Convergence purge (§17.33). Default ON; ?pcmjitpurge=0 is the control arm.
   jitterPurge: QS.get('pcmjitpurge') === '0' ? false : undefined,
   jitterPurgeMs: Number(QS.get('pcmjitpurgems')) || undefined,
+  // Hold arming (§17.34). Default ON; ?pcmholdarm=0 is the control arm.
+  holdArm: QS.get('pcmholdarm') === '0' ? false : undefined,
+  holdArmMs: Number(QS.get('pcmholdarmms')) || undefined,
+  holdArmMaxMs: Number(QS.get('pcmholdarmmaxms')) || undefined,
   // Latency governor (task #47): trims buffer depth the measured per-frame
   // slack proves the call never needed. STAYS OPT-IN — the gates ran and were
   // NOT met (2026-08-05, all on real shipping browsers): under injected

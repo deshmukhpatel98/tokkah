@@ -823,7 +823,9 @@ if (ra.pcmAudio || rb.pcmAudio) {
         `  holdMax ${p.jitHoldMaxRun ?? '?'} ms  wantMax ${p.jitWantMaxRun ?? '?'}f  clampedTicks ${p.jitClampedTicks ?? '?'}` +
         `  elMaxRun ${p.elMaxRun ?? "?"}f  painEvents ${p.painEvents ?? '?'}` +
         `  window[p90 ${p.jitP90Ms ?? '?'} p99 ${p.jitP99Ms ?? '?'} max ${p.jitMaxMs ?? '?'}]` +
-        `  purge ${p.jitPurge === false ? 'OFF' : `@${p.jitPurgedAtMs ?? 'never'} ms dropped ${p.jitPurgedSpread ?? '?'} ms`}`,
+        `  purge ${p.jitPurge === false ? 'OFF' : `@${p.jitPurgedAtMs ?? 'never'}`}` +
+        `  holdArm ${p.holdArm === false ? 'OFF' : `@${p.holdArmedAtMs ?? 'NEVER'}`}` +
+        `  bands ${(p.jitBands ?? []).join('/')}`,
     );
     // Lane 0 (§3.1 lever 4) wire counters: T_PRED pairs sent/received (+ the
     // duplicate copies proving the duplication works) and T_PAD pre-warm
