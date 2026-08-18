@@ -72,10 +72,16 @@ const PAGE_URL =
 // intercontinental leg on decent fixed line; `mobile` is a 4G handset; `poor` is
 // the congested wifi most complaints come from.
 const NET_PROFILES = {
-  real:     { jitter: 8,  loss: 0.3, bw: 0,   note: 'intercontinental fixed line' },
-  mobile:   { jitter: 30, loss: 1.0, bw: 3,   note: '4G handset' },
-  poor:     { jitter: 20, loss: 0.5, bw: 5,   note: 'congested wifi' },
-  puredelay:{ jitter: 0,  loss: 0,   bw: 0,   note: 'ARTIFICIAL: constant delay, no network' },
+  // MODEL, not just magnitude. netsim's default jitter is UNIFORM — every delay
+  // equally likely inside a band — and real network jitter is nothing like that.
+  // It is heavy-tailed: mostly punctual with occasional large excursions, and the
+  // excursions are the entire reason a jitter buffer exists. A uniform band with
+  // the same mean is the second way this rig was flattering itself, after the
+  // constant-delay pipe. 'heavy' is netsim's exponential model, capped at 8x.
+  real:     { jitter: 8,  loss: 0.3, bw: 0, model: 'heavy', note: 'intercontinental fixed line' },
+  mobile:   { jitter: 30, loss: 1.0, bw: 3, model: 'heavy', note: '4G handset' },
+  poor:     { jitter: 20, loss: 0.5, bw: 5, model: 'heavy', note: 'congested wifi' },
+  puredelay:{ jitter: 0,  loss: 0,   bw: 0, model: 'uniform', note: 'ARTIFICIAL: constant delay, no network' },
 };
 const NET = args.net ? String(args.net) : null;
 if (NET && !NET_PROFILES[NET]) {
@@ -86,6 +92,7 @@ const PROF = NET ? NET_PROFILES[NET] : null;
 const SIM_RTT = Number(args.rtt ?? 0);
 const SIM_JITTER = Number(args.jitter ?? PROF?.jitter ?? 0);
 const SIM_LOSS = Number(args.loss ?? PROF?.loss ?? 0);
+const SIM_JMODEL = args.jittermodel ?? PROF?.model ?? 'uniform';
 if (SIM_RTT > 0 && !NET && args.jitter === undefined && args.loss === undefined) {
   console.error(
     `\n--rtt=${SIM_RTT} with no jitter and no loss is a CONSTANT-DELAY PIPE, not a network.\n`
@@ -114,7 +121,7 @@ const TAG =
   (args.ns ? 'ns-on' : args.relay ? 'relay'
     // The conditions travel WITH the run. A tag of "rtt260" says nothing about
     // whether that run saw a network or a delay line.
-    : SIMULATED ? `rtt${SIM_RTT}-${NET ?? 'custom'}-j${SIM_JITTER}-l${SIM_LOSS}${SIM_BW ? `-bw${SIM_BW}` : ''}`
+    : SIMULATED ? `rtt${SIM_RTT}-${NET ?? 'custom'}-j${SIM_JITTER}${SIM_JMODEL === 'heavy' ? 'h' : ''}-l${SIM_LOSS}${SIM_BW ? `-bw${SIM_BW}` : ''}`
     : 'baseline');
 const OUTDIR = join(HERE, 'runs', `${TAG}-${ROOM}`);
 const HEADED = !!args.headed;
@@ -349,6 +356,7 @@ const sim = !SIMULATED
       await startP2PSim({
         oneWayMs: SIM_RTT / 2,
         jitterMs: SIM_JITTER,
+        jitterModel: SIM_JMODEL,
         lossPct: SIM_LOSS,
         bwMbps: SIM_BW,
         queueMs: SIM_QUEUE,
@@ -356,6 +364,7 @@ const sim = !SIMULATED
     : await startNetsim({
         oneWayMs: SIM_RTT / 2,
         jitterMs: SIM_JITTER,
+        jitterModel: SIM_JMODEL,
         lossPct: SIM_LOSS,
         bwMbps: SIM_BW,
         queueMs: SIM_QUEUE,
@@ -599,6 +608,7 @@ const meta = {
     ? {
         rttMs: SIM_RTT,
         jitterMs: SIM_JITTER,
+        jitterModel: SIM_JMODEL,
         lossPct: SIM_LOSS,
         bwMbps: SIM_BW,
         queueMs: SIM_QUEUE,
