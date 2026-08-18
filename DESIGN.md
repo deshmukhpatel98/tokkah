@@ -4745,6 +4745,84 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.27 Skew-aware striping — the control plane rode the lane it was reporting on (2026-08-18)
+
+Skew-aware striping is worth **35 ms of mouth-to-ear** under realistic route divergence (§ the Stage 2
+table: m2e 104/115.6 vs 149.3/140.7 at 24 ms divergence) — the largest measured latency lever in the
+project, larger than everything in our own 44 ms budget put together. It has stayed behind
+`?pcmskewstripe=1` because of one scenario: three of six routes stalled by +5000 ms quadrupled
+concealment.
+
+### First, a correction to the obvious reading
+
+Both sides demote lanes roughly 30 s **before** the fault is injected, which looks like the bug and is
+not. This scenario's network carries 24 ms of built-in per-lane divergence, the two directions traverse
+different proxies, and each side demoted exactly the lanes its peer reported slow. Nothing is wrong at
+t=30. I recorded the opposite on first read; the trace is what corrected it.
+
+### A hypothesis, built and disproved
+
+The MIN_FAST floor ranked rescue candidates by their **current** reported lateness — and a demoted lane
+carries no audio, so the peer measures no frames on it and reports zero within seconds. A route stalled
+by five seconds therefore ties at `late 0` with lanes that are merely slow and gets drafted straight
+back: the lane's own condemnation erasing the evidence for it. `laneLateDemoted` already records the
+verdict and is already trusted to block the skew release path for exactly this reason, so the floor now
+uses it too.
+
+**Measured: no change.** 928 → 956 ms. Kept — the reasoning holds and it is inert unless
+`?pcmlatedemote=1` — but it is not the fix, and building it on two samples taken 25 s apart was the
+actual mistake. The rig now traces both sides once a second through the whole stall window.
+
+### What the trace found
+
+```
+t+1s   A n4[1235]     conceal 1936
+t+2s   A n4[1235]     conceal 2616      the peer has moved off the bad lanes
+t+3s   A n6[012345] STALE1              peerSkewAt stale >2 s -> FAIL-OPEN
+t+4s   A n4[1235]   DEAD2 STALE1        ...and back off them again
+```
+
+`sendSkewReport()` sent on **one** association — `assocs[0]`, or the first open one. The ping and the
+loss report both already loop over every open association, and `sendPing`'s own comment gives the
+reason: *the report that matters most is the one from the link that is losing packets, and that is
+precisely the link most likely to drop it.* The skew report is the one control message that never got
+that rule, and it is the one carrying the lane-health verdict.
+
+Lane 0 is one of the stalled routes here, so the instant the fault landed **the control plane went into
+the five-second hole with it.** The peer's evidence went stale, it fail-opened to all six lanes — correct
+behaviour on stale evidence, and also, here, posting audio straight back into routes just demoted for
+being unusable.
+
+**A lane-health signal that cannot be delivered by an unhealthy lane reports on every lane except the
+ones worth reporting on.**
+
+Fanned out to every open association (15 B at 4/s × 6 = 360 B/s against ~0.92 Mbps lanes; copies within
+a tick are identical, so duplicates are idempotent):
+
+| | before | after |
+|---|---:|---:|
+| fail-opens through the stall window | 23 | **0** |
+| ON conceal delta | 956 ms | **748** |
+| OFF conceal delta | 416 ms | 444 |
+| the scenario's own assertion | FAIL | **PASS** |
+
+### Why that is still not enough to flip the default
+
+The same trace says so. Concealment lands almost entirely in the **first two seconds** and is flat for
+the remaining twenty-three, in both arms — before any detector could have reacted. That residual is
+structural rather than a tuning problem: with three of six lanes carrying everything, a fault taking two
+of them removes **67% of capacity at once**, while the control arm spreads over six, loses 33%, and FEC
+repairs most of it. No detection speed recovers audio already in flight down a five-second hole.
+
+**The design answer that follows: stop demoting to ZERO.** A demoted lane keeping a small share stays
+measurable — the "acting on the signal erases the signal" trap, which has now bitten this one file three
+separate ways (skew after demotion, latePct after demotion, and the MIN_FAST ranking above) — and stays
+as capacity insurance against exactly this fault. Its arrivals would need to be excluded from the spread
+estimator, or the slow lane it is insuring against would inflate the jitter target it was demoted to
+protect. Scoped, not built.
+
+---
+
 ## 17.26 The filter under LIVE rate control — the same picture on a third of the link (2026-08-18, task #2)
 
 §17.25 priced the presence filter with the quantizer **pinned**: 61.5% fewer bits at QP 24. Pinning is
