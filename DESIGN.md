@@ -8203,3 +8203,64 @@ as well, not only at the long distances it was built for.
 
 Under-150 now holds at rtt<=180 and fails beyond it. The remaining gap is not a
 control-loop gain; it is depth, propagation, and the 3 Mbps structural failure.
+
+## 17.54 The lane carries ~8 bits/sample of non-signal — and the rig went bad mid-measurement
+
+Three calls at rtt=180, same build, differing only in the capture fixture:
+
+| fixture | wire | total w/ parity | fit16 |
+|---|---|---|---|
+| digital silence | **57 B/frame** | 70 kbps | **100 / 100 %** |
+| pure 440 Hz sine, 16-bit, amp 8000 | **537 B/frame** | 692 kbps | 0 / 0 % |
+| speech (normal fixture) | 682 B/frame | 821-871 kbps | 0 / 0 % |
+
+A pure sine costs **537 kbps — 11.2 bits/sample for the most predictable signal
+there is.** After any first- or second-order predictor a sine's residual is
+near zero, so essentially all of those 11.2 bits are incompressible residue, not
+tone. And `fit16` is 100% for silence and 0% the instant there is amplitude:
+the chain maps zero to zero exactly and perturbs every nonzero sample. That is
+the signature of a **sample-rate conversion**, where zeros interpolate exactly
+and nothing else does.
+
+So §17.15's premise is confirmed in magnitude: roughly 8 bits/sample of what we
+transmit losslessly is not signal. What is NOT yet established is whether that
+belongs to the product or to this rig -- see below, because the host turned out
+to be running its audio at 44.1 kHz against a 48 kHz graph, which is exactly the
+mechanism that would produce this.
+
+### The rig degraded mid-session, and the instrument caught it
+
+`outLatency` reads **20 ms in all 22 captures taken earlier today and 195 ms in
+all 6 wire runs and every run since.** It did not drift; it stepped. The third
+wire run used the ordinary speech fixture with no override and still read 195,
+so the probe files are not the cause.
+
+Cause found in the host, not the code: the default output device is now
+**"realme Buds Air7" -- Bluetooth earbuds -- at 44100 Hz**. Bluetooth output
+latency is characteristically 150-200 ms, and 195 is squarely in it. Earlier
+runs were on MacBook Air Speakers.
+
+Consequences, both of which matter more than the finding above:
+
+1. **Every m2e measured after that step is inflated by ~175 ms** and cannot be
+   compared with anything from earlier today. The 512.6 / 343.0 ms readings at
+   rtt=180 are the device, not a regression. All latency work is blocked until
+   the host output is back on the internal speakers at 48 kHz.
+2. **The 44.1 kHz device is a candidate cause of the bit-depth finding itself.**
+   A 48 kHz graph on a 44.1 kHz device forces a rate conversion, and a rate
+   conversion is precisely what turns exact 16-bit values into interpolated ones
+   with noise in the low bits. The 682 kbps figure predates the Bluetooth step
+   (it was measured at `outLatency 20 ms`), so the two are not the same event --
+   but they may share a cause if the device was already at 44.1 kHz then.
+
+That distinction is worth the wait rather than a guess. If it is the rig, real
+calls already cost ~300 kbps and this file has been overstating the audio lane
+by more than 2x. If it is the product, there is a ~380 kbps lossless win
+available. **These are opposite conclusions and the current data cannot choose
+between them.** Re-measure with the host output on the internal speakers at
+48 kHz before believing either.
+
+This is `measure-the-rig's-noise-first` and `green-metrics-can-hide-defects`
+arriving together: had `outputLatency` not been printed on every line, six runs
+of 320-512 ms mouth-to-ear would have read as a catastrophic regression in the
+build I had just shipped.
