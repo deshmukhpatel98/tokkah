@@ -7549,8 +7549,34 @@ rtt=180 is at or under the goal whenever depth holds near its 3f target — whic
 7/24 sides did (§17.40). The gap between 7/24 and 24/24 is depth variance, and
 §17.42 showed it cannot be closed by draining harder.
 
-That makes the next step a measurement, not a change: `outputLatency` on a real
-browser, which decides whether the ~4 ms is real and therefore whether the
-median is already under 150. It cannot be taken from this testbed — it needs the
-one thing this project has never had a route to, a real browser on a real
-sensor, which is [[no-camera-route-from-this-mac]]'s standing blocker.
+### Measured on a real browser
+
+The ~4 ms was speculation in every earlier section. It is not any more.
+`outputLatency` needs **no camera** — it is an `AudioContext` property, so the
+standing no-real-sensor-route blocker does not apply to it, which is why this
+sat unmeasured far longer than it should have.
+
+Taken in a real Chromium on `https://room.tokkah.com`:
+
+| `latencyHint` | `outputLatency` | `baseLatency` |
+|---|---|---|
+| **0** | **16.00 ms** | 2.92 ms |
+| 'interactive' | 24.00 ms | 5.81 ms |
+| 'playback' | 40.00 ms | 21.33 ms |
+
+`onset-monitor.js:56` uses `latencyHint: pcm ? 0 : 'interactive'`, so the lossless
+path takes the 16 ms row. **The headless testbed reports 20. The 4 ms is real
+and every absolute mouth-to-ear figure in this file is 4 ms pessimistic.**
+
+It also settles the `latencyHint` choice with numbers rather than assertion:
+'interactive' costs +8 ms and 'playback' +24 ms on this platform, so 0 is not
+merely preferred, it is worth 8 ms against the nearest alternative.
+
+Applying it to §17.40's 12-round result: median 155.8 -> **~151.8 ms** on a real
+browser, and the best sides move from 143.7 to ~139.7. Still not a median under
+150, so this does not close the goal — but the remaining gap at rtt=180 is
+**~1.8 ms of median**, not the ~6 ms the testbed reports.
+
+What is still unproven is the whole-call figure on a real browser with a real
+sensor, which remains [[no-camera-route-from-this-mac]]'s blocker. This
+measurement narrows what that test has to show, it does not substitute for it.
