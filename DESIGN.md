@@ -7706,3 +7706,49 @@ So the work is not "edit three constants". It is, in order:
 Step 1 is independently worth having: a format both ends must agree on, with no
 field saying which format it is, is a defect on its own terms regardless of
 whether the frame ever changes.
+
+### Steps 1 and 2 are shipped and verified
+
+- **Step 1** (`8a0836e`) — peers negotiate the shape. `pcm.js` exports
+  `FRAME_SHAPE`, `join` carries `pcmFrame`, the worker relays `peerPcmFrame` via
+  a `pcmFrameCaps` map parallel to `pcmCaps`, and `pcmAgree` checks shape
+  *before* capability. Verified live: lane up, m2e 164.1/166.2, nothing refused.
+- **Step 2** (`1ac6593`) — `pcm.js` and its own worklet reconcile by assertion.
+  They cannot reconcile by construction (the worklet's `FRAME` feeds
+  module-level `RING`/`CAP_FRAME_B`, evaluated before any instance exists, and
+  the worklet cannot import from pcm.js), so `pcm.js` sends `frameSamples` and
+  the constructor throws on disagreement. Verified live: `1152/3 = 384`
+  reconciles, nothing thrown.
+
+So a shape change now fails loudly at **both** boundaries it could break —
+between two peers, and between pcm.js and its own worklet.
+
+### Step 2b, which the original survey missed
+
+Changing the three declarations is **not sufficient**, and this is the part worth
+recording because it was not visible until the guards were built:
+
+    pcm.js          24 literal `384`, 3 literal `1152`
+    pcm-worklet.js   4 literal `384`
+    of which 16 are in executable lines in pcm.js, not comments
+
+Including `pcm.js:1268` — `new SharedArrayBuffer(816 + RING_F * 384 * 4)` — and
+its paired view at 1275, plus `zipIn`/`zipOut` sizing at 262-263 and the
+per-frame loops at 1333-1345. Editing `FRAME_BYTES` and `FRAME_MS` while those
+stay at 384 gives a ring whose geometry disagrees with its contents: **silent
+corruption, not a throw**, because the assertion added in step 2 compares
+pcm.js's declared value against the worklet's, and both would still be
+internally consistent while the literals are not.
+
+So the real order is:
+
+1. shape negotiation between peers — **done**
+2. assertion between pcm.js and its worklet — **done**
+3. **de-literalise**: replace all 28 literals with derivations from the single
+   declaration, verify as a pure no-op on a live call
+4. only then change the value
+
+Step 3 is mechanical and individually safe, but it touches SAB geometry where a
+mistake is inaudible rather than loud, so it wants a session with room to verify
+each site rather than the tail of one. The counts above are the survey it needs;
+they are the thing that would otherwise be discovered halfway through.
