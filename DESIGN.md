@@ -4799,12 +4799,19 @@ ones worth reporting on.**
 Fanned out to every open association (15 B at 4/s × 6 = 360 B/s against ~0.92 Mbps lanes; copies within
 a tick are identical, so duplicates are idempotent):
 
-| | before | after |
+| | before (2 runs) | after (2 valid runs) |
 |---|---:|---:|
 | fail-opens through the stall window | 23 | **0** |
-| ON conceal delta | 956 ms | **748** |
-| OFF conceal delta | 416 ms | 444 |
-| the scenario's own assertion | FAIL | **PASS** |
+| ON conceal delta | 928, 956 ms | **748, 960** |
+| OFF conceal delta | 428, 416 | 444, 476 |
+| margin against the bar (OFF + 500) | −0, −40 | **+196, +16** |
+| the scenario's own assertion | FAIL, FAIL | PASS, PASS |
+
+**Read that last row honestly: two passes, one of them by 16 ms, which is inside this rig's own
+run-to-run spread.** And it took eight attempts to get two valid runs — the other six were thrown out by
+the rig's pre-injection validity gate (`jitSpreadMaxRun` 608–3150 ms against a 300 ms bar) because the
+host was too noisy after a day of back-to-back live-call rigs. The gate doing that is the rig working;
+it is also the reason this is a direction and not a verdict.
 
 ### Why that is still not enough to flip the default
 
