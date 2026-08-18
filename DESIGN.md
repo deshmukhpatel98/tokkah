@@ -4760,6 +4760,24 @@ section is optimistic. Re-run with `--net=real` (jitter 8 ms, loss 0.3%):
 | 180 | 136.1 ms | **157 / 274 ms** (sides diverge) |
 | 220 | 151.7 ms | **173.5 / 309 ms** (sides diverge) |
 
+**A second correction, from repeats.** The table above is single runs. Under
+heavy-tailed jitter (netsim's default was UNIFORM, which is the other way this
+rig flattered itself — see the profile comment in `call.mjs`) rtt=180 first read
+144.5 ms, apparently just inside the goal. Eight measurements at that point say
+otherwise:
+
+    149.5  152.9  165.7  165.8  174.8  183.8  202.7  214.4     median 165.8 ms
+
+**One of eight is under 150.** And `target` reached 6-10f in half of them, so the
+buffer inflation of 17.30 is not an occasional event at this distance — it is the
+normal case. Interpolating against rtt=140 (130.3 ms), the 150 ms crossing sits at
+roughly **RTT 155**, one-way ~78 ms.
+
+Which is Delhi-Amsterdam (real RTT ~140) inside the goal, and **Delhi-New York
+(~230) outside it**. Against the original claim of RTT 205 / 14-15,000 km, the
+reach has roughly halved every time the test got more honest: constant delay ->
+uniform jitter + loss -> heavy-tailed jitter + repeats.
+
 **Three corrections.** The fixed overhead is ~56 ms, not 48 — real jitter costs
 about 8 ms of buffer the delay line never charged. Delhi-Amsterdam is 133 ms, not
 116, so the margin under the goal is a third of what was claimed. And the
