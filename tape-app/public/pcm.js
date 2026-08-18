@@ -2692,11 +2692,33 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     let farRejected = 0;      // consecutive samples turned away
     const ELASTIC = cfg.jitterElastic !== false;
     const ELASTIC_MAX_F = 48;
-    // DERIVED, not chosen: the deepest target the elastic ceiling can ever
-    // reach. An arrival further past the window floor than this could not have
-    // been played even at maximum buffer, so it is evidence about a lane's
-    // health and not about how deep this ring should be. See FAR_SKIP above.
-    const FAR_BOUND_MS = ELASTIC_MAX_F * FRAME_MS;
+    // DERIVED FROM THE GOAL, and the first version of this was derived from the
+    // wrong thing. It was ELASTIC_MAX_F * FRAME_MS = 384 ms, on the argument
+    // that a frame later than the deepest reachable target could never be
+    // played. True about PLAYABILITY, irrelevant to the TARGET: `holdCeil`
+    // already clamps spreadHold at (maxEff - D_MARGIN_FRAMES) * FRAME_MS —
+    // 248 ms at the base maxTargetFrames of 32, 376 ms fully elastic — so a
+    // bound of 384 sat ABOVE the clamp and discarded only what was already
+    // being discarded. Measured exactly that way: the rule fired 100-180 times
+    // per side and collapsed jitSpreadMaxRun from 1200-2536 ms to 114-375, and
+    // the ring did not move, because 1500 ms and 370 ms of spread produce the
+    // same clamped target.
+    //
+    // So the bound now comes from the 150 ms mouth-to-ear budget instead. The
+    // fixed pipeline is measured, not guessed: outputMs 20 (the OS device
+    // buffer, already at the API floor under latencyHint 0), frameMs 8,
+    // netAgeP50 ~2 — about 30 ms before the ring gets anything. That leaves
+    // ~120 ms of ring for a zero-propagation call, and less for a real one.
+    // An arrival further past the window floor than that cannot be waited for
+    // without spending the entire budget the project exists to defend.
+    //
+    // A LIVE KNOB (`?pcmjitfarms=`), because the honest value is a trade this
+    // rig has to find rather than one this comment can assert: buffering less
+    // means concealing frames that a deeper ring would have caught, and the
+    // de-skew experiment at the ringWrite call site paid +1 s/min of
+    // concealment for 27.6 ms of ring. Sweeping it without a redeploy is the
+    // difference between measuring that curve and guessing a point on it.
+    const FAR_BOUND_MS = Math.max(FRAME_MS * 2, cfg.jitterFarMs ?? 120);
     const ELASTIC_STEP_F = 8;
     let maxEff = cfg.maxTargetFrames;
     let elPainSeen = 0, elLastUp = 0, elCalmMs = 0;

@@ -2240,6 +2240,11 @@ const PCM_CFG = {
   // could not have been caught at any depth, so they no longer set it.
   // `?pcmjitfar=0` is the control arm. Inert on a clean call by construction.
   jitterFarSkip: QS.get('pcmjitfar') !== '0',
+  // How far past the window floor an arrival may be and still size the buffer.
+  // 120 ms = the 150 ms goal minus the measured fixed pipeline (output 20 +
+  // frame 8 + netAge ~2). Must sit BELOW holdCeil (248 ms base) or it discards
+  // only what the clamp already discards — which is what 384 ms did.
+  jitterFarMs: Number(QS.get('pcmjitfarms')) || 120,
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',
