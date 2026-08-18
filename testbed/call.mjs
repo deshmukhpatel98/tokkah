@@ -868,6 +868,20 @@ if (ra.pcmAudio || rb.pcmAudio) {
         `  age p50 ${p.ageP50} ms  p95 ${p.ageP95} ms  (rtt ${p.rttMs}, baseRtt ${p.baseRttMs}, offset ${p.clockOffsetMs})` +
         `  mode ${p.mode}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
     );
+    // The BANDWIDTH axis of the goal, which this rig has never printed. Every
+    // number here was already in the snapshot; 17.47 asked for wire bytes
+    // beside latency and they were sitting unread. bPerFrame is the real
+    // post-compression payload, so at 8 ms/frame it is also kbps exactly
+    // (125 frames/s x B x 8 bits = 1000 x B bit/s) -- stated rather than
+    // assumed, because that identity dies the moment FRAME_MS changes.
+    const fms = p.pcmFrameMs ?? 8;
+    log(
+      `      wire ${p.bPerFrame ?? '?'} B/frame` +
+        `  ${p.bPerFrame ? Math.round((p.bPerFrame * 8) / fms) : '?'} kbps @${fms}ms` +
+        `  parity ${p.bPerParity ?? '?'} B` +
+        `  wastedShift ${p.wastedShift ?? '?'} (>=8 on ${p.shift8Pct ?? '?'}%)` +
+        `  fit16 ${p.fit32767Pct ?? '?'}/${p.fit32768Pct ?? '?'}%  rxWasted ${p.rxWastedShift ?? '?'}`,
+    );
     // The estimator's own inputs. Without these the target is a number with no
     // provenance: a run showed target 22f while age p95-p50 was 7.8 ms, and there
     // was no way to tell whether spread had genuinely seen 168 ms of dispersion

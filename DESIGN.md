@@ -7888,3 +7888,68 @@ the first change where they pull against each other hard enough to matter.
 
 Prod is on 8 ms and verified. `frame-4ms` is functional, unmerged, and now
 worth A/B-ing on wire bytes as well as latency.
+
+## 17.48 The rtt=260 collapse is deterministic, not bistable — and 17.38 was wrong about that
+
+Re-measured on the CURRENT build (hold-arm, purge and margin=0 all shipped),
+`--net=real`, alternating 260/220 by round so time-drift cannot fake the delta:
+
+    rtt=220, six directions:  180.5  193.8  195.3  196.1  203.1  209.2   (target 3-5f, depth 41-70 ms)
+    rtt=260, four directions: 468.5  471.6  502.4  546.9                 (target 38-41f, depth 308-386 ms)
+    rtt=260, round 2:         PCM did not stay up -- fell back to OPUS, 274.2 ms
+
+**§17.38 called this bistable. It is not.** Four of four PCM runs at 260
+collapsed, and the fifth and sixth did not keep the PCM path at all. There is no
+good arm. A mechanism that fails every time is a different fix from one that
+fails sometimes, and the earlier characterisation would have sent me looking for
+a trigger that tips a metastable system when what is actually there is a floor
+that is simply too low at that distance.
+
+The stale 12:15 sweep that first showed this cliff was on a CLEAN pipe and
+predates the estimator fixes, so it could not be used: at rtt=220 it read 151 ms
+where a real path reads 196. Both halves of that gap are honest -- 17.33/17.34
+fixed startup contamination, and `--net=real` costs about 45 ms at this distance
+that a constant-delay pipe hides. Neither number was wrong; they measured
+different things, and only one of them is the goal's.
+
+### The estimator is not the defect here
+
+`age p95 656.7 ms` against `age p50 133.1` in one direction, and 235.2 vs 132.0
+in another. The transport is genuinely delivering frames half a second late. A
+jitter estimator that asks for 41 frames when it has seen 656 ms of dispersion
+is behaving CORRECTLY. Nothing in the receiver needs fixing; it is reading a
+sick transport accurately and sizing for what it sees.
+
+So the target for the fix is the queue itself, not the thing measuring it.
+`backlogLimit() = BDP x 1.5` makes the tolerated queue proportional to RTT: at
+1.152 Mbps and rtt=260 that is 56 kB, about 390 ms of standing backlog, and the
+observed depth (308-386 ms) sits just inside the allowance. At rtt=220 the same
+rule permits ~330 ms and only 41-70 ms appears -- so the allowance is not the
+TRIGGER, it is the HOLDER. It is the reason the queue, once formed, is permitted
+to stay. This is the `queue-tolerance-in-ms` bug class exactly: a backlog gate
+written as BDP x k lets tolerated queue grow with distance.
+
+Mathis does not explain the cliff and should stop being offered as the reason:
+at 0.3% loss, MSS/(RTT*sqrt(p)) is ~650 kbps per association at rtt=260, six
+associations against a 1.152 Mbps source. Throughput is not the binding
+constraint at either distance, and a sharp step between 220 and 260 is not what
+a smooth 1/RTT law produces.
+
+### A second defect, found in passing: the drift estimator is railed
+
+`drift 2000 ppm` appears pinned in four of six rtt=220 directions, and 7946 ppm
+at 260. Both peers are Chrome instances on ONE Mac, sharing one oscillator, so
+the true sender-receiver clock drift is approximately zero. A pinned reading at
+what looks like a +-2000 clamp is not a measurement, it is a rail. The estimator
+is attributing queue growth to clock skew -- the two are indistinguishable from
+arrival times alone unless something separates them, and nothing does.
+
+That is its own bug and is not the cliff, but it is worth writing down before it
+gets rediscovered: on this rig, ANY nonzero drift reading is an artifact, which
+makes the rig unusually good at exposing this particular estimator's failure.
+
+Under test now: `?pcmqms=40`, the allowance-in-milliseconds lever built in 17.35
+and left defaulted OFF. Acceptance requires concealment as well as m2e -- 17.42
+established that depth above target is load-bearing, so if the 300 ms queue is
+genuinely carrying audio the path cannot otherwise deliver, clamping it converts
+latency into dropouts and the goal asks for lossless.
