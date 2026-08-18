@@ -4798,9 +4798,45 @@ pinned at 24-32f. Arrival age stays punctual throughout (p50 132.7 / p95 136.0 �
 is the graded drain doing its job against an overfull ring, not a broken clock.
 
 Punctual arrivals, no jitter, five seconds of HELD concealment, and a ring that
-fills anyway. Whatever this is, it is not distance — distance is only making it
-more likely to show up. Not yet diagnosed; the frequency-vs-RTT relationship is
-the next thing to establish, and the rig is not yet excluded as its author.
+fills anyway.
+
+**Characterised, 15 calls.** The onset is SHARP, and the rig is excluded:
+
+| sim RTT | broken | clean | m2e when clean |
+|---|---|---|---|
+| 0 | **0 / 4** | 4 | 43.0, 52.7, 50.5, 46.9 |
+| 220 | 0 / 2 | 2 | 151.9, 151.4 |
+| 240 | 0 / 2 | 2 | 166.6 |
+| 260 | **4 / 7** | 3 | 175.8, 175.9, 179.5 |
+
+Nothing at 240, more than half at 260, and **zero at rtt=0 across four calls**, so
+this is not the harness. The clean runs at 260 are tight to 0.1 ms of each other
+and sit exactly on the line, which is what makes the broken ones so clearly a
+separate mode rather than a tail.
+
+**The mechanism, from the code.** A frame arriving with `seq < lo` — the playhead
+already past its slot — takes the late branch: `stats.late++`, then
+`bumpTarget('late')`. Enough of those and the target is pinned at the ceiling,
+which is exactly the 24-32f seen. The worklet's own comment describes this
+escalation from the priming side and names it: *"the playhead advances on its own
+clock while priming stalls, so `lo = max(startSeq, play)` outruns the stream;
+every arriving frame is then late, and every late frame calls `bumpTarget('late')`,
+which pins the target at the ceiling."* That incident was fixed on the priming
+span. The RTT-dependent half — a playhead anchored against a stream with 130 ms
+still in flight — was not obviously covered by that fix.
+
+`reAnchor()` exists to break exactly this deadlock, but it is gated on
+`now() - lastRingWriteAt > 1000`: a **flat 1000 ms drought**, RTT-blind like every
+other flat timeout this project has had to find. A late frame returns before
+updating `lastRingWriteAt`, so the drought should accumulate and fire — yet the
+damage runs to 5-7 s, far longer than one rescue should allow.
+
+So the decisive question is narrow: **does `reAnchors` fire at all in a broken
+run?** If it stays 0 the rescue is unreachable at this RTT; if it fires
+repeatedly, it is firing and losing the anchor again immediately. Those are
+different bugs with different fixes and the counter distinguishes them in one
+run. Measurement in flight — it was not captured in any of the 15 calls above,
+which is the gap in this write-up.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 
