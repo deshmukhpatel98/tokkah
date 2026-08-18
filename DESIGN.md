@@ -4805,6 +4805,40 @@ the ring the bound has to be below the clamp, not level with it, and the honest
 place to derive it from is the 150 ms goal rather than the buffer's own maximum.
 Next step, named rather than guessed at.
 
+**Then the bound was moved below the clamp, and the ring followed.** Re-derived
+from the 150 ms budget instead of the buffer's maximum: the fixed pipeline is
+`outputMs` 20 (the OS device buffer, already at the API floor under
+`latencyHint: 0`) + `frameMs` 8 + `netAgeP50` ~2 = ~30 ms, leaving ~120 ms of ring
+for a zero-propagation call. `?pcmjitfarms=` makes it a live knob. 2 valid paired
+rounds, order rotated:
+
+| | ON (120 ms) | OFF | median delta | per round |
+|---|---|---|---|---|
+| **mouth-to-ear during fault** | **162 ms** | 303 ms | **-142 ms** | -145, -139 |
+| **ring depth during fault** | **77 ms** | 218 ms | **-142 ms** | -144, -139 |
+| conceal during stall | — | — | -46 ms | — |
+| conceal whole call | 2684 ms | 2448 ms | +236 ms | -320, +792 UNRESOLVED |
+
+    far-arrivals skipped ON : 120/119 | 113/167   (jitSpreadMaxRun 118.2/113.6 | 119.9/113.9)
+    far-arrivals skipped OFF:   0/0   |   0/0     (jitSpreadMaxRun 1402.7/946 | 1469.1/1213.3)
+
+`jitSpreadMaxRun` now pins at the bound, which is the mechanism visible directly.
+
+**Why this 2-round result is believed where the earlier one was not.** The
+withdrawn one had per-round values 124 ms apart (-77, -201) on a 139 ms effect —
+agreement no better than the effect. These are **6 ms apart on 142 ms**, twice,
+with the arm order rotated between them. That is a different kind of evidence, not
+a luckier draw of the same kind. It is still two rounds, and today has twice
+punished reading two rounds as a result.
+
+**The cost is real and NOT yet resolved.** Whole-call concealment straddles zero
+at +236 ms (-320, +792). Buffering less means conceal ing frames a deeper ring
+would have caught, and the de-skew experiment at the `ringWrite` call site paid
++1 s/min of concealment for 27.6 ms of ring. 142 ms of ring is a far better trade
+than that one, but the concealment column has to be resolved before this is a
+finished result — that is what the live knob is for: sweep 80/120/160/200 and find
+where the curve turns.
+
 **What stands:** the estimator is no longer lane-blind, the rule is measured to
 fire correctly and only when intended, and nothing regressed (both runs' deltas
 straddle zero in at least one direction, so there is no evidence of harm either).
