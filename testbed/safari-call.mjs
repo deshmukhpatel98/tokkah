@@ -258,13 +258,26 @@ try {
         mean: +m.toFixed(1), variance: +vv.toFixed(1), change: +ch.toFixed(3) });
     `);
     const r = JSON.parse(cam);
-    const real = r.variance > 25 && r.change > 0.2;
+    // A SYNTHETIC SOURCE CAN BE BRIGHT AND BUSY. The variance-and-motion test was
+    // built to catch a DENIED camera, which macOS serves as uniform black — and it
+    // does catch that. It does not catch a source that is fake but lively, and
+    // Safari's mock capture device is exactly that: measured variance 4663 and
+    // motion 5.175/px, i.e. it sails through a bar a real dim room would struggle
+    // with, and the probe printed "REAL SENSOR IN SAFARI" over a test pattern.
+    // The label is the only thing that actually distinguishes them, so the label is
+    // now checked FIRST and no amount of detail can override it.
+    const fake = !r.label || /mock|fake|virtual|synthetic|dummy|obs |camo|test pattern/i.test(r.label);
+    const real = !fake && r.variance > 25 && r.change > 0.2;
     console.log(`  REAL SENSOR CHECK: "${r.label}" ${r.w}x${r.h}  mean ${r.mean} `
       + `variance ${r.variance} change ${r.change}/px  -> ${real ? 'REAL' : 'NOT REAL'}`);
     if (!real) {
-      throw new Error(`--realcam asked for a sensor and got a ${r.variance <= 25 ? 'flat' : 'frozen'} picture `
-        + `(variance ${r.variance}, change ${r.change}). macOS is denying the camera to Safari, or it is `
-        + 'covered. Refusing to report these as real-sensor numbers.');
+      throw new Error(fake && r.label
+        ? `--realcam asked for a sensor and Safari handed over "${r.label}" — a SYNTHETIC source. `
+          + `Turn it off: Safari > Develop > WebRTC > uncheck "Use Mock Capture Devices". `
+          + 'Refusing to report these as real-sensor numbers.'
+        : `--realcam asked for a sensor and got a ${r.variance <= 25 ? 'flat' : 'frozen'} picture `
+          + `(variance ${r.variance}, change ${r.change}). macOS is denying the camera to Safari, or it is `
+          + 'covered. Refusing to report these as real-sensor numbers.');
     }
   }
   await C.page.waitForFunction(() => document.querySelector('#preview')?.videoWidth > 0, null, { timeout: 30000 });

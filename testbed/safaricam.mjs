@@ -118,12 +118,27 @@ try {
   say(`safaricam: getUserMedia -> ${got}`);
 
   const r = JSON.parse(got);
+  // A SYNTHETIC SOURCE CAN BE BRIGHT AND BUSY. The variance-and-motion test was
+  // built to catch a DENIED camera, which macOS serves as uniform black — and it
+  // does catch that. It does not catch a source that is fake but lively, and
+  // Safari's mock capture device is exactly that: measured variance 4663 and
+  // motion 5.175/px, i.e. it sails through a bar a real dim room would struggle
+  // with, and the probe printed "REAL SENSOR IN SAFARI" over a test pattern.
+  // The label is the only thing that actually distinguishes them, so the label is
+  // now checked FIRST and no amount of detail can override it.
+  const FAKE = /mock|fake|virtual|synthetic|dummy|obs |camo|test pattern/i;
+  const fake = !r.label || FAKE.test(r.label);
   // A denied camera on macOS does not throw: it resolves, reads "live", and
   // every frame is uniformly black. Detail AND life, or it is not a sensor.
-  const real = r.variance > 25 && r.change > 0.2;
+  const real = !fake && r.variance > 25 && r.change > 0.2;
   say(real
     ? `\nREAL SENSOR IN SAFARI: "${r.label}" ${r.w}x${r.h}, detail ${r.variance}, motion ${r.change}/px`
-    : `\nNO REAL SENSOR IN SAFARI — ${r.err ?? (r.hung ? 'getUserMedia never settled (prompt sitting unanswered)'
+    : fake && r.label
+      ? `\nNOT A REAL SENSOR — Safari handed over "${r.label}". That is a SYNTHETIC source, and it`
+        + ` passes every picture test (variance ${r.variance}, motion ${r.change}/px) because a test`
+        + ` pattern is livelier than a real room.\n  Turn it off: Safari > Develop > WebRTC >`
+        + ` uncheck "Use Mock Capture Devices", then re-run.`
+      : `\nNO REAL SENSOR IN SAFARI — ${r.err ?? (r.hung ? 'getUserMedia never settled (prompt sitting unanswered)'
         : `flat/frozen picture (variance ${r.variance}, change ${r.change})`)}`);
   process.exitCode = real ? 0 : 1;
 } finally {
