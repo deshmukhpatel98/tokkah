@@ -112,6 +112,11 @@ async function getSample(p) {
       dupRecv: snap.dupRecv ?? null,
       stripe: snap.stripe ?? null,
       jitSpreadMaxRun: snap.jitSpreadMaxRun ?? null,
+      // The far-arrival bound's own counters. Without these the only evidence
+      // the rule fired is jitSpreadMaxRun collapsing, which is an inference.
+      jitFarSkipped: snap.jitFarSkipped ?? null,
+      jitFarRelearn: snap.jitFarRelearn ?? null,
+      jitFarByLane: snap.jitFarByLane ?? null,
       jitSpreadMaxLate: snap.jitSpreadMaxLate ?? null,
       perAssoc: snap.perAssoc ? snap.perAssoc.map(a => ({
         i: a.i,
@@ -403,9 +408,25 @@ const medConceal = median(rounds.map((r) => concealDelta(r.on) - concealDelta(r.
 const concealPass = medConceal <= 500;
 console.log(`assert median ON-OFF conceal delta <= +500 ms: ${concealPass ? 'PASS' : 'FAIL'} (${medConceal > 0 ? '+' : ''}${medConceal.toFixed(1)} ms)`);
 
-const floorPass = rounds.every((r) => (r.on.t55.pA.stripe?.nFast ?? 0) >= 3 && (r.on.t55.pB.stripe?.nFast ?? 0) >= 3);
-console.log(`assert ON nFast >= 3 at end, every round: ${floorPass ? 'PASS' : 'FAIL'}`
-  + ` (${rounds.map((r) => `${r.on.t55.pA.stripe?.nFast}/${r.on.t55.pB.stripe?.nFast}`).join(' | ')})`);
+// ONLY WHEN STRIPING WAS ASKED FOR. nFast is the stripe's lane floor and does
+// not exist without it — striping is OFF by default in production, so on any
+// A/B of the shipped configuration this read `undefined >= 3`, failed, and
+// turned a clean result into a FAIL. Same conflation as the trace guard above:
+// "did the stripe hold its floor" is not "did the call work".
+const stripedArm = ON_FLAGS.includes('pcmskewstripe=1');
+const floorPass = !stripedArm
+  || rounds.every((r) => (r.on.t55.pA.stripe?.nFast ?? 0) >= 3 && (r.on.t55.pB.stripe?.nFast ?? 0) >= 3);
+console.log(`assert ON nFast >= 3 at end, every round: ${stripedArm ? (floorPass ? 'PASS' : 'FAIL') : 'N/A (ON arm is not striping)'}`
+  + (stripedArm ? ` (${rounds.map((r) => `${r.on.t55.pA.stripe?.nFast}/${r.on.t55.pB.stripe?.nFast}`).join(' | ')})` : ''));
+
+// The far-arrival bound, when it is the thing under test: how many arrivals it
+// turned away, and from which lanes. Printed rather than asserted — the count
+// is a description of the fault the rig injected, not a target.
+for (const [label, pick] of [['ON ', (r) => r.on], ['OFF', (r) => r.off]]) {
+  const sk = rounds.map((r) => ['pA', 'pB'].map((s) => pick(r).t55[s].jitFarSkipped).join('/')).join(' | ');
+  const sp = rounds.map((r) => ['pA', 'pB'].map((s) => pick(r).t55[s].jitSpreadMaxRun).join('/')).join(' | ');
+  console.log(`far-arrivals skipped ${label}: ${sk}   (jitSpreadMaxRun ${sp})`);
+}
 
 const pass = livePass && framesPass && concealPass && floorPass;
 console.log(`\nVERDICT: ${pass ? 'PASS' : 'FAIL'}`);
