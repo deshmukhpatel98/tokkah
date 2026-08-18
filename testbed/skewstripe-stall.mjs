@@ -176,8 +176,36 @@ async function armStall(qs) {
       sim.flap(idx, 5000);
     }
 
-    // Step 3: Run 25 s more (to t=55s total) and sample
-    await pA.waitForTimeout(25000);
+    // Step 3: Run 25 s more (to t=55s total), TRACING once a second.
+    //
+    // Two samples 25 s apart say the ON arm concealed 2.3x the control and say
+    // nothing whatever about why, and one hypothesis has already been built and
+    // disproved on that basis (ranking the MIN_FAST rescue by why-a-lane-was-
+    // demoted rather than by its now-meaningless current reading — correct in
+    // itself, worth nothing here). The failure is a SEQUENCE: who demoted what,
+    // when, how often it changed its mind, and where the concealment landed
+    // relative to those decisions. A per-second trace is the cheapest thing that
+    // can show a sequence, and guessing again without one is not a method.
+    const trace = [];
+    for (let t = 0; t < 25; t++) {
+      await pA.waitForTimeout(1000);
+      const [ta, tb] = await Promise.all([pA, pB].map((p) => p.evaluate(() => {
+        const s = window.__tape?.pcm?.snapshot?.() ?? {};
+        return {
+          conceal: s.concealedMs ?? null, depth: s.m2eParts?.ringDepthMs ?? null,
+          nFast: s.stripe?.nFast ?? null, order: s.stripe?.fastOrder ?? null,
+          dem: s.stripe?.demotions ?? null, pro: s.stripe?.promotions ?? null,
+          probe: s.stripe?.probePromotions ?? null, dead: s.stripe?.dead ?? null,
+          stale: s.stripe?.staleFailopen ?? null,
+          lateRecv: s.latePct?.weRecv ?? null, lateSend: s.latePct?.weSend ?? null,
+        };
+      }).catch(() => null)));
+      trace.push({ t: t + 1, a: ta, b: tb });
+    }
+    const fmt = (x) => x ? `n${x.nFast}[${(x.order ?? []).join('')}] d${x.dem}/p${x.pro}/pp${x.probe}`
+      + `${x.dead ? ` DEAD${x.dead}` : ''}${x.stale ? ` STALE${x.stale}` : ''} cc${x.conceal} dep${Math.round(x.depth ?? 0)}` : '—';
+    console.log(`[trace ${qs || 'control'}] second-by-second from the moment of the stall`);
+    for (const r of trace) console.log(`  t+${String(r.t).padStart(2)}s  A ${fmt(r.a)}   |   B ${fmt(r.b)}`);
     const t55A = await getSample(pA);
     const t55B = await getSample(pB);
 
@@ -246,7 +274,13 @@ let off = null;
 let valid = false;
 
 for (let attempt = 0; attempt < 3; attempt++) {
-  on = await armRetryStall('&pcmskewstripe=1');
+  // The ON arm's flags, overridable. The controller that acts on the third
+  // lane-health signal ships as a SEPARATE switch (?pcmlatedemote=1) precisely
+  // so this scenario can be re-run against it without rebuilding the rig, and
+  // hardcoding the arm here meant the one comparison the switch exists for
+  // needed a source edit every time.
+  //   --on='&pcmskewstripe=1&pcmlatedemote=1'
+  on = await armRetryStall(process.argv.find((a) => a.startsWith('--on='))?.slice(5) ?? '&pcmskewstripe=1');
   off = await armRetryStall('');
 
   const invalidReasons = checkValidity(on, off);

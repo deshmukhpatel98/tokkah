@@ -911,17 +911,41 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // leaves fewer than MIN_FAST lanes, fewer is the truth — fall-forward
           // still reaches every open association as the last resort.
           if (desiredState[k] === 1 && !laneDead[k]) {
-            demotedCandidates.push({ k, skew: peerSkewMs[k], late: peerLatePct[k] });
+            demotedCandidates.push({
+              k, skew: peerSkewMs[k], late: peerLatePct[k],
+              // WHY it was demoted, not what it currently reports. See below.
+              wasLate: laneLateDemoted[k] ? 1 : 0,
+            });
           }
         }
-        // Ranked by LATENESS first, then skew. Sorting on skew alone was an
-        // active trap once lateness could demote: a uniformly-delayed lane
-        // reports almost no skew, so it sorted to the FRONT and the floor
-        // rescued precisely the lanes that had just been proven unable to
-        // deliver on time. The floor exists to preserve capacity, and a lane
-        // whose frames miss the playhead has none to preserve — so it is the
-        // last one drafted back, not the first.
-        demotedCandidates.sort((a, b) => a.late - b.late || a.skew - b.skew || a.k - b.k);
+        // Ranked by WHY THE LANE WAS DEMOTED first, then by what it currently
+        // reports.
+        //
+        // Ranking on the current reading alone looks right and is the same trap
+        // this sort was already rewritten once to escape, one level deeper. A
+        // demoted lane carries no audio, so the peer measures no frames on it,
+        // so peerLatePct decays to ZERO within seconds — the lane's own
+        // condemnation erases the evidence for it. A route stalled by five
+        // seconds therefore sorts to the FRONT of the rescue list, tied at
+        // late 0 with lanes that are merely slow, and the floor drafts back
+        // precisely the lane it just proved cannot deliver.
+        //
+        // Measured on the 3-of-6-stalled scenario (testbed/skewstripe-stall.mjs,
+        // --on='&pcmskewstripe=1&pcmlatedemote=1'): the sending side logged 8
+        // demotions against 5 promotions in one 25 s window and settled only at
+        // the end, while the RECEIVING side concealed 1624 ms against the
+        // control's 448. Every one of those promotions posted speech back into a
+        // five-second hole.
+        //
+        // laneLateDemoted already records the verdict and is already trusted to
+        // block the skew release path, for exactly this reason: a lane condemned
+        // by the signal skew cannot see must not be released by skew. The floor
+        // needs the same rule. It is cleared the moment the lane is genuinely
+        // promoted, so this is an ordering preference, not a life sentence — and
+        // the RTT probe, which reaches demoted lanes and does not depend on the
+        // traffic we took away, remains the way back.
+        demotedCandidates.sort((a, b) => a.wasLate - b.wasLate || a.late - b.late
+          || a.skew - b.skew || a.k - b.k);
         const needed = MIN_FAST - fastCount;
         for (let i = 0; i < needed && i < demotedCandidates.length; i++) {
           desiredState[demotedCandidates[i].k] = 0; // force FAST
