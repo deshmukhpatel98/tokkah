@@ -454,6 +454,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       jitSpreadMs: null, jitP99Ms: null, jitP90Ms: null, jitMaxMs: null, jitWant: null, jitN: 0,
       capSabOverruns: 0,
       jitSpreadMaxRun: 0, jitAboveFloorMs: 0, jitWantMaxRun: 0, jitClampedTicks: 0, jitHoldMaxRun: 0,
+      jitPurgedAtMs: null, jitPurgedSpread: null,
       // Arrivals turned away as unplayable-at-any-depth, and which lane they
       // came from. Cumulative counters, not gauges — a fault that is over by
       // snapshot time still has to be visible in the snapshot.
@@ -2719,6 +2720,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Where the knob is CONNECTED, fast wins everything measured: post-stall excursion
     // 1.8-6x smaller, 8/8 paired calls at 5% loss (p=0.0346), and direction at 2.5 Mbps.
     const JIT_RELEASE = cfg.jitterRelease ?? 2;
+    const JIT_OUTLIERS = Math.max(1, Math.min(16, cfg.jitterOutliers ?? 1));
+    // Default ON (`?pcmjitpurge=0` is the control arm). 4000 ms sits after every
+    // observed peak (2292-3016 ms) and well inside the 10 s observability warm.
+    const JIT_PURGE = cfg.jitterPurge !== false;
+    const JIT_PURGE_MS = Math.max(500, cfg.jitterPurgeMs ?? 4000);
+    let jitPurged = false;
     // Where the target saturates: ceil(spreadHold/FRAME_MS) + D_MARGIN_FRAMES
     // reaches maxTargetFrames here, so held spread above this is invisible to
     // the output and costs only recovery time. Derived, not a constant, so it
@@ -2927,7 +2934,67 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // the buffer could have prevented", which is the window's MAX. Second-largest
       // rather than max so one pathological arrival cannot pin the buffer for a
       // whole window; in effect, at most one frame in 320 may be late.
-      const spread = s[Math.max(0, dN - 2)] - s[0];
+      // HOW MANY OUTLIERS THE WINDOW MAY REJECT (`?pcmjitout=N`, default 1 = the
+      // shipped second-largest).
+      //
+      // This knob was added to test the theory that heavy-tailed jitter defeats
+      // one-outlier rejection by landing two excursions in one 2.56 s window.
+      // THAT THEORY IS WRONG and the measurement that killed it is worth keeping:
+      // on four sides at rtt=180 --net=real the window's own p99 was 15.8-17.3 ms
+      // and its max 16.5-33.1, while `spread` recorded 146-405 ms. A statistic
+      // cannot report 405 from samples that top out at 33. The tail was never
+      // the problem, so rejecting more of it cannot be the fix -- see the
+      // convergence purge below for what actually drives those numbers.
+      //
+      // Kept because it is free and it is the control arm that proves the point.
+      // ── CONVERGENCE PURGE (§17.33) ────────────────────────────────────────
+      // A statistic whose inputs have not converged is not a measurement.
+      //
+      // D = (arrival - skewMs) - seq*FRAME_MS. Two of those three terms are
+      // still settling when a call starts: `skewMs` comes from the clock-offset
+      // estimator, which needs several ping/pong exchanges, and `dFloor` is a
+      // running minimum that has not yet seen its minimum. Every D computed
+      // before they settle carries their error, and the window keeps the worst
+      // one for 2.56 s while peak-hold keeps it for far longer.
+      //
+      // MEASURED (4 sides, rtt=180 --net=real, prod):
+      //   spreadMax 405.4 @3016 ms | 194.5 @2292 | 170.6 @2873 | 146.5 @2720
+      //   post-warm max   20.3     |  16.5       |  16.9       |  17.9
+      //   window p99      16.7     |  16.1       |  15.8       |  17.3
+      // Every peak inside the first three seconds; every steady-state number
+      // ~17 ms. The estimator is RIGHT once converged and wrong only before.
+      //
+      // Why it then lasts the whole call: JIT_RELEASE is 2 ms/tick = 8 ms/s, so
+      // 405 ms takes ~50 s to bleed off and a 45 s call never recovers. That is
+      // the documented "one hiccup costs 54 ms for 90 s" behaviour above -- the
+      // new part is that the hiccup is the call's OWN STARTUP, on every call,
+      // deterministically, and it is 4-20x larger than the hole that study used.
+      //
+      // This also explains the asymmetry that resisted three previous fixes:
+      // both directions run the same code on the same host, so which one inflates
+      // is decided by which one drew the worse startup transient. Nothing about
+      // the steady-state control law differs, which is why re-anchor reset, the
+      // late-pin guard and a faster release all measured null or negative.
+      //
+      // The purge is one-shot and total: drop the window, the floor and the hold
+      // at PURGE_MS, and re-derive from arrivals whose inputs have converged. It
+      // costs one window (2.56 s) of re-learning, during which the target sits at
+      // its floor -- acceptable because the pre-purge target is provably built on
+      // garbage. A genuine burst at that instant is re-learned within the window.
+      if (JIT_PURGE && !jitPurged && dT0 && now() - dT0 >= JIT_PURGE_MS) {
+        jitPurged = true;
+        // Read the discarded value from the sorted window BEFORE zeroing dN, and
+        // never from `spread` -- that binding is declared below this block, so
+        // touching it here is a temporal-dead-zone ReferenceError. It threw once
+        // per call and still looked like it worked, because every mutation above
+        // it had already run and the guard stopped the tick from re-entering.
+        stats.jitPurgedSpread = +(s[Math.max(0, dN - 1 - JIT_OUTLIERS)] - s[0]).toFixed(1);
+        stats.jitPurgedAtMs = Math.round(now() - dT0);
+        dN = 0; dI = 0; dFloor = null; farRejected = 0;
+        spreadHold = 0;
+        return; // `s` describes the window just discarded; do not act on it.
+      }
+      const spread = s[Math.max(0, dN - 1 - JIT_OUTLIERS)] - s[0];
       // The floor the next interval's arrivals are judged against. Taken here
       // because this tick already paid for the sort; recomputing it per frame
       // would put an O(n log n) on the receive path to save nothing.
@@ -3341,6 +3408,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           // peak and raise count, so a call that stretched and came back is
           // distinguishable from one that never needed to.
           jitMaxTarget: maxEff, elMaxRun: stats.elMaxRun, elUps: stats.elUps,
+          // Exported so "the target grew" can be attributed. With the estimator on,
+          // bumpTarget() returns before touching the target and only counts here,
+          // so painEvents high + wantMax low means the growth came from the
+          // estimator, not the pain path -- and vice versa.
+          painEvents: stats.painEvents,
+          jitPurgedAtMs: stats.jitPurgedAtMs, jitPurgedSpread: stats.jitPurgedSpread,
+          jitPurge: JIT_PURGE, jitPurgeMs: JIT_PURGE_MS,
           // Latency governor (task #47). govOn distinguishes "off" from "on but
           // never trimmed"; govTrimTicks is the authority check demanded by
           // [[the-contradiction-was-a-dead-knob]] — an A/B where this reads 0 in

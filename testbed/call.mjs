@@ -813,6 +813,18 @@ if (ra.pcmAudio || rb.pcmAudio) {
         `  age p50 ${p.ageP50} ms  p95 ${p.ageP95} ms  (rtt ${p.rttMs}, baseRtt ${p.baseRttMs}, offset ${p.clockOffsetMs})` +
         `  mode ${p.mode}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
     );
+    // The estimator's own inputs. Without these the target is a number with no
+    // provenance: a run showed target 22f while age p95-p50 was 7.8 ms, and there
+    // was no way to tell whether spread had genuinely seen 168 ms of dispersion
+    // or the demand had come from somewhere else entirely. Printing the raw
+    // want, the held peak and the post-warm spread max separates those.
+    log(
+      `      jit spreadMax ${p.jitSpreadMaxRun ?? '?'} ms @${p.jitSpreadMaxAtMs ?? '?'} ms (warm ${p.jitWarmMs ?? '?'}; late ${p.jitSpreadMaxLate ?? '?'} @${p.jitSpreadMaxLateAtMs ?? '?'} ms)` +
+        `  holdMax ${p.jitHoldMaxRun ?? '?'} ms  wantMax ${p.jitWantMaxRun ?? '?'}f  clampedTicks ${p.jitClampedTicks ?? '?'}` +
+        `  elMaxRun ${p.elMaxRun ?? "?"}f  painEvents ${p.painEvents ?? '?'}` +
+        `  window[p90 ${p.jitP90Ms ?? '?'} p99 ${p.jitP99Ms ?? '?'} max ${p.jitMaxMs ?? '?'}]` +
+        `  purge ${p.jitPurge === false ? 'OFF' : `@${p.jitPurgedAtMs ?? 'never'} ms dropped ${p.jitPurgedSpread ?? '?'} ms`}`,
+    );
     // Lane 0 (§3.1 lever 4) wire counters: T_PRED pairs sent/received (+ the
     // duplicate copies proving the duplication works) and T_PAD pre-warm
     // bytes in both directions. T_PAD never enters an RS group — the proof is
