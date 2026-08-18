@@ -209,8 +209,18 @@ async function armStall(qs) {
       // Refuse to keep going if the very first sample is empty. A trace of
       // nulls costs a full two-arm run (nearly four minutes) to discover, and
       // it looks exactly like a trace of a call that is not doing anything.
-      if (t === 0 && (ta?.nFast == null && tb?.nFast == null) && qs) {
-        throw new Error('trace read no stripe state on either side — the snapshot spelling is wrong');
+      if (t === 0) {
+        // The real check is "does the snapshot answer at all", and it was
+        // written as "does it carry stripe state" — which made it fire on any
+        // arm without `&pcmskewstripe=1`, including the SHIPPING DEFAULT, where
+        // stripe is legitimately null. It crashed a full 3-round run of an
+        // unrelated A/B. Split into the two questions it was conflating.
+        if (ta?.conceal == null && tb?.conceal == null) {
+          throw new Error('trace read no snapshot on either side — the snapshot spelling is wrong');
+        }
+        if (qs.includes('pcmskewstripe=1') && ta?.nFast == null && tb?.nFast == null) {
+          throw new Error('striping was requested but no lane state came back — the stripe spelling is wrong');
+        }
       }
     }
     const fmt = (x) => x ? `n${x.nFast}[${(x.order ?? []).join('')}] d${x.dem}/p${x.pro}/pp${x.probe}`
