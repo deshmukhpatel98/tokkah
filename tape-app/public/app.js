@@ -2250,7 +2250,7 @@ const PCM_CFG = {
   // Where the worklet's graded drain starts, in ms of excess (§17.41). Default 25.
   drainKneeMs: QS.has('pcmdrainknee') ? Number(QS.get('pcmdrainknee')) : undefined,
   // Queue allowance in ms above the BDP (§17.35). Unset = shipped BDP x 1.5.
-  queueMs: Number(QS.get('pcmqms')) || undefined,
+  queueMs: QS.has('pcmqms') ? Number(QS.get('pcmqms')) : undefined,
   // Latency governor (task #47): trims buffer depth the measured per-frame
   // slack proves the call never needed. STAYS OPT-IN — the gates ran and were
   // NOT met (2026-08-05, all on real shipping browsers): under injected

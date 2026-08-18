@@ -8047,3 +8047,56 @@ bandwidth ceiling. A tight gate sheds frames the concealer must cover, and that
 cost should rise with loss, so `--net=mobile` (30 ms jitter, 1% loss, 3 Mbps
 ceiling against a 1.152 Mbps audio source plus video) at rtt=220 and rtt=300 is
 the last gate before this can default on.
+
+## 17.51 The mobile gate could not gate it — both arms disintegrate at 3 Mbps
+
+`--net=mobile` (30 ms jitter, 1% loss, **3 Mbps ceiling**) at rtt=220 and 300,
+arms alternated, two rounds. This was meant to be the last gate before
+defaulting the queue cap on. It is not a valid A/B, and saying so is the finding:
+
+    rtt 8723.98 / 12712.93 / 5021.17 ms   (baseRtt 288-816)
+    depth null / -497.7 / -429 / -75.5 ms
+    clockOffset -3072 / -5496 / +2996 ms
+    drift railed at -20000 ppm in nearly every direction
+    concealed 4,672 - 27,008 ms out of a 45 s call
+
+Negative and null depths, RTT readings forty times baseRtt, and clock offsets of
+several seconds are not measurements of a jitter buffer. **The instrument is
+outside its domain**, and an A/B scored inside that regime would be scoring
+noise. Both arms are destroyed; neither is a control.
+
+What does survive is one-directional and consistent across both distances:
+
+| concealed median | ARM (40 ms) | CTL (bdp x 1.5) |
+|---|---|---|
+| rtt=220 mobile | **2088 ms** | 6768 ms |
+| rtt=300 mobile | **6964 ms** | 12228 ms |
+
+So the cap is not harmful even here. Recorded as **"could not gate, and not a
+fail"** rather than as a pass -- the difference matters, because a later reader
+finding "mobile: passed" in this file would be reading something I did not
+measure.
+
+### The real finding is that 3 Mbps destroys the call, in both arms
+
+The goal asks for the same quality "at the lowest possible bandwidth -- heading
+for ~1 Mbps and below". A 1.152 Mbps audio lane plus video behind a 3 Mbps
+ceiling does not degrade; it disintegrates. That is §17.38's missing
+congestion-to-source-rate feedback, now visible as a hard failure rather than an
+inference: under a real ceiling the app keeps writing at design rate and
+everything drowns together. **This is a larger and more goal-relevant defect
+than the cliff I just fixed**, and nothing in the stack currently answers it.
+
+### Shipped
+
+`QUEUE_MS` now defaults to 40; `?pcmqms=0` restores `bdp x 1.5` as the control.
+`app.js` had `Number(QS.get('pcmqms')) || undefined`, which swallows an explicit
+zero -- so `?pcmqms=0` would have silently taken the new default and the control
+arm would have been a second copy of the treatment. Changed to `QS.has(...)`.
+
+Deploy verified: pcm.js 229773 -> 230868 B and app.js 478096 -> 478114 B, local
+equal to fetched, and both new expressions confirmed present in the served
+assets. Live confirmation of the DEFAULT path (a call carrying no query string
+at all) is running -- the flag existing in the file is not proof the default
+branch works, and `?pcmqms=0` must reproduce the old collapse or the control is
+broken for every future A/B on this flag.

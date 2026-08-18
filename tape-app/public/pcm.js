@@ -329,11 +329,28 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // One BDP of unacked bytes is legitimately in flight and is not queue. Only
   // the excess is, and how much of it is tolerable is a LATENCY budget.
   //
-  // Left OFF by default. The comment above records a measured collapse
-  // (pcm-loss2) from making this gate too tight, and audio the gate sheds is
-  // audio the concealer has to cover -- so this trades queue for drops and the
-  // trade has to be measured, not assumed, before it ships.
-  const QUEUE_MS = Number(cfg.queueMs) > 0 ? Number(cfg.queueMs) : 0;
+  // ON by default at 40 ms since §17.49; `?pcmqms=0` restores `bdp x 1.5`.
+  //
+  // The trade this comment used to demand be measured was measured, and it does
+  // not exist. rtt=260, --net=real, alternated, 3 rounds: m2e median 227.8 vs
+  // 472.3 ms AND concealed median 188 vs 5496 ms -- the audio got MORE lossless,
+  // not less, because the control's age p95 was 1326 ms against a p50 of 133.
+  // Frames sat in the backlog past their play deadline and were concealed on
+  // arrival: the queue was manufacturing the lateness it then failed to cover.
+  //
+  // The pcm-loss2 collapse cited above cannot return, and this is arithmetic
+  // rather than hope: `bdp x 1.5` IS `bdp + (rtt/2) ms of data`, so QUEUE_MS=40
+  // is byte-for-byte the old gate at rtt=80 -- exactly where that collapse was
+  // measured -- looser below it and tighter only above. The change is not a
+  // tightening everywhere; it is a ceiling on a quantity that had none.
+  //
+  // Gates: rtt=180/220 --net=real showed no harm (m2e median 154.8 vs 158.3 and
+  // 190.8 vs 202.6). --net=mobile could NOT gate it -- at a 3 Mbps ceiling both
+  // arms disintegrate (rtt readings of 8-12 s, null depths, 4-27 s concealed) --
+  // but concealment was still about half in this arm at both distances.
+  //
+  // 40 is the first value tried, not a tuned one. 20 and 80 are unmeasured.
+  const QUEUE_MS = Number.isFinite(Number(cfg.queueMs)) ? Math.max(0, Number(cfg.queueMs)) : 40;
   function backlogLimit(a) {
     const rtt = a.baseRttMs ?? 0;
     if (rtt <= 0) return cfg.queueBytes;
