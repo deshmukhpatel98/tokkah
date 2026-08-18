@@ -6896,3 +6896,61 @@ connection-state transitions and DTLS restarts per call at rtt=180 vs 300. The
 `retransmittedPacketsSent` are collected per-report but not carried into the
 aggregate -- and that should be closed at the same time so retransmission can be
 ruled in or out properly rather than inferred.
+
+## 17.36 What the rtt>=260 collapse is, and three things it is not
+
+Recorded because each elimination cost a measurement cycle and the next person
+(or the next session) should not repeat them.
+
+### Ruled out, each by a counter rather than by argument
+
+**The rig.** netsim separates injected loss from its own failures:
+`dropped 1588 on purpose, 0 to the bandwidth ceiling, 0 by accident`. Zero
+accidental drops at rtt=300. The emulator is not the scarce resource.
+
+**Session resets.** The 24-25 keyframes at rtt=300 against 3-4 at rtt=180
+looked exactly like repeated renegotiation, and `recoverCall()` escalates from
+ICE `disconnected` on a flat 5000 ms timer -- a textbook member of the
+RTT-blind-timeout family this codebase has produced three times. So it was
+instrumented: `window.__recoverStats` counts asks, runs, cap refusals and
+reasons. **Result: `asked 0, ran 0` at rtt=300.** It never fires. Hypothesis
+dead.
+
+That counter also replaced a blind instrument. The first attempt grepped the
+driver's stdout for "reconnect" and got 0 at both distances -- but those strings
+live in the DOM and the telemetry, so it would have printed 0 whether or not the
+event happened. A negative result from an instrument that cannot see the event
+is not a negative result.
+
+**Run duration.** Frames offered are stable per distance (~350 at rtt=180,
+~3130 at rtt=300) and that 9x looked like the rtt=300 call simply running
+longer. Wall clock says otherwise: **111.8 s vs 113.4 s.** Same duration. The 9x
+is real and remains unexplained; it is NOT a longer call.
+
+### What is actually established
+
+    rtt=300:  age p50 358.9 ms  p95 2266 ms   (baseRtt 288)  target 48f  m2e 747.8
+              age p50 106.4 ms  p95 468.3 ms  (baseRtt 288)  target 38f  m2e 486.7
+    rtt=180:  age p50  91.6 ms  p95   99.1 ms (baseRtt 171)  target  4f  m2e 154.0
+
+**Arrival age spreads across 2.3 seconds at rtt=300 while the network delivers
+cleanly.** At rtt=180 the p95-p50 gap is 7.5 ms; at rtt=300 it is 1907 ms — 250x
+wider for a 1.7x longer path. The jitter buffer is then sizing itself correctly
+for what it is being handed; it is not the defect, and 17.33/17.34's fix is not
+implicated.
+
+So the fault is upstream of the estimator, in the send path or SCTP itself:
+something is bursting and stalling delivery at a scale the wire is not doing.
+The queue gate (17.35) is part of it — tightening it cut lane backlog 14x and
+lane RTT 3.6x — but it left mouth-to-ear untouched, so it is downstream of
+whatever is actually stalling.
+
+### The next measurement
+
+Not another hypothesis. The instrument that would settle it: per-lane send
+timestamps versus arrival timestamps for the same sequence numbers, so the 1907
+ms of dispersion can be attributed to a specific hop — application write, SCTP
+queue, wire, or receive processing. Every cheaper proxy tried so far
+(datagram counts, keyframes, frame counts, reconnect counts) has been either
+confounded or blind, and two claims have already had to be withdrawn for
+resting on one of them.

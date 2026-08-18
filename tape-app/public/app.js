@@ -293,7 +293,16 @@ const RECOVER_WINDOW_MS = 3 * 60_000; // network is not coming back on its own
 // room, so a close is loss rather than lobby noise. The attempt is still bounded
 // by RECOVER_MAX/WINDOW/COOLDOWN, and `wsOpened` still gates the caller, so a
 // socket that never opened goes to wsPreOpenFail as before.
+// Cumulative, and counted at the CALL not at the gate: a reconnect that the
+// cooldown or the cap turns away is a different fact from one that runs, and a
+// single counter cannot tell them apart. Needed because a grep of the driver's
+// stdout reported 0 reconnects at both rtt=180 and rtt=300 -- the status strings
+// live in the DOM and the telemetry, so the instrument was blind and reported
+// the same "0" whether the event happened or not.
+window.__recoverStats = { asked: 0, ran: 0, why: {} };
 function recoverCall(why) {
+  window.__recoverStats.asked++;
+  window.__recoverStats.why[why] = (window.__recoverStats.why[why] ?? 0) + 1;
   if (leavingDeliberately || !joined || !activeRoom) return;
   const now = Date.now();
   const past = (safe(() => JSON.parse(sessionStorage.getItem(RECOVER_KEY) ?? '[]'), 'recover.read') ?? [])
@@ -301,8 +310,10 @@ function recoverCall(why) {
   if (past.length && now - past[past.length - 1] < RECOVER_COOLDOWN_MS) return;
   if (past.length >= RECOVER_MAX) {
     setStatus('connection lost — will reconnect when the network returns');
+    window.__recoverStats.capped = (window.__recoverStats.capped ?? 0) + 1;
     return;
   }
+  window.__recoverStats.ran++;
   past.push(now);
   safe(() => sessionStorage.setItem(RECOVER_KEY, JSON.stringify(past)), 'recover.mark');
   tel?.log('recover', { why, attempt: past.length });
@@ -8592,6 +8603,7 @@ window.__tape = {
         // a built second pair carries its own p.pc, and its audio stripes ride
         // pcmLadder(role) — pcmConn reports its idx-0 (main) pc.
         conn: (p.media ? pc : p.pc)?.connectionState ?? null,
+        recovers: window.__recoverStats,
         pcmConn: (p.media ? pc : (pcmLadder(p.role)?.[0] ?? p.pc))?.connectionState ?? null,
         // Lane A FLOW for this pair, not intent. `pcmHalf` is its receive-half
         // index; `pcmDc` is assoc-0's channel state (null on the media pair,

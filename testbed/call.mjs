@@ -526,6 +526,11 @@ const grab = async (s) =>
       // Lane A (lossless PCM audio) is likewise invisible to getStats() —
       // with the lane on, the pc carries no audio track at all.
       pcmAudio: t?.pcm ?? null,
+      // Reconnects. Read straight off the window, because the previous attempt to
+      // count these grepped the driver's stdout and found 0 at both rtt=180 and
+      // rtt=300 -- the status text lives in the DOM, so the instrument could not
+      // see the event and reported the same number either way.
+      recovers: (typeof window !== 'undefined' && window.__recoverStats) || null,
       // §10 session-clock sync (offset/drift/epoch) — null when the bundle is off.
       timesync: t?.timesync ?? null,
       // Lane 0 (§3.1 levers 3+4): app-side policy counters; wire counters ride
@@ -823,6 +828,10 @@ if (ra.pcmAudio || rb.pcmAudio) {
     // was no way to tell whether spread had genuinely seen 168 ms of dispersion
     // or the demand had come from somewhere else entirely. Printing the raw
     // want, the held peak and the post-warm spread max separates those.
+    if (r.recovers) {
+      const rc = r.recovers;
+      log(`      recovers asked ${rc.asked ?? 0}  ran ${rc.ran ?? 0}  capped ${rc.capped ?? 0}  why ${JSON.stringify(rc.why ?? {})}`);
+    }
     log(
       `      jit spreadMax ${p.jitSpreadMaxRun ?? '?'} ms @${p.jitSpreadMaxAtMs ?? '?'} ms (warm ${p.jitWarmMs ?? '?'}; late ${p.jitSpreadMaxLate ?? '?'} @${p.jitSpreadMaxLateAtMs ?? '?'} ms)` +
         `  holdMax ${p.jitHoldMaxRun ?? '?'} ms  wantMax ${p.jitWantMaxRun ?? '?'}f  clampedTicks ${p.jitClampedTicks ?? '?'}` +
