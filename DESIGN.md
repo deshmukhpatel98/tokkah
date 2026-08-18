@@ -4745,6 +4745,44 @@ Screenshots: `scratchpad/ui-shots/{ratio}-{1-lobby,2-waiting,3-incall-A,3-incall
 
 *Coordinator verification 2026-08-02: suites re-run independently on the merged tree — tsc 0, onset 69/69, turntaking 45/45, pcmrs ok; screenshots inspected (phone waiting = full-screen self view, zero stats; desktop in-call = remote-fullscreen + corner PiP); `STATS_UI` gate confirmed at app.js:58/1848 (chip hidden without `?stats=1`, DOM-scan clean); loopback lane numbers spot-checked against run `ui-lanes90-bot-msatfavb-4zm7`. Deployed in version 35118ff8 (train: #22 stall + #32 hardening + #28 UI), prod headers + served app.js/tape.js verified byte-identical to the working tree post-deploy.*
 
+## 17.31 The distance numbers were measured on a delay line — corrected (2026-08-18)
+
+17.30's sweep used `call.mjs --rtt=N`, which leaves **jitter 0, loss 0, bandwidth
+unlimited**. That is a constant-delay pipe, not a network, and the thing it
+removes is precisely what a jitter buffer exists to absorb. Every number in that
+section is optimistic. Re-run with `--net=real` (jitter 8 ms, loss 0.3%):
+
+| sim RTT | 17.30, delay line | corrected, real conditions |
+|---|---|---|
+| 0 | 48.1 ms | **55.9 ms** |
+| 100 | 99.8 ms | **106.6 ms** |
+| 140 | 116.0 ms | **133.0 ms** |
+| 180 | 136.1 ms | **157 / 274 ms** (sides diverge) |
+| 220 | 151.7 ms | **173.5 / 309 ms** (sides diverge) |
+
+**Three corrections.** The fixed overhead is ~56 ms, not 48 — real jitter costs
+about 8 ms of buffer the delay line never charged. Delhi-Amsterdam is 133 ms, not
+116, so the margin under the goal is a third of what was claimed. And the
+crossing is not at RTT ~205: at 180 one side is already at 274 ms. **The
+~14,000 km reach is withdrawn.** The defensible statement is now roughly RTT
+<= 150 — Delhi to Europe, with Delhi-New York marginal.
+
+**And the bug is not an edge case.** 17.30 hunted the buffer-inflation fault at
+rtt=260 because that is where a delay line first showed it. Under real conditions
+it appears at **rtt=180** — depth 154 ms, target 19f — in an ordinary five-point
+sweep, and asymmetrically: one side of the same call is fine while the other
+inflates. That reframes the whole investigation. It is not a long-haul curiosity,
+it is a defect inside the range the product is actually for, and the asymmetry
+(same call, same conditions, opposite outcomes) is a new and strong clue that was
+invisible while both sides saw a perfectly regular pipe.
+
+**Why this happened, recorded because the mechanism is general:** the knobs
+existed the whole time and the artificial condition was the DEFAULT. An
+unrealistic test that is one flag shorter than a realistic one is the test that
+gets run. `call.mjs` now exits 2 on a bare `--rtt`, prints the profile list, and
+stamps the conditions into the run tag, so a number cannot be quoted apart from
+what produced it.
+
 ## 17.30 How far around the earth is 150 ms? (2026-08-18)
 
 The goal is "any call, anywhere on earth, under 150 ms". That is a question with
