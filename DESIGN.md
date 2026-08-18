@@ -7340,3 +7340,52 @@ neither losslessness nor usable latency — 550 ms with 26 s of concealment is
 damaged audio arriving late. A path that can carry 1.5 Mbps keeps PCM; one that
 cannot falls back and stays under ~210 ms. Both are now measurable on the same
 scale, which is what this section unblocked.
+
+## 17.40 The margin frame: exactly the predicted 8 ms, on two usable rounds
+
+At rtt=180 with the lossless lane the median is 152.7 ms — **2.7 ms over the
+goal**. The target there is 4f, of which one frame is `D_MARGIN_FRAMES`, a safety
+margin sized when `spread` still included startup contamination. 17.34 removed
+that contamination, so the margin may now be paying for a risk that no longer
+exists. One frame is 8 ms and the gap is 2.7.
+
+`?pcmjitmargin=0`, 8 calls at rtt=180, alternated. **Half the rounds were
+unusable, and the instruments said so rather than the numbers being quietly
+wrong:**
+
+- r1's control ran with **emulator loop lag 126.3 ms**, past the 100 ms trust
+  threshold. Discarded. Without the lag counter added in 17.37 this would have
+  been scored against a jostled ruler.
+- r3's arm produced **no snapshot at all** — no m2e, no target. Discarded.
+
+| round | M0 | M1 | delta |
+|---|---|---|---|
+| r2 | 151.45 | 158.80 | -7.35 |
+| r4 | 147.45 | 157.40 | -9.95 |
+
+**Median -8.65 ms against a predicted -8.0.** The mechanism is visible too:
+targets read 3f where the control read 4f (r1, r4).
+
+### Why this is not being defaulted on
+
+The number matches theory almost exactly, and that is precisely when to be
+careful — a matching value is the most persuasive kind of noise, and this
+project has already withdrawn five claims this session for resting on too few
+paired rounds. Two usable rounds is not enough, whatever the agreement.
+
+Three things also argue against, all small and all pointing the same way:
+
+- **Concealment rose ~19%** — 544 ms across M0's four sides against 456 for M1.
+  The margin is doing *something*; it is not pure waste.
+- **Under-150 count is unchanged**, 1/4 for both arms. The median moved and the
+  thing that actually matters did not follow, which is the same shape as the
+  queue gate in 17.35 (its own metric improved, the goal metric did not).
+- **One M0 run produced nothing** against zero such runs for M1. Probably chance
+  at n=4; worth counting rather than ignoring, since `D_MARGIN_FRAMES` also
+  feeds `holdCeil`.
+
+So: promising, underpowered, and cheap to settle — 12 usable rounds at rtt=180
+with the lag threshold enforced, scoring concealment and under-150 count
+alongside the median. If it holds, it is 8 of the 53 ms of overhead and it takes
+rtt=180 under the goal **with lossless audio**, which no configuration has yet
+done.
