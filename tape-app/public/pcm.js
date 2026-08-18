@@ -2557,15 +2557,24 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const hdr = compact ? HDR_DATA_C : HDR;
         const seq = compact ? dv.getUint32(1) : dv.getUint32(4);
         // Both timestamps come from the anchor under compact framing. capUs is
-        // exact (8000 µs/seq by construction); wall becomes the frame's ideal
+        // exact (FRAME_MS*1000 µs/seq by construction); wall becomes the frame's ideal
         // capture instant rather than its send instant, which is what ageMs
         // should have been measuring. With no anchor yet, capUs 0 lets capUsFor
         // fall back exactly as it does for an FEC-repaired frame.
+        // FRAME_MS, not 8. These two lines are the seq->wall-clock conversion and
+        // they carried the frame duration as a bare literal, which the §17.44
+        // de-literalisation could not have caught: it replaced every `384`, and
+        // the number here is `8`. Measured at FRAME_MS=4 (§17.46): the sequence
+        // advances twice as fast, `wall` outruns real time, and `now() - wall`
+        // went to -99.6 ms -- frames timestamped as arriving before capture.
+        // m2e came back null only because the snapshot refuses negative
+        // compositions; the unguarded value would have read ~44 ms and looked
+        // like the goal had been beaten.
         const wall = compact
-          ? (anchSeq >= 0 ? anchWall + (seq - anchSeq) * 8 : NaN)
+          ? (anchSeq >= 0 ? anchWall + (seq - anchSeq) * FRAME_MS : NaN)
           : dv.getFloat64(8);
         const capUs = compact
-          ? (anchSeq >= 0 && anchUs > 0 ? anchUs + (seq - anchSeq) * 8000 : 0)
+          ? (anchSeq >= 0 && anchUs > 0 ? anchUs + (seq - anchSeq) * FRAME_MS * 1000 : 0)
           : (data.byteLength >= HDR ? dv.getFloat64(16) : 0);
         stats.framesRecv++;
         a.framesRecv++;
