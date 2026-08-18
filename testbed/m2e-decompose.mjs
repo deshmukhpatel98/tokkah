@@ -46,7 +46,12 @@ const median = (arr) => {
 
 async function main() {
   const room = `m2e-${Date.now().toString(36)}`;
-  const url = `https://room.tokkah.com/?r=${room}`;
+  // Flags, so this can be an A/B rather than a single reading. It measures the
+  // budget the whole project is graded on and could only ever report one arm,
+  // which is how a suspected clean-path regression had no way to be tested.
+  //   node testbed/m2e-decompose.mjs --qs='&pcmjitfar=0'
+  const extraQs = process.argv.find((a) => a.startsWith('--qs='))?.slice(5) ?? '';
+  const url = `https://room.tokkah.com/?r=${room}${extraQs}`;
   console.log(`[m2e-decompose] Launching 2 peers into room: ${room}`);
 
   const bA = await chromium.launch({ executablePath: CHROME, headless: true, args: argsFor('a') });

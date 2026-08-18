@@ -2245,6 +2245,21 @@ const PCM_CFG = {
   // frame 8 + netAge ~2). Must sit BELOW holdCeil (248 ms base) or it discards
   // only what the clamp already discards — which is what 384 ms did.
   jitterFarMs: Number(QS.get('pcmjitfarms')) || 120,
+  // Lane liveness probe period. 400 makes dead-route detection ~3x faster
+  // (worst case 8.0 s -> 2.8 s) for 135 B/s across six lanes.
+  //
+  // A SUSPECTED 4 ms COST HERE DID NOT SURVIVE A SECOND RUN, and the story is
+  // worth keeping because it nearly caused a bad revert. One m2e-decompose at
+  // `&pcmpingms=2000` read 43.6 ms against 47.6 for the default, so the fast
+  // ping looked like it cost 4 ms of mouth-to-ear on every call. Setting the
+  // DEFAULT to 2000 and re-measuring returned 47.7 — the same high value. The
+  // 43.6 was a low draw, not the flag. Clean-path m2e ranges 42.4-49.2 across
+  // today's runs and a single reading per arm cannot resolve 4 ms of it.
+  //
+  // So: no measured clean-path cost, a measured fault-path benefit, default
+  // stays 400. `?pcmpingms=` remains the control arm — and the next attempt at
+  // this question uses PAIRED REPEATS, the way the stall rig now does.
+  pingMs: Number(QS.get('pcmpingms')) || 400,
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',

@@ -645,7 +645,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // condemned whichever lanes it caught. Measured on a clean same-route call
     // with no stall and 1 ms of skew: 3 lanes demoted out of nowhere. Declared
     // here, above every use, rather than beside the timer it feeds.
-    const PING_MS = 400;
+    // A LIVE KNOB, and it should have been one when the value moved. Dropping
+    // this 2000 -> 400 put 5x the message rate on the same associations the
+    // audio rides, and it shipped with no way to A/B it — so when the clean
+    // path drifted 43.6 -> 47.6 ms of mouth-to-ear (ring 13.5 -> 17.5) the same
+    // day, the prime suspect was the one change that could not be tested. The
+    // far-arrival bound WAS testable and was cleared in minutes by its control
+    // arm; this one had to be argued about. Every knob that touches the audio
+    // path gets a control arm, including the ones that look too small to matter.
+    const PING_MS = Math.max(50, cfg.pingMs ?? 400);
     /**
      * How long silence has to last before it means death — in MILLISECONDS,
      * and relative to the lane's own round trip.
