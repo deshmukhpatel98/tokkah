@@ -22,7 +22,7 @@ const CAM = '/Users/deveshpatel/Downloads/video calling/testbed/media/cam1080.mj
 const AUD = '/Users/deveshpatel/Downloads/video calling/testbed/media/conv/A.wav';
 
 // Unknown flags must be FATAL (see crossengine.mjs for the incident).
-const KNOWN = new Set(['sec', 'query', 'base', 'every', 'port', 'order', 'peer', 'queryA', 'queryB', 'stall', 'stallms', 'stallevery', 'stallfrom', 'json']);
+const KNOWN = new Set(['sec', 'query', 'base', 'every', 'port', 'order', 'peer', 'queryA', 'queryB', 'stall', 'stallms', 'stallevery', 'stallfrom', 'json', 'realcam']);
 for (const a of process.argv.slice(2)) {
   const m = /^--([a-zA-Z]+)(=|$)/.exec(a);
   if (!m || !KNOWN.has(m[1])) { console.error(`unknown flag: ${a}\nknown: ${[...KNOWN].map((k) => '--' + k).join(' ')}`); process.exit(2); }
@@ -39,6 +39,15 @@ const QUERY = arg('query', 'tape=2&pcmdiag=1');
 const QUERY_A = arg('queryA', QUERY);
 const QUERY_B = arg('queryB', QUERY);
 const BASE = arg('base', 'https://room.tokkah.com');
+// --realcam drops the synthmedia hook and lets Safari open the ACTUAL sensor.
+// The header above says WebDriver cannot answer a camera prompt, and that is
+// true — but it is only a blocker the FIRST time. Safari persists camera
+// permission per site, so if room.tokkah.com has been granted once by hand,
+// getUserMedia resolves with no prompt and the run is on a real sensor. That
+// is the one route to satisfying the real-sensor law from this machine:
+// Chrome for Testing gets no answer at all (camprobe: "HUNG", 1 video input
+// present) and the in-app browser refuses by policy (NotAllowedError).
+const REALCAM = process.argv.includes('--realcam');
 const PORT = Number(arg('port', 4747));
 // --peer=brave runs the REAL installed Brave (its own binary, throwaway
 // profile) so the pair is two shipping browsers — the configuration the
@@ -175,7 +184,7 @@ const fmt = (s) => {
 const room = 'sf' + Math.random().toString(36).slice(2, 8);
 console.log(`\nREAL Safari <-> ${C.engine}   room=${room}   A=${QUERY_A} B=${QUERY_B}   ${SEC}s${STALL !== '0' ? `  stall=${STALL} ${STALL_MS}ms/${STALL_EVERY}s from ${STALL_FROM}s` : ''}\n${'='.repeat(78)}`);
 try {
-  await S.goto(`${BASE}/?r=${room}&${QUERY_A}&synthmedia=1`);
+  await S.goto(`${BASE}/?r=${room}&${QUERY_A}${REALCAM ? '' : '&synthmedia=1'}`);
   // Wedge tracer. Batch of 2026-08-05: runs died at "never connected" with
   // Safari's #status reading "connecting…" — which is that div's DEFAULT text,
   // visible call screen or not, so the error line said nothing. These hooks
@@ -213,8 +222,50 @@ try {
   for (let i = 0; i < 60; i++) {
     const ok = await S.eval(`return (document.querySelector('#preview')?.videoWidth ?? 0) > 0;`);
     if (ok) break;
-    if (i === 59) throw new Error('Safari preview never lit (synthmedia hook not live?)');
+    if (i === 59) {
+      throw new Error(REALCAM
+        ? 'Safari preview never lit — the camera prompt is probably sitting unanswered. '
+          + 'WebDriver cannot click it. Open Safari by hand once, load '
+          + `${BASE}, allow the camera, then re-run with --realcam.`
+        : 'Safari preview never lit (synthmedia hook not live?)');
+    }
     await new Promise((r) => setTimeout(r, 500));
+  }
+  // IS IT ACTUALLY A SENSOR? A camera macOS has denied does not throw: the
+  // promise resolves, the track reads "live", videoWidth is non-zero, and every
+  // frame is uniformly black. Waiting for videoWidth would report a real-sensor
+  // run while measuring a black rectangle — a rig blind to the defect it exists
+  // to catch. A real room is never uniform and never twice identical, so this
+  // demands spatial variance AND frame-to-frame change before the numbers from
+  // this run are allowed to be called real-sensor numbers.
+  if (REALCAM) {
+    const cam = await S.eval(`
+      const v = document.querySelector('#preview');
+      const t = (v.srcObject && v.srcObject.getVideoTracks && v.srcObject.getVideoTracks()[0]) || null;
+      const c = document.createElement('canvas'); c.width = 160; c.height = 90;
+      const x = c.getContext('2d');
+      const luma = () => { x.drawImage(v, 0, 0, 160, 90);
+        const d = x.getImageData(0, 0, 160, 90).data, a = new Float64Array(14400);
+        for (let i = 0; i < 14400; i++) a[i] = 0.299*d[i*4] + 0.587*d[i*4+1] + 0.114*d[i*4+2];
+        return a; };
+      const f0 = luma();
+      const t0 = Date.now(); while (Date.now() - t0 < 250) {}
+      const f1 = luma();
+      let m = 0; for (const q of f0) m += q; m /= 14400;
+      let vv = 0; for (const q of f0) vv += (q - m) * (q - m); vv /= 14400;
+      let ch = 0; for (let i = 0; i < 14400; i++) ch += Math.abs(f1[i] - f0[i]); ch /= 14400;
+      return JSON.stringify({ label: t && t.label, w: v.videoWidth, h: v.videoHeight,
+        mean: +m.toFixed(1), variance: +vv.toFixed(1), change: +ch.toFixed(3) });
+    `);
+    const r = JSON.parse(cam);
+    const real = r.variance > 25 && r.change > 0.2;
+    console.log(`  REAL SENSOR CHECK: "${r.label}" ${r.w}x${r.h}  mean ${r.mean} `
+      + `variance ${r.variance} change ${r.change}/px  -> ${real ? 'REAL' : 'NOT REAL'}`);
+    if (!real) {
+      throw new Error(`--realcam asked for a sensor and got a ${r.variance <= 25 ? 'flat' : 'frozen'} picture `
+        + `(variance ${r.variance}, change ${r.change}). macOS is denying the camera to Safari, or it is `
+        + 'covered. Refusing to report these as real-sensor numbers.');
+    }
   }
   await C.page.waitForFunction(() => document.querySelector('#preview')?.videoWidth > 0, null, { timeout: 30000 });
   // --order=c puts Chromium in first (role a). The Playwright pair runs the
