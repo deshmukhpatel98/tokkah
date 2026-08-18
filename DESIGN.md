@@ -4855,11 +4855,38 @@ rescue — the same shape as the three "acting on a signal erases the signal" tr
 already found in this file, and a fourth instance of a flat RTT-blind constant
 deciding behaviour.
 
-Stated as a hypothesis, not a finding: `reAnchors` itself is not in `call.mjs`'s
-printed output, so it was still not captured. Adding it to that output is the one
-cheap step that would settle whether the rescue never fired (`0`) or fired and
-immediately lost the anchor again (climbing). Those remain different bugs with
-different fixes.
+**The counter was added, and it refutes that hypothesis.** Three more calls at
+260:
+
+| run | reAnchors | concealed | held | FEC repaired (late) | m2e |
+|---|---|---|---|---|---|
+| broken | **1** | 6456 ms | 4296 | 54 (**49**) | 398.8 ms |
+| broken | **2** | 4800 ms | 3048 | 67 (3) | 461.5 ms |
+| clean | **0** | 0 ms | 0 | 0 (0) | 171.2 ms |
+
+Not zero, so the rescue is not held shut and the masked-trigger story above is
+wrong. Not climbing either, so it is not thrashing. It fires once or twice and
+**the damage continues anyway**: two droughts account for about 2 s, against 6.4 s
+concealed. Re-anchoring is reaching the deadlock and not resolving it.
+
+The other number worth keeping is `FEC repaired 54 (late 49)`. Nine of every ten
+repairs arrive after the playhead has passed — FEC is spending parity to
+reconstruct frames that are then thrown away. On the clean run it repairs nothing
+at all, so this is not steady-state cost, it is the fault recruiting the recovery
+machinery into wasted work.
+
+So the shape is now bounded on three sides — it is not the network (3.3 ms of
+arrival spread), not the harness (0/4 at rtt=0), and not an unreachable rescue
+(reAnchors 1-2) — and the remaining question is why a re-anchor does not restore
+the stream. That is where the next session should start, and it should start by
+reading what `reAnchor()` leaves behind: it sets `startSeq = seq`, fills `tags`
+with -1, sets `reprime = true` and posts `reprime` to the worklet. If the worklet
+then re-primes against a `target` that the late-storm has already pinned at 32f,
+priming needs 32 present frames before playout resumes — a quarter of a second of
+audio that must land contiguously while the stream is still arriving a ring
+ahead. That would explain a rescue that fires, is correct in principle, and
+cannot complete in practice. Unverified: stated as the next thing to test, not as
+a result.
 
 ## 17.29 The buffer was being sized by frames it could never have played (2026-08-18)
 

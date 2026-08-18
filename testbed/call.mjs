@@ -747,7 +747,12 @@ if (ra.pcmAudio || rb.pcmAudio) {
     log(
       `      FEC repaired ${p.fecRepaired} (late ${p.fecRepairedLate ?? 0})  failed ${p.fecFailed}  parityUnused ${p.parityUnused}` +
         `  concealed ${p.concealedMs} ms (extrapolated ${p.extrapolatedMs}, held ${p.heldMs})` +
-        `  overflowSkips ${p.overflowSkips}`,
+        `  overflowSkips ${p.overflowSkips}` +
+        // reAnchors, because the far-future rescue is the thing under suspicion
+        // and this line printed every counter around it except whether it fired.
+        // 624 refusals were observed with no way to tell "never reached" from
+        // "reached and lost the anchor again" — different bugs, one counter.
+        `  reAnchors ${p.reAnchors ?? '?'}`,
     );
     log(
       `      depth ${p.depthMs} ms  target ${p.targetFrames}f  drift ${p.driftPpm} ppm` +
