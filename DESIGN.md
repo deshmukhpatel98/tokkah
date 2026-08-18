@@ -7042,3 +7042,69 @@ about the median being a good case plus a tail — and it means **any single run
 at rtt=300 is uninformative.** Everything measured here from now on needs
 repeats, and the earlier single-run numbers (including the 941 ms in the sweep)
 should be read as draws from a wide distribution, not as the value.
+
+## 17.37 The rig is exonerated, and the offered rate is the distance limit
+
+### The ruler was measured, and it is steady
+
+netsim holds every datagram in a `setTimeout`, so emulated distance is a
+property of the Node event loop's punctuality — if the loop is late by L, every
+packet in flight is late by up to L, and from inside the browser that is
+indistinguishable from the network batching. netsim has measured its own lag all
+along; `call.mjs` never printed it. **That is the third counter in one session
+that existed and was invisible** (after the estimator's provenance in 17.34 and
+the arrival-gap statistics in 17.36).
+
+    rtt=180   loop lag p50 0.2  p95 1.1  max 4.2 ms   (steady)
+    rtt=300   loop lag p50 0.1  p95 0.9  max 40 ms    (steady)
+
+Printed on the same line as the verdict it could invalidate, with an explicit
+"THE RULER WAS JOSTLED" warning above p95 20 ms / max 100 ms. **The batching is
+real and it is in the browser's transport.**
+
+### Everything else is now eliminated
+
+| candidate | ruled out by |
+|---|---|
+| the emulator dropping | `0 by accident`, `0 to the bandwidth ceiling` |
+| the emulator batching | loop lag p95 0.9 ms at rtt=300 |
+| session resets | `recoverStats asked 0, ran 0` |
+| run duration | wall clock 111.8 s vs 113.4 s |
+| main-thread blocking | tick lateness 6-7 ms, 0/76 ticks >100 ms |
+| the jitter estimator | 17.33/17.34; it sizes correctly for a 1.2 s hole |
+| the queue gate | cut backlog 14x and lane RTT 3.6x, m2e unmoved |
+| SCTP reliability / HOL | all channels are `ordered: false, maxRetransmits: 0` |
+
+### What is left, and why it is the rate
+
+With `maxRetransmits: 0` there is no retransmission and no head-of-line
+blocking — but **SCTP still paces by congestion window, and a message sitting in
+the send queue has not been transmitted yet, so nothing abandons it.** It simply
+waits for cwnd. That is the mechanism behind everything observed: 52-379 KB of
+backlog, lane RTT of 2300-4143 ms against a `baseRtt` of 288, delivery in
+sub-millisecond clumps separated by ~1 s silences.
+
+And the rate is not modest. `OFFER_BPS` is 125 pps x 1168 B x 1.3 =
+**~189,800 B/s, about 1.5 Mbps for audio alone.** Against the stated budget of
+~1 Mbps for the whole call, the lossless PCM lane is already over budget before
+video is counted. At 180 ms RTT the path carries it; at 300 ms, six SCTP
+associations with 0.3% loss cannot, cwnd collapses, and the queue becomes the
+latency.
+
+**So the distance limit is the audio bitrate, not a bug to be found.** That
+reframes the remaining work: no further elimination will help, because nothing
+is broken in the sense the last several sections assumed.
+
+### The test that decides it, and the direction
+
+Decisive and cheap: run rtt=300 with the lossless lane off, so audio falls back
+to Opus at ~40 kbps. If mouth-to-ear returns to `floor + small`, the rate is
+confirmed as the limit and the fix is a lower-rate lossless mode — the goal asks
+for lossless audio and ~1 Mbps, and 1.5 Mbps of uncompressed PCM satisfies
+neither. Lossless *compression* (FLAC-class, roughly 50-60% on speech) or a
+mono lane at long distance would bring the offered rate under what a 300 ms path
+sustains, without giving up losslessness.
+
+If Opus at rtt=300 is *also* broken, then the rate is not the limit and the
+fault is in how this code drives SCTP — which would be a genuine bug and the
+next thing to find.

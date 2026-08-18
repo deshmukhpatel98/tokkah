@@ -655,7 +655,22 @@ if (sim) {
       `${sim.stats.sendErrors} by accident` +
       (sim.stats.unreachable ? `, ${sim.stats.unreachable} to an unreachable address (benign)` : '') +
       (sim.stats.sendErrors ? `  [${Object.entries(sim.stats.errCodes).map(([k, v]) => k + '×' + v).join(', ')}]` : '') +
-      (sim.stats.sendErrors ? '  ← THE EMULATOR LOST PACKETS; the run is not trustworthy' : ''),
+      (sim.stats.sendErrors ? '  ← THE EMULATOR LOST PACKETS; the run is not trustworthy' : '') +
+      // THE RULER'S OWN STEADINESS. netsim holds every datagram in a setTimeout, so
+      // emulated distance is a property of THIS event loop's punctuality: if the
+      // loop is late by L, every packet in flight is late by up to L, and from
+      // inside the browser that is indistinguishable from the network doing it.
+      // netsim has measured this all along and call.mjs never printed it -- the
+      // third counter today that existed and was invisible. A batched-arrival
+      // finding at long RTT is exactly what a lagging emulator would fake, so
+      // this has to be on the same line as the verdict it could invalidate.
+      (() => {
+        const l = sim.loopLag?.() ?? null;
+        if (!l) return '';
+        const bad = (l.p95 ?? 0) > 20 || (l.max ?? 0) > 100;
+        return `\n  emulator loop lag p50 ${l.p50 ?? '?'} p95 ${l.p95 ?? '?'} max ${l.max ?? '?'} ms` +
+          (bad ? '  ← THE RULER WAS JOSTLED; arrival-timing findings from this run are not trustworthy' : '  (steady)');
+      })(),
   );
   const qd = sim.queueDelay();
   // The queue delay is the finding, not a diagnostic: it is how much latency the sender's own
