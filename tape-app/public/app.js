@@ -2231,6 +2231,11 @@ const PCM_CFG = {
   holdArm: QS.get('pcmholdarm') === '0' ? false : undefined,
   holdArmMs: Number(QS.get('pcmholdarmms')) || undefined,
   holdArmMaxMs: Number(QS.get('pcmholdarmmaxms')) || undefined,
+  // Safety frame added on top of the measured spread. 1 = shipped. Worth an A/B
+  // now that the estimator's input is clean: the margin was sized against a
+  // spread that included startup contamination, so it may be paying twice.
+  // Number() alone would swallow 0, which is the arm worth testing.
+  jitterMarginFrames: QS.has('pcmjitmargin') ? Number(QS.get('pcmjitmargin')) : undefined,
   // Latency governor (task #47): trims buffer depth the measured per-frame
   // slack proves the call never needed. STAYS OPT-IN — the gates ran and were
   // NOT met (2026-08-05, all on real shipping browsers): under injected

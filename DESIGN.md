@@ -6758,3 +6758,78 @@ measure **143.7 / 144.4 ms** against the arithmetic floor for this distance:
 90 propagation + 25 ring + 20 audio + 8 frame = 143.
 
 Remaining at this distance: median 152.7 ms against a 150 ms goal, 5/14 under.
+
+## 17.35 The cliff is not the estimator — it is our own send queue
+
+Distance sweep after 17.34, `--net=real`, two calls per point, against each
+distance's arithmetic floor (`one-way + 25 ring + 20 audio + 8 frame`):
+
+| rtt | floor | measured | excess |
+|---|---|---|---|
+| 140 | 123 | 140.6 / 151.5 / 152.9 / 136.5 | +23 |
+| 180 | 143 | 148.3 / 166.4 / 155.1 / 156.6 | +13 |
+| 220 | 163 | 194.1 / 180.4 / 205.1 / 191.3 | +30 |
+| 260 | 183 | **462.2 / 468.9** / 230.2 / 222 | +39 … **+286** |
+| 300 | 203 | **941.4 / 720.7 / 505.1 / 494.6** | **+292 … +738** |
+
+A hard cliff between 220 and 260, intermittent at 260, total by 300 (4/4).
+17.31 saw this at 260, got a clean repeat, and wrote it off as an intermittent
+fault. It is not intermittent — 260 is simply the edge of it.
+
+**It is a different defect from 17.33/17.34, and reproducible at rtt=300**,
+which makes it far cheaper to work on than anything chased so far today.
+
+### What the counters say
+
+    depth 373.8 ms  target 41f  drift 5065 ppm  age p50 173.2  p95 1750.1
+    (rtt 859.79, baseRtt 286.33)  mouthToEar 575
+    FEC repaired 1072 (late 88)  concealed 9304 ms  reAnchors 5
+    bands 114.9 / 122 / 99 / 119.9 / 115.7 / 3826.8
+    [0] rtt 859.79 baseRtt 286.33 buffered 0
+    [2] rtt 1055.33 baseRtt 289.16 buffered 52310
+    [3] rtt 1027.99 baseRtt 289.21 buffered 0      (other side: 72644)
+
+- **Our own SCTP send queues are backing up** — 52-72 KB on individual lanes.
+  At rtt<=220 `buffered` is 0 everywhere.
+- Lane RTT inflated to 859-1804 ms against a baseRtt of ~287. That is queueing
+  delay, self-inflicted.
+- `age p95` 1750 ms. `FEC repaired` 1072 against ~30 at rtt=180.
+- Bands 0-4 are flat at ~100-122 ms and band 5 is 3826.8. **A progressive
+  collapse over the call, not a startup transient** — the opposite shape to
+  17.33, which is how it is distinguishable at a glance.
+
+### The mechanism
+
+`backlogLimit()` is already RTT-relative, and that is exactly the bug:
+
+    limit = max(queueBytes, (rtt/1000) * OFFER_BPS * 1.5 + 2 frames)
+
+`OFFER_BPS` = 125 pps x 1168 B x 1.3 = ~189,800 B/s. At rtt=300 that is **~84 KB**
+— and every observed backlog (52/65/72 KB) sits *under* it, so the gate never
+fires.
+
+One BDP of unacked bytes is legitimately in flight; anything beyond it is queue.
+Writing the budget as `BDP x 1.5` therefore tolerates **0.5 x BDP of pure queue,
+which grows with distance**: ~143 ms of queue allowed at rtt=300 against ~90 ms
+at rtt=180. The gate widens exactly as the path gets long enough for the queue
+to hurt.
+
+This is the mirror image of the `rtt-blind-timeouts` class this project has hit
+three times. There the bug was a constant where the value should scale with RTT.
+Here it is a scaling where the value should be constant: **queue tolerance is a
+latency budget and belongs in milliseconds.**
+
+    limit = BDP + QUEUE_MS * rate      (QUEUE_MS fixed, ~30)
+
+instead of `BDP * 1.5`. At rtt=300 that is 317 ms of bytes rather than 430 —
+about 113 ms of self-inflicted delay removed; ~60 ms at rtt=180.
+
+### Not yet attempted
+
+The formula change above is reasoned, not measured. What must be checked before
+believing it: whether shrinking the gate merely converts queue into drops
+(`drop(link)` was 78-80/lane on one side against 13-14 on the other), and
+whether cwnd recovery at rtt>=260 is the real driver — 0.3% loss with
+RTT-paced recovery across six associations may mean throughput simply never
+returns to the offered rate, in which case the gate is a symptom and the
+offered rate is the problem.
