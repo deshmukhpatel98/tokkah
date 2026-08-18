@@ -7426,3 +7426,54 @@ comparable and only the paired deltas are. What can be said: 8 ms of the ~53 ms
 overhead is now gone, under-150 calls went from 1-in-8 to roughly 1-in-3.5, and
 the remaining overhead is ~20 ms output latency (platform floor, ~4 ms of it the
 headless testbed) plus ~25 ms of jitter buffer.
+
+## 17.41 What is left at rtt=180, stated as an inequality
+
+`mouthToEarMs = 8 + age + depthMs + outputLatency` (§pcm.js snapshot). At
+rtt=180 `--net=real`, measured: `age p50` ~91.6 ms, `outputLatency` 20 ms. So
+
+    m2e = 119.6 + depthMs
+
+and the goal at this distance is exactly:
+
+    depthMs < 30.4 ms
+
+The target is now 3f = 24 ms (§17.40), so **there is 6.4 ms of headroom and the
+whole question is whether ring depth stays near its target.** It does not,
+consistently. Two sides from the same round:
+
+    m2e 141.2  ->  depth 21.6 ms   (at target)
+    m2e 162.3  ->  depth 42.7 ms   (target + 18.7)
+
+Same target, same network, 21 ms apart. Under-150 was 7/24 sides, which is
+simply the fraction of the time depth stayed under 30.4.
+
+### So the remaining defect is depth wandering above target, not the target
+
+This is worth stating precisely because every fix this session has been aimed at
+the *target* — the estimator (17.33), the hold (17.34), the margin frame
+(17.40) — and the target is now right: 3f against a measured arrival spread of
+17-21 ms is very close to optimal, and that spread is the netsim's injected 8 ms
+heavy-tailed jitter, which is real and irreducible.
+
+What is not right is that the ring runs above what the target asks. The drain
+path exists (the worklet resamples, clamped by `maxDrain` at 20000 ppm, which
+would clear 18 ms of excess in under a second) so the question is why it is not
+converging — whether depth is being refilled as fast as it drains, or the drain
+only engages on some condition, or `depthMs` and `target` are measured at
+different points in the ring.
+
+### Why this is the right next thing
+
+- It is **bounded and arithmetic**: 6.4 ms of headroom, one variable.
+- It is the **only remaining term** at this distance. Propagation is physics,
+  `outputLatency` is at the platform floor (and ~4 ms of the 20 is the headless
+  testbed — a real browser reports 16), the frame is 8 ms by design, and the
+  target is now correct.
+- Closing it takes rtt=180 under 150 ms **with lossless audio**, which nothing
+  has achieved yet.
+
+The instrument needed is a depth-versus-target trace over the call, not a
+snapshot: the snapshot says depth is high at the end, not whether it started
+high and never drained or drifted up late. `--trace` already exists for the
+level detector and the same 20 Hz cadence would answer this.
