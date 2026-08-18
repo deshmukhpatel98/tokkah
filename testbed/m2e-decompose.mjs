@@ -166,6 +166,17 @@ async function main() {
       fecRepaired: { 'Peer A': fecRepairedA, 'Peer B': fecRepairedB },
     });
 
+    // MACHINE-READABLE, so this can be driven in paired rounds from outside
+    // (testbed/m2e-ab.mjs). The tables above are for a human reading one call;
+    // they cannot be aggregated, and a single call cannot resolve the ~7 ms of
+    // run-to-run spread this metric actually has (42.4-49.2 ms observed in one
+    // day). Reading one of them as a result is how a 4 ms "regression" got
+    // diagnosed, acted on, and then contradicted by the very next run.
+    console.log('M2ERESULT ' + JSON.stringify({
+      m2eA, m2eB, ringA: ringDepthA, ringB: ringDepthB,
+      outA: outputA, outB: outputB, netA: netAgeP50A, netB: netAgeP50B,
+    }));
+
     // Determine largest component of mouthToEarMs breakdown
     const partsAvg = [
       { name: 'frameMs', val: ((frameMsA ?? 0) + (frameMsB ?? 0)) / 2 },
