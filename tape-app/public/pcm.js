@@ -292,10 +292,30 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // its gate is the FULL design-rate budget — an association absorbing spilled
   // frames from a congested sibling needs headroom for exactly that, and a
   // gate shrunk by 1/N would re-create the wall the stripe exists to remove.
+  // `?pcmqms=N` (§17.35): state the queue allowance in MILLISECONDS instead of as
+  // a multiple of the BDP. `BDP x 1.5` tolerates 0.5 x BDP of pure queue, so the
+  // allowance GROWS with distance -- ~143 ms of queue permitted at rtt=300
+  // against ~90 at rtt=180 -- and the gate widens exactly as the path gets long
+  // enough for the queue to hurt. Measured at rtt=300: lane backlogs of
+  // 52/65/72 KB against an 84 KB gate, so it never fired, and lane RTT inflated
+  // to 859-1804 ms against a baseRtt of 287.
+  //
+  // One BDP of unacked bytes is legitimately in flight and is not queue. Only
+  // the excess is, and how much of it is tolerable is a LATENCY budget.
+  //
+  // Left OFF by default. The comment above records a measured collapse
+  // (pcm-loss2) from making this gate too tight, and audio the gate sheds is
+  // audio the concealer has to cover -- so this trades queue for drops and the
+  // trade has to be measured, not assumed, before it ships.
+  const QUEUE_MS = Number(cfg.queueMs) > 0 ? Number(cfg.queueMs) : 0;
   function backlogLimit(a) {
     const rtt = a.baseRttMs ?? 0;
     if (rtt <= 0) return cfg.queueBytes;
-    return Math.max(cfg.queueBytes, (rtt / 1000) * OFFER_BPS * 1.5 + 2 * (HDR + FRAME_BYTES));
+    const bdp = (rtt / 1000) * OFFER_BPS;
+    const budget = QUEUE_MS
+      ? bdp + (QUEUE_MS / 1000) * OFFER_BPS
+      : bdp * 1.5;
+    return Math.max(cfg.queueBytes, budget + 2 * (HDR + FRAME_BYTES));
   }
 
   // ── Stage timing diagnostics (?pcmdiag=1, task #37) ────────────────────────
