@@ -2066,7 +2066,18 @@ const PCM_CFG = {
   spatial: QS.get('spatial') !== '0', // placed voices when >1 remote (presence placement law)
   echoDetect: QS.get('aec') !== '0',
   fec: QS.get('pcmfec') !== '0', // RS(10,13); `?pcmfec=0` is the control arm
-  targetFrames: Number(QS.get('pcmjb')) || 2, // starting jitter target, 16 ms
+  // Starting jitter target, 16 ms. MEASURED 2026-08-18 with m2e-ab (3 paired
+  // rounds, rotated, +/-2.7 ms null floor) because the clean ring sits near two
+  // frames and it looked like it might be resting on this floor — which would
+  // have made halving FRAME_MS worth ~12 ms. It is not resting on it:
+  //     `?pcmjb=1`  mouth-to-ear +0.1 ms, ring +0.1 ms  (both UNRESOLVED)
+  //                 concealed   +168 ms median, per-round +4, +168, +588
+  // Lowering the floor does not lower the ring, it only concealed audio. So the
+  // ring is set by the estimator above this, and the frame-halving prize is at
+  // most the 8 -> 4 ms frameMs term itself: ~4 ms, barely over the instrument's
+  // resolution, for a wire-format migration through FRAME_BYTES, the RS symbol
+  // size, pcmpack's block size and the SAB ring layout. Priced, and not bought.
+  targetFrames: Number(QS.get('pcmjb')) || 2,
   // D_max for audio. 15 frames = 120 ms, and it is a HAND-SET constant, not a
   // measured one -- on a bandwidth-constrained link the estimator asked for
   // 23-41 frames and was capped here without saying so. `?pcmjbmax=` makes
