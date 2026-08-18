@@ -452,6 +452,7 @@ const TRANSIENT_STATUS = new Set(['connected', 'they left']);
  * The server relays without interpreting, so what a lab frame can do is exactly
  * and only what this list allows.
  */
+let lastLabReply = null;
 async function handleLab(m) {
   const op = String(m.op ?? '');
   // Answers go back over the signaling socket, where the room buffers them for
@@ -459,6 +460,10 @@ async function handleLab(m) {
   // the same permanent record every other call does.
   const reply = (data) => {
     const body = { op, ...data };
+    // Kept for the in-page entry point below: every branch here ends in
+    // `reply(); return;`, so a local caller has no other way to learn whether
+    // its knob was applied or refused. Remote callers read it off the socket.
+    lastLabReply = body;
     tel?.log('lab-reply', body);
     safe(() => send({ type: 'lab-reply', ...body }), 'lab.reply');
   };
@@ -572,6 +577,32 @@ async function handleLab(m) {
     if (m.qpMin != null) { const n = num(m.qpMin, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMin = n; applied.qpMin = n; } }
     if (m.qpMax != null) { const n = num(m.qpMax, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMax = n; applied.qpMax = n; } }
     if (m.rc != null) { TAPE_CFG.l2Rc = String(m.rc) === '1'; applied.rc = TAPE_CFG.l2Rc ? 1 : 0; }
+    // The budget band, live. rcPollBudget re-reads both bounds on every 1 s
+    // poll (it clamps the GCC estimate into them, and the trust floor is
+    // clamped by them too), so moving them mid-call is honoured within a
+    // second with nothing to reconfigure — the consumer-re-reads test this
+    // list requires.
+    //
+    // Why it is worth a knob: the only way to ask "how low can this call go
+    // before the picture softens" used to be one page load per budget, which
+    // means one CALL per budget — different connection, different GCC warm-up,
+    // different point in the fixture loop. The interesting quantity is a
+    // DIFFERENCE between two arms of a few percent, and that is smaller than
+    // the spread between two calls. A ladder walked inside one call compares
+    // like with like.
+    //
+    // Applied as a pair, min first, so an intermediate state where min > max
+    // never reaches rcClamp. Asking for min > max is refused outright rather
+    // than silently reordered: it is a rig bug and should read as one.
+    if (m.rcMin != null || m.rcMax != null) {
+      const lo = m.rcMin != null ? num(m.rcMin, 0.05, 50) : TAPE_CFG.l2RcMinMbps;
+      const hi = m.rcMax != null ? num(m.rcMax, 0.05, 50) : TAPE_CFG.l2RcMaxMbps;
+      if (lo != null && hi != null && lo <= hi) {
+        TAPE_CFG.l2RcMinMbps = lo; TAPE_CFG.l2RcMaxMbps = hi;
+        if (m.rcMin != null) applied.rcMin = lo;
+        if (m.rcMax != null) applied.rcMax = hi;
+      }
+    }
     if (m.w != null) { const n = num(m.w, 160, 3840); if (n != null) { TAPE_CFG.width = n; applied.w = n; } }
     if (m.h != null) { const n = num(m.h, 120, 2160); if (n != null) { TAPE_CFG.height = n; applied.h = n; } }
     // Presence filter, and its three parameters. This is the knob that makes a
@@ -8359,6 +8390,18 @@ window.__tape = {
   switchCam: (id) => switchCameraTo(id),
   get tel() { return tel; },
   get turns() { return turns; },
+  // The lab whitelist, reachable from a local driver. A Playwright rig on this
+  // machine and a lab operator on another continent now go through the SAME
+  // function — same whitelist, same range checks, same refusals — instead of
+  // the rig poking module state that the shipped path would have rejected.
+  // That also means every local rig is a test of the remote lab path.
+  //
+  // No new capability: a peer in the room can already send these ops over
+  // signaling by design, and this object already hands out `pc`, `ws` and
+  // `tel`. Returns the reply body so the caller can check `applied`/`refused`
+  // — a knob that was silently refused is the failure mode that produced a
+  // whole table of "the arm changed nothing" results once already.
+  lab: async (m) => { await handleLab(m || {}); return lastLabReply; },
   // Task #50 test hook: the recovery harness kills this socket to simulate the
   // network dying under a live call. Read-only access; the app owns lifecycle.
   get ws() { return ws; },
