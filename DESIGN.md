@@ -6824,12 +6824,44 @@ latency budget and belongs in milliseconds.**
 instead of `BDP * 1.5`. At rtt=300 that is 317 ms of bytes rather than 430 —
 about 113 ms of self-inflicted delay removed; ~60 ms at rtt=180.
 
-### Not yet attempted
+### Measured, and the gate is real but is not the cause
 
-The formula change above is reasoned, not measured. What must be checked before
-believing it: whether shrinking the gate merely converts queue into drops
-(`drop(link)` was 78-80/lane on one side against 13-14 on the other), and
-whether cwnd recovery at rtt>=260 is the real driver — 0.3% loss with
-RTT-paced recovery across six associations may mean throughput simply never
-returns to the offered rate, in which case the gate is a symptom and the
-offered rate is the problem.
+`?pcmqms=30`, 4 calls at rtt=300, arms alternated:
+
+| | QMS30 | DEF |
+|---|---|---|
+| r1 mean m2e | 534.3 | 550.7 |
+| r2 mean m2e | 575.7 | 848.8 |
+| max lane backlog | **27.7 KB** | **379 KB** |
+| max lane RTT | 462 ms | 1669 ms |
+| concealment total | **29.7 s** | 63.6 s |
+
+The gate works exactly as designed: backlog down 14x, lane RTT down 3.6x,
+concealment halved. **And mouth-to-ear is still ~550 ms.** So the self-inflicted
+queue was real, was worth removing, and is *not* what sets the latency here.
+It stays behind the flag: a change that fixes its own metric while the number
+that matters does not move has not earned a default.
+
+Note also that backlogs of 152-379 KB were observed against an 84 KB gate. The
+gate governs lane SELECTION, not admission — when every lane is over budget
+something still has to carry the frame — so it can never be the whole answer.
+
+### The rig is not the problem, and the next lead
+
+Checked first, because a collapse that only appears at the longest distance is
+exactly where the emulator would be expected to fail (see
+`measure-the-rigs-noise-first`). netsim separates injected loss from its own:
+
+    delay line carried 1037804 datagrams (988.3 MB),
+    dropped 1588 on purpose, 0 to the bandwidth ceiling, 0 by accident
+
+Zero accidental drops. The emulator is clean and the collapse is ours.
+
+But that line contains the finding. **988.3 MB in 1,037,804 datagrams across a
+45 s call is ~176 Mbps and ~23,000 packets/second.** The audio path offers ~1,500
+pps. Whatever is generating the other ~21,500 pps at rtt=300 is a retransmission
+explosion, and it is orders of magnitude larger than anything the queue gate
+governs. That is the thing to measure next: the same counter at rtt=180 versus
+rtt=300, to establish whether this scales with distance or is a threshold
+effect, and which stream (audio stripes, video, or DTLS/SCTP retransmits) owns
+the packets.
