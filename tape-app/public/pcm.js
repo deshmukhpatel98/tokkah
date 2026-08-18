@@ -641,12 +641,50 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // condemned whichever lanes it caught. Measured on a clean same-route call
     // with no stall and 1 ms of skew: 3 lanes demoted out of nowhere. Declared
     // here, above every use, rather than beside the timer it feeds.
-    const PING_MS = 2000;
+    const PING_MS = 400;
+    /**
+     * How long silence has to last before it means death — in MILLISECONDS,
+     * and relative to the lane's own round trip.
+     *
+     * It used to be `PING_MS * 2.5`, which tied the verdict to the cadence. So
+     * when the ping period was raised to 2000 the deadline silently moved to
+     * 5 s, and the rule below still says "a lane whose pong has not come back
+     * for 2 s is not slow, it is gone" — the comment describing an intent the
+     * arithmetic stopped implementing. A constant expressed in units of another
+     * constant is a constant that changes when nobody is looking at it.
+     *
+     * Three ping periods, so losing two probes back to back is survivable: one
+     * dropped pong must never condemn a healthy lane, and DEAD skips the dwell,
+     * the hysteresis and the MIN_FAST floor, so a false positive here is the
+     * expensive kind. Plus three of THIS LANE's own round trips, because a flat
+     * allowance is a hidden distance limit — the bug class already found three
+     * times in this repo, invisible every time on a short path. At 5 ms of RTT
+     * that is 1.35 s; at the 150 ms of a Delhi-Amsterdam leg it stretches to
+     * 1.65 s on its own, rather than eating a fixed budget for being far away.
+     */
+    const FAST_DEAD = cfg.fastDead !== false;
+    const muteAfterMs = (a) => (FAST_DEAD
+      ? 3 * PING_MS + 3 * Math.max(a?.baseRttMs ?? 0, 50)
+      // The control arm restores the old DEADLINE only — both arms ping at the
+      // new cadence, which isolates the thing under test. The faster ping is
+      // not part of the experiment: it costs 135 B/s across six lanes and
+      // strictly sharpens laneRttBase, which is a running minimum.
+      : 5000);
     let lastOrderRecompute = 0;
     let stripeDemotions = 0;
     let stripePromotions = 0;
     let stripeStaleFailopen = 0;
     let stripeProbePromotions = 0;
+    // RISING EDGES, not the instantaneous `dead` gauge beside it. The gauge
+    // reads laneDead at snapshot time, and laneDead is recomputed from scratch
+    // every tick — so a blackhole correctly caught at t+2 s reads 0 by t+25 s
+    // and the snapshot says the rule never fired. That is a birth certificate
+    // being read as a health record, and it made the first A/B of muteAfterMs
+    // unattributable: the scenario passed and the evidence for WHY was gone.
+    let stripeDeadEvents = 0;
+    const deadCause = { mute: 0, peer: 0, hopeless: 0 };
+    let stripeDeadFirstMs = null;   // ms from first ping to the first death seen
+    const laneDeadPrev = new Uint8Array(PAIRS);
     let deadGraceUntil = 0;
     let isStaleFailopen = false;
 
@@ -725,6 +763,28 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // where every lane sits at 250 ms — reads as healthy; only a lane 300 ms
       // worse than its own peers, far beyond any jitter and beyond the ring's
       // deepest setting, counts as hopeless.
+      // THE FRESHEST PONG ON ANY LANE, which is what turns the silence test
+      // below from an absolute one into a relative one. An absolute deadline
+      // cannot tell a dead route from OUR OWN main thread stalling: a renderer
+      // that freezes for 1.5 s stops answering on all six lanes at once, and
+      // every one of them then reads as blackholed. Measured, on the very first
+      // A/B of the shortened deadline: 3 dead events on side A and 1 on side B
+      // BEFORE the fault was injected, on lanes that were entirely healthy, and
+      // 1696 ms of pre-stall concealment against the control's 1032 — a change
+      // that helped during the stall and made the ordinary call worse, which is
+      // the trade this file has refused three times already.
+      //
+      // Relative, it is immune: a local freeze moves every lane's lastPongT
+      // together, so the DIFFERENCE stays near zero and nothing is condemned.
+      // A genuine blackhole leaves its siblings answering every 400 ms, so the
+      // difference is exactly the silence. (When every lane really is gone the
+      // difference is zero and nothing is marked — which is correct, and is the
+      // same verdict the global-outage guard below reaches by its own route.)
+      let newestPong = 0;
+      for (let k = 0; k < PAIRS; k++) {
+        const a = assocs[k];
+        if (a?.dc?.readyState === 'open' && (a.lastPongT ?? 0) > newestPong) newestPong = a.lastPongT;
+      }
       for (let k = 0; k < PAIRS; k++) {
         const a = assocs[k];
         const open = a?.dc?.readyState === 'open';
@@ -745,15 +805,26 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           && (tn - laneStateSince[k]) > 2000
           && (peerLiveMask & (1 << k)) === 0
           && peerSkewAt > 0 && (tn - peerSkewAt) < 2000;
-        // 2.5 ping periods: long enough that normal cadence plus a round trip
-        // never trips it, short enough to notice a genuinely silent route.
-        const mute = open && lp > 0 && (tn - lp) > PING_MS * 2.5;
+        // See muteAfterMs. Was 2.5 ping periods = 5 s, which is not "notice a
+        // silent route" — it is five seconds of speech posted into a hole while
+        // every other signal waits for this one.
+        const mute = open && lp > 0
+          && (tn - lp) > muteAfterMs(a)             // silent for longer than it should ever be
+          && (newestPong - lp) > muteAfterMs(a);    // AND silent while its siblings are answering
         const hopeless = open && a?.rttMs != null && minFastRtt !== Infinity
           && (a.rttMs - minFastRtt) > 300;
         // Nothing is declared dead while we are still recovering from a local
         // freeze: the evidence for death and the evidence of our own stall are
         // the same observation.
         laneDead[k] = (tn >= deadGraceUntil && (peerSaysGone || mute || hopeless)) ? 1 : 0;
+        if (laneDead[k] && !laneDeadPrev[k]) {
+          stripeDeadEvents++;
+          if (mute) deadCause.mute++;
+          else if (peerSaysGone) deadCause.peer++;
+          else if (hopeless) deadCause.hopeless++;
+          if (stripeDeadFirstMs == null) stripeDeadFirstMs = +tn.toFixed(0);
+        }
+        laneDeadPrev[k] = laneDead[k];
       }
 
       // GLOBAL OUTAGE IS NOT A ROUTE PROBLEM. The peer freezing sends neither
@@ -863,14 +934,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             // the dwell — a bounded, self-correcting probe rather than a
             // permanent verdict.
             //
-            // Cadence, since this comment claimed 4x/s and the ping timer says
-            // otherwise: PING_MS is 2000, so RTT refreshes every 2 s per lane —
-            // 0.5/s, 8x slower than stated. Three ticks therefore span roughly
-            // ONE AND A HALF fresh round trips, not three, so the streak buys
-            // less independent evidence here than the same number does on the
-            // demote side, where the skew it counts arrives 4x/s on T_SKEW.
-            // The promote direction is the safe one to be slow about (a lane
-            // stays demoted), which is why this is recorded rather than tuned.
+            // Cadence, which this comment twice had wrong. The streak counts
+            // RECOMPUTE TICKS (rate-limited to 1/s), not pings, so its length
+            // in seconds does not move with PING_MS — what moves is how much
+            // independent evidence each tick carries. At the old 2000 ms period
+            // RTT refreshed every 2 s, so three ticks spanned roughly ONE AND A
+            // HALF fresh round trips and the streak bought less than it looked
+            // like it did. At 400 ms each tick sees a sample of its own and
+            // "one sample is jitter, a streak is a route" is finally true.
+            // Promotion timing is unchanged: still ~3 s, still the safe
+            // direction to be slow about.
             // 8 ms of round trip is the 4 ms one-way promote hysteresis seen
             // from the sender's side, so the probe and the skew rule agree on
             // where "fast again" begins.
@@ -3216,6 +3289,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             promotions: stripePromotions,
             probePromotions: stripeProbePromotions,
             dead: Array.from(laneDead).reduce((n, v) => n + v, 0),
+            deadEvents: stripeDeadEvents,
+            deadCause: { ...deadCause },
+            deadFirstMs: stripeDeadFirstMs,
+            muteAfterMs: +muteAfterMs(assocs[0]).toFixed(0),
             staleFailopen: stripeStaleFailopen,
           } : null,
           perAssoc: assocs.map((s, i) => ({

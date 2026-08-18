@@ -2228,6 +2228,12 @@ const PCM_CFG = {
   // still interoperates and one call can carry one arm per direction.
   pcmSw: QS.get('pcmsw') !== '0',
   pcmDup: QS.get('pcmdup') ?? undefined, // burst shield: '0' never | '1' always | absent = auto
+  // A blackholed lane used to take 8 s to be recognised: a 5 s pong-silence
+  // deadline, evaluated once a second, against pongs only 0.5/s fresh. Now
+  // ~2.8 s, and RTT-relative so distance does not eat the budget. Default ON
+  // per the house rule; `?pcmfastdead=0` restores the old deadline as the
+  // control arm, which is the only way to A/B it inside one build.
+  fastDead: QS.get('pcmfastdead') !== '0',
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
   pcmPump: QS.get('pcmpump') ?? 'timer',
