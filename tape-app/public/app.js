@@ -6764,12 +6764,33 @@ async function join(room) {
   // for in the lane watchdogs.
   const pingSec = QS.get('wsping') == null ? 25 : Number(QS.get('wsping'));
   let wsPing = null;
+  // #66 PONG WATCHDOG. A socket can die HALF-OPEN: the server (or a DO
+  // restart) closes it, the VPN eats the FIN, and this side's readyState says
+  // OPEN forever. Measured live 2026-08-19 23:11: both peers dropped on a
+  // deploy, one recovered, the other sat "welcomed and alone" on a corpse
+  // socket — pings leaving, nothing coming back, no rule watching for that.
+  // Now: a ping schedules a deadline; ANY inbound ws message clears it (data
+  // is better proof of life than a pong); three consecutive unanswered pings
+  // read as death and recoverCall runs, exactly as a clean close would.
+  // ?wsping=0 disables the keepalive and this watchdog with it.
+  let pongMisses = 0;
+  const pongAlive = () => { pongMisses = 0; };
+  ws.addEventListener('message', pongAlive);
   ws.addEventListener('open', () => {
     wsOpened = true;
     if (!pingSec) return;
     clearInterval(wsPing);
+    pongMisses = 0;
     wsPing = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      pongMisses++;
+      if (pongMisses > 3) {
+        tel?.log('ws-pong-timeout', { misses: pongMisses - 1, pingSec });
+        clearInterval(wsPing);
+        safe(() => ws.close(4002, 'no pong'), 'pong.close');
+        safe(() => recoverCall('pong-timeout'), 'pong.recover');
+        return;
+      }
       safe(() => ws.send(JSON.stringify({ type: 'ping', t: Date.now() })), 'ws.ping');
     }, pingSec * 1000);
   });
