@@ -3238,7 +3238,14 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     }
     while (lpAge.length && t - lpAge[0].t > cfg.stallResumeCleanMs) lpAge.shift();
     if (!lpAge.length) return;
-    if (lpAge.every((s) => s.age < 250)) sendResume('clean');
+    // #63's law applied to the EXIT, which the first pass missed: lane-P ages
+    // contain the same one-way propagation the video ages do, so an absolute
+    // 250 ms gate left ~80 ms of headroom on a 170 ms-floor path and the clean
+    // resume almost never fired — measured live 2026-08-19 23:26: "holding"
+    // stood for minutes while the stills were arriving fine. Judge the QUEUE:
+    // stills within 100 ms of the path floor mean the pipe is clear.
+    const lpBase = Number.isFinite(ageFloorMs) ? ageFloorMs : 0;
+    if (lpAge.every((s) => s.age - lpBase < (lpBase ? 100 : 250))) sendResume('clean');
   }
 
   function classify() {
