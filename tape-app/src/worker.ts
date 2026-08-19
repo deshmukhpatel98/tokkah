@@ -600,7 +600,10 @@ export class Room implements DurableObject {
       // relaying it would put a new message type on a peer's signaling chain
       // for no reason, which is the exact mistake the keepalive below avoids.
       // Bounded at 64 so a client that chatters cannot grow the room.
-      if (typeof e.data === 'string' && e.data.length < 8192 && e.data.includes('"lab-reply"')) {
+      // 64 KB, not 8: a `deep:1` snapshot reply is the whole stats object and the
+      // 8 KB guard silently ATE it — the operator saw `replies: []` from two live
+      // peers, indistinguishable from clients that never answered.
+      if (typeof e.data === 'string' && e.data.length < 65536 && e.data.includes('"lab-reply"')) {
         try {
           const m = JSON.parse(e.data) as Record<string, unknown>;
           if (m.type === 'lab-reply') {
