@@ -2430,10 +2430,12 @@ const PCM_CFG = {
   // behaviour, and no linter here caught it.
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
-  // #65 default 'mc': the setTimeout(0) pump is subject to the hidden-tab
-  // clamp; the MessageChannel pump is not, and its worst case is the old
-  // behaviour. ?pcmpump=timer is the control arm.
-  pcmPump: QS.get('pcmpump') ?? 'mc',
+  // #65 tried defaulting this to 'mc' (MessageChannel, exempt from the
+  // hidden-tab clamp) and it REGRESSED the testbed to 6% frames admitted:
+  // that pump is an unpaced message loop and saturates the main thread. The
+  // clamp-immune drain lives in the worker-clock 250 ms tick instead; the
+  // pump stays the yielding setTimeout(0) chain.
+  pcmPump: QS.get('pcmpump') ?? 'timer',
   // Pins the stride (data frames per parity; 0 = parity off). Unset = adaptive,
   // driven off the same T_LOSS ladder as fecN.
   pcmSwStride: QS.get('pcmswstride') != null ? Number(QS.get('pcmswstride')) : undefined,
