@@ -1345,6 +1345,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // playhead actually reset — while it is set, SAB_PLAY is stale and must not
     // define the accept window.
     let lastRingWriteAt = 0, lastRejSeq = -1, reprime = false;
+    // #67 mixed-epoch rescue: rejected-seq CLUSTER (see starving gate below)
+    let rejClLo = -1, rejClHi = -1, rejClN = 0, rejClAt = 0;
     const RE_ANCHOR = cfg.reAnchor !== false; // ?reanchor=0 is the control arm
     const REANCHOR_RESET = cfg.reAnchorReset === true; // ?pcmreanchorreset=1 re-enables; measured null
     // ── DO NOT GROW A BUFFER TO FIX A MISPLACED WINDOW (`?pcmlatepin=0`) ──────
@@ -1559,19 +1561,42 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       //     what wall time allows is a bogus header, exactly as before.
       //   · the 1 s drought itself rate-limits: each re-anchor resets the clock.
       const coherentAdvance = lastRejSeq >= 0 && seq > lastRejSeq && seq - lastRejSeq <= 8;
-      const starving = RE_ANCHOR && play >= 0 && !reprime && laneIdx >= 0 && coherentAdvance
+      // #67: the strict-run gate has a blind spot the live call hit (2026-08-19
+      // 23:52): during a REJOIN two epochs interleave across the six lanes —
+      // new-epoch lows and old-epoch highs alternate — so `seq - lastRejSeq <= 8`
+      // almost never holds, the rescue never fires, and the playhead sat 412 ms
+      // AHEAD of the stream concealing for ~60 s. A CLUSTER replaces the run:
+      // rejected wire seqs landing near and above each other build one,
+      // interleaved far-away seqs are ignored rather than resetting it, and 8
+      // members during a >1 s window drought is the same evidence the run
+      // wanted, made order-tolerant. ?pcmreclust=0 is the control arm.
+      if (RE_ANCHOR && cfg.reClust !== false && laneIdx >= 0) {
+        const tRej = now();
+        if (rejClHi < 0 || tRej - rejClAt > 2000) { rejClLo = seq; rejClHi = seq; rejClN = 1; rejClAt = tRej; }
+        else if (seq >= rejClLo && seq >= rejClHi - 4 && seq <= rejClHi + 32) {
+          if (seq > rejClHi) rejClHi = seq;
+          rejClN++; rejClAt = tRej;
+        }
+      }
+      const clusterAdvance = rejClN >= 8;
+      const starving = RE_ANCHOR && play >= 0 && !reprime && laneIdx >= 0
+        && (coherentAdvance || clusterAdvance)
         && now() - lastRingWriteAt > 1000;
       const reAnchor = () => {
         stats.reAnchors++;
-        L('pcm-reanchor', { seq, play, startSeq, sinceWriteMs: +(now() - lastRingWriteAt).toFixed(0) });
+        // The cluster's high edge is newer evidence than this one frame when
+        // the cluster is what fired; anchoring low replays the storm.
+        const aSeq = rejClN >= 8 && rejClHi > seq ? rejClHi : seq;
+        L('pcm-reanchor', { seq: aSeq, rawSeq: seq, clN: rejClN, play, startSeq, sinceWriteMs: +(now() - lastRingWriteAt).toFixed(0) });
+        rejClLo = -1; rejClHi = -1; rejClN = 0; rejClAt = 0;
         tags.fill(-1);
-        startSeq = seq;
-        Atomics.store(ctl, SAB_START, seq);
+        startSeq = aSeq;
+        Atomics.store(ctl, SAB_START, aSeq);
         // hiSeq1 must follow the window in BOTH directions here — frozen high it
         // would keep depthMs lying, and on a sender seq restart it sits above the
         // whole new stream. The write below advances it to seq + 1.
-        hiSeq1 = seq;
-        Atomics.store(ctl, SAB_HI, seq);
+        hiSeq1 = aSeq;
+        Atomics.store(ctl, SAB_HI, aSeq);
         reprime = true;
         lastRingWriteAt = now();
         // FORGET THE TARGET THIS DEADLOCK CAUSED (`?pcmreanchorreset=0`).
