@@ -319,10 +319,23 @@ export class Room implements DurableObject {
 
     const [{ n: existing }] = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM events').toArray();
     if (existing >= MAX_ROWS_PER_ROOM) {
-      // Refuse rather than evict. Losing the *start* of the call would be worse
-      // than losing the end, and silently rolling the window would make the data
-      // look complete when it isn't.
-      return json({ ok: false, error: 'room log full', stored: 0 }, 507);
+      // ROTATE rather than refuse. "Refuse rather than evict" was right for a
+      // one-call room and wrong for a standing one: this room crossed the cap
+      // at 22:06 on 2026-08-19 and every event after — joins, negotiations,
+      // rescues — was silently 507'd for two hours while the operator debugged
+      // against a log that looked merely quiet (blind-instruments class). The
+      // original worry ("rolling silently makes the data look complete") is
+      // answered head-on: each rotation writes a `log-rotated` marker row
+      // stating exactly how many rows were dropped, so a reader can see the
+      // cut. Oldest 20% goes — the tail is where the live questions are.
+      const cut = Math.floor(MAX_ROWS_PER_ROOM * 0.2);
+      this.sql.exec(
+        'DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id LIMIT ?)', cut,
+      );
+      this.sql.exec(
+        'INSERT INTO events (session, role, t, wall, kind, data) VALUES (?, ?, ?, ?, ?, ?)',
+        'room', 'op', 0, Date.now(), 'log-rotated', JSON.stringify({ dropped: cut, capRows: MAX_ROWS_PER_ROOM }),
+      );
     }
 
     let stored = 0;
