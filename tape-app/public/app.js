@@ -2300,6 +2300,11 @@ const PCM_CFG = {
   // decoder always honours the header, so `?pcmwaste=0` is a safe control arm
   // that still interoperates with a peer running the default.
   wastedBits: QS.get('pcmwaste') !== '0',
+  // #15 noise-floor quantiser: round samples to a step >=12 dB below the mic's
+  // own measured floor before packing, so its hiss stops costing ~380 kbps of
+  // lossless lane. Default ON; ?pcmqbits=0 is the bit-exact control.
+  qBits: QS.get('pcmqbits') !== '0',
+  qBitsMargin: QS.has('pcmqmargin') ? Number(QS.get('pcmqmargin')) : undefined,
   // Adaptive RS code rate, driven by the loss the PEER reports (T_LOSS).
   // `?pcmfecadapt=0` is the control arm: the old fixed RS(10,13) on every link.
   // `?pcmfecmax=N` caps the ladder (0..3) — mainly to pin a rung for a probe.

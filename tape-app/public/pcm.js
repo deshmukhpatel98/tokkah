@@ -251,6 +251,20 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // less on this project than an interleaved one, and because a change that
   // halves the lane deserves an off switch that does not need a deploy.
   const WASTED = cfg.wastedBits !== false;
+  // #15: quantise to the MICROPHONE'S OWN noise floor before packing. Measured
+  // 2026-08-19 on a real mic: wastedShift 0, fit16 0/0% — the low ~8 bits of
+  // every sample are the capture chain's analog hiss, and shipping them
+  // losslessly costs ~380 kbps of lane for content indistinguishable from any
+  // other hiss. The step is held >=2 bits (>=12 dB) BELOW the quietest frame
+  // heard so far, so the rounding error is masked by the mic's own floor by
+  // construction. Rounding, not truncation — truncation is a -0.5 LSB DC bias
+  // and 1.8 dB extra error for nothing. The rounded samples have qsh trailing
+  // zero bits, so the EXISTING wasted-bits shift finds and ships the saving:
+  // no wire, header, or decoder change of any kind. ?pcmqbits=0 is the
+  // bit-exact control arm; ?pcmqmargin=N moves the safety margin (bits).
+  const QBITS = cfg.qBits !== false;
+  const QB_MARGIN = Math.max(0, Math.min(8, cfg.qBitsMargin ?? 2));
+  const QB_WARM_FRAMES = 250; // ~2 s at 8 ms frames: no step until the floor is real
   const RS_FIXED = cfg.rsFixed === true;          // control arm, see rsClose()
   // `?pcmfecadapt=0` pins the old fixed RS(10,13). `?pcmfecmax=` caps how far
   // the ladder may climb; it cannot exceed RS_P, because the Cauchy matrix in
@@ -453,6 +467,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     captureFrames: 0,
     zipFrames: 0, shiftSum: 0, shift8: 0,
     probeTick: 0, probeFrames: 0, fit32767: 0, fit32768: 0,
+    qShift: 0, qFloorBits: null, qFrames: 0, // #15 noise-floor quantiser state
     // The main thread stalling past the CAPTURE ring is a local scheduling
     // fault, one per page — never a peer's.
     capSabOverruns: 0,
@@ -3850,6 +3865,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // objects a second into the one loop that must not pause: the memo's job is
   // to make the SECOND peer free, not to make the first peer allocate.
   let packSeq = -1, packLen = FRAME_BYTES;
+  let qbMinRms = Infinity, qbFrames = 0, qbShift = 0; // #15
   function packOnce(seq, buf) {
     if (packSeq === seq) return packLen;
     packSeq = seq;
@@ -3857,6 +3873,40 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     for (let i = 0, o = 0; i < FRAME_SAMPLES; i++, o += 3) {
       const v = src[o] | (src[o + 1] << 8) | (src[o + 2] << 16);
       zipIn[i] = (v & 0x800000) ? (v | ~0xffffff) : v;
+    }
+    // ── #15 noise-floor quantiser ────────────────────────────────────────
+    // The floor is the minimum RMS over non-silent frames. A minimum, not an
+    // average: speech frames are loud, and the quietest thing this mic has
+    // produced IS its floor (startup-poisons-estimators: no step until
+    // QB_WARM_FRAMES non-silent frames have been heard, so a hot-plug
+    // transient cannot set the floor). It only falls, so a floor learned high
+    // corrects itself the first time the room goes quiet; qsh follows it DOWN
+    // immediately and may only RISE one bit per frame, so the step never jumps.
+    if (QBITS) {
+      let sum2 = 0, mOr = 0;
+      for (let i = 0; i < FRAME_SAMPLES; i++) { const v = zipIn[i]; sum2 += v * v; mOr |= v; }
+      if (mOr !== 0) {
+        const rms = Math.sqrt(sum2 / FRAME_SAMPLES);
+        qbFrames++;
+        if (rms < qbMinRms) qbMinRms = rms;
+        const wantSh = qbFrames < QB_WARM_FRAMES || qbMinRms < 2
+          ? 0
+          : Math.max(0, Math.min(8, Math.floor(Math.log2(qbMinRms)) - QB_MARGIN));
+        qbShift = wantSh < qbShift ? wantSh : Math.min(wantSh, qbShift + 1);
+        if (qbShift > 0) {
+          const step = 1 << qbShift, half = step >> 1;
+          for (let i = 0; i < FRAME_SAMPLES; i++) {
+            // round-half-away-from-zero, clamped to int24
+            const v = zipIn[i];
+            let q = v >= 0 ? (v + half) & ~(step - 1) : -((-v + half) & ~(step - 1));
+            if (q > 0x7fffff) q = 0x7fffff & ~(step - 1);
+            zipIn[i] = q;
+          }
+        }
+        capStats.qShift = qbShift;
+        capStats.qFloorBits = +Math.log2(qbMinRms).toFixed(1);
+        capStats.qFrames = qbFrames;
+      }
     }
     // ── bit-depth probe, 1 frame in 64 ───────────────────────────────────
     // wastedShift reports that the low 8 bits are NOT zero. This says whether
