@@ -551,6 +551,7 @@ async function handleLab(m) {
         // lane's decision to yield is only auditable from outside if the input
         // and the output of that decision are both reported.
         concealRateMsS: a.concealRateMsS ?? null, duressLevel: a.duressLevel ?? null,
+        qShift: a.qShift ?? null, qFloorBits: a.qFloorBits ?? null, // #15 noise-floor quantiser
         depthMs: a.depthMs ?? null, targetFrames: a.targetFrames ?? null,
         bPerFrame: a.bPerFrame ?? null, wastedShift: a.wastedShift ?? null,
       },
