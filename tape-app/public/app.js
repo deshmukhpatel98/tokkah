@@ -6735,6 +6735,50 @@ async function join(room) {
     tel.log('ws-error', { opened: wsOpened ? 1 : 0 });
     if (!wsOpened) wsPreOpenFail?.(preOpenErr());
   };
+  // ── Welcome watchdog (§17.60) ──────────────────────────────────────────────
+  // A socket that OPENS but never receives `welcome` leaves this client sitting
+  // in the lobby on "waiting for the other person" forever, while the room has
+  // no record of it at all. Observed 2026-08-19 on a two-browser call: the
+  // server held exactly one peer across 90 s of 3 s sampling while BOTH screens
+  // showed the waiting state, and a fresh Chromium and a fresh WebKit from the
+  // same machine each joined that same room and reached `connected` in 11 s.
+  // Nothing was wrong with the room; one client had silently failed to admit
+  // and had no way to notice, because every path here is edge-triggered and
+  // "welcome never arrived" is the absence of an edge.
+  //
+  // 8 s and not a function of RTT ON PURPOSE. This is the one shape that must
+  // NOT scale with distance: it is an absolute liveness bound, and 8 s is far
+  // above any real signaling round trip (the worst path measured here is
+  // 341 ms). Compare the rtt-blind-timeout bug class, which is the mirror
+  // error — a flat timeout wrapped around a HANDSHAKE that legitimately grows
+  // with distance. Admission does not.
+  let welcomeSeen = false;
+  const WELCOME_MS = 8000;
+  const welcomeTimer = setTimeout(() => {
+    if (welcomeSeen) return;
+    // One retry, then one cache-busting reload, then stop and SAY so. The
+    // reload is guarded by sessionStorage so a persistently broken room cannot
+    // put the tab in a refresh loop -- a silent failure replaced by an infinite
+    // one is not an improvement.
+    const tries = Number(sessionStorage.getItem('tape.welcomeRetry') ?? '0');
+    tel.log('welcome-timeout', { tries, readyState: ws.readyState, room });
+    if (tries === 0) {
+      sessionStorage.setItem('tape.welcomeRetry', '1');
+      safe(() => ws.close(4001, 'no welcome'), 'welcome.retry');
+      safe(() => recoverCall('no-welcome'), 'welcome.recover');
+    } else if (tries === 1) {
+      sessionStorage.setItem('tape.welcomeRetry', '2');
+      // Stale assets are the likeliest cause on a day with several deploys, and
+      // a plain reload can serve them again from cache.
+      location.replace(location.pathname + '?cb=' + Date.now() + location.hash);
+    } else {
+      // Third failure: stop retrying and TELL the user. A call that cannot
+      // join is already dead; the only thing left worth doing is making the
+      // failure legible instead of leaving them staring at a waiting message
+      // that will never resolve.
+      safe(() => setStatus("couldn't join this room — reload the page"), 'welcome.stuck');
+    }
+  }, WELCOME_MS);
   if (adopted) {
     // The hold socket was accepted without being admitted, so its upgrade URL
     // carried no caps at all — this join body IS its admission, and the wire
@@ -6787,6 +6831,12 @@ async function join(room) {
         return;
       }
       if (m.type === 'welcome') {
+        // Admission actually happened: disarm the watchdog and clear the retry
+        // ladder so a LATER failure in this tab starts from zero rather than
+        // inheriting a count and jumping straight to the reload.
+        welcomeSeen = true;
+        clearTimeout(welcomeTimer);
+        safe(() => sessionStorage.removeItem('tape.welcomeRetry'), 'welcome.clear');
         role = m.role;
         tel.role = role;
         tel.log('role', { role, peerPresent: m.peerPresent });

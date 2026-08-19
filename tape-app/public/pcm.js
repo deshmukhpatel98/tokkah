@@ -3353,7 +3353,21 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       {
         const cms = (wl.concealedFrames ?? 0) * FRAME_MS;
         const tNow = now();
-        if (concealAt) {
+        // STARTUP GUARD (§17.60). The ring is empty at call start, so every
+        // frame conceals until the buffer fills and the raw rate reads ~3900
+        // ms/s — measured on a live reload 2026-08-19, which drove duress
+        // straight to 2 and throttled video to the 0.6 Mbps floor at the START
+        // OF EVERY CALL. That is `startup-poisons-estimators` exactly, and I
+        // wrote this bug four hours after writing that lesson down.
+        //
+        // Same JIT_WARM the jitter estimator already uses, and the same reason:
+        // a rate sampled before the stream is established is a birth
+        // certificate, not a health record. Concealment during warm-up is real
+        // but it is NOT evidence the link is too small for the video lane,
+        // which is the only question duress exists to answer.
+        const warm = stats.t0 == null || tNow - stats.t0 < JIT_WARM;
+        if (warm) { concealPrev = cms; concealAt = tNow; concealRate = 0; stats.concealRateMsS = 0; }
+        else if (concealAt) {
           const dt = (tNow - concealAt) / 1000;
           if (dt >= 0.2) {
             const r = (cms - concealPrev) / dt;

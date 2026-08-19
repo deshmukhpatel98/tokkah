@@ -8492,3 +8492,63 @@ un-duck the video mid-burst. `?duresslate=0` is the control arm.
   read a running call without joining it; `set` changes w/h and rcMin/rcMax on
   the running call without a reload. Everything above was measured and fixed
   while two people stayed connected.
+
+## 17.60 A join that fails silently, and a startup artifact I shipped myself
+
+### The silent join
+
+Two browsers on one machine, both showing "waiting for the other person", while
+the room held **exactly one peer across 90 s of 3 s sampling**. Diagnosis, all
+of it without touching the user's machine:
+
+- A fresh Chromium joined that same room and reached `connected` in 9-11 s.
+- A fresh **WebKit** did too, with its signaling socket open and no page errors.
+- So the room, the pairing, Safari support and the day's deploys were all fine;
+  one client's join was never reaching the server at all.
+
+The defect is not the failure — it is that the failure is **invisible**. Every
+path in the join is edge-triggered, and "welcome never arrived" is the ABSENCE
+of an edge, so the client sat in the lobby forever with a message that would
+never resolve. Added a welcome watchdog: 8 s, then one socket retry, then one
+cache-busting reload (guarded in `sessionStorage` so a broken room cannot cause
+a refresh loop), then it stops and SAYS so in the status line.
+
+**8 s is deliberately not a function of RTT.** This is an absolute liveness
+bound and the worst real path measured here is 341 ms. That is the mirror of the
+`rtt-blind-timeouts` class: there a flat timeout wrapped a handshake that
+legitimately grows with distance; admission does not.
+
+Root cause on the day was almost certainly a mixed cache after six deploys — new
+HTML against a stale `app.js`/`pcm.js`. The `lab` channel's `reload` op shipped
+the fix into the running call (`sent: 2`), which also proved both peers had been
+reachable all along and the room's occupancy reads were flapping.
+
+### The artifact I shipped
+
+Immediately after that reload the stream showed:
+
+    a tx[1280x720 bud0.6]  aud[depth -5412.9  rate 3873.9  DURESS 2]
+
+§17.59's `concealRate` was reading **3873 ms/s** at call start, because the ring
+is empty and every frame conceals until the buffer fills. That drove duress to 2
+and throttled video to the 0.6 Mbps floor **at the start of every call** — a
+regression in the fix, live, on a real call.
+
+This is `startup-poisons-estimators`, and it was written down in this very
+session four hours earlier. Writing a lesson down does not install it. The guard
+is the same `JIT_WARM` the jitter estimator already uses: concealment during
+warm-up is real, but it is not evidence the link is too small for the video
+lane, which is the only question duress exists to answer.
+
+Confirmed after the fix, same live call:
+
+    a: m2e 273.8  depth 87.3  tgt 11f  rate 10.3  DURESS 0
+    b: m2e 371.3  depth 117   tgt 14f  rate  3.6  DURESS 1
+
+### The A/B I should not have designed
+
+`--net=mobile` was chosen to produce lateness for the §17.59 A/B. It is the
+regime §17.51 had ALREADY ruled outside the instrument's domain, and the data
+said so again: CTL concealed 3120/2504 ms in round 1 and 26696/26288 ms in round
+2 — a 10x swing within the control arm. Stopped and not scored. The live call is
+the evidence for §17.59, which is what the testing law asks for anyway.
