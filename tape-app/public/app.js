@@ -623,6 +623,19 @@ async function handleLab(m) {
     if (m.qpMin != null) { const n = num(m.qpMin, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMin = n; applied.qpMin = n; } }
     if (m.qpMax != null) { const n = num(m.qpMax, 1, 51); if (n != null) { TAPE_CFG.l2RcQpMax = n; applied.qpMax = n; } }
     if (m.rc != null) { TAPE_CFG.l2Rc = String(m.rc) === '1'; applied.rc = TAPE_CFG.l2Rc ? 1 : 0; }
+    // Mic, remotely. Flips the SAME state the mic button flips — track.enabled
+    // plus the button's dataset — so the on-screen circle keeps telling the
+    // truth (a mute the UI cannot see is the failure mode 'a muted call looks
+    // completely normal' warns about). User directive 2026-08-19: both mics
+    // muted while two calls share one desk, or the room echoes.
+    if (m.mic != null) {
+      const on = String(m.mic) === '1';
+      for (const t of armStream()?.getAudioTracks?.() ?? []) t.enabled = on;
+      const el = $('mic');
+      if (el) el.dataset.off = on ? '0' : '1';
+      tel?.log('toggle', { what: 'mic', on, via: 'lab' });
+      applied.mic = on ? 1 : 0;
+    }
     // The budget band, live. rcPollBudget re-reads both bounds on every 1 s
     // poll (it clamps the GCC estimate into them, and the trust floor is
     // clamped by them too), so moving them mid-call is honoured within a
