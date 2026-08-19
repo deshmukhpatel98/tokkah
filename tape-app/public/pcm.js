@@ -3461,7 +3461,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           if (netAgeFloorRing.length > 240) netAgeFloorRing.shift(); // 60 s at 4 Hz
           netAgeFloor = Math.min(...netAgeFloorRing);
           stats.netAgeFloorMs = +netAgeFloor.toFixed(1);
-          const q = Math.max(0, p50 - netAgeFloor);
+          const q = Math.max(0, p50 - Math.max(0, netAgeFloor)); // #72 negative floor = measurement error; raw value stays visible in stats
           stats.netQueueMs = +q.toFixed(1);
         } else if (warm) { netAgeFloorRing.length = 0; netAgeFloor = Infinity; stats.netQueueMs = 0; }
       }

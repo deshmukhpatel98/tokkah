@@ -2412,16 +2412,19 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // decaying upward at ~2 ms/s so a route change (VPN reconnect) is
     // re-learned within a minute rather than never (#71: via a 60 s rolling min). Additive field: an old
     // sender ignores pmin and keeps the absolute law.
-    if (w.length) {
-      // #71 The all-time min latch was poisonable: one bogus-low sample (a
-      // clock-offset transient around a rejoin) set the floor for ~10 minutes
-      // at the 2 ms/s decay -- measured live 2026-08-20, a floor of -24.7 ms
-      // held the pacer in its dead zone. A rolling min over the last 60
-      // reports ages poison out in a minute and needs no decay constant.
-      ageFloorRing.push(Math.min(...w));
-      if (ageFloorRing.length > 60) ageFloorRing.shift();
-      ageFloorMs = Math.min(...ageFloorRing);
-    }
+    // #71 The all-time min latch was poisonable: one bogus-low sample (a
+    // clock-offset transient around a rejoin) set the floor for ~10 minutes
+    // at the 2 ms/s decay -- measured live 2026-08-20, a floor of -24.7 ms
+    // held the pacer in its dead zone. A rolling min over the last 60
+    // reports ages poison out in a minute and needs no decay constant.
+    // #72 The ring must age by TIME, not by sample count: an empty window
+    // pushes Infinity, or a poisoned floor that itself stops the frame flow
+    // (held-exit demanded stills younger than -133 ms, live 2026-08-20)
+    // freezes its own ring and never heals. All-Infinity ring -> floor
+    // Infinity -> pmin null -> both ends fall back to the absolute law.
+    ageFloorRing.push(w.length ? Math.min(...w) : Infinity);
+    if (ageFloorRing.length > 60) ageFloorRing.shift();
+    ageFloorMs = Math.min(...ageFloorRing);
     // mco: our camera clock's offset — the peer's fullAge correction.
     // avd (§10): the delta between OUR two capture clocks, video and audio,
     // read at the same instant — the two drift apart on one device, so the
@@ -2872,7 +2875,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // 100 ms, hold between. On a short path pmin≈age floor≈small and the
         // behaviour is the shipped one; an old peer sends no pmin and gets the
         // absolute law byte-for-byte.
-        const base = Number.isFinite(m.pmin) ? m.pmin : 0;
+        const base = Math.max(0, Number.isFinite(m.pmin) ? m.pmin : 0); // #72 a poisoned (negative) peer floor reverts to the absolute law rather than an impossible band
         const q50 = m.p50 - base, q95 = (m.p95 ?? 0) - base;
         if (q50 > (base ? 250 : 400) || q95 > (base ? 700 : 900)) {
           // 0.75x, not 1.0x, of the rate that broke: recovering all the way back
@@ -3251,7 +3254,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // resume almost never fired — measured live 2026-08-19 23:26: "holding"
     // stood for minutes while the stills were arriving fine. Judge the QUEUE:
     // stills within 100 ms of the path floor mean the pipe is clear.
-    const lpBase = Number.isFinite(ageFloorMs) ? ageFloorMs : 0;
+    const lpBase = Math.max(0, Number.isFinite(ageFloorMs) ? ageFloorMs : 0); // #72 a negative floor is measurement error; it must never tighten a gate
     if (lpAge.every((s) => s.age - lpBase < (lpBase ? 100 : 250))) sendResume('clean');
   }
 
@@ -3269,7 +3272,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // unreachable and the regime oscillated absorb/held forever (measured live
     // 2026-08-19: held -> resume -> 303 ms of nominal -> back to absorb).
     // Judged on queue = age - path floor when the floor is known.
-    const clsBase = Number.isFinite(ageFloorMs) ? ageFloorMs : 0;
+    const clsBase = Math.max(0, Number.isFinite(ageFloorMs) ? ageFloorMs : 0); // #72 clamp: see lpBase
     const q50 = p50 - clsBase;
     // Regime naming. The bands are the AIMD governor's own thresholds: under
     // its increase bound is nominal (D at D_min), the hysteresis band is
