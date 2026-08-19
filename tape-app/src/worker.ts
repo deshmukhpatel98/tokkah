@@ -173,6 +173,16 @@ export class Room implements DurableObject {
   // the welcome message as an additive field — clients that predate it ignore
   // it, exactly like session_epoch_us.
   private logToken = '';
+  // #62 GHOST EVICTION BY SILENCE. Every current client pings this socket every
+  // 25 s (the keepalive above the relay listener). A socket whose transport died
+  // WITHOUT a close frame — VPN path change, NAT rebind, sleep — keeps
+  // readyState OPEN here indefinitely, occupies a slot, and turns every rejoin
+  // into `full`: measured live 2026-08-19, one browser held "connecting…"
+  // through 5 room-full rejections while the room showed a single live peer.
+  // Stamped on every inbound message; swept ONLY when a join would otherwise be
+  // refused, so a legacy client that never pings can lose its slot only to a
+  // person who is actually at the door, never to a timer.
+  private lastSeen = new Map<WebSocket, number>();
   private postTimes: number[] = [];
   // Interpreter sessions, keyed by signaling role. Parallel to `peers` like the
   // cap maps: the translation socket is a sibling of the call, never a part of it.
@@ -481,6 +491,27 @@ export class Room implements DurableObject {
         }
       }
     }
+    if (this.peers.size < this.cap(v)) return false;
+    // Full — before refusing, evict occupants that have been silent past two
+    // keepalive intervals plus margin. READY_STATE_OPEN is a claim about this
+    // end; silence is evidence about the other. 60 s of it with a live person
+    // waiting outside decides the slot.
+    const GHOST_MS = 60_000;
+    const cut = Date.now() - GHOST_MS;
+    for (const [p] of this.peers) {
+      const seen = this.lastSeen.get(p) ?? 0;
+      if (seen < cut) {
+        try { p.close(1000, 'evicted: silent past keepalive'); } catch { /* dead */ }
+        this.peers.delete(p);
+        this.laneCaps.delete(p);
+        this.pcmCaps.delete(p);
+        this.pcmFrameCaps.delete(p);
+        this.sids.delete(p);
+        this.geo.delete(p);
+        this.vers.delete(p);
+        this.lastSeen.delete(p);
+      }
+    }
     return this.peers.size >= this.cap(v);
   }
 
@@ -515,6 +546,7 @@ export class Room implements DurableObject {
     const taken = new Set(this.peers.values());
     const role = ROLES.find((r) => !taken.has(r)) ?? 'a';
     this.peers.set(server, role);
+    this.lastSeen.set(server, Date.now());
 
     // Which video transport this client can actually run, declared on the
     // upgrade URL because it has to be known BEFORE either side builds its peer
@@ -550,6 +582,7 @@ export class Room implements DurableObject {
     // another occupant's signaling. When the flag is off, relay stays exactly
     // as it was: opaque forward to every other socket, no JSON inspection.
     server.addEventListener('message', (e: MessageEvent) => {
+      this.lastSeen.set(server, Date.now()); // #62: liveness for ghost eviction
       // KEEPALIVE, and it TERMINATES HERE. After the offer/answer/ICE exchange
       // the signaling socket goes completely silent for the rest of the call,
       // and an idle TCP connection through a VPN or a corporate proxy gets
@@ -643,6 +676,7 @@ export class Room implements DurableObject {
       this.sids.delete(server);
       this.vers.delete(server);
       this.geo.delete(server);
+      this.lastSeen.delete(server);
       const announce = () => {
         for (const [p] of this.peers) {
           try {

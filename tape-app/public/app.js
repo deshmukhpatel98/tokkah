@@ -6846,6 +6846,22 @@ async function join(room) {
         $('join').disabled = false;
         if (resumePending) { resumePending = false; clearLive(); }
         safe(() => ws.close(), 'full.close');
+        // #62: "full" is routinely a GHOST, not a person — a peer whose
+        // transport died without a close frame holds its slot with
+        // readyState OPEN. The room now evicts occupants silent past the
+        // keepalive when a join is refused, but that eviction only runs when
+        // someone knocks — so knock again. Bounded: a genuinely full room
+        // (two real people) stays refused after ~1 min of trying, and the
+        // counter lives in sessionStorage so a reload does not restart it.
+        {
+          const tries = Number(safe(() => sessionStorage.getItem('tape.fullRetry'), 'full.retryGet') ?? '0');
+          if (tries < 5) {
+            safe(() => sessionStorage.setItem('tape.fullRetry', String(tries + 1)), 'full.retrySet');
+            $('joinStatus').textContent = `call looks full — checking again (${tries + 1}/5)…`;
+            tel.log('room-full-retry', { tries: tries + 1 });
+            setTimeout(() => safe(() => recoverCall('room-full-retry'), 'full.retry'), 13000);
+          }
+        }
         return;
       }
       if (m.type === 'welcome') {
@@ -6855,6 +6871,7 @@ async function join(room) {
         welcomeSeen = true;
         clearTimeout(welcomeTimer);
         safe(() => sessionStorage.removeItem('tape.welcomeRetry'), 'welcome.clear');
+        safe(() => sessionStorage.removeItem('tape.fullRetry'), 'welcome.clearFull');
         role = m.role;
         tel.role = role;
         tel.log('role', { role, peerPresent: m.peerPresent });
