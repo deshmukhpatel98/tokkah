@@ -2391,6 +2391,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // stick the loop on a QP boundary and stall the integrator.
   const rcQpNow = () => (cfg.l2Rc ? Math.round(rcQp) : cfg.qp);
   const ageWindow = []; // this side's receive ages, drained by the reporter below
+  let ageFloorMs = Infinity; // #63 running min frame age = the path floor
   const ageReporter = setInterval(() => {
     if (closed) return;
     const w = ageWindow.splice(0);
@@ -2399,6 +2400,19 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       const s = [...w].sort((a, b) => a - b);
       p50 = +s[Math.min(s.length - 1, Math.floor(0.5 * s.length))].toFixed(1);
       p95 = +s[Math.min(s.length - 1, Math.floor(0.95 * s.length))].toFixed(1);
+    }
+    // #63 THE PATH'S AGE FLOOR. Frame age CONTAINS one-way propagation, so any
+    // absolute threshold on it is a hidden distance limit (rtt-blind-timeouts,
+    // third instance found). On a 337 ms RTT path no frame can ever be younger
+    // than ~200 ms, so "increase when p50 < 250" almost never fired and the
+    // AIMD pacer sat at its 2 fps floor for the whole call while the budget
+    // read 3.8 Mbps — measured live 2026-08-19. The floor is the min age seen,
+    // decaying upward at ~2 ms/s so a route change (VPN reconnect) is
+    // re-learned within a minute rather than never. Additive field: an old
+    // sender ignores pmin and keeps the absolute law.
+    if (w.length) {
+      const mn = Math.min(...w);
+      ageFloorMs = mn < ageFloorMs ? mn : ageFloorMs + 2;
     }
     // mco: our camera clock's offset — the peer's fullAge correction.
     // avd (§10): the delta between OUR two capture clocks, video and audio,
@@ -2409,7 +2423,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // audio-sample clock, which its playhead speaks natively (capUs chain).
     // Only present under the avsync bundle: the flag-off ctl wire is
     // byte-identical.
-    const msg = { t: 'age', p50, p95, mco };
+    stats.ageFloorMs = Number.isFinite(ageFloorMs) ? +ageFloorMs.toFixed(1) : null;
+    // ?agefloor=0 control: withhold pmin and every consumer reverts to the
+    // absolute law — one flag silences the whole #63 change on this side's
+    // receive direction.
+    const msg = { t: 'age', p50, p95, mco,
+                  pmin: cfg.l2AgeFloor !== false && Number.isFinite(ageFloorMs) ? +ageFloorMs.toFixed(1) : null };
     if (avsync && mco != null && Number.isFinite(mco)) {
       const ac = avsync.audioClockUs?.();
       if (ac != null) msg.avd = Math.round((now() - mco) * 1000 - ac);
@@ -2837,14 +2856,24 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // pacer backlog. p50 null means the peer decoded nothing this window
         // (startup, or a hole already healing): hold the rate, don't guess.
         if (!cfg.l2Pace || m.p50 == null) break;
-        if (m.p50 > 400 || (m.p95 ?? 0) > 900) {
+        // #63: judge the QUEUE, not the trip. `pmin` is the peer's measured
+        // path floor; subtracting it makes these thresholds distance-invariant
+        // (queue-tolerance-in-ms — the same law as the audio queue cap; the
+        // old absolute bands double-counted propagation exactly like the BDP
+        // multiplier did). Queue bands: cut above 250 ms of queue, climb below
+        // 100 ms, hold between. On a short path pmin≈age floor≈small and the
+        // behaviour is the shipped one; an old peer sends no pmin and gets the
+        // absolute law byte-for-byte.
+        const base = Number.isFinite(m.pmin) ? m.pmin : 0;
+        const q50 = m.p50 - base, q95 = (m.p95 ?? 0) - base;
+        if (q50 > (base ? 250 : 400) || q95 > (base ? 700 : 900)) {
           // 0.75x, not 1.0x, of the rate that broke: recovering all the way back
           // to it at speed just re-breaks the link. Successive cuts drag the
           // reference down with them, which is the correct reading of a link
           // that really is degrading.
           paceRef = admitRate * 0.75;
           admitRate = Math.max(2, admitRate * 0.6);
-        } else if (m.p50 < 250) {
+        } else if (q50 < (base ? 100 : 250)) {
           // Fast below the last proven rate, additive above it. The old law was
           // additive everywhere, so recovering from one x0.6 cut took ~8 s at
           // +3 fps/s — long enough that ordinary motion, which spikes the age
@@ -3220,12 +3249,19 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     const ages = [...clsWin].sort((a, b) => a.age - b.age);
     const p50 = +ages[Math.min(ages.length - 1, Math.floor(0.5 * ages.length))].age.toFixed(1);
     const fps = delTs.length;
+    // #63: the same distance correction as the AIMD pacer — these bands
+    // contained one-way propagation, so on a 337 ms RTT path `nominal` was
+    // unreachable and the regime oscillated absorb/held forever (measured live
+    // 2026-08-19: held -> resume -> 303 ms of nominal -> back to absorb).
+    // Judged on queue = age - path floor when the floor is known.
+    const clsBase = Number.isFinite(ageFloorMs) ? ageFloorMs : 0;
+    const q50 = p50 - clsBase;
     // Regime naming. The bands are the AIMD governor's own thresholds: under
     // its increase bound is nominal (D at D_min), the hysteresis band is
     // squeeze (D growing to cover jitter), above its halving bound is absorb
     // (the shock absorber spending time). Worse moves apply immediately;
     // nominal re-entry needs the diagram's 2 s clean.
-    const want = p50 < 250 ? 'nominal' : p50 < cfg.stallShedAgeMs ? 'squeeze' : 'absorb';
+    const want = q50 < (clsBase ? 100 : 250) ? 'nominal' : q50 < (clsBase ? 250 : cfg.stallShedAgeMs) ? 'squeeze' : 'absorb';
     if (want === 'nominal') {
       if (stallRegime !== 'nominal') {
         if (!cleanSince) cleanSince = t;
@@ -3242,7 +3278,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // at/below the pacer's floor counts too (starvation even at bounded age).
     // Either, for the whole dwell — and only after startup, where the GCC ramp
     // legitimately looks like this.
-    if (t - armedAt > 10000 && (p50 > cfg.stallShedAgeMs || fps <= cfg.stallShedFps)) {
+    if (t - armedAt > 10000 && (q50 > (clsBase ? 250 : cfg.stallShedAgeMs) || fps <= cfg.stallShedFps)) {
       if (!badSince) badSince = t;
       if (t - badSince >= cfg.stallShedDwellMs) enterHeld('capacity');
     } else badSince = 0;

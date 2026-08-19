@@ -495,6 +495,13 @@ async function handleLab(m) {
     // steer an experiment.
     const v = safe(() => tape?.snapshot?.(), 'lab.video') ?? null;
     const a = safe(() => pcm?.snapshot?.(), 'lab.audio') ?? null;
+    // `deep:1` returns BOTH snapshots whole. The curated list below has now
+    // eaten four debugging sessions by silently omitting the one field that
+    // mattered (processorOptions, PCM_CFG, concealRateMsS, and tonight the
+    // stall machine's shed/resume counters during a live 1 fps mystery). The
+    // curation stays for the streamer's bandwidth; the raw object is for
+    // when the operator is actively hunting.
+    if (m.deep) { reply({ tag: m.tag ?? null, deep: 1, video: v, audio: a }); return; }
     reply({
       tag: m.tag ?? null,
       video: v && {
@@ -1829,6 +1836,10 @@ const TAPE_CFG = {
   // its ceiling and the encoder stays over budget. Pixels move bytes at fixed
   // QP; frame rate does not (measured, testbed/bytepace.mjs). ?rcres=0 control.
   l2RcRes: QS.get('rcres') !== '0',
+  // #63 distance-invariant pacing: the receiver reports its min frame age (the
+  // path floor) and the pacer/stall bands judge queue = age - floor instead of
+  // the raw trip. ?agefloor=0 reverts this side to the absolute law.
+  l2AgeFloor: QS.get('agefloor') !== '0',
   // #61 The same lever, applied BEFORE the damage instead of after. l2RcRes waits
   // for 2 s of pinned-and-over then halves; this derives the resolution the
   // measured budget can actually afford and caps there continuously. Inert in the
