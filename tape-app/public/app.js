@@ -541,6 +541,12 @@ async function handleLab(m) {
         concealedMs: a.concealedMs ?? null, framesRecv: a.framesRecv ?? null,
         rttMs: a.rttMs ?? null, baseRttMs: a.baseRttMs ?? null,
         latePct: a.latePct ?? null,
+        // §17.59: the lateness signal and the duress level it drives. The video
+        // lane's decision to yield is only auditable from outside if the input
+        // and the output of that decision are both reported.
+        concealRateMsS: a.concealRateMsS ?? null, duressLevel: a.duressLevel ?? null,
+        depthMs: a.depthMs ?? null, targetFrames: a.targetFrames ?? null,
+        bPerFrame: a.bPerFrame ?? null, wastedShift: a.wastedShift ?? null,
       },
       // The conversation itself. `humanMedian` is the response time with the
       // network removed BY CONSTRUCTION — both its events are observed on this

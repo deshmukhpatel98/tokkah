@@ -3679,6 +3679,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           playedFrames: wl.playedFrames,
           lostFrames: wl.concealedFrames, // frames the playhead found missing
           concealedMs: wl.concealedFrames * 8,
+          // §17.59's signal and the level it produces. Without these the fix is
+          // invisible from outside and could only be verified by changing it and
+          // re-running -- which is how a plausible-but-wrong mechanism survives.
+          concealRateMsS: stats.concealRateMsS ?? null,
+          duressLevel: (() => { try { return halves[0]?.duress?.() ?? null; } catch { return null; } })(),
           extrapolatedMs: (wl.concealedFrames - wl.heldFrames) * 8,
           heldMs: wl.heldFrames * 8,
           lateFrames: wl.lateFrames + stats.late,
