@@ -2854,6 +2854,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // Until then, do not HOLD anything -- track `spread` instantaneously, which
     // self-cleans within one window (2.56 s) and cannot pin a bad peak. Hold
     // begins the moment the floor is stable, starting from zero.
+    // §17.59 conceal-rate state. Thresholds are in ms of concealed speech per
+    // second: a healthy live call measured 0-20 here, the drowning one ~500, so
+    // 60/250 sit well clear of both rather than between them.
+    let concealPrev = 0, concealAt = 0, concealRate = 0;
+    const DURESS_LATE = cfg.duressLate !== false;
+    const DURESS_C1 = Math.max(1, cfg.duressConceal1 ?? 60);
+    const DURESS_C2 = Math.max(DURESS_C1, cfg.duressConceal2 ?? 250);
     let dMinRun = Infinity, dMinAt = 0, holdArmed = false;
     const HOLD_ARM = cfg.holdArm !== false;
     const HOLD_ARM_MS = Math.max(500, cfg.holdArmMs ?? 2560); // one window
@@ -3331,6 +3338,33 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // sits near the target itself so the trim is ~0 and nothing changes. Pain
       // pops the floor to zero FIRST, so the same tick that saw a conceal already
       // restores the untrimmed target ("UP immediately" applies to the pop too).
+      // ── Audio duress from LATENESS, not just loss (§17.59) ────────────────
+      // `duress()` below is read by the video lane to decide whether to yield
+      // uplink, and its raw signal is peerLossPct alone. That is blind to the
+      // failure that actually happens: a queue that delivers every frame far
+      // too late produces NO loss. Measured on a live India<->Norway call
+      // (2026-08-19): the audio lane concealed 45 s and ran m2e 1043 ms while
+      // duress read 0 and the video budget sat at its 8 Mbps ceiling, still
+      // filling the pipe that was drowning the audio it was meant to protect.
+      // Capping video by hand took concealment to 0 ms/s within seconds.
+      // Concealment RATE is the direct measure of audio being damaged, and it
+      // is denominated in ms of ruined speech per second, which is a quantity
+      // with meaning rather than a tuned index.
+      {
+        const cms = (wl.concealedFrames ?? 0) * FRAME_MS;
+        const tNow = now();
+        if (concealAt) {
+          const dt = (tNow - concealAt) / 1000;
+          if (dt >= 0.2) {
+            const r = (cms - concealPrev) / dt;
+            // Same asymmetry as duress itself: rise at once, decay slowly, so a
+            // single clean tick cannot un-duck the video mid-burst.
+            concealRate = r > concealRate ? r : concealRate * 0.7 + r * 0.3;
+            stats.concealRateMsS = +concealRate.toFixed(1);
+            concealPrev = cms; concealAt = tNow;
+          }
+        } else { concealPrev = cms; concealAt = tNow; }
+      }
       let eff = want;
       if (JIT_GOV) {
         const pain = stats.late + (wl.lateFrames ?? 0) + (wl.concealedFrames ?? 0);
@@ -3460,8 +3494,11 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         // read has held lower for a continuous 4 s. A marginal link now sits
         // at its worst recent level instead of strobing through all three.
         const cap = rungTop[Math.min(FEC_N_MAX, rungTop.length - 1)];
-        const raw = stats.dupOn ? 2
+        // Loss OR lateness. `?duresslate=0` is the control arm.
+        const lateLvl = !DURESS_LATE ? 0 : concealRate >= DURESS_C2 ? 2 : concealRate >= DURESS_C1 ? 1 : 0;
+        const lossLvl = stats.dupOn ? 2
           : (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
+        const raw = lateLvl > lossLvl ? lateLvl : lossLvl;
         if (raw >= dLevel) { dLevel = raw; dLowSince = 0; return dLevel; }
         const t = now();
         if (!dLowSince) dLowSince = t;

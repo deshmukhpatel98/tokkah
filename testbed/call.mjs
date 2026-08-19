@@ -20,7 +20,7 @@
  *   node call.mjs --headed                         watch it happen
  */
 
-import { chromium } from 'playwright-core';
+import { chromium, webkit } from 'playwright-core';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -133,6 +133,15 @@ const HEADED = !!args.headed;
 // Two real cameras on one machine share the sensor AND the CPU — a one-sided arm
 // (realcam=a) is the clean sender measurement.
 const realcamFor = (side) => args.realcam === true || String(args.realcam).toLowerCase() === side.toLowerCase();
+// `--webkit=A` runs that side on real WebKit instead of Chromium. This exists
+// because the rate-control failure this rig most needs to reproduce is a
+// WEBKIT one: tape.js records a live Delhi<->NL call where Safari's estimate
+// collapsed to 72 kbps and admitted 2.7 fps while Chromium on the SAME path in
+// the SAME second ran 573 kbps and 22.7 fps. A Chromium-only rig cannot see
+// that at all, and a defect the rig cannot see is a defect it ships.
+// WebKit ignores Chrome's --use-file-for-fake-* flags, so a WebKit side
+// necessarily uses real devices; that is stated here rather than discovered.
+const webkitFor = (side) => args.webkit === true || String(args.webkit).toLowerCase() === side.toLowerCase();
 
 const truth = JSON.parse(readFileSync(join(CONV, 'truth.json'), 'utf8'));
 // Let the whole fixture play, plus slack for setup and the final turn's tail.
@@ -255,7 +264,7 @@ const RECORD_CONSTRAINTS = `
 `;
 
 async function launch(side, wav) {
-  const browser = await chromium.launch({
+  const browser = webkitFor(side) ? await webkit.launch({ headless: !HEADED }) : await chromium.launch({
     executablePath: CHROME,
     headless: !HEADED,
     args: [
@@ -286,6 +295,13 @@ async function launch(side, wav) {
     ],
   });
   const page = await browser.newPage();
+  // WebKit has no equivalent of --use-fake-ui-for-media-stream, so getUserMedia
+  // is denied outright unless the context grants it. Without this the WebKit
+  // side joins with no tracks and reports a clean, entirely fictional call.
+  if (webkitFor(side)) {
+    await page.context().grantPermissions(['camera', 'microphone'], { origin: new URL(URL_BASE).origin })
+      .catch((e) => console.log(`  ${side}: webkit permission grant failed — ${e.message}`));
+  }
   const errors = [];
   const netFails = [];
   page.on('console', (m) => {

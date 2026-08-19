@@ -2249,6 +2249,12 @@ const PCM_CFG = {
   // spread that included startup contamination, so it may be paying twice.
   // Number() alone would swallow 0, which is the arm worth testing.
   jitterMarginFrames: QS.has('pcmjitmargin') ? Number(QS.get('pcmjitmargin')) : undefined,
+  // §17.59: let audio duress rise on LATENESS as well as loss, so the video
+  // lane yields when a queue is ruining speech without dropping a packet.
+  // `?duresslate=0` is the control arm. Thresholds in ms concealed per second.
+  duressLate: QS.get('duresslate') !== '0',
+  duressConceal1: QS.has('duressc1') ? Number(QS.get('duressc1')) : undefined,
+  duressConceal2: QS.has('duressc2') ? Number(QS.get('duressc2')) : undefined,
   // Where the worklet's graded drain starts, in ms of excess (§17.41). Default 25.
   drainKneeMs: QS.has('pcmdrainknee') ? Number(QS.get('pcmdrainknee')) : undefined,
   // Queue allowance in ms above the BDP (§17.35). Unset = shipped BDP x 1.5.

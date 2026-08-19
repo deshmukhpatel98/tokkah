@@ -8425,3 +8425,70 @@ result. `target 3f` is a direct read of the estimator and is independent of the
 output device, which is why it is the thing being claimed here. The latency
 value of this change rests on §17.40's measurement, taken when the rig was
 sound; it has not been re-measured tonight and does not need to be.
+
+## 17.59 Audio duress was blind to lateness — found on a live India↔Norway call
+
+A real call, real cameras and microphones, one peer behind a VPN to Norway,
+read live through the lab channel (`op:'snap'`, no join, no renegotiation):
+
+| | a (India) | b (Norway) |
+|---|---|---|
+| video | 30 fps, 2.43 Mbps, 3420x2136 | 0.3 fps, 3360x2100 |
+| **glass-to-glass** | **14,351 ms** | 222 ms |
+| rate budget | **8 Mbps — the CEILING** | 0.6 Mbps — the floor |
+| audio m2e | **1043 ms** | 81 ms |
+| audio concealed | **45.4 s** | 2.5 s |
+| baseRtt | 341 ms | 342 ms |
+
+a was pushing seven megapixels at 30 fps into an intercontinental VPN uplink,
+had built a **fourteen-second** video queue, and was concealing roughly 8 s of
+speech every 16 s. **And its video budget was at the 8 Mbps maximum the whole
+time.**
+
+### The defect
+
+`duress()` exists precisely so the video lane yields uplink when audio is
+suffering. Its raw signal was:
+
+    const raw = stats.dupOn ? 2
+      : (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
+
+**Loss only.** A queue that delivers every frame far too late drops nothing, so
+`peerLossPct` stayed low, `duress` read 0, and the video lane was told the audio
+was fine while the audio was being destroyed. This is
+`blind-instruments-report-negatives` in its most expensive form yet: the
+instrument could not see the dominant real-world failure, and returned the
+identical value to a healthy call.
+
+Confirmed causally, live: capping video by hand (`op:'set'`, w/h and rcMax, no
+reload, no disconnect) took a's concealment from ~500 ms/s to **0 ms/s within
+seconds**, and m2e from 1043 to ~400. Nothing else changed.
+
+### The fix
+
+Duress now also rises on **concealment rate**, in ms of ruined speech per
+second — a quantity with physical meaning rather than a tuned index:
+
+    lateLvl = concealRate >= 250 ? 2 : concealRate >= 60 ? 1 : 0
+    raw     = max(lateLvl, lossLvl)
+
+Thresholds are placed against measurement, not taste: a healthy live call read
+0-20 ms/s on this same connection and the drowning one ~500, so 60 and 250 sit
+clear of both rather than between them. Rise is immediate and decay is smoothed
+(0.7/0.3), the same asymmetry duress already used, so one clean tick cannot
+un-duck the video mid-burst. `?duresslate=0` is the control arm.
+
+### What this call also settled
+
+- **#15 answered on a real microphone.** `--realcam=A` (real camera and mic):
+  `wire 704 B/frame, wastedShift 0, fit16 0/0%` — identical in character to the
+  file fixture. The ~8 bits/sample is NOT a fake-capture artifact; it is the
+  microphone's genuine analog noise floor, and we spend ~380 kbps transmitting
+  it losslessly. Not a chain bug — noise we should stop sending.
+- **The goal met on real hardware.** Same run, `outLatency` back to 20 ms:
+  **mouthToEar 138.6 and 141.5 ms at rtt=180**, depth 19-22 ms, target 4-5f,
+  with §17.49's queue cap and §17.58's margin fix both live.
+- **The lab channel is the right instrument for a live call.** `snap`/`drain`
+  read a running call without joining it; `set` changes w/h and rcMin/rcMax on
+  the running call without a reload. Everything above was measured and fixed
+  while two people stayed connected.
