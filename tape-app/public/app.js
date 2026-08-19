@@ -560,6 +560,7 @@ async function handleLab(m) {
         concealRateMsS: a.concealRateMsS ?? null, duressLevel: a.duressLevel ?? null,
         qShift: a.qShift ?? null, qFloorBits: a.qFloorBits ?? null, // #15 noise-floor quantiser
         netQueueMs: a.netQueueMs ?? null, // #64 standing net queue (p50 age - floor)
+        netAgeFloorMs: a.netAgeFloorMs ?? null, // #71 the floor itself -- a poisoned one is visible, not inferred
         depthMs: a.depthMs ?? null, targetFrames: a.targetFrames ?? null,
         bPerFrame: a.bPerFrame ?? null, wastedShift: a.wastedShift ?? null,
       },
@@ -2307,6 +2308,7 @@ const PCM_CFG = {
   // (p50 age - path floor) says the shared uplink is buffering, the failure
   // concealment cannot see. ?duressq=0 control.
   duressQueue: QS.get('duressq') !== '0',
+  pongClean: QS.get('pongclean') !== '0', // #71 gate clock-offset updates to clean pongs
   duressQueue1: QS.has('duressq1') ? Number(QS.get('duressq1')) : undefined,
   duressQueue2: QS.has('duressq2') ? Number(QS.get('duressq2')) : undefined,
   duressConceal1: QS.has('duressc1') ? Number(QS.get('duressc1')) : undefined,

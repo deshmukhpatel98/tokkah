@@ -568,7 +568,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // browsers' stamps are directly comparable on one machine.
       stalls: [],
       // timing
-      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0, ageMs: [],
+      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0, offAt: 0, ageMs: [],
       t0: null,
       // Jitter-target control. painEvents counts every conceal that asked for a
       // bigger buffer; bumps counts the ones that got it (a call at the ceiling
@@ -602,7 +602,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       dc: null,
       framesSent: 0, bytesSent: 0, paritySent: 0, parityBytes: 0, skipBuffered: 0,
       framesRecv: 0, bytesRecv: 0, parityRecv: 0,
-      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0,
+      rttMs: null, baseRttMs: null, clockOffsetMs: null, lastPongT: 0, offAt: 0,
       padBytesSent: 0, padBytesRecv: 0, // Lane 0: pre-warm padding per association
     });
     const assocs = Array.from({ length: PAIRS }, newAssoc);
@@ -2591,7 +2591,17 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (a.baseRttMs == null || a.rttMs < a.baseRttMs) a.baseRttMs = a.rttMs;
         // Same symmetric-path caveat as lane 1's ctl ping: an offset estimate,
         // reported as such, not ground truth.
-        a.clockOffsetMs = +(b - (ts + (nowMs - ts) / 2)).toFixed(2);
+        // #71 Only a clean pong may move the clock. The midpoint estimate is
+        // biased by half of any extra delay THIS pong suffered, and one
+        // stalled pong (884 ms tick stalls measured live) shifts every ageMs
+        // sample until the next update -- the poison that latched the queue
+        // floor at -1053 ms. Gate: within 40 ms of the best RTT seen, or the
+        // first estimate, or the last accepted one is >30 s stale (a genuine
+        // route change still re-learns). ?pongclean=0 restores the old law.
+        if (!PONG_CLEAN || a.clockOffsetMs == null || a.rttMs <= a.baseRttMs + 40 || nowMs - a.offAt > 30000) {
+          a.clockOffsetMs = +(b - (ts + (nowMs - ts) / 2)).toFixed(2);
+          a.offAt = nowMs;
+        }
         // The aggregate view reports association 0 (at pairs=1 it is the only
         // one — same numbers as before striping existed).
         if (a === assocs[0]) {
@@ -2899,11 +2909,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // second: a healthy live call measured 0-20 here, the drowning one ~500, so
     // 60/250 sit well clear of both rather than between them.
     let concealPrev = 0, concealAt = 0, concealRate = 0;
-    let netAgeFloor = Infinity; // #64 running min net age = path floor
+    let netAgeFloor = Infinity; // #64 path floor; #71 min over a 60 s ring
+    const netAgeFloorRing = []; // #71 per-tick window p5s -- poison ages out
     const DURESS_LATE = cfg.duressLate !== false;
     const DURESS_C1 = Math.max(1, cfg.duressConceal1 ?? 60);
     const DURESS_C2 = Math.max(DURESS_C1, cfg.duressConceal2 ?? 250);
   const DURESS_Q = cfg.duressQueue !== false;
+  const PONG_CLEAN = cfg.pongClean !== false; // #71
   const DURESS_Q1 = Math.max(10, cfg.duressQueue1 ?? 60);
   const DURESS_Q2 = Math.max(DURESS_Q1, cfg.duressQueue2 ?? 150);
     let dMinRun = Infinity, dMinAt = 0, holdArmed = false;
@@ -3437,11 +3449,21 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         if (!warm && stats.ageMs.length >= 100) {
           const srt = [...stats.ageMs].sort((x, y) => x - y);
           const p50 = srt[Math.floor(srt.length / 2)];
-          const mn = srt[0];
-          netAgeFloor = mn < netAgeFloor ? mn : netAgeFloor + 0.5; // +0.5/tick = 2 ms/s
+          // #71 p5 of the window, never the absolute min: one poisoned sample
+          // (a clock-offset transient around a rejoin) must not set the floor.
+          // Ring of per-tick lows, floor = min over 60 s, so poison ages out
+          // instead of decaying at 2 ms/s -- measured live 2026-08-20, the
+          // latched floor sat at -1053 ms, read 1203 ms of queue against a
+          // 150 ms ageP50, and pinned duress at 2 (video crushed to 0.6 Mbps)
+          // for the whole call. Same fix shape as the video pacer's floor.
+          const lo = srt[Math.floor(srt.length * 0.05)];
+          netAgeFloorRing.push(lo);
+          if (netAgeFloorRing.length > 240) netAgeFloorRing.shift(); // 60 s at 4 Hz
+          netAgeFloor = Math.min(...netAgeFloorRing);
+          stats.netAgeFloorMs = +netAgeFloor.toFixed(1);
           const q = Math.max(0, p50 - netAgeFloor);
           stats.netQueueMs = +q.toFixed(1);
-        } else if (warm) { netAgeFloor = Infinity; stats.netQueueMs = 0; }
+        } else if (warm) { netAgeFloorRing.length = 0; netAgeFloor = Infinity; stats.netQueueMs = 0; }
       }
       let eff = want;
       if (JIT_GOV) {

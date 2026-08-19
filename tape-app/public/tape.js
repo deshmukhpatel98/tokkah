@@ -2392,7 +2392,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // stick the loop on a QP boundary and stall the integrator.
   const rcQpNow = () => (cfg.l2Rc ? Math.round(rcQp) : cfg.qp);
   const ageWindow = []; // this side's receive ages, drained by the reporter below
-  let ageFloorMs = Infinity; // #63 running min frame age = the path floor
+  let ageFloorMs = Infinity; // #63 the path floor; #71 min over a 60 s ring
+  const ageFloorRing = []; // #71 per-report window minima -- poison ages out
   const ageReporter = tickInterval(() => {
     if (closed) return;
     const w = ageWindow.splice(0);
@@ -2409,11 +2410,17 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // AIMD pacer sat at its 2 fps floor for the whole call while the budget
     // read 3.8 Mbps — measured live 2026-08-19. The floor is the min age seen,
     // decaying upward at ~2 ms/s so a route change (VPN reconnect) is
-    // re-learned within a minute rather than never. Additive field: an old
+    // re-learned within a minute rather than never (#71: via a 60 s rolling min). Additive field: an old
     // sender ignores pmin and keeps the absolute law.
     if (w.length) {
-      const mn = Math.min(...w);
-      ageFloorMs = mn < ageFloorMs ? mn : ageFloorMs + 2;
+      // #71 The all-time min latch was poisonable: one bogus-low sample (a
+      // clock-offset transient around a rejoin) set the floor for ~10 minutes
+      // at the 2 ms/s decay -- measured live 2026-08-20, a floor of -24.7 ms
+      // held the pacer in its dead zone. A rolling min over the last 60
+      // reports ages poison out in a minute and needs no decay constant.
+      ageFloorRing.push(Math.min(...w));
+      if (ageFloorRing.length > 60) ageFloorRing.shift();
+      ageFloorMs = Math.min(...ageFloorRing);
     }
     // mco: our camera clock's offset — the peer's fullAge correction.
     // avd (§10): the delta between OUR two capture clocks, video and audio,
