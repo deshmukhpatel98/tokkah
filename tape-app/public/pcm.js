@@ -51,6 +51,7 @@ import { audioContext, addWorkletModule } from './onset-monitor.js';
 import { RsEncoder, rsDecode, RS_K, RS_P, setRsK } from './core/pcmrs.js';
 import { SwEncoder, SwDecoder, SW_STRIDE } from './core/pcmsw.js';
 import { packFrame, unpackFrame } from './core/pcmpack.js';
+import { tickInterval } from './core/tick.js';
 
 const FRAME_BYTES = 1152; // 384 samples × int24
 // Samples per frame, DERIVED. Until 2026-08-18 this number was written out as a
@@ -2445,8 +2446,8 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       if (closed || !cfg.lane0) return;
       padLeft += totalBytes;
       if (padTimer) return; // a pad is already running; it absorbs the addition
-      padTimer = setInterval(() => {
-        if (closed || padLeft <= 0) { clearInterval(padTimer); padTimer = null; padLeft = 0; return; }
+      padTimer = tickInterval(() => {
+        if (closed || padLeft <= 0) { padTimer?.clear?.(); padTimer = null; padLeft = 0; return; }
         const n = Math.min(PAD_MSG, padLeft);
         const msg = new ArrayBuffer(5 + n);
         const dv = new DataView(msg);
@@ -2461,7 +2462,7 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
           a.padBytesSent += msg.byteLength;
           break;
         }
-        if (!sent) { padLeft = 0; clearInterval(padTimer); padTimer = null; return; }
+        if (!sent) { padLeft = 0; padTimer?.clear?.(); padTimer = null; return; }
         stats.padBytesSent += msg.byteLength;
         stats.padMsgsSent++;
         padLeft -= n;
@@ -3086,7 +3087,9 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // is the most shared thing there is. If it blocks, every send AND every
     // receive batches at once, which is exactly the observed signature.
     let tickLast = 0;
-    const decayTimer = setInterval(() => {
+    // Worker clock (#65): this tick IS the drain/duress/queue controller and a
+    // hidden tab clamped it to 1 Hz — the ring ballooned to 300+ ms, measured live.
+    const decayTimer = tickInterval(() => {
       {
         const tnow = now();
         if (tickLast) {
@@ -3576,12 +3579,12 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         channel.onmessage = (e) => { try { onMessage(e.data, idx); } catch { /* one bad datagram is not a call-ending event */ } };
         channel.onopen = () => {
           L('pcm-dc-open', PAIRS > 1 ? { mode, assoc: idx, pairs: PAIRS } : { mode });
-          if (!pinger) pinger = setInterval(sendPing, PING_MS);
+          if (!pinger) pinger = tickInterval(sendPing, PING_MS);
           // 250 ms, not the ping's 2 s: 2 s of under-protection after a burst
           // begins is 250 frames of audio, and the whole point of the ladder is
           // to have the parity already in flight when the loss arrives.
           if (!lossTimer) {
-            lossTimer = setInterval(() => {
+            lossTimer = tickInterval(() => {
               sendLossReport();
               sendSkewReport();
               if (SKEWSTRIPE) recomputeLaneOrder();
@@ -3868,10 +3871,10 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
       // Tear down ONE peer. The capture half — worklet, capture ring, echo
       // detector, mic source — belongs to the call and outlives any peer in it.
       stop() {
-        clearInterval(pinger);
-        clearInterval(lossTimer);
-        clearInterval(decayTimer);
-        clearInterval(padTimer);
+        pinger?.clear?.();
+        lossTimer?.clear?.();
+        decayTimer.clear();
+        padTimer?.clear?.();
         try { playNode?.disconnect(); } catch { /* ignore */ }
         for (const a of assocs) { try { a.dc?.close(); } catch { /* ignore */ } }
       },

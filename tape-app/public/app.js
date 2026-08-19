@@ -2430,7 +2430,10 @@ const PCM_CFG = {
   // behaviour, and no linter here caught it.
   pcmDiag: QS.get('pcmdiag') === '1',
   pcmCapSab: QS.get('pcmcap') !== '0',
-  pcmPump: QS.get('pcmpump') ?? 'timer',
+  // #65 default 'mc': the setTimeout(0) pump is subject to the hidden-tab
+  // clamp; the MessageChannel pump is not, and its worst case is the old
+  // behaviour. ?pcmpump=timer is the control arm.
+  pcmPump: QS.get('pcmpump') ?? 'mc',
   // Pins the stride (data frames per parity; 0 = parity off). Unset = adaptive,
   // driven off the same T_LOSS ladder as fecN.
   pcmSwStride: QS.get('pcmswstride') != null ? Number(QS.get('pcmswstride')) : undefined,

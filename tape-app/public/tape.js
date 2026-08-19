@@ -37,6 +37,7 @@
  * happens once. Every entry point is wrapped, and any failure calls `onFail` so the
  * caller can fall back to an ordinary WebRTC video track.
  */
+import { tickInterval } from './core/tick.js';
 
 // ── Wire format ──────────────────────────────────────────────────────────────
 // 28-byte header per fragment. Fragments are independent datagrams, which is the
@@ -762,7 +763,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
       dc.onopen = () => {
         L('tape-ctl-open', {});
         setupEncoder().catch((e) => fail('encoder-setup', e));
-        pinger = setInterval(() => ctlSend({ t: 'ping', a: now() }), 2000);
+        pinger = tickInterval(() => ctlSend({ t: 'ping', a: now() }), 2000);
         ctlSend({ t: 'ping', a: now() });
       };
       dc.onerror = (e) => L('tape-ctl-error', { e: String(e?.error || e).slice(0, 120) });
@@ -835,7 +836,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
     },
     stop() {
       closed = true;
-      clearInterval(pinger);
+      pinger?.clear?.();
       try { procReader?.cancel(); } catch { /* ignore */ }
       for (const c of [enc, dec]) { try { c?.state !== 'closed' && c?.close(); } catch { /* ignore */ } }
       try { writer?.close(); } catch { /* ignore */ }
@@ -1415,7 +1416,7 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       ctx.fillStyle = flick ? '#000' : '#101010';
       ctx.fillRect(0, 0, 1, 1);
     };
-    setInterval(dirty, 16); // hidden-tab floor; rAF below is the fast path
+    tickInterval(dirty, 16); // worker clock (#65): the hidden-tab floor must not itself be clamped
     // Twice the data rate covers the tick that each parity fragment spends. Asked, not
     // guaranteed: the compositor caps it at the display refresh regardless.
     // ?ctickhz=N overrides the tick rate. It exists because the carrier tick is
@@ -1522,13 +1523,13 @@ export function prepareTapeRtp(pc, track, log, cfg = {}) {
       // question is whether the contention is what is left of the wait.
       const svc = Number(cfg.l2CarrierSvcMs);
       const svcMs = Number.isFinite(svc) && svc >= 8 && svc <= 200 ? Math.round(svc) : 16;
-      setInterval(() => { dirty(); emitCarrier(); }, svcMs);
+      tickInterval(() => { dirty(); emitCarrier(); }, svcMs);
     } else {
       carrierTrack = canvas.captureStream(carrierTicksAsked).getVideoTracks()[0];
       emitCarrier = () => {
         try { carrierTrack.requestFrame?.(); } catch { /* older Chrome: auto cadence carries on */ }
       };
-      if (manualCarrier) setInterval(() => { dirty(); emitCarrier(); }, 16);
+      if (manualCarrier) tickInterval(() => { dirty(); emitCarrier(); }, 16);
     }
     L('carrier-ticks', { asked: carrierTicksAsked, manual: manualCarrier,
       fastFlicker: cfg.l2FastCarrier !== false && carrierTicksAsked > 60,
@@ -2345,7 +2346,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       L('vbr-retune-failed', { want, err: String(e).slice(0, 120) });
     }
   }
-  const rcTimer = cfg.l2Rc ? setInterval(() => { rcPollBudget().catch(() => {}); }, 1000) : null;
+  const rcTimer = cfg.l2Rc ? tickInterval(() => { rcPollBudget().catch(() => {}); }, 1000) : null;
   if (cfg.l2Rc) rcPollBudget().catch(() => {});
 
   // Called once per encoded frame with its size. Keyframes are excluded: they are
@@ -2392,7 +2393,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   const rcQpNow = () => (cfg.l2Rc ? Math.round(rcQp) : cfg.qp);
   const ageWindow = []; // this side's receive ages, drained by the reporter below
   let ageFloorMs = Infinity; // #63 running min frame age = the path floor
-  const ageReporter = setInterval(() => {
+  const ageReporter = tickInterval(() => {
     if (closed) return;
     const w = ageWindow.splice(0);
     let p50 = null, p95 = null;
@@ -3980,7 +3981,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // on a healthy path; the classifier's own trigger is exercised by the
     // bandwidth-ceiling runs.
     if (cfg.stall) {
-      stallTimer = setInterval(() => {
+      stallTimer = tickInterval(() => {
         if (closed) return;
         try {
           if (cfg.stallForceAt && !stallForced && stallRegime === 'nominal' && now() - armedAt >= cfg.stallForceAt * 1000) {
@@ -4005,7 +4006,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     } else {
       startEncodeHalf();
     }
-    pinger = setInterval(() => ctlSend({ t: 'ping', a: now() }), 2000);
+    pinger = tickInterval(() => ctlSend({ t: 'ping', a: now() }), 2000);
     ctlSend({ t: 'ping', a: now() });
     try { avsync?.onCtlOpen?.(); } catch { /* TIME_SYNC must never break the lane */ }
   };
@@ -4245,10 +4246,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // link hands it to a survivor, so the room's other leg keeps its picture.
       try { if (link) link.leave(half); } catch { /* teardown is never load-bearing */ }
       try { pFilter?.close(); pFilter = null; } catch { /* teardown is never load-bearing */ }
-      clearInterval(pinger);
-      clearInterval(ageReporter);
-      clearInterval(rcTimer); // #44 — a live getStats poll on a closed pc throws every second
-      clearInterval(stallTimer);
+      pinger?.clear?.();
+      ageReporter?.clear?.();
+      rcTimer?.clear?.(); // #44 — a live getStats poll on a closed pc throws every second
+      stallTimer?.clear?.();
       clearTimeout(holdTimer);
       for (const q of avq.splice(0)) { try { q.frame.close(); } catch { /* already closed */ } }
       for (const q of vpq.splice(0)) { try { q.frame.close(); } catch { /* already closed */ } }
