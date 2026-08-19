@@ -559,6 +559,7 @@ async function handleLab(m) {
         // and the output of that decision are both reported.
         concealRateMsS: a.concealRateMsS ?? null, duressLevel: a.duressLevel ?? null,
         qShift: a.qShift ?? null, qFloorBits: a.qFloorBits ?? null, // #15 noise-floor quantiser
+        netQueueMs: a.netQueueMs ?? null, // #64 standing net queue (p50 age - floor)
         depthMs: a.depthMs ?? null, targetFrames: a.targetFrames ?? null,
         bPerFrame: a.bPerFrame ?? null, wastedShift: a.wastedShift ?? null,
       },
@@ -2302,6 +2303,12 @@ const PCM_CFG = {
   // lane yields when a queue is ruining speech without dropping a packet.
   // `?duresslate=0` is the control arm. Thresholds in ms concealed per second.
   duressLate: QS.get('duresslate') !== '0',
+  // #64 queue-aware duress: video yields when audio's standing network queue
+  // (p50 age - path floor) says the shared uplink is buffering, the failure
+  // concealment cannot see. ?duressq=0 control.
+  duressQueue: QS.get('duressq') !== '0',
+  duressQueue1: QS.has('duressq1') ? Number(QS.get('duressq1')) : undefined,
+  duressQueue2: QS.has('duressq2') ? Number(QS.get('duressq2')) : undefined,
   duressConceal1: QS.has('duressc1') ? Number(QS.get('duressc1')) : undefined,
   duressConceal2: QS.has('duressc2') ? Number(QS.get('duressc2')) : undefined,
   // Where the worklet's graded drain starts, in ms of excess (§17.41). Default 25.

@@ -2873,9 +2873,13 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
     // second: a healthy live call measured 0-20 here, the drowning one ~500, so
     // 60/250 sit well clear of both rather than between them.
     let concealPrev = 0, concealAt = 0, concealRate = 0;
+    let netAgeFloor = Infinity; // #64 running min net age = path floor
     const DURESS_LATE = cfg.duressLate !== false;
     const DURESS_C1 = Math.max(1, cfg.duressConceal1 ?? 60);
     const DURESS_C2 = Math.max(DURESS_C1, cfg.duressConceal2 ?? 250);
+  const DURESS_Q = cfg.duressQueue !== false;
+  const DURESS_Q1 = Math.max(10, cfg.duressQueue1 ?? 60);
+  const DURESS_Q2 = Math.max(DURESS_Q1, cfg.duressQueue2 ?? 150);
     let dMinRun = Infinity, dMinAt = 0, holdArmed = false;
     const HOLD_ARM = cfg.holdArm !== false;
     const HOLD_ARM_MS = Math.max(500, cfg.holdArmMs ?? 2560); // one window
@@ -3393,6 +3397,23 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             concealPrev = cms; concealAt = tNow;
           }
         } else { concealPrev = cms; concealAt = tNow; }
+        // #64 STANDING NETWORK QUEUE, the duress signal concealment cannot see.
+        // A shared uplink queue (video filling the VPN's buffer) delays every
+        // audio frame equally; the jitter buffer absorbs it, nothing conceals,
+        // and m2e silently grows by the queue — measured live 2026-08-19:
+        // netAgeP50 234.6 ms against a ~170 ms path floor while duress read 0.
+        // queue = p50(age) - min(age), the same floor law as the video pacer
+        // (17.64) and the audio queue cap before it. Floor decays up 2 ms/s so
+        // a route change is re-learned; warm-gated for the same reason as the
+        // conceal rate above.
+        if (!warm && stats.ageMs.length >= 100) {
+          const srt = [...stats.ageMs].sort((x, y) => x - y);
+          const p50 = srt[Math.floor(srt.length / 2)];
+          const mn = srt[0];
+          netAgeFloor = mn < netAgeFloor ? mn : netAgeFloor + 0.5; // +0.5/tick = 2 ms/s
+          const q = Math.max(0, p50 - netAgeFloor);
+          stats.netQueueMs = +q.toFixed(1);
+        } else if (warm) { netAgeFloor = Infinity; stats.netQueueMs = 0; }
       }
       let eff = want;
       if (JIT_GOV) {
@@ -3525,9 +3546,15 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
         const cap = rungTop[Math.min(FEC_N_MAX, rungTop.length - 1)];
         // Loss OR lateness. `?duresslate=0` is the control arm.
         const lateLvl = !DURESS_LATE ? 0 : concealRate >= DURESS_C2 ? 2 : concealRate >= DURESS_C1 ? 1 : 0;
+        // #64: the queue level. Loss and lateness say frames are DYING; this
+        // says they are all ALIVE BUT LATE — the failure the other two are
+        // structurally blind to, and the one that costs mouth-to-ear directly.
+        // ?duressq=0 control; ?duressq1/?duressq2 move the thresholds (ms).
+        const qMs = stats.netQueueMs ?? 0;
+        const queueLvl = !DURESS_Q ? 0 : qMs >= DURESS_Q2 ? 2 : qMs >= DURESS_Q1 ? 1 : 0;
         const lossLvl = stats.dupOn ? 2
           : (stats.peerLossPct > cap / 2 || stats.peerLossFastPct > cap) ? 1 : 0;
-        const raw = lateLvl > lossLvl ? lateLvl : lossLvl;
+        const raw = Math.max(lateLvl, lossLvl, queueLvl);
         if (raw >= dLevel) { dLevel = raw; dLowSince = 0; return dLevel; }
         const t = now();
         if (!dLowSince) dLowSince = t;
