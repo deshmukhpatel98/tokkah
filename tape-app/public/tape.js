@@ -302,6 +302,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
     });
     enc.configure(config);
     encConfig = config; // kept so a mid-call resize can re-issue it with new dims
+    stats.encW = config.width; stats.encH = config.height;
     L('tape-encoder', { ...config, hw: sup.config?.hardwareAcceleration ?? null });
     // The receiver configures its decoder from this, so it must be the size we
     // really encoded, not the size we asked for.
@@ -455,6 +456,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
         // ceiling, so without this the lane would upscale every frame back to it and
         // pay for pixels the sensor never produced. Held for RESIZE_HOLD frames so a
         // single odd frame cannot cost a keyframe.
+        stats.camW = frame.displayWidth; stats.camH = frame.displayHeight;
         if (!UPSCALE && encConfig && enc?.state === 'configured') {
           const want = fitSize(frame.displayWidth, frame.displayHeight, cfg);
           if (want.width !== encConfig.width || want.height !== encConfig.height) {
@@ -462,6 +464,7 @@ export function startTapeVideo({ pc, track, initiator, cfg, onRemote, log, onFai
               resizeHold = 0;
               const from = `${encConfig.width}x${encConfig.height}`;
               encConfig = { ...encConfig, width: want.width, height: want.height };
+              stats.encW = want.width; stats.encH = want.height;
               try {
                 enc.configure(encConfig);
                 // annexb carries SPS/PPS inline, so this keyframe re-describes the
@@ -1801,6 +1804,15 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     skipPaced: 0, // captures the AIMD pacer withheld (invisible to the reference chain)
     skipBytePaced: 0, // captures the byte brake withheld (QP pinned AND over budget)
     rcResShrink: 1, // encode-resolution divisor the rc actuator is applying now
+    linkScale: 1, // #61 proactive budget-derived resolution scale (1 = untouched)
+    // #61 resolution truth. The ENCODE size is recomputed every frame and was
+    // kept only in a closure, so every instrument reported TAPE_CFG — the
+    // CEILING — instead. camW/camH is the sensor; encW/encH is what the encoder
+    // was actually configured to, i.e. min(camera, ceiling) after rcResShrink.
+    // Without both, a CEILING of 3420x2136 is indistinguishable from an ENCODE
+    // of 3420x2136, and those two call for opposite fixes.
+    camW: null, camH: null, // camera frame size, per encode loop
+    encW: null, encH: null, // encoder config size — the real pixels on the wire
     pfMs: null, pfFrames: 0, pfFallbacks: 0, // presence filter: cost, output, declines
     pfStillMean: null, // 0..1 mean stillness — how much of the picture is held
     pfHoldThresh: null, // the lock threshold in luma, after upward adaptation
@@ -2137,6 +2149,55 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     }
   }
 
+  // ── #61 The LINK term on encode resolution ─────────────────────────────────
+  // The ceiling implements min(camera, peer panel): it answers "what is worth
+  // sending" — never more pixels than the sensor made, never more than the far
+  // panel can show. It does NOT answer "what FITS". Measured on a live call
+  // 2026-08-19: a 3420x2136 ceiling (the peer's Retina panel) against a 4.3 Mbps
+  // budget is 0.019 bits/pixel. The encoder cannot make that sharp. It pins QP
+  // and spreads the same bytes over 3.5x more pixels, so the picture comes out
+  // SOFTER, and the frame rate falls paying for the pixels it did encode — that
+  // call ran 14 fps on one side against the peer's 30. Above the link's carrying
+  // capacity, more pixels is not a quality trade: it is worse on both axes at
+  // once. So the budget sets a third ceiling beside the other two.
+  //
+  // This is `l2RcRes`'s job done BEFORE the damage instead of after. That
+  // actuator waits for 2 s of pinned-and-over and then halves; it is the right
+  // lever (pixels move bytes at fixed QP, frame rate does not) reached too late
+  // and only in powers of two. This one is continuous and arrives first;
+  // rcResShrink stays underneath it as the backstop for what the budget did not
+  // predict.
+  //
+  // DENOMINATOR IS cfg.fps, THE TARGET — never the achieved rate. Achieved fps
+  // is positive feedback here: fps falls -> cap rises -> more pixels -> fps
+  // falls further. The target is the intent and it does not move.
+  //
+  // Shrink-only, applied to the CAMERA size exactly like rcResShrink, so it
+  // composes with fitSize rather than fighting it: a 720p camera still encodes
+  // 720p, min(camera, panel) still holds, and every demotion flows through the
+  // one resize path (RESIZE_HOLD debounce, self-describing keyframe). Order is
+  // irrelevant because all three bounds are minima.
+  let linkScale = 1;          // 1 .. 0.25 — linear divisor the budget is asking for
+  function linkScaleEval() {
+    if (!cfg.l2ResLink) return;
+    const cw = stats.camW, ch = stats.camH;
+    if (!(rcBudgetMbps > 0) || !(cw > 0) || !(ch > 0) || !(cfg.fps > 0)) return;
+    const maxPx = (rcBudgetMbps * 1e6) / (cfg.l2ResBpp * cfg.fps);
+    const want = Math.min(1, Math.sqrt(maxPx / (cw * ch)));
+    // Quantised to 1/16ths and floored at 1/4 (the same total authority
+    // rcResShrink has). Hysteresis of 10%: the GCC estimate wanders continuously
+    // and every change here costs a keyframe, so a raw scale would reconfigure
+    // the encoder forever and spend more on keyframes than the shrink saves.
+    const q = Math.max(0.25, Math.round(want * 16) / 16);
+    if (Math.abs(q - linkScale) / linkScale >= 0.1) {
+      const from = linkScale;
+      linkScale = q;
+      stats.linkScale = q;
+      L('rc-res-link', { from, to: q, budgetMbps: +rcBudgetMbps.toFixed(2),
+                         cam: `${cw}x${ch}`, bpp: cfg.l2ResBpp, fps: cfg.fps });
+    }
+  }
+
   // The budget. `availableOutgoingBitrate` is Chrome's own GCC estimate for this
   // path — it has been probing since the call connected, which is strictly more
   // than we know — so use it and clamp into the configured band. Falling back to
@@ -2299,6 +2360,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     if (isKey) return;
     rcBytesEwma = rcBytesEwma == null ? bytes : 0.85 * rcBytesEwma + 0.15 * bytes;
     rcResEval(now());
+    linkScaleEval();
     // §6.1: the worst peer's budget, because one bitstream feeds both decoders.
     const budgetMbps = gBudgetMbps();
     if (budgetMbps == null) return;
@@ -3488,6 +3550,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // Set only once the encoder really holds it. Setting it before the await above
     // let the pump see a config `enc` had not been given yet, on a null `enc`.
     encConfig = config; // kept so a mid-call resize can re-issue it with new dims
+    stats.encW = config.width; stats.encH = config.height;
     L('tape-encoder', { lane: 'rtp', ...config, rateControl,
       rcForced: cfg.l2RcMode === 'vbr' ? 1 : 0,
       hw: sup.config?.hardwareAcceleration ?? null });
@@ -3707,17 +3770,20 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // Held for RESIZE_HOLD consecutive frames so one odd frame cannot start a
       // reconfigure storm, and skipped entirely under ?upscale=1 so the control
       // arm stays a true copy of the old behaviour.
+      stats.camW = frame.displayWidth; stats.camH = frame.displayHeight;
       if (!UPSCALE && encConfig) {
         // rcResShrink divides the CAMERA size before it is fitted to the
         // ceiling, so a demotion flows through the exact resize machinery a
         // camera change would use — RESIZE_HOLD debounce, reconfigure,
         // self-describing keyframe — rather than through a second path.
-        const want = fitSize(frame.displayWidth / rcResShrink, frame.displayHeight / rcResShrink, cfg);
+        const rDiv = rcResShrink / linkScale;
+        const want = fitSize(frame.displayWidth / rDiv, frame.displayHeight / rDiv, cfg);
         if (want.width !== encConfig.width || want.height !== encConfig.height) {
           if (++resizeHold >= RESIZE_HOLD) {
             resizeHold = 0;
             const from = `${encConfig.width}x${encConfig.height}`;
             encConfig = { ...encConfig, width: want.width, height: want.height };
+            stats.encW = want.width; stats.encH = want.height;
             try {
               // configure() on a live encoder applies to subsequent frames and
               // resets the reference chain, so the next frame must be a key

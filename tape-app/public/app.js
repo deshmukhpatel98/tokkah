@@ -499,6 +499,12 @@ async function handleLab(m) {
       tag: m.tag ?? null,
       video: v && {
         qp: TAPE_CFG.qp, w: TAPE_CFG.width, h: TAPE_CFG.height,
+        // w/h above are the CEILING (TAPE_CFG), which is what every instrument
+        // has been reporting as if it were the resolution. It is not: the encoder
+        // runs at fitSize(camera, ceiling), so a 720p camera under a 4K ceiling
+        // encodes 720p. These four are the real chain — sensor, then encoder.
+        camW: v.camW ?? null, camH: v.camH ?? null,
+        encW: v.encW ?? null, encH: v.encH ?? null,
         // `mbpsAtFps` and NOT any "bytes sent" counter: it is bytes-per-frame
         // times the frame rate actually ACHIEVED, so it answers "what does this
         // quality cost on the wire" without flattering itself when the lane is
@@ -1822,6 +1828,18 @@ const TAPE_CFG = {
   // its ceiling and the encoder stays over budget. Pixels move bytes at fixed
   // QP; frame rate does not (measured, testbed/bytepace.mjs). ?rcres=0 control.
   l2RcRes: QS.get('rcres') !== '0',
+  // #61 The same lever, applied BEFORE the damage instead of after. l2RcRes waits
+  // for 2 s of pinned-and-over then halves; this derives the resolution the
+  // measured budget can actually afford and caps there continuously. Inert in the
+  // normal case by construction: a 1080p camera at 4.3 Mbps already sits above the
+  // floor, so the scale computes to 1 and nothing moves. It only bites where the
+  // ceiling asked for more pixels than the pipe can carry — which is where the
+  // picture was getting softer AND slower at the same time. ?resfit=0 control.
+  l2ResLink: QS.get('resfit') !== '0',
+  // Bits per pixel per frame the budget must afford at the encoded size. 0.06 is
+  // the low end of usable H.264 for talking-head content (1080p30 at 4 Mbps is
+  // 0.064); the live pathology that motivated this was 0.019. ?resbpp=N to tune.
+  l2ResBpp: Math.max(0.005, Number(QS.get('resbpp')) || 0.06),
   // Presence filter (presence-filter.js): remove grain where nothing moved,
   // soften only what the eye cannot resolve, so the same encoder at the same
   // quantizer spends fewer bits. OPT-IN while it is being measured — this one
