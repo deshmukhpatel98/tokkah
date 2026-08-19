@@ -895,6 +895,9 @@ if (ra.pcmAudio || rb.pcmAudio) {
         `  age p50 ${p.ageP50} ms  p95 ${p.ageP95} ms  (rtt ${p.rttMs}, baseRtt ${p.baseRttMs}, offset ${p.clockOffsetMs})` +
         `  mode ${p.mode}  rate ${p.sampleRate ?? '?'}  outLatency ${p.outputLatencyMs} ms  mouthToEar ${p.mouthToEarMs} ms`,
     );
+    log(
+      `      floor ${p.netAgeFloorMs ?? '?'} ms  netQueue ${p.netQueueMs ?? '?'} ms  duress ${p.duressLevel ?? '?'}`,
+    );
     // The BANDWIDTH axis of the goal, which this rig has never printed. Every
     // number here was already in the snapshot; 17.47 asked for wire bytes
     // beside latency and they were sitting unread. bPerFrame is the real

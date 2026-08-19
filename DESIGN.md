@@ -8552,3 +8552,32 @@ regime §17.51 had ALREADY ruled outside the instrument's domain, and the data
 said so again: CTL concealed 3120/2504 ms in round 1 and 26696/26288 ms in round
 2 — a 10x swing within the control arm. Stopped and not scored. The live call is
 the evidence for §17.59, which is what the testing law asks for anyway.
+## 17.73: #14 re-run with the halved lane — the gate moved from audio to the estimator
+
+Protocol: rtt=220, `--net=mobile` (3 Mbps nominal), 60 s, quantiser default
+(ARM) vs `?pcmqbits=0` (CTL), order rotated. r1-ARM invalid (audio lane never
+started, 0/0 frames); scored on r2-ARM vs both CTL rounds. The §17.51 caveat
+on mobile-regime concealment noise applies to the concealment numbers, not to
+the wire arithmetic, which is what this study is about.
+
+The lane, with parity and ~1% loss counted — the exact currency #14 was
+denominated in:
+
+    CTL  wire 682-683 B/frame  = 896-911 kbps total
+    ARM  wire 366     B/frame  = 483-491 kbps total   (wastedShift 6.6 bits, >=8 on 82.5%)
+
+The quantiser halves the delivered lane under loss, not just the clean wire.
+Audio concealment moved the same direction (ARM 304/864 ms vs CTL 328-3800 ms).
+
+Video did NOT escape the 0.6 Mbps clamp floor: admitted 27-32% (ARM) vs 27-34%
+(CTL), budgets 0.6 in every scored run. The reason is now visible in the rc
+line: `rc est 0.93-1.53 Mbps` on a nominal 3 Mbps pipe. GCC's estimate under
+mobile jitter IS the pipe as far as the budget law is concerned, and
+audio (0.49) + video floor (0.6) ≈ est. #14 is no longer "audio fills the
+pipe" — 17.63 fixed that half — it is "the estimator won't credit a jittery
+pipe with its capacity". The next lever is estimator-side (or accepting that a
+pipe this jittery genuinely carries ~1.5 Mbps of usable real-time budget).
+
+Also confirmed in every run, both arms: the 17.71/17.72 floors read sane and
+positive (81.8-98.6 ms on a ~110 ms one-way path), netQueue 25-89 ms tracking
+the real mobile queue, no negative floors, no false duress-2 from the metric.
