@@ -755,6 +755,7 @@ if (ra.tapeMode?.wanted || rb.tapeMode?.wanted) {
         `  ${(v.bytesSent / 1e6).toFixed(1)} MB  ${v.mbpsAtFps} Mbps-at-fps` +
         `  RTX ${v.rtxP ?? '?'}p/${v.packetsSent ?? '?'}p ${(((v.rtxB ?? 0) / 1e6)).toFixed(1)}MB nack ${v.nack ?? '?'}` +
         `  key ${v.keyframesSent}` +
+        `  cam ${v.camW ?? '?'}x${v.camH ?? '?'} enc ${v.encW ?? '?'}x${v.encH ?? '?'} linkScale ${v.linkScale ?? '?'} shr ${v.rcResShrink ?? '?'}` +
         (r.tapeMode?.fellBack ? '  — FELL BACK to RTP' : ''),
     );
     log(
