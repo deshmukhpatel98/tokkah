@@ -36,6 +36,7 @@ import { TurnTaking, median } from './turntaking.js';
 import { startTapeVideo, startTapeRtp, prepareTapeRtp, createTapeLink, tapeSupported, tapeRtpSupported } from './tape.js';
 import { initPcmAudio, FRAME_SHAPE } from './pcm.js';
 import { initTimeSync } from './timesync.js';
+import { tickMode } from './core/tick.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -501,9 +502,10 @@ async function handleLab(m) {
     // stall machine's shed/resume counters during a live 1 fps mystery). The
     // curation stays for the streamer's bandwidth; the raw object is for
     // when the operator is actively hunting.
-    if (m.deep) { reply({ tag: m.tag ?? null, deep: 1, video: v, audio: a }); return; }
+    if (m.deep) { reply({ tag: m.tag ?? null, deep: 1, tick: tickMode(), video: v, audio: a }); return; }
     reply({
       tag: m.tag ?? null,
+      tick: tickMode(), // #74 which clock drives the ticks: worker | worker-pending | plain-failover | plain-flag
       video: v && {
         qp: TAPE_CFG.qp, w: TAPE_CFG.width, h: TAPE_CFG.height,
         // w/h above are the CEILING (TAPE_CFG), which is what every instrument

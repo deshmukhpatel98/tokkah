@@ -68,3 +68,14 @@ export function tickInterval(fn, ms) {
     },
   };
 }
+
+// #74 Observability: which clock is actually driving the ticks. 'worker' only
+// after the worker's first real tick -- 'worker-pending' means subscriptions
+// exist but no proof of life yet, and the two plain variants say WHY the
+// fallback is in charge. A blocked worker script used to be indistinguishable
+// from a healthy one out here.
+export function tickMode() {
+  if (PLAIN) return 'plain-flag';
+  if (dead) return 'plain-failover';
+  return seenTick ? 'worker' : 'worker-pending';
+}

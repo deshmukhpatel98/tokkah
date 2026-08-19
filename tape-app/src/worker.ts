@@ -2114,6 +2114,15 @@ export default {
     const res = new Response(asset.body, asset);
     res.headers.set('X-Content-Type-Options', 'nosniff');
     res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    // #74 A dedicated worker's SCRIPT response must itself carry COEP on a
+    // cross-origin-isolated page, or Chromium refuses the spawn with
+    // ERR_BLOCKED_BY_RESPONSE. core/tickworker.js was being blocked, so every
+    // clock silently rode the plain-timer insurance fallback -- throttled to
+    // 1 Hz in background tabs, the exact defect 17.66 existed to fix (the
+    // failover made it invisible: tickLate500 was the only witness). COEP +
+    // CORP on every asset is harmless: everything here is same-origin.
+    res.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+    res.headers.set('Cross-Origin-Resource-Policy', 'same-origin');
     if (asset.headers.get('content-type')?.includes('text/html')) {
       res.headers.set('Content-Security-Policy', csp(new URL(request.url).host));
       // No X-Frame-Options: it cannot express "any ancestor" (its ALLOW-FROM
