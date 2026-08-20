@@ -585,6 +585,29 @@ export class Room implements DurableObject {
       for (const [p] of this.peers) if (p !== server) return m.get(p) ?? 0;
       return null; // nobody else here yet; `peer-joined` carries it when they arrive
     };
+    // ── #75 "UNKNOWN" AND "ZERO" ARE NOT THE SAME ANSWER ────────────────────
+    // peerCap's `?? 0` is right for laneCaps and pcmCaps, where 0 is a real
+    // value meaning "does not want the lane". It is WRONG for pcmFrameCaps,
+    // where 0 is not a frame length any client can have: it can only mean the
+    // occupant has not declared one. The client's guard is written for exactly
+    // that distinction —
+    //
+    //     if (peerFrameMs != null && peerFrameMs !== FRAME_SHAPE.ms) fallback
+    //
+    // with the comment "absent means before this existed and is left to the
+    // checks below". But absent could never reach it, because this server turned
+    // absent into 0, and 0 is present-and-different. So a peer whose cap entry
+    // was momentarily missing — a same-sid rejoin deletes it, and a welcome built
+    // in that window reads the gap — tore the LOSSLESS AUDIO LANE down and put the
+    // call on Opus. Silently: `pcm-fallback {why:'peer-frame-shape', quiet:true}`.
+    //
+    // Measured 2026-08-20: 3 of 8 rig calls against production hit it, one of them
+    // losing the lane on BOTH ends (`pcm-frame-mismatch {ours:8, theirs:0}`).
+    // Nothing else in the run said the call had been downgraded.
+    const peerFrameCap = () => {
+      for (const [p] of this.peers) if (p !== server) return this.pcmFrameCaps.get(p) ?? null;
+      return null;
+    };
 
     // §3.2 / §4: relay listener. When THREE_ENABLED, inbound messages are
     // inspected: a JSON object with a string `to` field naming a valid role is
@@ -767,7 +790,7 @@ export class Room implements DurableObject {
         preferRelay: (this.kmApart(server) ?? 0) >= RELAY_KM,
         peerLane: peerCap(this.laneCaps),
         peerPcm: peerCap(this.pcmCaps),
-        peerPcmFrame: peerCap(this.pcmFrameCaps),
+        peerPcmFrame: peerFrameCap(),
         // Additive fields — old clients ignore them.
         cap: this.cap(v),
         peers: peersArr,
@@ -1852,6 +1875,40 @@ export class Health implements DurableObject {
         failReasons: rows.filter((r) => r.evt === 'fail').reduce((m: Record<string, number>, r) => {
           const k = String(r.reason ?? '-'); m[k] = (m[k] ?? 0) + 1; return m;
         }, {}),
+        // ── #75 THE SAME NUMBERS, SPLIT BY ENGINE ────────────────────────────
+        // `byEngine` above counts beats per engine, which answers "who is using
+        // this" and nothing else. The question that actually needed answering on
+        // 2026-08-20 was "is Chromium worse than WebKit in the field", and it took
+        // hand-analysis of /recent to get at — twenty rows, because that endpoint
+        // caps there. The answer was stark enough to justify a permanent view:
+        // ONE live call, both ends, same second, same path — the Chromium end
+        // reported glassToGlass 9428.6 ms and the WebKit end 343.2 ms.
+        //
+        // Engine-specific defects are a real category here (WebKit has no
+        // MediaStreamTrackProcessor and no fixed-QP encoding; Chromium's data
+        // channel accepts megabytes of send buffer where WebKit applies its own
+        // backpressure), so a fleet view that cannot separate them cannot tell a
+        // regression in one engine from a change in traffic mix. Percentiles only,
+        // same shape as the fleet-wide ones directly above, so the two are
+        // read side by side without a second request.
+        byEngineStats: [...new Set(rows.map((r) => String(r.engine ?? '-')))].sort()
+          .reduce((m: Record<string, unknown>, eng) => {
+            const e = rows.filter((r) => String(r.engine ?? '-') === eng);
+            const en = (evt: string, field: string) =>
+              e.filter((r) => r.evt === evt && typeof r[field] === 'number')
+                .map((r) => r[field] as number).sort((a, b) => a - b);
+            const c = e.filter((r) => r.evt === 'connect').length;
+            const f = e.filter((r) => r.evt === 'fail').length;
+            m[eng] = {
+              beats: e.length, ends: e.filter((r) => r.evt === 'end').length,
+              connectRatePct: c + f ? +((100 * c) / (c + f)).toFixed(1) : null,
+              ttcMs: stats(en('connect', 'ttc_ms')),
+              glassToGlassMs: stats(en('end', 'glass_to_glass_ms')),
+              mouthToEarMs: stats(en('end', 'mouth_to_ear_ms')),
+              concealPct: stats(en('end', 'conceal_pct')),
+            };
+            return m;
+          }, {}),
       });
     }
     return json({ error: 'not found' }, 404);

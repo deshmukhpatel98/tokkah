@@ -8581,3 +8581,292 @@ pipe this jittery genuinely carries ~1.5 Mbps of usable real-time budget).
 Also confirmed in every run, both arms: the 17.71/17.72 floors read sane and
 positive (81.8-98.6 ms on a ~110 ms one-way path), netQueue 25-89 ms tracking
 the real mobile queue, no negative floors, no false duress-2 from the metric.
+
+## 17.75 "Bad in Brave, fine in Safari" — one live call, six defects, and a one-way door
+
+The report was a user's, not a rig's: calls are very bad in Brave and very fine
+in Safari. A live Safari↔Brave call was still up in `msc-vmfs-una`, so it was
+read through the lab channel and the room log before anything was changed.
+
+    a = Safari 27.0 (WebKit)      b = Chrome/151 (Brave)     6426 km apart
+    baseRtt 477 ms, media relayed (a srflx / b relay), both cameras real
+
+The Brave side spent **the entire call with its video lane in `held`** —
+`framesOut` went 310 → 882 in 366 s, which is 2.4 fps of picture — while the
+Safari side received 17 fps at a 300 ms frame age and never complained. That
+asymmetry is the whole report, and it decomposes into six independent defects,
+five of which are in this repo and one of which is a browser difference that
+makes the fifth matter far more on Chromium than on WebKit.
+
+### The chain, end to end
+
+    the ctl channel queues on a long constrained link
+      -> pong RTT swings 460 ms <-> 8.3 s
+      -> the clock offset it feeds swings +/-2.4 s                        [D1]
+      -> frame ages are poisoned; the age floor comes out at -2176 ms
+      -> §17.72's clamp turns that into ZERO
+      -> and a zero floor selects the DISTANCE-BLIND band                 [D2]
+      -> a 531 ms age on a 440 ms-RTT path reads "absorb" -> shed -> HELD
+      -> the held-exit probe is an 82 KB JPEG whose own arrival age is 12-25 s [D3]
+      -> and the sender stops sending it 8 s in, while the peer waits 60  [D4]
+      -> so `held` is a ONE-WAY DOOR and the picture never comes back
+
+and, independently, on a link that is marginal rather than hopeless:
+
+    GCC reads 0.25-0.64 Mbps honestly
+      -> the trust floor overrides it to 1.5 on every dip duress takes through 0 [D5]
+      -> budget square wave 0.6 <-> 1.5 Mbps
+      -> the resolution ladder's "10% hysteresis" is smaller than one rung   [D6]
+      -> ~6 encoder reconfigures and keyframes a minute, 64% of them reversals
+      -> each keyframe is ~250 ms of a 0.6 Mbps link, which IS the backlog
+         that made the peer shed the lane in the first place
+
+### D1 — a clock may only be moved by a clean pong
+
+`off = b - (a + rtt/2)` assumes a symmetric round trip. A pong that waited in a
+queue violates that by exactly the queue, and this channel queues — so the error
+is largest precisely when the ages it poisons are being used to decide whether
+the link is in trouble. The EWMA does not save it: a sustained one-sided queue
+biases every sample the same way, so the average converges ON the error.
+
+pcm.js learned this in §17.71 and got `pongClean`. The ctl channel — the one the
+video lane's own ages ride on — never did. It does now: a rolling minimum over
+30 round trips (one minute at the 2 s ping), and only a pong within
+max(30 ms, 15%) of it may move the clock. `rttMs` still updates on every pong,
+because there the queue IS the reading.
+
+Measured, 4 rows per arm: the ctl clock offset settled at **|off| <= 8 ms in every
+arm row** against **4.4 / 30.9 / 670.5 / -893.0 ms** in the control. 14-35 pongs
+per call were refused.
+
+### D2 — the fallback behind §17.72's clamp was distance-blind
+
+A negative floor is a broken measurement and clamping it to zero is right. But
+every consumer then reads that zero as "this path has no propagation in it" and
+switches to its ABSOLUTE band — which is the distance-blind branch. So a floor
+estimator that fails on a long path does not merely lose precision: it silently
+selects the exact behaviour the whole §17.63/64/68/72 line of work exists to
+remove. **Fourth instance of `rtt-blind-timeouts`, reached through a fallback
+rather than through a constant.**
+
+Half the ctl round trip measures the same distance and cannot go negative. It is
+a worse floor — it carries the return path and any queue on it — but it is the
+right kind of number, and on a long path an overestimate of propagation only
+makes a gate too patient. Zero makes it blind.
+
+### D3 — the exit probe was most of the delay it was measuring
+
+`exitProbe` resumes video when lane-P stills arrive within 100 ms of the path
+floor. A 960 px q0.85 JPEG of a real face is 34-82 KB (measured, both ends of
+both calls). On the 0.6 Mbps budget a shed link sits at, 34 KB is 453 ms of
+bytes and 82 KB is 1.09 s. **The probe could not satisfy a 100 ms gate however
+clear the pipe was, because the probe was the delay.** `control-plane-rides-its-
+own-resource`, in its self-poisoning form.
+
+So the still is now sized to ARRIVE, not to look good: at most `lpMs` (100 ms) of
+the current budget, converged by feedback on the previous still's actual bytes
+because content decides compressibility and no formula here can. 100 ms of
+0.6 Mbps is 7.5 KB; 100 ms of 8 Mbps is 100 KB, so a healthy link keeps the crisp
+still §4 asks for and only a starved one gets a smaller one — which is the right
+trade, because on a starved link the alternative to a small still is no video at
+all for a minute.
+
+### D4 — two constants that had to agree, on opposite sides of the link
+
+`maybeStill` lived only inside the shed branch of the capture pump. So stills
+stopped the instant our own dead-man switch un-shed us — `stallShedMaxMs`, 8 s
+after the peer asked us to stop. The peer's `held` lasts up to `stallMaxHoldMs`,
+60 s, and its only clean way out needs those stills. **For 52 of those 60 seconds
+the peer was waiting on a probe stream this side had already switched off**, and
+every recovery on a bad link came from the 60 s `maxhold` hatch instead.
+
+The two constants live in one config object, on two lines, and nothing connected
+them. The probe now follows the PEER's state (`peerHeldAt`, set by LANE_SHED and
+cleared only by LANE_RESUME — never by our own dead-man), bounded at 90 s.
+
+Measured: `lpSent` froze at 8 for the rest of every control call and moved to
+12-48 in the arm; probe age **5.5-25.4 s (ctl) -> 2.0-4.2 s (arm), no overlap**.
+
+### D5 — the trust floor is a claim about the INSTRUMENT, so the LINK outranks it
+
+§17.x's trust floor exists because GCC on a 320x180 synthetic carrier is not a
+measurement of the link — WebKit read 72 kbps where Chromium read 1.73 Mbps on
+the same path in the same second. That argument is sound and the floor stays.
+What it could not survive is contrary evidence from the link itself, and the old
+gate — `!dd` alone — could not see any.
+
+On the live call the sender's GCC read 0.25-0.64 Mbps for six minutes and the
+floor overrode it to 1.5 on every dip duress took through 0 (`rcTrusted` 107 on
+one side, 31 on the other) **while the receiver sat in `held` with the video lane
+shed — it had asked us to stop sending entirely.**
+
+Two pieces of evidence, both already in scope and neither consulted: `gShedded()`
+(the receiver's own verdict on our uplink, from arrival ages we cannot see), and
+the fact that duress-0 must be SUSTAINED — duress rises instantly and decays
+smoothed by design, so the instantaneous zero the gate read is a gap in the
+signal, not calm.
+
+### D6 — "hysteresis of 10%" that was smaller than one rung
+
+    if (Math.abs(q - linkScale) / linkScale >= 0.1)   // one rung is 1/16
+
+One rung is 0.0625/0.625 = 10.0% at 0.625 and 16.7% at 0.375. So from 0.625
+downward — the whole regime a struggling link lives in — a single rung always
+cleared the guard and there was no hysteresis at all. It only ever suppressed
+movement near 1.0, where movement is cheap.
+
+Live evidence: **37 and 40 link-scale changes in a ~400 s call, 64% and 54% of
+them immediate reversals** (the new rung was the one just left), the scale
+bouncing 0.375 <-> 0.625 — a 2.8x swing in pixels — because the budget itself is
+bistable between the 0.6 clamp floor and the 1.5 trust floor.
+
+The replacement is a DWELL, not a wider deadband: the input is a square wave and
+no deadband narrower than the square is safe against one. Down 1 s (two budget
+polls, so one bad poll still cannot move it); up 8 s, and only to the LEAST
+optimistic rung seen across the whole window — the level the link held
+throughout, never the peak it touched. A budget that never settles therefore
+leaves the resolution ALONE, which is the correct answer: pixels are the slow
+expensive knob and QP is the fast one, and rcQp keeps adapting every frame
+underneath this.
+
+### D7 — the audio backlog gate was denominated in a frame size that no longer exists
+
+`OFFER_BPS = 125 pps x (24 + 1152) B x 1.3` is the lane's design rate written as
+a constant, and every byte budget in pcm.js is denominated in it. **#15's
+noise-floor quantiser (shipped 17.72/17.73) more than tripled the compression:
+the lane now packs 316-340 B per data message, so `mbpsSent` reads 0.43 against a
+declared 1.52.** Nothing announced that to the gate, which quietly became 3.5x
+too generous — along with its burst allowance (`2 x (HDR + FRAME_BYTES)`) and its
+floor (`cfg.queueBytes` 6144, which was "about five frames" and is now eighteen).
+Three terms, one staleness, in the gate that decides how much audio may queue.
+
+**And this is where the browsers diverge.** On the live call the Chromium side
+stood at 107/112/114 KB of `bufferedAmount` per association with its per-
+association ping RTT reading **9.0 s against a 477 ms baseRtt**, while the WebKit
+side of the same call sat at **0-5 KB** — WebKit's data channel applies its own
+backpressure and Chromium's accepts megabytes. **On Chromium this gate is the
+only backpressure the lane has**, which is exactly why the number it is set to
+matters more there, and exactly why the same code feels different in the two
+browsers.
+
+Denominated now in what we are PACKING, never in what the network returned:
+bytes-per-message is known at send time, so it converges in a second and cannot
+learn a throttled rate the way a throughput estimator would (the pcm-loss2
+collapse the constant was chosen to avoid). Bounded above by the old constant, so
+it can only ever tighten.
+
+A second gate rides beside it on the quantity the first is a proxy for: the
+association's own `rttMs - baseRttMs`, measured at 2.5 Hz with no model in it.
+It TIGHTENS the byte budget rather than vetoing — the first cut was a veto, and a
+veto here is an outage waiting to happen, because on a congested link every
+association is over at the same moment, every picker returns null, and the lane
+goes silent.
+
+### What was measured, and what was not
+
+Rig: two Chromium browsers, real WebCodecs, real datachannels, against
+**production** (room.tokkah.com), through the netsim at 440 ms RTT / 15 ms heavy
+jitter / 0.5% loss / 2 Mbps. Four calls, arms rotated CTL,ARM,ARM,CTL, both roles
+scored, n = 4 rows per arm. CTL turns every change above back off by query flag.
+
+**Complete separation between arms (U = 0, the minimum n=4 v 4 can produce):**
+
+| | ctl | arm |
+|---|---|---|
+| lane-P still size | 80 KB x4 | 13-21 KB |
+| lane-P still width | 960 px x4 | 240 px x4 |
+| lane-P probe age | 5.5 - 25.4 s | 2.0 - 4.2 s |
+| standing backlog per association | 92.6 - 117.5 KB | 15.1 - 55.0 KB |
+| audio backlog gate | 90.7 - 97.8 KB | 37.1 - 47.0 KB |
+| ctl clock offset | 4.4 / 30.9 / 670.5 / -893.0 ms | -7.6 / 5.3 / -6.8 / -4.1 ms |
+| frame-age floor | one null, one -4454 ms | +209 to +1139, all positive |
+
+**Directional but overlapping, and reported as such:** held fraction (median 73%
+-> 41%), audio concealed (median 24.8 s -> 11.5 s, with 3 of 4 arm rows below
+every ctl row).
+
+**Too noisy at this profile to claim anything:** `framesOut` (22-870 within one
+arm), `fullAge`, and the audio lane's own RTT. At `--bw=2` with tail drop the
+emulated bottleneck is itself the dominant queue, so an end-to-end number cannot
+be attributed to us. That is a limit of the rig at this setting, not a null
+result, and it is the reason the table above is mechanism-level.
+
+**Not measured at all:** the resolution-ladder fix (D5/D6) does not reproduce in
+this regime — at 2 Mbps both arms pin at the 0.6 floor and the ladder never
+oscillates, so both arms show ~1 change per call. Its evidence is the live call
+(37/40 changes, 64%/54% reversals, the 0.6<->1.5 square wave visible in the
+budget) and the counter it now carries (`linkScaleMoves`). Saying it is "verified"
+would be a lie; it is measured on production traffic and unreproduced in the lab.
+
+### The one that got away
+
+The Brave side's A/V sync applied **-13.6 s** on the live call, against +51 ms on
+the Safari side. Two contributors, and only one is addressed here. Frames really
+were 9.4 s old on arrival (that is D1-D4). But the other is a genuine engine
+asymmetry: Chromium captures through MediaStreamTrackProcessor and reads
+`capLagP50` 0.4 ms, while WebKit has no breakout box and captures through
+`<video>` + rVFC — and that element's media clock advances only as fast as frames
+are actually rendered. On the live call the Safari sender's `capLagP50` was
+**175,665 ms** on a 190 s call: its capture clock had advanced ~15 s while the
+wall advanced 190. Every age and every A-V mapping the Chromium RECEIVER
+computes from that sender's timestamps inherits the error.
+
+The fix is not on the receiver. It is to stop shipping a media clock the peer has
+to reconstruct a wall time from, and stamp frames with the sender's own audio-
+clock time directly — the sender knows both at capture. That is a wire change and
+it is not in this section.
+
+### The fleet, split by engine for the first time
+
+The report was one person's impression. The health beacon has been running for
+weeks and could not answer it: `byEngine` counted BEATS per engine, which says
+who is using this and nothing else. Seven days of real calls, with the split
+added (`/api/health/summary` → `byEngineStats`):
+
+| | chromium | webkit |
+|---|---|---|
+| glass-to-glass p50 | **1434.2 ms** (n=8) | **172.6 ms** (n=11) |
+| glass-to-glass p90 | **9428.6 ms** | **274.5 ms** |
+| mouth-to-ear p50 | 520.8 ms (n=22) | 255.6 ms (n=9) |
+| mouth-to-ear p90 | 934.5 ms | 325.1 ms |
+| concealed p50 | 3.7% (n=22) | 0.9% (n=12) |
+| time-to-connect p50 | 3258 ms (n=50) | 1095 ms (n=18) |
+| connect rate | 87.7% | 85.7% |
+
+**8.3x on video at the median and 34x at p90.** The samples are small and these
+are DIFFERENT calls on different networks, so a traffic-mix confound cannot be
+excluded from this table alone — but the one paired observation there is points
+the same way with the same magnitude: a single call, both ends, same second, same
+relayed path, reported **9428.6 ms** from the Chromium end and **343.2 ms** from
+the WebKit end.
+
+The split is now a permanent field of the summary. An engine-specific defect is a
+real category in this codebase — WebKit has no MediaStreamTrackProcessor and no
+fixed-QP encoding; Chromium's data channel accepts megabytes of send buffer where
+WebKit applies its own backpressure — and a fleet view that cannot separate them
+cannot tell a regression in one engine from a change in who is calling.
+
+### D8 — a join race that silently took the lossless audio lane off the call
+
+Found while trying to A/B D7, in the runs rather than in the code: three of eight
+rig calls against production logged `pcm-fallback {why:'peer-frame-shape',
+quiet:true}` and finished the call on Opus with nothing else saying so.
+
+    client:  if (peerFrameMs != null && peerFrameMs !== FRAME_SHAPE.ms) fallback
+             // "absent means before this existed and is left to the checks below"
+    server:  peerCap = (m) => { ... return m.get(p) ?? 0; }
+
+The client's guard is written to be permissive about an occupant that has not
+declared a frame shape. **It could never see that case**, because the server
+substituted `0` for it — and 0 is present-and-different, so it took the branch
+that tears the lane down. `?? 0` is correct for `laneCaps` and `pcmCaps`, where
+zero means "does not want the lane". It is not a frame length.
+
+The gap is real and reachable: a same-sid rejoin deletes the cap entry while the
+socket is still in `peers`, and a welcome built in that window reads the hole.
+Observed: `pcm-frame-mismatch {ours: 8, theirs: 0}`.
+
+Fixed on both sides, because this repo is forked and self-hosted and a new client
+against an old worker is a real deployment shape: the server returns `null` for
+an undeclared frame cap, and the client treats `0` as unknown in every version of
+the server there has ever been.

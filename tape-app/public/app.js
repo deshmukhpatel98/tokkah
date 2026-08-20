@@ -1869,6 +1869,17 @@ const TAPE_CFG = {
   // the low end of usable H.264 for talking-head content (1080p30 at 4 Mbps is
   // 0.064); the live pathology that motivated this was 0.019. ?resbpp=N to tune.
   l2ResBpp: Math.max(0.005, Number(QS.get('resbpp')) || 0.06),
+  // #75 The resolution ladder gets a DWELL instead of a relative deadband. The
+  // old 10% guard was smaller than one 1/16 rung from 0.625 down, so on a
+  // struggling link it suppressed nothing: measured live 2026-08-20, 37 and 40
+  // scale changes in a 400 s call with 64% of them immediate reversals, each one
+  // an encoder reconfigure and a keyframe on a 0.6 Mbps pipe. Down is protective
+  // and cheap (1 s — two budget polls, so one bad poll still cannot move it); up
+  // re-floods the pipe it just drained and needs sustained proof (8 s). See
+  // linkScaleEval in tape.js. `?ressteady=0` is the control arm.
+  l2ResSteady: QS.get('ressteady') !== '0',
+  l2ResDownMs: Number(QS.get('resdownms')) || 1000,
+  l2ResUpMs: Number(QS.get('resupms')) || 8000,
   // Presence filter (presence-filter.js): remove grain where nothing moved,
   // soften only what the eye cannot resolve, so the same encoder at the same
   // quantizer spends fewer bits. OPT-IN while it is being measured — this one
@@ -1901,6 +1912,14 @@ const TAPE_CFG = {
   // `Number(null)` is 0 — the exact falsy-zero trap that has already put every
   // default call into manual carrier mode once today.
   l2RcTrustMbps: QS.get('l2rctrust') == null ? 1.5 : Number(QS.get('l2rctrust')),
+  // #75 How long duress must read 0, with no standing shed, before the floor
+  // above is allowed to override the estimate. Duress rises instantly and decays
+  // smoothed, so the instantaneous 0 the old gate read is a GAP in the signal,
+  // not calm — on the 2026-08-20 live call it bought a 2.5x budget rise on every
+  // dip while the peer sat in `held` with our video lane shed. `?l2rctrustcalm=0`
+  // restores the instant gate. Same `== null` reasoning as l2RcTrustMbps: 0 is
+  // the flag's most important value.
+  l2RcTrustCalmMs: QS.get('l2rctrustcalm') == null ? 5000 : Number(QS.get('l2rctrustcalm')),
   // QP band. 24 stays the floor, so nothing gets WORSE than today's picture on a
   // link that can afford today's bitrate; 42 is the ceiling, soft but never
   // blocky at 1080p, and reached only when the alternative is a slideshow.
@@ -2027,7 +2046,29 @@ const TAPE_CFG = {
   // fault, and an uplink that is off with nobody watching is a dead call.
   stallShedMaxMs: Number(QS.get('stallshedmax')) || 8000,
   lpFps: Number(QS.get('lpfps')) || 1, // §4: crisp stills, ~1 fps
-  lpWidth: Number(QS.get('lpw')) || 960, // still width (height keeps the camera's aspect)
+  lpWidth: Number(QS.get('lpw')) || 960, // still width CEILING (height keeps the camera's aspect)
+  // #75 The still doubles as the held-exit probe, so its size is a LATENCY
+  // budget: at most this many ms of the current video budget. 100 ms of 0.6 Mbps
+  // is 7.5 KB, of 8 Mbps is 100 KB — a healthy link keeps the crisp still, a
+  // starved one gets one that can actually arrive. Without this the probe was
+  // 453-970 ms of its own bytes against a 100 ms gate and `held` was a one-way
+  // door (measured live 2026-08-20). `?lpms=0` restores the fixed width.
+  lpMs: QS.get('lpms') == null ? 100 : Number(QS.get('lpms')),
+  // #75 When the age-floor estimator returns a negative (broken) value, fall back
+  // to half the ctl round trip rather than to zero — zero reads as "no distance"
+  // and selects the distance-blind band. `?agefloorrtt=0` restores the plain clamp.
+  l2AgeFloorRtt: QS.get('agefloorrtt') !== '0',
+  // #75 Only a pong whose round trip is near the recent minimum may move the ctl
+  // clock offset — a queued pong is asymmetric by exactly the queue, and that
+  // error lands straight in every frame age. pcm.js got this in 17.71; the video
+  // lane's own channel had it missing. `?ctlpongclean=0` is the control.
+  l2CtlPongClean: QS.get('ctlpongclean') !== '0',
+  lpMinWidth: Number(QS.get('lpminw')) || 240,
+  // #75 Keep the held-exit probe flowing while the PEER is held, not only while
+  // our own uplink is shed — our dead-man clears the shed after 8 s and the peer's
+  // hold lasts up to 60 s, so the probe used to stop 52 s early. `?lphold=0` is
+  // the control arm.
+  lpHold: QS.get('lphold') !== '0',
   lpQ: QS.has('lpq') ? Number(QS.get('lpq')) : 0.85, // JPEG quality — §4 says 0.9; 0.85 ≈ halves the bytes
   stallForceAt: Number(QS.get('stallforce')) || 0, // test hook: force one shed N s after arm
 };
@@ -2319,6 +2360,23 @@ const PCM_CFG = {
   drainKneeMs: QS.has('pcmdrainknee') ? Number(QS.get('pcmdrainknee')) : undefined,
   // Queue allowance in ms above the BDP (§17.35). Unset = shipped BDP x 1.5.
   queueMs: QS.has('pcmqms') ? Number(QS.get('pcmqms')) : undefined,
+  // #75 Denominate the backlog gate in the rate the lane ACTUALLY packs rather
+  // than the pre-quantiser constant it was written against. `?pcmoffer=0` pins
+  // the old constant back as the control arm. See offerBps() in pcm.js — this is
+  // strictly a tightening, bounded above by the constant it replaces.
+  offerMeasured: QS.get('pcmoffer') !== '0',
+  // #75 A second, model-free backlog gate: refuse an association whose MEASURED
+  // queueing delay (its own rttMs − baseRttMs, 2.5 Hz) is over budget. The byte
+  // gate converts a latency budget through a rate model and that model is what
+  // went stale; this one measures the latency. Default 2x pcmqms so the byte gate
+  // stays primary. `?pcmqdelay=0` disables, any number sets the budget in ms.
+  queueDelayMs: QS.has('pcmqdelay') ? Number(QS.get('pcmqdelay')) : undefined,
+  // `?pcmq=` given explicitly PINS the backlog floor in bytes. Without it the
+  // floor is denominated in frames of the size actually being sent (#75) — 6144
+  // bytes meant "about five frames" when a frame was 1176 B and means eighteen at
+  // the 340 B the quantiser packs, which is the same staleness as OFFER_BPS in a
+  // second term.
+  queueBytesPinned: QS.has('pcmq'),
   // Latency governor (task #47): trims buffer depth the measured per-frame
   // slack proves the call never needed. STAYS OPT-IN — the gates ran and were
   // NOT met (2026-08-05, all on real shipping browsers): under injected
@@ -3587,7 +3645,14 @@ function pcmAgree(peerPcm, when, peerFrameMs) {
   // counter reports a transport fault. Older peers omit the field entirely, so
   // only a PRESENT and DIFFERENT value refuses -- absent means "before this
   // existed" and is left to the checks below.
-  if (peerFrameMs != null && peerFrameMs !== FRAME_SHAPE.ms) {
+  // #75 ...and `0` is not a frame length either. The server used to substitute 0
+  // for "this occupant has not declared one" (peerCap's `?? 0`), which is fixed
+  // there — but this repo is forked and self-hosted, so a NEW client against an
+  // OLD worker is a real deployment shape, and in that shape this line is the only
+  // thing standing between a cap-map gap and the lossless lane being torn down
+  // silently. A zero here means unknown, in every version of the server there has
+  // ever been.
+  if (peerFrameMs != null && peerFrameMs !== 0 && peerFrameMs !== FRAME_SHAPE.ms) {
     tel?.log('pcm-frame-mismatch', { when, ours: FRAME_SHAPE.ms, theirs: peerFrameMs });
     fallbackToOpus('peer-frame-shape', true);
     return;
@@ -6690,7 +6755,33 @@ async function join(room) {
   // the driver compose the same quantity from getStats: one-way + jitter buffer
   // + output latency, the same three terms in the same order.
   window.__mediaPc = pc;
-  pc.onicecandidate = (e) => e.candidate && send({ type: 'ice', candidate: e.candidate, ...addr(mediaPeer) });
+  // ── #75 WHAT PATHS DID THIS BROWSER EVEN OFFER? ──────────────────────────────
+  // A call that ends up relayed costs an extra hop in each direction, and the
+  // logs so far only ever recorded the pair that WON — never whether a direct
+  // pair was on the table. Those are different diagnoses with different owners:
+  // "the NAT refused a direct path" is the network's, "this browser never
+  // gathered a server-reflexive candidate" is a browser SETTING the user can
+  // change. Brave in particular can be configured to disable non-proxied UDP,
+  // which forces every call onto TURN, and on a live 2026-08-20 Safari<->Brave
+  // call the Brave side's local candidate was `relay` on the media pair and on
+  // all five audio stripes while the Safari side had `srflx` — an asymmetry no
+  // log in this app could explain, because none of them recorded gathering.
+  //
+  // Types only. Never an address: the whole point of mDNS host candidates and of
+  // Brave's setting is that a local IP is not something a page should be leaking
+  // into a log, and the diagnosis does not need one.
+  const iceGathered = new Set();
+  pc.onicecandidate = (e) => {
+    if (!e.candidate) {
+      // End-of-candidates: the gathering is final, so this is the moment the set
+      // means something. A set without `srflx` or `host` on a call that then
+      // relays is the answer to "why is this call slow" in one line.
+      tel?.log('ice-gathered', { types: [...iceGathered].sort() });
+      return;
+    }
+    if (e.candidate.type) iceGathered.add(e.candidate.type);
+    send({ type: 'ice', candidate: e.candidate, ...addr(mediaPeer) });
+  };
   pc.oniceconnectionstatechange = () => {
     tel.log('ice-state', { state: pc.iceConnectionState });
     if (pc.iceConnectionState === 'failed') {

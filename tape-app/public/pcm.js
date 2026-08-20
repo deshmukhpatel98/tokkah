@@ -329,6 +329,64 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   // healthy in-flight bytes; anything beyond it (×1.5 for SACK/abandon lag,
   // plus two frames) is a true congestion queue, and that is what gets dropped.
   const OFFER_BPS = (1000 / 8) * (HDR + FRAME_BYTES) * 1.3; // 125 pps × 1168 B, +30% FEC
+  // ── #75: that constant became a fiction the day the quantiser shipped ──────
+  // OFFER_BPS above is the lane's design rate written as a CONSTANT, and every
+  // byte budget below is denominated in it. #15's noise-floor quantiser (shipped
+  // 17.72/17.73) more than tripled the compression: the same lane now packs
+  // 316-339 B per data message on real microphones instead of 1176, so the true
+  // offered rate is ~0.43 Mbps against a declared 1.52. Nothing announced that to
+  // the gate, so the gate quietly became 3.5x too generous.
+  //
+  // What that cost, measured, both ends of two real calls on 2026-08-20:
+  //   Chromium<->Chromium, rtt 180 through the simulator: 45-48 KB of standing
+  //     bufferedAmount on EVERY association against a 41.8 KB gate — at the
+  //     lane's real ~8.9 KB/s per association that is about 5 s of queue.
+  //   The user's live Safari<->Brave call, rtt 477: the Chromium side stood at
+  //     107/112/114 KB against a 98 KB gate, with its per-association ping RTT
+  //     reading 9.0 s against a 477 ms baseRtt. The WebKit side of the SAME call
+  //     sat at 0-5 KB, because WebKit's data channel applies its own backpressure
+  //     and Chromium's accepts megabytes. On Chromium this gate is the ONLY
+  //     backpressure the lane has, which is exactly why the number it is set to
+  //     matters more there.
+  //
+  // Denominated in what we are PACKING, never in what the network returned.
+  // bytes-per-message is known at send time, so this converges in a second and
+  // cannot learn a throttled rate the way a throughput estimator would — that is
+  // the pcm-loss2 collapse the constant was chosen to avoid, and it is avoided
+  // here for the same reason rather than by accident. The parity share is taken
+  // as a RATIO, which is also throttle-invariant: dropping frames drops data and
+  // parity together and leaves the ratio where it was.
+  //
+  // Bounded above by the constant — a packed frame cannot exceed the verbatim
+  // escape — so this can only ever tighten. `?pcmoffer=0` pins it back.
+  //
+  // Read off the ASSOCIATION's own counters, which is what is in scope at the
+  // gate — and is the same number anyway: every association carries the same
+  // sized messages, only 1/N as many of them, so its bytes-per-message is the
+  // lane's bytes-per-message. The 125 pps it is multiplied by is the design
+  // cadence (a constant of the format), never a measured throughput.
+  const OFFER_MIN_N = 32; // messages before the mean means anything (~1.5 s at 1/6 of 125 pps)
+  const BURST_SLACK_F = 2; // frames of slack above the budget — SCTP does not drain smoothly
+  const BURST_FLOOR_F = 5; // the gate's hard floor, in frames; `cfg.queueBytes` was this in 1176 B units
+  // Mean PAYLOAD bytes per data message on this association — the unit every byte
+  // budget in this file is really counting in. Falls back to the format's maximum
+  // (an unquantised frame) until there are enough samples, so the gate starts wide
+  // and tightens as the real size becomes known, never the other way round.
+  function offerFrameBytes(a) {
+    if (cfg.offerMeasured === false || !a || !(a.framesSent >= OFFER_MIN_N)) return FRAME_BYTES;
+    const dataBytes = a.bytesSent - a.parityBytes;
+    if (!(dataBytes > 0)) return FRAME_BYTES;
+    return Math.min(FRAME_BYTES, Math.max(1, dataBytes / a.framesSent - HDR));
+  }
+  function offerBps(a) {
+    if (cfg.offerMeasured === false || !a) return OFFER_BPS;
+    if (!(a.framesSent >= OFFER_MIN_N)) return OFFER_BPS;
+    const dataBytes = a.bytesSent - a.parityBytes;
+    if (!(dataBytes > 0)) return OFFER_BPS;
+    const bpf = dataBytes / a.framesSent;         // includes HDR: bytesSent counts whole messages
+    const parRatio = a.parityBytes / dataBytes;   // ~0.3, and ratios survive throttling
+    return Math.min(OFFER_BPS, (1000 / FRAME_MS) * bpf * (1 + parRatio));
+  }
   // The budget is per-association: each stripe carries ~1/N of the bytes, but
   // its gate is the FULL design-rate budget — an association absorbing spilled
   // frames from a congested sibling needs headroom for exactly that, and a
@@ -366,14 +424,75 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
   //
   // 40 is the first value tried, not a tuned one. 20 and 80 are unmeasured.
   const QUEUE_MS = Number.isFinite(Number(cfg.queueMs)) ? Math.max(0, Number(cfg.queueMs)) : 40;
+  // #75 the delay gate's allowance — see queueDelayDiv below. 2x QUEUE_MS so the
+  // byte gate stays the primary and this stays the backstop.
+  const QUEUE_DELAY_MS = Number.isFinite(Number(cfg.queueDelayMs)) ? Math.max(0, Number(cfg.queueDelayMs)) : 2 * QUEUE_MS;
   function backlogLimit(a) {
     const rtt = a.baseRttMs ?? 0;
     if (rtt <= 0) return cfg.queueBytes;
-    const bdp = (rtt / 1000) * OFFER_BPS;
-    const budget = QUEUE_MS
-      ? bdp + (QUEUE_MS / 1000) * OFFER_BPS
+    const bps = offerBps(a);
+    const bdp = (rtt / 1000) * bps;
+    let budget = QUEUE_MS
+      ? bdp + (QUEUE_MS / 1000) * bps
       : bdp * 1.5;
-    return Math.max(cfg.queueBytes, budget + 2 * (HDR + FRAME_BYTES));
+    budget /= queueDelayDiv(a);
+    // #75 THE BURST ALLOWANCE AND THE FLOOR WERE THE SAME STALE CONSTANT AGAIN.
+    // `2 * (HDR + FRAME_BYTES)` is "two frames of slack" written as a byte count,
+    // and `cfg.queueBytes` (6144, `?pcmq=`) was "about five frames" when a frame
+    // was 1176 B. At the 340 B the quantiser now packs they are 7 and 18 frames —
+    // the same 3.5x drift as OFFER_BPS, in the two terms that decide the gate on a
+    // SHORT path, where bdp is small and these dominate outright. Expressed in
+    // frames of the size actually being sent, they mean today what they meant when
+    // they were written.
+    const frame = HDR + offerFrameBytes(a);
+    // `?pcmq=` still pins the floor in bytes when someone wants a byte floor; the
+    // DEFAULT is the frame-denominated one, so the control arm (`?pcmoffer=0`,
+    // which pins offerFrameBytes to the format maximum) reproduces 5 x 1176 =
+    // 5880 against the old 6144 — the same floor to within one frame, on purpose.
+    const floor = cfg.queueBytesPinned ? cfg.queueBytes : BURST_FLOOR_F * frame;
+    return Math.max(floor, budget + BURST_SLACK_F * frame);
+  }
+
+  // ── #75 THE QUANTITY THE BYTE GATE IS A PROXY FOR, MEASURED DIRECTLY ───────
+  // Everything above converts a latency budget into a byte count through a rate
+  // model, and a rate model is exactly the thing that went stale for weeks when
+  // the quantiser shipped. The association ALREADY measures the quantity the byte
+  // count is standing in for: `rttMs - baseRttMs` is its queueing delay, in
+  // milliseconds, end to end, at 2.5 Hz (PING_MS 400), with no model in it at all.
+  //
+  // Measured 2026-08-20 with the byte gate corrected, Chromium<->Chromium at a
+  // simulated 440 ms RTT: per-association backlog 52 KB and lane RTT 1.8 s — an
+  // order better than the 115 KB / 32 s the stale gate allowed, and still 30x the
+  // buffer this lane plays out of. A byte gate cannot close that last gap without
+  // a burst allowance so tight it would drop clean frames; a delay gate closes it
+  // directly, because it is measuring the delay.
+  //
+  // BOTH, and for different failure modes: the byte gate is instantaneous and
+  // catches a burst before it is queued, the delay gate is 400 ms stale and
+  // catches a STANDING queue the byte gate has been sized to permit. Neither can
+  // see what the other sees.
+  //
+  // The allowance is DOUBLE the byte gate's QUEUE_MS: this is a backstop, and a
+  // backstop that fires first makes the primary dead code and hides it.
+  //
+  // IT TIGHTENS THE BYTE BUDGET — IT DOES NOT VETO. The first cut of this was a
+  // veto ("refuse an association whose delay is over budget"), and a veto here is
+  // an outage waiting to happen: on a congested link every association is over at
+  // the same moment, every picker returns null, and the lane goes SILENT. That is
+  // the one failure this codebase must never ship, and no amount of correctness in
+  // the signal excuses a control law that can reach it.
+  //
+  // Proportional instead, capped at 4x and standing on the `cfg.queueBytes` floor
+  // in backlogLimit, so the worst this can do is make the gate tight — never zero.
+  // It is also self-limiting in the right direction: as the queue drains the
+  // divisor falls and the budget comes back on its own, with no separate recovery
+  // path to get wrong. `?pcmqdelay=0` disables.
+  function queueDelayDiv(a) {
+    if (!QUEUE_DELAY_MS) return 1;
+    const base = a.baseRttMs, rtt = a.rttMs;
+    if (!(base > 0) || !(rtt > 0)) return 1; // no measurement yet is not evidence of trouble
+    const over = (rtt - base) / QUEUE_DELAY_MS;
+    return over > 1 ? Math.min(4, over) : 1;
   }
 
   // ── Stage timing diagnostics (?pcmdiag=1, task #37) ────────────────────────
@@ -3910,6 +4029,16 @@ export function initPcmAudio({ stream, cfg, log, onEvent, onConceal, onTurnEnd, 
             baseRttMs: s.baseRttMs,
             clockOffsetMs: s.clockOffsetMs,
             buffered: s.dc?.bufferedAmount ?? null,
+            // #75 the gate itself, beside the queue it is gating. Without this a
+            // standing backlog and the limit it is standing against are two
+            // numbers in two files and the operator has to recompute the second
+            // one by hand — which is how a constant stayed 3.5x stale for weeks.
+            gate: Math.round(backlogLimit(s)),
+            offerKBs: +(offerBps(s) / 1000).toFixed(1),
+            // #75 the delay gate's own reading, so "which gate turned this frame
+            // away" is answerable from one snapshot instead of two inferences.
+            qDelayMs: s.rttMs > 0 && s.baseRttMs > 0 ? +(s.rttMs - s.baseRttMs).toFixed(1) : null,
+            qDelayDiv: +queueDelayDiv(s).toFixed(2),
             padBytesSent: s.padBytesSent,
             padBytesRecv: s.padBytesRecv,
           })),

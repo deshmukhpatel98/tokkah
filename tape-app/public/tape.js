@@ -2178,7 +2178,18 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // 720p, min(camera, panel) still holds, and every demotion flows through the
   // one resize path (RESIZE_HOLD debounce, self-describing keyframe). Order is
   // irrelevant because all three bounds are minima.
+  // #75 trust-floor calm clock: when duress last became 0 with no standing shed.
+  // Seeded -Infinity, not 0, and the distinction is the whole startup behaviour:
+  // a call that has never seen duress and has never been shed has given no
+  // contrary evidence at all, so the floor applies from the first poll exactly as
+  // it did before. 0 would have meant "the clock has not started" and cost every
+  // call its first 5 s at the 0.6 Mbps clamp floor — a regression bought for
+  // nothing, since the thing being guarded against has not happened yet.
+  let rcCalmSince = -Infinity;
   let linkScale = 1;          // 1 .. 0.25 — linear divisor the budget is asking for
+  // #75 dwell state. Two clocks, one per direction, and the extreme candidate
+  // seen while each was armed. See the comment at the apply site below.
+  let lsDownSince = 0, lsDownWant = 0, lsUpSince = 0, lsUpWant = 0;
   function linkScaleEval() {
     if (!cfg.l2ResLink) return;
     const cw = stats.camW, ch = stats.camH;
@@ -2186,16 +2197,73 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     const maxPx = (rcBudgetMbps * 1e6) / (cfg.l2ResBpp * cfg.fps);
     const want = Math.min(1, Math.sqrt(maxPx / (cw * ch)));
     // Quantised to 1/16ths and floored at 1/4 (the same total authority
-    // rcResShrink has). Hysteresis of 10%: the GCC estimate wanders continuously
-    // and every change here costs a keyframe, so a raw scale would reconfigure
-    // the encoder forever and spend more on keyframes than the shrink saves.
+    // rcResShrink has).
     const q = Math.max(0.25, Math.round(want * 16) / 16);
-    if (Math.abs(q - linkScale) / linkScale >= 0.1) {
+    const apply = (to, why) => {
       const from = linkScale;
-      linkScale = q;
-      stats.linkScale = q;
-      L('rc-res-link', { from, to: q, budgetMbps: +rcBudgetMbps.toFixed(2),
+      linkScale = to;
+      stats.linkScale = to;
+      stats.linkScaleMoves = (stats.linkScaleMoves | 0) + 1;
+      lsDownSince = 0; lsDownWant = 0; lsUpSince = 0; lsUpWant = 0;
+      L('rc-res-link', { from, to, why, budgetMbps: +rcBudgetMbps.toFixed(2),
                          cam: `${cw}x${ch}`, bpp: cfg.l2ResBpp, fps: cfg.fps });
+    };
+    // ── The 10% guard was a no-op exactly where it was needed ────────────────
+    // `Math.abs(q - linkScale) / linkScale >= 0.1` was written as "hysteresis of
+    // 10%", but the rung is a FIXED 1/16 while the test is RELATIVE: one rung is
+    // 0.0625/0.625 = 10.0% at 0.625 and 16.7% at 0.375. So from 0.625 downward —
+    // the whole regime a struggling link lives in — a single rung always cleared
+    // the guard and there was no hysteresis at all. It only ever suppressed
+    // movement near 1.0, where movement is cheap.
+    //
+    // Measured on a live Safari<->Brave call (2026-08-20, room msc-vmfs-una,
+    // both sides): 37 and 40 link-scale changes in a ~400 s call — one encoder
+    // reconfigure and one keyframe every ~10 s — and **64% of them were
+    // immediate reversals** (the new rung was the one we had just left). The
+    // scale spent the call bouncing 0.375 <-> 0.625, a 2.8x swing in pixels,
+    // because the budget itself is bistable: the trust floor pins it at 1.5
+    // whenever duress dips to 0 and the duress multiplier drops it to the 0.6
+    // clamp floor the moment it does not. A keyframe at 720x406 is ~250 ms of a
+    // 0.6 Mbps link, so the ladder was manufacturing the very backlog that made
+    // the peer shed the video lane.
+    //
+    // The replacement is a DWELL, not a wider deadband — the input is a square
+    // wave, and no deadband narrower than the square is safe against one. Both
+    // directions must survive a window before they move, and the two windows are
+    // deliberately unequal:
+    //
+    //   DOWN is protective and cheap to be wrong about: a picture one rung too
+    //   small still arrives. 1 s — two budget polls, so one bad poll cannot move it.
+    //   UP re-floods the pipe it just drained, and being wrong about it costs a
+    //   keyframe AND the queue that keyframe builds. It needs sustained proof.
+    //   8 s, and it grows only to the LEAST optimistic rung seen across the whole
+    //   window — the level the link held throughout, never the peak it touched.
+    //
+    // A budget that never settles therefore leaves the resolution ALONE, which is
+    // the correct answer: pixels are the slow, expensive knob and QP is the fast
+    // one. rcQp keeps adapting per frame underneath this, so the picture still
+    // tracks the link every frame; only the pixel count stops chasing noise.
+    // `?ressteady=0` restores the old guard as the control arm.
+    if (!cfg.l2ResSteady) {
+      if (Math.abs(q - linkScale) / linkScale >= 0.1) apply(q, 'raw');
+      return;
+    }
+    const t = now();
+    if (q < linkScale) {
+      lsUpSince = 0; lsUpWant = 0;
+      lsDownWant = lsDownWant ? Math.min(lsDownWant, q) : q;
+      if (!lsDownSince) lsDownSince = t;
+      else if (t - lsDownSince >= cfg.l2ResDownMs) apply(lsDownWant, 'down');
+    } else if (q > linkScale) {
+      lsDownSince = 0; lsDownWant = 0;
+      lsUpWant = lsUpWant ? Math.min(lsUpWant, q) : q;
+      if (!lsUpSince) lsUpSince = t;
+      else if (t - lsUpSince >= cfg.l2ResUpMs) apply(lsUpWant, 'up');
+    } else {
+      // Back at the rung we are already on: whatever the excursion was, it did
+      // not last. Both clocks disarm, so a dwell only ever counts CONTINUOUS
+      // evidence and a square wave accumulates nothing.
+      lsDownSince = 0; lsDownWant = 0; lsUpSince = 0; lsUpWant = 0;
     }
   }
 
@@ -2277,9 +2345,50 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // wrong, the duress branch directly above corrects it within 250 ms and halves
     // or quarters the budget: the same feedback loop that already protects Lane B.
     // `?l2rctrust=0` disables, any number sets the floor in Mbps.
-    if (!dd && cfg.l2RcTrustMbps && rcBudgetMbps < cfg.l2RcTrustMbps) {
+    //
+    // ── #75: the floor is a claim about the INSTRUMENT, so the LINK outranks it ──
+    // Everything above is an argument that a collapsed estimate is GCC failing on
+    // a synthetic carrier. That argument is sound and the floor stays. What it
+    // cannot survive is contrary evidence from the link itself, and the old gate
+    // — `!dd` alone — could not see any.
+    //
+    // Measured on a live Safari<->Brave call (2026-08-20, room msc-vmfs-una):
+    // the sender's own GCC read 0.25-0.64 Mbps for six minutes and the floor
+    // overrode it to 1.5 on every dip duress took through 0 (`rcTrusted` 107 on
+    // one side, 31 on the other). The receiver spent that call in `held` with the
+    // video lane SHED — it had asked us to stop sending entirely — while we kept
+    // sizing the encoder for a 1.5 Mbps pipe. Its glass-to-glass never recovered
+    // and it received 882 frames in 366 s.
+    //
+    // Two pieces of evidence, both already in this scope and neither previously
+    // consulted:
+    //
+    //   `gShedded()` — the PEER has asked us to stop sending video. That is the
+    //     receiver's own verdict on our uplink, arrived at from arrival ages we
+    //     cannot see, and it is strictly better information than any local
+    //     estimate. While it stands, a floor that RAISES the budget is arguing
+    //     with the only party that can actually observe the outcome.
+    //
+    //   duress-0 must be SUSTAINED. Duress rises immediately and decays smoothed
+    //     (pcm.js, by design, so one clean tick cannot un-duck the video lane
+    //     mid-burst) — but this gate read the instantaneous value, so a single
+    //     zero between two bursts bought a full 2.5x budget rise. `l2RcTrustCalmMs`
+    //     of quiet is the same "is this actually calm" question the rest of the
+    //     stack asks with dwells. `?l2rctrustcalm=0` restores the instant gate.
+    if (dd || gShedded()) rcCalmSince = 0;
+    else if (!rcCalmSince) rcCalmSince = now();
+    // `?l2rctrustcalm=0` must restore the ORIGINAL gate exactly — `!dd` and
+    // nothing else — or the control arm is not a control. Both new conditions
+    // therefore hang off the one flag rather than only the dwell.
+    const calm = !cfg.l2RcTrustCalmMs
+      || (rcCalmSince && now() - rcCalmSince >= cfg.l2RcTrustCalmMs && !gShedded());
+    if (!dd && calm && cfg.l2RcTrustMbps && rcBudgetMbps < cfg.l2RcTrustMbps) {
       rcBudgetMbps = rcClamp(cfg.l2RcTrustMbps, cfg.l2RcMinMbps, cfg.l2RcMaxMbps);
       stats.rcTrusted = (stats.rcTrusted | 0) + 1;
+    } else if (!dd && cfg.l2RcTrustMbps && rcBudgetMbps < cfg.l2RcTrustMbps) {
+      // Counted, because "the floor stood down" is the whole point of the change
+      // and an arm that cannot be seen firing cannot be scored.
+      stats.rcTrustHeld = (stats.rcTrustHeld | 0) + 1;
     }
     if (dd !== stats.rcDuress) log?.('rc-duress', { level: dd, budgetMbps: +rcBudgetMbps.toFixed(2) });
     stats.rcDuress = dd;
@@ -2392,6 +2501,13 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // stick the loop on a QP boundary and stall the integrator.
   const rcQpNow = () => (cfg.l2Rc ? Math.round(rcQp) : cfg.qp);
   const ageWindow = []; // this side's receive ages, drained by the reporter below
+  // #75 ctl round trips, for the clean-pong gate on the clock offset above.
+  // 30 samples at one ping per 2 s is a minute — the same horizon the age floor's
+  // ring uses, and for the same reason: long enough that a queue cannot fill it,
+  // short enough that a route change is re-learned rather than never.
+  const CTL_RTT_WIN = 30;
+  const CTL_CLEAN_MS = 30; // floor on the margin, for short paths where 15% is nothing
+  const ctlRttRing = [];
   let ageFloorMs = Infinity; // #63 the path floor; #71 min over a 60 s ring
   const ageFloorRing = []; // #71 per-report window minima -- poison ages out
   const ageReporter = tickInterval(() => {
@@ -2816,11 +2932,42 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         const t = now();
         const rtt = t - m.a;
         stats.rttMs = +rtt.toFixed(2);
-        // EWMA the clock offset: a single ping's asymmetric RTT makes a noisy
-        // offset, and the offset feeds every age estimate — noisy ages were
-        // measured to trip false AIMD halvings at startup (lane2-pace1).
-        const off = m.b - (m.a + rtt / 2);
-        stats.clockOffsetMs = +(stats.clockOffsetMs == null ? off : 0.7 * stats.clockOffsetMs + 0.3 * off).toFixed(2);
+        // ── #75 A CLOCK MAY ONLY BE MOVED BY A CLEAN PONG ────────────────────
+        // `off = b - (a + rtt/2)` assumes the two halves of the round trip are
+        // equal. A pong that waited in a queue violates that by exactly the queue,
+        // and this channel queues — which makes the error largest precisely when
+        // the ages it poisons are being used to decide whether the link is in
+        // trouble. EWMA does not save it: a sustained one-sided queue biases every
+        // sample the same way, so the average converges ON the error.
+        //
+        // Measured 2026-08-20, both ends, simulated 440 ms RTT: the frame-age
+        // floor came out at -2176 ms and -939 ms. #72's clamp turned that into 0,
+        // and a zero floor selects the DISTANCE-BLIND band in the stall
+        // classifier (see pathFloorMs), which held the video lane for the rest of
+        // the call. pcm.js learned this in 17.71 and got `pongClean`; this channel
+        // never did, and it is the one the video lane's own ages ride on.
+        //
+        // Clean = within CTL_CLEAN_MS of the least-queued round trip in the recent
+        // window. A ROLLING min, not an all-time latch: an all-time latch set by
+        // one lucky early sample would mark every later pong dirty and freeze the
+        // clock forever, and it could not follow a route change. rttMs itself is
+        // always updated — the queue IS the reading there, and reporting it is the
+        // point. `?ctlpongclean=0` restores the unconditional update.
+        ctlRttRing.push(rtt);
+        if (ctlRttRing.length > CTL_RTT_WIN) ctlRttRing.shift();
+        const minRtt = Math.min(...ctlRttRing);
+        const clean = stats.clockOffsetMs == null // the first one has to be taken
+          || cfg.l2CtlPongClean === false
+          || rtt <= minRtt + Math.max(CTL_CLEAN_MS, minRtt * 0.15);
+        if (clean) {
+          // EWMA the clock offset: a single ping's asymmetric RTT makes a noisy
+          // offset, and the offset feeds every age estimate — noisy ages were
+          // measured to trip false AIMD halvings at startup (lane2-pace1).
+          const off = m.b - (m.a + rtt / 2);
+          stats.clockOffsetMs = +(stats.clockOffsetMs == null ? off : 0.7 * stats.clockOffsetMs + 0.3 * off).toFixed(2);
+        } else {
+          stats.ctlPongDirty = (stats.ctlPongDirty | 0) + 1;
+        }
         break;
       }
       case 'stall': stats.skipDecodeStalled++; break;
@@ -2829,6 +2976,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // and WE act on it — stop admitting captures, purge the worker FIFO.
         // Shedding at the source is what gives the audio lane its headroom.
         stats.shedRecv++;
+        // #75 The peer is HELD until it says otherwise, and that is NOT the same
+        // fact as "our uplink is shed". The dead-man below clears `shedded` on our
+        // own authority after 8 s; the peer's `held` lasts up to stallMaxHoldMs =
+        // 60 s. Conflating the two switched off the peer's only way out — see the
+        // still-probe guard in the capture pump.
+        peerHeldAt = now();
         if (!shedded) {
           shedded = true;
           sheddedAt = now();
@@ -2843,6 +2996,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // start rate, and the next admitted capture is a FRESH KEYFRAME at the
         // current instant — one clean cut, no fast-forward, no ramp.
         stats.resumeRecv++;
+        peerHeldAt = 0; // the only authority that can clear it: the peer itself
         if (shedded) {
           shedded = false;
           sheddedAt = 0;
@@ -3183,6 +3337,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   let cleanSince = 0;          // continuous-clean start (2 s clean → nominal)
   let badSince = 0;            // continuous-terrible start (dwell → shed)
   let shedded = false;         // SENDER side: our uplink is shed (peer asked)
+  // #75 RECEIVER side, as seen from here: when the peer last told us it is held.
+  // Cleared only by the peer's LANE_RESUME — never by our own dead-man.
+  let peerHeldAt = 0;
+  const STILL_HOLD_MAX_MS = 90000; // > stallMaxHoldMs (60 s): past this the peer is out by some other route
   let sheddedAt = 0;           // when — the dead-man switch's zero point
   let shedAt = 0;              // RECEIVER side: when we entered held
   let shedMaxId = -1;          // ids ≤ this predate the shed: stale, drop on sight
@@ -3254,10 +3412,34 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // resume almost never fired — measured live 2026-08-19 23:26: "holding"
     // stood for minutes while the stills were arriving fine. Judge the QUEUE:
     // stills within 100 ms of the path floor mean the pipe is clear.
-    const lpBase = Math.max(0, Number.isFinite(ageFloorMs) ? ageFloorMs : 0); // #72 a negative floor is measurement error; it must never tighten a gate
+    const lpBase = pathFloorMs(); // #72 a negative floor is measurement error; it must never tighten a gate — and #75, nor may it make this gate distance-blind
     if (lpAge.every((s) => s.age - lpBase < (lpBase ? 100 : 250))) sendResume('clean');
   }
 
+  // #75 THE FALLBACK BEHIND #72's CLAMP WAS DISTANCE-BLIND.
+  // A negative floor is a broken measurement, and clamping it to zero is right —
+  // a negative must never tighten a gate. But every consumer below then reads
+  // that zero as "this path has no propagation in it" and switches to its
+  // ABSOLUTE band, which is the distance-blind branch. So a floor estimator that
+  // fails on a long path does not merely lose precision: it silently selects the
+  // exact behaviour the whole #63/#64/#68/#72 line of work exists to remove.
+  //
+  // Measured 2026-08-20 at a simulated 440 ms RTT, both ends: ageFloorMs read
+  // -2176 ms and -939 ms, so clsBase was 0, so a 531 ms age was judged against
+  // the 250 ms absolute band and the lane went to `held` for the rest of the call.
+  //
+  // The ctl channel's round trip measures the same distance and cannot go
+  // negative. Half of it is a WORSE floor — it carries the return path and any
+  // queue standing on it — but it is the right kind of number, and on a long path
+  // an overestimate of propagation only makes a gate too patient. Zero makes it
+  // blind. `?agefloorrtt=0` restores the plain clamp.
+  const pathFloorMs = () => {
+    const f = Number.isFinite(ageFloorMs) ? ageFloorMs : NaN;
+    if (f > 0) return f;
+    if (cfg.l2AgeFloorRtt === false) return 0;
+    const rtt = stats.rttMs;
+    return Number.isFinite(rtt) && rtt > 0 ? rtt / 2 : 0;
+  };
   function classify() {
     const t = now();
     if (stallRegime === 'held') { exitProbe(); return; }
@@ -3272,7 +3454,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     // unreachable and the regime oscillated absorb/held forever (measured live
     // 2026-08-19: held -> resume -> 303 ms of nominal -> back to absorb).
     // Judged on queue = age - path floor when the floor is known.
-    const clsBase = Math.max(0, Number.isFinite(ageFloorMs) ? ageFloorMs : 0); // #72 clamp: see lpBase
+    const clsBase = pathFloorMs(); // #72 clamp + #75 rtt/2 fallback: see pathFloorMs
     const q50 = p50 - clsBase;
     // Regime naming. The bands are the AIMD governor's own thresholds: under
     // its increase bound is nominal (D at D_min), the hysteresis band is
@@ -3307,12 +3489,57 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // no second video encoder needed (§4). A sharp JPEG is not a degraded video
   // frame: it is a different, honest representation, and the UI labels it.
   let stillCv = null, stillCtx = null, stillBusy = false, lastStillAt = 0;
+  // #75 The still is also the HELD-EXIT PROBE, so its size is a latency budget.
+  //
+  // `exitProbe` asks whether stills are arriving within 100 ms of the path floor
+  // and resumes video when they are. `lpAge` is `now - sendWall`, so it contains
+  // the still's OWN serialisation time — and a 960 px q0.85 JPEG of a real face
+  // is 34-73 KB (measured, both ends of the live call 2026-08-20). On the 0.6
+  // Mbps budget a shed link is sitting at, 34 KB is 453 ms of bytes and 73 KB is
+  // 970 ms. **The probe cannot satisfy a 100 ms gate on a slow link no matter how
+  // clear the pipe is, because the probe IS most of the delay it measures.**
+  // Measured consequence on that call: the Chromium peer sat in `held` for 60 s
+  // at a time, escaping only via the `maxhold` hatch, never once via `clean`, with
+  // lpAgeP50 672 ms against a 200 ms floor. Its video was off for the whole call.
+  //
+  // That is `control-plane-rides-its-own-resource` in its self-poisoning form: a
+  // health probe sent over the resource it reports on, sized without reference to
+  // that resource, so it reports congestion it created itself.
+  //
+  // So the still is sized to ARRIVE, not to look good: at most `lpMs` worth of
+  // the current budget. 100 ms of 0.6 Mbps is 7.5 KB; 100 ms of 8 Mbps is 100 KB,
+  // so a healthy link still gets the crisp still §4 asks for and only a starved
+  // one gets a smaller one — which is the correct trade, because on a starved
+  // link the alternative to a small still is no video at all for a minute.
+  //
+  // Converged by feedback on the LAST still's actual bytes rather than by a
+  // model of JPEG: content decides compressibility and no formula here can.
+  // Multiplicative on area, damped, and clamped to [lpMinWidth, lpWidth].
+  // `?lpms=0` restores the fixed width.
+  let stillW = cfg.lpWidth;
+  function stillTargetBytes() {
+    if (!cfg.lpMs) return 0;
+    const mbps = rcBudgetMbps > 0 ? rcBudgetMbps : cfg.l2RcMinMbps;
+    return (cfg.lpMs / 1000) * (mbps * 1e6) / 8;
+  }
+  function stillFit(bytes) {
+    const target = stillTargetBytes();
+    if (!target || !(bytes > 0)) return;
+    // Area scales roughly with bytes, so width scales with the square root — and
+    // the response is ASYMMETRIC for the same reason everything else here is.
+    // Shrinking is urgent: while the peer is held this probe is the only way out
+    // and every still that does not fit is another second frozen, so one step is
+    // allowed to take the width to 30% and land on the answer immediately.
+    // Growing costs nothing to defer, so it is capped at +15% per still.
+    const k = Math.min(1.15, Math.max(0.3, Math.sqrt(target / bytes)));
+    stillW = Math.round(Math.min(cfg.lpWidth, Math.max(cfg.lpMinWidth, stillW * k)));
+  }
   function maybeStill(frame) {
     if (dcLaneP?.readyState !== 'open') return;
     const t = now();
     if (t - lastStillAt < 1000 / cfg.lpFps || stillBusy) return;
     lastStillAt = t;
-    const w = Math.min(cfg.lpWidth, frame.displayWidth);
+    const w = Math.min(cfg.lpMs ? stillW : cfg.lpWidth, frame.displayWidth);
     const h = Math.round((w * frame.displayHeight) / frame.displayWidth);
     if (!stillCv) { stillCv = new OffscreenCanvas(w, h); stillCtx = stillCv.getContext('2d'); }
     if (stillCv.width !== w || stillCv.height !== h) { stillCv.width = w; stillCv.height = h; }
@@ -3328,6 +3555,8 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           dcLaneP.send(out);
           stats.lpSent++;
           stats.lpBytes += out.byteLength;
+          stillFit(out.byteLength);
+          stats.lpW = stillW;
         }
       })
       .catch(() => { /* a still that failed to encode is skipped, not repaired */ })
@@ -3744,6 +3973,29 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           continue;
         }
       }
+      // ── #75 HELD WAS A ONE-WAY DOOR, AND THIS IS WHY ─────────────────────────
+      // `maybeStill` used to live ONLY inside the shed branch above, so lane-P
+      // stills stopped the instant our dead-man switch un-shed us — 8 s
+      // (stallShedMaxMs) after the peer asked us to stop. The peer's `held` lasts
+      // up to 60 s (stallMaxHoldMs) and its ONLY clean way out is `exitProbe`,
+      // which needs stills to judge. So for 52 of those 60 seconds the peer was
+      // waiting on a probe stream this side had already switched off, and every
+      // recovery on a bad link came from the 60 s `maxhold` hatch instead.
+      //
+      // Measured 2026-08-20, both ends, simulated 440 ms RTT: lpSent froze at 8
+      // and never moved again; the receiver's lpAge ring emptied, exitProbe
+      // returned early on every tick, and the lane sat held for 52-77% of the
+      // call. Two constants that had to agree — one on each side of the link, in
+      // different objects — and nothing made them.
+      //
+      // Now the probe follows the PEER's state: keep sending stills while the peer
+      // is held, whether or not our own uplink is still shed. Bounded so a peer
+      // that vanishes mid-hold cannot leave this running forever — past its own
+      // maxhold the peer has resumed by some other route and no longer needs us.
+      // `?lphold=0` is the control arm: stills only while our own uplink is shed,
+      // which is the behaviour that made held a one-way door.
+      if (cfg.lpHold !== false
+          && !gShedded() && peerHeldAt && now() - peerHeldAt < STILL_HOLD_MAX_MS) maybeStill(frame);
       // A cfg-nak renegotiation closes the encoder for a few microtasks; a
       // frame arriving in that window is dropped, not a crash — the keyframe
       // that reopens the stream makes the gap invisible.
@@ -4240,7 +4492,14 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         stall: cfg.stall
           ? {
               regime: stallRegime, shedded,
+              // #75 the two facts that used to be one. `shedded` is our uplink;
+              // `peerHeldMs` is how long the PEER has been waiting for the probe
+              // stream that keeps it alive. A held peer with no still flowing is
+              // the exact state that made `held` a one-way door.
+              peerHeldMs: peerHeldAt ? Math.round(now() - peerHeldAt) : 0,
               lpAgeP50: pct(stats.lpAgeMs, 50),
+              lpW: stats.lpW ?? null,
+              pathFloorMs: +pathFloorMs().toFixed(1),
               transitions: [...stallLog],
             }
           : null,
