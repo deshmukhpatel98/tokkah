@@ -1863,6 +1863,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   // offset once and ships it on the 1 s age report; the receiver needs it to
   // turn a frame's capture timestamp into wall age.
   let mco = null;     // now() - captureTimestamp/1000, captured at first frame
+  // #75 the bound past which a capture "lag" is a stalled media clock rather than
+  // a deep pipeline. See the re-anchor in pumpCapture for the measurement that
+  // set it: real pipelines here read 0.1-0.5 ms, the broken one read 42,933.
+  const MCO_MAX_LAG = cfg.mcoMaxLagMs ?? 150;
   let peerMco = null; // the same quantity for the peer's camera, via ctl
 
   let closed = false;
@@ -3930,6 +3934,38 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
       // delivery jitter around the ideal cadence.
       const rawLag = now() - frame.timestamp / 1000;
       mco = Math.min(mco ?? Infinity, rawLag);
+      // ── #75 A RUNNING MIN ASSUMES THE MEDIA CLOCK TRACKS THE WALL ────────────
+      // `mco` exists so the peer can map our frame timestamps onto our wall clock:
+      // it is the least-queued frame's lag, and `rawLag - mco` is therefore the
+      // capture pipeline's depth. That reasoning holds only while the media clock
+      // ADVANCES with real time. On the WebKit path it does not — there is no
+      // MediaStreamTrackProcessor, so frames come from a <video> element whose
+      // clock advances as fast as frames are RENDERED, and under admission
+      // throttling that is a fraction of wall time. `rawLag` then grows without
+      // bound while a min latched in the first second never moves.
+      //
+      // Measured on a live Safari<->Brave call, 2026-08-20: the Safari sender's
+      // capLagP50 read **42,933 ms** on a call minutes old (and 175,665 ms on an
+      // earlier one), while the Chromium sender on the same call read 0.2 ms. Both
+      // consumers of `mco` are downstream of that: the peer's `fullAge` came out
+      // 18.1 s against a real frame age of 216 ms, and the A-V presenter — which
+      // maps frames onto the sender's audio clock through `avd`, also computed from
+      // `mco` — applied **-38 s**. The Chromium RECEIVER wore the whole error,
+      // which is a large part of why the same code feels broken in Brave and fine
+      // in Safari: WebKit is the engine that emits the bad clock, and Chromium is
+      // the one that has to believe it.
+      //
+      // A capture pipeline is a physical depth, tens of milliseconds. Anything past
+      // MCO_MAX_LAG is not a deep pipeline, it is a stale anchor — so let the anchor
+      // RISE, bounded. The min still takes any lower reading immediately, so a clock
+      // that recovers heals at once and one that stalls is wrong by at most the
+      // bound instead of by the whole call. On an engine whose clock tracks (every
+      // Chromium path measured here: 0.1-0.5 ms) this branch never runs and the
+      // behaviour is byte-identical. `?mcomax=0` restores the pure latch.
+      if (MCO_MAX_LAG && rawLag - mco > MCO_MAX_LAG) {
+        mco = rawLag - MCO_MAX_LAG;
+        stats.mcoReanchors = (stats.mcoReanchors | 0) + 1;
+      }
       stats.capLagMs.push(+(rawLag - mco).toFixed(1));
       if (stats.capLagMs.length > 900) stats.capLagMs.shift();
       // VIDEO SHED (§13): the peer asked us to drop lane B entirely. No

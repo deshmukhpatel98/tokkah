@@ -142,6 +142,43 @@ const realcamFor = (side) => args.realcam === true || String(args.realcam).toLow
 // WebKit ignores Chrome's --use-file-for-fake-* flags, so a WebKit side
 // necessarily uses real devices; that is stated here rather than discovered.
 const webkitFor = (side) => args.webkit === true || String(args.webkit).toLowerCase() === side.toLowerCase();
+// `--rvfc=A` forces that side down the NON-MediaStreamTrackProcessor capture path
+// by hiding MSTP, so tape.js's frameReader() falls to <video> + requestVideoFrame-
+// Callback — the path WebKit is always on. This is not cosmetic: the two paths
+// carry DIFFERENT CLOCKS. MSTP hands through the camera's own capture timestamp,
+// which tracks the wall. rVFC's `mediaTime` is the <video> element's media
+// timeline, and that advances only for frames actually PRESENTED — so under any
+// render throttling it falls behind wall time without bound, and every quantity
+// the peer derives from the sender's timestamps goes with it. That is a real
+// shipped defect (#75, capLagP50 42,933 ms on a live Safari call), and a
+// Chromium-only rig could not see it, because the bug is in the path and not in
+// the engine. WebKit needs real devices here; this runs the same PATH on Chromium
+// with fake ones -- but read the next paragraph before trusting it as a repro.
+//
+// MEASURED 2026-08-20, and it is a negative worth keeping: forcing this path on
+// Chromium does NOT reproduce the clock defect. `capLagP50` read 1.9 ms plain and
+// 9.3 ms with 3 s of pause/resume injected into the element, against the 42,933 ms
+// a live Safari sender produced. A standalone probe settled why: Chromium's rVFC
+// `mediaTime` for a MediaStream source is derived from the frame's CAPTURE
+// timestamp, so it tracks the wall across pauses (17 ms of drift after 3,000 ms of
+// deliberate pausing). WebKit's is a presentation counter, which is the whole bug.
+// So the defect is in the ENGINE and not merely in the path, and a Chromium rig
+// cannot see it at any effort -- an injector was written for this and then deleted,
+// because an inert fault injector is worse than none: it returns the same clean
+// number a real fix would and invites a false pass.
+// What --rvfc IS good for: exercising the shim's framing, queueing and lifecycle,
+// which no Chromium-only run otherwise touches, and confirming that the #75 anchor
+// bound never fires on a healthy clock (measured capLagP95 8.6-12.2 ms vs a 150 ms
+// bound).
+const rvfcFor = (side) => args.rvfc === true || String(args.rvfc).toLowerCase() === side.toLowerCase();
+const HIDE_MSTP = `
+  (() => {
+    try { delete window.MediaStreamTrackProcessor; } catch {}
+    Object.defineProperty(window, 'MediaStreamTrackProcessor', {
+      get() { return undefined; }, configurable: true,
+    });
+  })();
+`;
 
 const truth = JSON.parse(readFileSync(join(CONV, 'truth.json'), 'utf8'));
 // Let the whole fixture play, plus slack for setup and the final turn's tail.
@@ -337,6 +374,7 @@ async function launch(side, wav) {
     })();
   `);
   // Order matters: record last so it wraps whatever the override installed.
+  if (rvfcFor(side)) await page.addInitScript(HIDE_MSTP);
   if (args.ns) await page.addInitScript(FORCE_PROCESSING);
   // Two mutually exclusive ways to get distance into the media path. Candidate rewriting keeps
   // the P2P path and needs no relay; forcing relay-only is mandatory for the TURN route,

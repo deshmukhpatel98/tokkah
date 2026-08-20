@@ -2063,6 +2063,14 @@ const TAPE_CFG = {
   // error lands straight in every frame age. pcm.js got this in 17.71; the video
   // lane's own channel had it missing. `?ctlpongclean=0` is the control.
   l2CtlPongClean: QS.get('ctlpongclean') !== '0',
+  // #75 Ceiling on the capture-clock anchor, in ms. A capture pipeline is a
+  // physical depth; past this a "lag" is a media clock that has stopped tracking
+  // the wall — which is what WebKit's <video>+rVFC capture path does under
+  // throttling (measured: capLagP50 42,933 ms on a live call, against 0.2 ms for
+  // Chromium's MediaStreamTrackProcessor on the same call). The peer computes both
+  // frame age and A-V sync from this anchor, so an unbounded one lands entirely on
+  // the RECEIVER. `?mcomax=0` restores the pure all-time latch.
+  mcoMaxLagMs: QS.get('mcomax') == null ? 150 : Number(QS.get('mcomax')),
   lpMinWidth: Number(QS.get('lpminw')) || 240,
   // #75 Keep the held-exit probe flowing while the PEER is held, not only while
   // our own uplink is shed — our dead-man clears the shed after 8 s and the peer's

@@ -8798,7 +8798,7 @@ oscillates, so both arms show ~1 change per call. Its evidence is the live call
 budget) and the counter it now carries (`linkScaleMoves`). Saying it is "verified"
 would be a lie; it is measured on production traffic and unreproduced in the lab.
 
-### The one that got away
+### The one that got away — and then didn't
 
 The Brave side's A/V sync applied **-13.6 s** on the live call, against +51 ms on
 the Safari side. Two contributors, and only one is addressed here. Frames really
@@ -8811,10 +8811,71 @@ are actually rendered. On the live call the Safari sender's `capLagP50` was
 wall advanced 190. Every age and every A-V mapping the Chromium RECEIVER
 computes from that sender's timestamps inherits the error.
 
-The fix is not on the receiver. It is to stop shipping a media clock the peer has
-to reconstruct a wall time from, and stamp frames with the sender's own audio-
-clock time directly — the sender knows both at capture. That is a wire change and
-it is not in this section.
+The fix is not on the receiver, and — after reading the wire contract — it is not
+a wire change either. Both broken numbers pass through one variable. `mco` is the
+sender's `now() - frame.timestamp/1000`, kept as an all-time minimum, and it is
+shipped once per second so the peer can map our frame timestamps onto our wall
+clock. The peer's frame age is `now - (ts/1000 + mco + clockOffset)`; A-V sync is
+`(now - mco)*1000 - audioClock`. One anchor, both consumers.
+
+A minimum is the right estimator for a **pipeline depth**, which is what
+`rawLag - mco` is meant to be: the least-queued frame in history is the one with
+the least queueing in it. But it silently assumes the media clock advances with
+the wall. When it doesn't, `rawLag` grows without bound while a minimum latched in
+the first second never moves, and the anchor is wrong by the entire elapsed
+divergence — 42,933 ms on the live call, 175,665 ms on the earlier one.
+
+So bound it. A capture pipeline is a physical depth, tens of milliseconds; past
+`mcoMaxLagMs` (150 ms) a "lag" is a stale anchor rather than a deep pipeline, so
+the anchor is allowed to rise to `rawLag - 150`. The minimum still takes any lower
+reading on the very next frame, so a clock that recovers heals immediately and one
+that stalls is wrong by at most the bound instead of by the whole call — 42.9 s to
+≤0.15 s, and the receiver's inherited A-V error with it. On every engine whose
+clock tracks (all Chromium capture measured here: 0.1-0.5 ms) the branch never
+runs and the behaviour is byte-identical, which is what makes this safe to default
+on. `?mcomax=0` restores the pure latch.
+
+The general shape is worth naming, because it is the fourth time a
+**startup-latched estimator** has cost real quality in this codebase (§17.35's
+peak-hold RTT, §17.71's floor rings, §17.72's clock offset, now this): a min or a
+max held forever is only sound while the quantity it summarises is stationary.
+None of them are. Every one of them needed a way to move back.
+
+#### What was verified, and what was not
+
+Two halves, and only one of them could be measured here.
+
+The **bound** is an invariant rather than a statistic. The branch runs on every
+frame immediately before the sample is taken, so `rawLag - mco <= 150` holds
+unconditionally afterwards, and the peer's reconstructed capture wall time is
+therefore stale by at most 150 ms minus the true pipeline depth. That does not
+need a run to believe; it needs the code read, which is why it is written out
+above.
+
+The **no-op property** is the half that could be wrong in practice — a bound that
+fires spuriously on a healthy call would move every age the peer computes. That
+was measured on live prod, rotated CTL/ARM/ARM/CTL over the netsim (440 ms RTT,
+15 ms heavy jitter, 0.5% loss, 2 Mbps), with one side forced onto the `<video>` +
+rVFC capture path by hiding `MediaStreamTrackProcessor`.
+
+And the **effect** was not measured, because this machine cannot produce the
+defect. Forcing the rVFC path on Chromium reproduces the code path but not the
+bug: `capLagP50` read 1.9 ms, and 9.3 ms with three seconds of pause/resume
+injected into the capture element, against 42,933 ms from the live Safari sender.
+A standalone probe found the reason — Chromium's rVFC `mediaTime` for a
+MediaStream source comes from the frame's **capture** timestamp, so it tracks the
+wall across pauses (17 ms of drift after 3,000 ms of deliberate pausing), whereas
+WebKit's is a presentation counter. The defect lives in the engine, not merely in
+the path, so no Chromium-based rig can see it at any effort. The fault injector
+written to force it was deleted rather than kept: it produced clean numbers by
+being inert, and an inert injector is worse than none, because it returns exactly
+what a working fix returns. Closing this properly needs one live Safari sender,
+and that needs a real browser on a real machine.
+
+That asymmetry is the reason this defect survived so long in the first place. The
+engine that emits the bad clock is the one that feels fine, because a sender never
+consumes its own anchor. The whole cost lands on the peer — which is Chromium, on
+a call that Safari reports as healthy.
 
 ### The fleet, split by engine for the first time
 
