@@ -27,6 +27,12 @@ final class Audio {
                                    // untouched; the howl is gone.
   var jitTarget = 2                // packets of deliberate buffer. 2 == 5.3 ms.
   var jitAuto = true               // size the buffer from measurement, not from a guess
+  // peer clock - my clock, in ms, from TimeSync. Zero and INVALID are different
+  // things: on a two-machine call the offset can be hours, so a measurement taken
+  // before the offset is known is not approximately right, it is meaningless. No
+  // number is the honest output in that window.
+  var thetaMs: Double = 0
+  var thetaValid = false
   var jitGrows = 0, jitShrinks = 0 // so the adaptation is auditable after the call
 
   // Capture side
@@ -338,9 +344,11 @@ final class Audio {
           // exists, and the DAC buffer-to-air delay happens after this callback
           // returns. Neither is visible from inside the callbacks, and a number that
           // omits them is a smaller number about a different question.
-          let ms = Clock.msSigned(earHost, ring.capHost[slot]) + outLatencyMs + inLatencyMs
-          m2eLast = ms
-          m2e.add(ms)
+          if thetaValid {
+            let ms = Clock.msSigned(earHost, ring.capHost[slot]) + thetaMs + outLatencyMs + inLatencyMs
+            m2eLast = ms
+            m2e.add(ms)
+          }
         }
       } else {
         out[i] = 0

@@ -1,1 +1,1 @@
-{"version":"0.4.0","url":"https://room.tokkah.com/macos/dl/tk-0.4.0.tar.gz","sha256":"2c09201808462f07ad9499911a6c3c0374310ae20f1b425dc80e5992de021feb","size":94413,"notes":"window display, on-demand keyframes, late-join recovery in ~300ms"}
+{"version":"0.5.0","url":"https://room.tokkah.com/macos/dl/tk-0.5.0.tar.gz","sha256":"9f174e9529c9c491ef2c36c1db188803f4423148e520e0fb96bd204ee268c252","size":107578,"notes":"adaptive jitter buffer + 64-frame packets: m2e 24.5 -> 16.2 ms; --room NAT traversal for calls between two houses"}

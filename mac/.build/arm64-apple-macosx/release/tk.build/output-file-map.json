@@ -34,6 +34,12 @@
     "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.swiftdeps",
     "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.dia"
   },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/TimeSync.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.dia"
+  },
   "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift": {
     "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.swift.o",
     "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update~partial.swiftmodule",

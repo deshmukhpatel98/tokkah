@@ -132,6 +132,10 @@ final class RecvRing {
 // own queues and buffering, and "owns its own buffering" is precisely the thing
 // a latency measurement must not have between the wire and the ring.
 final class Wire {
+  // Non-zero means the far end is on a different build. Reported, never hidden:
+  // a count of zero and a count of thousands must not print the same line.
+  var fmtMismatch = 0
+  var tsync: TimeSync?
   /// Exposed so STUN can run on THIS socket. A mapping discovered on any other
   /// socket describes that socket's NAT hole, not this one's, and most NATs give
   /// a different external port per source port -- so the wrong socket yields an
@@ -244,6 +248,18 @@ final class Wire {
     rawSend(scratch, 8)
   }
 
+  /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
+  /// media socket so it measures the path the media actually takes.
+  func sendTimeProbe() {
+    var out = [UInt8](repeating: 0, count: TPKT)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+      p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
+      p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
+    }
+    out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
+  }
+
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
     // One buffer big enough for either kind. Audio and video share the socket, so
     // the loop dispatches on the magic rather than owning two sockets: two ports
@@ -265,11 +281,58 @@ final class Wire {
         continue
       }
       if magic == KMAGIC { onKeyRequest?(); continue }
+      if magic == TMAGIC {
+        guard Int(n) >= TPKT else { continue }
+        let t4 = Clock.now()   // stamp FIRST: everything after this is our own cost
+        let kind = (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+        let t1 = (buf + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        if kind == 0 {
+          // A request. Reply from THIS thread, immediately -- handing it to
+          // another thread would put that thread's scheduling delay inside t3-t2,
+          // where it is indistinguishable from network asymmetry and biases the
+          // offset by half of it.
+          var out = [UInt8](repeating: 0, count: TPKT)
+          out.withUnsafeMutableBytes { p in
+            p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+            p.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 4, as: UInt32.self)
+            p.storeBytes(of: t1.littleEndian, toByteOffset: 8, as: UInt64.self)
+            p.storeBytes(of: t4.littleEndian, toByteOffset: 16, as: UInt64.self)   // t2
+            p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 24, as: UInt64.self)  // t3
+          }
+          out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
+        } else {
+          let t2 = (buf + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+          let t3 = (buf + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+          tsync?.note(t1: t1, t2: t2, t3: t3, t4: t4)
+        }
+        continue
+      }
       if magic != MAGIC || n < HDR { continue }
       let seq = Int32(bitPattern: (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
       let cap = (buf + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
       let frames = Int((buf + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
-      if frames <= 0 || frames > FPP || Int(n) < HDR + frames * 4 { continue }
+      // EXACTLY our packet size, or nothing. The old test was `frames > FPP`,
+      // which is wrong in both directions during a rollout -- and the two machines
+      // in a call update up to 60 s apart, so a rollout is guaranteed.
+      //
+      // A larger packet was dropped SILENTLY, which is indistinguishable from a
+      // peer that is not sending at all. A smaller one PASSED, and wrote its
+      // samples into a slot sized for ours, leaving the remainder as whatever the
+      // previous packet left there: half the audio becomes stale garbage, which is
+      // far worse than silence and says nothing about why.
+      //
+      // Now it is neither. A mismatch is refused and named, so the failure tells
+      // you what it is and which side to fix.
+      if frames <= 0 || Int(n) < HDR + frames * 4 { continue }
+      if frames != FPP {
+        fmtMismatch += 1
+        if fmtMismatch == 1 || fmtMismatch % 4000 == 0 {
+          fputs("audio: peer sends \(frames)-sample packets, this build expects \(FPP)"
+              + " -- the two ends are on different versions, one side needs the update"
+              + " (\(fmtMismatch) packets refused)\n", stderr)
+        }
+        continue
+      }
       (buf + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
     }
   }

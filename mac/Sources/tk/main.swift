@@ -13,7 +13,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.4.0"
+let VERSION = "0.5.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -147,6 +147,8 @@ if let room = arg("room") {
   }.start()
 }
 
+var gThetaMs: Double = 0
+var gThetaValid = false
 let audio = Audio()
 audio.wire = wire
 audio.mute = flag("mute")
@@ -210,7 +212,10 @@ if flag("window") {
 let dumpTo = arg("dump")
 var dumped = false
 vdec.onDecoded = { img, capHost in
-  vg2g.add(Clock.msSigned(Clock.now(), capHost)); vDecoded += 1
+  // Same rule as audio: the capture stamp is the PEER's clock, so without the
+  // offset this is not a latency, it is the difference between two epochs.
+  if gThetaValid { vg2g.add(Clock.msSigned(Clock.now(), capHost) + gThetaMs) }
+  vDecoded += 1
   display?.show(img)
   if let path = dumpTo, !dumped, vDecoded > 30 {
     dumped = true
@@ -270,6 +275,28 @@ Thread {
 // The socket thread. Not the audio thread and not the main thread: a blocking
 // recvfrom on the render callback would be a dropout, and on main it would fight
 // the reporter for the runloop.
+// Clock sync, before the receive loop exists to answer probes.
+let tsync = TimeSync()
+wire.tsync = tsync
+Thread {
+  // Fast at first, then settle. The window wants a spread of samples quickly so
+  // the first honest number arrives within a second or two of the call starting;
+  // after that a probe a second is plenty to track drift between two crystals,
+  // which is parts per million.
+  var n = 0
+  while true {
+    wire.sendTimeProbe()
+    n += 1
+    Thread.sleep(forTimeInterval: n < 24 ? 0.15 : 1.0)
+    if let th = tsync.thetaNs {
+      audio.thetaMs = Double(th) / 1e6
+      audio.thetaValid = true
+      gThetaMs = audio.thetaMs
+      gThetaValid = true
+    }
+  }
+}.start()
+
 let t = Thread { wire.recvLoop(into: audio.ring, video: vasm) }
 t.start()
 
@@ -469,7 +496,11 @@ func reportLoop() {
       + "  conceal \(d.concealed)/s  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
-      + "  jit \(audio.jitTarget) snap \(r.snaps)\n", stderr)
+      + "  jit \(audio.jitTarget) snap \(r.snaps)"
+      + (wire.fmtMismatch > 0 ? "  VERSION-MISMATCH \(wire.fmtMismatch)" : "")
+      + "  net rtt \(tsync.bestRttMs.map { String(format: "%.2f", $0) } ?? "-")"
+      + " jit \(tsync.rttSpreadMs.map { String(format: "%.2f", $0) } ?? "-")"
+      + " (\(tsync.samples) probes)\n", stderr)
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
   if vsource != nil || vasm.fragsIn > 0 {

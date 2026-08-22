@@ -44,6 +44,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/TimeSync.swift"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift"
         },
         {
@@ -76,6 +80,7 @@
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Video.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/VideoNet.swift.o",
@@ -152,6 +157,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.swift.o"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.swift.o"
         },
         {
@@ -178,6 +187,7 @@
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/TimeSync.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift",
@@ -203,6 +213,7 @@
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/TimeSync.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift",
@@ -318,6 +329,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/TimeSync.swift"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift"
         },
         {
@@ -361,6 +376,10 @@
         {
           "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/TimeSync.swift.o"
         },
         {
           "kind" : "file",
