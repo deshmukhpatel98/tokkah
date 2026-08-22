@@ -623,6 +623,17 @@
      larger than the ambient tile was, because looking at yourself here is a
      deliberate act, not a peripheral cue. Release and it is gone. */
   #selfSense.peeking { opacity: 1; width: clamp(140px, 26vmin, 240px); }
+  /* `?selfpin=1` — the self-view STAYS. Never a product default: the
+     persistent mirror is the #1 measured fatigue driver (Fauville et al. 2021,
+     N=10,322) and hold-to-peek exists precisely to avoid it. But a TEST
+     environment that cannot show you your own camera is a blindfold — on the
+     far-away-lab rig the operator reported "no real camera input from my side"
+     on a call whose own telemetry proved the sensor was live at 1280x720@26,
+     and one glance at a pinned tile would have ruled the camera out in a
+     second. Two stale comments in app.js had promised this control for weeks
+     ("toggleable via the c-selfview chip", "pinnable from the more sheet");
+     neither was ever built. This is it, behind a flag. */
+  #selfSense.pinned { opacity: .96; width: clamp(140px, 26vmin, 240px); }
 </style>
 </head>
 <body>
@@ -807,8 +818,17 @@
     <button id="peek" class="icon-btn" aria-label="hold to see yourself" title="hold to see yourself">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="9" r="3.2"/><path d="M5.5 19c1.2-3 3.6-4.5 6.5-4.5s5.3 1.5 6.5 4.5"/><rect x="2.8" y="3.2" width="18.4" height="17.6" rx="4.5"/></svg>
     </button>
+    <!-- SWITCH CAMERA. The glyph is the same camcorder body as #cam next door,
+         with a double-headed arrow over it: the shape is already learned from
+         the neighbouring button, so the only new information is "go round to
+         the next one". It replaced two bare circular arcs that were, at the
+         22 px this actually ships at, indistinguishable from a refresh icon --
+         nothing in them said camera, and an operator with two cameras plugged
+         in picked the wrong one and spent a live call believing their sensor
+         was dead. Candidates were rendered at 22 px and judged by eye before
+         this one was chosen; a glyph reasoned about at 240 px is not a glyph. -->
     <button id="flip" class="icon-btn" style="display:none" aria-label="switch camera" title="switch camera">
-      <svg viewBox="0 0 24 24"><path d="M3.2 12a8.8 8.8 0 0 1 8.8-8.8c2.5 0 4.8 1.05 6.4 2.75"/><path d="M20.8 12a8.8 8.8 0 0 1-8.8 8.8c-2.5 0-4.8-1.05-6.4-2.75"/><path d="M18.4 2.6v3.6h-3.6"/><path d="M5.6 21.4v-3.6h3.6"/></svg>
+      <svg viewBox="0 0 24 24"><rect x="2.6" y="10.2" width="11.4" height="10.2" rx="2.6"/><path d="M13.9 13.7l5.5-3v8.6l-5.5-3z"/><path d="M5.2 7.6a7.8 7.8 0 0 1 13.6-.8"/><path d="M18.9 2.9l0 4-4 0"/><path d="M5.1 3.4l0 4 4 0"/></svg>
     </button>
     <button id="xlate" class="icon-btn" data-off="1" aria-label="live translation" title="live translation">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18"/><path class="slash" d="M4 4l16 16"/></svg>

@@ -8,53 +8,153 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // The permanent operator link. `workers_dev` stays explicit alongside it:
+  // adding `routes` silently drops the workers.dev route otherwise, which was
+  // measured on tape-app the moment its custom domain was added (every path on
+  // the workers.dev host went 404).
+  "routes": [{ "pattern": "lab.tokkah.com", "custom_domain": true }],
+  "workers_dev": true,
+
+  "vars": {
+    // The cron has no Request and therefore no origin, but the container needs
+    // an absolute URL to fetch its script from and to report back to. Guessing
+    // it is how six attempts were spent on silence.
+    "SELF_ORIGIN": "https://lab.tokkah.com"
+  },
+
   // Container instances are OWNED by a Durable Object, which is the whole
-  // reason this file exists: the DO is what carries `locationHint`, so pinning
-  // the DO to a continent is what pins the container to it. Same mechanism the
-  // /api/probe region prober already uses in tape-app.
+  // reason this file exists: the DO is what carries placement, so pinning the
+  // DO to a continent is what pins the browser to it.
+  //
+  // ONE CLASS PER REGION, because `constraints` is per class and `constraints`
+  // is the half that actually binds. locationHint alone was caught placing a
+  // wnam-hinted DO in bom10 — MUMBAI, ~1200 km from this laptop — which would
+  // have turned a cross-planet measurement into a domestic one and reported it
+  // as US West.
   "durable_objects": {
-    "bindings": [{ "name": "PEER", "class_name": "PeerContainer" }]
+    "bindings": [
+      { "name": "PEER_WNAM", "class_name": "PeerWnam" },
+      { "name": "PEER_ENAM", "class_name": "PeerEnam" },
+      { "name": "PEER_SAM", "class_name": "PeerSam" },
+      { "name": "PEER_EEUR", "class_name": "PeerEeur" },
+      { "name": "PEER_OC", "class_name": "PeerOc" },
+      { "name": "PEER_APAC", "class_name": "PeerApac" },
+      { "name": "PEER_AFR", "class_name": "PeerAfr" },
+      { "name": "LAB", "class_name": "LabState" }
+    ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["PeerContainer"] }
+    { "tag": "v1", "new_sqlite_classes": ["PeerContainer"] },
+    {
+      "tag": "v2",
+      // PeerContainer was the single-region prototype; its whole state was one
+      // experiment's result and there is nothing in it worth carrying forward.
+      "deleted_classes": ["PeerContainer"],
+      "new_sqlite_classes": ["PeerWnam", "PeerEnam", "PeerSam", "PeerEeur", "PeerOc", "LabState"]
+    },
+    // OC is provisioned as a class and has no container: measured 2026-08-23,
+    // `constraints.regions: ["OC"]` is refused outright with "Regions OC have
+    // limited capacity, and require additional capabilities". Oceania is the
+    // far half of the furthest pair this network's CONTROL plane will reach
+    // (eeur<->oc, 320 ms) and it cannot hold a browser, so the furthest pair a
+    // CONTAINER can be placed in is a different, shorter one. The class stays
+    // so the region can be switched on the day capacity opens, without a
+    // migration.
+    { "tag": "v3", "new_sqlite_classes": ["PeerApac", "PeerAfr"] }
   ],
 
-  "containers": [
-    {
-      "class_name": "PeerContainer",
-      // Pushed 2026-08-14 from testbed/peer/Dockerfile. Playwright's image, so
-      // the far peer drives the SAME Chromium our local rigs do.
-      //
-      // v3 moved the join logic into CMD, because v2 kept it in an entrypoint
-      // override that `container.start()` silently discarded. v4 adds what v3
-      // still lacked: the playwright npm package. The base image ships the
-      // BROWSERS but not the driver, so node died at require() before it could
-      // open anything -- found in ten seconds by running the image locally,
-      // after four attempts spent guessing at it remotely.
-      // v5 bakes in the real talking-head camera and speech for side B, so both
-      // ends of a cross-planet call carry real media rather than Chromium's
-      // rolling pattern and beep.
-      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v5",
-      // Two, not one. A cap of one is shared across the WHOLE application, and
-      // the alarm chain that keeps a Durable Object awake through a cold image
-      // pull also keeps its container holding that single slot -- so the next
-      // run could never be placed and looked, once again, like silence. Two
-      // gives a finishing run and a starting run room to overlap without
-      // letting anything actually fan out.
-      "max_instances": 2,
+  // Runs every minute. Its only job is to make the permanent link behave like a
+  // permanent thing: a human who opens room.tokkah.com/far-away-lab finds
+  // somebody on the other side within a minute, and a human who leaves stops
+  // paying for one two minutes later. An always-on 2 vCPU container bills
+  // continuously whether or not anyone is looking at it, and "just leave the
+  // rig running" is how a test environment becomes a subscription.
+  "triggers": { "crons": ["* * * * *"] },
 
-      // THE HINT IS NOT ENOUGH. The DO carried locationHint "wnam" and the
-      // container was placed in bom10 -- MUMBAI, ~1200 km from this laptop,
-      // which would have quietly turned a cross-planet measurement into a
-      // domestic one and reported it as US West. locationHint is advisory
-      // (already proved once when `me` probed at 9.57x the speed of light);
-      // `constraints` is the part that actually binds.
-      //
-      // Change this region to move the far peer. That is the experiment's dial.
+  "containers": [
+    // v6 (2026-08-23) carries BOTH recorded speakers, so a container-to-container
+    // call has two different voices in it — the furthest-pair rig puts a browser
+    // on each end, and one voice talking to itself would have made every
+    // turn-taking, echo and duplex measurement an artefact of the media.
+    // v5 carried side B only; v4 added the playwright driver the base image
+    // lacks; v3 moved the join logic into CMD because container.start()
+    // silently discards an entrypoint override.
+    //
+    // 3 GiB of memory per vCPU is enforced: 2 vCPU with 4096 MiB is rejected
+    // outright with VALIDATE_INPUT. 6144 is the floor that is accepted, so
+    // 4 vCPU takes 12288.
+    //
+    // 4 vCPU, not 2, and this is a MEASUREMENT correction rather than a
+    // comfort upgrade. At 2 vCPU the container's fake camera delivered 14.9
+    // frames a second from the same 720p mjpeg that this laptop plays at 30
+    // (framesIn 7484 over 501 s, live, while its encoder sat at 4.2 ms and
+    // refused almost nothing -- so the encoder was idle and the CAPTURE was the
+    // ceiling). Every video number the rig has ever produced was therefore
+    // capped at half rate, and a receiver presenting 15 fps looked like a lane
+    // defect when it was faithfully painting everything it was sent. A rig that
+    // silently halves the thing it measures is worse than no rig.
+    //
+    // max_instances 2, not 1: a cap of one is shared across the whole
+    // application, and the alarm chain that keeps a Durable Object awake
+    // through a cold image pull also keeps its container holding that single
+    // slot — so the next run could never be placed and looked, once again, like
+    // silence. Two gives a finishing run and a starting run room to overlap
+    // without letting anything actually fan out.
+    {
+      "class_name": "PeerWnam",
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v7",
+      "max_instances": 2,
+      // 305 ms round trip from the DEL edge — tied with enam for the furthest
+      // this operator's own city can reach, and the hard case for a real call.
       "constraints": { "regions": ["WNAM"] },
-      // 3 GiB per vCPU is enforced: 2 vCPU with 4096 MiB is rejected outright
-      // with VALIDATE_INPUT. 6 GiB is the floor that is accepted.
-      "instance_type": { "vcpu": 2, "memory_mib": 6144, "disk_mb": 8000 }
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 8000 }
+    },
+    {
+      "class_name": "PeerEnam",
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v7",
+      "max_instances": 2,
+      "constraints": { "regions": ["ENAM"] },
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 8000 }
+    },
+    {
+      "class_name": "PeerSam",
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v7",
+      "max_instances": 2,
+      "constraints": { "regions": ["SAM"] },
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 8000 }
+    },
+    {
+      "class_name": "PeerEeur",
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v7",
+      "max_instances": 2,
+      // Half of the furthest pair this network will place: eeur <-> oc measured
+      // 320 ms round trip on Cloudflare's own backbone, 160 ms one way.
+      "constraints": { "regions": ["EEUR"] },
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 8000 }
+    },
+    {
+      "class_name": "PeerApac",
+      "image": "registry.cloudflare.com/d40c56319e9a41fec6cb6aee7b6b63b3/tokkah-peer:v7",
+      "max_instances": 2,
+      // The far half of the furthest pair a container CAN be placed in:
+      // sam <-> apac measured 228 ms and enam <-> apac 243 ms on the backbone.
+      // Its own same-region calibration arm came back at 84 ms, which means the
+      // two APAC probes landed in different countries — so treat "apac" as a
+      // region and never as a city, and read the container's own cdn-cgi/trace
+      // colo before quoting any distance.
+      "constraints": { "regions": ["APAC"] },
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 8000 }
     }
+    // AFR and OC have DO classes and NO container, both for the same reason:
+    // measured 2026-08-23, `constraints.regions` refuses each of them with
+    // "Regions <X> have limited capacity, and require additional capabilities".
+    // So the placeable set is exactly WNAM, ENAM, SAM, EEUR, APAC, and the
+    // furthest pair a browser can be put on is enam <-> apac at 243 ms — not
+    // eeur <-> oc at 320 ms, which the network routes but cannot host.
   ]
+
+  // SECRET, not a var — tape-app's live-laboratory key, used here only to READ
+  // a room's occupant list (`{"op":"drain"}`), which is presence without holding
+  // a room slot and without one line of change in production:
+  //   wrangler secret put LAB_KEY -c testbed/peer/wrangler.jsonc
 }

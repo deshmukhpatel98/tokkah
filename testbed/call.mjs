@@ -1026,15 +1026,60 @@ if (ra.lane0 || rb.lane0) {
   }
 }
 
-const nf = [...new Set([...A.netFails, ...B.netFails])];
-if (nf.length) {
-  log(`\n  ${nf.length} failed request(s):`);
-  for (const f of nf.slice(0, 8)) log(`    ${f}`);
+// ── Known-benign noise, named and subtracted (never hidden) ──────────────────
+// These two lines are read as a pass signal, so anything permanently in them
+// costs more than it looks: a console that is always red is a console nobody
+// reads, and the NEXT error — the real one — arrives invisible. But suppressing
+// noise silently is the worse failure (a rig blind to a defect reports PASS
+// while shipping it), so the rule here is: a tolerated line must be NAMED, with
+// a reason and a way for it to end, it is subtracted from the counted tally,
+// and it is still PRINTED every run. Nothing is dropped, only re-labelled.
+//
+// Keep this list tiny and keep every matcher narrow. It is for third-party
+// noise we do not control — not for our own errors we have not fixed yet.
+const BENIGN = [
+  {
+    tag: 'cf-jsd-inline-script',
+    why: "Cloudflare Bot Management 'JavaScript Detections' appends an inline <script> "
+       + 'to the HTML at the edge, downstream of the worker. Our CSP carries no '
+       + "'unsafe-inline' and no nonce, and the injected text embeds per-request tokens "
+       + '(r:, t:) so its hash differs on every response — there is nothing to pin. The '
+       + 'block is the CSP working. Ends when the zone toggle is off: Cloudflare → '
+       + 'Security → Bots → JavaScript Detections. Audited 2026-08-20: no rule on the '
+       + 'zone reads a bot signal, so the feature buys nothing. See csp() in worker.ts.',
+    // Narrow on purpose: an inline-script refusal that names OUR directive. Worded
+    // differently by Chromium ('Refused to execute inline script…') and WebKit, so
+    // match the invariants rather than either sentence.
+    hit: (t) => /content security policy/i.test(t)
+             && /inline/i.test(t)
+             && t.includes("script-src 'self' 'wasm-unsafe-eval'"),
+  },
+];
+const sift = (lines) => {
+  const real = [], noise = [];
+  for (const l of lines) {
+    const b = BENIGN.find((x) => x.hit(l));
+    (b ? noise : real).push(b ? `[${b.tag}] ${l}` : l);
+  }
+  return { real, noise };
+};
+
+const nf = sift([...new Set([...A.netFails, ...B.netFails])]);
+if (nf.real.length) {
+  log(`\n  ${nf.real.length} failed request(s):`);
+  for (const f of nf.real.slice(0, 8)) log(`    ${f}`);
 }
-const errs = [...A.errors, ...B.errors];
-if (errs.length) {
-  log(`\n  ${errs.length} console error(s):`);
-  for (const e of [...new Set(errs)].slice(0, 6)) log(`    ${e}`);
+const ce = sift([...new Set([...A.errors, ...B.errors])]);
+if (ce.real.length) {
+  log(`\n  ${ce.real.length} console error(s):`);
+  for (const e of ce.real.slice(0, 6)) log(`    ${e}`);
+}
+const benign = [...nf.noise, ...ce.noise];
+if (benign.length) {
+  log(`\n  ${benign.length} known-benign, not counted above:`);
+  for (const b of benign.slice(0, 6)) log(`    ${b.slice(0, 300)}`);
+  for (const t of [...new Set(BENIGN.filter((x) => benign.some((b) => b.startsWith(`[${x.tag}]`))))])
+    log(`      why ${t.tag}: ${t.why}`);
 }
 log('');
 process.exit(0);

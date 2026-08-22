@@ -1,0 +1,405 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.tk-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/sources",
+      "importPath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/main.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "tk",
+      "moduleOutputPath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/Modules/tk.swiftmodule",
+      "objects" : [
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Audio.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Clock.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Display.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Net.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Stun.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Update.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Video.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/VideoNet.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/main.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "tk_main",
+        "-swift-version",
+        "5",
+        "-Ounchecked",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "mac"
+      ],
+      "outputFileMapPath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Audio.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Clock.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Display.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Net.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Stun.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Update.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Video.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/VideoNet.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/Modules/tk.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/main.swift"
+      ],
+      "tempsPath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "tk" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "tk",
+      "-package-name",
+      "mac",
+      "-c",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/main.swift",
+      "-I",
+      "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "tk_main",
+      "-swift-version",
+      "5",
+      "-Ounchecked",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "mac",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "tk" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+    },
+    "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk-entitlement.plist"
+    },
+    "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/main.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/sources"
+    },
+    "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Audio.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Clock.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Display.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Net.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Stun.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Update.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/Video.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/VideoNet.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.build/main.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/debug/tk.product/Objects.LinkFileList"
+    }
+  }
+}

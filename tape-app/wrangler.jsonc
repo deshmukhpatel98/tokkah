@@ -28,7 +28,7 @@
     { "tag": "v2", "new_sqlite_classes": ["Health"] }
   ],
   "observability": { "enabled": true },
-  "workers_dev": true
+  "workers_dev": true,
 
   // OPTIONAL — TURN relay credentials (calls between different networks — a
   // phone on cellular and a laptop on wifi will often need a relay). Without
@@ -38,4 +38,12 @@
   //   wrangler secret put TURN_KEY_ID
   //   wrangler secret put TURN_KEY_API_TOKEN
   // (Cloudflare TURN keys: dash.cloudflare.com → Calls → TURN)
+
+  // Releases of the native macOS app. Out of the assets directory on purpose:
+  // this repo is AGPL-published, and committing a multi-megabyte binary per
+  // release would grow the history forever for something that is a build
+  // artifact, not source.
+  "r2_buckets": [
+    { "binding": "MACREL", "bucket_name": "tokkah-mac" }
+  ],
 }

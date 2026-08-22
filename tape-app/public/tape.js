@@ -3084,10 +3084,107 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   const avq = []; // { frame, avUs } — decoded, awaiting their vsync
   const AVQ_MAX = 12; // ~400 ms at 30 fps; deeper means the lane is broken, not sync
   let avEngaged = false;
+  // ── ENGAGEMENT IS NO LONGER A ONE-WAY DOOR ──────────────────────────────────
+  // It used to be "sticky by design": set once on the first frame where both
+  // clock mappings existed, never cleared. Below this block sit TWO working
+  // presenters (the #33 cadence-locked v-presenter, and §17.8 paint-on-arrival)
+  // and engagement made both unreachable for the rest of the call — so a single
+  // wrong clock mapping could stop the picture permanently, with every other
+  // number in the lane reading healthy.
+  //
+  // That is exactly what it did. `avUs = frame.timestamp - peerAvDeltaUs`, and
+  // `avd` is derived from `mco`, a running MINIMUM — a one-way ratchet whose own
+  // comment already records it applying -38 s on a WebKit sender. With the
+  // mapping off by seconds every frame fails the "not newer than target" test,
+  // `best` stays -1, and the presenter holds. Forever. Measured: 6178 holds
+  // against 8 presents; on a live call, 3931 against 12 with 830 mco reanchors.
+  //
+  // So the door opens both ways now, and it is judged on OUTCOME rather than on
+  // any bound for what the clocks may plausibly say: frames are queued and
+  // nothing is being presented, therefore the mapping is wrong, whatever the
+  // reason. Giving up is permanent for the call, the same shape as
+  // `pcmFellBack` and `tapeFellBack` — a gate that can re-arm flaps, and a
+  // flapping presenter is worse than either presenter.
+  let avGaveUp = false;
+  let avEngagedAt = 0;
+  let avLastPresentAt = 0;
+  const AV_STARVE_MS = cfg.avStarveMs ?? 1200;
+  const AV_GRACE_MS = 1500; // engagement to first judgement: let it try
   const avStats = { presents: 0, holds: 0, drops: 0, skips: 0, offMs: [] };
+
+  // Judge only once there is something to judge: an empty queue is not a
+  // starving presenter, it is a quiet lane, and condemning sync for that would
+  // disengage on every gap in the video.
+  function avStarving() {
+    if (!avEngaged || avGaveUp || !AV_STARVE_MS) return false;
+    const t = now();
+    if (t - avEngagedAt < AV_GRACE_MS) return false;
+    if (!avq.length) return false;
+    return t - (avLastPresentAt || avEngagedAt) > AV_STARVE_MS;
+  }
+
+  function avDisengage(why) {
+    avGaveUp = true;
+    avEngaged = false;
+    const held = avq.length;
+    // Hand nothing forward: these frames are mapped onto a clock we have just
+    // declared wrong, and the next presenter would paint them out of order.
+    for (const q of avq.splice(0)) { q.frame.close(); avStats.drops++; }
+    L('tape-avsync-starved', {
+      why, holds: avStats.holds, presents: avStats.presents, held,
+      // The whole chain, in one line, so the ROOT cause stays visible after the
+      // symptom is gone. A fallback that hides its reason buys silence, not a fix.
+      peerAvDeltaUs: peerAvDeltaUs != null ? Math.round(peerAvDeltaUs) : null,
+      offsetMs: avsync?.offsetMs ?? null,
+      playoutUs: (() => { const ph = avsync?.audioPlayoutUs?.(); return ph ? Math.round(ph.us) : null; })(),
+      engagedMs: Math.round(now() - avEngagedAt),
+    });
+  }
 
   function avEngageable() {
     return !!(avsync && peerAvDeltaUs != null && avsync.audioPlayoutUs?.() != null);
+  }
+
+  // Does the mapping describe a POSSIBLE call? `avEngageable` above asks only
+  // whether the two numbers exist, and they always do -- including when
+  // `peerAvDeltaUs` is -27 MINUTES. Measured on the long path across four
+  // consecutive arms: -633053, -994270, -1300330, -1636066 ms, drifting one way
+  // and never recovering. The sender builds `avd` as
+  // `(now() - mco) * 1000 - ctx.currentTime * 1e6`: the left half reconstructs a
+  // VideoFrame.timestamp (Chromium's capture clock) and the right half is an
+  // AudioContext clock that is ZERO at construction. Two origins with nothing in
+  // common, subtracted. So presence was never evidence of validity, and the
+  // presenter inherited a target hundreds of seconds in the past and dutifully
+  // waited for it -- 5870 frames held against 16 presented.
+  //
+  // The presenter's whole contract is that `frame.timestamp - avd` lands on the
+  // peer's audio timeline near its playhead. Test exactly that, on the real
+  // frame we are about to take ownership of.
+  //
+  // The bound is deliberately ENORMOUS: 2 s, against a real A/V skew of at most
+  // a couple of hundred ms. This gate rejects the physically impossible, it does
+  // not police tuning -- a tight bound would quietly switch sync off on a merely
+  // mediocre estimate, which is a regression wearing a fix's clothes. Anything
+  // inside 2 s still engages and is still judged on outcome by avStarving().
+  const AV_MAP_MAX_US = (cfg.avMapMaxMs ?? 2000) * 1000;
+  let avMapRejects = 0;
+  let avMapErrUs = null;
+  function avMapSane(tsUs) {
+    if (!AV_MAP_MAX_US) return true;
+    const ph = avsync.audioPlayoutUs?.();
+    if (!ph) return false;
+    avMapErrUs = Math.round((tsUs - peerAvDeltaUs) - (ph.us + ph.outLatUs));
+    if (Math.abs(avMapErrUs) <= AV_MAP_MAX_US) return true;
+    // Logged on the first rejection and then sparsely: a call whose peer clock
+    // is broken produces one of these per decoded frame, and a log that floods
+    // is a log nobody reads.
+    if (avMapRejects === 0 || avMapRejects % 300 === 0) {
+      L('tape-avsync-implausible', { errMs: Math.round(avMapErrUs / 1000),
+        boundMs: AV_MAP_MAX_US / 1000, rejects: avMapRejects,
+        peerAvDeltaMs: Math.round(peerAvDeltaUs / 1000), tsUs: Math.round(tsUs) });
+    }
+    avMapRejects++;
+    return false;
   }
 
   // The one paint path for remote frames: sizes the backing store to the
@@ -3130,6 +3227,9 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   function avTick() {
     if (closed || !avEngaged) return;
     requestAnimationFrame(avTick);
+    // Checked BEFORE the work, so the tick that condemns the mapping does not
+    // also add one more hold to the count it is being judged on.
+    if (avStarving()) { avDisengage('no-present'); return; }
     const ph = avsync.audioPlayoutUs?.();
     if (!ph || avq.length === 0) { avStats.holds++; return; }
     // audio_playout_time at the EAR: the ring playhead plus the output
@@ -3154,6 +3254,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
     paintRemote(frame);
     frame.close();
     lastDrawAt = now();
+    avLastPresentAt = lastDrawAt;
     avStats.presents++;
     stats.presentAt.push(+lastDrawAt.toFixed(1));
     if (stats.presentAt.length > 1800) stats.presentAt.shift();
@@ -3231,6 +3332,61 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   let vpLastK = -1;                        // slot of the last presented frame
   let vpShift = 0;                         // servo phase pull so far, in slots (≤ 0)
   let vpRunning = false;
+
+  // THE PEER'S CADENCE, NOT OURS.
+  //
+  // Everything below used to derive its slot interval from `cfg.fps` -- OUR
+  // configured capture rate -- while the frames being scheduled are the PEER's.
+  // The comment above states the premise plainly: "the sender's capture
+  // timestamps are the intended fps grid". They are, but the grid is the
+  // SENDER's, and nothing guaranteed it matched ours.
+  //
+  // Measured on the long path: a peer capturing 25 fps into our 30 fps grid
+  // leaves five slots a second empty, resyncs the metronome ~1.5 times a
+  // second, and stretches inter-present p99 to 831 ms against a p50 of 67. That
+  // is not a subtle regression, it is the difference between "smooth" and
+  // visibly stuttering, and it was reported as exactly that.
+  //
+  // 25 fps is not exotic. PAL-region webcams do it by default, and phone
+  // sensors drop to 24/20/15 in anything short of bright light -- so this fired
+  // on a large share of real calls and could only ever be seen from the far
+  // end. The rig only found it because its own media happens to be 25 fps.
+  //
+  // The estimator is the MEDIAN of recent inter-capture deltas, which is the
+  // capture period even when frames are missing: a hole doubles one delta
+  // rather than shifting all of them, so the median is unmoved until more than
+  // half the intervals have holes. A mean would be dragged by every drop.
+  const VP_CAD = cfg.vpCadence !== false;  // ?vpcad=0 restores the cfg.fps grid
+  const VP_CAD_MIN = 12;                   // samples before the estimate is trusted
+  const VP_CAD_BAND = 0.08;                // re-anchor only on a real regime change
+  const vpDeltas = [];
+  let vpLastTs = null;
+  let vpIus = null;                        // learned peer capture interval, µs
+  // Slot interval in µs: the learned one once it exists, else the old behaviour
+  // exactly. With ?vpcad=0 this is the shipped line for line.
+  const vpI = () => (VP_CAD && vpIus != null ? vpIus : 1e6 / cfg.fps);
+  function vpNoteCadence(tsUs) {
+    if (!VP_CAD) return false;
+    if (vpLastTs != null) {
+      const d = tsUs - vpLastTs;
+      // 4 ms..500 ms == 250..2 fps. Anything outside is a reorder, a capture
+      // reset or a loop point in a file, and must not enter the estimate --
+      // a timestamp reset is precisely what poisons `mco` elsewhere in this
+      // file, and the same trap is available here.
+      if (d > 4000 && d < 500000) {
+        vpDeltas.push(d);
+        if (vpDeltas.length > 60) vpDeltas.shift();
+      }
+    }
+    vpLastTs = tsUs;
+    if (vpDeltas.length < VP_CAD_MIN) return false;
+    const sorted = [...vpDeltas].sort((a, b) => a - b);
+    const est = sorted[sorted.length >> 1];
+    if (vpIus != null && Math.abs(est - vpIus) / vpIus <= VP_CAD_BAND) return false;
+    vpIus = est;
+    vpStats.recadence = (vpStats.recadence | 0) + 1;
+    return true;                           // caller re-anchors the metronome
+  }
   const vpStats = { presents: 0, holds: 0, drops: 0, skips: 0, resyncs: 0, early: 0 };
 
   function vpPresent(frame, idx, at) {
@@ -3254,9 +3410,18 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   }
 
   function vpEnqueue(frame) {
-    const I_us = 1e6 / cfg.fps;
-    const I_ms = 1000 / cfg.fps;
-    if (vpTs0 == null) { vpTs0 = frame.timestamp; vpT0 = now() + VP_D_SLOTS * I_ms; }
+    // A changed cadence changes the UNIT every queued idx is expressed in, so
+    // the metronome must be re-anchored rather than reinterpreted. Rare by
+    // construction (an 8% deadband on a 60-sample median), and the queue is at
+    // most VPQ_MAX=3 frames, so the cost is bounded and counted.
+    const recad = vpNoteCadence(frame.timestamp);
+    const I_us = vpI();
+    const I_ms = I_us / 1000;
+    if (recad || vpTs0 == null) {
+      for (const q of vpq.splice(0)) { q.frame.close(); vpStats.drops++; }
+      vpTs0 = frame.timestamp; vpT0 = now() + VP_D_SLOTS * I_ms;
+      vpLastK = -1; vpShift = 0;
+    }
     const idx = Math.round((frame.timestamp - vpTs0) / I_us);
     if (idx <= vpLastK) { frame.close(); vpStats.skips++; return; } // stale: never present backwards in time
     if (now() > vpT0 + idx * I_ms + VPQ_MAX * I_ms) {
@@ -3285,7 +3450,7 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
   function vpTick() {
     if (closed || avEngaged || !cfg.vprev) { vpRunning = false; return; }
     requestAnimationFrame(vpTick);
-    const I_ms = 1000 / cfg.fps;
+    const I_ms = vpI() / 1000;
     const k = Math.floor((now() - vpT0) / I_ms);
     if (k === vpLastK) return;             // one present per slot (60 Hz rAF, 30 fps supply)
     let best = -1;
@@ -3668,8 +3833,10 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         if (ctx2d) {
           // §10 engagement check: both mappings ready → queue for vsync
           // presentation from here on. Sticky by design (see avEngaged).
-          if (!avEngaged && avEngageable()) {
+          if (!avEngaged && !avGaveUp && avEngageable() && avMapSane(frame.timestamp)) {
             avEngaged = true;
+            avEngagedAt = now();
+            avLastPresentAt = 0;
             L('tape-avsync-engaged', { lane: 'rtp', peerAvDeltaUs: Math.round(peerAvDeltaUs), offsetMs: avsync.offsetMs });
             // #33 handoff: frames queued to the v-presenter must not strand.
             for (const q of vpq.splice(0)) { q.frame.close(); vpStats.drops++; }
@@ -4500,7 +4667,12 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
           return { ipiP50: pct(d, 50), ipiP95: pct(d, 95), ipiP99: pct(d, 99) };
         })(),
         // #33 v-presenter counters (all zero on the ?vprev=0 control arm).
-        vp: { ...vpStats, depth: vpq.length, shift: vpShift, dMs: +(VP_D_SLOTS * (1000 / cfg.fps)).toFixed(1) },
+        // `fps` is the PEER's measured capture rate and `dMs` the anchor cost in
+        // its units -- both were previously quoted in ours, so a 25 fps peer
+        // was reported as a 30 fps grid and the mismatch was unreadable.
+        vp: { ...vpStats, depth: vpq.length, shift: vpShift,
+              fps: vpIus != null ? +(1e6 / vpIus).toFixed(1) : null,
+              dMs: +(VP_D_SLOTS * (vpI() / 1000)).toFixed(1) },
         frameBytesMean: mean(b), frameBytesP95: pct(b, 95),
         mbpsAtFps: mean(b) != null ? +((mean(b) * 8 * cfg.fps) / 1e6).toFixed(2) : null,
         buffered: null, decQueue: dec?.decodeQueueSize ?? null, encQueue: enc?.encodeQueueSize ?? null,
@@ -4518,11 +4690,24 @@ export function startTapeRtp({ pc, track, initiator, pre, cfg, onRemote, log, on
         // §10 A-V sync telemetry (null/absent when the bundle never engaged —
         // the paint-on-arrival path is then exactly §17.8's).
         avEngaged,
+        // Visible in every snapshot, because "sync gave up" is the difference
+        // between a lane that is fine and a lane that is fine BECAUSE it stopped
+        // trying to be clever. A rig cannot see that from g2g alone.
+        avGaveUp,
         avPresents: avStats.presents, avHolds: avStats.holds,
         avDrops: avStats.drops, avSkips: avStats.skips,
         avOffP50: pct(avStats.offMs, 50), avOffP95: pct(avStats.offMs, 95),
         avqDepth: avq.length,
         peerAvDeltaUs: peerAvDeltaUs != null ? Math.round(peerAvDeltaUs) : null,
+        // How wrong the mapping was, and how often it was refused. Without
+        // these a rig sees "sync never engaged" and cannot tell a healthy call
+        // that had no need of it from one whose peer clock is nonsense.
+        avMapErrMs: avMapErrUs != null ? Math.round(avMapErrUs / 1000) : null,
+        avMapRejects,
+        // Counted since #14 and never reported until now: every rig run read
+        // `reanch undefined` while this was the direct diagnostic for the
+        // ratcheting anchor that poisons `avd` in the first place.
+        mcoReanchors: stats.mcoReanchors | 0,
         // §12–13 stall machine (null with ?stall=0 — the classifier never ran,
         // no lane-P channel exists, and no shed/resume byte was ever sent).
         stall: cfg.stall

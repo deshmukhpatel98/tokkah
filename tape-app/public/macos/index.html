@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Tokkah for macOS</title>
+<style>
+  :root { --bg:#fff; --fg:#12151a; --dim:#5d6673; --line:#e3e7ec; --code:#f5f7f9; --accent:#0a58ca; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#232a33; --code:#161b22; --accent:#6ea8fe; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); padding:56px 22px 96px;
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
+  main { max-width: 47rem; margin: 0 auto; }
+  h1 { font-size: 1.9rem; letter-spacing:-.02em; margin:0 0 .3em; }
+  h2 { font-size: 1.05rem; margin: 2.6em 0 .7em; letter-spacing:.01em; }
+  p.lede { color:var(--dim); font-size:1.06rem; margin:0 0 2.2em; }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:9px;
+        padding:15px 17px; overflow-x:auto; font-size:.9rem; margin:0 0 1em; }
+  code { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
+  table { border-collapse: collapse; width:100%; font-size:.93rem; }
+  th, td { text-align:left; padding:8px 12px 8px 0; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; }
+  td.n { font-family: ui-monospace,Menlo,monospace; }
+  .note { color:var(--dim); font-size:.9rem; }
+  a { color:var(--accent); }
+  .tag { display:inline-block; font-size:.72rem; letter-spacing:.09em; text-transform:uppercase;
+         border:1px solid var(--line); color:var(--dim); border-radius:99px; padding:3px 10px; margin-bottom:1.6em; }
+</style>
+<main>
+  <div class=tag>early build · apple silicon · audio + video</div>
+  <h1>Tokkah for macOS</h1>
+  <p class=lede>A video call that should feel like the other person is in the room. This is the
+     native half — built because a browser will not give you the clocks or the audio
+     thread the goal requires.</p>
+
+  <h2>Install</h2>
+  <pre><code>curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code></pre>
+  <p class=note>Installs to <code>~/.local/bin/tk</code>. No security dialog to click through:
+     files fetched by <code>curl</code> are not quarantined, so this path never meets Gatekeeper.
+     The download is checked against a SHA-256 in a signed manifest, and from then on
+     <code>tk</code> updates itself and verifies an Ed25519 signature on every update before
+     applying it. Read the script first if you like — it is
+     <a href="/macos/install.sh">right here</a>, 50 lines.</p>
+
+  <h2>Use it</h2>
+  <pre><code>tk --listen 7001 --peer &lt;other-mac-ip&gt;:7001 --window</code></pre>
+  <p class=note>Run it on both Macs. <code>--window</code> opens the picture; without it you get
+     audio and a latency read-out. Add <code>--video camera</code> to send your camera, or
+     <code>--video &lt;clip.mov&gt;</code> to send a file. It asks for microphone and camera
+     permission the first time, prints its latency budget on start, and then one line a second.</p>
+
+  <h2>Where it is</h2>
+  <table>
+    <tr><th>Audio</th><th></th></tr>
+    <tr><td>mouth-to-ear</td><td class=n>21–24 ms</td></tr>
+    <tr><td>packets played</td><td class=n>100%</td></tr>
+    <tr><td>concealment</td><td class=n>0</td></tr>
+    <tr><td>jitter, p50 → p99</td><td class=n>0.03 ms</td></tr>
+    <tr><td>device buffer</td><td class=n>2.67 ms (128 frames)</td></tr>
+    <tr><td>format</td><td class=n>32-bit float, uncompressed</td></tr>
+    <tr><th>Video</th><th></th></tr>
+    <tr><td>capture → decoded</td><td class=n>3.96 ms p50, 4.9 ms p95</td></tr>
+    <tr><td>+ compositor (60 Hz)</td><td class=n>~8 ms mean, 16.7 ms worst</td></tr>
+    <tr><td>hardware encode</td><td class=n>2.8 ms</td></tr>
+    <tr><td>hardware decode</td><td class=n>1.1 ms</td></tr>
+    <tr><td>frame rate</td><td class=n>30 fps sustained, 0 dropped</td></tr>
+    <tr><td>B-frames</td><td class=n>none, by design</td></tr>
+  </table>
+  <p class=note>Measured between two processes on one Mac, so the network contributes nothing
+     and both ends share one clock — these are the pipeline itself, not an estimate. Audio and
+     video ride one UDP socket, so there is one port and one hole to punch. Keyframes are sent
+     on request rather than on a timer, so a healthy call never pays for one and a late joiner
+     recovers in about 300 ms.</p>
+
+  <h2>Honest limits</h2>
+  <p class=note>Apple silicon only. It is a command-line tool that can open a window, not yet
+     an app with buttons. There is no call setup: you type the other machine's address. No
+     encryption on the wire yet. No forward error correction, so real packet loss will show as
+     a brief freeze until the next keyframe. It is signed by us, not notarised by Apple, which
+     is exactly why the install goes through <code>curl</code>. And it is an early build being
+     changed several times a day — it updates itself, so it will not stay this one for long.</p>
+</main>

@@ -1,0 +1,61 @@
+{
+  "": {
+    "dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/tk.d",
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/tk.o",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/primary.swiftdeps"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Audio.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Audio~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Audio.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Audio.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Stun.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Stun.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Update.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Update.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Video.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Video.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Video~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Video.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Video.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/VideoNet.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/VideoNet.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/VideoNet~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/VideoNet.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/VideoNet.dia"
+  },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/main.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/main.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/main.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/main.dia"
+  }
+}

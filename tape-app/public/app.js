@@ -348,7 +348,10 @@ function recoverCall(why) {
 // screen — the same fullscreen preserve-aspect treatment as the remote view
 // (#selfFull: inset 0 + object-fit: cover, mirrored). On peer arrival the
 // remote view takes the screen and self view shrinks to the conventional
-// static corner PiP (toggleable via the c-selfview chip).
+// static corner PiP -- available on `?selfpin=1`, and otherwise one HOLD of the
+// #peek button away. There is no `c-selfview` chip and never was; that claim
+// stood here for weeks and sent a reader looking for a control that did not
+// exist.
 function peerArrived() {
   hadPeer = true;
   safe(() => {
@@ -367,9 +370,11 @@ function peerArrived() {
     // the PiP on, and removing it is the single most evidence-backed change in
     // the redesign: the all-day mirror is Bailenson's second mechanism (2021),
     // and Fauville et al. (2021, N=10,322) found mirror anxiety a significant
-    // predictor of videoconference fatigue. It is one hold away on the
-    // self-view button and pinnable from the more sheet — it just never
-    // arrives uninvited.
+    // predictor of videoconference fatigue. It is one HOLD away on the
+    // self-view button (#peek), and `?selfpin=1` keeps it up for a whole call —
+    // it just never arrives uninvited. (It was never "pinnable from the more
+    // sheet": that sentence described a control nobody had built.)
+    if (SELF_PIN) $('selfSense')?.classList.add('pinned');
     startRemoteFill();
     applyChips();
   }, 'peer.arrived');
@@ -639,6 +644,17 @@ async function handleLab(m) {
       if (el) el.dataset.off = on ? '0' : '1';
       tel?.log('toggle', { what: 'mic', on, via: 'lab' });
       applied.mic = on ? 1 : 0;
+    }
+    // The self-view, remotely, and it is not a media knob at all. It exists
+    // because the far-away-lab rig needs the operator to be able to SEE their
+    // own camera on a call that is ALREADY UP — the alternative was a reload,
+    // which drops the very call the experiment is running inside. The consumer
+    // here is the DOM, so applying it IS the toggle; nothing has to re-read
+    // anything, which is the test this whitelist requires of every entry.
+    if (m.selfpin != null) {
+      SELF_PIN = String(m.selfpin) === '1';
+      safe(() => $('selfSense')?.classList.toggle('pinned', SELF_PIN), 'lab.selfpin');
+      applied.selfpin = SELF_PIN ? 1 : 0;
     }
     // The budget band, live. rcPollBudget re-reads both bounds on every 1 s
     // poll (it clamps the GCC estimate into them, and the trust floor is
@@ -2071,6 +2087,26 @@ const TAPE_CFG = {
   // frame age and A-V sync from this anchor, so an unbounded one lands entirely on
   // the RECEIVER. `?mcomax=0` restores the pure all-time latch.
   mcoMaxLagMs: QS.get('mcomax') == null ? 150 : Number(QS.get('mcomax')),
+  // §10 A-V synchroniser STARVATION WATCHDOG. Milliseconds of "frames queued
+  // and nothing presented" that condemn the sync mapping. DEFAULT ON;
+  // `?avstarve=0` restores the old sticky-forever engagement (the control arm).
+  //
+  // Measured 2026-08-23 on a real 300 ms path: the presenter had HELD 6178
+  // frames and presented 8, an inter-present interval of 633 ms against 100 ms
+  // with `?avsync=0`, and on a longer-lived live call glass-to-glass 7337 ms
+  // with presentLag 6828 ms while the encoder took 4 ms and every queue was
+  // empty. Engagement was "sticky by design" with no way back, so one bad clock
+  // mapping took the picture out for the rest of the call and the two working
+  // fallbacks underneath it were unreachable.
+  avStarveMs: QS.get('avstarve') == null ? 1200 : Number(QS.get('avstarve')),
+  // §10 pre-flight: reject an A/V mapping that is not physically possible
+  // before the presenter owns a single frame. `?avmapmax=0` is the control arm
+  // (engage on any mapping, however absurd -- the behaviour up to 17.77).
+  avMapMaxMs: QS.get('avmapmax') == null ? 2000 : Number(QS.get('avmapmax')),
+  // #33 the remote presenter's slot grid follows the PEER's measured capture
+  // cadence. `?vpcad=0` restores the old cfg.fps grid (the control arm), which
+  // stutters against any peer that is not sending exactly cfg.fps.
+  vpCadence: QS.get('vpcad') !== '0',
   lpMinWidth: Number(QS.get('lpminw')) || 240,
   // #75 Keep the held-exit probe flowing while the PEER is held, not only while
   // our own uplink is shed — our dead-man clears the shed after 8 s and the peer's
@@ -2159,6 +2195,27 @@ const FRAME_CFG = {
   // (head-coupled parallax / presence-window) is worked out.
   tile: QS.get('fstile') === '1',
 };
+
+// Keep the self-view on screen for the whole call.
+//
+// DEFAULT ON IN THE LAB ROOMS, OFF EVERYWHERE ELSE, and the split is the whole
+// point. For a real call the all-day mirror is the single best-evidenced fatigue
+// driver in the literature (Fauville et al. 2021, N=10,322), which is why
+// hold-to-peek (#peek) is the shipped way to look at yourself. But `far-away-*`
+// is a TEST environment, where the question is never "how do I feel after an
+// hour" and always "is my camera actually alive" — and its absence there cost an
+// operator a live call's worth of doubt about a sensor that was working fine.
+//
+// Scoped by ROOM rather than by query string because the operator should not
+// have to remember a flag to get a rig's behaviour. `?selfpin=0` opts out and
+// `?selfpin=1` opts in, so an explicit answer always beats the room default.
+const LAB_ROOM_RE = /^far-away-(lab|two|max)$/;
+const IN_LAB_ROOM = LAB_ROOM_RE.test(location.pathname.slice(1))
+  || LAB_ROOM_RE.test(QS.get('r') ?? '');
+// `let`, not `const`: the lab channel can flip this mid-call (op 'set',
+// selfpin), which is the difference between changing it and reloading the page
+// out from under the call you are measuring.
+let SELF_PIN = QS.get('selfpin') != null ? QS.get('selfpin') === '1' : IN_LAB_ROOM;
 
 // ── Aperture Parallax configuration (testbed/specs/presence-window.md §1) ───
 // Head-coupled two-plane parallax. Default ON per defaults law (`?window=0` disables).
@@ -5291,6 +5348,11 @@ function updateSelfViewBreathing(wantVisible) {
   // that is the full-screen waiting-alone layer, not a self-view tile.
   const sv = $('selfSense');
   if (!sv || !FRAME_CFG.tile) return;
+  // The pin outranks the breathing. This function sets inline opacity, which
+  // beats `#selfSense.pinned` no matter how specific the selector is, so with
+  // both flags on the tile would fade out from under a user who asked for it
+  // to stay.
+  if (SELF_PIN) return;
 
   const now = Date.now();
   if (wantVisible) frameSenseLastMotionTs = now;
@@ -8326,12 +8388,25 @@ let iceCache = null;
 // Durable Object's cold start, paid by whoever CREATES the room. The lobby
 // knows the room name long before the click (deep link, typed name, or the
 // pre-minted one below), so warm the DO while the human is still looking at
-// the preview. /summary without a token is a 401 — but the DO is constructed
-// and its storage read to answer it, which is the entire point.
+// the preview. Reaching the DO at all is the entire point: the constructor,
+// its storage reads and the schema exec are the cold start, and /warm answers
+// once they are done. The body is read and thrown away rather than ignored: an
+// undrained response is CANCELLED, and Chromium reports the cancel as
+// net::ERR_ABORTED — which is a failed request in every tool that watches for
+// one. Draining costs nothing here (the body is a dozen bytes, already
+// arrived) and it is what makes this fetch leave no trace at all.
+//
+// This used to be a tokenless GET /summary, which warmed the DO correctly and
+// then answered 403 — one failed request in EVERY visitor's console on EVERY
+// load. A permanently-red console is what the next real error hides behind,
+// and it was inflating the testbed's own console-error pass signal too.
 let pendingMint = null; // minted at lobby load so its DO can be warmed too
 function prewarmRoom(room) {
   if (!room) return;
-  safe(() => { fetch(`/api/room/${encodeURIComponent(room)}/summary`).catch(() => {}); }, 'prewarm');
+  safe(() => {
+    fetch(`/api/room/${encodeURIComponent(room)}/warm`)
+      .then((r) => r.arrayBuffer()).catch(() => {});
+  }, 'prewarm');
 }
 
 // The second joiner's 241 ms click→welcome was the largest slice of

@@ -23,6 +23,9 @@
 
 interface Env {
   ASSETS: Fetcher;
+  // Native macOS app releases. The bucket holds only build artifacts; the
+  // page, installer and signed manifest are ordinary static assets.
+  MACREL?: R2Bucket;
   ROOM: DurableObjectNamespace;
   HEALTH: DurableObjectNamespace;
   TURN_KEY_ID?: string;
@@ -224,9 +227,54 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/log') && request.method === 'POST') return this.ingest(request);
     if (url.pathname.endsWith('/log') && request.method === 'GET') return this.dump(url);
     if (url.pathname.endsWith('/summary')) return this.summary(url);
+    if (url.pathname.endsWith('/warm')) return this.warm();
     if (url.pathname.endsWith('/xlate')) return this.xlate(request);
     if (url.pathname.endsWith('/lab') && request.method === 'POST') return this.lab(request);
+    if (url.pathname.endsWith('/rv')) return this.rendezvous(url);
     return this.signal(request);
+  }
+
+  /**
+   * RENDEZVOUS for the native app: two Macs swap the public UDP addresses they
+   * each learned from STUN, then both start sending, which punches the holes.
+   *
+   * A pure address exchange and nothing else. No media, no keys, no session — the
+   * only thing that cannot be discovered without help is what the other side's
+   * NAT called it, and this answers exactly that. Deliberately unauthenticated
+   * like the web app's room codes: knowing a room code has always been the
+   * credential here, and an address is not a secret worth more than the media it
+   * carries (which is the next thing to encrypt, and is not encrypted yet).
+   *
+   * Held in memory with a short lease rather than in storage. An address is only
+   * true while the NAT binding behind it is alive, so persisting one would mean
+   * handing out mappings that expired hours ago — worse than handing out nothing,
+   * because the caller would spend its whole punch budget on a dead address.
+   */
+  private rvPeers = new Map<string, { addr: string; local?: string; at: number }>();
+
+  private rendezvous(url: URL): Response {
+    const me = url.searchParams.get('me') ?? '';
+    const addr = url.searchParams.get('addr') ?? '';
+    const now = Date.now();
+    // 90 s: long enough to survive a slow start on the far side, short enough
+    // that a stale mapping is never offered as a live one.
+    for (const [k, v] of this.rvPeers) if (now - v.at > 90_000) this.rvPeers.delete(k);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(me)) return json({ error: 'bad me' }, 400);
+    const local = url.searchParams.get('local') ?? '';
+    const addrOk = (a: string) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(a);
+    if (addr) {
+      if (!addrOk(addr)) return json({ error: 'bad addr' }, 400);
+      if (local && !addrOk(local)) return json({ error: 'bad local' }, 400);
+      // The LAN address travels too. Two machines behind one NAT should talk over
+      // the LAN: it is a shorter path, and reaching your own public address from
+      // inside requires NAT hairpinning that many routers refuse outright. The
+      // client compares public IPs and picks; this only carries both.
+      this.rvPeers.set(me, { addr, local: local || undefined, at: now });
+    }
+    const others = [...this.rvPeers.entries()]
+      .filter(([k]) => k !== me)
+      .map(([k, v]) => ({ id: k, addr: v.addr, local: v.local, ageMs: now - v.at }));
+    return json({ me, peers: others });
   }
 
   /**
@@ -414,6 +462,33 @@ export class Room implements DurableObject {
       durationMin: span?.lo && span?.hi ? +((span.hi - span.lo) / 60000).toFixed(1) : null,
       byKind: counts,
     });
+  }
+
+  // ── Prewarm: pay the cold start before the human clicks ───────────────────
+  // The lobby calls this while the preview is still on screen (app.js
+  // prewarmRoom). Its only job is to EXIST: reaching the DO at all runs the
+  // constructor, its blockConcurrencyWhile storage reads (epoch + log token)
+  // and the schema exec, which is the ~0.8 s the first joiner used to pay.
+  //
+  // It used to be a tokenless GET /summary — which warmed the DO perfectly and
+  // then answered 403, putting a failed request in every visitor's console on
+  // every single load, forever. That is not free. Standing noise is precisely
+  // what the next real error hides behind, and this one was also inflating the
+  // testbed's own "console error(s)" / "failed request(s)" pass signal, i.e.
+  // corrupting the instrument used to decide whether a build is good. 204 warms
+  // exactly the same and says nothing.
+  private warm(): Response {
+    // COUNT(*) rather than SELECT 1 so the events table's pages are faulted in
+    // too — the same storage touch /summary was doing, minus the answer.
+    this.sql.exec('SELECT COUNT(*) FROM events');
+    // 200 with a body, NOT 204. Measured: a 204 here still showed up as
+    // `failed …/warm — net::ERR_ABORTED` in Playwright's requestfailed, i.e.
+    // it swapped a red console line for a red harness line and fixed nothing.
+    // Chromium reports the abort when a response body is never drained, and an
+    // empty body is the easiest one to leave hanging. A small real body that
+    // the caller reads to completion (see prewarmRoom in app.js) closes the
+    // stream cleanly and nothing anywhere logs it.
+    return json({ warm: true });
   }
 
   // ── Signaling ─────────────────────────────────────────────────────────────
@@ -1934,6 +2009,43 @@ const csp = (host: string) => [
   // 'wasm-unsafe-eval' admits WebAssembly.compile for the self-hosted
   // MediaPipe face tracker (aperture parallax) — wasm only, no eval(); the
   // binary itself still has to come from 'self'.
+  //
+  // KNOWN, ACCEPTED CONSOLE ERROR: Cloudflare's Bot Management "JavaScript
+  // Detections" appends an inline <script> to this HTML at the edge, AFTER the
+  // worker returns (it sets window.__CF$cv$params and loads
+  // /cdn-cgi/challenge-platform/scripts/jsd/main.js). This policy has no
+  // 'unsafe-inline' and no nonce, so our own CSP blocks Cloudflare's own
+  // script, and every visitor's console logs one violation per load. Every
+  // escape route was measured and is worse than the noise:
+  //
+  //   'unsafe-inline'  — defeats script-src for the whole app to accommodate a
+  //                      feature we do not use. Never.
+  //   a 'sha256-…' hash — impossible, not merely ugly: the injected text embeds
+  //                      per-request tokens (r:'…', t:'…'), so the digest is
+  //                      different on every response. Nothing to pin.
+  //   a nonce          — requires authoring the tag; the edge appends this one
+  //                      downstream of us, so there is no nonce to attach.
+  //   Cache-Control:
+  //     no-transform   — DOES remove the injection (measured, gone), but the
+  //                      edge counts compression as a transform too: gzip
+  //                      disappears and the page goes 13,423 -> 41,776 wire
+  //                      bytes, 3.1x, for every visitor. 28 kB a load to
+  //                      silence a script the CSP already blocks is the wrong
+  //                      trade.
+  //
+  // The fix is at the zone, not here: Security → Bots → JavaScript Detections
+  // → off. It is safe to turn off because nothing consumes the signal — audited
+  // 2026-08-20 across all three custom rulesets on the zone (Tokkah Abuse
+  // Shield, API Burst Shield, managed default) and NOT ONE rule references
+  // cf.bot_management.*, cf.client.bot, or verified_bot; the Abuse Shield gates
+  // on user-agent and path. So JS Detections is running purely to produce a
+  // score no rule reads, and paying for it in standing console noise.
+  //
+  // Until that toggle is flipped, the violation is expected. It is enumerated
+  // as known-benign in testbed/call.mjs so it cannot quietly inflate the
+  // per-run "console error(s)" pass signal — the point of keeping the console
+  // clean is that the NEXT error is visible, and a tolerated error that is not
+  // named is indistinguishable from a new one.
   "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'unsafe-inline'",
   "img-src 'self' data:", // data: is the inline SVG favicon
@@ -2128,8 +2240,8 @@ export default {
       );
     }
 
-    // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary
-    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab)$/);
+    // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary | …/warm
+    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab|warm|rv)$/);
     if (m) {
       const code = decodeURIComponent(m[1]);
       if (!ROOM_RE.test(code)) return json({ error: 'bad room code' }, 400);
@@ -2153,6 +2265,30 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404);
+
+    // ── Native macOS releases ────────────────────────────────────────────────
+    //
+    // Only the tarball comes from R2. Everything a human reads -- the page, the
+    // installer, the signed manifest -- is a static asset under public/macos, so
+    // it is reviewable in the repo and cannot be changed without a deploy.
+    //
+    // No auth: the binary is meant to be downloadable by anyone with the link,
+    // and the thing that makes an install safe is the Ed25519 signature the
+    // client verifies, not obscurity about the URL.
+    const rel = url.pathname.match(/^\/macos\/dl\/([A-Za-z0-9._-]{1,64})$/);
+    if (rel) {
+      if (!env.MACREL) return json({ error: 'releases not configured' }, 503);
+      const obj = await env.MACREL.get(rel[1]);
+      if (!obj) return json({ error: 'no such release' }, 404);
+      const h = new Headers();
+      obj.writeHttpMetadata(h);
+      h.set('etag', obj.httpEtag);
+      // Immutable: a release filename carries its version, so the bytes behind a
+      // given URL never change and a year of caching is honest.
+      h.set('cache-control', 'public, max-age=31536000, immutable');
+      h.set('content-type', 'application/gzip');
+      return new Response(obj.body, { headers: h });
+    }
     // Short invite links: room.tokkah.com/etm-bkmb-iev (Meet-shaped, minted by
     // the client). The path IS the room; the asset behind it is the app shell.
     // Tightly scoped to the minted format so real assets (/app.js, /embed.js)
@@ -2195,13 +2331,16 @@ export default {
       res.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
       res.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
       // Do NOT add `Cache-Control: no-transform` here. It is Cloudflare's
-      // documented opt-out from edge HTML rewriting, and it does stop the two
+      // documented opt-out from edge HTML rewriting, and it does stop the
       // injected third-party scripts (Web Analytics beacon + bot-management JS
       // detection) — measured, both gone. But the edge counts compression as a
       // transform too: gzip disappeared and the page went 13,423 -> 41,776 wire
       // bytes, 3.1x, for every visitor. Spending 28 kB a load to suppress a
-      // script the CSP already blocks is the wrong trade. Turn the two features
-      // off at the zone instead.
+      // script the CSP already blocks is the wrong trade. Turn the features off
+      // at the zone instead. Status 2026-08-20: the Web Analytics beacon is
+      // gone from the served HTML, JS Detections is still injecting — see the
+      // KNOWN, ACCEPTED CONSOLE ERROR note on script-src in csp() above for
+      // why no CSP-side fix exists and which toggle actually ends it.
     }
     return res;
   },

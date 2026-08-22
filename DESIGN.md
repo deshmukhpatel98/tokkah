@@ -8931,3 +8931,213 @@ Fixed on both sides, because this repo is forked and self-hosted and a new clien
 against an old worker is a real deployment shape: the server returns `null` for
 an undeclared frame cap, and the client treats `0` as unknown in every version of
 the server there has ever been.
+
+## 17.76 Two standing console errors: one is Cloudflare's, one was ours
+
+Every load of room.tokkah.com left errors in the console. Standing noise is not
+a cosmetic problem: a console that is always red is a console nobody reads, so
+the cost is paid later, by the *next* error, which arrives invisible. Both of
+these were also being counted by `testbed/call.mjs` in its per-run
+`console error(s)` / `failed request(s)` lines — which are read as a pass
+signal — so the noise was corrupting the instrument used to judge builds.
+
+    before, one bare prod load, captured exactly as call.mjs captures:
+      CONSOLE ERRORS (2):  CSP inline-script violation
+                           403 (failed to load resource)
+      NET FAILS     (1):   403 https://room.tokkah.com/api/room/…/summary
+
+### Ours: a prewarm that answered 403 on every load, forever
+
+§17.51's lobby prewarm warms the room DO before the click, and it did so with a
+tokenless `GET /api/room/:code/summary`. That warms the DO perfectly — and then
+answers 403, because `/summary` requires the log token. The 403 was *intended*;
+what was not intended is that it is a failed request in every visitor's console
+on every load, and in the harness's tally too.
+
+Now `GET /api/room/:code/warm` → `200 {"warm":true}`. Reaching the DO at all is
+the whole point: the constructor, its `blockConcurrencyWhile` storage reads
+(epoch + log token) and the schema exec are the cold start, and `COUNT(*)` keeps
+the events table's pages faulted in exactly as `/summary` did. `/summary` itself
+is unchanged and still 403s without a token.
+
+**The 204 that wasn't free.** The first version returned `204 No Content` — and
+it still showed up as `failed …/warm — net::ERR_ABORTED` in Playwright's
+`requestfailed`. It had swapped a red console line for a red harness line and
+fixed nothing. Chromium reports the abort when a response body is never drained,
+and an empty body is the easiest one to leave hanging. So: a small real body,
+and the client reads it to completion (`.then(r => r.arrayBuffer())`). An
+undrained `fetch` is a cancelled `fetch`; the cancel is what tooling sees.
+
+### Cloudflare's: an inline script our own CSP blocks
+
+Bot Management's "JavaScript Detections" appends an inline `<script>` to the
+HTML at the edge, *downstream of the worker*. Our `script-src 'self'
+'wasm-unsafe-eval'` has no `'unsafe-inline'` and no nonce, so we block
+Cloudflare's own script. Every escape route was checked and each is worse than
+the noise:
+
+| route | verdict |
+|---|---|
+| `'unsafe-inline'` | defeats script-src for the whole app, for a feature we do not use. Never. |
+| `'sha256-…'` | **impossible**, not merely ugly — measured across four loads the digest was `6VL9…`, `UlVwpg…`, `eTowXn…`, `1HJeeu…`: the injected text embeds per-request tokens (`r:`, `t:`), so there is nothing to pin. |
+| a nonce | requires authoring the tag; the edge appends this one after us. |
+| `Cache-Control: no-transform` | works (injection gone, measured) but the edge counts compression as a transform: 13,423 → 41,776 wire bytes, **3.1×**, for every visitor. 28 kB a load to silence a script the CSP already blocks. |
+
+So there is no fix on this side of the wire, by construction. The fix is one
+zone toggle — Security → Bots → JavaScript Detections → off — and it is safe
+because **nothing consumes the signal**: audited across all three custom
+rulesets on the zone (Tokkah Abuse Shield, API Burst Shield, managed default),
+not one rule references `cf.bot_management.*`, `cf.client.bot`, or
+`verified_bot`. The Abuse Shield gates on user-agent and path. JS Detections is
+running to produce a score no rule reads, and charging us standing console noise
+for it.
+
+That toggle is not reachable from here: `PATCH /zones/:id/bot_management` returns
+`10405 Method not allowed for this authentication scheme` with the stored API
+token, and the wrangler OAuth grant is `zone:read`. It needs the dashboard, or a
+token scoped Zone → Bot Management → Edit.
+
+### Until then: named, subtracted, still printed
+
+`call.mjs` now partitions the two report lines against a small `BENIGN` list.
+The rule, because the opposite mistake is the worse one — a rig blind to a defect
+reports PASS while shipping it (§17.58, and the camera-orientation run):
+
+- a tolerated line must be **named**, with a reason and a way for it to end;
+- it is **subtracted** from the counted tally, so the pass signal is honest;
+- it is **still printed every run**, under its own heading, with the why.
+
+Nothing is hidden, only re-labelled. The matcher is deliberately narrow (an
+inline-script refusal naming *our* directive, worded per-engine) and the list is
+for third-party noise we do not control — never for our own unfixed errors.
+
+`csp-check.mjs` already did the right thing here and needed no change: it reads
+`securitypolicyviolation` events and splits `connect-src` violations (mine) from
+everything else (the CSP doing its job), failing only on the former.
+
+### Verified on a live prod call
+
+    after, node call.mjs --url=https://room.tokkah.com
+      (no "console error(s)" line, no "failed request(s)" line)
+      2 known-benign, not counted above:
+        [cf-jsd-inline-script] Executing inline script violates … script-src …
+      call healthy: lost 0, concealed 0 ms, drop(link) 0,
+                    mouthToEar 46.4 / 40.8 ms, both lanes sab
+
+## 17.77 The native floor: a buffer that measures itself, and 24.5 ms → 16.2 ms
+
+The native app's mouth-to-ear had been sitting at ~23 ms and I had been treating
+that as the floor. It was not the floor, it was four copies of one constant.
+
+### The instrument that reported perfection during a failure
+
+`m2e` here is *constant* — p50, p95 and p99 identical to two decimals, unchanged
+for a minute. That is not a broken quantile; it is the governor doing its job.
+The read cursor is pinned to its target, so as long as a packet beats its
+deadline the ear gets the designed delay and nothing else. Correct definition,
+and blind in a way that matters: **"zero concealment with 1 ms to spare" and
+"zero concealment with 20 ms to spare" print the same line**, and only one of
+them survives a real path.
+
+So packets now record **arrival slack** — how long before its deadline each one
+turned up — computed from the local read cursor alone. No peer clock, no offset
+estimate, nothing to sync, which is the entire reason it can be trusted at
+10,000 km. It immediately paid for itself twice.
+
+First, it confirmed the model exactly: `slack p01 == jitTarget × packet`, and
+`m2e == floor + jitTarget × packet`. On a real path, therefore,
+`slack p01 == buffer − jitter`, which is the control signal that stops the
+jitter buffer being a hand-picked number.
+
+Second, it exposed the reason a fixed buffer is a bug in this codebase's oldest
+family — a constant with a duration in it is a hidden limit on how far away the
+other person may be (§ RTT-blind timeouts, queue-tolerance-in-ms). 5.33 ms is
+right for one path and wrong for every other.
+
+### Slack lies while the cursor is behind, and it lies flatteringly
+
+The debug build glitches its render callback — useless for measuring, but a free
+step-injector. Two ~200 ms stalls, and:
+
+    played 302/s (80.5%)  conceal 0/s   m2e p95 220.78 → 412.74 ms
+    jit -> 1 (shrank: slack p01 5.33 ms, 5 windows clean)   ← during the stall
+
+Two separate defects in one line.
+
+**The governor had no step recovery.** Its jump threshold was the whole ring —
+1.36 s — and below that the ±0.4% rate limit claws back 4 ms per second. A 200 ms
+hiccup therefore cost 200 ms of added latency for the next *fifty seconds*;
+`m2e p50` sat at 391 ms for the rest of the run with every other counter clean.
+There is now a middle tier, and it is asymmetric because the two directions are
+different problems: cursor **late** means the buffer holds stale audio, and
+skipping it is right — the listener wants to be current, not to hear a backlog;
+cursor **early** means no amount of aggression invents a sample. Snap forward
+above ~29 ms, ease below it.
+
+**The controller steered on a signal the failure inverts.** Slack is measured
+against the read cursor, so a cursor that falls behind makes every packet look
+early. The buffer controller read `p01 2.69 ms`, judged the path healthy and
+*shrank* — while m2e passed 400 ms. A controller that can be fooled by the
+failure it exists to catch is worse than none, so shrinking now requires the
+governor to be **converged** first: the cursor is where it was told to be, which
+is the only condition under which slack describes the network rather than the
+cursor.
+
+Two more corrections came out of live runs:
+
+- **A level that failed is remembered**, with doubling backoff. Without it the
+  thing shrank, clicked, grew, waited out its hold and shrank into the same click
+  forever — observed cycling 2→1→2→1 at three concealed packets a lap.
+- **Attribution before action.** A snap means a stall, and a buffer one packet
+  larger would have prevented none of it. Growing anyway is how one transient
+  hiccup becomes permanent latency: two stalls ratcheted 3→4→5 and held m2e
+  1.7 ms worse for the rest of the run, with a 240 s backoff before it would
+  reconsider. Stalls are now absorbed by the snap and the level is held.
+
+And the descent is the default: auto starts at 6 packets and walks down. Arriving
+at the right buffer from below means walking through it, and every step is a
+click (18 concealed packets while learning). From above it costs a few ms for the
+first fifteen seconds and nothing else.
+
+### The constant was in the budget four times
+
+`FPP` is samples per packet *and* the device buffer size, so it appears in the
+mic path, the speaker path, the packetisation and the jitter buffer. The hardware
+reports a usable range of 15..4096 frames; we were sitting at 128 because that is
+what was typed first.
+
+    FPP=128  floor 17.12 ms   m2e 23.82   conceal 0
+    FPP=64   floor 10.46 ms   m2e 14.07   conceal 0
+    FPP=32   floor  7.12 ms   m2e 12.63   conceal 12   ← min slack −1.99 ms
+
+32 buys 1.4 ms and pays in audible gaps. 64 is the pick, and `JIT_MIN` is 2 for a
+structural reason rather than a cautious one: a packet holds exactly one device
+buffer, so at one packet the render callback and the socket contend for the same
+slot. At jit 1 the *loopback* path — no network at all — still concealed. The
+minimum buffer is one render granularity above zero.
+
+A useful thing fell out of the A/B: the required buffer *duration* stayed ~5 ms
+either way, because path jitter sets that. What shrank was the overhead that
+scales with packet size. The adaptive buffer then restored the duration on its
+own, which is exactly the division of labour intended.
+
+### Measured, release build, 3 minutes, audio + video both directions
+
+    before   FPP=128, jit pinned 2      m2e 24.50 ms   conceal 0
+    after    FPP=64,  auto (settled 3)  m2e 16.23 ms   conceal 1 packet / 181 s
+
+    budget   mic device      2.88 ms
+             packetise       1.33 ms
+             jitter buffer   4.00 ms   sized from measured arrival slack
+             speaker device  3.58 ms
+             floor          11.79 ms   (was 17.12)
+
+**8.3 ms off mouth-to-ear, a 34% cut**, one 1.3 ms gap in three minutes, and the
+buffer now sizes itself from evidence instead of from my guess. Video was
+unaffected throughout: 30 fps, g2g p50 5.81 ms, zero decode failures, zero
+partial-frame drops.
+
+One rig fact worth writing down, because it cost an hour: **the debug build
+cannot measure this.** `-Onone` in a render callback produced two 200 ms stalls
+in 45 s; the same code at `-c release` ran 48 s with none. Every audio number
+here is a release build.
