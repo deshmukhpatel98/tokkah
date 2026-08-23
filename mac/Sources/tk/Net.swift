@@ -92,6 +92,9 @@ final class RecvRing {
   // The test is exact and already available -- a late arrival is one with
   // negative slack.
   var lateArrivals = 0
+  /// Late arrivals that missed by less than one packet -- the only ones a single
+  /// extra packet of buffer would have saved.
+  var nearLate = 0
   // ── Is the tail the sender's or the receiver's? ────────────────────────────
   //
   // The buffer controller keeps settling at 3, 4 or 5 packets across runs, worth
@@ -219,7 +222,23 @@ final class RecvRing {
       slackWin.add(ms)
       if ms < slackMin { slackMin = ms }
       if ms < slackWinMin { slackWinMin = ms }
-      if ms < 0 { lateArrivals += 1 }
+      if ms < 0 {
+        lateArrivals += 1
+        // ── Lateness that one more packet of buffer would actually have caught ──
+        //
+        // Growing the buffer by one packet saves an arrival that missed by LESS
+        // THAN ONE PACKET. It does nothing for one that missed by 15 ms, and the
+        // controller had no way to tell the two apart: it grew on the count of
+        // late arrivals, so a path that stalls 15 ms every three seconds drove it
+        // from 6 packets to 26 and still climbing, with grows logged at slack p01
+        // +5.15 ms and +14.44 ms -- comfortable margin, deep outliers, and twenty
+        // consecutive grows that could not have helped and did not.
+        //
+        // This is the same attribution the controller already does for stalls and
+        // for loss, applied to the one case it was still missing: attribute the
+        // symptom to a MAGNITUDE the action can address, not just to a count.
+        if ms > -(Double(FPP) / SR * 1000.0) { nearLate += 1 }
+      }
     }
     memcpy(samples + slot * FPP, src, min(n, FPP) * 4)
     let now = Clock.now()

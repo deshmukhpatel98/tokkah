@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.12.0"
+let VERSION = "0.13.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -453,10 +453,13 @@ Thread {
 // real path to measure. Off unless asked for, and impossible to overlook when on.
 let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
                     burstMs: Double(arg("imp-burst") ?? "0") ?? 0,
-                    jitterMs: Double(arg("imp-jitter") ?? "0") ?? 0)
+                    jitterMs: Double(arg("imp-jitter") ?? "0") ?? 0,
+                    delayMs: Double(arg("imp-delay") ?? "0") ?? 0,
+                    spikeMs: Double(arg("imp-spike") ?? "0") ?? 0,
+                    spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3)
 if impair.enabled {
   wire.impair = impair
-  if impair.jitterMs > 0 { wire.armDelayQueue() }
+  if impair.holdsPackets { wire.armDelayQueue() }
   fputs("IMPAIRED: \(impair.description) -- numbers from this run describe a damaged path on purpose\n", stderr)
 }
 
@@ -618,6 +621,11 @@ if audio.jitAuto {
     var lastConcealed = 0
     var lastSnaps = 0
     var lastLate = 0
+    var lastNearLate = 0
+    var lastStarved = 0
+    var deepRefused = 0
+    var enoughRefused = 0
+    let STARVE_AUDIBLE_PCT = Double(arg("starve-pct") ?? "0.02") ?? 0.02
     var lastLostForFec = 0
     var fecCalm = 0
     // Redundancy has to earn its bandwidth. Measured: at 1% UNIFORM loss it
@@ -649,6 +657,13 @@ if audio.jitAuto {
       lastConcealed = r.concealed
       let late = r.lateArrivals - lastLate
       lastLate = r.lateArrivals
+      let near = r.nearLate - lastNearLate
+      lastNearLate = r.nearLate
+      // Of the late arrivals in this window, how many missed by less than one
+      // packet. Those are the ones growing by one packet would have saved; the
+      // rest are outliers that a buffer can only catch by covering the whole
+      // excursion, and covering it costs that much on every word forever.
+      let deep = late - near
 
       // REDUNDANCY FOLLOWS THE EVIDENCE, not a setting. It doubles the audio
       // payload, so a clean call must not pay for it -- and a call that IS losing
@@ -719,6 +734,35 @@ if audio.jitAuto {
       }
       let snapped = r.snaps - lastSnaps
       lastSnaps = r.snaps
+      // ── What growing is FOR, and when it has finished ──────────────────────
+      //
+      // A buffer exists to stop starvation. So the question "should it grow?" has
+      // an answer that does not depend on any threshold about margins or counts:
+      // grow while starvation is still audible, and stop when it is not.
+      //
+      // Starvation, specifically -- not concealment. Concealment also covers lost
+      // packets, and no buffer size catches a packet that was never sent. That
+      // distinction already exists in the ring and was already being used for the
+      // redundancy controller; this is the same evidence answering the other
+      // question.
+      //
+      // Why a rule and not a judgement: on a path that stalls 15 ms every three
+      // seconds the controller grew from 6 packets to 26 and was still climbing at
+      // four minutes, converging on "cover the worst excursion" -- 15 ms of latency
+      // on every word, forever, to avoid concealing 1% of packets in 0.67 ms
+      // pieces that are now filled at the speaker's own pitch. The project made
+      // exactly this trade by hand once before (25 concealed packets in 568 s is
+      // inaudible against 2.7 ms on every word). Writing it down makes it apply
+      // every time instead of whenever someone reads a log.
+      //
+      // 0.02% is one 0.67 ms gap every three seconds at 1500 packets/s. Where
+      // exactly the audible line sits is a listening question, not a measurement
+      // one, so the number is a flag and the log always says what was traded.
+      let starved = r.concealStarved - lastStarved
+      lastStarved = r.concealStarved
+      let expected = 2.0 * SR / Double(FPP)
+      let starvedPct = Double(starved) / expected * 100.0
+      let starving = starvedPct > STARVE_AUDIBLE_PCT
       guard let p01 = r.slackWin.p(0.01) else { continue }
       r.slackWin.reset()
       // The WORST arrival in the window is what a shrink has to survive, not the
@@ -798,7 +842,31 @@ if audio.jitAuto {
         fputs("jit: slack p01 \(String(format: "%.2f", p01)) ms but the far end skipped an input"
             + " wakeup (cadence gap \(String(format: "%.2f", senderGap)) ms vs \(String(format: "%.2f", pktMs)) nominal),"
             + " 0 concealed, 0 late -- holding at \(audio.jitTarget)\n", stderr)
-      } else if late >= GROW_LATE_MIN || (p01 < GROW_BELOW_MS && converged) {
+      } else if !starving, audio.jitTarget > JIT_MIN + 1,
+                (late >= GROW_LATE_MIN || p01 < GROW_BELOW_MS) {
+        // The thing a buffer prevents is not happening. Whatever the margin looks
+        // like, there is nothing left for another packet of latency to buy.
+        enoughRefused += 1
+        calm = 0
+        if enoughRefused % 10 == 1 {
+          fputs("jit: \(late) late, slack p01 \(String(format: "%.2f", p01)) ms, but starvation is"
+              + " \(String(format: "%.3f", starvedPct))% of packets (\(starved) in 2 s) -- under the"
+              + " \(STARVE_AUDIBLE_PCT)% line, so holding at \(audio.jitTarget) and concealing the"
+              + " excursions at the pitch period rather than buying \(String(format: "%.2f", pktMs)) ms"
+              + " more on every word\n", stderr)
+        }
+      } else if late >= GROW_LATE_MIN, near < GROW_LATE_MIN, p01 >= GROW_BELOW_MS {
+        // Late, but not by an amount a packet of buffer reaches, and the margin is
+        // fine. Chasing this is the queue-tolerance mistake wearing a new hat.
+        deepRefused += 1
+        calm = 0
+        if deepRefused % 5 == 1 {
+          fputs("jit: \(late) late arrivals but only \(near) missed by under one packet"
+              + " (\(deep) were deeper), slack p01 \(String(format: "%.2f", p01)) ms"
+              + " -- one more packet would not have caught them; holding at \(audio.jitTarget)."
+              + " Deep excursions are concealed at the pitch period instead.\n", stderr)
+        }
+      } else if (late >= GROW_LATE_MIN && near >= GROW_LATE_MIN) || (p01 < GROW_BELOW_MS && converged) {
         if audio.jitTarget < JIT_MAX {
           audio.jitTarget += 1
           audio.jitGrows += 1
@@ -810,7 +878,7 @@ if audio.jitAuto {
           // buffer high for a quarter of an hour, and a path that recovers
           // deserves to be re-probed sooner than that.
           backoff = min(backoff * 2, 120)
-          fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, slack p01 \(String(format: "%.2f", p01)) ms"
+          fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, \(near) of them by under one packet, slack p01 \(String(format: "%.2f", p01)) ms"
               + (growSuppressed > 0 ? ", \(growSuppressed) refused mid-slew" : "")
               + (marginExcused > 0 ? ", \(marginExcused) refused as far-end hiccups" : "") + ")"
               + "  -- below \(unsafeBelow) marked unsafe, next probe in \(Int(backoff / 2)) s\n", stderr)

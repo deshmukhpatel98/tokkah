@@ -21,17 +21,52 @@ final class Impair {
   let dropPct: Double
   let burstMs: Double
   let jitterMs: Double
-  var enabled: Bool { dropPct > 0 || jitterMs > 0 }
+  // ── Propagation, which this app has never once been tested with ────────────
+  //
+  // Every latency number in the native app to date is loopback: base delay zero.
+  // The call it exists for is Delhi to the Netherlands, where the measured
+  // one-way propagation is about 65 ms and no amount of engineering removes it.
+  // This project has a recorded bug class -- four instances -- of absolute
+  // thresholds that silently contain propagation, so a hardcoded "300 ms" or
+  // "30 packets" becomes a hidden distance limit that only fails far from home.
+  // A base delay is the only way to find the fifth instance before a real call
+  // does.
+  let delayMs: Double
+  // And real jitter is not uniform. A real path is mostly steady with occasional
+  // spikes -- a wifi retry, a queue that fills, a route that flaps -- so uniform
+  // 0..N over-exercises the "thin margin" path and never exercises the "one big
+  // spike" path at all. Shape matters more than magnitude to a controller that
+  // reacts to percentiles.
+  //
+  // A SPIKE IS AN EVENT, NOT A PER-PACKET DRAW. The first version of this drew a
+  // spike independently per packet at 0.5% -- which, at 1500 packets a second
+  // through a FIFO queue, is seven and a half stalls a second, a path far more
+  // hostile than anything real. Worse, it was hostile in a way the parameter name
+  // hid: "0.5% spikes" reads as rare. A real queue event holds EVERY packet that
+  // arrives during it and releases them together, so the honest parameters are
+  // events per second and a duration -- and the release burst that follows is part
+  // of the phenomenon, not an artefact.
+  let spikeMs: Double
+  let spikeHz: Double
+  private var stallUntil: UInt64 = 0
+  var enabled: Bool { dropPct > 0 || jitterMs > 0 || delayMs > 0 || spikeMs > 0 }
+  var holdsPackets: Bool { jitterMs > 0 || delayMs > 0 || spikeMs > 0 }
+  private(set) var stalls = 0
+
 
   private(set) var dropped = 0
   private(set) var delayed = 0
   private var burstUntil: UInt64 = 0
   private var seed: UInt64 = 0x2545_F491_4F6C_DD1D
 
-  init(dropPct: Double, burstMs: Double, jitterMs: Double) {
+  init(dropPct: Double, burstMs: Double, jitterMs: Double,
+       delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0) {
     self.dropPct = dropPct
     self.burstMs = burstMs
     self.jitterMs = jitterMs
+    self.delayMs = delayMs
+    self.spikeMs = spikeMs
+    self.spikeHz = spikeHz
   }
 
   // xorshift rather than a system RNG: this is called on the audio capture
@@ -63,17 +98,39 @@ final class Impair {
     return false
   }
 
-  /// Extra delay for this packet, in host ticks. Uniform 0..jitterMs.
+  /// Extra delay for this packet: propagation, plus uniform jitter, plus the
+  /// occasional spike. Propagation is added to EVERY packet and reorders nothing,
+  /// which is what makes it a distance rather than an impairment.
   func delayTicks() -> UInt64 {
-    guard jitterMs > 0 else { return 0 }
+    guard holdsPackets else { return 0 }
+    var ms = delayMs
+    if jitterMs > 0 { ms += rnd() * jitterMs }
+    if spikeMs > 0, spikeHz > 0 {
+      let now = Clock.now()
+      // Per-packet probability that yields spikeHz events per second.
+      let pktMs = Double(FPP) / SR * 1000.0
+      if now >= stallUntil, rnd() < spikeHz * pktMs / 1000.0 {
+        stallUntil = now + Clock.ticks(ns: UInt64(spikeMs * 1e6))
+        stalls += 1
+      }
+      // Everything arriving during the event waits for it to end. Packets after it
+      // are unaffected, which is what makes this a queue and not a per-packet coin
+      // flip.
+      if now < stallUntil {
+        ms = max(ms, Clock.ms(stallUntil - now) + delayMs)
+      }
+    }
+    guard ms > 0 else { return 0 }
     delayed += 1
-    return Clock.ticks(ns: UInt64(rnd() * jitterMs * 1e6))
+    return Clock.ticks(ns: UInt64(ms * 1e6))
   }
 
   var description: String {
     var s: [String] = []
     if dropPct > 0 { s.append(burstMs > 0 ? "\(dropPct)% loss in \(burstMs) ms bursts" : "\(dropPct)% uniform loss") }
+    if delayMs > 0 { s.append("\(delayMs) ms one-way propagation (\(delayMs * 2) ms rtt)") }
     if jitterMs > 0 { s.append("0..\(jitterMs) ms jitter") }
+    if spikeMs > 0 { s.append("\(spikeMs) ms queue stalls, \(spikeHz)/s") }
     return s.joined(separator: ", ")
   }
 }

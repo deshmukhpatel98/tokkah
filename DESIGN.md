@@ -10138,3 +10138,118 @@ every conclusion drawn from a single run before that null was unsupported.
 
 **Audio, loopback, this Mac: 24.50 ms at the start of this work, 11.75 this morning,
 9.64 now. 1518 packets/s, 2.43 Mbps, 6% of one core, encrypted, zero concealment.**
+
+## 17.98 Distance, at last — and the buffer had no idea what it was growing for
+
+Every latency number the native app has ever produced was loopback. Base delay zero.
+The call it exists for is Delhi to the Netherlands, where one-way propagation is about
+65 ms and no engineering removes it — and this project has a recorded bug class, four
+instances, of absolute thresholds that quietly contain propagation and so become
+hidden distance limits. There was no way to look for the fifth.
+
+`--imp-delay <ms>` adds a base delay to every packet through the existing FIFO delay
+queue: propagation, reordering nothing, which is what makes it a distance rather than
+an impairment. 65 ms each way, 150 s:
+
+```
+m2e p50 75.75 ms   net rtt 130.29   jit 4   conceal 0/s   lost 0   2.42 Mbps
+stages: cap->send 1.68  recv->play 4.29  mic 1.88  spk 2.58  = 10.42 accounted,
+        m2e 75.75, unexplained 65.32
+```
+
+**Clean pass.** The buffer settled at 4 packets, exactly as on loopback — distance did
+not inflate it — TimeSync read the round trip correctly, and the stage decomposition
+attributed all 10.42 ms of local pipeline and left precisely the injected propagation
+in "unexplained". No fifth instance in the audio path.
+
+### The rig lied first, and the parameter name is what hid it
+
+Real jitter is not uniform. A real path is mostly steady with occasional excursions,
+so uniform `0..N` over-exercises "thin margin" and never exercises "one big spike".
+The first spike model drew independently per packet at 0.5% — which, at 1500 packets a
+second through a FIFO queue, is **seven and a half stalls per second**, a path far more
+hostile than anything real. And it was hostile in a way the parameter hid: "0.5%
+spikes" reads as rare.
+
+A real queue event holds every packet that arrives during it and releases them
+together. So the honest parameters are events per second and a duration, and the
+release burst afterwards is part of the phenomenon rather than an artefact. Rewritten
+as `--imp-spike <ms> --imp-spike-hz <n>`.
+
+### Then the actual finding
+
+130 ms rtt, 1% uniform loss, 0-2 ms jitter, and a 15 ms queue stall every 3 seconds.
+The buffer climbed monotonically from 6 packets to 26 and was still climbing at four
+minutes. m2e 90.73. And the grows say why:
+
+```
+jit -> 21 (grew: 12 late arrivals, slack p01  5.15 ms)
+jit -> 25 (grew: 25 late arrivals, slack p01 14.44 ms)
+```
+
+It grew while the 1st percentile of arrivals had five and fourteen milliseconds of
+room. One more packet of buffer is 0.67 ms. It cannot catch a 15 ms outlier — so those
+grows could not have helped, and twenty consecutive ones didn't.
+
+§17.92 already found this shape and its fix was to raise the bar: lateness must be
+*sustained*. But a count is the wrong evidence. **The right evidence is the magnitude**,
+and it is exact and free: an arrival that missed by less than one packet is the only
+kind one more packet would have saved.
+
+```swift
+if ms > -(Double(FPP) / SR * 1000.0) { nearLate += 1 }
+```
+
+Grow on lateness only when `near >= GROW_LATE_MIN`. Everything else is a deep
+excursion, and the log says so rather than acting:
+
+```
+jit: 17 late arrivals but only 3 missed by under one packet (14 were deeper),
+     slack p01 2.90 ms -- one more packet would not have caught them; holding at 18.
+     Deep excursions are concealed at the pitch period instead.
+```
+
+Eighteen such refusals in 560 s, and the run no longer overshoots past what the path
+needs. It does still creep, because the *thin-margin* rule keeps nudging — so that got
+the same treatment from the other direction.
+
+### What is a buffer FOR, and when has it finished?
+
+A buffer exists to stop starvation. So "should it grow?" has an answer that needs no
+threshold about margins or counts at all: **grow while starvation is still audible, and
+stop when it is not.** Starvation specifically, not concealment — no buffer size
+catches a packet that was never sent, and the ring already separates the two for the
+redundancy controller.
+
+That turns a judgement into a rule. And it makes the policy explicit, which matters,
+because on this path it is a real trade with two defensible answers. Both measured, same
+path, same binary:
+
+| policy | jitter buffer | m2e | concealed |
+|---|---|---|---|
+| conceal nothing (`--starve-pct 0.02`, default) | 19 → ~23 | 87.3 → ~90 | 0/s |
+| accept 1% (`--starve-pct 1.0`) | 10–12, oscillating | **82.1** | 14/s = 0.94% |
+
+**About 8 ms of latency against about 1% of the audio being substituted** — 14 gaps of
+0.67 ms a second, filled at the speaker's pitch, step/rms 0.62. The default stays
+conservative: the goal says audio lossless, 8 ms is 6% of a 130 ms one-way, and the
+cheaper arm also oscillates, which is worse behaviour than a stable level. The knob and
+the measurement exist so that stops being an opinion. Which one actually sounds better
+is a listening question, and it is now a listening question with two numbers attached.
+
+### And the clean path did not move
+
+The case that matters most, twice:
+
+```
+clean run 1: m2e p50 9.98  jit 3  conceal 0/s  late 0
+clean run 2: m2e p50 9.82  jit 3  conceal 0/s  late 0
+```
+
+Where the app is now, all measured today, all encrypted, 2.43 Mbps, 6% of one core:
+
+| path | mouth-to-ear | above propagation |
+|---|---|---|
+| loopback | 9.8 ms | 9.8 |
+| 130 ms rtt, clean | 75.8 ms | 10.8 |
+| 130 ms rtt, 1% loss + 15 ms stalls every 3 s | ~90 ms | ~25 |
