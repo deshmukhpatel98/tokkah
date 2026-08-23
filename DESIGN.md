@@ -12234,3 +12234,21 @@ the clipboard, connection numbers ticking on, the encryption code agreeing acros
 both ends, the hang-up arming into "tap to leave" with its four neighbours collapsed
 to nothing, and both destructive paths — confirmed leave and closing the window —
 ending the process.
+
+### Postscript: a frozen face and a running clock
+
+The end-to-end pass finished with one more question that only a test can ask: kill
+one end, and what does the other one *say*? Nothing. The 3-second silence detector
+has been re-finding moved peers for weeks without ever telling the person watching,
+and what they see is a still picture with the call timer counting up — which looks
+exactly like the app having died, so they close the window and blame it.
+
+It now says "reconnecting…", the word the web app has used for this the whole time.
+
+Which left the harder half: a network blip and a departure are the same silence. From
+the *directory* they are not — a peer that has left stops republishing. Waiting for
+the room to evict them takes 90 seconds, which is far too long, but every rendezvous
+entry already carries `ageMs`: the time since that peer last said it was there. Four
+polls of an absent or stale entry is about two seconds, and the window says "the
+other person left". Probing continues regardless — a peer that comes back
+republishes, and the status is a report, not a decision to give up.

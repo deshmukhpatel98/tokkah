@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.38.0"
+let VERSION = "0.40.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -617,11 +617,15 @@ if let room = arg("room") {
   // before either will pass an inbound one.
   Thread {
     var announcedFor = ""
+    /// Consecutive rendezvous polls that did not list the peer at all.
+    var gone = 0
     while true {
       if wire.locked {
         if announcedFor != wire.lockedFrom {
           announcedFor = wire.lockedFrom
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
+          if sawRemote { display?.controls?.setStatus("connected") }
+          gone = 0
         }
         // SILENCE IS THE SIGNAL. Three seconds with nothing arriving means the
         // address we locked onto has stopped being true -- a new NAT port, a
@@ -632,6 +636,15 @@ if let room = arg("room") {
           fputs("room \(room): nothing from \(wire.lockedFrom) for 3 s -- looking again\n", stderr)
           wire.unlockForRediscovery()
           announcedFor = ""
+          // ── SAY SOMETHING ─────────────────────────────────────────────────
+          //
+          // This detector has re-found a moved peer since it was written, and never
+          // once told the person watching. What they see is a frozen face with the
+          // call timer still counting -- which looks exactly like the app having
+          // died, so they close the window and blame it. The web app has said
+          // "reconnecting…" for this the whole time.
+          display?.controls?.setStatus("reconnecting…")
+          gone = 0
         }
         Thread.sleep(forTimeInterval: 0.5)
         continue
@@ -639,9 +652,32 @@ if let room = arg("room") {
       // Unlocked: refresh the directory as well as probing, because if the peer
       // moved, its old address is exactly the one we would otherwise keep trying.
       let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
-      if let p = peers.first {
+      // ── A BLIP AND A DEPARTURE ARE NOT THE SAME THING ────────────────────
+      //
+      // From the media side they are identical: silence. From the DIRECTORY they
+      // are not -- a peer that has left stops republishing its address. Waiting for
+      // the room to evict them takes 90 s (worker.ts: "short enough that a stale
+      // mapping is never offered as a live one"), which is far too long to leave a
+      // frozen face over a running clock. But every entry carries `ageMs`, the time
+      // since that peer last said it was there, so the answer arrives in seconds
+      // and needs no change to the protocol.
+      if let p = peers.first, p.ageMs < 4000 {
+        gone = 0
         wire.addCandidate(ip: p.ip, port: p.port)
         if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+      } else if sawRemote {
+        gone += 1
+        if gone == 4 {
+          let why = peers.isEmpty ? "not in the room" : "silent for \(peers[0].ageMs / 1000)s"
+          fputs("room \(room): peer is \(why) -- telling the window\n", stderr)
+          display?.controls?.setStatus("the other person left")
+        }
+        // Keep probing anyway: a peer that comes BACK republishes, and the status
+        // is a report, not a decision to stop trying.
+        if let p = peers.first {
+          wire.addCandidate(ip: p.ip, port: p.port)
+          if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+        }
       }
       wire.probeAllCandidates()
       Thread.sleep(forTimeInterval: 0.5)

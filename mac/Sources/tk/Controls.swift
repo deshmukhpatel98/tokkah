@@ -1645,6 +1645,7 @@ final class CallControls: NSView {
 
   var describeTree: String {
     "controls \(Int(bounds.width))x\(Int(bounds.height))"
+      + "  status=\(status.isEmpty ? "-" : status)"
       + "  room=\(roomPill.text)"
       + "  quality=\(qualityPill.text.isEmpty ? "-" : qualityPill.text)"
       + "  echo=\(echoPill.isHidden ? "-" : echoPill.text)"
