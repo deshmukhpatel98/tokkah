@@ -9699,3 +9699,40 @@ latency included exactly once, however the timestamps are defined. That requires
 making a sound, and the machine's owner is asleep. Until then the reported figure
 stays the larger one, and it is the larger one on purpose: being wrong in the
 direction that flatters the project is the mistake this file keeps having to correct.
+
+## 17.90 A locked address is a claim about the past
+
+Candidate racing (§17.81) adopts the address a packet actually arrived from, which
+is the right way to *start* a call. But `adopt` fired once and never again, so the
+address was remembered forever — and a remembered address is a claim about the
+past, not evidence that a path still works.
+
+Everything that breaks it happens on an ordinary daily call: the peer's router
+hands out a new port, someone walks into another room and joins a different access
+point, DHCP renews, a laptop sleeps and wakes. In every case the remembered
+address is simply wrong, nothing arrives, and the call is silent for good.
+
+**Silence is the signal.** Three seconds with nothing accepted means the lock has
+expired: unlock, forget the candidates, re-read the rendezvous — because if the
+peer moved, its old address is precisely the one we would otherwise keep probing —
+and race again.
+
+Verified by moving a peer to a different port mid-call:
+
+    connected via 192.168.1.105:47201
+    played 1514/s (100.9%)
+    -- beta killed, restarted on port 47301 --
+    nothing from 192.168.1.105:47201 for 3 s -- looking again
+    connected via 192.168.1.105:47301
+    played 1502/s (100.1%)   peer-restarts 1   re-found-peer 1
+
+Both mechanisms fired together and independently: the ring recovered from the
+sequence-number restart (§17.88) and the socket re-found the peer at a new
+address. A call now survives the other side restarting, changing network, or
+disappearing and coming back — which between them are most of the ways a real
+daily call gets interrupted.
+
+Note what `lastRecvHost` is measured from: packets **accepted**, not packets
+received. A datagram that fails to decrypt or carries the wrong wire format is not
+evidence that the path works, and counting it would keep a dead call looking alive
+— the same distinction as `open-socket-is-not-a-live-peer`, one layer down.

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.5"
+let VERSION = "0.9.6"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -141,22 +141,40 @@ if let room = arg("room") {
   // audio. The correct fix is to demultiplex STUN inside the media loop, and
   // until that exists the mapping does not need rediscovering: 375 audio packets
   // a second keep the NAT binding alive far more reliably than a probe would.
-  // Punch every candidate until one answers. Fast while unresolved, because this
-  // is the window the user experiences as "is it connecting?", and both NATs need
-  // an outbound packet before either will pass an inbound one.
+  // Punch every candidate until one answers, and go back to punching if the peer
+  // ever goes quiet. Fast while unresolved, because this is the window a person
+  // experiences as "is it connecting?", and both NATs need an outbound packet
+  // before either will pass an inbound one.
   Thread {
-    var announced = false
+    var announcedFor = ""
     while true {
       if wire.locked {
-        if !announced {
-          announced = true
+        if announcedFor != wire.lockedFrom {
+          announcedFor = wire.lockedFrom
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
         }
-        Thread.sleep(forTimeInterval: 1.0)
+        // SILENCE IS THE SIGNAL. Three seconds with nothing arriving means the
+        // address we locked onto has stopped being true -- a new NAT port, a
+        // different access point, a DHCP renewal, a lid closed and reopened. The
+        // old code locked once and could never reconsider, so any of those ended
+        // the call permanently and silently.
+        if wire.lastRecvHost != 0, Clock.msSigned(Clock.now(), wire.lastRecvHost) > 3000 {
+          fputs("room \(room): nothing from \(wire.lockedFrom) for 3 s -- looking again\n", stderr)
+          wire.unlockForRediscovery()
+          announcedFor = ""
+        }
+        Thread.sleep(forTimeInterval: 0.5)
         continue
       }
+      // Unlocked: refresh the directory as well as probing, because if the peer
+      // moved, its old address is exactly the one we would otherwise keep trying.
+      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
+      if let p = peers.first {
+        wire.addCandidate(ip: p.ip, port: p.port)
+        if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+      }
       wire.probeAllCandidates()
-      Thread.sleep(forTimeInterval: 0.2)
+      Thread.sleep(forTimeInterval: 0.5)
     }
   }.start()
 
@@ -767,6 +785,7 @@ func reportLoop() {
       + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals)"
       + " recovered \(r.recovered)\(audio.redundancy ? " FEC-on" : ""))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + (r.restarts > 0 ? " peer-restarts \(r.restarts)" : "")
+      + (wire.relocks > 0 ? " re-found-peer \(wire.relocks)" : "")
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
       + "  jit \(audio.jitTarget) snap \(r.snaps)"

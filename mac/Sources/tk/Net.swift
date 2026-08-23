@@ -450,6 +450,29 @@ final class Wire {
   /// A packet arrived and parsed. Whatever address it came from is reachable, so
   /// that is the peer from now on. Only the FIRST one wins: after that, changing
   /// the peer on arriving traffic would let a stray packet steal the call.
+  /// Host time of the last packet we accepted from the peer. This, not
+  /// `locked`, is what "connected" means -- a remembered address is a claim about
+  /// the past, and the only evidence a path still works is traffic on it.
+  private(set) var lastRecvHost: UInt64 = 0
+  private(set) var relocks = 0
+
+  /// Nothing has arrived for a while, so the address we locked onto is no longer
+  /// true. Reasons this happens on a real daily call and not just in a test: the
+  /// peer's router hands out a new port, someone changes room and joins another
+  /// access point, DHCP renews, a laptop sleeps and wakes. In every one of them the
+  /// remembered address is now wrong and the call is silent forever, because
+  /// `adopt` only ever fires once.
+  ///
+  /// So it can fire again. Unlock, forget the candidates, and let the rendezvous
+  /// and the probes find the peer the same way they did at the start.
+  func unlockForRediscovery() {
+    guard locked else { return }
+    locked = false
+    lockedFrom = ""
+    candidates.removeAll()
+    relocks += 1
+  }
+
   private func adopt(_ from: sockaddr_in) {
     guard !locked else { return }
     peer = from
@@ -559,8 +582,9 @@ final class Wire {
       // A recognised magic from a reachable address is enough to point media
       // there. Once encryption is up this is genuine authentication: the packet
       // decrypted, so it came from someone holding the key.
-      if !locked, magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
-        adopt(src)
+      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
+        lastRecvHost = Clock.now()
+        if !locked { adopt(src) }
       }
       if magic == VMAGIC {
         guard let v = video, plainN >= VHDR else { continue }

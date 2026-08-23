@@ -1,1 +1,1 @@
-{"version":"0.9.5","url":"https://room.tokkah.com/macos/dl/tk-0.9.5.tar.gz","sha256":"9c8487972242ef523b33bfd4ac96a7cd3eb1537ecb49c2f306e53c4cd564b6bb","size":147410,"notes":"important: a call now survives the other side restarting (it used to die for good)"}
+{"version":"0.9.6","url":"https://room.tokkah.com/macos/dl/tk-0.9.6.tar.gz","sha256":"fbc462db295c47222b45e17f696e9f88aa13c58541f4e0321d04190e8f050569","size":150006,"notes":"latency now reports where every millisecond goes; --acoustic can check the device numbers against a real click"}
