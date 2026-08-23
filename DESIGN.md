@@ -10893,3 +10893,148 @@ one per 0.4 s and only 56 fired in 80 s, so they account for roughly 7% of it; t
 rest is unexplained. The controller's response is still correct — it retreats —
 but "loss makes us send more" is the shape of congestion collapse and deserves its
 own investigation. Recorded here rather than left as a number nobody looked at.
+
+## 17.106 The controller that never controlled anything
+
+17.105 ended with an anomaly it declined to explain: under 3% loss the send rate
+inflated to 1.4–2.4 Mbps "even at quality 0.3". Chasing that number found three
+separate defects, and the last one means the picture controller shipped in 17.105
+had never altered a single byte on the wire.
+
+### An aggregate counter cannot attribute
+
+`upMbps` was `wire.sentBytes`, which sums audio, video, clock probes and keyframe
+requests. So "the send rate inflated" was a true statement about a number that
+could not say *which* stream inflated, and 17.105 guessed at the video encoder.
+Bytes are now counted per stream at the point the program decides to emit them —
+audio, video, probes, keyreqs, and separately the audio bytes that are a **repair
+copy** of an earlier packet. First thing the split said:
+
+```
+bytes out: audio 1.27 (repair copies 0.39)  video 2.63  probes 0.00  keyreqs 0.00 Mbps
+```
+
+Redundancy — a documented feature of this same program, which turns on when the
+path loses packets — was 31% of the audio stream. Not 100%, because the repair copy
+is compressed too. The rest was video, and much larger than 17.105 assumed.
+
+### The controller was reading the other end of the path
+
+`VQuality` was fed `vasm.missing` (video **we** failed to assemble),
+`ring.concealed` (audio **we** had to fill in) and our own jitter buffer growing.
+All three describe the path *into* this machine. The only thing the controller can
+change is what *leaves* it.
+
+A one-directional impairment made it unmissable. 3% loss on A's send only:
+
+| end | outbound path | 17.105 behaviour | after |
+|---|---|---|---|
+| A — the one actually dropping packets | lossy | **held q0.7** | retreats to q0.3 |
+| B — clean | clean | **collapsed to q0.3, 87 of 98 s** | holds q0.7 |
+
+Not wrong at one end — **inverted at both**. B destroyed its own picture for a
+problem in the opposite direction, and in that same run video was not even
+running, so a controller whose entire job is video volume retreated three levels on
+evidence that had nothing to do with video at all.
+
+It now steers on `peerRxLost + peerRxRecovered` — what the far end reports about the
+path *from here*. Lost **plus** recovered, not lost alone: our own FEC repaired 4209
+of 4443 outbound losses, so watching only what survived reports a 3% path as
+healthy. A packet that had to be repaired still did not arrive the first time.
+
+A symmetric rig can never show this, which is why it survived 17.105's
+measurements. Third instance of *directional property, wrong end* in this program —
+and the **second consumer of this exact signal**: the redundancy controller had the
+identical bug, read local receive counters, turned on redundancy in the transmit
+path, and was fixed by switching to the peer's report. The report was already on the
+wire. This is the same fix, in the file that did not get it.
+
+### And then the knob turned out not to be connected
+
+With the direction fixed, A retreated 0.7 → 0.6 → 0.5 → 0.3 as designed, and sent
+**2.55 Mbps** of video. A clean link at q0.3 sends 0.08. So something was still
+wrong, and an average byte-per-frame could not say what — a keyframe storm and a
+dead quality knob look identical through it. Splitting the encoder's output by
+frame type answered it in one run:
+
+| end | quality | keyframes | keyframe avg | P-frames | **P avg** |
+|---|---|---|---|---|---|
+| A | q0.3, the **floor** | 180 | 53,637 B | 2490 | **7,650 B** |
+| B | q0.7, the **ceiling** | 1 | 53,034 B | 2669 | **7,301 B** |
+
+The end at the floor had **larger** P-frames than the end at the ceiling. Set at
+session *init* the same two values give 226 B and 6,673 B — a 23× spread.
+
+**`kVTCompressionPropertyKey_Quality` is an init-time property that accepts a live
+change, reports the new value back, and does not make it.** Every retreat 17.105
+printed was fiction, confirmed by a readback that 17.105 had added *specifically to
+catch properties that lie*.
+
+`AverageBitRate` is the documented dynamic alternative, so it got the same
+treatment rather than the benefit of the doubt. `--vq-step` drops the ceiling
+mid-call on an otherwise untouched link:
+
+```
+vq-step: bitrate ceiling -> 400000 bps (accepted true, reads back 400000)
+A: 1.79 1.66 1.44 | 1.77 1.85 1.57 2.00 2.08 2.01 Mbps     <- stepped at |
+B: 1.79 1.66 1.44 | 1.73 1.90 1.57 2.00 2.01 2.15 Mbps     <- control, untouched
+```
+
+Accepted, read back, output went **up**, and the control end moved identically. Also
+a no-op. Three properties in one day.
+
+### So the session is rebuilt
+
+Video.swift used to argue against that — "a rebuild would cost a keyframe, and the
+moment a link is struggling is the worst time for one." Right about the cost, wrong
+about the alternative: the alternative was a controller that did nothing. And a
+struggling link was being sent 180 keyframes in 90 seconds anyway.
+
+The config is kept, `pendingQuality` is consumed on the encoder's own thread, and
+the session is torn down and rebuilt. Proved on a clean link, with a control:
+
+```
+A: 1.79 1.66 1.44 | 0.17 0.08 0.05 0.10 0.10 0.11 Mbps     <- stepped to q0.3 at |
+B: 1.79 1.66 1.44 | 1.73 1.90 1.57 2.00 2.01 2.08 Mbps     <- control, untouched
+```
+
+**19× less video, and the control went the other way** over the same seconds.
+
+### Measured, 3% loss on one direction, 110 s
+
+| | 17.105 | now |
+|---|---|---|
+| sender's video | 2.55 Mbps | **0.17 Mbps** (15×) |
+| sender's keyframes | 180 × 53,637 B | 102 × 19,862 B |
+| sender's P-frames | 7,650 B | **922 B** (8.3×) |
+| receiver's lost video frames | 544 | **173** (3.1×) |
+| receiver's keyframe requests | 158 | 91 |
+| sender m2e p50 | 9.97 | 9.88 |
+
+A lossy path now gets 15× less video pushed down it, and the keyframe storm partly
+extinguishes itself: a 19.9 KB keyframe is ~14 fragments instead of ~37, so it
+survives a 3% path 65% of the time instead of 32%. Clean link: **0 rebuilds**, q0.7
+held for 108 s, one keyframe, no concealment.
+
+### Two rig defects that each cost a run
+
+**`--video` given a path with a space** expanded unquoted, so the source was
+`/Users/.../Downloads/video` and three consecutive "video" arms ran with `enc 0/s`.
+An unreadable video source that has produced *no* frames is now fatal — same
+reasoning as the flag guard, one level down, where the guard cannot see it because
+the value looks like a path. A source that dies after ten thousand good frames
+still only warns; that is a disk, not a typo.
+
+**`--video --imp-drop 3`** made `--video`'s value `"--imp-drop"`. `arg()` now
+refuses a value that begins with `--`. Fourth instance of *silent no-op flag*, and
+the first where the flag itself was spelled correctly.
+
+### Still open
+
+102 keyframes in 110 s is still ~1/s, and the receiver still loses 173 frames. The
+keyframe repair loop converges now instead of diverging, but it has not been
+designed — only improved by accident, because the frames got smaller. And at 1.6
+Mbps video the jitter buffer holds 4 packets where it holds 3 with video off,
+costing 0.6 ms, while arrival cadence is *identical* (p99 0.81 vs 0.78 ms) and slack
+is *better* (2.84 vs 2.11 ms). The buffer is declining to descend for a reason that
+is not lateness. Named, not hidden.

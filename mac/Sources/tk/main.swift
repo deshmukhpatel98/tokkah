@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.23.0"
+let VERSION = "0.24.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -24,6 +24,19 @@ if CommandLine.arguments.contains("--version") { print(VERSION); exit(0) }
 func arg(_ name: String) -> String? {
   let a = CommandLine.arguments
   guard let i = a.firstIndex(of: "--" + name), i + 1 < a.count else { return nil }
+  // A VALUE THAT IS ITSELF A FLAG MEANS THE VALUE WAS FORGOTTEN.
+  //
+  // `--video --imp-drop 3` reads as video="--imp-drop", which is not "on", so the
+  // arm runs with video OFF while being named the video arm. That exact command
+  // was just typed, and the run it produced was measuring nothing. The guard
+  // below refuses unknown flags; this is the same failure wearing a known one.
+  // Fourth instance of this class -- so it dies here rather than being remembered.
+  if a[i + 1].hasPrefix("--") {
+    fputs("--\(name) needs a value, and got the next flag instead: \(a[i + 1])\n"
+        + "an arm running without the thing it is named after is worse than no arm at all.\n",
+          stderr)
+    exit(2)
+  }
   return a[i + 1]
 }
 func flag(_ name: String) -> Bool { CommandLine.arguments.contains("--" + name) }
@@ -44,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -528,6 +541,21 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 // AIM AT VISUALLY LOSSLESS AND RETREAT WHEN THE LINK SAYS NO. `--vquality <n>`
 // caps it; `--vquality 0` reproduces the old always-unset behaviour.
 let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) })
+// ── Prove a live encoder property, or do not believe it ─────────────────────
+//
+// `--vq-step 30:400000` drops the bitrate ceiling to 400 kbps at t=30 s on an
+// otherwise untouched call. A step on a CLEAN link is the only way to separate
+// "the property works" from "loss changed the picture": under impairment the
+// keyframe storm moves the bytes by more than the knob does, which is exactly
+// how a no-op property survived being watched for a whole release.
+let vqStep: (at: Double, q: Double)? = arg("vq-step").flatMap { spec in
+  let parts = spec.split(separator: ":")
+  guard parts.count == 2, let t = Double(parts[0]), let q = Double(parts[1]) else {
+    fputs("--vq-step wants seconds:quality, e.g. 40:0.3\n", stderr); exit(2)
+  }
+  return (t, q)
+}
+var vqStepDone = false
 let videoArg = arg("video") ?? "off"
 var vsource: FrameSource?
 var venc: VEncoder?
@@ -791,6 +819,7 @@ do { try audio.start() } catch {
 // arithmetic is worth more than a smooth one.
 var last = (sent: 0, recv: 0, played: 0, concealed: 0, dup: 0, tooOld: 0, jumps: 0, cap: 0)
 var lastBytes = (up: 0, down: 0)
+var lastGen = (a: 0, v: 0, p: 0, c: 0, fec: 0)
 var lastV = (dec: 0, sent: 0, bytes: 0)
 var lastVBytesPrev = 0
 let expected = SR / Double(FPP)   // 375 packets/s at 128 frames
@@ -1197,6 +1226,8 @@ nonisolated(unsafe) var shuttingDown = false
 nonisolated(unsafe) var videoBeat: [String: Any] = [:]
 /// Previous-tick values for the picture-quality controller.
 nonisolated(unsafe) var lastVqLost = 0, lastVqConc = 0, lastVqJit = 0
+nonisolated(unsafe) var lastVqPeerLost = 0, lastVqPeerRec = 0
+nonisolated(unsafe) var vqWarnedLocal = false
 
 /// One beat's worth of fields. Raw numbers only -- no verdicts, no thresholds.
 /// The dashboard decides what "good" means, so changing that opinion does not
@@ -1301,6 +1332,32 @@ func reportLoop() {
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
+
+  // ── WHERE THE BANDWIDTH WENT ────────────────────────────────────────────────
+  //
+  // Because one number could not answer it. DESIGN 17.105 recorded an
+  // "unexplained" send-rate inflation under loss and guessed at the video
+  // encoder; the bytes were audio redundancy, which this program turns on
+  // deliberately when the path loses packets. The aggregate was not wrong, it was
+  // unattributable, and an unattributable number sends you looking in the wrong
+  // file. Printed every second so the next surprise arrives pre-attributed.
+  // Named `gen`, not `g`: the video block below has its own `g` and a silently
+  // shadowed name has already cost this session an hour.
+  let gen = (wire.genAudio, wire.genVideo, wire.genProbe, wire.genCtl, wire.genFec)
+  let dg = (a: gen.0 - lastGen.a, v: gen.1 - lastGen.v, p: gen.2 - lastGen.p,
+            c: gen.3 - lastGen.c, fec: gen.4 - lastGen.fec)
+  lastGen = (gen.0, gen.1, gen.2, gen.3, gen.4)
+  let mb = { (x: Int) in String(format: "%.2f", Double(x) * 8.0 / 1_000_000.0) }
+  fputs("  bytes out: audio \(mb(dg.a)) (repair copies \(mb(dg.fec)))"
+      + "  video \(mb(dg.v))  probes \(mb(dg.p))  keyreqs \(mb(dg.c)) Mbps\n", stderr)
+  // FEC is a 100% surcharge on audio, and it buys repair of ISOLATED loss. Said
+  // out loud when it is on, because doubling what you send down a path that is
+  // already dropping packets is the textbook first step of congestion collapse,
+  // and this program should never do that without the number being visible.
+  if dg.fec > 0, dg.a > 0 {
+    let share = Double(dg.fec) / Double(dg.a) * 100.0
+    fputs("  repair overhead: \(String(format: "%.0f", share))% of the audio stream\n", stderr)
+  }
 
   // ── The same numbers, somewhere they survive ────────────────────────────────
   //
@@ -1481,6 +1538,12 @@ func reportLoop() {
         // falls back to doing it there when full, is a queue that looks like it is
         // working while the defect continues.
         + "  picture \(vq.describe)"
+        // Which kind of frame the bytes went into, averaged over the call. A
+        // keyframe is meant to be rare and large; if it is neither rare nor the
+        // large one, the thing to look at is not the encoder.
+        + (venc.map { v in
+            "  keyframes \(v.keyFrames) avg \(v.keyFrames > 0 ? v.keyBytes / v.keyFrames : 0) B"
+            + " | P \(v.pFrames) avg \(v.pFrames > 0 ? v.pBytes / v.pFrames : 0) B" } ?? "")
         + "  decodeq \(dq.queued) queued, depth<=\(dq.maxDepth)"
         + (dq.inlineFull + dq.inlineTooBig > 0
            ? "  INLINE \(dq.inlineFull) full + \(dq.inlineTooBig) oversize" : "")
@@ -1516,20 +1579,69 @@ func reportLoop() {
         + "\n", stderr)
   }
 
-  // Steer the picture. One tick per second, on the harm that happened during it.
+  // The step injector, if armed. Deliberately BEFORE the controller so a manual
+  // step and an automatic one cannot both move the knob in the same second and
+  // leave the result unattributable.
+  if let st = vqStep, !vqStepDone, Double(beatTick) >= st.at, let e = venc {
+    vqStepDone = true
+    e.pendingQuality = st.q
+    fputs("  vq-step: quality -> \(st.q) by session rebuild"
+        + " -- WATCH THE B/FRAME, not any readback\n", stderr)
+  }
+
+  // ── Steer the picture on evidence about the path THESE BYTES TRAVEL ─────────
+  //
+  // This read the WRONG END, and a one-directional impairment proved it. With 3%
+  // loss injected on A's send only, B's inbound was damaged and B's outbound was
+  // perfectly clean -- and B drove its OWN outbound video to the floor and held
+  // it there for 87 of 98 seconds. Less video from B could not have helped: the
+  // congested direction was the other one. In the same run video was not even
+  // running, so a controller whose entire job is video volume retreated three
+  // levels on evidence that had nothing to do with video at all.
+  //
+  // `vasm.missing` is video WE failed to assemble and `ring.concealed` is audio WE
+  // had to fill in. Both are inbound. `jitTarget` growing is our own receive
+  // buffer. All three describe the path INTO this machine, and the only thing
+  // this controller can change is what leaves it.
+  //
+  // A symmetric rig can never show this -- loss both ways makes the wrong end
+  // look like the right one, which is why it survived 17.105's measurements.
+  // Third instance of "directional property, wrong end" in this program, and the
+  // second consumer of THIS signal: the redundancy controller had the identical
+  // bug (it read local receive counters and turned on redundancy in the transmit
+  // path) and was fixed by switching to the peer's report. The report was already
+  // on the wire. This is the same fix, in the file that did not get it.
   if let e = venc {
-    let lostNow = vasm.missing, concNow = r.concealed
-    let jitGrew = audio.jitTarget > lastVqJit
+    // What the far end says about the path FROM HERE. lost + recovered, not lost
+    // alone: our own FEC repaired 4209 of 4443 outbound losses in the run above,
+    // so watching only what survived would report a 3% path as healthy. A packet
+    // that had to be repaired still did not arrive the first time.
+    let pLost = wire.peerRxLost, pRec = wire.peerRxRecovered
+    var outboundHarm = (pLost - lastVqPeerLost) + (pRec - lastVqPeerRec)
+    lastVqPeerLost = pLost; lastVqPeerRec = pRec
+    // An older peer does not report, and falling back silently to the local
+    // numbers would restore the exact bug this comment describes. So it falls
+    // back and SAYS SO, once.
+    if !wire.peerReportsLoss {
+      outboundHarm = (r.concealed - lastVqConc) + (vasm.missing - lastVqLost)
+      if !vqWarnedLocal, beatTick > 10 {
+        vqWarnedLocal = true
+        fputs("picture: the far end does not report its receive loss (older build), "
+            + "so quality is steered from LOCAL inbound harm -- which is the wrong "
+            + "direction and can lower the picture for a problem it cannot fix\n", stderr)
+      }
+    }
     let changed = vq.tick(now: Double(beatTick),
-                          framesLost: lostNow - lastVqLost,
-                          concealed: concNow - lastVqConc,
-                          jitGrew: jitGrew)
-    lastVqLost = lostNow; lastVqConc = concNow; lastVqJit = audio.jitTarget
+                          framesLost: outboundHarm,
+                          concealed: 0,
+                          jitGrew: false)
+    lastVqLost = vasm.missing; lastVqConc = r.concealed; lastVqJit = audio.jitTarget
     if let newQ = changed {
-      let ok = e.setQuality(newQ)
-      fputs("  picture: \(vq.describe)"
-          + "  encoder now \(e.qualityNow.map { String(format: "%.2f", $0) } ?? "nil")"
-          + (ok ? "" : "  -- THE ENCODER DID NOT TAKE IT") + "\n", stderr)
+      // Hand it to the encoder thread, which rebuilds the session. NOT setQuality:
+      // that is accepted, reads back, and changes nothing on a live session.
+      e.pendingQuality = newQ
+      fputs("  picture: \(vq.describe) -- rebuilding encoder at \(newQ)"
+          + " (rebuilds so far \(e.rebuilds))\n", stderr)
     }
   }
 

@@ -478,7 +478,9 @@ final class Wire {
     var total = HDR + put(src, HDR)
     if let r = redundant {
       (scratch + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
+      let before = total
       total += 8 + put(r, total + 8)
+      genFec += total - before
       redundantSent += 1
     }
     // Through rawSend, not sendto. This path used to call sendto directly, which
@@ -487,13 +489,44 @@ final class Wire {
     // A 20% loss arm dropped 13 packets out of twelve thousand and the receiver
     // reported zero concealment, so the rig said the app shrugs off heavy loss
     // while actually testing nothing. One send path, one gate.
-    rawSend(scratch, total)
+    rawSend(scratch, total, .audio)
   }
+
+  // ── Which stream those bytes belonged to ──────────────────────────────────
+  //
+  // `sentBytes` sums audio, video, clock probes and keyframe requests into one
+  // number, and DESIGN 17.105 then named an "unexplained" inflation to 1.4-2.4
+  // Mbps under 3% loss as a possible video problem. It was not video. Audio
+  // redundancy turns on under loss and sends a full copy of the previous packet,
+  // which doubles the audio stream -- a documented feature of this same program,
+  // read through an instrument that cannot tell three streams apart. Attribute
+  // before acting; an aggregate counter cannot attribute.
+  //
+  // Counted HERE, at the point the program decides to emit, rather than in
+  // wireSend: the rig's drop and delay stages sit in between, and the question
+  // this answers is "what did the app choose to send", which is the question a
+  // bandwidth number is always really asking. `sentBytes` still measures what
+  // reached the socket, so the difference is exactly the impairment.
+  enum TxCls { case audio, video, probe, ctl }
+  private(set) var genAudio = 0, genVideo = 0, genProbe = 0, genCtl = 0
+  /// Of `genAudio`, the bytes that were a second copy of an earlier packet. This
+  /// is the price of loss repair, and it should be readable on its own.
+  private(set) var genFec = 0
 
   /// One datagram, already framed by the caller. Shared by the audio and video
   /// paths so there is exactly one socket, one port and one NAT binding per peer
   /// -- two ports would mean two hole-punches and two things to go wrong.
-  func rawSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
+  ///
+  /// `cls` has no default on purpose: a new send path that forgets to say what it
+  /// is would otherwise be silently filed as audio, which is the exact failure
+  /// this parameter exists to have prevented.
+  func rawSend(_ p: UnsafePointer<UInt8>, _ n: Int, _ cls: TxCls) {
+    switch cls {
+    case .audio: genAudio += n + 28
+    case .video: genVideo += n + 28
+    case .probe: genProbe += n + 28
+    case .ctl:   genCtl += n + 28
+    }
     // The impairment sits here rather than at the two call sites so that nothing
     // can slip past it -- audio, video fragments and clock probes all get the
     // same treatment a real path would give them. Impairing the clock probes is
@@ -710,7 +743,7 @@ final class Wire {
     scratch.withMemoryRebound(to: UInt32.self, capacity: 2) {
       $0[0] = KMAGIC.littleEndian; $0[1] = 0
     }
-    rawSend(scratch, 8)
+    rawSend(scratch, 8, .ctl)
   }
 
   /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
@@ -723,7 +756,7 @@ final class Wire {
       p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
       appendRxReport(p)
     }
-    out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
+    out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .probe) }
   }
 
   /// Ask the scheduler to treat this thread the way it treats CoreAudio's own IO
@@ -920,7 +953,7 @@ final class Wire {
             p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 24, as: UInt64.self)  // t3
             appendRxReport(p)
           }
-          out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
+          out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .probe) }
         } else {
           let t2 = (plain + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           let t3 = (plain + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }

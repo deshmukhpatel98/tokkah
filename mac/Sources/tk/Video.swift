@@ -44,6 +44,10 @@ final class FileSource: FrameSource {
   private let fps: Double
   var describe: String { "file \(url.lastPathComponent) @\(Int(fps))fps" }
 
+  /// Frames actually handed on. Distinguishes "the path was wrong" from "the file
+  /// went away mid-call", which deserve opposite responses.
+  private var framesOut = 0
+
   init(path: String, fps: Double = 30) { url = URL(fileURLWithPath: path); self.fps = fps }
 
   func start() throws {
@@ -58,7 +62,31 @@ final class FileSource: FrameSource {
         let asset = AVURLAsset(url: self.url)
         guard let reader = try? AVAssetReader(asset: asset),
               let track = asset.tracks(withMediaType: .video).first
-        else { fputs("video: cannot read \(self.url.path)\n", stderr); return }
+        else {
+          // AN ARM NAMED "VIDEO" MUST NOT RUN WITHOUT VIDEO.
+          //
+          // This warned and returned, and three consecutive measurement runs went
+          // by with `enc 0/s` while being labelled the video arm -- the media path
+          // contains a space, the harness expanded it unquoted, and `--video
+          // /Users/.../Downloads/video calling/x.mp4` arrived as a path ending at
+          // "video". Same failure as a misspelled flag, one level down, and the
+          // flag guard cannot see it because the value looks like a path.
+          //
+          // Fatal only if NOTHING was ever produced, which is the "you typed it
+          // wrong" case. A file that stops being readable after ten thousand good
+          // frames is a disk or a removable volume, and killing a live call over
+          // that would be worse than dropping to audio.
+          if self.framesOut == 0 {
+            fputs("video: cannot read \(self.url.path)\n"
+                + "  the video source was requested and does not exist, so this run would\n"
+                + "  measure a call with no video while claiming to have one. Refusing.\n"
+                + "  (a path with spaces needs quoting)\n", stderr)
+            exit(2)
+          }
+          fputs("video: source became unreadable after \(self.framesOut) frames "
+              + "-- continuing without video\n", stderr)
+          return
+        }
         let out = AVAssetReaderTrackOutput(track: track, outputSettings: [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
         ])
@@ -72,6 +100,7 @@ final class FileSource: FrameSource {
           next += interval
           let wait = next - Date().timeIntervalSinceReferenceDate
           if wait > 0 { usleep(UInt32(wait * 1_000_000)) } else { next = Date().timeIntervalSinceReferenceDate }
+          self.framesOut += 1
           self.onFrame?(pb, Clock.now())
         }
       }
@@ -161,6 +190,36 @@ final class VEncoder {
     qualityAsked = q
     return st == noErr && now != nil && abs(now! - q) < 0.01
   }
+  // ── The knob that actually moves on a live session ──────────────────────────
+  //
+  // `setQuality` above is a NO-OP after the session is running. Proved, not
+  // suspected: with 3% loss on its send, one end retreated 0.7 -> 0.6 -> 0.5 ->
+  // 0.3, the readback agreed at every step, and its P-frames came out at 7,650 B
+  // against the peer's 7,301 B at quality 0.7 -- LARGER at the floor than at the
+  // ceiling. Set at session INIT the same two values give 226 B and 6,673 B, a
+  // 23x spread. So Quality is an init-time property that accepts and reports
+  // live changes it does not make, and the entire retreat controller has never
+  // altered a single byte on the wire.
+  //
+  // That is the third time this file has been lied to by a readback in one day
+  // (DataRateLimits, encLatUs, and now Quality), so this one is NOT verified by
+  // reading the property back. `--vq-step` exists to verify it the only way that
+  // counts: change it mid-call and look at the bytes that come out.
+  @discardableResult func setBitrate(_ bps: Int) -> Bool {
+    guard let sess = session else { return false }
+    let st = VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate,
+                                  value: NSNumber(value: bps))
+    bitrateAsked = bps
+    var back: CFTypeRef?
+    VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate,
+                          allocator: nil, valueOut: &back)
+    bitrateNow = (back as? NSNumber)?.intValue
+    // Reported, but deliberately NOT the return value's only basis -- see above.
+    return st == noErr
+  }
+  var bitrateNow: Int?
+  var bitrateAsked: Int?
+
   /// What the session is actually set to, for the report line. Not what was asked
   /// for -- those have differed before.
   var qualityNow: Double?
@@ -168,9 +227,39 @@ final class VEncoder {
   var qualityAsked: Double?
   private var wantKey = false
 
+  // ── Rebuilding is the only way to change how this encoder encodes ───────────
+  //
+  // Quality and AverageBitRate both accept a live change, both read the new value
+  // back, and neither alters a byte. Measured on a clean link with `--vq-step`:
+  // the ceiling was dropped from 3 Mbps to 400 kbps at t=40 s, accepted, read back
+  // as 400000, and the output went from 1.7 Mbps to 2.0 -- while the untouched
+  // control end moved identically, so the change was the content and not the knob.
+  //
+  // So the config is kept and the session is REBUILT. Video.swift used to argue
+  // against that ("a rebuild would cost a keyframe, and the moment a link is
+  // struggling is the worst time for one"), and that argument was right about the
+  // cost and wrong about the alternative: the alternative was a controller that
+  // did nothing at all. One keyframe to actually shed 20x the bandwidth is a good
+  // trade, and a struggling link is currently being sent 180 keyframes in 90
+  // seconds anyway.
+  private let cfgW: Int, cfgH: Int, cfgBitrate: Int
+  private var cfgQuality: Double?
+  /// Set by the controller on any thread; consumed on the capture thread inside
+  /// `encode`. A pending flag rather than a lock, matching `wantKey`: rebuilding
+  /// under the encoder's own thread means no other thread can be inside it.
+  nonisolated(unsafe) var pendingQuality: Double?
+  private(set) var rebuilds = 0
+
   init(width: Int, height: Int, bitrate: Int, quality: Double? = nil) throws {
+    cfgW = width; cfgH = height; cfgBitrate = bitrate; cfgQuality = quality
+    try buildSession()
+  }
+
+  /// Everything that configures the encoder, in one place so a rebuild is
+  /// provably the same encoder and not a second slightly different one.
+  private func buildSession() throws {
     var s: VTCompressionSession?
-    let st = VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
+    let st = VTCompressionSessionCreate(allocator: nil, width: Int32(cfgW), height: Int32(cfgH),
       codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
       compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
     guard st == noErr, let sess = s else { throw Err.e("VTCompressionSessionCreate \(st)") }
@@ -187,7 +276,7 @@ final class VEncoder {
     set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime")
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "AllowFrameReordering")   // no B-frames
     set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel, "ProfileLevel")
-    set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate), "AverageBitRate")
+    set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: cfgBitrate), "AverageBitRate")
     set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 100_000), "MaxKeyFrameInterval")
     set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 100_000), "MaxKeyFrameIntervalDuration")
     set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30), "ExpectedFrameRate")
@@ -197,7 +286,7 @@ final class VEncoder {
     // stopped at 42.8 dB PSNR -- which is neither the requested rate nor a
     // transparent picture, so the bitrate was not the binding constraint. Quality
     // is a separate knob and was never set.
-    if let q = quality {
+    if let q = cfgQuality {
       set(kVTCompressionPropertyKey_Quality, NSNumber(value: q), "Quality")
       qualityNow = q
       // NO DataRateLimits HERE, and that is a measured decision, not an omission.
@@ -235,8 +324,32 @@ final class VEncoder {
     fputs("encoder: DataRateLimits readback \(drl.map { String(describing: $0 as NSArray) } ?? "nil")"
         + "  Quality readback \(q.map { "\($0 as NSNumber)" } ?? "nil")\n", stderr)
     let gotBps = (got as? NSNumber)?.intValue ?? -1
-    fputs("encoder: H.264 \(width)x\(height) bitrate asked \(bitrate) got \(gotBps), B-frames off\n", stderr)
+    fputs("encoder: H.264 \(cfgW)x\(cfgH) bitrate asked \(cfgBitrate) got \(gotBps), B-frames off\n", stderr)
     VTCompressionSessionPrepareToEncodeFrames(sess)
+  }
+
+  /// Tear the session down and build an identical one at a new quality. Called on
+  /// the capture thread only. Silent about its own success on purpose -- the caller
+  /// reports the bytes per frame afterwards, which is the only evidence that has
+  /// not lied today.
+  private func rebuild(quality q: Double) {
+    guard let old = session else { return }
+    // Flush first: frames already handed over still deliver through the callback,
+    // and invalidating underneath them loses the tail of the picture.
+    VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
+    VTCompressionSessionInvalidate(old)
+    session = nil
+    cfgQuality = q
+    do {
+      try buildSession()
+      rebuilds += 1
+      // A fresh session has no reference frames and the decoder on the far side
+      // has the old parameter sets, so the next frame MUST be an IDR carrying new
+      // ones. A fresh session emits one anyway; asking makes it not depend on that.
+      wantKey = true
+    } catch {
+      fputs("video: encoder rebuild FAILED (\(error)) -- the picture stops here\n", stderr)
+    }
   }
 
   func requestKeyframe() { wantKey = true }
@@ -252,6 +365,9 @@ final class VEncoder {
   /// almost nothing, so without this a frozen source and an efficient encoder
   /// produce identical numbers.
   var lastDiff = -1
+  /// Encoder output split by frame type, so "the picture got expensive" can name
+  /// which kind of frame got expensive.
+  nonisolated(unsafe) var keyFrames = 0, pFrames = 0, keyBytes = 0, pBytes = 0
   private var prevSample: [UInt8] = []
   private var lumaTick = 0
 
@@ -284,6 +400,12 @@ final class VEncoder {
   }
 
   func encode(_ pb: CVPixelBuffer, hostTime: UInt64) {
+    // Consumed here, on the encoder's own thread, so a rebuild can never happen
+    // while a frame is inside VTCompressionSessionEncodeFrame.
+    if let q = pendingQuality {
+      pendingQuality = nil
+      if q != cfgQuality { rebuild(quality: q) }
+    }
     guard let sess = session else { return }
     probeLuma(pb)
     let t0 = Clock.now()
@@ -302,6 +424,16 @@ final class VEncoder {
       self.encodes += 1
       guard let payload = Self.serialize(sb) else { return }
       let key = Self.isKeyframe(sb)
+      // SPLIT THE BYTES BY FRAME TYPE.
+      //
+      // "10,000 B/frame at quality 0.3, where a clean link at the same setting
+      // sends 226" has two completely different explanations -- giant keyframes
+      // being requested by a lossy peer, or a Quality property that reads back
+      // correctly on a live session and does nothing. An average over both frame
+      // types cannot tell them apart, and guessing which one it is has already
+      // sent this investigation to the wrong file once today.
+      if key { self.keyFrames += 1; self.keyBytes += payload.count }
+      else { self.pFrames += 1; self.pBytes += payload.count }
       self.onEncoded?(payload, hostTime, key)
     }
   }

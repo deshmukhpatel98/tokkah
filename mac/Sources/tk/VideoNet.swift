@@ -219,7 +219,7 @@ extension Wire {
         (scratch + 20).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
         (scratch + 22).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
         memcpy(scratch + VHDR, src + off, len)
-        rawSend(scratch, VHDR + len)
+        rawSend(scratch, VHDR + len, .video)
       }
     }
   }
