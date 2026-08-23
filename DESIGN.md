@@ -11901,3 +11901,22 @@ room.tokkah.com the way two machines do:
 
 Both windows photographed: each end shows the other person full-bleed with its own camera
 in the corner. Then `peek` on one of them, photographed again — the pictures had swapped.
+
+### A self-updater gains new abilities exactly one release late
+
+First test of the bundle-carrying update, on a copy of the real installed app:
+
+    before: binary 0.33.0   Info.plist 0.28.0   icon 3808ec01…
+    after:  binary 0.34.0   Info.plist 0.28.0   icon 3808ec01…
+
+The binary moved and the bundle did not. Nothing was wrong with the new code — it simply
+was not the code that ran. **The half of an update that installs things is the OLD half.**
+0.33.0 fetched 0.34.0's archive, and 0.33.0's `apply()` looks for one file called `tk` and
+has never heard of `bundle/`. The ability to install an icon arrives with 0.34.0 and can
+only be used by whatever 0.34.0 is asked to install next.
+
+This is a permanent property of self-updating software and worth stating once: an updater
+change takes **two** releases to have an effect — one to distribute the new updater, one
+for it to act on. Everything about the payload is backward compatible (an old updater
+ignores the extra directory, a new one applies it when present), so the only cost is the
+lag. Verified on the second hop rather than assumed.
