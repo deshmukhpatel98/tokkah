@@ -9736,3 +9736,65 @@ Note what `lastRecvHost` is measured from: packets **accepted**, not packets
 received. A datagram that fails to decrypt or carries the wrong wire format is not
 evidence that the path works, and counting it would keep a dead call looking alive
 — the same distinction as `open-socket-is-not-a-live-peer`, one layer down.
+
+## 17.92 The buffer ratcheted, and the reason was the same mistake a third time
+
+A 568-second run, which is the first one long enough to show it:
+
+    m2e 13.15 -> 14.51 -> 15.84 ms      buf 6 -> 8 -> 10       and still climbing
+
+Monotonic. The 12-minute run in §17.87 came back down and I took that as evidence
+the ratchet was solved; it was luck. The grow log says why:
+
+    jit -> 7  (grew: 5 late arrivals, slack p01 3.36 ms)
+    jit -> 8  (grew: 3 late arrivals, slack p01 3.36 ms)
+    jit -> 9  (grew: 11 late arrivals, slack p01 4.70 ms)
+    jit -> 10 (grew: 3 late arrivals, slack p01 5.35 ms)
+
+Three late packets out of three thousand. And the **margin rises at every step** —
+2.69 → 3.36 → 4.70 → 5.35 ms — while it keeps growing. That is the proof, not an
+argument: four grows did not stop the lateness, so a bigger buffer does not prevent
+it. Those are far-tail scheduling outliers, and chasing a long tail with buffer
+makes every word wait to rescue a handful of packets. It is
+[[queue-tolerance-in-ms]] wearing a different coat.
+
+The arithmetic of the trade, which is not close:
+
+- not growing: 25 concealed packets in 568 s — one 0.67 ms gap every 23 seconds,
+  inaudible.
+- growing: 2.7 ms of latency on every word, for the rest of the call.
+
+So lateness now has to be **sustained** to count — 8 in a 2 s window, 0.27% of
+packets — while a thin margin (`p01 < 1 ms`) still grows instantly, because that is
+the signal that the buffer genuinely is too small. And the backoff caps at 120 s
+instead of 900: at 900 s a single bad minute locked the buffer high for a quarter of
+an hour.
+
+This is the third instance of one mistake in this controller: don't grow on loss
+(§17.79), don't grow on stalls (§17.79), don't grow on lateness a bigger buffer
+demonstrably does not prevent. Each time the fix was the same shape — **attribute
+the symptom to a cause the action can actually address, before acting** — and each
+time I fixed the instance rather than the class.
+
+## 17.93 FPP=16: 9.48 ms, and why it is not the default
+
+    FPP=32   floor 9.79 ms   m2e 11.6–13 ms   2.43 Mbps   1516 pkt/s
+    FPP=16   floor 6.79 ms   m2e  9.48 ms     3.30 Mbps   3031 pkt/s   conceal 0
+
+Sub-ten-millisecond mouth-to-ear, and clean over a minute. But look at what the
+bandwidth is made of: at 16 samples a packet the payload is 64 bytes and the
+headers are **72** — 20 app, 24 crypto, 28 UDP/IP. More than half of a 3.3 Mbps
+uplink is envelope.
+
+Not shipped as the default, for a reason that is about the goal rather than the
+number. The target is 150 ms end to end, and the call is already at roughly 30–50 ms
+including a real network. Two more milliseconds of audio is worth very little
+against that, while **20 ms sits untouched in the display path** (§17.83) and the
+uplink cost is real — 3.3 Mbps up is a meaningful fraction of an ordinary home
+connection, and the failure mode is the call stuttering during the one test that
+matters.
+
+The right version of this is a runtime `--fpp`, so the packet size can follow the
+link instead of being chosen at compile time for everyone. That refactor touches the
+hottest loop in the program for a flag most people would never set, so it waits
+until something needs it. Recorded here so the measurement is not lost.

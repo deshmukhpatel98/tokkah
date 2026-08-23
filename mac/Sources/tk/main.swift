@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.7"
+let VERSION = "0.9.8"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -587,6 +587,24 @@ if audio.jitAuto {
     // this codebase (queue tolerance in ms; a codec win is a change of units).
     let JIT_MAX = max(JIT_MIN + 2, Int((30.0 / pktMs).rounded()))
     let GROW_BELOW_MS = 1.0     // headroom this thin is one jitter spike from a click
+    // A TRICKLE OF LATE PACKETS IS NOT A BUFFER THAT IS TOO SMALL.
+    //
+    // Measured over 568 s: the buffer ratcheted 6 -> 7 -> 8 -> 9 -> 10 and m2e
+    // climbed 13.15 -> 15.84 ms with no recovery, on grows of "3 late arrivals",
+    // "5", "3", "11", "3" -- three packets out of three thousand. And the slack
+    // ROSE at every step (2.69 -> 3.36 -> 4.70 -> 5.35 ms of margin) while it kept
+    // growing, which is the proof: four grows did not stop the lateness, so a
+    // bigger buffer does not prevent it. Those are far-tail scheduling outliers,
+    // and chasing a long tail with buffer makes everyone wait to rescue a few
+    // packets -- the queue-tolerance mistake in another costume.
+    //
+    // Total cost of NOT growing: 25 concealed packets in 568 s, one 0.67 ms gap
+    // every 23 seconds, which is inaudible. Cost of growing: 2.7 ms of latency on
+    // every word, forever. That is not a close call.
+    //
+    // So lateness has to be SUSTAINED to count. Thin margin still grows instantly,
+    // because that is the signal that the buffer really is too small.
+    let GROW_LATE_MIN = 8      // per 2 s window, out of ~3000 packets (0.27%)
     let SHRINK_ABOVE_MS = 2.0   // and this much would survive losing a packet of buffer
     let SHRINK_HOLD = 5         // consecutive 2 s windows -- 10 s of agreement
     let SHRINK_HOLD_FAST = 2    // ...but 4 s while still descending from the safe start
@@ -706,7 +724,7 @@ if audio.jitAuto {
       if snapped > 0 {
         calm = 0
         fputs("jit: \(snapped) snap(s), \(conc) concealed -- stall, not jitter; holding at \(audio.jitTarget)\n", stderr)
-      } else if late > 0 || p01 < GROW_BELOW_MS {
+      } else if late >= GROW_LATE_MIN || p01 < GROW_BELOW_MS {
         if audio.jitTarget < JIT_MAX {
           audio.jitTarget += 1
           audio.jitGrows += 1
@@ -714,7 +732,10 @@ if audio.jitAuto {
           // one is safe either.
           unsafeBelow = max(unsafeBelow, audio.jitTarget)
           probeAt = t + backoff
-          backoff = min(backoff * 2, 900)
+          // Capped low on purpose. At 900 s a single bad minute locked the
+          // buffer high for a quarter of an hour, and a path that recovers
+          // deserves to be re-probed sooner than that.
+          backoff = min(backoff * 2, 120)
           fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, slack p01 \(String(format: "%.2f", p01)) ms)"
               + "  -- below \(unsafeBelow) marked unsafe, next probe in \(Int(backoff / 2)) s\n", stderr)
         }

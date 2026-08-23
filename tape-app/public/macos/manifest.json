@@ -1,1 +1,1 @@
-{"version":"0.9.7","url":"https://room.tokkah.com/macos/dl/tk-0.9.7.tar.gz","sha256":"c1cd57757de3c07e34bc6b0a042b5329dd340a0e6bd71d8c1b661ff3ad00c479","size":151131,"notes":"a call now survives the other side changing network or restarting -- it re-finds them in about 3 seconds"}
+{"version":"0.9.8","url":"https://room.tokkah.com/macos/dl/tk-0.9.8.tar.gz","sha256":"3e8eb9a4950b50d518da59d759281e1657d9c6376cb42b8507832e5d10c3310c","size":151583,"notes":"reports the bandwidth a call actually uses; installer now gives the command that works between two houses"}
