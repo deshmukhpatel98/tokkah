@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.14.0"
+let VERSION = "0.15.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -969,7 +969,9 @@ func reportLoop() {
            ? "  crypt on (\(c.sealed)/\(c.opened) sealed/opened, \(c.openFails) bad"
              + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "") + ")"
            : "  CRYPT PENDING (plaintext \(c.plaintextTx) sent)" } ?? "  crypt off")
-      + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "") + "\n", stderr)
+      + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
+      + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
+      + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.

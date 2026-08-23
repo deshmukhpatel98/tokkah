@@ -10327,3 +10327,89 @@ physical pair of audio devices, so the capture-to-playout clock relationship her
 not the one two separate Macs will have. The mechanism most likely to explain the
 variance — the rate governor tracking a real clock difference — is the mechanism this
 rig can least faithfully reproduce.
+
+## 17.100 The device changed underneath a call, three times, and each fix revealed the next
+
+The startup path already refuses a device that will not do 48 kHz, loudly, because a
+44.1 kHz device makes `AudioUnitRender` return -10863 on every callback and the app goes
+silently deaf. That was a fix from a real incident. **It ran once, at start.**
+
+macOS moves device rates on its own — a headset is plugged in, another app claims the
+device. So: move both devices to 44.1 kHz underneath a running call and see.
+
+```
+cap 0/s   played 18/s   conceal 1501/s   renderErr 0   error lines in the log: 0
+```
+
+Dead for thirty-five seconds, recovered only because the rate was put back by hand, and
+**nothing in the log at all**. To a user that reads exactly like a muted microphone.
+
+### Fix one: watch the rate
+
+`AudioObjectAddPropertyListenerBlock` on `kAudioDevicePropertyNominalSampleRate` for both
+devices; on a change away from 48 kHz, say so and put it back. Capture then never
+stopped. But:
+
+```
+cap 1504/s   played 0/s   late 43387   slack min -110.70 ms
+```
+
+Forty seconds of degraded playout, and the watchdog said nothing — because it watched
+the **capture** callback, and capture had been rescued. An instrument that can only see
+one cause reports every other cause as fine. So the watchdog watches both callbacks, and
+a rate event now also re-primes the read cursor: the graph was disturbed, so any anchor
+from before it is a claim about a pipeline that no longer exists. Recovery: 6 seconds.
+
+### Fix two: hold the device at the wrong rate and fight the app
+
+Setting 44.1 kHz every 200 ms for eight seconds, so the app's re-assert keeps losing:
+
+```
+both ends:  recv 1508/s   played 0/s   conceal 1509/s   snap 0
+            slack p50 -74.45   p01 -84.17   min -115.53 ms
+```
+
+Packets arriving at fifteen hundred a second, and total silence for over half a minute.
+The read cursor had run **ahead** of the stream, so every packet was already past its
+deadline. And `snap 0`, because:
+
+```swift
+if hi - cur - Int64(jitTarget) > SNAP_PKTS { ... }      // only one sign
+```
+
+The re-anchor triggered when the cursor fell **behind** at a 30 ms threshold, and a
+cursor running **ahead** had to be 341 ms out before the jump guard noticed — until then
+the governor crawled it back at its 0.4% authority, twenty-nine seconds for 115 ms. The
+asymmetry was backwards on severity: behind costs latency, ahead costs *everything*. One
+expression, either sign:
+
+```swift
+if abs(hi - cur - Int64(jitTarget)) > SNAP_PKTS { ... }
+```
+
+And a third watchdog for the state that got past the first two — both callbacks running,
+packets arriving, nothing played. Watching the callbacks cannot see it; watching what
+came *out* can, which needed `accepted` alongside `played`, because a healthy receive
+with a dead playout is a real state and it takes two counters to be visible.
+
+### The same adversarial test, three builds
+
+| build | during | after release |
+|---|---|---|
+| 0.14.0 | `cap 0/s`, silent, nothing logged | dead until fixed by hand |
+| + rate listener + both watchdogs | announced, capture fine | `played 0/s` for 35+ s |
+| + symmetric snap + played-nothing watchdog | `CAPTURE HAS STOPPED -- input 48000 Hz, output 44100 Hz, last render status -10863` | **under 3 s**, m2e 9.82 |
+
+```
++ 3s  played 1505/s  conceal 0/s  slack p50 2.92  snap 106
++20s  played 1506/s  conceal 0/s  slack p50 2.17  snap 106
+```
+
+106 snaps during the disturbance, none in a clean run. The stat line now carries
+`[N capture stall(s) recovered]` and `[N device rate change(s)]` so the event survives
+in the log rather than only in the moment.
+
+Three bugs, and each was only visible once the previous one was fixed — the second hid
+behind the first, the third behind the second. Which is the argument for fixing a fault
+and then **running the same test again** rather than moving on: the first green result
+after a fix is the least informative one available.

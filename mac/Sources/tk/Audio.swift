@@ -17,6 +17,26 @@ import Darwin
 // a render callback is a dropout, and the whole point of this app is that there
 // are none.
 final class Audio {
+  // ── The device is not a constant, and neither is its RATE ──────────────────
+  //
+  // The startup path already refuses a device that will not do 48 kHz, loudly,
+  // because a 44.1 kHz device makes AudioUnitRender return -10863 on every
+  // callback and the app goes silently deaf. That check ran once, at start.
+  //
+  // Measured 2026-08-23, mid-call, by moving both devices to 44.1 kHz underneath a
+  // running call: `cap 0/s`, `played 18/s`, `conceal 1501/s` -- and renderErr 0,
+  // zero error lines, nothing in the log at all. The call was dead for 35 seconds
+  // and recovered only because the rate was put back by hand. macOS does this on
+  // its own when a headset is plugged in or another app claims the device.
+  //
+  // So the rate is WATCHED, and separately there is a watchdog on the symptom --
+  // because the specific cause is only one way to stop capturing, and an
+  // instrument that can only see one cause reports every other cause as fine.
+  private(set) var inDev: AudioDeviceID = 0
+  private(set) var outDev: AudioDeviceID = 0
+  private(set) var audioStalls = 0
+  private(set) var rateEvents = 0
+  private var started = false
   private var inUnit: AudioUnit?
   private var outUnit: AudioUnit?
 
@@ -532,6 +552,7 @@ final class Audio {
           + "*** Audio MIDI Setup, and run again.\n\n", stderr)
       throw Err.e("\(input ? "input" : "output") device at \(Int(rate)) Hz, need \(Int(SR)) Hz")
     }
+    if input { inDev = dev } else { outDev = dev }
     let got = setBufferFrames(dev, UInt32(Audio.devBuf), input: input)
     if input { inLatencyMs = deviceLatencyMs(dev, input: true) } else { outLatencyMs = deviceLatencyMs(dev, input: false) }
     let lat = input ? inLatencyMs : outLatencyMs
@@ -567,6 +588,136 @@ final class Audio {
     try ck(AudioUnitInitialize(ou), "init out")
     try ck(AudioOutputUnitStart(iu), "start in")
     try ck(AudioOutputUnitStart(ou), "start out")
+    started = true
+    watchRate()
+    watchStalls()
+  }
+
+  /// Tell me the moment the rate moves, and put it back.
+  private func watchRate() {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    for (dev, label) in [(inDev, "input"), (outDev, "output")] where dev != 0 {
+      AudioObjectAddPropertyListenerBlock(dev, &addr, DispatchQueue.global()) { [weak self] _, _ in
+        guard let self else { return }
+        var r: Float64 = 0; var sz = UInt32(MemoryLayout<Float64>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+          mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &r)
+        guard abs(r - SR) > 1 else { return }
+        self.rateEvents += 1
+        fputs("\n*** the \(label) device just moved to \(Int(r)) Hz mid-call. Every render fails at\n"
+            + "*** that rate and the call would go silent with no error, so putting it back.\n", stderr)
+        let got = self.forceSampleRate(dev, SR)
+        // Re-prime the read cursor. The graph was disturbed, so any anchor from
+        // before it is a claim about a pipeline that no longer exists -- and
+        // crawling back from it took forty seconds and 43,000 late arrivals when
+        // this was left alone. A re-prime is one discontinuity in the middle of a
+        // disturbance that already happened.
+        self.ring.pos = -1
+        fputs(abs(got - SR) < 1
+              ? "*** \(label) device back at \(Int(got)) Hz, playout re-primed.\n\n"
+              : "*** \(label) device REFUSED \(Int(SR)) Hz, stuck at \(Int(got)). Audio will not work\n"
+                + "*** until this device changes or another is selected.\n\n", stderr)
+      }
+    }
+  }
+
+  /// And watch the SYMPTOM, whatever the cause. A capture callback that stops
+  /// arriving while the unit is supposed to be running is a dead call, and the one
+  /// thing it must never be is quiet about it.
+  private func watchStalls() {
+    Thread { [weak self] in
+      // BOTH callbacks, because either one stopping is a dead call and they stop
+      // for different reasons. The first version of this watched only capture, and
+      // the very next test moved the devices to 44.1 kHz: capture was rescued by
+      // the rate listener and never stalled, while PLAYOUT sat at 0/s -- so the
+      // watchdog reported nothing through the exact failure it was added for.
+      var lastCap = -1, lastRender = -1
+      var stillCap = 0, stillRender = 0
+      var lastPlayed = -1, lastGot = -1, stuck = 0
+      var announced = false
+      func rate(_ d: AudioDeviceID) -> Int {
+        var r: Float64 = 0; var sz = UInt32(MemoryLayout<Float64>.size)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+          mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(d, &a, 0, nil, &sz, &r)
+        return Int(r)
+      }
+      while true {
+        Thread.sleep(forTimeInterval: 0.25)
+        guard let self, self.started else { continue }
+        let c = self.capCallbacks, r2 = self.renderTicks
+        stillCap = (c == lastCap) ? stillCap + 1 : 0
+        stillRender = (r2 == lastRender) ? stillRender + 1 : 0
+        lastCap = c; lastRender = r2
+        // A THIRD WAY TO BE SILENT, and the one that got past the first two: both
+        // callbacks running, packets arriving, and nothing played -- because the
+        // read cursor sat ahead of the stream and concealed every packet. Watching
+        // the callbacks does not see it; watching what came OUT does.
+        let played = self.ring.played, got = self.ring.accepted
+        stuck = (played == lastPlayed && got > lastGot) ? stuck + 1 : 0
+        lastPlayed = played; lastGot = got
+        if stuck >= 4, !announced {
+          announced = true
+          self.audioStalls += 1
+          fputs("\n*** NOTHING IS BEING PLAYED although packets are arriving"
+              + " -- the read cursor is off the stream. Re-anchoring.\n\n", stderr)
+          self.ring.pos = -1
+          continue
+        }
+        let dead = stillCap >= 3 || stillRender >= 3        // 750 ms of nothing
+        if dead, !announced {
+          announced = true
+          self.audioStalls += 1
+          let which = stillCap >= 3 && stillRender >= 3 ? "CAPTURE AND PLAYOUT"
+                    : stillCap >= 3 ? "CAPTURE" : "PLAYOUT"
+          fputs("\n*** \(which) HAS STOPPED -- no callback for 750 ms."
+              + " Input device \(rate(self.inDev)) Hz, output \(rate(self.outDev)) Hz,"
+              + " last render status \(self.lastRenderErr).\n*** Attempting recovery.\n", stderr)
+          _ = self.forceSampleRate(self.inDev, SR)
+          _ = self.forceSampleRate(self.outDev, SR)
+          self.restart()
+        } else if !dead, announced {
+          fputs("*** audio is back.\n\n", stderr)
+          announced = false
+          stillCap = 0; stillRender = 0
+        }
+      }
+    }.start()
+  }
+
+  /// Tear the graph down and build it again. Heavier than a stop/start, and
+  /// deliberately so: rebuilding re-runs the rate check, the buffer size and the
+  /// stream format, which is exactly the state a device change invalidated.
+  private func restart() {
+    if let u = inUnit { AudioOutputUnitStop(u); AudioUnitUninitialize(u); AudioComponentInstanceDispose(u) }
+    if let u = outUnit { AudioOutputUnitStop(u); AudioUnitUninitialize(u); AudioComponentInstanceDispose(u) }
+    inUnit = nil; outUnit = nil; started = false
+    do {
+      let iu = try makeUnit(input: true)
+      let ou = try makeUnit(input: false)
+      inUnit = iu; outUnit = ou
+      let me = Unmanaged.passUnretained(self).toOpaque()
+      var inCb = AURenderCallbackStruct(inputProc: captureProc, inputProcRefCon: me)
+      try ck(AudioUnitSetProperty(iu, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+        &inCb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set input cb")
+      var outCb = AURenderCallbackStruct(inputProc: renderProc, inputProcRefCon: me)
+      try ck(AudioUnitSetProperty(ou, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
+        &outCb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set render cb")
+      try ck(AudioUnitInitialize(iu), "init in")
+      try ck(AudioUnitInitialize(ou), "init out")
+      try ck(AudioOutputUnitStart(iu), "start in")
+      try ck(AudioOutputUnitStart(ou), "start out")
+      started = true
+      // The read cursor must re-prime from the new stream rather than carry an
+      // anchor from before the graph changed.
+      ring.pos = -1
+      fputs("*** audio graph rebuilt.\n", stderr)
+    } catch {
+      fputs("*** audio graph rebuild FAILED: \(error). Retrying in a moment.\n", stderr)
+      started = true          // let the watchdog try again
+    }
   }
 
   // ── Capture: mic -> packetise -> wire ────────────────────────────────────
@@ -723,7 +874,21 @@ final class Audio {
     // mistake in this one file, so it is now derived rather than typed.
     let SNAP_PKTS = max(Int64(4), Int64((30.0 / (Double(FPP) / SR * 1000.0)).rounded()))
     var cur = curSeq
-    if hi - cur - Int64(jitTarget) > SNAP_PKTS {
+    // SYMMETRIC, and it was not. This snapped only when the cursor fell BEHIND the
+    // stream; a cursor that ran AHEAD had to be 341 ms out before the jump guard
+    // noticed, and until then the governor crawled it back at its 0.4% authority --
+    // 29 seconds to recover 115 ms.
+    //
+    // Which is exactly what a device rate change produces. Measured: hold both
+    // devices at 44.1 kHz for eight seconds and the output unit advances the cursor
+    // at the wrong rate; when the graph recovers the cursor is 115 ms AHEAD, so
+    // every arriving packet is already past its deadline, `played 0/s`,
+    // `conceal 1509/s`, total silence on a link that was delivering 1508 packets a
+    // second. Both ends, for over half a minute.
+    //
+    // And the asymmetry was backwards on severity: behind costs latency, ahead
+    // costs EVERYTHING. One expression, either sign.
+    if abs(hi - cur - Int64(jitTarget)) > SNAP_PKTS {
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
       ring.snaps += 1
       cur = Int64(ring.pos) / Int64(FPP)

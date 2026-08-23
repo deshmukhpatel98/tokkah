@@ -95,6 +95,9 @@ final class RecvRing {
   /// Late arrivals that missed by less than one packet -- the only ones a single
   /// extra packet of buffer would have saved.
   var nearLate = 0
+  /// Packets written into the ring. Distinct from `played`: a healthy receive with
+  /// a dead playout is a real state and it needs two counters to be visible.
+  var accepted = 0
 
   /// One sample by ABSOLUTE index, or nil if the packet holding it is not here.
   /// The resampler needs neighbours either side of the read cursor and a missing
@@ -264,6 +267,7 @@ final class RecvRing {
     capHost[slot] = cap
     recvHost[slot] = now
     tags[slot] = seq
+    accepted += 1
     if seq > hiSeq { hiSeq = seq }
   }
 }
