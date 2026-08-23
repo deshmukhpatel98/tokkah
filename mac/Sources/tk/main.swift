@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.24.0"
+let VERSION = "0.25.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -57,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -903,9 +903,30 @@ if audio.jitAuto {
     // So lateness has to be SUSTAINED to count. Thin margin still grows instantly,
     // because that is the signal that the buffer really is too small.
     let GROW_LATE_MIN = 8      // per 2 s window, out of ~3000 packets (0.27%)
-    let SHRINK_ABOVE_MS = 2.0   // and this much would survive losing a packet of buffer
+    // ── How much proven margin is worth one packet of latency ─────────────────
+    //
+    // 2.0 ms pinned the buffer one packet high for entire calls, and where it
+    // pinned was decided by the first fifteen seconds. Measured on a clean rig,
+    // both ends running 1.6 Mbps of video: at jit 4 the steady-state head sat at
+    // 1.84 ms and never once cleared 2.0 in fifty windows, so the descent stopped
+    // at 4 and stayed for the whole call -- 0.67 ms of pure latency, charged to
+    // every syllable, for a threshold missed by 0.16 ms. With video OFF the same
+    // build reached jit 3, ran 87 seconds with head 1.19 ms and concealed NOTHING.
+    // So 2.0 was not the safety line, it was an untested constant that happened to
+    // be above the margin one traffic mix produces.
+    //
+    // `head` is already the headroom that would REMAIN one packet smaller, and it
+    // is computed from the WORST arrival in the window, not a percentile. So the
+    // break-even point is head > 0, and this constant is pure extra safety on top
+    // of a worst-case measurement. 1.0 ms is still 1.5 packets of it.
+    //
+    // Traded against more evidence, not less: the hold below goes to 5 windows in
+    // both cases, so a smaller margin has to hold for 10 s rather than 4.
+    let SHRINK_ABOVE_MS = arg("jit-shrink-margin").flatMap { Double($0) } ?? 1.0
     let SHRINK_HOLD = 5         // consecutive 2 s windows -- 10 s of agreement
-    let SHRINK_HOLD_FAST = 2    // ...but 4 s while still descending from the safe start
+    // Was 2. A smaller margin buys its way in with more agreement, so the
+    // descent from the deliberately safe start is no longer the fast path.
+    let SHRINK_HOLD_FAST = 5
     var calm = 0
     var lastConcealed = 0
     var lastSnaps = 0

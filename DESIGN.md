@@ -11038,3 +11038,63 @@ Mbps video the jitter buffer holds 4 packets where it holds 3 with video off,
 costing 0.6 ms, while arrival cadence is *identical* (p99 0.81 vs 0.78 ms) and slack
 is *better* (2.84 vs 2.11 ms). The buffer is declining to descend for a reason that
 is not lateness. Named, not hidden.
+
+## 17.107 A permanent latency decision, made in the first fifteen seconds
+
+17.106 left this named: at 1.6 Mbps of video the jitter buffer held 4 packets where
+it held 3 with video off, costing 0.6 ms, while arrival cadence was *identical*
+(p99 0.81 vs 0.78 ms) and slack was *better* (2.84 vs 2.11 ms). The buffer was
+declining to descend for a reason that was not lateness.
+
+### Two independent causes, both about the descent rather than the path
+
+**The threshold was an untested constant.** `head` is the headroom that would remain
+one packet smaller, computed from the WORST arrival in the window rather than a
+percentile — so break-even is `head > 0`, and `SHRINK_ABOVE_MS` is pure extra
+safety on top of a worst case. It was 2.0. At jit 4 with video the steady-state head
+sat at **1.84 ms and never once cleared 2.0 in fifty windows**: the descent stopped
+at 4 and stayed there for the whole call, 0.67 ms charged to every syllable for a
+line missed by 0.16 ms. With video off the same build reached jit 3, ran 87 seconds
+at head 1.19 ms and concealed nothing. So 2.0 was never the safety line — it was a
+constant that happened to sit above the margin one traffic mix produces.
+
+**And the descent was too fast to be trusted.** `SHRINK_HOLD_FAST` was 2 windows
+while descending from the deliberately safe start, so the buffer walked 6→5→4 within
+about eight seconds — through exactly the window where the rate governor, the offset
+estimator and the slack distribution are all still settling. Where it stopped was
+luck about the first fifteen seconds, and then permanent.
+
+Raising the fast hold to 5 windows made the buffer descend **further**, which is the
+whole lesson in one sentence.
+
+### Measured, rotated, old margin first
+
+Both ends running 1.6 Mbps of video, 100 s per arm:
+
+| arm | jit settles at | m2e A / B | concealed | snaps |
+|---|---|---|---|---|
+| 2.0 | 3 | 9.80 / 10.60 | 0 | 0 |
+| **1.0** | **2** | **9.15 / 9.24** | 0 | 0 |
+| 2.0 | 3 | 9.99 / 10.00 | 0 | 0 |
+| **1.0** | **2** | **9.21 / 9.31** | 0 | 0 |
+
+**0.87 ms, non-overlapping** (old min 9.80, new max 9.31), zero concealment in every
+arm. Against the build shipped an hour earlier, which settled at jit 4 and measured
+10.47, it is **1.24 ms**.
+
+### The safety property, checked rather than assumed
+
+A thinner margin is only defensible if the controller still refuses to descend when
+the path is actually jittery. With 3 ms of injected jitter both ways:
+
+| arm | jit | m2e A / B | concealed of 4.75 M samples |
+|---|---|---|---|
+| 2.0 | **6, never descends** | 14.25 / 14.44 | 468 (0.010%) |
+| 1.0 | **6, never descends** | 14.68 / 13.48 | 1013 (0.021%) |
+
+Identical behaviour: both hold at the safe start. And because both sat at the *same*
+buffer size, the concealment difference cannot be caused by the margin — it is the
+rig's noise floor for this measurement, which is worth knowing on its own.
+
+`--jit-shrink-margin` exists so the constant can be moved without a rebuild, because
+a number this consequential should not be reachable only by editing it.
