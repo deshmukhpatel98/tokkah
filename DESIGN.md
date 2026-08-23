@@ -9939,3 +9939,202 @@ So the cost of reading the wrong end was not only 1.55 Mbps spent in the wrong
 direction. It was a controller that **misdiagnosed the path and then acted correctly
 on the misdiagnosis**, which is the failure mode that no amount of looking at the log
 would have caught, because the log was internally consistent and completely wrong.
+
+## 17.96 The device buffer is not the packet, and the receive thread was not real-time
+
+Two changes, 11.75 ms to 9.83, and neither one is a new algorithm. Both came from
+finally attributing the 3.2 ms that the named terms did not explain.
+
+### First, name it
+
+The budget listed two device latencies, a packet fill and a jitter buffer -- about
+8.5 ms -- and m2e measured 11.76. The difference was sitting inside two stage numbers
+where nobody could see it, which is the shape of a cost that never gets removed
+because it never gets named. Three measurements split it:
+
+```
+soft: capLag 1.68 ms (fill 0.67 + sched 1.01)  sendCost 0.01  renderLead 1.67
+                                                p95 1.69/0.01/1.68
+```
+
+`capLag` is the first sample being captured to the input callback getting to look at
+it; `sendCost` is that callback's entry to `sendto` returning; `renderLead` is the
+output callback's entry to that buffer reaching the DAC.
+
+**This program's own work costs 0.01 ms.** Every remaining soft millisecond -- 2.68
+of them -- is CoreAudio scheduling, and p95 equals p50 to two decimals, so it is a
+constant, not a tail.
+
+### Then find out what it is a function of
+
+Sweeping the device buffer with the packet size held at 32 samples:
+
+| devbuf | capLag sched | renderLead | m2e | packets/s | Mbps |
+|---|---|---|---|---|---|
+| 15 | 0.66 | 1.32 | 10.67 | 1518 | 2.43 |
+| 16 | 0.68 | 1.34 | 10.55 | 1518 | 2.43 |
+| 32 | 1.01 | 1.68 | 11.50 | 1517 | 2.43 |
+| 64 | 1.73 | 2.34 | 14.83 | 1508 | 2.41 |
+
+Both constants are affine in the device buffer, and the fit is exact:
+
+```
+capture schedule = 0.35 ms + one device buffer
+render lead      = 1.00 ms + one device buffer
+```
+
+So CoreAudio has a **1.35 ms floor that no buffer size removes**, plus two device
+buffers. And the thing those constants scale with is the DEVICE BUFFER, while the
+packet fill and the bandwidth scale with the PACKET. They had been the same number
+only because `setBufferFrames(dev, UInt32(FPP))` made them the same number.
+
+§17.93 measured FPP=16 at 9.48 ms and rejected it for doubling the packet rate to
+3000/s and the header overhead with it. That experiment moved both quantities at
+once. Halving only the device buffer buys most of the same win at **1518 packets/s
+and 2.43 Mbps, identical to three significant figures.**
+
+One thing stood in the way, and it was a trap rather than a design: the packet's
+capture stamp was `host0 + Clock.ticks(ns: UInt64(Double(i - FPP) / SR * 1e9))`. Once
+the device buffer is smaller than a packet, the packet started in an *earlier* buffer,
+`i - FPP` is negative, and `UInt64(negative Double)` traps. A signed offset is four
+lines. That trap was the entire reason these two numbers had to be equal.
+
+Adopted 16, not 15: the hardware floor here is 15 and it accepts any value, but 15
+buys 0.02 ms and costs four times the missed wakeups. What 16 costs is 2-8 missed
+input wakeups per 350-750k callbacks, one 0.33 ms gap somewhere around every minute,
+now covered by a pitch-period repeat (§17.94). The frame-deficit counter reads -94
+samples at devbuf 16 against -47 at devbuf 32, but devbuf 32 shows -47 with **zero**
+skips, so most of the deficit is device-clock drift near 30 ppm, which the rate
+governor already absorbs. The skip count is the clean loss signal; the deficit is not.
+
+### Then notice which thread was not real-time
+
+On loopback the network jitter is 0.1 ms, and yet arrival slack reached **-1.38 ms**
+and the jitter buffer sized itself to 4 packets: 2.67 ms, a quarter of the whole
+mouth-to-ear number. That buffer was not absorbing the network. It was absorbing the
+receive thread's wakeup -- and the receive thread was a plain pthread at default
+priority, sitting between two CoreAudio callbacks that both run at time-constraint
+priority. The receive side of a real-time pipeline was the only part of it that was
+not real-time. Nothing in the program set a thread policy anywhere.
+
+`THREAD_TIME_CONSTRAINT_POLICY`, period `FPP/SR`, computation a fifth of that,
+preemptible so it can never starve the callbacks it feeds. Rotated arms, 90 s,
+`--no-rt` as the control:
+
+| arm | m2e | slack min | late | jitter buffer |
+|---|---|---|---|---|
+| **real-time recv** | 9.96, 9.88 | +0.94, +1.63 | 0, 0 | **3** |
+| default priority | 10.61, 10.64 | -1.58, -0.17 | 4, 1 | 4 |
+
+The causal chain is visible in one table: the slack minimum stops going negative, so
+nothing arrives late, so the controller settles one packet shallower, so m2e drops
+0.70 ms. The policy call's result is printed, because a failed `thread_policy_set`
+leaves the thread at default priority and every number after it describes a different
+program.
+
+### Together, and they interact
+
+The two changes meet at the jitter buffer, so measuring them separately was not
+enough. 250 s each, both with the real-time thread:
+
+```
+devbuf 16   m2e 10.00 10.01 10.01 10.01 10.01 10.01 10.01 10.01 10.01   jit 3 throughout
+devbuf 32   m2e 10.92 10.92 10.92 11.61 11.79 11.82 11.80 11.83 11.80   jit 3 -> 4 at ~120 s
+```
+
+The smaller device buffer is not only faster, it is **steadier**: slack p01 2.16 with
+zero spread, so the controller never found a reason to grow, while devbuf 32 grew at
+two minutes and stayed there. A finer callback quantises arrival less, and the jitter
+buffer is sized by the worst quantisation it sees.
+
+**9.83 ms mouth-to-ear, 1518 packets/s, 2.43 Mbps, 6% of one core.** A 6.5 minute run
+does eventually grow to jit 4 and 10.68, so the honest steady-state claim is 9.8-10.7
+depending on whether the margin holds, against 11.5-11.8 before.
+
+Both of these were sitting in plain sight for the entire life of the program. Neither
+needed a new idea. One needed a number to have a name, and the other needed somebody
+to ask which threads were real-time.
+
+## 17.97 The jitter buffer was paying for the far end's missed wakeups
+
+After §17.96 the buffer kept settling at 3, 4 or 5 packets across runs -- 1.3 ms of
+spread -- and it decides on the 1st percentile of arrival slack. So the number that
+actually sets the latency is the TAIL of the arrival distribution, and "arrival" is
+two things a single measurement cannot separate: when the far end managed to emit the
+packet, and how long it then took to get here and be noticed. On loopback the second
+should be nothing, and the observed tail was 3.2 ms, so one of those assumptions was
+wrong and there was no way to tell which.
+
+Both are measurable at the receiver, on the same packets, in the same window. The gap
+between consecutive CAPTURE stamps is the far end's own emission cadence -- its clock,
+but a difference, so the offset cancels. The gap between arrivals is that plus
+everything after it. Consecutive sequence numbers only, because a gap across a lost
+packet is not a cadence measurement.
+
+```
+cadence (nominal 0.67 ms): sender p50 0.67 p99 0.67 max 1.33
+                         | arrival p50 0.67 p99 0.70 max 1.37
+```
+
+**The path and this machine contribute 0.03 ms.** The entire tail is the far end
+missing an input wakeup -- max is exactly twice nominal, one skipped packet slot,
+4 to 10 times per 450k callbacks, which is the price of the 16-frame device buffer.
+
+### Then the decision changes
+
+A bigger buffer does absorb that. It also charges every syllable for the rest of the
+call to cover a 0.67 ms hiccup that arrives once every twenty seconds, still has
+1.3 ms to spare, and conceals nothing. This controller already refused that trade for
+a trickle of late packets (§17.92). Refusing it again is the consistent answer -- but
+only when the dip is actually explained AND nothing was actually concealed or late:
+
+```swift
+let senderHiccup = senderGap > pktMs * 1.5
+let excusedDip = p01 < GROW_BELOW_MS && senderHiccup && conc == 0 && late == 0
+```
+
+Note which asymmetry this fixes. Lateness is *actual harm* and needed 8 occurrences in
+a window to count. A thin margin is a *prediction* and needed one. The bar was high
+for the fact and absent for the forecast.
+
+330 s, one run, the whole trace:
+
+```
+jit -> 5 (shrank: slack p01 3.84 ms, err -0.09 ms, 2 windows clean)
+jit -> 4 (shrank: slack p01 3.38 ms, err  0.05 ms, 2 windows clean)
+jit -> 3 (shrank: slack p01 2.73 ms, err  0.09 ms, 2 windows clean)
+jit: slack p01 0.83 ms but the far end skipped an input wakeup (cadence gap 1.33 ms
+     vs 0.67 nominal), 0 concealed, 0 late -- holding at 3
+jit: ... 0.91 ms ... gap 1.25 ms ... holding at 3
+jit: ... 0.93 ms ... gap 1.25 ms ... holding at 3
+
+jit: 666555544444444444...333333333333333333333333333333333333333333333333 (to the end)
+m2e p50 9.64 p95 9.80    slack p50 1.77 p01 0.96 min 0.81    conceal 0/s
+```
+
+**9.64 ms**, held for the whole run, and the worst arrival in five and a half minutes
+still had 0.81 ms to spare.
+
+### And the safety net, tested rather than assumed
+
+The excuse must not swallow a real problem. Under injected network jitter it does not:
+
+| injected jitter | behaviour | m2e | concealed |
+|---|---|---|---|
+| 3 ms | refused to shrink below the safe start of 6 | 14.24 | 0 |
+| 6 ms | **grew to 7** on "6 late arrivals" | 18.17 | 0 |
+
+Lateness still grows instantly, converged or not, excused or not: a late arrival is
+not a margin estimate -- the packet's play time passed before it got here, which is a
+fact about the packet and not about the cursor.
+
+### A note on the null
+
+Before any of this, four identical runs, because the thing being tuned had been
+varying by more than the effect being claimed. Three completed: m2e 10.00, 10.01,
+10.00, all at jit 3. A spread of 0.01 ms. So the earlier 4s and 5s were excursions
+that had not yet recovered when those runs ended, not a different steady state -- and
+every conclusion drawn from a single run before that null was unsupported.
+
+**Audio, loopback, this Mac: 24.50 ms at the start of this work, 11.75 this morning,
+9.64 now. 1518 packets/s, 2.43 Mbps, 6% of one core, encrypted, zero concealment.**

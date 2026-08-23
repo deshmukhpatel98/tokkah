@@ -115,6 +115,30 @@ final class Audio {
   // decimated by two -- about 60k multiply-adds. It is on the render thread on
   // purpose (the alternative is a stale period computed for a different sound),
   // and the callback cost is measured, not assumed: see `plcSearchUs`.
+  // ── The device buffer is not the packet ────────────────────────────────────
+  //
+  // These were the same number, and the measurement says they should not be. The
+  // two CoreAudio scheduling constants -- 1.01 ms to wake the input callback,
+  // 1.67 ms of lead on the output callback, 2.68 ms together and steadier than
+  // anything else in the budget -- are multiples of the DEVICE BUFFER. The packet
+  // fill and the bandwidth are functions of the PACKET.
+  //
+  // FPP=16 was measured at 9.48 ms and rejected because it doubled the packet rate
+  // to 3000/s and the 36% header overhead with it. But that experiment moved both
+  // quantities at once. Halving only the device buffer should buy most of the same
+  // scheduling win at exactly the same packet rate and exactly the same bandwidth.
+  // 16, measured. The hardware floor on this Mac is 15 and it accepts any value,
+  // but 15 buys 0.02 ms over 16 and costs four times the missed wakeups (8 per
+  // 379k callbacks against 2 per 358k), so 16 is where the curve flattens. 32 was
+  // the default only because it was the packet size.
+  //
+  // What 16 costs: about 2 missed input wakeups per two minutes, and a frame
+  // deficit of 94 samples against 47 at devbuf 32 -- of which roughly half is
+  // device-clock drift rather than loss, since devbuf 32 shows 47 samples with
+  // ZERO skips. So the real price is one 0.33 ms gap somewhere around every minute,
+  // now covered by a pitch-period repeat, against 0.95 ms off every syllable
+  // forever. Rotated arms: 10.50/10.59 ms against 11.43/11.57.
+  nonisolated(unsafe) static var devBuf = 16
   private static let HIST = 2048           // 42.7 ms, power of two for masking
   private static let HMASK = HIST - 1
   private static let PMIN = 96             // 500 Hz
@@ -284,12 +308,56 @@ final class Audio {
   var acRound = Quantiles(cap: 64)
   private(set) var acFired = 0, acHeard = 0
   var capToSend = Quantiles(cap: 2048)     // sender: capture stamp -> handed to the socket
+  // ── Where the soft milliseconds actually are ───────────────────────────────
+  //
+  // The named terms -- two device latencies, the packet fill, the jitter buffer --
+  // add up to about 8.5 ms, and m2e measures 11.76. The 3.2 ms difference has been
+  // sitting in the two stage numbers unattributed, which is exactly the shape of a
+  // cost nobody can reduce because nobody can name it. These three split it into
+  // CoreAudio's scheduling (which this program does not control) and this program's
+  // own work (which it does).
+  //
+  //   capLag     first sample captured  ->  input callback gets to look at it
+  //   sendCost   input callback entry    ->  sendto has returned
+  //   renderLead output callback entry   ->  that buffer reaches the DAC
+  // ── Can this buffer size actually be served? ───────────────────────────────
+  //
+  // A CoreAudio overrun does not return an error. AudioUnitRender succeeds, the
+  // callback simply took too long and a buffer is gone -- so `xruns`, which counts
+  // render failures, reads zero through exactly the failure it is supposed to
+  // catch. But a SKIPPED BUFFER IS A DOUBLED GAP between consecutive callback host
+  // times, and that needs no cooperation from anyone: it is arithmetic on a
+  // timestamp CoreAudio already provides. Counted for both callbacks, with the
+  // duration of the work beside it, so "is 15 frames serviceable" is a question
+  // with an answer instead of a hope.
+  var capSkips = 0, renderSkips = 0
+  var capTicks = 0, renderTicks = 0
+  // A gap in the host times is not yet a defect: CoreAudio may have COALESCED two
+  // buffers, in which case the callback simply gets twice the frames and no audio
+  // is missing. Summing the frames actually delivered and comparing to wall time
+  // is what separates "coalesced" from "lost", and it is the difference between a
+  // buffer size being serviceable and being lossy.
+  var capFrames = 0, renderFrames = 0
+  private var firstCapHost: UInt64 = 0
+  private var lastCapHost: UInt64 = 0
+  private var lastRenderHost: UInt64 = 0
+  var renderCost = Quantiles(cap: 2048)
+  var capLag = Quantiles(cap: 2048)
+  var sendCost = Quantiles(cap: 2048)
+  var renderLead = Quantiles(cap: 2048)
   var recvToPlay = Quantiles(cap: 2048)    // receiver: off the socket -> at the DAC
   var m2eLast: Double = 0
   var outLatencyMs: Double = 0
   var inLatencyMs: Double = 0
   var capturedPkts = 0
   var xruns = 0
+  /// Frames the input unit actually delivered, minus the frames the elapsed time
+  /// says it should have. Negative means audio was genuinely lost.
+  var capFrameDeficit: Double {
+    guard firstCapHost != 0 else { return 0 }
+    let elapsedS = Clock.ms(Clock.now() - firstCapHost) / 1000.0
+    return Double(capFrames) - elapsedS * SR
+  }
   var capCallbacks = 0
   var lastRenderErr: OSStatus = 0
 
@@ -418,7 +486,7 @@ final class Audio {
           + "*** Audio MIDI Setup, and run again.\n\n", stderr)
       throw Err.e("\(input ? "input" : "output") device at \(Int(rate)) Hz, need \(Int(SR)) Hz")
     }
-    let got = setBufferFrames(dev, UInt32(FPP), input: input)
+    let got = setBufferFrames(dev, UInt32(Audio.devBuf), input: input)
     if input { inLatencyMs = deviceLatencyMs(dev, input: true) } else { outLatencyMs = deviceLatencyMs(dev, input: false) }
     let lat = input ? inLatencyMs : outLatencyMs
     fputs("[\(input ? "in" : "out")] \"\(nm)\" \(Int(rate)) Hz  bufferFrames=\(got)"
@@ -477,6 +545,17 @@ final class Audio {
     // measurement honest, and it is the field a browser will not give you.
     let host0 = (ts.pointee.mFlags.contains(.hostTimeValid) && ts.pointee.mHostTime != 0)
       ? ts.pointee.mHostTime : Clock.now()
+    let entry = Clock.now()
+    capLag.add(Clock.msSigned(entry, host0))
+    // 1.5x nominal, not 2x: a buffer that is late by more than half a period has
+    // already missed, and rounding the threshold up would hide the marginal case
+    // that matters most.
+    let nominal = Double(Audio.devBuf) / SR * 1000.0
+    if lastCapHost != 0, Clock.msSigned(host0, lastCapHost) > nominal * 1.5 { capSkips += 1 }
+    lastCapHost = host0
+    capTicks += 1
+    capFrames += Int(n)
+    if firstCapHost == 0 { firstCapHost = host0 }
 
     // Substitute the file, if one was given, before anything looks at the samples.
     if let src = srcSamples, srcCount > 0 {
@@ -514,11 +593,16 @@ final class Audio {
       memcpy(capBuf + capFill, inScratch + i, take * 4)
       capFill += take; i += take
       if capFill == FPP {
-        // Host time of THIS packet's first sample: the buffer's host time plus
-        // the samples already consumed from it.
-        let off = UInt64(Double(i - FPP) / SR * 1_000_000_000.0)
-        let cap = host0 + Clock.ticks(ns: off)
+        // Host time of THIS packet's first sample, relative to this buffer's host
+        // time. SIGNED, and it has to be: once the device buffer is smaller than a
+        // packet the packet STARTED IN AN EARLIER BUFFER, so the offset is negative
+        // and `UInt64(negative Double)` traps. That trap is the only thing that was
+        // stopping the device buffer from being decoupled from the packet size.
+        let d = i - FPP
+        let offNs = UInt64(abs(Double(d)) / SR * 1_000_000_000.0)
+        let cap = d >= 0 ? host0 + Clock.ticks(ns: offNs) : host0 - Clock.ticks(ns: offNs)
         capToSend.add(Clock.msSigned(Clock.now(), cap))
+        defer { sendCost.add(Clock.msSigned(Clock.now(), entry)) }
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
                    redundant: (redundancy && havePrev) ? prevBuf : nil,
                    redundantCap: prevCap)
@@ -619,6 +703,14 @@ final class Audio {
     // mouth-to-ear by a whole buffer plus the device's own pipeline.
     let dueHost = (ts.pointee.mFlags.contains(.hostTimeValid) && ts.pointee.mHostTime != 0)
       ? ts.pointee.mHostTime : Clock.now()
+    let rEntry = Clock.now()
+    renderLead.add(Clock.msSigned(dueHost, rEntry))
+    let rNominal = Double(Audio.devBuf) / SR * 1000.0
+    if lastRenderHost != 0, Clock.msSigned(dueHost, lastRenderHost) > rNominal * 1.5 { renderSkips += 1 }
+    lastRenderHost = dueHost
+    renderTicks += 1
+    renderFrames += Int(n)
+    defer { renderCost.add(Clock.msSigned(Clock.now(), rEntry)) }
 
     for i in 0..<Int(n) {
       let absF = ring.pos + Double(i) * ring.rate

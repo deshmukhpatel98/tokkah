@@ -92,6 +92,32 @@ final class RecvRing {
   // The test is exact and already available -- a late arrival is one with
   // negative slack.
   var lateArrivals = 0
+  // ── Is the tail the sender's or the receiver's? ────────────────────────────
+  //
+  // The buffer controller keeps settling at 3, 4 or 5 packets across runs, worth
+  // 1.3 ms, and it decides on the 1st percentile of arrival slack. So the thing
+  // that actually sets the latency is the TAIL of the arrival distribution -- and
+  // "arrival" has two components that a single number cannot separate: when the
+  // sender managed to emit the packet, and how long it then took to get here and be
+  // noticed. On loopback the second should be nothing, and the observed tail is
+  // 3.2 ms, so one of those two assumptions is wrong.
+  //
+  // Both are measurable at the receiver, in the same window, on the same packets:
+  // the gap between consecutive CAPTURE stamps is the sender's own cadence (its
+  // clock, but a difference, so the offset cancels), and the gap between arrivals
+  // is that cadence plus everything after it. Consecutive sequence numbers only --
+  // a gap across a lost packet is not a cadence measurement.
+  var ipiCap = Quantiles(cap: 4096)
+  var ipiRecv = Quantiles(cap: 4096)
+  var ipiCapMax = 0.0, ipiRecvMax = 0.0
+  /// Worst sender cadence gap in the current controller window, reset by the
+  /// controller when it reads it. This is what lets a margin dip be ATTRIBUTED:
+  /// a gap of two packet periods means the far end missed an input wakeup, and no
+  /// buffer size on this machine prevents that.
+  var ipiCapWinMax = 0.0
+  private var lastIpiSeq: Int32 = -1
+  private var lastIpiCap: UInt64 = 0
+  private var lastIpiRecv: UInt64 = 0
   /// Packets that would have been a click and were not, because a later packet
   /// carried a second copy.
   var recovered = 0
@@ -196,8 +222,17 @@ final class RecvRing {
       if ms < 0 { lateArrivals += 1 }
     }
     memcpy(samples + slot * FPP, src, min(n, FPP) * 4)
+    let now = Clock.now()
+    if seq == lastIpiSeq + 1, lastIpiCap != 0 {
+      let dc = Clock.msSigned(cap, lastIpiCap)
+      let dr = Clock.msSigned(now, lastIpiRecv)
+      ipiCap.add(dc); if dc > ipiCapMax { ipiCapMax = dc }
+      if dc > ipiCapWinMax { ipiCapWinMax = dc }
+      ipiRecv.add(dr); if dr > ipiRecvMax { ipiRecvMax = dr }
+    }
+    lastIpiSeq = seq; lastIpiCap = cap; lastIpiRecv = now
     capHost[slot] = cap
-    recvHost[slot] = Clock.now()
+    recvHost[slot] = now
     tags[slot] = seq
     if seq > hiSeq { hiSeq = seq }
   }
@@ -467,6 +502,9 @@ final class Wire {
   /// What the PEER has lost and recovered on the path FROM HERE. Cumulative, so
   /// a reader that samples at any cadence gets a true delta -- a windowed average
   /// read on the wrong cadence has inverted an A/B in this project before.
+  /// `--no-rt` exists so the thread policy can be A/B'd against itself. A change
+  /// nobody can turn off is a claim, not a measurement.
+  nonisolated(unsafe) static var noRealtime = false
   private(set) var peerRxLost: Int = 0
   private(set) var peerRxRecovered: Int = 0
   /// Whether the far end reports at all. False means an older build, and the
@@ -543,8 +581,54 @@ final class Wire {
     out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
   }
 
+  /// Ask the scheduler to treat this thread the way it treats CoreAudio's own IO
+  /// thread.
+  ///
+  /// Why this belongs in the latency budget at all: on loopback the network jitter
+  /// is 0.1 ms, and yet the arrival-slack minimum goes to -1.38 ms and the jitter
+  /// buffer sizes itself to 4 packets, 2.67 ms -- a quarter of the entire
+  /// mouth-to-ear number. The buffer is not absorbing the network. It is absorbing
+  /// THIS THREAD'S WAKEUP, and this thread was running at whatever priority a
+  /// default pthread gets while the two audio callbacks around it run at
+  /// time-constraint priority. The receive side of a real-time pipeline was the
+  /// only part of it that was not real-time.
+  ///
+  /// Time-constraint rather than merely "high", because the work genuinely is
+  /// periodic -- one packet every FPP/SR seconds -- which is exactly the contract
+  /// this policy exists to express. Preemptible, because this thread must never be
+  /// able to starve the audio callbacks it feeds.
+  private func goRealtime() -> String {
+    var tb = mach_timebase_info()
+    mach_timebase_info(&tb)
+    let toAbs = { (ns: Double) -> UInt32 in
+      UInt32(max(1, ns * Double(tb.denom) / Double(tb.numer)))
+    }
+    let periodNs = Double(FPP) / SR * 1_000_000_000.0
+    var pol = thread_time_constraint_policy(
+      period: toAbs(periodNs),
+      // Measured, not guessed: the receive path's work is a decrypt and a memcpy,
+      // p95 well under 20 us. Asking for a fifth of the period is generous and
+      // still leaves the scheduler room to say no.
+      computation: toAbs(periodNs / 5),
+      constraint: toAbs(periodNs),
+      preemptible: 1)
+    let count = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &pol) {
+      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                          UInt32(THREAD_TIME_CONSTRAINT_POLICY), $0, count)
+      }
+    }
+    // Reported rather than assumed. A failed policy call leaves the thread at
+    // default priority and every number after it describes a different program.
+    return kr == KERN_SUCCESS
+      ? "recv thread: time-constraint, period \(String(format: "%.2f", periodNs / 1000)) us"
+      : "recv thread: NOT real-time (thread_policy_set = \(kr)) -- arrival jitter will include this thread's scheduling"
+  }
+
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
     reportRing = ring
+    if !Wire.noRealtime { fputs(goRealtime() + "\n", stderr) }
     // One buffer big enough for either kind. Audio and video share the socket, so
     // the loop dispatches on the magic rather than owning two sockets: two ports
     // means two NAT bindings, and the second one is the one that fails.

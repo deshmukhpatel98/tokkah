@@ -66,16 +66,18 @@
   <h2>Where it is</h2>
   <table>
     <tr><th>Audio</th><th></th></tr>
-    <tr><td>mouth-to-ear</td><td class=n>15.6 ms</td></tr>
-    <tr><td>&hellip; at 1% packet loss</td><td class=n>16.3 ms</td></tr>
-    <tr><td>&hellip; at 3% bursty loss</td><td class=n>17.4 ms</td></tr>
-    <tr><td>concealment, clean path</td><td class=n>1 packet in 3 minutes</td></tr>
-    <tr><td>jitter buffer</td><td class=n>sizes itself, 2.7&ndash;30 ms</td></tr>
-    <tr><td>device buffer</td><td class=n>1.33 ms (64 frames)</td></tr>
+    <tr><td>mouth-to-ear</td><td class=n>9.6 ms</td></tr>
+    <tr><td>&hellip; at 1% packet loss</td><td class=n>10.7 ms, 97% of it repaired</td></tr>
+    <tr><td>&hellip; at 3% loss in 20 ms bursts</td><td class=n>10.2 ms</td></tr>
+    <tr><td>&hellip; at 10% packet loss</td><td class=n>11.4 ms, 89% repaired</td></tr>
+    <tr><td>concealment, clean path</td><td class=n>none in 5&frac12; minutes</td></tr>
+    <tr><td>jitter buffer</td><td class=n>sizes itself, 2.0&ndash;30 ms</td></tr>
+    <tr><td>device buffer</td><td class=n>0.33 ms (16 frames)</td></tr>
+    <tr><td>when a packet is lost</td><td class=n>filled at the speaker's pitch period</td></tr>
     <tr><td>format</td><td class=n>32-bit float, uncompressed</td></tr>
     <tr><td>encryption</td><td class=n>AES-256-GCM, 0.78 &micro;s/packet</td></tr>
-    <tr><td>bandwidth</td><td class=n>2.4 Mbps each way (3.7 while repairing loss)</td></tr>
-    <tr><td>at 10% packet loss</td><td class=n>still connects, 100% played</td></tr>
+    <tr><td>bandwidth</td><td class=n>2.4 Mbps each way (4.0 while repairing loss)</td></tr>
+    <tr><td>cost</td><td class=n>6% of one core</td></tr>
     <tr><th>Video</th><th></th></tr>
     <tr><td>capture &rarr; decoded</td><td class=n>5.6 ms p50, 8.2 ms p95</td></tr>
     <tr><td>+ display pipeline (60 Hz)</td><td class=n>~23 ms measured</td></tr>

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.10.0"
+let VERSION = "0.12.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -246,6 +246,9 @@ let fecAllowed = !flag("no-fec")
 // --acoustic measures the real speaker->air->mic path, which is the only thing
 // that can settle whether the device-latency terms are already inside the
 // timestamps we add them to (17.89). It has to make a sound.
+// Must be set before the units are built: the buffer size is a device property.
+if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
+if flag("no-rt") { Wire.noRealtime = true }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 audio.concealZeros = (arg("conceal") == "zeros")
 audio.concealGrain = (arg("conceal") == "grain")
@@ -631,6 +634,8 @@ if audio.jitAuto {
     // forever -- observed on this rig cycling 2 -> 1 -> 2 -> 1 with three
     // concealed packets each lap. Backoff doubles, so a path that genuinely
     // improves is still re-probed, just not at the cost of a click a minute.
+    var growSuppressed = 0       // thin-margin grows refused because the governor was still moving
+    var marginExcused = 0        // ...and refused because the far end, not the path, caused the dip
     var unsafeBelow = 0          // levels < this are known bad
     var probeAt = 0.0            // seconds-since-start after which to retry one
     var backoff = 60.0
@@ -745,10 +750,55 @@ if audio.jitAuto {
       //
       // So the stall is absorbed by the snap, the level is held, and nothing is
       // marked unsafe on this evidence.
+      // THE SAME RULE THE SHRINK BRANCH ALREADY OBEYS, APPLIED TO GROWING.
+      //
+      // The comment above says slack describes the cursor rather than the network
+      // whenever the governor has not converged. That was applied to shrinking and
+      // not to growing, and the asymmetry is a shrink-grow oscillation: the level
+      // goes 4 -> 3, the governor works harder to hold the new target, the slack
+      // distribution widens while it hunts -- measured on the published 0.11.0
+      // binary, the p01/p50 gap was 0.02 ms at jit 4 and 1.27 ms in the one window
+      // at jit 3 -- p01 reads 1.04, and the controller grows straight back and
+      // marks 3 unsafe with a doubling backoff. It then spends the rest of the call
+      // 0.67 ms worse on the strength of a measurement of its own transient.
+      //
+      // LATENESS STILL GROWS INSTANTLY, converged or not. A late arrival is not a
+      // margin estimate: the packet's play time passed before it arrived, which is
+      // a fact about the packet, not about the cursor. The emergency path is
+      // untouched. Only the JUDGEMENT waits for the evidence to mean what it says.
+      if p01 < GROW_BELOW_MS, !converged { growSuppressed += 1 }
+      // AND ATTRIBUTE THE THIN MARGIN, now that it can be attributed.
+      //
+      // The cadence instrument separates the two halves of "arrival": the gap
+      // between consecutive CAPTURE stamps is the far end's own emission cadence,
+      // and the gap between arrivals is that plus the path. Measured on loopback:
+      // sender p99 0.67 max 1.33, arrival p99 0.70 max 1.37, nominal 0.67. The path
+      // and this machine contribute 0.03 ms. THE ENTIRE TAIL IS THE FAR END MISSING
+      // AN INPUT WAKEUP -- exactly 2x nominal, one skipped packet slot, 4-10 times
+      // per 450k callbacks.
+      //
+      // A bigger buffer here does absorb that. It also charges every syllable for
+      // the rest of the call to cover a 0.67 ms hiccup that arrives once every
+      // twenty seconds with 1.3 ms still to spare and conceals NOTHING. That is the
+      // same trade this controller already refused for a trickle of late packets,
+      // and refusing it again is the consistent answer -- but only when the dip is
+      // actually explained and nothing was actually concealed.
+      let senderGap = r.ipiCapWinMax
+      let senderHiccup = senderGap > pktMs * 1.5
+      r.ipiCapWinMax = 0
+      let excusedDip = p01 < GROW_BELOW_MS && senderHiccup && conc == 0 && late == 0
+      if excusedDip { marginExcused += 1 }
       if snapped > 0 {
         calm = 0
         fputs("jit: \(snapped) snap(s), \(conc) concealed -- stall, not jitter; holding at \(audio.jitTarget)\n", stderr)
-      } else if late >= GROW_LATE_MIN || p01 < GROW_BELOW_MS {
+      } else if excusedDip {
+        // Held, not grown, and said out loud -- a controller that silently declines
+        // to act looks identical to one that never saw anything.
+        calm = 0
+        fputs("jit: slack p01 \(String(format: "%.2f", p01)) ms but the far end skipped an input"
+            + " wakeup (cadence gap \(String(format: "%.2f", senderGap)) ms vs \(String(format: "%.2f", pktMs)) nominal),"
+            + " 0 concealed, 0 late -- holding at \(audio.jitTarget)\n", stderr)
+      } else if late >= GROW_LATE_MIN || (p01 < GROW_BELOW_MS && converged) {
         if audio.jitTarget < JIT_MAX {
           audio.jitTarget += 1
           audio.jitGrows += 1
@@ -760,7 +810,9 @@ if audio.jitAuto {
           // buffer high for a quarter of an hour, and a path that recovers
           // deserves to be re-probed sooner than that.
           backoff = min(backoff * 2, 120)
-          fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, slack p01 \(String(format: "%.2f", p01)) ms)"
+          fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, slack p01 \(String(format: "%.2f", p01)) ms"
+              + (growSuppressed > 0 ? ", \(growSuppressed) refused mid-slew" : "")
+              + (marginExcused > 0 ? ", \(marginExcused) refused as far-end hiccups" : "") + ")"
               + "  -- below \(unsafeBelow) marked unsafe, next probe in \(Int(backoff / 2)) s\n", stderr)
         }
         calm = 0
@@ -851,6 +903,45 @@ func reportLoop() {
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.
+  // The tail that sets the jitter buffer, split by where it comes from. Nominal
+  // is one packet period; anything above it in the sender column is the sender
+  // failing to emit on time, and anything above it only in the arrival column is
+  // the path plus this machine noticing.
+  if let cp = audio.ring.ipiCap.p(0.50), let rp = audio.ring.ipiRecv.p(0.50) {
+    let nom = Double(FPP) / SR * 1000.0
+    let f = { (v: Double?) in String(format: "%.2f", v ?? 0) }
+    fputs("  cadence (nominal \(f(nom)) ms): sender p50 \(f(cp)) p99 \(f(audio.ring.ipiCap.p(0.99)))"
+        + " max \(f(audio.ring.ipiCapMax))"
+        + " | arrival p50 \(f(rp)) p99 \(f(audio.ring.ipiRecv.p(0.99)))"
+        + " max \(f(audio.ring.ipiRecvMax))\n", stderr)
+  }
+  // Split the two stage numbers into CoreAudio's scheduling and this program's
+  // own work, because a millisecond nobody can name is a millisecond nobody can
+  // remove.
+  if let cl = audio.capLag.p(0.50), let sc = audio.sendCost.p(0.50), let rl = audio.renderLead.p(0.50) {
+    let fill = Double(FPP) / SR * 1000.0
+    fputs("  soft: capLag \(String(format: "%.2f", cl)) ms (fill \(String(format: "%.2f", fill))"
+        + " + sched \(String(format: "%.2f", cl - fill)))"
+        + "  sendCost \(String(format: "%.2f", sc))"
+        + "  renderLead \(String(format: "%.2f", rl))"
+        + "  p95 \(String(format: "%.2f", audio.capLag.p(0.95) ?? 0))/"
+        + "\(String(format: "%.2f", audio.sendCost.p(0.95) ?? 0))/"
+        + "\(String(format: "%.2f", audio.renderLead.p(0.95) ?? 0))\n", stderr)
+    // Serviceability, printed every window whether or not it is bad news. A
+    // skipped buffer is a doubled gap; the render cost says how close the work is
+    // to the deadline it has.
+    let budgetUs = Double(Audio.devBuf) / SR * 1_000_000.0
+    fputs("  buffer \(Audio.devBuf) frames (\(String(format: "%.2f", budgetUs / 1000)) ms):"
+        + " skips \(audio.capSkips)/\(audio.capTicks) in, \(audio.renderSkips)/\(audio.renderTicks) out"
+        + "  renderErrs \(audio.xruns)"
+        + "  work p50 \(String(format: "%.0f", (audio.renderCost.p(0.50) ?? 0) * 1000)) us"
+        + " p99 \(String(format: "%.0f", (audio.renderCost.p(0.99) ?? 0) * 1000)) us"
+        + " of \(String(format: "%.0f", budgetUs)) us"
+        + " (\(String(format: "%.0f", (audio.renderCost.p(0.99) ?? 0) * 1000 / budgetUs * 100))% p99)"
+        + "  frames \(audio.capFrames) vs clock, deficit "
+        + "\(String(format: "%.0f", audio.capFrameDeficit)) samples "
+        + "(\(String(format: "%.2f", audio.capFrameDeficit / SR * 1000)) ms)\n", stderr)
+  }
   if let j = audio.jumpAtEdge.p(0.95), audio.jumpAtEdge.count > 4 {
     let rms = audio.sigRms
     fputs("  conceal edges: \(audio.jumpAtEdge.count) sampled, step p95 \(String(format: "%.4f", j))"
