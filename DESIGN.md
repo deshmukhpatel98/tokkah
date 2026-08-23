@@ -10253,3 +10253,77 @@ Where the app is now, all measured today, all encrypted, 2.43 Mbps, 6% of one co
 | loopback | 9.8 ms | 9.8 |
 | 130 ms rtt, clean | 75.8 ms | 10.8 |
 | 130 ms rtt, 1% loss + 15 ms stalls every 3 s | ~90 ms | ~25 |
+
+## 17.99 What was said against what was played — and validating the ruler first
+
+Half the goal is "audio lossless" and there has never been an instrument for it. Every
+audio quality number in this project has been a **proxy**: the size of the step at a
+concealment seam, the count of concealed packets, the recovery rate. Proxies are what
+you use when you cannot see the thing itself.
+
+But the thing itself is right here. The source is a known file (§17.94's `--audio`) and
+the playout is a stream of samples, so the actual error between what was said and what
+was played is computable, sample by sample. `--dump-playout` writes the samples that
+reached the speaker — appended into a preallocated buffer from the render callback and
+flushed by a background thread, because file I/O on a real-time audio thread is the
+malloc-on-the-audio-thread mistake in another costume. `testbed/playout-snr.py` aligns
+and scores it.
+
+### The ruler was wrong twice, and both times it said something plausible
+
+This is the part worth keeping. Before believing any number, the analyser was run
+against inputs whose answers are known in advance: a perfect copy at an integer delay,
+a perfect copy at an exact 0.37-sample delay, the source plus white noise at exactly
+-40 dB, and the source resampled by 30 ppm with linear and with cubic interpolation.
+
+| known input | should read | first read | after fixes |
+|---|---|---|---|
+| perfect copy | ~140 dB (float32) | 141.2 ✓ | 140.6 ✓ |
+| exact 0.37-sample shift | ~140 dB | **56.9** ✗ | 78.4 |
+| noise at -40 dB | 40 dB | 39.8 ✓ | 40.3 ✓ |
+| linear resample, 30 ppm | worse than cubic | **28.6** | 51.8 |
+| cubic resample, 30 ppm | better than linear | **28.6** ✗ (identical) | **54.2** |
+
+Two defects, and each produced a confident wrong story about the app:
+
+1. **A circular shift on a non-periodic segment.** An FFT phase rotation is an exact
+   fractional delay for a periodic signal; a one-second excerpt of speech is not one,
+   so the shift wrapped the segment's end into its start and the edge artifact capped
+   the analyser at 57 dB. I had already read "the app measures 57 dB p50" off it and
+   concluded the linear interpolator was the quality ceiling. **It was the ruler's own
+   floor.** Fixed by shifting a padded window and scoring only its centre.
+2. **Intra-chunk drift.** At 30 ppm a one-second chunk drifts 1.4 samples from start to
+   end, and one offset cannot correct a moving one. That residual is identical whatever
+   the interpolator is, which is exactly why linear and cubic scored the same **to
+   0.1 dB across every percentile** — a result impossible on its face, and the tell.
+   Chunks are 50 ms now: 0.07 samples of intra-chunk drift.
+
+A third fix came from the same discipline: the per-chunk alignment search now *tracks*,
+centring each chunk on the previous chunk's answer, and rejects chunks whose
+correlation peak is not clearly dominant. A wide fixed window let self-similar speech
+win with the wrong peak, which is how an earlier version reported 238 samples of
+"drift" in a single chunk. The validated ruler recovers a deliberate 30 ppm as 123
+samples of walk over 85 s, which is right to the sample.
+
+### What it then said
+
+The resampler was changed from linear to Catmull-Rom while all this was going on — the
+rate governor reads the ring at a non-integer position, so every played sample is
+interpolated, and one sample behind and two ahead are already available inside the
+jitter buffer's 96 samples of lookahead. In the **controlled** test at 30 ppm it is
+worth 2.4 dB at p50 and 7 dB at p05 (38.4 → 45.4). Operationally it is free: rotated
+arms give m2e 9.93/9.92 against linear's 9.91/9.77, all at jit 3, zero concealment,
+render callback work still under a microsecond of its 333. Kept, on that evidence.
+
+In the **app**, run-to-run variance swamps it: end-to-end SNR p50 ranged 51 to 85 dB
+across runs of the same build, p05 29 to 38 dB, with one 50 ms chunk at -2.6 dB. So
+there is no interpolator claim to make here, and the honest statement is the harder
+one: **the path is not transparent, the variance is larger than any mechanism tested so
+far, and it is now measurable.** That is the next thread, and before this there was no
+way to even ask the question.
+
+One caveat that matters for interpreting all of it: on loopback both ends share one
+physical pair of audio devices, so the capture-to-playout clock relationship here is
+not the one two separate Macs will have. The mechanism most likely to explain the
+variance — the rate governor tracking a real clock difference — is the mechanism this
+rig can least faithfully reproduce.

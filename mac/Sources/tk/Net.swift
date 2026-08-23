@@ -95,6 +95,17 @@ final class RecvRing {
   /// Late arrivals that missed by less than one packet -- the only ones a single
   /// extra packet of buffer would have saved.
   var nearLate = 0
+
+  /// One sample by ABSOLUTE index, or nil if the packet holding it is not here.
+  /// The resampler needs neighbours either side of the read cursor and a missing
+  /// neighbour has to be visible as missing -- substituting a zero would put a
+  /// notch in the waveform at every packet edge.
+  @inline(__always) func sampleAt(_ i: Int64) -> Float? {
+    guard i >= 0 else { return nil }
+    let sq = Int32(i / Int64(FPP))
+    guard present(sq) else { return nil }
+    return samples[(Int(sq) % RING) * FPP + Int(i % Int64(FPP))]
+  }
   // ── Is the tail the sender's or the receiver's? ────────────────────────────
   //
   // The buffer controller keeps settling at 3, 4 or 5 packets across runs, worth

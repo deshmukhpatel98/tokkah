@@ -156,6 +156,8 @@ final class Audio {
   /// attributed to the thing that changed is not an improvement, it is a hope.
   var concealZeros = false
   var concealGrain = false
+  /// `--interp linear` restores the old resampler so the change can be A/B'd.
+  var interpLinear = false
   /// THE SIZE OF THE CLICK, measured rather than argued about. A click is a
   /// discontinuity in the waveform, so the biggest sample-to-sample step at the
   /// edge of a concealed packet IS the artifact. Filling with zeros steps by the
@@ -194,6 +196,50 @@ final class Audio {
   private var srcSamples: UnsafeMutablePointer<Float>?
   private var srcCount = 0
   private var srcPos = 0
+  // ── What was said, and what was played ─────────────────────────────────────
+  //
+  // Every audio quality number in this project has been a PROXY: the size of the
+  // step at a concealment seam, the count of concealed packets, the recovery rate.
+  // Proxies are what you use when you cannot see the thing itself. But the thing
+  // itself is right here -- the source is a known file and the playout is a stream
+  // of samples -- so the actual error between what was said and what was played is
+  // computable, sample by sample, and every proxy can be checked against it.
+  //
+  // Writing from the render callback is not allowed: file I/O on a real-time audio
+  // thread is the malloc-on-the-audio-thread mistake in another costume. So the
+  // callback only appends into a preallocated buffer and bumps an index, and a
+  // background thread does the writing. If the buffer fills, recording stops and
+  // says so -- it does not wrap, because a wrapped recording silently splices two
+  // moments together and would look like a glitch that never happened.
+  private var dumpBuf: UnsafeMutablePointer<Float>?
+  private var dumpCap = 0
+  private var dumpW = 0
+  private(set) var dumpFull = false
+  private var dumpPath: String?
+
+  func startDump(_ path: String, seconds: Double = 300) -> String {
+    let n = Int(seconds * SR)
+    let b = UnsafeMutablePointer<Float>.allocate(capacity: n)
+    b.initialize(repeating: 0, count: n)
+    dumpBuf = b; dumpCap = n; dumpW = 0; dumpPath = path
+    Thread { [weak self] in
+      guard let self else { return }
+      FileManager.default.createFile(atPath: path, contents: nil)
+      guard let fh = FileHandle(forWritingAtPath: path) else { return }
+      var flushed = 0
+      while true {
+        Thread.sleep(forTimeInterval: 0.5)
+        let w = self.dumpW              // one reader, one writer, monotonic index
+        if w > flushed {
+          let bytes = (w - flushed) * 4
+          fh.write(Data(bytes: UnsafeRawPointer(b + flushed), count: bytes))
+          flushed = w
+        }
+      }
+    }.start()
+    return "playout dump: \(path) -- raw float32 mono @48000, up to \(Int(seconds)) s"
+  }
+
   var acoustic = false
 
   /// The pitch period of what was just playing, by normalised autocorrelation.
@@ -728,11 +774,40 @@ final class Audio {
         let nSeq = Int32(nextI / Int64(FPP)), nOff = Int(nextI % Int64(FPP))
         let b = ring.present(nSeq) ? ring.samples[(Int(nSeq) % RING) * FPP + nOff] : a
         let fr = Float(absF - Double(absI))
+        // ── The resampler was the quality ceiling ──────────────────────────────
+        //
+        // The rate governor reads the ring at a non-integer position, so every
+        // played sample is interpolated. It was interpolated LINEARLY, and that is
+        // the whole reason this path -- uncompressed 32-bit float, zero loss, zero
+        // concealment -- measured 57 dB end to end instead of the 96 dB its 16-bit
+        // source allows. 2.43 Mbps of pristine samples, resampled down to worse
+        // than a good 64 kbps codec, and no metric in the program could see it:
+        // concealment, lateness and mouth-to-ear all read perfectly clean.
+        //
+        // Worse at the start. While the buffer descends from its safe 6 packets the
+        // governor is slewing hard, the fractional position sweeps fast, and the
+        // measured SNR over the first twenty seconds of a call runs 10-45 dB.
+        //
+        // Catmull-Rom needs one sample behind and two ahead. Both are already
+        // there -- the jitter buffer holds at least three packets, 96 samples, of
+        // lookahead -- so this costs about ten multiply-adds per sample on a
+        // callback that currently uses under one microsecond of its 333.
         // The value the algorithm produces, measured BEFORE muting. Muting is a
         // property of this test rig, not of the concealment, and a metric that
         // reads zero for both arms because the speaker is off would have made
         // this whole comparison meaningless while looking like a result.
-        var val = a + (b - a) * fr
+        var val: Float
+        if interpLinear {
+          val = a + (b - a) * fr
+        } else {
+          let sm = ring.sampleAt(absI - 1) ?? a
+          let s2 = ring.sampleAt(absI + 2) ?? b
+          let t = fr, t2 = t * t, t3 = t2 * t
+          val = 0.5 * ((2 * a)
+                     + (-sm + b) * t
+                     + (2 * sm - 5 * a + 4 * b - s2) * t2
+                     + (-sm + 3 * a - 3 * b + s2) * t3)
+        }
         if wasConcealing {
           // Do not step into the returning signal either. Cross-fade its first
           // 1.3 ms against the synthesis that is already running -- the real
@@ -753,6 +828,7 @@ final class Audio {
         out[i] = mute ? 0 : val
         noteEdge(val)
         prevOut = val
+        if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         sigSumSq += Double(val) * Double(val); sigN += 1
         // History is what was actually PLAYED, and only the good path writes it:
         // feeding synthesis back in would make the cursor chase its own tail.
@@ -811,6 +887,7 @@ final class Audio {
         out[i] = mute ? 0 : val
         noteEdge(val)
         prevOut = val
+        if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if off == 0 {
           if concealRun < 1_000_000 { concealRun += 1 }
           ring.concealed += 1

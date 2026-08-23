@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.13.0"
+let VERSION = "0.14.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -250,8 +250,10 @@ let fecAllowed = !flag("no-fec")
 if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
 if flag("no-rt") { Wire.noRealtime = true }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
+if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 audio.concealZeros = (arg("conceal") == "zeros")
 audio.concealGrain = (arg("conceal") == "grain")
+audio.interpLinear = (arg("interp") == "linear")
 audio.acoustic = flag("acoustic")
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
 if audio.acoustic && audio.mute {
