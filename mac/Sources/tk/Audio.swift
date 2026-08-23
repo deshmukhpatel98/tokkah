@@ -111,6 +111,7 @@ final class Audio {
   // a tone, which is worse than a hole.
   private var lastGood: UnsafeMutablePointer<Float>
   private var haveLastGood = false
+  private var goodRun = 0
   private var concealRun = 0
 
   // ── Packet loss concealment, at the pitch period ───────────────────────────
@@ -1382,7 +1383,13 @@ final class Audio {
         lastGood[off] = a
         // A complete packet of last-good samples needs the boundary; the run
         // length does not, and resetting it per sample is what makes it true.
-        if off == FPP - 1 { haveLastGood = true }
+        // LAST of the same class as `played` and `concealed`: this asked for the
+        // cursor to land on the exact final sample of a packet, which a fractional
+        // cursor can step over indefinitely -- so the grain conceal path could
+        // stay disarmed for the whole call and output silence instead. A run of
+        // FPP good samples proves every slot was written, and cannot be skipped.
+        goodRun += 1
+        if goodRun >= FPP { haveLastGood = true }
         concealRun = 0
         ring.playedS += 1
         if Int64(seq) > ring.maxPlayedSeq { ring.maxPlayedSeq = Int64(seq) }
@@ -1454,6 +1461,7 @@ final class Audio {
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
         if concealRun < 1_000_000_000 { concealRun += 1 }
+        goodRun = 0
         ring.concealedS += 1
         // Already past this sequence and it never came: lost. Not yet reached
         // by the stream: starved, which a bigger buffer does address.

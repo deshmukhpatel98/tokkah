@@ -33,6 +33,9 @@ let HPKT = 4 + 32
 // it is a silent break, and the two ends of a call update up to 60 s apart.
 let HPKTX = HPKT + 4
 let CAP_PCM16: UInt32 = 1 << 0
+/// Lossless prediction + Rice coding on the payload. Advertised, never assumed:
+/// a peer that does not know the format would read the mode byte as a sample.
+let CAP_PCM_LP: UInt32 = 1 << 1
 let MAGIC: UInt32 = 0x544B_0001
 /// "send me a keyframe". Eight bytes, no payload, sent by a receiver that cannot
 /// decode. Necessary because H.264 parameter sets ride only with keyframes and
@@ -451,15 +454,31 @@ final class Wire {
     // it in the handshake. Guessing here would mean an old build computing
     // frames = 65568 and dropping the packet in silence.
     let pcm16 = sendPcm16
+    let lp = sendLp
     let bps = pcm16 ? 2 : 4
-    let tag = UInt32(n) | (pcm16 ? (1 << 16) : 0)
+    let tag = UInt32(n) | (pcm16 ? (1 << 16) : 0) | (lp ? (1 << 17) : 0)
     (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = tag.littleEndian }
-    if pcm16 { pack16(src, n, into: scratch + HDR) } else { memcpy(scratch + HDR, src, n * 4) }
-    var total = HDR + n * bps
+    // A compressed block is variable length, so it carries its own length byte.
+    // Deriving it from the datagram size would work for the primary block and be
+    // ambiguous the moment a redundant block follows.
+    func put(_ from: UnsafePointer<Float>, _ at: Int) -> Int {
+      guard lp else {
+        if pcm16 { pack16(from, n, into: scratch + at) } else { memcpy(scratch + at, from, n * 4) }
+        return n * bps
+      }
+      pack16(from, n, into: lpTmp)
+      let m = lpTmp.withMemoryRebound(to: Int16.self, capacity: n) {
+        Lpc.encode($0, n, into: scratch + at + 1)
+      }
+      scratch[at] = UInt8(m)
+      lpIn += n * 2; lpOut += m + 1
+      if scratch[at + 1] & 0x80 != 0 { lpRaws += 1 }
+      return 1 + m
+    }
+    var total = HDR + put(src, HDR)
     if let r = redundant {
       (scratch + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
-      if pcm16 { pack16(r, n, into: scratch + total + 8) } else { memcpy(scratch + total + 8, r, n * 4) }
-      total += 8 + n * bps
+      total += 8 + put(r, total + 8)
       redundantSent += 1
     }
     // Through rawSend, not sendto. This path used to call sendto directly, which
@@ -614,11 +633,23 @@ final class Wire {
   /// nobody can turn off is a claim, not a measurement.
   nonisolated(unsafe) static var noRealtime = false
   /// What this build can receive, and what the far end says it can.
-  nonisolated(unsafe) static var myCaps: UInt32 = CAP_PCM16
+  nonisolated(unsafe) static var myCaps: UInt32 = CAP_PCM16 | CAP_PCM_LP
   /// `--pcm32` forces the old format so the change can be A/B'd from either side.
   nonisolated(unsafe) static var forceFloat = false
+  nonisolated(unsafe) static var forceNoLp = false
   private(set) var peerCaps: UInt32 = 0
   var sendPcm16: Bool { !Wire.forceFloat && (peerCaps & CAP_PCM16) != 0 }
+  /// Compression rides ON TOP of 16-bit: the coder's input is int16 samples, so
+  /// without pcm16 there is nothing for it to compress.
+  var sendLp: Bool { !Wire.forceNoLp && sendPcm16 && (peerCaps & CAP_PCM_LP) != 0 }
+  /// Wire bytes actually spent on payload, coded and raw, so the ratio the call
+  /// achieved is reported rather than assumed from an offline measurement.
+  nonisolated(unsafe) var lpIn = 0
+  nonisolated(unsafe) var lpOut = 0
+  nonisolated(unsafe) var lpRaws = 0
+  nonisolated(unsafe) var lpBadDecode = 0
+  /// int16 staging for the coder's input, owned by the capture thread.
+  private let lpTmp = UnsafeMutablePointer<UInt8>.allocate(capacity: Lpc.MAXN * 2)
   private(set) var peerRxLost: Int = 0
   private(set) var peerRxRecovered: Int = 0
   /// Whether the far end reports at all. False means an older build, and the
@@ -754,6 +785,26 @@ final class Wire {
     // One float scratch for unpacking 16-bit payloads. Safe as a single buffer for
     // the same reason dbuf is: there is exactly one receive thread.
     let fbuf = UnsafeMutablePointer<Float>.allocate(capacity: FPP + 8)
+    // Compressed payload lands here as int16 first, then converts to float. Both
+    // buffers belong to this thread alone, which is why neither needs a lock.
+    let ibuf = UnsafeMutablePointer<Int16>.allocate(capacity: Lpc.MAXN)
+    /// Decode a coded block into `fbuf`. Takes the pointer to the LENGTH BYTE, not
+    /// to the payload, so it mirrors the sender's framing exactly -- the first
+    /// version took the payload pointer and the two call sites passed the length
+    /// byte, so the decoder read it as the mode byte and refused every packet on
+    /// the call. `recv 0/s` for three minutes while bytes kept arriving.
+    ///
+    /// False means malformed, which a corrupt or hostile packet is allowed to be:
+    /// counted and dropped, never trusted.
+    func expand(_ at: UnsafePointer<UInt8>, _ frames: Int) -> Bool {
+      let len = Int(at[0])
+      guard frames <= Lpc.MAXN, len > 0, Lpc.decode(at + 1, len, frames, into: ibuf) else {
+        lpBadDecode += 1
+        return false
+      }
+      for i in 0..<frames { fbuf[i] = Float(ibuf[i]) / 32767.0 }
+      return true
+    }
     while true {
       var src = sockaddr_in()
       var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -775,7 +826,7 @@ final class Wire {
           let c2 = (buf + HPKT).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
           if c2 != peerCaps {
             peerCaps = c2
-            fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\n", stderr)
+            fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\(c2 & CAP_PCM_LP != 0 ? ", lossless-compressed" : "")\n", stderr)
           }
         }
         if let c = crypto {
@@ -882,7 +933,12 @@ final class Wire {
       let cap = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
       let tag = (plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
       let frames = Int(tag & 0xffff)
-      let bps = (tag >> 16) == 1 ? 2 : 4
+      // MASK THE BIT, do not compare the whole field. This read `(tag >> 16) == 1`,
+      // which is the same thing only while pcm16 is the only flag up there -- the
+      // next flag added silently turns every 16-bit packet into a 32-bit one and
+      // the audio becomes noise. One bit per question.
+      let bps = (tag >> 16) & 1 == 1 ? 2 : 4
+      let lp = (tag >> 17) & 1 == 1
       // EXACTLY our packet size, or nothing. The old test was `frames > FPP`,
       // which is wrong in both directions during a rollout -- and the two machines
       // in a call update up to 60 s apart, so a rollout is guaranteed.
@@ -895,7 +951,10 @@ final class Wire {
       //
       // Now it is neither. A mismatch is refused and named, so the failure tells
       // you what it is and which side to fix.
-      if frames <= 0 || plainN < HDR + frames * bps { continue }
+      // A compressed block's length is in the byte before it; an uncompressed one
+      // is frames * bps. Either way the payload must be entirely inside the packet.
+      let plen = lp ? (plainN > HDR ? 1 + Int(plain[HDR]) : 0) : frames * bps
+      if frames <= 0 || plen <= 0 || plainN < HDR + plen { continue }
       if frames != FPP {
         fmtMismatch += 1
         // The far end is on another build and this call is going nowhere until one
@@ -910,7 +969,9 @@ final class Wire {
         }
         continue
       }
-      if bps == 2 {
+      if lp {
+        if expand(plain + HDR, frames) { ring.write(seq: seq, cap: cap, src: fbuf, n: frames) }
+      } else if bps == 2 {
         unpack16(plain + HDR, frames, into: fbuf)
         ring.write(seq: seq, cap: cap, src: fbuf, n: frames)
       } else {
@@ -920,12 +981,15 @@ final class Wire {
       // the hole only if it IS a hole -- ring.write already refuses a duplicate,
       // and refuses anything the cursor has passed, so nothing here can overwrite
       // audio about to play.
-      let redOff = HDR + frames * bps
-      if plainN >= redOff + 8 + frames * bps, seq > 0 {
+      let redOff = HDR + plen
+      let rLen = lp ? (plainN > redOff + 8 ? 1 + Int(plain[redOff + 8]) : 0) : frames * bps
+      if rLen > 0, plainN >= redOff + 8 + rLen, seq > 0 {
         let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
         let rSeq = seq - 1
         if !ring.present(rSeq) {
-          if bps == 2 {
+          if lp {
+            if expand(plain + redOff + 8, frames) { ring.write(seq: rSeq, cap: rCap, src: fbuf, n: frames) }
+          } else if bps == 2 {
             unpack16(plain + redOff + 8, frames, into: fbuf)
             ring.write(seq: rSeq, cap: rCap, src: fbuf, n: frames)
           } else {

@@ -44,6 +44,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
+  "selftest-lpc", "no-lp",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -289,6 +290,7 @@ let fecAllowed = !flag("no-fec")
 if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
 if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
+if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if flag("aec") { fputs(audio.enableAec() + "\n", stderr) }
@@ -304,6 +306,76 @@ audio.concealGrain = (arg("conceal") == "grain")
 audio.interpLinear = (arg("interp") == "linear")
 audio.acoustic = flag("acoustic")
 audio.cursorAheadMs = Double(arg("cursor-ahead") ?? "0") ?? 0
+
+// ── Self-test: decode(encode(x)) must equal x, for every x ────────────────────
+//
+// A lossless coder has the rare luxury of an ABSOLUTE test, so it gets one: real
+// speech, then the shapes that break bit-packers -- silence, full scale, the
+// alternating extremes that maximise every residual, and pseudo-random noise
+// where prediction cannot help and the raw fallback must engage.
+if let path = arg("selftest-lpc") {
+  var fail = 0, packets = 0, inBytes = 0, outBytes = 0
+  var raws = 0
+  var hist = [Int: Int]()
+  func check(_ s: [Int16], _ label: String) {
+    var enc = [UInt8](repeating: 0, count: Lpc.bound(s.count))
+    var dec = [Int16](repeating: 0, count: s.count)
+    let m = s.withUnsafeBufferPointer { sp in
+      enc.withUnsafeMutableBufferPointer { ep in Lpc.encode(sp.baseAddress!, s.count, into: ep.baseAddress!) }
+    }
+    let ok = enc.withUnsafeBufferPointer { ep in
+      dec.withUnsafeMutableBufferPointer { dp in Lpc.decode(ep.baseAddress!, m, s.count, into: dp.baseAddress!) }
+    }
+    packets += 1; inBytes += s.count * 2; outBytes += m
+    if enc[0] & 0x80 != 0 { raws += 1 } else { hist[Int(enc[0] & 3), default: 0] += 1 }
+    if !ok || dec != s {
+      fail += 1
+      if fail <= 3 {
+        let bad = (0..<s.count).first { dec[$0] != s[$0] } ?? -1
+        fputs("  MISMATCH \(label): ok=\(ok) first bad index \(bad)"
+            + " want \(bad >= 0 ? Int(s[bad]) : 0) got \(bad >= 0 ? Int(dec[bad]) : 0)"
+            + "  mode 0x\(String(enc[0], radix: 16)) bytes \(m)\n", stderr)
+      }
+    }
+  }
+  // Synthetic edge cases first: they are the ones that expose a bit-packer.
+  check([Int16](repeating: 0, count: FPP), "silence")
+  check([Int16](repeating: 32767, count: FPP), "full positive")
+  check([Int16](repeating: -32768, count: FPP), "full negative")
+  check((0..<FPP).map { $0 % 2 == 0 ? Int16(32767) : Int16(-32768) }, "alternating extremes")
+  check((0..<FPP).map { Int16(truncatingIfNeeded: $0 * 1031) }, "ramp")
+  var seed: UInt64 = 0x2545_F491_4F6C_DD1D
+  for _ in 0..<2000 {
+    let s = (0..<FPP).map { _ -> Int16 in
+      seed = seed &* 6364136223846793005 &+ 1442695040888963407
+      return Int16(truncatingIfNeeded: seed >> 33)
+    }
+    check(s, "random")
+  }
+  // Then the thing it actually has to compress.
+  if let d = FileManager.default.contents(atPath: path) {
+    // Walk the chunks; realA.wav carries a LIST chunk so `data` starts at 78, not
+    // 44, and assuming the canonical header silently feeds metadata to the coder.
+    var off = 12
+    while off + 8 <= d.count {
+      let cid = String(bytes: d[off..<(off + 4)], encoding: .ascii) ?? ""
+      let sz = d[(off + 4)..<(off + 8)].withUnsafeBytes { $0.load(as: UInt32.self) }
+      if cid == "data" { off += 8; break }
+      off += 8 + Int(sz) + (Int(sz) & 1)
+    }
+    let count = (d.count - off) / 2
+    var pcm = [Int16](repeating: 0, count: count)
+    _ = pcm.withUnsafeMutableBytes { d.copyBytes(to: $0, from: off..<(off + count * 2)) }
+    var i = 0
+    while i + FPP <= count { check(Array(pcm[i..<(i + FPP)]), "speech@\(i)"); i += FPP }
+  } else { fputs("  (no wav at \(path) -- synthetic cases only)\n", stderr) }
+  let ratio = Double(inBytes) / Double(max(1, outBytes))
+  fputs("lpc self-test: \(packets) packets, \(fail) mismatches"
+      + "  \(String(format: "%.2f", Double(outBytes) / Double(packets))) B/packet"
+      + "  ratio \(String(format: "%.2f", ratio))x"
+      + "  raw-fallback \(raws)  orders \(hist.sorted { $0.key < $1.key }.map { "p\($0.key)x\($0.value)" }.joined(separator: " "))\n", stderr)
+  exit(fail == 0 ? 0 : 1)
+}
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
 if audio.acoustic && audio.mute {
   fputs("--acoustic needs to play a sound and playout is muted (--mute or TK_MUTE=1).\n"
@@ -1052,6 +1124,12 @@ func reportLoop() {
     // skipped buffer is a doubled gap; the render cost says how close the work is
     // to the deadline it has.
     let budgetUs = Double(Audio.devBuf) / SR * 1_000_000.0
+    if wire.lpIn > 0 {
+      let ratio = Double(wire.lpIn) / Double(max(1, wire.lpOut))
+      fputs("  payload: \(wire.lpIn / 1024) KiB of samples sent as \(wire.lpOut / 1024) KiB"
+          + " (\(String(format: "%.2f", ratio))x lossless)"
+          + "  raw-fallback \(wire.lpRaws)  bad decodes \(wire.lpBadDecode)\n", stderr)
+    }
     // EVERY rendered sample takes exactly one of the two branches, so this is an
     // identity, not an estimate. If it ever fails to hold, a sample was played
     // that no counter saw -- which is the class of bug that made a healthy call
