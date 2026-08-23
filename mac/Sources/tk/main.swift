@@ -13,7 +13,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.8.0"
+let VERSION = "0.9.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -252,10 +252,11 @@ if flag("window") {
   let app = NSApplication.shared
   app.setActivationPolicy(.regular)
   if displayKind == "metal" {
-    if let m = MetalDisplay(vsyncOff: arg("vsync") == "0") {
+    if let m = MetalDisplay(vsyncOff: arg("vsync") == "0", fullscreen: flag("fullscreen")) {
       m.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
       mdisplay = m
-      fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on"), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
+      fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on")"
+          + "\(m.fullscreen ? ", fullscreen" : ""), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
     } else {
       fputs("display: metal unavailable, falling back\n", stderr)
     }
@@ -675,11 +676,28 @@ func reportLoop() {
         + "  frags \(vasm.fragsIn) frames-lost \(vasm.missing) partial-drops \(vasm.dropped) decFails \(vdec.decFails) noFmt \(vdec.noFormat)"
         + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
         + (display != nil ? "  window \(display!.state) shown \(display!.shown) enqFail \(display!.enqueueFails) refresh \(String(format: "%.1f", display!.refreshMs))ms" : "")
-        + (mdisplay != nil ? "  metal \(mdisplay!.state) shown \(mdisplay!.shown) skip \(mdisplay!.skipped)"
-           + "  decode->glass p50 \(mdisplay!.present.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
-           + " p95 \(mdisplay!.present.p(0.95).map { String(format: "%.2f", $0) } ?? "-") ms"
-           + " (timed \(mdisplay!.present.count) of \(mdisplay!.shown)"
-           + ", noTime \(mdisplay!.presentNoTime), outOfRange \(mdisplay!.presentOutOfRange))" : "")
+        + (mdisplay != nil ? { () -> String in
+            let m = mdisplay!
+            let cov = m.shown > 0 ? Double(m.present.count) / Double(m.shown) : 0
+            // A PERCENTILE OVER A TENTH OF THE FRAMES IS NOT A LATENCY.
+            //
+            // A two-minute fullscreen run reported "decode->glass p50 3.78 ms"
+            // from 402 samples out of 3875 -- the window had gone occluded, so
+            // most frames were never presented at all, and the quantile was
+            // frozen from the first few seconds. It looked like the best result
+            // of the day. Coverage was printed right beside it and I still had
+            // to go looking. So now the number withholds itself: below half the
+            // frames it prints the coverage instead, because a figure that is
+            // present but wrong is read, and a figure that is absent is
+            // investigated.
+            let body = cov >= 0.5
+              ? "decode->glass p50 \(m.present.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
+                + " p95 \(m.present.p(0.95).map { String(format: "%.2f", $0) } ?? "-") ms"
+              : "decode->glass WITHHELD (only \(Int(cov * 100))% of frames were presented"
+                + "\(m.state == "occluded" ? ", window occluded" : "") -- no number)"
+            return "  metal \(m.state) shown \(m.shown) skip \(m.skipped)  \(body)"
+                 + " (timed \(m.present.count) of \(m.shown), noTime \(m.presentNoTime))"
+          }() : "")
         + "\n", stderr)
   }
   if d.cap == 0 {

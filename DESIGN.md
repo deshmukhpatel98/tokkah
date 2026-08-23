@@ -9415,3 +9415,57 @@ so an unencrypted call cannot pass for an encrypted one. Verified against **the
 real 0.8.0 binary fetched from prod**: 759 and 754 packets/s both directions, call
 unaffected. Steady state between two updated ends: `crypt on (11628/11633
 sealed/opened, 0 bad)`, m2e 15.93 ms — unchanged.
+
+## 17.83 Fullscreen alone does nothing; fullscreen and no-vsync together is 3.8 ms
+
+Hypothesis: a single opaque layer covering the whole screen can qualify for the
+compositor's direct-to-display path, skipping a compositing step — and unlike
+vsync-off, costing no tearing. Measured, 45 s per arm, coverage in brackets:
+
+    windowed,   vsync on    24.60 ms p50   33.50 p95   (1204/1217)
+    fullscreen, vsync on    26.28 ms p50   31.93 p95   (1246/1249)
+    fullscreen, vsync off    3.81 ms p50   16.88 p95   (1246/1250)
+
+**The hypothesis was wrong and the combination was right.** Fullscreen on its own
+is no better — slightly worse, inside noise. But fullscreen *with* vsync off is
+3.81 ms where windowed with vsync off was 20.46 ms. So going fullscreen does open
+a direct path to the display controller; it just cannot be taken while the
+compositor is still being asked to synchronise. Windowed mode has to composite the
+layer against the rest of the desktop and can never go direct.
+
+If that holds, video is `capture → decoded 2.7–5.6 ms` plus `3.8 ms`, so **glass
+to glass around 7–9 ms**, against ~35 ms at the start of the day.
+
+### The follow-up run reported the best number of the day and meant nothing
+
+    2 minutes: decode->glass p50 3.78 ms   (timed 402 of 3875, noTime 3473)
+
+Ten percent coverage. The window had gone occluded partway through — the machine's
+screen state changed on its own — and an occluded window's drawables are never
+presented, so `presentedTime` comes back zero. The quantile stopped moving after
+the first few seconds and then sat there looking like a result. Coverage was
+printed directly beside it and I still had to go and check.
+
+So the metric now **withholds itself**: under 50% coverage it prints the coverage
+and the occlusion state instead of a figure. A number that is present but wrong
+gets read; a number that is absent gets investigated. Verified by the next run,
+which printed
+
+    decode->glass WITHHELD (only 0% of frames were presented, window occluded -- no number)
+
+instead of a personal best.
+
+### What is and is not established
+
+The three arms above each have ≥99% coverage on a visible window, so the
+*comparison* stands. The 3.81 ms arm is one 45-second run and wants replication on
+a screen that stays awake, which is not something I can arrange at 6am while its
+owner is asleep — the same constraint that blocks the camera work. And the win is
+still a trade: tearing does not exist in a GPU readback, so no instrument here can
+price it. `--dump-metal` in this mode shows the picture correct — upright, not
+mirrored, colours right — but tearing is a scanout artifact and a readback cannot
+see one.
+
+Default therefore stays `AVSampleBufferDisplayLayer`, windowed, synchronised.
+`--display metal --fullscreen --vsync 0` is the measured fast path, and whether
+its tearing is acceptable belongs to whoever is looking at the screen.

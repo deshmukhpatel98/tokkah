@@ -51,9 +51,11 @@ final class MetalDisplay {
   private(set) var lastPresentMs: Double = 0
   private(set) var refreshMs: Double = 0
   let vsyncOff: Bool
+  let fullscreen: Bool
 
-  init?(vsyncOff: Bool) {
+  init?(vsyncOff: Bool, fullscreen: Bool) {
     self.vsyncOff = vsyncOff
+    self.fullscreen = fullscreen
     guard let d = MTLCreateSystemDefaultDevice(), let q = d.makeCommandQueue() else { return nil }
     dev = d
     queue = q
@@ -133,6 +135,14 @@ final class MetalDisplay {
     window.center()
     window.makeKeyAndOrderFront(nil)
     win = window
+    // FULLSCREEN IS NOT COSMETIC HERE. A single opaque layer covering the whole
+    // screen can qualify for the compositor's direct-to-display path, which skips
+    // a compositing step -- and unlike vsync-off, it costs no tearing. Whether it
+    // actually engages is not something to assume: presentedTime says.
+    if fullscreen {
+      window.collectionBehavior = [.fullScreenPrimary]
+      window.toggleFullScreen(nil)
+    }
     if let scr = window.screen ?? NSScreen.main {
       let hz = scr.maximumFramesPerSecond
       refreshMs = hz > 0 ? 1000.0 / Double(hz) : 0

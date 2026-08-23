@@ -1,1 +1,1 @@
-{"version":"0.8.0","url":"https://room.tokkah.com/macos/dl/tk-0.8.0.tar.gz","sha256":"57e5f433c0bd0577cf1be92bd54a355cfbc4d2db390b2128849bfcbdb12a2120","size":117623,"notes":"--room races both candidate addresses and locks onto whichever answers"}
+{"version":"0.9.0","url":"https://room.tokkah.com/macos/dl/tk-0.9.0.tar.gz","sha256":"531643edf548773969315c7a79cb763a8b4fdfb965922819d8991fa8e10532df","size":144040,"notes":"audio and video are encrypted (X25519 + AES-256-GCM), and it costs 0.78 microseconds a packet"}
