@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tokkah calls</title>
+<style>
+  :root {
+    --bg: #0e1014; --panel: #16191f; --line: #262b34;
+    --fg: #e8eaf0; --dim: #8b93a3;
+    --good: #35c46a; --warn: #e0a53a; --bad: #e8544f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 22px 24px 10px; }
+  h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 13px; margin-top: 3px; }
+  main { padding: 8px 24px 60px; max-width: 1400px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--dim); font-weight: 600; margin: 26px 0 10px; }
+  .call { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 10px; }
+  .call.live { border-color: #2c4a34; }
+  .top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--dim); }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 20px; font-weight: 600; }
+  .badge.live { background: #16351f; color: var(--good); }
+  .badge.done { background: #23262d; color: var(--dim); }
+  .verdict { margin-left: auto; font-weight: 600; font-size: 13px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(126px, 1fr)); gap: 8px; }
+  .m { background: #11141a; border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; }
+  .m .k { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+  .m .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .m .n { font-size: 10px; color: var(--dim); }
+  .m.good .v { color: var(--good); } .m.warn .v { color: var(--warn); } .m.bad .v { color: var(--bad); }
+  .fix { margin-top: 10px; font-size: 13px; }
+  .fix b { color: var(--bad); } .fix i { color: var(--good); font-style: normal; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; font-size: 11px;
+       text-transform: uppercase; letter-spacing: .05em; padding: 6px 10px 6px 0; }
+  td { padding: 7px 10px 7px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  td.g { color: var(--good); } td.w { color: var(--warn); } td.b { color: var(--bad); }
+  .empty { color: var(--dim); padding: 18px 0; }
+  a { color: #79a6f6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tokkah calls</h1>
+  <div class="sub">Native macOS app. Live calls refresh every 3 seconds.
+    Nothing here identifies a person or a room &mdash; the room name is the encryption key and is never sent.</div>
+</header>
+<main>
+  <h2>Happening now</h2>
+  <div id="live"><div class="empty">No call in progress.</div></div>
+  <h2>Recent calls</h2>
+  <div id="recent"><div class="empty">Loading&hellip;</div></div>
+</main>
+<script src="calls.js"></script>
+</body>
+</html>

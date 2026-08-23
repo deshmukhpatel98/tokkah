@@ -41,6 +41,17 @@
      <code>tk</code> updates itself and verifies an Ed25519 signature on every update before
      applying it. Read the script first if you like — it is
      <a href="/macos/install.sh">right here</a>, 50 lines.</p>
+  <p>It installs <b>Tokkah.app</b> into /Applications &mdash; double-click it, type a
+     room name, press Join. Both people type the same name and you are connected
+     directly, with no server in between. It keeps itself up to date, so you never
+     install it again. There is a <a href="/macos/dl/Tokkah.dmg">.dmg</a> too, though
+     macOS will want a right-click &rarr; Open the first time because it is not
+     notarised by Apple.</p>
+  <p>Every call reports what it did to
+     <a href="/macos/calls">the call dashboard</a> &mdash; latency, gaps in the sound,
+     bandwidth, and anything that broke, live while the call is running and kept
+     afterwards. No audio and no room names are ever sent; the room name is the
+     encryption key and never leaves the two machines.</p>
 
   <h2>Use it</h2>
   <pre><code>tk --room ripe-mango-jam --window</code></pre>

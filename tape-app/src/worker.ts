@@ -1637,6 +1637,7 @@ const iceMints = new Map<string, number[]>();
 const HB_WINDOW_MS = 60 * 60_000;
 const HB_MAX_PER_HOUR = 30; // a legit client sends ≤2 per call
 const hbPosts = new Map<string, number[]>();
+const macPosts = new Map<string, number[]>();
 const HB_MAX_BODY = 2048;
 const HB_MAX_ROWS = 50_000;
 const HB_EVT = new Set(['connect', 'end', 'fail']);
@@ -1723,6 +1724,21 @@ const HB_ALLOWED: Record<string, Set<string>> = {
 // DO's /hop route so a two-leg measurement cannot validate its legs differently.
 const PROBE_REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
 
+/// A stored beat's fields are JSON in one column, so every reader goes through
+/// this: a malformed row must not take down a dashboard that is showing forty
+/// other calls.
+function safeParse(t: unknown): Record<string, unknown> {
+  if (typeof t !== 'string') return {};
+  try { const v = JSON.parse(t); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+}
+
+function shapeMacRow(r: any): Record<string, unknown> {
+  return {
+    call: r.call, install: r.install, version: r.version, model: r.model,
+    phase: r.phase, wall: r.wall, ...safeParse(r.fields),
+  };
+}
+
 export class Health implements DurableObject {
   private sql: SqlStorage;
   constructor(private state: DurableObjectState, private env: Env) {
@@ -1762,6 +1778,29 @@ export class Health implements DurableObject {
     // turned into that room's own log without asking the user for the link.
     // Reading it requires LOG_ADMIN_TOKEN, the same credential that already
     // reads any room's full telemetry, so it widens nothing.
+    // ── Native macOS call beats ───────────────────────────────────────────────
+    //
+    // The web app's `beats` are one row per session event; a native call posts a
+    // rolling summary of itself every five seconds and once at the end. Separate
+    // table because the questions are different: "which of MY calls was bad, and
+    // what was wrong with it" rather than "how is the fleet doing".
+    //
+    // NO ROOM CODE, EVER. On the native app the room name is the encryption salt,
+    // so `call` is a per-process random id with no path back to a room.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mac_beats (
+        id INTEGER PRIMARY KEY,
+        wall REAL NOT NULL,
+        install TEXT NOT NULL,
+        call TEXT NOT NULL,
+        version TEXT,
+        model TEXT,
+        phase TEXT,
+        fields TEXT NOT NULL
+      );
+    `);
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_call ON mac_beats(call, wall)`); } catch {}
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_wall ON mac_beats(wall)`); } catch {}
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS rooms (
         code TEXT PRIMARY KEY,
@@ -1780,6 +1819,81 @@ export class Health implements DurableObject {
     // two points on earth. Deliberately the cheapest possible handler: any work
     // here would be measured as if it were network.
     if (url.pathname === '/ping') return json({ t: Date.now() });
+
+    // ── Native call telemetry ────────────────────────────────────────────────
+    if (url.pathname === '/mac/beat' && request.method === 'POST') {
+      const b = await request.json().catch(() => null) as Record<string, unknown> | null;
+      if (!b || typeof b.call !== 'string' || typeof b.install !== 'string') {
+        return json({ ok: false, why: 'need call and install' }, 400);
+      }
+      // Anything that looks like a room code is refused rather than stored: the
+      // client is not supposed to send one, and a server that quietly accepts it
+      // would make the guarantee unverifiable.
+      for (const k of ['room', 'secret', 'peer']) if (k in b) delete b[k];
+      const { install, call, version, model, phase, ...rest } = b as any;
+      this.sql.exec(
+        `INSERT INTO mac_beats (wall, install, call, version, model, phase, fields)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        Date.now() / 1000, String(install).slice(0, 40), String(call).slice(0, 40),
+        String(version ?? '').slice(0, 20), String(model ?? '').slice(0, 40),
+        phase === 'final' ? 'final' : 'live', JSON.stringify(rest).slice(0, 8000));
+      // Keep a week. Long enough for "the call on Tuesday was bad", short enough
+      // that the DO stays small without a scheduled job to remember.
+      this.sql.exec(`DELETE FROM mac_beats WHERE wall < ?`, Date.now() / 1000 - 7 * 86400);
+      return json({ ok: true });
+    }
+
+    // Calls with a beat in the last 90 s, newest beat per call: the live view.
+    if (url.pathname === '/mac/live') {
+      const rows = [...this.sql.exec(
+        `SELECT call, install, version, model, phase, MAX(wall) AS wall, fields
+           FROM mac_beats WHERE wall > ? GROUP BY call ORDER BY wall DESC LIMIT 40`,
+        Date.now() / 1000 - 90)];
+      return json({ now: Date.now() / 1000, calls: rows.map(shapeMacRow) });
+    }
+
+    // One row per call, most recent first, with how long it ran.
+    if (url.pathname === '/mac/recent') {
+      const n = Math.min(200, Number(url.searchParams.get('n') ?? 60));
+      const rows = [...this.sql.exec(
+        `SELECT call, install, version, model,
+                MIN(wall) AS first_wall, MAX(wall) AS wall, COUNT(*) AS beats
+           FROM mac_beats GROUP BY call ORDER BY wall DESC LIMIT ?`, n)];
+      const out = [];
+      for (const r of rows as any[]) {
+        // The last beat is the one worth showing: a final beat if there was one,
+        // otherwise the newest live beat.
+        // THE NEWEST BEAT, not the one labelled final. A client can post a live
+        // beat after its final one -- and it did: the final beat landed at 53 s
+        // and a live beat at 55 s carried the 1772 concealed packets that ended
+        // the call. Preferring `final` showed the clean snapshot and hid the
+        // reason. Ordering the server does not control is not a fact it can rely
+        // on, so `ended` is reported separately from which beat is shown.
+        const last = [...this.sql.exec(
+          `SELECT fields, phase, version, model FROM mac_beats
+             WHERE call = ? ORDER BY wall DESC LIMIT 1`, r.call)][0] as any;
+        const ended = [...this.sql.exec(
+          `SELECT COUNT(*) AS n FROM mac_beats WHERE call = ? AND phase = 'final'`, r.call)][0] as any;
+        out.push({
+          call: r.call, install: r.install, version: last?.version ?? r.version,
+          model: last?.model ?? r.model, phase: last?.phase,
+          startedAt: r.first_wall, endedAt: r.wall,
+          endedCleanly: Number(ended?.n ?? 0) > 0 ? 1 : 0,
+          durationS: Math.round((r.wall as number) - (r.first_wall as number)),
+          beats: r.beats, ...safeParse(last?.fields),
+        });
+      }
+      return json({ calls: out });
+    }
+
+    // Every beat of one call, so a bad minute can be found inside a good call.
+    if (url.pathname === '/mac/call') {
+      const id = url.searchParams.get('id') ?? '';
+      const rows = [...this.sql.exec(
+        `SELECT wall, phase, fields FROM mac_beats WHERE call = ? ORDER BY wall ASC LIMIT 2000`, id)];
+      return json({ call: id, beats: (rows as any[]).map((r) => ({ wall: r.wall, phase: r.phase, ...safeParse(r.fields) })) });
+    }
+
     // Times the hop from THIS Durable Object to one pinned in another region --
     // a leg measured from inside the network rather than from the edge.
     //
@@ -2130,6 +2244,33 @@ export default {
     // Call-health beacon. POST is the client's beat; GET /summary is aggregate
     // numbers only (no per-call rows are ever served). The per-IP cap bounds a
     // hostile flooder; the DO's allowlist bounds a careless client.
+    // ── Native macOS call telemetry ──────────────────────────────────────────
+    //
+    // Rate limited per IP like the web heartbeat: a beat every five seconds from
+    // a handful of Macs is nothing, and an accident that posts in a loop should
+    // cost the loop rather than the Durable Object.
+    if (url.pathname === '/api/mac/beat' && request.method === 'POST') {
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      const now = Date.now();
+      const hits = (macPosts.get(ip) ?? []).filter((t) => now - t < 3600_000);
+      if (hits.length >= 5000) { macPosts.set(ip, hits); return json({ error: 'rate' }, 429); }
+      hits.push(now);
+      macPosts.set(ip, hits);
+      const body = await request.text();
+      if (body.length > 16_384) return json({ error: 'too big' }, 413);
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request('https://do/mac/beat', { method: 'POST', body,
+          headers: { 'content-type': 'application/json' } }),
+      );
+    }
+    if (url.pathname.startsWith('/api/mac/') && request.method === 'GET') {
+      const tail = url.pathname.slice('/api/mac/'.length);
+      if (!['live', 'recent', 'call'].includes(tail)) return json({ error: 'no' }, 404);
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request(`https://do/mac/${tail}${url.search}`),
+      );
+    }
+
     if (url.pathname === '/api/health' && request.method === 'POST') {
       const ip = request.headers.get('cf-connecting-ip') ?? 'local';
       const now = Date.now();
@@ -2283,10 +2424,18 @@ export default {
       const h = new Headers();
       obj.writeHttpMetadata(h);
       h.set('etag', obj.httpEtag);
-      // Immutable: a release filename carries its version, so the bytes behind a
-      // given URL never change and a year of caching is honest.
-      h.set('cache-control', 'public, max-age=31536000, immutable');
-      h.set('content-type', 'application/gzip');
+      // Immutable ONLY when the filename carries a version, because then the bytes
+      // behind the URL never change. `Tokkah.dmg` is the stable link a human
+      // shares, so its content changes every release and a year of caching would
+      // pin the world to whatever shipped first.
+      const versioned = /\d+\.\d+\.\d+/.test(rel[1]);
+      h.set('cache-control', versioned
+        ? 'public, max-age=31536000, immutable'
+        : 'public, max-age=300');
+      // By extension, not a constant. This served a disk image as application/gzip.
+      h.set('content-type', rel[1].endsWith('.dmg')
+        ? 'application/x-apple-diskimage'
+        : 'application/gzip');
       return new Response(obj.body, { headers: h });
     }
     // Short invite links: room.tokkah.com/etm-bkmb-iev (Meet-shaped, minted by

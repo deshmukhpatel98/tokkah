@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.19.0"
+let VERSION = "0.20.1"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -44,7 +44,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui",
+  "selftest-lpc", "no-lp", "gui", "no-telemetry", "tel-endpoint",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -304,6 +304,8 @@ if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v
 if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
+if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
+if let e = arg("tel-endpoint") { Telemetry.endpoint = e }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if flag("aec") { fputs(audio.enableAec() + "\n", stderr) }
@@ -1054,6 +1056,72 @@ fputs("\n", stderr)
 
 // With a window, AppKit owns the main thread and the reporter moves off it.
 // Without one, main just loops. Same body either way.
+var beatTick = 0
+/// Held so the sources are not deallocated the moment the loop above ends.
+var signalSources: [DispatchSourceSignal] = []
+/// The last per-second figures the report loop computed. The final beat used to
+/// send zeros for these, which the dashboard then displayed as a call that used
+/// 0.00 Mbps -- a made-up number is worse than a missing one.
+var lastRates = (up: 0.0, down: 0.0, played: 0, concealed: 0, cap: 0)
+/// Set the moment a quit is requested. Without it the report loop kept beating
+/// during the handler's grace period and posted a LIVE beat after the FINAL one
+/// -- so the last beat of the call was not the final beat, and a dashboard that
+/// preferred `final` showed a clean snapshot while hiding the second in which
+/// the peer vanished and everything was concealed. A record is only final if
+/// nothing can be written after it.
+nonisolated(unsafe) var shuttingDown = false
+
+/// One beat's worth of fields. Raw numbers only -- no verdicts, no thresholds.
+/// The dashboard decides what "good" means, so changing that opinion does not
+/// need every installed copy to update first.
+func audioBeat(uptime: Double, up: Double, down: Double,
+               played: Int, concealed: Int, cap: Int,
+               p50: Double?, p95: Double?, p99: Double?) -> [String: Any] {
+  let r = audio.ring
+  var f: [String: Any] = [
+    "uptime_s": uptime,
+    "up_mbps": up, "down_mbps": down,
+    "played_ps": played, "conceal_ps": concealed, "cap_ps": cap,
+    "jit": audio.jitTarget,
+    "conceal_total": r.concealed, "conceal_lost": r.concealLost,
+    "conceal_starved": r.concealStarved,
+    "late": r.lateArrivals, "near_late": r.nearLate,
+    "snaps": r.snaps, "dup": r.dup, "too_old": r.tooOld, "jumps": r.jumps,
+    "recv": r.recv, "accepted": r.accepted,
+    // Health flags. These are the ones that mean "something is wrong that the
+    // person on the call cannot see".
+    "stalls": audio.audioStalls, "rate_events": audio.rateEvents,
+    "render_errs": audio.xruns, "cap_skips": audio.capSkips,
+    "fmt_mismatch": wire.fmtMismatch, "relocks": wire.relocks,
+    "peer_restarts": r.restarts,
+    // The sample audit is an identity, so a non-zero difference is a real defect
+    // and worth carrying even when nothing else looks wrong.
+    "audit_delta": audio.renderFrames - (r.playedS + r.concealedS),
+    "gate_lock_max": audio.offZeroRunMax,
+    "lp_in": wire.lpIn, "lp_out": wire.lpOut, "lp_raws": wire.lpRaws,
+    "lp_bad": wire.lpBadDecode,
+    "probes": tsync.samples,
+  ]
+  if let v = p50 { f["m2e_p50"] = v }
+  if let v = p95 { f["m2e_p95"] = v }
+  if let v = p99 { f["m2e_p99"] = v }
+  if let v = r.slack.p(0.50) { f["slack_p50"] = v }
+  if let v = r.slack.p(0.01) { f["slack_p01"] = v }
+  if let v = tsync.bestRttMs { f["rtt_ms"] = v }
+  if let v = tsync.rttSpreadMs { f["rtt_jit_ms"] = v }
+  if let c = crypto { f["crypt"] = c.established ? 1 : 0; f["crypt_bad"] = c.openFails }
+  if let v = vg2g.p(0.50) { f["g2g_p50"] = v }
+  if let v = vg2g.p(0.95) { f["g2g_p95"] = v }
+  if vDecoded > 0 { f["v_decoded"] = vDecoded; f["v_sent"] = vSentFrames }
+  if let e = venc {
+    f["v_encodes"] = e.encodes
+    if let v = e.encLatUs.p(0.50) { f["v_enc_us_p50"] = v }
+    if let v = e.encLatUs.p(0.99) { f["v_enc_us_p99"] = v }
+  }
+  if let v = vdec.decLatMs.p(0.50) { f["v_dec_ms_p50"] = v }
+  return f
+}
+
 func reportLoop() {
   while true {
     usleep(1_000_000)
@@ -1106,6 +1174,19 @@ func reportLoop() {
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
+
+  // ── The same numbers, somewhere they survive ────────────────────────────────
+  //
+  // Built here because this is where every value already is, so the beat and the
+  // line above it can never disagree about what the call did. Every five seconds,
+  // and once more at the end.
+  beatTick += 1
+  lastRates = (upMbps, downMbps, d.played, d.concealed, d.cap)
+  if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
+    Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
+                             played: d.played, concealed: d.concealed, cap: d.cap,
+                             p50: p50, p95: p95, p99: p99))
+  }
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.
@@ -1275,6 +1356,40 @@ func reportLoop() {
         + "\n", stderr)
   }
 }
+}
+
+// ── One last beat on the way out ─────────────────────────────────────────────
+//
+// A call's most interesting moment is often its end -- someone gave up. Without
+// this the record simply stops, which looks identical to a laptop lid closing.
+//
+// A DispatchSource rather than signal(2): the handler needs to make a network
+// request and wait for it, and neither is safe inside a real signal handler.
+// SIGINT is IGNORED for a background job of a non-interactive shell, so SIGTERM
+// is watched too -- that difference once left eight test processes running and
+// silently corrupted a day of measurements.
+for sig in [SIGINT, SIGTERM] {
+  signal(sig, SIG_IGN)
+  let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+  src.setEventHandler {
+    shuttingDown = true
+    if Telemetry.enabled {
+      let done = DispatchSemaphore(value: 0)
+      Telemetry.post(audioBeat(uptime: Double(beatTick),
+                               up: lastRates.up, down: lastRates.down,
+                               played: lastRates.played, concealed: lastRates.concealed,
+                               cap: lastRates.cap,
+                               p50: audio.m2e.p(0.50), p95: audio.m2e.p(0.95),
+                               p99: audio.m2e.p(0.99)), final: true)
+      // Give it a moment, then go regardless. A report is not worth hanging a
+      // quit on -- the person pressed Ctrl-C because they wanted out.
+      _ = done.wait(timeout: .now() + 1.5)
+    }
+    fputs("\nbye\n", stderr)
+    exit(0)
+  }
+  src.resume()
+  signalSources.append(src)
 }
 
 if display != nil || mdisplay != nil {

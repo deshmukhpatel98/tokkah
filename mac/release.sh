@@ -65,6 +65,9 @@ cp bundle/AppIcon.icns "$REPO/tape-app/public/macos/AppIcon.icns"
 echo "== upload =="
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$TAR" --file="/tmp/$TAR" --remote >/dev/null)
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$DMG" --file="/tmp/$DMG" --remote >/dev/null)
+# A stable name as well as the versioned one, because the link a human shares
+# should not go stale the next time this runs.
+(cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/Tokkah.dmg" --file="/tmp/$DMG" --remote >/dev/null)
 
 echo "== manifest =="
 OUT="$REPO/tape-app/public/macos"
