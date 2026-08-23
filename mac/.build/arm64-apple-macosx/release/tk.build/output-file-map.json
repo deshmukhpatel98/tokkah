@@ -28,6 +28,12 @@
     "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.swiftdeps",
     "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.dia"
   },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/MetalDisplay.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/MetalDisplay.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/MetalDisplay~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/MetalDisplay.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/MetalDisplay.dia"
+  },
   "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift": {
     "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.swift.o",
     "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net~partial.swiftmodule",

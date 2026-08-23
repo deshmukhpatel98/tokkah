@@ -13,7 +13,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.7.1"
+let VERSION = "0.8.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -176,13 +176,23 @@ if let room = arg("room") {
 }
 
 var keyAsksOnLoss = 0
+var gDumpedMetal = false
 var gDecLuma: Double = -1
 var gDecLumaTick = 0
 var gThetaMs: Double = 0
 var gThetaValid = false
 let audio = Audio()
 audio.wire = wire
-audio.mute = flag("mute")
+// TK_MUTE=1 in the environment silences playout as surely as --mute does.
+// This exists because a flag you have to remember on every one of forty test
+// commands is a flag you will forget on the forty-first, and here the cost of
+// forgetting is landing on someone's speakers while they are asleep. An exported
+// variable is remembered once.
+audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
+// SAID OUT LOUD, because "played 754/s" is identical whether the samples are
+// audio or zeros -- the counter cannot tell me the speaker is silent, and a
+// check that cannot fail is not a check.
+if audio.mute { fputs("PLAYOUT MUTED (zeros to the speaker; capture and all measurements unaffected)\n", stderr) }
 // --jit auto (default) sizes the buffer from measured arrival slack. --jit N
 // pins it, which is what an A/B needs and what a bisect needs.
 let jitArg = arg("jit") ?? "auto"
@@ -228,6 +238,12 @@ vasm.onFrame = { data, host in vdec.decode(data, hostTime: host) }
 // --window opens a real window and shows the peer. Without it tk is a meter;
 // with it, it is a call.
 var display: Display?
+var mdisplay: MetalDisplay?
+// --display metal draws the frame by hand so that (a) the time it actually
+// reaches the panel can be READ from Metal instead of inferred from a refresh
+// rate, and (b) --vsync 0 can skip the compositor's synchronised pass. Default
+// stays the AVSampleBufferDisplayLayer path until the measurement says otherwise.
+let displayKind = arg("display") ?? "avsbdl"
 if flag("window") {
   // NSApplication FIRST. AppKit will build an NSWindow before the application
   // object exists and simply never show it -- decode ran at 31 fps into a window
@@ -235,9 +251,20 @@ if flag("window") {
   // bug. Touching .shared here is what creates it.
   let app = NSApplication.shared
   app.setActivationPolicy(.regular)
-  let d = Display()
-  d.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
-  display = d
+  if displayKind == "metal" {
+    if let m = MetalDisplay(vsyncOff: arg("vsync") == "0") {
+      m.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
+      mdisplay = m
+      fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on"), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
+    } else {
+      fputs("display: metal unavailable, falling back\n", stderr)
+    }
+  }
+  if mdisplay == nil {
+    let d = Display()
+    d.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
+    display = d
+  }
 }
 
 let dumpTo = arg("dump")
@@ -265,6 +292,15 @@ vdec.onDecoded = { img, capHost in
   if gThetaValid { vg2g.add(Clock.msSigned(Clock.now(), capHost) + gThetaMs) }
   vDecoded += 1
   display?.show(img)
+  // Stamped HERE, not inside show(): the measurement is decode-to-glass, and a
+  // timestamp taken after the draw call would quietly exclude the draw.
+  if let m = mdisplay, let pb = img as CVPixelBuffer? {
+    m.show(pb, at: Clock.now())
+    if let mp = arg("dump-metal"), !gDumpedMetal, vDecoded > 40 {
+      gDumpedMetal = true
+      fputs("metal dump: \(m.dumpRendered(pb, to: mp))\n", stderr)
+    }
+  }
   if let path = dumpTo, !dumped, vDecoded > 30 {
     dumped = true
     let ci = CIImage(cvImageBuffer: img)
@@ -606,6 +642,11 @@ func reportLoop() {
         + "  frags \(vasm.fragsIn) frames-lost \(vasm.missing) partial-drops \(vasm.dropped) decFails \(vdec.decFails) noFmt \(vdec.noFormat)"
         + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
         + (display != nil ? "  window \(display!.state) shown \(display!.shown) enqFail \(display!.enqueueFails) refresh \(String(format: "%.1f", display!.refreshMs))ms" : "")
+        + (mdisplay != nil ? "  metal \(mdisplay!.state) shown \(mdisplay!.shown) skip \(mdisplay!.skipped)"
+           + "  decode->glass p50 \(mdisplay!.present.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
+           + " p95 \(mdisplay!.present.p(0.95).map { String(format: "%.2f", $0) } ?? "-") ms"
+           + " (timed \(mdisplay!.present.count) of \(mdisplay!.shown)"
+           + ", noTime \(mdisplay!.presentNoTime), outOfRange \(mdisplay!.presentOutOfRange))" : "")
         + "\n", stderr)
   }
   if d.cap == 0 {
@@ -617,7 +658,7 @@ func reportLoop() {
 }
 }
 
-if display != nil {
+if display != nil || mdisplay != nil {
   Thread { reportLoop() }.start()
   NSApplication.shared.activate(ignoringOtherApps: true)
   NSApplication.shared.run()

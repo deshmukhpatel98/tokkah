@@ -9276,3 +9276,69 @@ Building an unmeasurable optimisation is how this codebase acquires its worst
 bugs, so this is recorded as the largest known win and left unbuilt until it can
 be shown. The page now says ~23 ms and ~28 ms, because the old number was wrong
 in the direction that flattered us.
+
+## 17.81 The display, measured properly: 29 ms, and 8.7 ms of it is buyable
+
+§17.80 said the display was the largest number in the app and left it there,
+because proving anything about it seemed to need a camera pointed at the panel.
+It does not. **`MTLDrawable.addPresentedHandler` reports `presentedTime`** — when
+the frame actually reached the display, from the system, on the same mach
+timebase as everything else. `AVSampleBufferDisplayLayer` offers no equivalent,
+which is exactly why this term stayed a guess for so long: the layer that was
+easiest to use was also the one that could not be measured.
+
+So there is now a hand-drawn path — `CAMetalLayer`, a runtime-compiled BT.709
+video-range YUV→RGB shader, two textures out of a `CVMetalTextureCache`,
+`maximumDrawableCount = 2` because a third drawable is a third frame of queue.
+
+    --display metal            decode -> glass  p50 29.18 ms  p95 32.53 ms
+    --display metal --vsync 0  decode -> glass  p50 20.46 ms  p95 23.68 ms
+
+**8.72 ms at p50, 8.85 ms at p95.** `displaySyncEnabled = false` presents as soon
+as the GPU is done instead of waiting for the compositor's synchronised pass, and
+the price is tearing.
+
+### The first version of this measurement was wrong, and said so
+
+    vsync on   p50 22.13 ms  (timed 832 of 1312)
+    vsync off  p50 14.96 ms  (timed 206 of 1337)
+
+Two faults. The window was **occluded** — the compositor does not present a
+hidden window the way it presents a visible one, so both numbers described a path
+no user ever sees. And a p50 over 206 samples against one over 832 is not a
+faster population, it is a *different* population; a percentile over a silently
+filtered subset is a claim about the subset. The presented-time handler now counts
+`noTime` and `outOfRange` rejections and reports **timed-of-shown**, so coverage
+is visible instead of inferred. Re-run visible: 1295 of 1309 and 1325 of 1338,
+99% both arms, and the gap held at 8.7 ms.
+
+### And then I looked at it
+
+A YUV→RGB shader has at least four ways to be wrong that no counter can see:
+chroma planes swapped, video range treated as full, the V axis flipped, or the
+wrong matrix. **Mean luma is blind to every one of them** — an upside-down frame
+has exactly the same mean as an upright one, which is the specific mistake this
+project has already shipped once. So `--dump-metal` renders to an offscreen
+texture, reads it back off the GPU and writes a PNG. Upright, not mirrored,
+natural skin tones, NASA blue rendering as blue, the name tag legible.
+
+### Default unchanged, deliberately
+
+`AVSampleBufferDisplayLayer` stays the default and Metal is opt-in, for one
+reason: **the comparison I can make is not the comparison that matters.**
+vsync-on against vsync-off is measured, well-covered and clean. Metal against
+AVSBDL is *not* measurable, because the thing I would be comparing against is
+precisely the layer that cannot report its own present time — so making a
+hand-rolled path the default would be trading a known quantity for an unknown
+one on the strength of a number that says nothing about it.
+
+And the 8.7 ms is a trade, not a win: I can measure the latency it buys and I
+cannot measure the tearing it costs. Tearing is a scanout artifact — it does not
+exist in a GPU readback, so no instrument here can see it. That one belongs to
+whoever is looking at the screen.
+
+Honest video accounting as it stands:
+
+    capture -> encoded -> wire -> decoded    5.6 ms   measured
+    decoded -> glass                        29.2 ms   measured (20.5 with vsync off)
+    total                                  ~34.8 ms  (~26.1 with vsync off)
