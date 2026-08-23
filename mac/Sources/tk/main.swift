@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.34.0"
+let VERSION = "0.35.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -196,6 +196,9 @@ fputs("packet=\(FPP) frames (\(String(format: "%.2f", Double(FPP) / SR * 1000)) 
 // with stale code. --no-update is for bisecting a regression, nothing else.
 if !flag("no-update") {
   if let (m, _) = Update.available(current: VERSION) { Update.apply(m) }
+  // And if we are already current but our BUNDLE is not -- an old updater took the
+  // binary and left the icon behind -- fix that too, once, quietly.
+  Update.repairBundleIfStale(current: VERSION)
   Update.startPolling(current: VERSION, every: 60)
 }
 

@@ -11920,3 +11920,27 @@ change takes **two** releases to have an effect — one to distribute the new up
 for it to act on. Everything about the payload is backward compatible (an old updater
 ignores the extra directory, a new one applies it when present), so the only cost is the
 lag. Verified on the second hop rather than assumed.
+
+### So the bundle repairs itself, because the users who need it most cannot be reached otherwise
+
+The one-release lag has a nastier edge than "the icon arrives late". A machine on 0.33.0
+fetches the newest release, takes the binary, and leaves the bundle — and then there is no
+*newer* release to trigger the refresh. That bundle stays wrong **forever**. The people
+furthest behind are the only ones who cannot be fixed by shipping another release.
+
+So the app now checks its own bundle against itself at startup. If the Info.plist does not
+say what the binary says, it re-fetches its **own** version's archive — same signed
+manifest, same hash check, no version comparison — and applies only the bundle half. No
+binary swap, so no re-exec: the icon just becomes right, once, quietly. It declines when
+the manifest has already moved on, because the normal update will bring both halves in one
+step and a repair would be a wasted download of the wrong version.
+
+Tested both directions, on real bundles:
+
+| bundle | binary | before | after |
+|---|---|---|---|
+| stranded | 0.35.0 | plist 0.28.0, old icon | plist 0.35.0, new icon — *"bundle says 0.28.0 but this binary is 0.35.0 — repairing"* |
+| consistent | 0.35.0 | plist 0.35.0, new icon | no network call, no log line |
+
+The negative case matters as much as the positive one: a repair that fires on a healthy
+bundle is a download on every launch forever.
