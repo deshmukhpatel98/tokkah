@@ -10586,3 +10586,153 @@ default**, and it stays off until it has been measured against a real speaker in
 room. The estimator, by contrast, runs always and on every call: "your speaker is feeding
 your microphone at 18 ms with 0.7 correlation" is worth saying out loud whether or not
 anything can be done about it yet.
+
+## 17.103 Two counters, one gate — and a rescue that only rescued the mild case
+
+A clean three-minute loopback run of the published 0.17.0 printed this twice:
+
+    *** NOTHING IS BEING PLAYED although packets are arriving -- the read cursor
+    *** is off the stream. Re-anchoring.
+
+on a call with `1.65/1.65 Mbps`, `m2e p50 9.80`, `jit 3`, `conceal 0/s`, `late 0`,
+`snap 0`. Everything healthy, and a watchdog declaring silence. Worse, the stat
+line *after* each warning showed `played 285/s (19.0%)` — so the dip appeared
+after the warning, which made my own re-anchor the cause of the only glitch in
+the run rather than the fix for it.
+
+### Print the state, not the symptom
+
+The first change was not a fix. The watchdog said "nothing is being played" and
+named none of the several things that can cause it, so it printed the ring state
+instead:
+
+    pos 9879511 (pkt 308734)  hiSeq 308739  jitTarget 4  err -0.17 ms  rate 1.00008
+    accepted 308740  played 305624  concealed 0 (lost 0 starved 0)  snaps 0
+    renderTicks 617460  capCallbacks 617457
+
+Read it: the cursor is five packets behind the write head against a target of
+four — exactly where it belongs. `err` is 0.17 ms. Nothing concealed, nothing
+skipped, both callbacks running. **The audio was perfect.** So `played` was not
+measuring what its name claimed.
+
+`played` and `concealed` are both incremented inside `if off == 0` — the sample
+where the read cursor lands exactly on a packet boundary. Which means the two
+facts that looked contradictory, *played frozen* and *concealed zero*, were one
+fact: `off == 0` was never reached. Two instruments, one gate, blind together.
+
+### The gate is skippable, and it stays skipped
+
+Measuring the gate directly (count callbacks that cross no boundary):
+
+    packet gate: 563235 of 962912 callbacks crossed no packet boundary,
+                 longest run 146329 (48776 ms)  n 16x962912
+
+Forty-eight seconds. On a healthy call. The arithmetic says this is impossible —
+a callback consumes 16 samples of a 32-sample packet, so consecutive callbacks
+tile the packet exactly and one of every pair must contain sample 0. Dumping the
+actual offsets settled it:
+
+    pos 8998199.999252703  rate 1.0000833411176766  n 16 FPP 32
+    offs [23, 24, 25, 26, 27, 28, 29, 30, 31, 1, 2, 3, 4, 5, 6, 7]
+
+It steps 31 → **1**. The cursor is fractional; its integer part crosses a
+boundary *inside* the callback, and the single sample it steps over is precisely
+sample 0. At a rate 0.008% off unity the phase drifts so slowly that it stays
+there for tens of thousands of callbacks.
+
+So three instruments rode a gate that can vanish for a minute at a time:
+
+- `played` — froze, and the watchdog read the freeze as silence and re-anchored,
+  which is a real discontinuity. The false positive *caused* the glitch it exists
+  to prevent.
+- `concealed` — froze with it. **This is the dangerous half.** A genuine
+  two-second dropout during a phase-lock would have reported `conceal 0`.
+- `m2e` — the headline number. Its p95 and p99 were quantiles over whatever the
+  gate happened to admit, with 49-second holes.
+
+### Count samples; they cannot be skipped
+
+Every rendered sample takes exactly one of two branches, so counting per sample
+makes the totals an identity rather than an estimate, and the report asserts it:
+
+    sample audit: played 20131536 + concealed 0 = 20131536 vs 20131536 rendered (exact)
+
+Packet-equivalents are those divided by `FPP`, so every consumer and the wire
+loss report keep their units. `m2e` moved to `i == 0` — once per callback, never
+skippable — which needs the capture stamp advanced by `off` samples, because the
+stamp belongs to the packet's first sample and this one is mid-packet. Without
+that correction the number would read ~0.32 ms high; measured against the old
+gate it reads 9.83–10.03 against a 9.80–10.02 baseline, which is how the
+correction was checked.
+
+The lock is still there — `longest run 29433 (9811 ms)` on the verification run —
+and now costs nothing.
+
+### The rescue that only covered the mild direction
+
+With honest counters a second defect surfaced immediately:
+
+    pos (pkt 69923)  hiSeq 69899  jitTarget 13  err -24.85 ms  rate 0.99600
+    concealed 7516 (lost 0 starved 7516)  snaps 0
+
+The cursor was **24 packets past the newest packet received** — reading audio
+that had not arrived, so every sample was starved, and the governor was pinned at
+its 0.996 floor. `snaps 0`: the symmetric snap added in 17.100 never fired.
+`SNAP_PKTS` is 30 ms — 45 packets — and the excursion was 37.
+
+The comment above that code says, in as many words, that behind costs latency and
+ahead costs everything. Then it applies one magnitude to both. Making it
+symmetric in *direction* had left it symmetric in *magnitude*, which under-serves
+the severe side by exactly the amount that matters: 24 ms "ahead" is not a small
+version of 24 ms "behind", it is `played 0/s, conceal 1510/s`.
+
+So the directions get their own thresholds — and "past the stream" turned out to
+have two causes with opposite remedies:
+
+- **Displaced forward** (a device rate change, or the new `--cursor-ahead`
+  injector): the packets it jumped over were never played, so rewinding plays
+  them. Correct.
+- **Stream stalled**: it played everything there was, so rewinding *replays* it.
+
+`maxPlayedSeq` — the highest sequence any sample of which was actually output —
+separates them exactly: rewind only where there is audio behind the cursor that
+has never been heard. A first attempt without that test snapped 2075 times in
+200 s.
+
+### Measured, injected, rotated
+
+`--cursor-ahead <ms>` pushes the cursor forward once, 30 s in, because a recovery
+path that only runs during a failure and has never been triggered by a test is a
+guess. Injecting the exact 25 ms that occurred naturally, arms rotated:
+
+| arm | fires | snaps | worst second | m2e p50 | jit |
+|---|---|---|---|---|---|
+| new | 0 | 1 | 100.1% | 10.03 | 3 |
+| old | 1 | 0 | **0.0% — total silence** | 10.69 | 4 |
+| old | 1 | 0 | **0.0% — total silence** | 10.55 | 4 |
+| new | 0 | 1 | 99.7% | 9.83 | 3 |
+
+Null A/B first, same binary twice: m2e 10.00 and 9.98, `jit 3` both, zero snaps,
+zero concealment. Rig noise 0.02 ms, so the 0.6–0.7 ms difference is thirty times
+the noise — and it is permanent in the old arms, because the buffer ratchets to 4
+and stays there.
+
+### The rig was hosting eight calls
+
+Between those two findings, several runs produced `jit 18`, `m2e 19.28` and
+`snap 2075`, and I nearly drew conclusions from them. The cause was eight stray
+`tk` processes and `coreaudiod` at 119% CPU: the test harness stopped runs with
+`kill -INT`, and a background job started with `&` from a non-interactive shell
+has SIGINT **ignored**. Every run printed its periodic report to the end, so the
+logs looked complete and nothing announced that the previous four calls were
+still up.
+
+`measure the rig's noise first` is not enough on its own. The harness now refuses
+to start when any `tk` is already running, kills with `-9`, and verifies the
+machine is empty on the way out.
+
+**Laws.** *Two instruments behind one gate fail together, and their agreement
+reads as corroboration.* *A metric sampled on an exact coincidence is sampled on
+whether that coincidence is reachable.* *When a comment states an asymmetry,
+check that the code implements it in magnitude and not only in sign.* *Verify the
+rig is empty, not merely quiet.*

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.17.0"
+let VERSION = "0.18.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -43,7 +43,7 @@ func flag(_ name: String) -> Bool { CommandLine.arguments.contains("--" + name) 
 let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
-  "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
+  "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -303,6 +303,7 @@ audio.concealZeros = (arg("conceal") == "zeros")
 audio.concealGrain = (arg("conceal") == "grain")
 audio.interpLinear = (arg("interp") == "linear")
 audio.acoustic = flag("acoustic")
+audio.cursorAheadMs = Double(arg("cursor-ahead") ?? "0") ?? 0
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
 if audio.acoustic && audio.mute {
   fputs("--acoustic needs to play a sound and playout is muted (--mute or TK_MUTE=1).\n"
@@ -1051,6 +1052,18 @@ func reportLoop() {
     // skipped buffer is a doubled gap; the render cost says how close the work is
     // to the deadline it has.
     let budgetUs = Double(Audio.devBuf) / SR * 1_000_000.0
+    // EVERY rendered sample takes exactly one of the two branches, so this is an
+    // identity, not an estimate. If it ever fails to hold, a sample was played
+    // that no counter saw -- which is the class of bug that made a healthy call
+    // look silent.
+    let counted = audio.ring.playedS + audio.ring.concealedS
+    fputs("  sample audit: played \(audio.ring.playedS) + concealed \(audio.ring.concealedS)"
+        + " = \(counted) vs \(audio.renderFrames) rendered"
+        + " \(counted == audio.renderFrames ? "(exact)" : "*** MISMATCH \(audio.renderFrames - counted) ***")\n", stderr)
+    fputs("  packet gate: \(audio.offZeroMiss) of \(audio.renderTicks) callbacks crossed no"
+        + " packet boundary, longest run \(audio.offZeroRunMax)"
+        + " (\(String(format: "%.0f", Double(audio.offZeroRunMax) * Double(Audio.devBuf) / SR * 1000)) ms)"
+        + "  n \(audio.nHist.sorted { $0.key < $1.key }.map { "\($0.key)x\($0.value)" }.joined(separator: " "))\n", stderr)
     fputs("  buffer \(Audio.devBuf) frames (\(String(format: "%.2f", budgetUs / 1000)) ms):"
         + " skips \(audio.capSkips)/\(audio.capTicks) in, \(audio.renderSkips)/\(audio.renderTicks) out"
         + "  renderErrs \(audio.xruns)"

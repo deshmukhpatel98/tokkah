@@ -159,6 +159,17 @@ final class Audio {
   // now covered by a pitch-period repeat, against 0.95 ms off every syllable
   // forever. Rotated arms: 10.50/10.59 ms against 11.43/11.57.
   nonisolated(unsafe) static var devBuf = 16
+  /// The gate every per-packet counter rides. `played` and `concealed` both only
+  /// move at `off == 0`, so if a callback grid can straddle packet boundaries
+  /// without ever landing on one, BOTH read zero on a perfectly healthy call --
+  /// and the watchdog reads that as silence. Measure the gate itself.
+  nonisolated(unsafe) var offZeroMiss = 0
+  nonisolated(unsafe) var offZeroRun = 0
+  nonisolated(unsafe) var offZeroRunMax = 0
+  nonisolated(unsafe) var nHist = [Int: Int]()
+  nonisolated(unsafe) var cursorAheadMs = 0.0
+  nonisolated(unsafe) var cursorAheadDone = false
+  nonisolated(unsafe) var aheadRun = 0
   private static let HIST = 2048           // 42.7 ms, power of two for masking
   private static let HMASK = HIST - 1
   private static let PMIN = 96             // 500 Hz
@@ -925,14 +936,33 @@ final class Audio {
         // callbacks running, packets arriving, and nothing played -- because the
         // read cursor sat ahead of the stream and concealed every packet. Watching
         // the callbacks does not see it; watching what came OUT does.
-        let played = self.ring.played, got = self.ring.accepted
+        let played = self.ring.playedS, got = self.ring.accepted
         stuck = (played == lastPlayed && got > lastGot) ? stuck + 1 : 0
+        if ProcessInfo.processInfo.environment["TK_TRACE_STUCK"] != nil {
+          fputs("tick dPlayed \(played - lastPlayed) dGot \(got - lastGot)"
+              + " stuck \(stuck) render \(r2) cap \(c) stillR \(stillRender)"
+              + " pos \(Int(self.ring.pos)) played \(played)\n", stderr)
+        }
         lastPlayed = played; lastGot = got
-        if stuck >= 4, !announced {
+        // 8 ticks, not 4: two seconds. The action here is a re-anchor, which is
+        // itself a discontinuity, so a false positive causes the very glitch it
+        // exists to prevent -- and this fired twice in a clean three-minute run at
+        // four ticks. And it prints the RING STATE, because "nothing is being
+        // played" is a symptom with several causes and a watchdog that names none
+        // of them turns an investigation into guesswork.
+        if stuck >= 8, !announced {
           announced = true
           self.audioStalls += 1
-          fputs("\n*** NOTHING IS BEING PLAYED although packets are arriving"
-              + " -- the read cursor is off the stream. Re-anchoring.\n\n", stderr)
+          let r = self.ring
+          fputs("\n*** NOTHING IS BEING PLAYED although packets are arriving.\n"
+              + "*** pos \(Int(r.pos)) (pkt \(Int(r.pos) / FPP))  hiSeq \(r.hiSeq)"
+              + "  jitTarget \(self.jitTarget)  err \(String(format: "%.2f", r.errMs)) ms"
+              + "  rate \(String(format: "%.5f", r.rate))\n"
+              + "*** accepted \(got)  played \(played)  concealed \(r.concealed)"
+              + " (lost \(r.concealLost) starved \(r.concealStarved))  snaps \(r.snaps)"
+              + "  renderTicks \(r2)  capCallbacks \(c)\n"
+              + "*** offZeroMiss \(self.offZeroMiss) run \(self.offZeroRun) max \(self.offZeroRunMax)  n \(self.nHist.sorted { $0.key < $1.key })\n"
+              + "*** Re-anchoring.\n\n", stderr)
           self.ring.pos = -1
           continue
         }
@@ -1134,6 +1164,16 @@ final class Audio {
       guard hi >= Int64(jitTarget) else { for i in 0..<Int(n) { out[i] = 0 }; return }
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
     }
+    // FAULT INJECTION, because the recovery path above is the kind that only ever
+    // runs during a failure -- and a recovery no test has ever triggered is a
+    // guess. A device rate change is the natural cause and it needs the machine's
+    // devices; this needs nothing, and it puts the cursor exactly where the real
+    // fault put it, on demand, repeatably.
+    if cursorAheadMs > 0, !cursorAheadDone, renderTicks > 90_000 {
+      cursorAheadDone = true
+      ring.pos += cursorAheadMs / 1000.0 * SR
+      fputs("*** injected: cursor pushed \(cursorAheadMs) ms ahead\n", stderr)
+    }
     let curSeq = Int64(ring.pos) / Int64(FPP)
     // A JUMP is for a broken stream, not for a drift. Only two things justify
     // discarding continuity: the stream has run further ahead than the ring can
@@ -1194,8 +1234,40 @@ final class Audio {
     // second. Both ends, for over half a minute.
     //
     // And the asymmetry was backwards on severity: behind costs latency, ahead
-    // costs EVERYTHING. One expression, either sign.
-    if abs(hi - cur - Int64(jitTarget)) > SNAP_PKTS {
+    // costs EVERYTHING.
+    //
+    // The first fix made this symmetric in DIRECTION and left it symmetric in
+    // MAGNITUDE, which under-serves the severe side by exactly the amount that
+    // matters. Measured on a loaded machine: the cursor ended up 37 packets
+    // (24.7 ms) past the newest packet received -- under the 45-packet threshold,
+    // so no snap -- and that is not "24 ms of jitter", it is `played 0/s,
+    // conceal 1510/s`, TOTAL SILENCE, because the cursor was reading packets that
+    // had not arrived. The governor clawed at it with its 0.4% authority while the
+    // buffer controller, seeing starvation, grew the target and re-opened the
+    // error. Two hundred seconds to recover from 24 ms, with 14 seconds of audio
+    // concealed on the way.
+    //
+    // So the two directions get their own thresholds. Behind: 30 ms, because
+    // skipping stale audio is a click and wants real evidence. Past the newest
+    // packet: essentially zero, because there is nothing there to play and no
+    // amount of patience invents a sample. Two packets of grace for ordinary
+    // raciness, and then jump.
+    let behind = hi - cur - Int64(jitTarget)   // > 0: too much buffered
+    let past = cur - hi                        // > 0: reading unarrived packets
+    // But "past the stream" has TWO causes and only one of them is repaired by
+    // rewinding. A cursor DISPLACED forward skipped packets that were never
+    // played, so moving it back plays them: correct. A cursor that reached the
+    // head because the stream STALLED already played everything there was, so
+    // moving it back replays it -- and under load that is the common case. First
+    // attempt used `past > 1` alone and snapped 2075 times in 200 s.
+    //
+    // `maxPlayedSeq` tells them apart exactly: rewind only where there is audio
+    // behind the cursor that has never been heard. Plus a few ms of persistence,
+    // because a single late packet momentarily looks like the first case.
+    let unplayedBehind = hi - Int64(jitTarget) > ring.maxPlayedSeq
+    aheadRun = (past > 1) ? aheadRun + 1 : 0
+    let AHEAD_HOLD = Int(0.010 * SR / Double(Audio.devBuf))   // 10 ms of callbacks
+    if behind > SNAP_PKTS || (past > 1 && aheadRun >= AHEAD_HOLD && unplayedBehind) {
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
       ring.snaps += 1
       cur = Int64(ring.pos) / Int64(FPP)
@@ -1230,6 +1302,7 @@ final class Audio {
     renderFrames += Int(n)
     defer { renderCost.add(Clock.msSigned(Clock.now(), rEntry)) }
 
+    var sawZero = false
     for i in 0..<Int(n) {
       let absF = ring.pos + Double(i) * ring.rate
       let absI = Int64(absF)
@@ -1307,25 +1380,43 @@ final class Audio {
         // feeding synthesis back in would make the cursor chase its own tail.
         hist[histW & Audio.HMASK] = val; histW += 1
         lastGood[off] = a
-        if off == FPP - 1 { haveLastGood = true; concealRun = 0 }
-        if off == 0 {
-          ring.played += 1
-          // capture -> this sample at the DAC, plus the output hardware the
-          // callback cannot see.
-          let earHost = dueHost + Clock.ticks(ns: UInt64(Double(i) / SR * 1_000_000_000.0))
+        // A complete packet of last-good samples needs the boundary; the run
+        // length does not, and resetting it per sample is what makes it true.
+        if off == FPP - 1 { haveLastGood = true }
+        concealRun = 0
+        ring.playedS += 1
+        if Int64(seq) > ring.maxPlayedSeq { ring.maxPlayedSeq = Int64(seq) }
+        if off == 0 { sawZero = true }
+        // ── Sample the latency ONCE PER CALLBACK, not once per packet ──────────
+        //
+        // This used to sit inside `off == 0`, and that gate is skippable: the
+        // fractional cursor can step over sample 0 of a packet and, at a rate
+        // near 1.0, keep doing it. Measured on a healthy call: 146329 consecutive
+        // callbacks -- 48.8 SECONDS -- in which no callback crossed a boundary. So
+        // the headline latency number had a 49-second blind spot, and its p95 and
+        // p99 were quantiles over whatever the gate happened to let through.
+        //
+        // `i == 0` fires exactly once per callback and cannot be skipped. The
+        // sample is then mid-packet, so the capture stamp -- which belongs to the
+        // packet's FIRST sample -- has to be advanced by `off` samples to describe
+        // this one. Without that the number is up to 0.67 ms too large.
+        if i == 0 {
+          let earHost = dueHost
+          let capOfs = Clock.ticks(ns: UInt64(Double(off) / SR * 1_000_000_000.0))
           // MOUTH to EAR, not callback to callback. Both device latencies count: the
           // mic transducer-to-buffer delay happens BEFORE the capture timestamp
           // exists, and the DAC buffer-to-air delay happens after this callback
           // returns. Neither is visible from inside the callbacks, and a number that
           // omits them is a smaller number about a different question.
           if thetaValid {
-            let ms = Clock.msSigned(earHost, ring.capHost[slot]) + thetaMs + outLatencyMs + inLatencyMs
+            let ms = Clock.msSigned(earHost, ring.capHost[slot] + capOfs)
+                   + thetaMs + outLatencyMs + inLatencyMs
             m2eLast = ms
             m2e.add(ms)
           }
           // Local both ends, no offset involved, so this term is exact even
           // between two machines. Includes the deliberate jitter buffer.
-          recvToPlay.add(Clock.msSigned(earHost, ring.recvHost[slot]))
+          recvToPlay.add(Clock.msSigned(earHost, ring.recvHost[slot] + capOfs))
         }
       } else {
         // Repeat the last good packet, fading out over about 20 ms so a real
@@ -1351,7 +1442,7 @@ final class Audio {
         var val: Float = 0
         if concealGrain {
           if haveLastGood {
-            let fade = max(0.0, 1.0 - Double(concealRun) / 30.0)
+            let fade = max(0.0, 1.0 - Double(concealRun) / (30.0 * Double(FPP)))
             val = lastGood[off] * Float(fade)
           }
         } else if !concealZeros {
@@ -1362,15 +1453,19 @@ final class Audio {
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
-        if off == 0 {
-          if concealRun < 1_000_000 { concealRun += 1 }
-          ring.concealed += 1
-          // Already past this sequence and it never came: lost. Not yet reached
-          // by the stream: starved, which a bigger buffer does address.
-          if hi > Int64(seq) { ring.concealLost += 1 } else { ring.concealStarved += 1 }
-        }
+        if concealRun < 1_000_000_000 { concealRun += 1 }
+        ring.concealedS += 1
+        // Already past this sequence and it never came: lost. Not yet reached
+        // by the stream: starved, which a bigger buffer does address.
+        if hi > Int64(seq) { ring.concealLostS += 1 } else { ring.concealStarvedS += 1 }
+        if off == 0 { sawZero = true }
       }
     }
+    if sawZero { offZeroRun = 0 } else {
+      offZeroMiss += 1; offZeroRun += 1
+      if offZeroRun > offZeroRunMax { offZeroRunMax = offZeroRun }
+    }
+    nHist[Int(n), default: 0] += 1
     ring.pos += Double(n) * ring.rate
 
     if acoustic, !mute, !acWaiting, dueHost > acNext {

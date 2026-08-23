@@ -87,7 +87,35 @@ final class RecvRing {
   // Counters. Written by whichever thread owns the event; read by the reporter.
   // Plain vars rather than atomics: they are diagnostics, a torn read costs a
   // wrong log line, and an atomic on the audio path costs a real-time budget.
-  var recv = 0, dup = 0, jumps = 0, played = 0, concealed = 0, tooOld = 0, snaps = 0
+  var recv = 0, dup = 0, jumps = 0, tooOld = 0, snaps = 0
+  // ── Count SAMPLES, not packet boundaries ───────────────────────────────────
+  //
+  // These were counted once per packet, at the sample where the read cursor
+  // landed exactly on a packet boundary (`off == 0`). That gate is not always
+  // reachable. A callback consumes 16 samples of a 32-sample packet, so it
+  // crosses a boundary every other callback -- but the cursor is FRACTIONAL, and
+  // at a rate a hair off 1.0 it skips exactly one input sample every other
+  // callback. When the skipped sample is sample 0 of a packet, `off == 0` never
+  // happens, and because the rate is within 0.08% of 1 the phase drifts so
+  // slowly that it STAYS there. Measured on a healthy loopback call: 6542
+  // consecutive callbacks, 2181 ms, without one boundary crossing.
+  //
+  // Two things rode that gate and both went blind together: `played` froze, so
+  // the playout watchdog declared silence on perfect audio and re-anchored the
+  // cursor -- causing the only real glitch in the run -- and `concealed` froze
+  // with it, which is the dangerous half. A genuine two-second dropout during a
+  // phase-lock would have reported `conceal 0`.
+  //
+  // A sample count cannot be skipped by any phase. Packet-equivalents are these
+  // divided by FPP, so every consumer and the wire format keep their units.
+  var playedS = 0, concealedS = 0, concealLostS = 0, concealStarvedS = 0
+  /// Highest sequence any sample of which was actually OUTPUT. This is what
+  /// separates the two ways a cursor ends up past the stream: displaced forward
+  /// (it skipped packets that were never played, so rewinding plays them) versus
+  /// a stalled stream (it played everything there was, so rewinding REPLAYS it).
+  var maxPlayedSeq: Int64 = -1
+  var played: Int { playedS / FPP }
+  var concealed: Int { concealedS / FPP }
   // LATE and LOST are different events with opposite remedies, and the buffer
   // controller has no business acting until it knows which one it is looking at.
   //
@@ -150,7 +178,8 @@ final class RecvRing {
   /// a peer whose sequence numbers went backwards produces a run of these.
   private var oldRun = 0
   var restarts = 0
-  var concealLost = 0, concealStarved = 0
+  var concealLost: Int { concealLostS / FPP }
+  var concealStarved: Int { concealStarvedS / FPP }
   // Occupancy error in ms, published by the audio thread so the buffer
   // controller can tell "the buffer is roomy" from "the cursor is behind".
   var errMs: Double = 0
