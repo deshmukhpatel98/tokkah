@@ -13,7 +13,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.0"
+let VERSION = "0.9.1"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -645,6 +645,20 @@ func reportLoop() {
   let heard = Double(d.played) / expected * 100
 
   let pct = String(format: "%5.1f", heard)
+  // A SEND RATE THAT DOES NOT MATCH THE CAPTURE RATE IS A BUG, SAID OUT LOUD.
+  //
+  // Every packet this app sends is caused by something countable: one per audio
+  // packet captured, ~30/s of video, one clock probe. So `sent` should sit just
+  // above `cap` and nothing else is legitimate. A handshake that replied to
+  // handshakes once put it at 20,972/s against 758 captured -- 26x, about 6 Mbps
+  // of echo -- and it cost NOTHING observable on loopback, where bandwidth is
+  // free: latency, concealment and every other counter stayed clean. It would
+  // have destroyed the first real call between two houses. Both numbers were
+  // printed side by side on every line for two releases and I did not look.
+  if d.cap > 100, d.sent > d.cap * 2 {
+    fputs("WARNING: sending \(d.sent)/s against \(d.cap)/s captured "
+        + "-- \(d.sent / max(d.cap, 1))x more packets than anything asked for\n", stderr)
+  }
   fputs("cap \(d.cap)/s  sent \(d.sent)/s  recv \(d.recv)/s  played \(d.played)/s (\(pct)%)"
       + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"

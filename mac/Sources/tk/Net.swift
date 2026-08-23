@@ -293,6 +293,7 @@ final class Wire {
   }
 
   private(set) var cryptSendFails = 0
+  private(set) var handshakeReplies = 0
 
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
     let r = withUnsafePointer(to: &peer) { pp in
@@ -430,14 +431,24 @@ final class Wire {
       if magic == HMAGIC, Int(n) >= HPKT {
         if !locked { adopt(src) }
         if let c = crypto {
-          let was = c.established
-          if c.adoptPeer(Data(bytes: buf + 4, count: 32)), !was {
+          // REPLY ONLY WHEN THE KEY WAS NEW. The previous version replied to every
+          // handshake it received, and so did the peer, so a reply provoked a
+          // reply: on loopback that ran at about ten thousand round trips a second
+          // -- 20,000 packets/s sent against 758 captured, 36 bytes each, roughly
+          // 6 Mbps of pure echo per direction. It cost nothing measurable on
+          // loopback, where bandwidth is free and latency stayed at 17 ms, and it
+          // would have swamped the real link between two houses. It shipped in
+          // 0.9.0 and 0.9.1.
+          //
+          // Liveness does not need the echo. Both ends beat a handshake on a timer
+          // -- fast while unkeyed, every 5 s after -- so a peer that restarts with
+          // a fresh key is adopted on its next beat, that adoption IS a change, and
+          // the single reply that follows completes the exchange in one round trip.
+          if c.adoptPeer(Data(bytes: buf + 4, count: 32)) {
             fputs("crypto: \(c.summary)\n", stderr)
+            sendHandshake()
+            handshakeReplies += 1
           }
-          // Always reply. The peer may have started after us, or restarted with a
-          // new key, and a one-way handshake leaves whichever side booted first
-          // waiting forever.
-          sendHandshake()
         }
         continue
       }

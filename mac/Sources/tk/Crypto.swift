@@ -65,10 +65,13 @@ final class Crypto {
     salt = Data(("tk-v1-" + roomSalt).utf8)
   }
 
+  /// Returns true ONLY when the peer's key was new to us -- i.e. when something
+  /// actually changed. The caller replies on true, and that distinction is what
+  /// keeps the handshake from becoming an echo: a reply to a reply to a reply.
   func adoptPeer(_ raw: Data) -> Bool {
     guard raw.count == 32 else { return false }
     let hex = raw.map { String(format: "%02x", $0) }.joined()
-    if hex == peerKeyHex { return established }   // same peer, nothing to redo
+    if hex == peerKeyHex { return false }   // already have this peer's key: nothing to do
     guard let pk = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: raw),
           let secret = try? mine.sharedSecretFromKeyAgreement(with: pk) else { return false }
     // Deterministic, symmetric, and needs no negotiation: whoever's public key

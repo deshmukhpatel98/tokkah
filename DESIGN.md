@@ -9469,3 +9469,59 @@ see one.
 Default therefore stays `AVSampleBufferDisplayLayer`, windowed, synchronised.
 `--display metal --fullscreen --vsync 0` is the measured fast path, and whether
 its tearing is acceptable belongs to whoever is looking at the screen.
+
+## 17.84 A handshake that answered handshakes: 20,972 packets a second, and every metric said fine
+
+The key exchange in §17.82 replied to every handshake it received. So did the
+peer. A reply provoked a reply.
+
+    cap 758/s   sent 20972/s        (FPP=64, encrypted, loopback)
+    cap 1516/s  sent 14422/s        (FPP=32)
+
+Twenty-seven times more packets than anything asked for — 36 bytes each, about
+**6 Mbps of pure echo per direction**, bounded only by round-trip time. On
+loopback that is ten thousand exchanges a second.
+
+**Nothing detected it.** m2e stayed at 17 ms. Concealment stayed at zero. Slack,
+late arrivals, snaps, decode failures, frames lost, seal/open counts — every one
+clean, because loopback bandwidth is free and the echo consumed nothing that any
+of those measure. It shipped in 0.9.0 and 0.9.1. On the real link between two
+houses it would have swamped the call it was protecting.
+
+`cap` and `sent` were printed side by side on every report line for two releases.
+I had read that line dozens of times before adding encryption, when it said
+`sent 789/s`, and never re-read it afterwards.
+
+### The fix, and why the echo was not needed
+
+Reply only when the peer's key was **new**. `adoptPeer` now returns true only if
+something actually changed, and a repeated handshake is silence.
+
+Liveness never needed the echo: both ends already beat a handshake on a timer —
+fast while unkeyed, every 5 s after — so a peer that restarts with a fresh key is
+adopted on its next beat, that adoption *is* a change, and the single reply that
+follows completes the exchange in one round trip. Initial connect now costs three
+packets and then stops.
+
+    after:  cap 758/s   sent 790/s     (audio 758 + video 30 + one probe)
+            crypt on (30283/30278 sealed/opened, 0 bad)
+
+### The guard
+
+Every packet this app sends is caused by something countable, so `sent` should sit
+just above `cap` and nothing else is legitimate. A run now says so itself:
+
+    WARNING: sending N/s against M/s captured -- Kx more packets than anything asked for
+
+Silent on a healthy run, verified. This is the fourth member of a family that has
+now cost me a full day between them — an impairment gate the audio path bypassed,
+a video counter that could not see a lost frame, a display percentile computed
+over a tenth of the frames, and now a flood that no instrument was pointed at.
+Printing a number next to another number is not the same as comparing them.
+
+### And it invalidated the experiment running at the time
+
+The FPP 32-vs-64 re-test was measured with the flood active — and at *different*
+rates in each arm (20,972/s versus 14,422/s), so the two arms carried different
+amounts of parasitic traffic. Its result, that FPP=32 buys 3.7 ms, is void and
+has to be re-run.
