@@ -23,6 +23,61 @@ final class CallControls: NSView {
   private let inviteButton = NSButton()
   private let leaveButton = NSButton()
 
+  // ── HOW THE CALL IS GOING, WHERE THE PERSON CAN SEE IT ────────────────────
+  //
+  // This program measures mouth-to-ear latency, packet loss, concealment and
+  // repair to a precision most video apps never reach -- and showed the person on
+  // the call exactly none of it. When a call goes bad the first thing they need is
+  // to know whether it is them, and the second is proof it is not, and the app had
+  // every number and no way to say either.
+  //
+  // Said in words, not milliseconds, and short: nobody on a call wants a
+  // dashboard. The number is there for the curious and the word is there for
+  // everyone. A separate label from `statusLabel` because mute state and line
+  // quality are different facts and one of them must not overwrite the other.
+  private let qualityLabel = NSTextField(labelWithString: "")
+  /// Seconds since the call connected. Every call app on earth shows this; it is
+  /// how a person knows the app has not silently died.
+  private var startedAt: Date?
+
+  /// Set once, when the far end's media first arrives.
+  func markConnected() {
+    if startedAt == nil { startedAt = Date() }
+  }
+
+  /// Latency in ms and the fraction of audio that had to be invented, once a
+  /// second. Turns the numbers into a sentence, and a colour.
+  func setQuality(m2eMs: Double?, concealPct: Double, lossPct: Double) {
+    var parts: [String] = []
+    if let t = startedAt {
+      let s = Int(Date().timeIntervalSince(t))
+      parts.append(String(format: "%d:%02d", s / 60, s % 60))
+    }
+    var word = "", colour = NSColor.white.withAlphaComponent(0.55)
+    if let ms = m2eMs, ms > 0 {
+      parts.append("\(Int(ms.rounded())) ms")
+      // Thresholds in the units a listener actually notices. Concealment is the
+      // honest one -- it is audio the far end never heard, so it outranks latency:
+      // a 40 ms call that drops nothing sounds better than a 15 ms one that does.
+      if concealPct > 1.0 { word = "breaking up"; colour = NSColor.systemRed }
+      else if concealPct > 0.1 { word = "patchy"; colour = NSColor.systemOrange }
+      else if ms < 60 { word = "clear" }
+      else if ms < 150 { word = "good" }
+      else { word = "far away"; colour = NSColor.systemOrange }
+    }
+    if lossPct >= 0.5, word == "clear" || word == "good" {
+      // The line is losing packets and we are repairing them. The person should
+      // know their network is struggling even while it still sounds fine.
+      word += " (repairing)"
+    }
+    if !word.isEmpty { parts.append(word) }
+    let text = parts.joined(separator: " · ")
+    DispatchQueue.main.async { [weak self] in
+      self?.qualityLabel.stringValue = text
+      self?.qualityLabel.textColor = colour
+    }
+  }
+
   /// True means muted / camera off, matching what the button then offers to undo.
   private(set) var micMuted = false
   private(set) var camOff = false
@@ -50,6 +105,11 @@ final class CallControls: NSView {
     statusLabel.font = .systemFont(ofSize: 11)
     statusLabel.textColor = NSColor.white.withAlphaComponent(0.6)
     addSubview(statusLabel)
+
+    qualityLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    qualityLabel.textColor = NSColor.white.withAlphaComponent(0.55)
+    qualityLabel.alignment = .right
+    addSubview(qualityLabel)
 
     styleRound(micButton, symbol: "mic.fill", action: #selector(toggleMic))
     styleRound(camButton, symbol: "video.fill", action: #selector(toggleCam))
@@ -109,6 +169,9 @@ final class CallControls: NSView {
     let w = bounds.width, h = bounds.height
     roomLabel.frame = NSRect(x: 20, y: h / 2 + 1, width: 240, height: 18)
     statusLabel.frame = NSRect(x: 20, y: h / 2 - 17, width: 300, height: 16)
+    // Right of centre, left of the invite/leave buttons: the middle belongs to the
+    // mic and camera, which are the two things reached for in a hurry.
+    qualityLabel.frame = NSRect(x: w / 2 + 70, y: h / 2 - 8, width: max(80, w / 2 - 300), height: 16)
     let mid = w / 2
     micButton.frame = NSRect(x: mid - 50, y: h / 2 - 22, width: 44, height: 44)
     camButton.frame = NSRect(x: mid + 6, y: h / 2 - 22, width: 44, height: 44)

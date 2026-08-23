@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 
 // ── The join screen, for a Tokkah.app that was double-clicked ────────────────
@@ -80,6 +81,33 @@ enum Launcher {
     return r
   }
 
+  // ── Recent rooms, remembered ────────────────────────────────────────────────
+  //
+  // A room name is the rendezvous key AND the crypto salt, so it is never
+  // normalised or guessed at -- but the ones you have actually used are worth
+  // offering back. Five, most recent first.
+  private static let recentKey = "tk.recentRooms"
+  static var recentRooms: [String] {
+    UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+  }
+  static func remember(_ room: String) {
+    var r = recentRooms.filter { $0 != room }
+    r.insert(room, at: 0)
+    UserDefaults.standard.set(Array(r.prefix(5)), forKey: recentKey)
+    UserDefaults.standard.set(room, forKey: lastRoomKey)
+  }
+
+  /// A room nobody else is in. Three words, because a name you can say down a
+  /// phone is worth more here than one that is hard to guess -- the rendezvous
+  /// lease is seconds long and both ends have to be live at the same moment, so
+  /// the name is not the security boundary. The encryption key is.
+  static func suggestRoom() -> String {
+    let a = ["ripe", "quiet", "warm", "bright", "kind", "swift", "clear", "brave", "calm", "keen"]
+    let b = ["mango", "cedar", "harbour", "meadow", "lantern", "compass", "river", "ember", "willow", "summit"]
+    let c = ["jam", "path", "light", "song", "stone", "drift", "bell", "field", "wave", "spark"]
+    return "\(a.randomElement()!)-\(b.randomElement()!)-\(c.randomElement()!)"
+  }
+
   static func askRoom() -> String? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
@@ -87,38 +115,93 @@ enum Launcher {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
-    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 210),
+    let W: CGFloat = 520, PREVIEW: CGFloat = 268, H: CGFloat = PREVIEW + 214
+    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                      styleMask: [.titled, .closable], backing: .buffered, defer: false)
     w.title = "Tokkah"
     w.center()
     w.isReleasedWhenClosed = false
 
-    let v = NSView(frame: w.contentLayoutRect)
+    let v = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+
+    // ── THE CAMERA, BEFORE YOU COMMIT TO A CALL ───────────────────────────────
+    //
+    // The permission prompt used to appear after joining, at which point the
+    // window was showing nothing and there was no way to tell a refused camera
+    // from a broken one from a call that had not connected. Here it is answered
+    // while you are looking at the thing it is about, and a picture of your own
+    // face is the only proof of a working camera that needs no explanation.
+    //
+    // AVCaptureVideoPreviewLayer, not our own frame handling: this window does not
+    // encode anything, so the capture pipeline it needs is the one AVFoundation
+    // already has. The session is torn down before the re-exec so the real call
+    // opens the device cleanly.
+    let camBox = NSView(frame: NSRect(x: 0, y: H - PREVIEW, width: W, height: PREVIEW))
+    camBox.wantsLayer = true
+    let host = CALayer()
+    host.backgroundColor = NSColor.black.cgColor
+    camBox.layer = host
+    v.addSubview(camBox)
+
+    let hint = NSTextField(labelWithString: "")
+    hint.font = .systemFont(ofSize: 12)
+    hint.textColor = .secondaryLabelColor
+    hint.alignment = .center
+    hint.frame = NSRect(x: 20, y: H - PREVIEW / 2 - 9, width: W - 40, height: 18)
+    v.addSubview(hint)
+
+    let session = AVCaptureSession()
+    var preview: AVCaptureVideoPreviewLayer?
+    if let dev = AVCaptureDevice.default(for: .video),
+       let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
+      session.addInput(input)
+      let pl = AVCaptureVideoPreviewLayer(session: session)
+      pl.videoGravity = .resizeAspectFill
+      pl.frame = CGRect(x: 0, y: 0, width: W, height: PREVIEW)
+      host.addSublayer(pl)
+      preview = pl
+      DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
+    } else {
+      // Said plainly, in the window. A black rectangle with no caption is how a
+      // person concludes the app is broken when the answer is one settings toggle.
+      hint.stringValue = "No camera available — audio only.\nAllow camera access in System Settings › Privacy & Security."
+      hint.maximumNumberOfLines = 2
+      hint.frame = NSRect(x: 20, y: H - PREVIEW / 2 - 18, width: W - 40, height: 36)
+    }
+    _ = preview
+
     let title = NSTextField(labelWithString: "Join a call")
-    title.font = .systemFont(ofSize: 22, weight: .semibold)
-    title.frame = NSRect(x: 28, y: 148, width: 364, height: 30)
+    title.font = .systemFont(ofSize: 20, weight: .semibold)
+    title.frame = NSRect(x: 24, y: H - PREVIEW - 38, width: 300, height: 26)
     v.addSubview(title)
 
-    let sub = NSTextField(labelWithString: "Both people type the same room name.")
-    sub.font = .systemFont(ofSize: 12)
+    let sub = NSTextField(labelWithString: "Both of you type the same room name — that is the whole setup. "
+                        + "It is also the encryption key, so pick something only the two of you would say.")
+    sub.font = .systemFont(ofSize: 11)
     sub.textColor = .secondaryLabelColor
-    sub.frame = NSRect(x: 28, y: 126, width: 364, height: 18)
+    sub.maximumNumberOfLines = 2
+    sub.frame = NSRect(x: 24, y: H - PREVIEW - 74, width: W - 48, height: 32)
     v.addSubview(sub)
 
-    let field = NSTextField(frame: NSRect(x: 28, y: 78, width: 364, height: 28))
+    let field = NSTextField(frame: NSRect(x: 24, y: H - PREVIEW - 112, width: W - 48 - 96, height: 30))
     field.placeholderString = "room name"
-    field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? ""
+    field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom()
     field.font = .systemFont(ofSize: 15)
     v.addSubview(field)
+
+    let newBtn = NSButton(title: "Suggest", target: nil, action: nil)
+    newBtn.frame = NSRect(x: W - 24 - 88, y: H - PREVIEW - 112, width: 88, height: 30)
+    newBtn.bezelStyle = .rounded
+    v.addSubview(newBtn)
 
     let status = NSTextField(labelWithString: "")
     status.font = .systemFont(ofSize: 11)
     status.textColor = .secondaryLabelColor
-    status.frame = NSRect(x: 28, y: 22, width: 240, height: 16)
+    status.frame = NSRect(x: 24, y: 20, width: W - 150, height: 16)
     v.addSubview(status)
 
     let join = NSButton(title: "Join", target: nil, action: nil)
-    join.frame = NSRect(x: 296, y: 16, width: 96, height: 30)
+    join.frame = NSRect(x: W - 24 - 104, y: 14, width: 104, height: 32)
     join.bezelStyle = .rounded
     join.keyEquivalent = "\r"                      // Return joins
     v.addSubview(join)
@@ -132,17 +215,33 @@ enum Launcher {
       let field: NSTextField
       let status: NSTextField
       init(field: NSTextField, status: NSTextField) { self.field = field; self.status = status }
-      @objc func go() {
-        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      func validate(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Refuse rather than silently normalise: the room name is the rendezvous
         // key AND the crypto salt, so "My Room" and "my-room" being quietly the
         // same thing would be a surprise at exactly the wrong moment.
-        guard !name.isEmpty else { status.stringValue = "Type a room name."; return }
+        guard !name.isEmpty else { status.stringValue = "Type a room name."; return nil }
         guard name.count <= 64,
               name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else {
           status.stringValue = "Letters, numbers, - and _ only."
-          return
+          return nil
         }
+        return name
+      }
+      @objc func go() {
+        guard let name = validate(field.stringValue) else { return }
+        picked = name
+        done = true
+      }
+      @objc func suggest() {
+        field.stringValue = Launcher.suggestRoom()
+        status.stringValue = ""
+      }
+      /// A recent room, from its button. The name rides in the button's title, so
+      /// there is no parallel array to fall out of step with what is on screen.
+      @objc func pickRecent(_ sender: NSButton) {
+        field.stringValue = sender.title
+        guard let name = validate(sender.title) else { return }
         picked = name
         done = true
       }
@@ -151,6 +250,29 @@ enum Launcher {
     let t = Target(field: field, status: status)
     join.target = t
     join.action = #selector(Target.go)
+    newBtn.target = t
+    newBtn.action = #selector(Target.suggest)
+
+    // Rooms you have actually been in, one click each.
+    let recents = recentRooms
+    if !recents.isEmpty {
+      let lbl = NSTextField(labelWithString: "Recent")
+      lbl.font = .systemFont(ofSize: 10, weight: .semibold)
+      lbl.textColor = .tertiaryLabelColor
+      lbl.frame = NSRect(x: 24, y: H - PREVIEW - 140, width: 60, height: 14)
+      v.addSubview(lbl)
+      var x: CGFloat = 24
+      for r in recents.prefix(4) {
+        let b = NSButton(title: r, target: t, action: #selector(Target.pickRecent(_:)))
+        b.bezelStyle = .inline
+        b.font = .systemFont(ofSize: 11)
+        let width = min(150, b.intrinsicContentSize.width + 18)
+        if x + width > W - 24 { break }
+        b.frame = NSRect(x: x, y: H - PREVIEW - 166, width: width, height: 22)
+        v.addSubview(b)
+        x += width + 8
+      }
+    }
 
     w.makeKeyAndOrderFront(nil)
     w.makeFirstResponder(field)
@@ -159,20 +281,16 @@ enum Launcher {
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.
     while !t.done {
-      // A short timeout rather than distantFuture: a `tokkah://` link can arrive
-      // while this window is open, and with no events at all the loop would sit
-      // there forever having already been told where to go.
-      guard let e = app.nextEvent(matching: .any, until: Date().addingTimeInterval(0.2),
-                                 inMode: .default, dequeue: true) else {
-        if let r = urlRoom { t.picked = r; urlRoom = nil; t.done = true }
-        continue
-      }
+      guard let e = app.nextEvent(matching: .any, until: .distantFuture,
+                                 inMode: .default, dequeue: true) else { continue }
       app.sendEvent(e)
-      if let r = urlRoom { t.picked = r; urlRoom = nil; t.done = true }
       if !w.isVisible { t.done = true }             // they closed it
     }
     w.orderOut(nil)
-    if let r = t.picked { UserDefaults.standard.set(r, forKey: lastRoomKey) }
+    // Release the device before the re-exec, so the call opens it cleanly rather
+    // than racing a session this process is about to stop existing to own.
+    if session.isRunning { session.stopRunning() }
+    if let r = t.picked { remember(r) }
     return t.picked
   }
 

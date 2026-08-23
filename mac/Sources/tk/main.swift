@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.28.0"
+let VERSION = "0.29.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -854,6 +854,7 @@ vdec.onDecoded = { img, capHost in
     sawRemote = true
     // Their picture takes the window; yours moves to the corner.
     display?.selfViewOn = true
+    display?.controls?.markConnected()
     setWindowTitle("Tokkah — connected")
     display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
     fputs("the other side's picture is on screen\n", stderr)
@@ -1054,6 +1055,7 @@ do { try audio.start() } catch {
 var last = (sent: 0, recv: 0, played: 0, concealed: 0, dup: 0, tooOld: 0, jumps: 0, cap: 0)
 var lastBytes = (up: 0, down: 0)
 var lastGen = (a: 0, v: 0, p: 0, c: 0, fec: 0)
+var lastUiLost = 0, lastUiRecovered = 0
 var lastV = (dec: 0, sent: 0, bytes: 0)
 var lastVBytesPrev = 0
 let expected = SR / Double(FPP)   // 375 packets/s at 128 frames
@@ -1587,6 +1589,26 @@ func reportLoop() {
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
+
+  // ── AND TELL THE PERSON ON THE CALL ─────────────────────────────────────────
+  //
+  // Same numbers, same second, one place. The bar reads from what the report line
+  // just computed rather than sampling anything itself, so the window and the log
+  // can never disagree about how the call is going -- which is the whole reason
+  // the beat is built here too.
+  if let c = display?.controls {
+    // Concealment as a PERCENTAGE of what should have played, not a count: a count
+    // means nothing without a rate behind it, and this is the number that decides
+    // whether a person hears a problem.
+    let expectedPkts = max(1.0, expected)
+    let concealPct = Double(d.concealed) / expectedPkts * 100.0
+    // Loss on the path INTO here, before repair -- what the network did, not what
+    // survived it.
+    let lostNow = Double(r.concealLost - lastUiLost) + Double(r.recovered - lastUiRecovered)
+    lastUiLost = r.concealLost; lastUiRecovered = r.recovered
+    let lossPct = lostNow / expectedPkts * 100.0
+    c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
+  }
 
   // ── WHERE THE BANDWIDTH WENT ────────────────────────────────────────────────
   //

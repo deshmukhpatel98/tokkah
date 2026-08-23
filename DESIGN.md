@@ -11436,3 +11436,89 @@ pressed mic:    micMuted=true  camOff=false  clipboard=0 chars
 pressed cam:    micMuted=true  camOff=true   clipboard=0 chars
 pressed invite: micMuted=true  camOff=true   clipboard=183 chars
 ```
+
+## 17.113 Yourself in the corner, a join screen that proves the camera, and the numbers said out loud
+
+17.112 gave the window controls. Three things were still missing, and each of them
+is something a person reaches for in the first ten seconds.
+
+### You, in the corner
+
+A second `AVSampleBufferDisplayLayer` rather than compositing of our own: the window
+server composites layers for free, and the alternative is a shader written twice —
+once here, once for Metal — and then kept agreeing with itself. It is a **sublayer**
+of the hosted layer and not a subview, because this file has already paid for that
+distinction once with a control bar that never drew.
+
+It matters beyond vanity. Without it, a frozen remote picture, a dead remote camera
+and a hung app all look identical: a still photograph of somebody else. Watching
+yourself move is the only proof inside the app that **your** end works. Full-screen
+before anyone joins, corner once their picture arrives, gone while the camera is
+off. `CallControls.barHeight` is published so the corner sits above the buttons
+rather than a second file guessing 72 and drifting.
+
+### A join screen that answers the camera question first
+
+The permission prompt used to arrive *after* joining, into a window showing nothing
+— so a refused camera, a broken camera and a call that had not connected were
+indistinguishable. Now the join window runs an `AVCaptureVideoPreviewLayer` above
+the room field, so the prompt is answered while you are looking at the thing it is
+about, and a picture of your own face is the proof of a working camera that needs no
+explanation. No camera says so in words, with where to fix it, because a black
+rectangle with no caption is how a person concludes the app is broken.
+
+Also: the last five rooms as one-click buttons, and a **Suggest** button producing
+`ripe-mango-jam`. The name is not the security boundary — the rendezvous lease is
+seconds long and both ends must be live at once — so a name you can say down a phone
+is worth more than one that is hard to guess. The encryption key is the boundary,
+and it is still never sent.
+
+### And the numbers, in words
+
+This program measures mouth-to-ear latency, loss, concealment and repair to a
+precision most video apps never reach, and showed the person on the call **none of
+it**. When a call goes bad the first thing they need is to know whether it is them,
+and the second is proof that it is not.
+
+The bar now reads `0:20 · 11 ms · clear`. Elapsed time, because that is how a person
+knows the app has not silently died; the latency, for the curious; and one word for
+everyone. Concealment outranks latency in choosing that word, deliberately — it is
+audio the listener never heard, so a 40 ms call that drops nothing sounds better
+than a 15 ms one that does:
+
+| condition | word |
+|---|---|
+| concealment > 1% | **breaking up** (red) |
+| concealment > 0.1% | **patchy** (amber) |
+| < 60 ms | **clear** |
+| < 150 ms | **good** |
+| ≥ 150 ms | **far away** (amber) |
+| loss ≥ 0.5% but still clear/good | `clear (repairing)` |
+
+That last row exists because this app repairs loss well enough to hide it, and a
+person whose network is degrading deserves to know before it stops being hidden.
+
+Fed from the report loop, in the same second, from the same values that build the
+telemetry beat — so the window, the log and the dashboard cannot disagree about how
+a call went.
+
+### Self-update, verified rather than assumed
+
+Tested with a genuinely old binary, after a first attempt where the version edit
+silently matched nothing and the "old" binary was current — a null A/B that would
+have reported success:
+
+```
+tk 0.20.0
+update: 0.28.0 available (...) -- downloading
+update: installed 0.28.0 -- restarting
+tk 0.28.0
+```
+
+Signed manifest, Ed25519, verified before anything is written. Nobody reinstalls.
+
+### Still missing from the web app
+
+Named rather than implied: device pickers (choose or switch camera and microphone),
+the "your room is loud" echo warning, and live translation. Translation is a feature
+rather than a control and is not started.
