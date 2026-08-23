@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.4"
+let VERSION = "0.9.5"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -770,6 +770,19 @@ func reportLoop() {
              + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "") + ")"
            : "  CRYPT PENDING (plaintext \(c.plaintextTx) sent)" } ?? "  crypt off")
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "") + "\n", stderr)
+  // Where the milliseconds actually are. cap->send is this machine's send side;
+  // recv->play is this machine's receive side including the jitter buffer. What
+  // m2e has left over after those two and the two device latencies is the wire.
+  if let cs = audio.capToSend.p(0.50), let rp = audio.recvToPlay.p(0.50) {
+    let acct = cs + rp + audio.inLatencyMs + audio.outLatencyMs
+    fputs("  stages: cap->send \(String(format: "%.2f", cs))"
+        + "  recv->play \(String(format: "%.2f", rp))"
+        + "  mic \(String(format: "%.2f", audio.inLatencyMs))"
+        + "  spk \(String(format: "%.2f", audio.outLatencyMs))"
+        + "  = \(String(format: "%.2f", acct)) ms accounted"
+        + (audio.m2eLast > 0 ? ", m2e \(String(format: "%.2f", audio.m2eLast))"
+           + ", unexplained \(String(format: "%.2f", audio.m2eLast - acct))" : "") + "\n", stderr)
+  }
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
   if vsource != nil || vasm.fragsIn > 0 {

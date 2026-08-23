@@ -1,1 +1,1 @@
-{"version":"0.9.4","url":"https://room.tokkah.com/macos/dl/tk-0.9.4.tar.gz","sha256":"7076c4c6f66daf68df365b7f5ea104a45082dd3da43f748b76cd05a4a07aceca","size":147368,"notes":"isolated packet loss is repaired instead of clicking (18x less concealment), and the mic permission finally explains itself"}
+{"version":"0.9.5","url":"https://room.tokkah.com/macos/dl/tk-0.9.5.tar.gz","sha256":"9c8487972242ef523b33bfd4ac96a7cd3eb1537ecb49c2f306e53c4cd564b6bb","size":147410,"notes":"important: a call now survives the other side restarting (it used to die for good)"}

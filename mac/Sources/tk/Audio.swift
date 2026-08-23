@@ -54,6 +54,12 @@ final class Audio {
 
   // Measurement
   var m2e = Quantiles()
+  /// THE DECOMPOSITION. The budget adds up to 9.8 ms and m2e measures 12.5, so
+  /// 2.6 ms is going somewhere unnamed -- and on loopback the network is 0.07 ms,
+  /// so it is not the network. An unexplained millisecond is a defect that has not
+  /// been located yet, which is the only reason these exist.
+  var capToSend = Quantiles(cap: 2048)     // sender: capture stamp -> handed to the socket
+  var recvToPlay = Quantiles(cap: 2048)    // receiver: off the socket -> at the DAC
   var m2eLast: Double = 0
   var outLatencyMs: Double = 0
   var inLatencyMs: Double = 0
@@ -253,6 +259,7 @@ final class Audio {
         // the samples already consumed from it.
         let off = UInt64(Double(i - FPP) / SR * 1_000_000_000.0)
         let cap = host0 + Clock.ticks(ns: off)
+        capToSend.add(Clock.msSigned(Clock.now(), cap))
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
                    redundant: (redundancy && havePrev) ? prevBuf : nil,
                    redundantCap: prevCap)
@@ -386,6 +393,9 @@ final class Audio {
             m2eLast = ms
             m2e.add(ms)
           }
+          // Local both ends, no offset involved, so this term is exact even
+          // between two machines. Includes the deliberate jitter buffer.
+          recvToPlay.add(Clock.msSigned(earHost, ring.recvHost[slot]))
         }
       } else {
         out[i] = 0

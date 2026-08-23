@@ -56,6 +56,10 @@ final class RecvRing {
   let samples: UnsafeMutablePointer<Float>
   let tags: UnsafeMutablePointer<Int32>       // seq present in this slot, or -1
   let capHost: UnsafeMutablePointer<UInt64>   // capture host time of that packet
+  /// When THIS machine took the packet off the socket. Local, so it needs no
+  /// clock offset, and it is what splits "the network was slow" from "we sat on
+  /// it" -- the difference between a defect that is mine and one that is not.
+  let recvHost: UnsafeMutablePointer<UInt64>
   private(set) var hiSeq: Int32 = -1          // newest seq ever written
 
   // Read cursor, in ABSOLUTE samples, FRACTIONAL. Owned by the audio thread.
@@ -130,6 +134,8 @@ final class RecvRing {
     tags.initialize(repeating: -1, count: RING)
     capHost = .allocate(capacity: RING)
     capHost.initialize(repeating: 0, count: RING)
+    recvHost = .allocate(capacity: RING)
+    recvHost.initialize(repeating: 0, count: RING)
   }
 
   @inline(__always) func present(_ seq: Int32) -> Bool {
@@ -191,6 +197,7 @@ final class RecvRing {
     }
     memcpy(samples + slot * FPP, src, min(n, FPP) * 4)
     capHost[slot] = cap
+    recvHost[slot] = Clock.now()
     tags[slot] = seq
     if seq > hiSeq { hiSeq = seq }
   }

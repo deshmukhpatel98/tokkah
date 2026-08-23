@@ -9655,3 +9655,47 @@ A receiver bug cannot be fixed from the sender's side. Every copy in the field i
 0.9.4, which still has it, so during the 0.9.4 → 0.9.5 rollout the side that
 updates *second* will refuse the first side's packets until it too updates — up to
 one poll interval of one-way audio. After that, every restart is clean forever.
+
+## 17.89 Naming the 2.6 ms — and finding that m2e is probably conservative
+
+The budget added up to 9.79 ms and m2e measured 12.08, and on loopback the network
+is 0.07 ms, so 2.6 ms was going somewhere unnamed. In this project that counts as a
+defect that has not been located rather than a rounding error, so the pipeline now
+reports its own stages:
+
+    stages: cap->send 1.68  recv->play 5.20  mic 2.21  spk 2.92
+            = 12.00 ms accounted, m2e 12.08, unexplained 0.08
+
+Both new terms are **local** — capture stamp to socket on the sender, socket to DAC
+on the receiver — so neither needs a clock offset and both stay exact between two
+machines, not just on loopback.
+
+The 2.6 ms is now two named amounts: **1.01 ms on the send side** above the 0.67 ms
+a packet needs to fill, and **1.87 ms on the receive side** above the 3.33 ms of
+deliberate jitter buffer.
+
+### And the decomposition cannot prove itself, which is the interesting part
+
+`unexplained 0.08` is close to tautological: m2e is
+`(earHost − capHost) + inLat + outLat`, and the two new stages sum to almost exactly
+`earHost − capHost`. So this confirms the accounting is *internally consistent*. It
+says nothing about whether `inLat` and `outLat` belong there at all.
+
+And there is now a specific reason to doubt they fully do. The input timestamp from
+AUHAL is the time the samples were *captured*, while the callback runs later — by
+about the safety offset, 48 frames, 1.0 ms. That is suspiciously exactly the send-side
+excess. The same argument fits the receive side: `earHost` is derived from the output
+timestamp, which already describes when the buffer reaches the DAC, and 1.87 ms is
+close to output safety offset plus buffer (1.67 ms).
+
+If that reading is right, **`inLatencyMs` and `outLatencyMs` are being counted twice
+and every m2e figure in this file is conservative by roughly 1.7–2.7 ms** — the true
+number nearer 9.5–10.5 ms than 12.1.
+
+I am not going to quietly claim the better number. Settling it needs the one
+measurement that cannot be argued: a click played out the speaker and recorded back
+through the microphone, which gives true acoustic mouth-to-ear with every device
+latency included exactly once, however the timestamps are defined. That requires
+making a sound, and the machine's owner is asleep. Until then the reported figure
+stays the larger one, and it is the larger one on purpose: being wrong in the
+direction that flatters the project is the mistake this file keeps having to correct.
