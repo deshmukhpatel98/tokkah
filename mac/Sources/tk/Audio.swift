@@ -58,6 +58,29 @@ final class Audio {
   /// 2.6 ms is going somewhere unnamed -- and on loopback the network is 0.07 ms,
   /// so it is not the network. An unexplained millisecond is a defect that has not
   /// been located yet, which is the only reason these exist.
+  // ── The acoustic ruler ─────────────────────────────────────────────────────
+  //
+  // Everything else here measures the pipeline with the pipeline's own
+  // timestamps, which cannot settle the one question that matters about them:
+  // whether `kAudioDevicePropertyLatency` and the safety offset are ALREADY
+  // inside the timestamps we add them to. If they are, every m2e figure in this
+  // project is ~2 ms too large.
+  //
+  // A click settles it. Emit an impulse at a known output host time, listen for
+  // it arriving at a known input host time, and the difference is the real
+  // speaker -> air -> microphone path measured with exactly the same timestamp
+  // conventions the app uses everywhere else. If it comes back close to
+  // inLatencyMs + outLatencyMs + air, the terms are real and separate. If it comes
+  // back far smaller, they are already counted and m2e is overstating.
+  //
+  // Needs to make a sound, so it is a flag and not a default, and it refuses to
+  // run muted rather than reporting a silent negative.
+  var acoustic = false
+  private var acPlayAt: UInt64 = 0        // host time of the impulse we emitted
+  private var acWaiting = false
+  private var acNext: UInt64 = 0          // do not fire again until this time
+  var acRound = Quantiles(cap: 64)
+  private(set) var acFired = 0, acHeard = 0
   var capToSend = Quantiles(cap: 2048)     // sender: capture stamp -> handed to the socket
   var recvToPlay = Quantiles(cap: 2048)    // receiver: off the socket -> at the DAC
   var m2eLast: Double = 0
@@ -249,6 +272,27 @@ final class Audio {
     let host0 = (ts.pointee.mFlags.contains(.hostTimeValid) && ts.pointee.mHostTime != 0)
       ? ts.pointee.mHostTime : Clock.now()
 
+    // Listen for the click we emitted. Scanning the raw input buffer, before any
+    // packetising, so nothing in this file's own plumbing is inside the answer.
+    if acoustic, acWaiting {
+      var j = 0
+      while j < Int(n) {
+        if abs(inScratch[j]) > 0.15 {
+          let heardAt = host0 + Clock.ticks(ns: UInt64(Double(j) / SR * 1_000_000_000.0))
+          let ms = Clock.msSigned(heardAt, acPlayAt)
+          // A detection before the click, or a second of silence, is not a fast
+          // path -- it is a false positive or a miss. Refuse both.
+          if ms > 0, ms < 500 { acRound.add(ms); acHeard += 1 }
+          acWaiting = false
+          break
+        }
+        j += 1
+      }
+      // Give up on this click rather than matching it to the NEXT one, which
+      // would report a delay of exactly the firing interval and look plausible.
+      if acWaiting, Clock.msSigned(host0, acPlayAt) > 300 { acWaiting = false }
+    }
+
     var i = 0
     while i < Int(n) {
       let take = min(FPP - capFill, Int(n) - i)
@@ -408,6 +452,17 @@ final class Audio {
       }
     }
     ring.pos += Double(n) * ring.rate
+
+    if acoustic, !mute, !acWaiting, dueHost > acNext {
+      // Full-scale for a handful of samples: short enough to locate precisely,
+      // loud enough to clear room noise without being a tone.
+      let k = min(8, Int(n))
+      for i in 0..<k { out[i] = (i % 2 == 0) ? 0.9 : -0.9 }
+      acPlayAt = dueHost
+      acWaiting = true
+      acFired += 1
+      acNext = dueHost + Clock.ticks(ns: 400_000_000)   // one every 400 ms
+    }
   }
 
 }

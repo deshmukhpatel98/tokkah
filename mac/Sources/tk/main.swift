@@ -225,7 +225,16 @@ case .denied, .restricted:
 // --no-fec exists so redundancy can be A/B'd against itself. A feature that
 // cannot be turned off cannot be measured, and this one costs bandwidth.
 let fecAllowed = !flag("no-fec")
+// --acoustic measures the real speaker->air->mic path, which is the only thing
+// that can settle whether the device-latency terms are already inside the
+// timestamps we add them to (17.89). It has to make a sound.
+audio.acoustic = flag("acoustic")
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
+if audio.acoustic && audio.mute {
+  fputs("--acoustic needs to play a sound and playout is muted (--mute or TK_MUTE=1).\n"
+      + "  Refusing rather than reporting zero clicks heard, which would look like a real negative.\n", stderr)
+  exit(1)
+}
 // SAID OUT LOUD, because "played 754/s" is identical whether the samples are
 // audio or zeros -- the counter cannot tell me the speaker is silent, and a
 // check that cannot fail is not a check.
@@ -773,6 +782,15 @@ func reportLoop() {
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.
+  if audio.acoustic {
+    let heard = audio.acRound.p(0.50)
+    let devSum = audio.inLatencyMs + audio.outLatencyMs
+    fputs("  acoustic: \(audio.acHeard)/\(audio.acFired) clicks heard"
+        + (heard != nil ? ", speaker->air->mic p50 \(String(format: "%.2f", heard!)) ms" : "")
+        + "  vs mic+spk latency \(String(format: "%.2f", devSum)) ms"
+        + (heard != nil ? "  => device terms are \(heard! > devSum * 0.6 ? "REAL and separate" : "ALREADY IN THE TIMESTAMPS (m2e overstates)")" : "")
+        + "\n", stderr)
+  }
   if let cs = audio.capToSend.p(0.50), let rp = audio.recvToPlay.p(0.50) {
     let acct = cs + rp + audio.inLatencyMs + audio.outLatencyMs
     fputs("  stages: cap->send \(String(format: "%.2f", cs))"
