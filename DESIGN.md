@@ -9141,3 +9141,95 @@ One rig fact worth writing down, because it cost an hour: **the debug build
 cannot measure this.** `-Onone` in a render callback produced two 200 ms stalls
 in 45 s; the same code at `-c release` ran 48 s with none. Every audio number
 here is a release build.
+
+## 17.79 What a lossy path actually costs, once the rig can see it
+
+Every native number so far was loopback: no loss, no jitter, no radio. The call
+this app exists for is wifi in one house to wifi in another, and this project has
+a standing rule that a clean pipe does not describe a real path. `pfctl` wants a
+password this process does not have, so the impairment went into the sender —
+uniform loss, **burst** loss (wifi does not lose packets one at a time; it loses
+a burst while the radio retries, and 1% uniform and 1% bursty sound nothing
+alike), and queue-style jitter.
+
+### The first sweep measured nothing, and said so confidently
+
+    clean          m2e 16.47   conceal 0
+    loss5-burst20  m2e 16.33   conceal 0   ← 5% loss, zero concealment
+
+Five percent loss and not one concealed packet. `[IMPAIRED …, 8 dropped]` — eight
+packets in sixty-five seconds. The audio send path called `sendto` directly and
+never went through `rawSend`, so the gate saw video fragments and clock probes and
+**not a single audio packet**. The rig reported that the app shrugs off heavy loss
+while testing nothing at all. There is now one send path and one gate; verified by
+three independent counters agreeing — 756 captured, 598 sent, receiver concealing
+159/s at a nominal 20%.
+
+### Then it found four real defects
+
+**1% loss cost 6.3 ms of latency, all of it waste.** The buffer controller grew to
+its ceiling on concealment, and concealment from loss is not a late packet — a
+lost packet is never coming, and no buffer size on earth catches it. Late and lost
+are different events with opposite remedies, and the test between them is exact
+and already measured: **a late arrival has negative slack**. Grow on lateness,
+never on loss. `m2e 22.22 → 17.28`.
+
+**A loss burst was being classified as a broken stream.** The jump guard read
+`curSeq > hi + 2`, but `hi` only moves when a packet *arrives*, so during a burst
+it freezes while the cursor conceals straight past it — which is what concealment
+is *for*. That tripped a rule written for "the peer restarted and we are somehow
+ahead of it" and repositioned the cursor against a **stale head**, rewinding it
+slightly on every burst. The signature was unmistakable once the instrument
+existed: `slack p50` climbing 8 → 13 → 15 → 17 ms, a snap firing every couple of
+seconds to undo it, `m2e` pinned near 29 ms on a path whose only defect was
+missing packets. A real restart puts sequence numbers back near zero, so the
+cursor is ahead by hundreds of packets, not two. `m2e 28.16 → 17.38`.
+
+**Two more constants with a duration hidden inside a count.** `JIT_MAX = 8
+packets` meant 21 ms at the old packet size and silently became 10.7 ms when
+packets halved — the maximum buffer cut in half by a change with nothing to do
+with it. `SNAP_PKTS = 11` likewise went from 29 ms to 14.7 ms. Third and fourth
+instances of this in one file, so both are derived from milliseconds now.
+
+**Video loss was completely invisible.** `partial-drops` counts a slot reused
+while incomplete, which only happens to a frame that arrived *in pieces*. At
+these bitrates a frame is ~300 bytes and fits in one fragment, so a wholly lost
+frame never created a slot and never touched the counter. The headline video line
+read `partial-drops 0  decFails 0` at 3% loss and meant it. Sequence gaps are
+exact: 41 frames lost in fifty seconds, where the number had been zero.
+
+### And a defect that had no symptom at all
+
+There are no B-frames here, which is right for latency and means every frame
+references the one before it. Lose one and the decoder keeps decoding happily
+against a reference it does not have: `decFails 0`, `noFmt 0`, 30 fps, and a
+picture that is quietly *wrong* until something else happens to send a keyframe.
+The old repair trigger fired when decoding **stopped**, which is the one symptom
+this failure does not have. It now repairs on a sequence gap, rate-limited so the
+repair cannot become the problem.
+
+To know whether that actually works, the receiver now probes its own decoded
+luma. Both ends of the rig play the same file, so a decoded mean that wanders from
+the encoder's reported mean *is* corruption — the one symptom `frames-lost`,
+`decFails` and `fps` all agree to call healthy. Under 3% burst loss: sender
+`luma 92`, receiver `decLuma 93`, 32 repair keyframes for 41 lost frames.
+
+### Measured, release build, 65 s per arm, impairment on both ends
+
+                        before        after
+    clean               16.34 ms      15.63 ms
+    1% uniform loss     22.22 ms      16.26 ms
+    3% burst loss       28.16 ms      17.38 ms
+    0-20 ms jitter      38.20 ms      38.88 ms   (correctly grows; this is the path)
+
+Three percent bursty loss now costs **1.75 ms** instead of 12.5 ms, and the app
+under that abuse is better than it was on a perfect path an hour ago. The jitter
+arm is unchanged on purpose: there the added delay is real and buffering is the
+correct answer, which is precisely the distinction the controller could not make
+before.
+
+One rig note, because it wasted a run: **zsh does not word-split unquoted
+parameter expansions.** A loop passing `$FLAGS` handed the binary one argument
+instead of four, the impairment never armed, and the arm reported a clean path
+under its damaged label. The banner is printed on every impaired run for exactly
+this reason — and it was its absence that gave the game away.

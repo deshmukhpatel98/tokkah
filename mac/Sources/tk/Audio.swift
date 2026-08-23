@@ -264,7 +264,21 @@ final class Audio {
     // A JUMP is for a broken stream, not for a drift. Only two things justify
     // discarding continuity: the stream has run further ahead than the ring can
     // hold, or the cursor is somehow ahead of the newest packet.
-    if hi - curSeq > Int64(RING - 2) || curSeq > hi + 2 {
+    // The cursor outrunning the newest packet by a hair is NORMAL, not broken.
+    //
+    // The old test was `curSeq > hi + 2`. But `hi` only moves when a packet
+    // arrives, so during a loss burst it freezes while the cursor conceals
+    // straight past it -- which is exactly what concealment is for. That tripped
+    // a rule written for "the stream restarted and we are somehow ahead of it",
+    // and repositioned the cursor against a STALE head, rewinding it a little on
+    // every burst. Measured at 3% burst loss: slack p50 climbing 8 -> 17 ms, a
+    // snap firing every couple of seconds to undo it, and m2e stuck near 29 ms
+    // on a path whose only defect was missing packets.
+    //
+    // A genuine peer restart looks completely different -- sequence numbers back
+    // near zero, so the cursor is ahead by hundreds of packets, not two. That is
+    // what this now tests for, and a loss burst no longer looks like one.
+    if hi - curSeq > Int64(RING - 2) || curSeq > hi + Int64(RING / 4) {
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
       ring.jumps += 1
     }
@@ -288,7 +302,10 @@ final class Audio {
     // The threshold sits far above real jitter and far below the ring: one rare
     // click after a network hiccup, in exchange for never carrying a hiccup's
     // latency for the rest of the call.
-    let SNAP_PKTS: Int64 = 11        // ~29 ms
+    // In MILLISECONDS. As `11 packets` this meant 29 ms at the old packet size and
+    // silently became 14.7 ms when packets halved -- third instance of the same
+    // mistake in this one file, so it is now derived rather than typed.
+    let SNAP_PKTS = max(Int64(4), Int64((30.0 / (Double(FPP) / SR * 1000.0)).rounded()))
     var cur = curSeq
     if hi - cur - Int64(jitTarget) > SNAP_PKTS {
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
@@ -352,7 +369,12 @@ final class Audio {
         }
       } else {
         out[i] = 0
-        if off == 0 { ring.concealed += 1 }
+        if off == 0 {
+          ring.concealed += 1
+          // Already past this sequence and it never came: lost. Not yet reached
+          // by the stream: starved, which a bigger buffer does address.
+          if hi > Int64(seq) { ring.concealLost += 1 } else { ring.concealStarved += 1 }
+        }
       }
     }
     ring.pos += Double(n) * ring.rate

@@ -22,6 +22,12 @@
     "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swiftdeps",
     "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.dia"
   },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Impair.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.dia"
+  },
   "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Net.swift": {
     "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net.swift.o",
     "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Net~partial.swiftmodule",

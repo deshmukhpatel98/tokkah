@@ -13,7 +13,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.5.0"
+let VERSION = "0.6.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -147,6 +147,9 @@ if let room = arg("room") {
   }.start()
 }
 
+var keyAsksOnLoss = 0
+var gDecLuma: Double = -1
+var gDecLumaTick = 0
 var gThetaMs: Double = 0
 var gThetaValid = false
 let audio = Audio()
@@ -212,6 +215,23 @@ if flag("window") {
 let dumpTo = arg("dump")
 var dumped = false
 vdec.onDecoded = { img, capHost in
+  // What the far end's picture actually looks like after decoding. Both ends of
+  // the test rig play the same file, so a decoded mean luma that wanders away
+  // from the encoder's reported luma is corruption -- the one symptom that
+  // frames-lost, decFails and fps all agree to call healthy.
+  gDecLumaTick += 1
+  if gDecLumaTick % 15 == 0, let pb = img as CVPixelBuffer? {
+    CVPixelBufferLockBaseAddress(pb, .readOnly)
+    if let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) {
+      let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+      let h = CVPixelBufferGetHeightOfPlane(pb, 0), w = CVPixelBufferGetWidthOfPlane(pb, 0)
+      let p = base.assumingMemoryBound(to: UInt8.self)
+      var sum = 0, n = 0, y = 0
+      while y < h { var x = 0; while x < w { sum += Int(p[y * stride + x]); n += 1; x += 8 }; y += 8 }
+      if n > 0 { gDecLuma = Double(sum) / Double(n) }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+  }
   // Same rule as audio: the capture stamp is the PEER's clock, so without the
   // offset this is not a latency, it is the difference between two epochs.
   if gThetaValid { vg2g.add(Clock.msSigned(Clock.now(), capHost) + gThetaMs) }
@@ -260,12 +280,31 @@ wire.onKeyRequest = { venc?.requestKeyframe() }
 Thread {
   var lastAsk = 0.0
   var lastDecodes = -1
+  var lastMissing = 0
   while true {
     Thread.sleep(forTimeInterval: 0.2)
     let blind = vasm.fragsIn > 0 && (vdec.noFormat > 0 || vdec.decodes == lastDecodes)
     lastDecodes = vdec.decodes
     let now = Date().timeIntervalSinceReferenceDate
-    if blind && vdec.decodes == 0 || (blind && now - lastAsk > 1.0) {
+
+    // A LOST FRAME IS A CORRUPTED PICTURE, not a missing one.
+    //
+    // There are no B-frames here, which is right for latency, but it means every
+    // frame references the one before it. Lose one and the decoder keeps decoding
+    // happily against a reference it does not have -- `decFails 0`, `noFmt 0`,
+    // 30 fps, and a picture that is quietly wrong until something else happens to
+    // send a keyframe. The old trigger only fired when decoding STOPPED, which is
+    // the one symptom this failure does not have.
+    //
+    // Rate-limited, because under sustained loss the repair must not become the
+    // problem: a keyframe is a few KB against a 300-byte P-frame.
+    let lost = vasm.missing > lastMissing
+    lastMissing = vasm.missing
+    if lost && now - lastAsk > 0.4 {
+      lastAsk = now
+      keyAsksOnLoss += 1
+      wire.requestKeyframe(scratch: kscratch)
+    } else if blind && vdec.decodes == 0 || (blind && now - lastAsk > 1.0) {
       lastAsk = now
       wire.requestKeyframe(scratch: kscratch)
     }
@@ -275,6 +314,17 @@ Thread {
 // The socket thread. Not the audio thread and not the main thread: a blocking
 // recvfrom on the render callback would be a dropout, and on main it would fight
 // the reporter for the runloop.
+// Network impairment, for measuring what a real path costs before there is a
+// real path to measure. Off unless asked for, and impossible to overlook when on.
+let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
+                    burstMs: Double(arg("imp-burst") ?? "0") ?? 0,
+                    jitterMs: Double(arg("imp-jitter") ?? "0") ?? 0)
+if impair.enabled {
+  wire.impair = impair
+  if impair.jitterMs > 0 { wire.armDelayQueue() }
+  fputs("IMPAIRED: \(impair.description) -- numbers from this run describe a damaged path on purpose\n", stderr)
+}
+
 // Clock sync, before the receive loop exists to answer probes.
 let tsync = TimeSync()
 wire.tsync = tsync
@@ -370,7 +420,13 @@ if audio.jitAuto {
     // concealed none and held slack p01 at exactly 5.33 ms. The minimum buffer is
     // one render granularity above zero, and shrinking below that is not a
     // latency win, it is a click generator.
-    let JIT_MIN = 2, JIT_MAX = 8
+    let JIT_MIN = 2
+    // A CEILING IN MILLISECONDS, not in packets. Written as 8 packets it meant
+    // 21 ms at the old packet size and silently became 10.7 ms when packets
+    // halved -- the maximum buffer was cut in half by a change that had nothing
+    // to do with it. Same family as every other duration hidden inside a count in
+    // this codebase (queue tolerance in ms; a codec win is a change of units).
+    let JIT_MAX = max(JIT_MIN + 2, Int((30.0 / pktMs).rounded()))
     let GROW_BELOW_MS = 1.0     // headroom this thin is one jitter spike from a click
     let SHRINK_ABOVE_MS = 2.0   // and this much would survive losing a packet of buffer
     let SHRINK_HOLD = 5         // consecutive 2 s windows -- 10 s of agreement
@@ -378,6 +434,7 @@ if audio.jitAuto {
     var calm = 0
     var lastConcealed = 0
     var lastSnaps = 0
+    var lastLate = 0
     // A LEVEL THAT FAILED IS REMEMBERED. Without this the controller shrinks,
     // hears a click, grows, waits out its hold and shrinks into the same click
     // forever -- observed on this rig cycling 2 -> 1 -> 2 -> 1 with three
@@ -394,6 +451,8 @@ if audio.jitAuto {
       guard r.pos >= 0 else { continue }
       let conc = r.concealed - lastConcealed
       lastConcealed = r.concealed
+      let late = r.lateArrivals - lastLate
+      lastLate = r.lateArrivals
       let snapped = r.snaps - lastSnaps
       lastSnaps = r.snaps
       guard let p01 = r.slackWin.p(0.01) else { continue }
@@ -430,7 +489,7 @@ if audio.jitAuto {
       if snapped > 0 {
         calm = 0
         fputs("jit: \(snapped) snap(s), \(conc) concealed -- stall, not jitter; holding at \(audio.jitTarget)\n", stderr)
-      } else if conc > 0 || p01 < GROW_BELOW_MS {
+      } else if late > 0 || p01 < GROW_BELOW_MS {
         if audio.jitTarget < JIT_MAX {
           audio.jitTarget += 1
           audio.jitGrows += 1
@@ -439,7 +498,7 @@ if audio.jitAuto {
           unsafeBelow = max(unsafeBelow, audio.jitTarget)
           probeAt = t + backoff
           backoff = min(backoff * 2, 900)
-          fputs("jit -> \(audio.jitTarget) (grew: conceal \(conc), slack p01 \(String(format: "%.2f", p01)) ms)"
+          fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, slack p01 \(String(format: "%.2f", p01)) ms)"
               + "  -- below \(unsafeBelow) marked unsafe, next probe in \(Int(backoff / 2)) s\n", stderr)
         }
         calm = 0
@@ -493,14 +552,15 @@ func reportLoop() {
 
   let pct = String(format: "%5.1f", heard)
   fputs("cap \(d.cap)/s  sent \(d.sent)/s  recv \(d.recv)/s  played \(d.played)/s (\(pct)%)"
-      + "  conceal \(d.concealed)/s  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
+      + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
       + "  jit \(audio.jitTarget) snap \(r.snaps)"
       + (wire.fmtMismatch > 0 ? "  VERSION-MISMATCH \(wire.fmtMismatch)" : "")
       + "  net rtt \(tsync.bestRttMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " jit \(tsync.rttSpreadMs.map { String(format: "%.2f", $0) } ?? "-")"
-      + " (\(tsync.samples) probes)\n", stderr)
+      + " (\(tsync.samples) probes)"
+      + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "") + "\n", stderr)
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
   if vsource != nil || vasm.fragsIn > 0 {
@@ -515,7 +575,8 @@ func reportLoop() {
         + "  luma \(venc?.lastLuma ?? -1) motion \(venc?.lastDiff ?? -1)"
         + "  encLat \(f(e.p(0.50)))  decLat \(f(dl.p(0.50)))"
         + "  g2g p50 \(f(g.p(0.50))) p95 \(f(g.p(0.95))) ms"
-        + "  frags \(vasm.fragsIn) partial-drops \(vasm.dropped) decFails \(vdec.decFails) noFmt \(vdec.noFormat)"
+        + "  frags \(vasm.fragsIn) frames-lost \(vasm.missing) partial-drops \(vasm.dropped) decFails \(vdec.decFails) noFmt \(vdec.noFormat)"
+        + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
         + (display != nil ? "  window \(display!.state) shown \(display!.shown) enqFail \(display!.enqueueFails) refresh \(String(format: "%.1f", display!.refreshMs))ms" : "")
         + "\n", stderr)
   }

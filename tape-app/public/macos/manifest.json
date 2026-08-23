@@ -1,1 +1,1 @@
-{"version":"0.5.0","url":"https://room.tokkah.com/macos/dl/tk-0.5.0.tar.gz","sha256":"9f174e9529c9c491ef2c36c1db188803f4423148e520e0fb96bd204ee268c252","size":107578,"notes":"adaptive jitter buffer + 64-frame packets: m2e 24.5 -> 16.2 ms; --room NAT traversal for calls between two houses"}
+{"version":"0.6.0","url":"https://room.tokkah.com/macos/dl/tk-0.6.0.tar.gz","sha256":"03e679615dc7e79d661f4985ab3d98e68521a63a25c138aa25a877b099a6f08d","size":111503,"notes":"clock sync: m2e and g2g are now measurable between two machines; wire-format mismatch named instead of silent"}

@@ -59,6 +59,19 @@ final class RecvRing {
   // Plain vars rather than atomics: they are diagnostics, a torn read costs a
   // wrong log line, and an atomic on the audio path costs a real-time budget.
   var recv = 0, dup = 0, jumps = 0, played = 0, concealed = 0, tooOld = 0, snaps = 0
+  // LATE and LOST are different events with opposite remedies, and the buffer
+  // controller has no business acting until it knows which one it is looking at.
+  //
+  // A late packet arrived after its deadline: a bigger buffer would have caught
+  // it, so grow. A lost packet is never coming: no buffer size on earth catches
+  // it, so growing is pure donated latency. Measured, at 1% loss: the controller
+  // grew to its ceiling and m2e went 15.93 -> 22.22 ms, six milliseconds spent
+  // waiting for packets that did not exist.
+  //
+  // The test is exact and already available -- a late arrival is one with
+  // negative slack.
+  var lateArrivals = 0
+  var concealLost = 0, concealStarved = 0
   // Occupancy error in ms, published by the audio thread so the buffer
   // controller can tell "the buffer is roomy" from "the cursor is behind".
   var errMs: Double = 0
@@ -118,6 +131,7 @@ final class RecvRing {
       slackWin.add(ms)
       if ms < slackMin { slackMin = ms }
       if ms < slackWinMin { slackWinMin = ms }
+      if ms < 0 { lateArrivals += 1 }
     }
     memcpy(samples + slot * FPP, src, min(n, FPP) * 4)
     capHost[slot] = cap
@@ -136,6 +150,9 @@ final class Wire {
   // a count of zero and a count of thousands must not print the same line.
   var fmtMismatch = 0
   var tsync: TimeSync?
+  var impair: Impair?
+  private(set) var delayQ: DelayQueue?
+  func armDelayQueue() { delayQ = DelayQueue { [weak self] p, n in self?.wireSend(p, n) } }
   /// Exposed so STUN can run on THIS socket. A mapping discovered on any other
   /// socket describes that socket's NAT hole, not this one's, and most NATs give
   /// a different external port per source port -- so the wrong socket yields an
@@ -203,18 +220,33 @@ final class Wire {
     (scratch + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
     (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(n).littleEndian }
     memcpy(scratch + HDR, src, n * 4)
-    let r = withUnsafePointer(to: &peer) { p in
-      p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        sendto(fd, scratch, HDR + n * 4, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    if r < 0 { sendErrs += 1 } else { sent += 1 }
+    // Through rawSend, not sendto. This path used to call sendto directly, which
+    // meant the impairment gate -- and anything else that ever belongs on the way
+    // out -- saw video fragments and clock probes but never a single audio packet.
+    // A 20% loss arm dropped 13 packets out of twelve thousand and the receiver
+    // reported zero concealment, so the rig said the app shrugs off heavy loss
+    // while actually testing nothing. One send path, one gate.
+    rawSend(scratch, HDR + n * 4)
   }
 
   /// One datagram, already framed by the caller. Shared by the audio and video
   /// paths so there is exactly one socket, one port and one NAT binding per peer
   /// -- two ports would mean two hole-punches and two things to go wrong.
   func rawSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
+    // The impairment sits here rather than at the two call sites so that nothing
+    // can slip past it -- audio, video fragments and clock probes all get the
+    // same treatment a real path would give them. Impairing the clock probes is
+    // deliberate: the offset estimator's min-delay filter is supposed to survive
+    // a lossy jittery path, and if it does not I want to find out here.
+    if let im = impair, im.enabled {
+      if im.shouldDrop() { return }
+      let d = im.delayTicks()
+      if d > 0, let q = delayQ { q.push(p, n, due: Clock.now() + d); return }
+    }
+    wireSend(p, n)
+  }
+
+  private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
     let r = withUnsafePointer(to: &peer) { pp in
       pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
         sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))

@@ -132,6 +132,18 @@ final class VideoAssembler {
   }
   private var slots = [Slot](repeating: Slot(), count: VRING)
   private(set) var complete = 0, dropped = 0, dupFrag = 0, fragsIn = 0
+  // FRAMES THAT NEVER ARRIVED AT ALL.
+  //
+  // `dropped` counts a slot reused while still incomplete, which only ever
+  // happens to a frame that arrived in pieces. At these bitrates a frame is about
+  // 300 bytes and fits in ONE fragment, so a lost frame never creates a slot and
+  // never touched that counter: the report said "partial-drops 0, decFails 0" at
+  // 3% packet loss and meant it, while every lost frame went unmentioned. An
+  // instrument that cannot see the event returns the same value as a real
+  // negative, and this one was doing it on the headline video line.
+  //
+  // Sequence gaps are the answer, and they are exact.
+  private(set) var missing = 0
   private(set) var lastDone: Int32 = -1
   var onFrame: ((Data, UInt64) -> Void)?
 
@@ -162,6 +174,7 @@ final class VideoAssembler {
       }
     }
     complete += 1
+    if lastDone >= 0 && seq > lastDone + 1 { missing += Int(seq - lastDone - 1) }
     lastDone = seq
     onFrame?(out, slots[idx].capHost)
     slots[idx].seq = -1
