@@ -11944,3 +11944,29 @@ Tested both directions, on real bundles:
 
 The negative case matters as much as the positive one: a repair that fires on a healthy
 bundle is a download on every launch forever.
+
+### The icon had a margin problem, and the fix is measured rather than eyeballed
+
+> the faces could stretch to the borders, currently there is a lot of margin, so it seems
+> unfinished
+
+It did. The glyph filled 0.68 of the plate, which left a wide empty border and read as a
+sticker placed on a tile rather than an icon. Read the icon builder for the Human app next
+door for calibration: it fills **0.765**, and that is the low end of what looks deliberate.
+
+Tokkah's is now **0.88**. The measurement that matters is not the number, it is that
+nothing clips the glyph — too large a fraction does not get cut off, it draws straight past
+the rounded corners onto transparent background, and the plate curving away behind it is
+what makes it *look* cut off. At 0.96 both heads spill over the top corners.
+
+So `mkicon.swift` measures it: draw the glyph once free and once clipped to the plate, and
+compare. Any difference is art that is not on the plate, and the build fails. Validated
+against inputs it must rank differently — 0.96 is rejected with "the glyph spills off the
+plate (454 sample points)", 0.88 passes — because a fit test that always passes is not a
+test.
+
+Two things from the Human builder were read and deliberately **not** taken: a gradient
+sweep across the glyph, and a stacked-outline bloom to fake a blur. Both are good, and the
+current flat white on near-black was explicitly liked. Worth knowing they exist for the day
+the mark needs more presence at 16 px, where a detailed line glyph is always going to
+struggle.

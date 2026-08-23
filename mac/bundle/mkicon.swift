@@ -126,10 +126,27 @@ func parse(_ d: String) -> NSBezierPath {
   return p
 }
 
+
+/// The plate, at one size. One definition, so the fit test and the render can
+/// never disagree about where the edge is.
+///
+/// Apple's grid: the artwork is inset ~9.77% of the canvas and the corner radius is
+/// ~22.37% of the artwork, which is what makes it sit level with every other icon in
+/// the Dock instead of looking a size too big. Circular corners, not a sampled
+/// squircle -- Apple's own plates measure out as a plain rounded rect, and a
+/// superellipse looks visibly puffy beside the real thing.
+func Self_plate(_ S: CGFloat) -> (NSRect, NSBezierPath) {
+  let m = S * 0.0977
+  let box = S - 2 * m
+  let r = box * 0.2237
+  let tile = NSRect(x: m, y: m, width: box, height: box)
+  return (tile, NSBezierPath(roundedRect: tile, xRadius: r, yRadius: r))
+}
+
 /// One icon, at one size. Apple's grid: the artwork is inset ~9.77% and the
 /// squircle's corner radius is ~22.37% of the artwork, which is what makes it sit
 /// level with every other icon in the Dock instead of looking a size too big.
-func render(_ S: CGFloat, glyph: NSBezierPath) -> NSBitmapImageRep {
+func render(_ S: CGFloat, glyph: NSBezierPath, clipToPlate: Bool = false) -> NSBitmapImageRep {
   let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(S), pixelsHigh: Int(S),
                              bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                              colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
@@ -137,11 +154,8 @@ func render(_ S: CGFloat, glyph: NSBezierPath) -> NSBitmapImageRep {
   NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
   NSGraphicsContext.current?.imageInterpolation = .high
 
-  let m = S * 0.0977
-  let box = S - 2 * m
-  let r = box * 0.2237
-  let tile = NSRect(x: m, y: m, width: box, height: box)
-  let squircle = NSBezierPath(roundedRect: tile, xRadius: r, yRadius: r)
+  let (tile, squircle) = Self_plate(S)
+  let box = tile.width
 
   // The app's own background, with a slight lift so a 512 px tile does not read
   // as a flat sticker.
@@ -165,7 +179,11 @@ func render(_ S: CGFloat, glyph: NSBezierPath) -> NSBitmapImageRep {
   // And it fits the glyph's MEASURED bounds rather than the nominal 960 box,
   // because Material glyphs do not fill their viewBox: `conversation` spans
   // 40...920, so centring on the box leaves it visibly off-centre and small.
-  let gs = box * 0.68
+  // How much of the tile the faces occupy. At 0.68 the glyph floated in the middle
+  // with a wide empty border and read as unfinished -- the Human app's icon next
+  // door fills 0.765 and that is the low end of what looks deliberate. Overridable
+  // so the choice can be made by looking rather than by arguing.
+  let gs = box * GLYPH_FRACTION
   let flip = NSAffineTransform()
   flip.scaleX(by: 1, yBy: -1)
   let upright = glyph.copy() as! NSBezierPath
@@ -178,6 +196,7 @@ func render(_ S: CGFloat, glyph: NSBezierPath) -> NSBitmapImageRep {
   t.scaleX(by: k, yBy: k)
   let g = upright.copy() as! NSBezierPath
   g.transform(using: t as AffineTransform)
+  if clipToPlate { squircle.addClip() }
   NSColor.white.setFill()
   g.fill()
 
@@ -187,10 +206,41 @@ func render(_ S: CGFloat, glyph: NSBezierPath) -> NSBitmapImageRep {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "AppIcon.icns"
+let GLYPH_FRACTION = CommandLine.arguments.count > 2 ? (Double(CommandLine.arguments[2]) ?? 0.88) : 0.88
 let glyph = parse(GLYPH)
 if glyph.isEmpty {
   FileHandle.standardError.write("mkicon: the path parsed to nothing\n".data(using: .utf8)!)
   exit(1)
+}
+
+// ── DOES THE ART STAY ON THE PLATE? ──────────────────────────────────────────
+//
+// Nothing clips the glyph, so too large a fraction does not get cut off -- it
+// draws straight past the rounded corners onto transparent background, and the
+// plate curving away behind it is what makes it LOOK cut off. At 0.96 both heads
+// spill over the top corners. Judging that by eye works exactly until the glyph
+// changes.
+//
+// So it is measured: draw the glyph once free and once clipped to the plate, and
+// compare. Any difference is art that is not on the plate. Exact, and it costs one
+// extra 1024px render.
+do {
+  let free = render(1024, glyph: glyph)
+  let clipped = render(1024, glyph: glyph, clipToPlate: true)
+  var spilled = 0
+  for y in stride(from: 0, to: 1024, by: 2) {
+    for x in stride(from: 0, to: 1024, by: 2) {
+      let a = free.colorAt(x: x, y: y), b = clipped.colorAt(x: x, y: y)
+      if let a, let b, abs(a.brightnessComponent - b.brightnessComponent) > 0.15 { spilled += 1 }
+    }
+  }
+  if spilled > 0 {
+    FileHandle.standardError.write(
+      "mkicon: the glyph spills off the plate at \(GLYPH_FRACTION) (\(spilled) sample points).\n"
+      .data(using: .utf8)!)
+    exit(1)
+  }
+  print("mkicon: glyph fits the plate at \(GLYPH_FRACTION)")
 }
 
 let fm = FileManager.default
