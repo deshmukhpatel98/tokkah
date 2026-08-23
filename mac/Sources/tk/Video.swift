@@ -134,7 +134,12 @@ final class VEncoder {
   private var session: VTCompressionSession?
   var onEncoded: ((Data, UInt64, Bool) -> Void)?
   var encodes = 0
-  var encLatUs = Quantiles()
+  /// MILLISECONDS. Named `Us` until 2026-08-23, while storing `Clock.ms(...)`
+  /// -- and the moment it was read by something that trusted the name, it
+  /// produced a telemetry field claiming 720p encoded in 2.56 MICROSECONDS.
+  /// A unit in a name is a claim; this project has now been wrong about one
+  /// four times.
+  var encLatMs = Quantiles()
   private var wantKey = false
 
   init(width: Int, height: Int, bitrate: Int) throws {
@@ -228,7 +233,7 @@ final class VEncoder {
     VTCompressionSessionEncodeFrame(sess, imageBuffer: pb, presentationTimeStamp: pts,
       duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
       guard let self, status == noErr, let sb, CMSampleBufferDataIsReady(sb) else { return }
-      self.encLatUs.add(Clock.ms(Clock.now() - t0))
+      self.encLatMs.add(Clock.ms(Clock.now() - t0))
       self.encodes += 1
       guard let payload = Self.serialize(sb) else { return }
       let key = Self.isKeyframe(sb)

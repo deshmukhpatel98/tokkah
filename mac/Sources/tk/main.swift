@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.20.1"
+let VERSION = "0.21.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -1070,6 +1070,9 @@ var lastRates = (up: 0.0, down: 0.0, played: 0, concealed: 0, cap: 0)
 /// the peer vanished and everything was concealed. A record is only final if
 /// nothing can be written after it.
 nonisolated(unsafe) var shuttingDown = false
+/// Video figures, stashed by the report loop's video section for the beat that
+/// follows it at the end of the same pass.
+nonisolated(unsafe) var videoBeat: [String: Any] = [:]
 
 /// One beat's worth of fields. Raw numbers only -- no verdicts, no thresholds.
 /// The dashboard decides what "good" means, so changing that opinion does not
@@ -1115,10 +1118,10 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   if vDecoded > 0 { f["v_decoded"] = vDecoded; f["v_sent"] = vSentFrames }
   if let e = venc {
     f["v_encodes"] = e.encodes
-    if let v = e.encLatUs.p(0.50) { f["v_enc_us_p50"] = v }
-    if let v = e.encLatUs.p(0.99) { f["v_enc_us_p99"] = v }
+    if let v = e.encLatMs.p(0.50) { f["v_enc_ms_p50"] = v }
+    if let v = e.encLatMs.p(0.99) { f["v_enc_ms_p99"] = v }
   }
-  if let v = vdec.decLatMs.p(0.50) { f["v_dec_ms_p50"] = v }
+  for (k, v) in videoBeat { f[k] = v }
   return f
 }
 
@@ -1182,11 +1185,6 @@ func reportLoop() {
   // and once more at the end.
   beatTick += 1
   lastRates = (upMbps, downMbps, d.played, d.concealed, d.cap)
-  if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
-    Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
-                             played: d.played, concealed: d.concealed, cap: d.cap,
-                             p50: p50, p95: p95, p99: p99))
-  }
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.
@@ -1311,13 +1309,35 @@ func reportLoop() {
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
   if vsource != nil || vasm.fragsIn > 0 {
-    var e = venc?.encLatUs ?? Quantiles(), dl = vdec.decLatMs, g = vg2g
+    var e = venc?.encLatMs ?? Quantiles(), dl = vdec.decLatMs, g = vg2g
     let dv = vDecoded - lastV.dec
     let sv = vSentFrames - lastV.sent
     let mbps = Double(vBytesSent - lastV.bytes) * 8 / 1e6
     lastV = (vDecoded, vSentFrames, vBytesSent)
     let perFrame = sv > 0 ? (vBytesSent - lastVBytesPrev) / max(sv, 1) : 0
     lastVBytesPrev = vBytesSent
+    // Stashed for the telemetry beat at the end of the loop. These deltas only
+    // exist inside this block, and a beat built before it ran said nothing at all
+    // about the picture -- on a video call, which is most of them.
+    videoBeat = [
+      "v_enc_ps": sv, "v_dec_ps": dv, "v_mbps": mbps, "v_bytes_frame": perFrame,
+      "v_frags": vasm.fragsIn, "v_frames_lost": vasm.missing,
+      "v_partial_drops": vasm.dropped, "v_dec_fails": vdec.decFails,
+      "v_no_fmt": vdec.noFormat, "v_repair_keys": keyAsksOnLoss,
+      "v_luma": venc?.lastLuma ?? -1, "v_motion": venc?.lastDiff ?? -1,
+    ]
+    if let v = e.p(0.50) { videoBeat["v_enc_ms_p50"] = v }
+    if let v = dl.p(0.50) { videoBeat["v_dec_ms_p50"] = v }
+    if let d = display { videoBeat["v_shown"] = d.shown; videoBeat["v_enq_fail"] = d.enqueueFails }
+    if let m = mdisplay {
+      videoBeat["v_shown"] = m.shown
+      // Coverage travels WITH the number, because a percentile over a tenth of the
+      // frames is not a latency -- and it once looked like the best result of the
+      // day. The dashboard can refuse to draw it; it cannot invent the coverage
+      // after the fact.
+      videoBeat["v_glass_cov"] = m.shown > 0 ? Double(m.present.count) / Double(m.shown) : 0
+      if let v = m.present.p(0.50) { videoBeat["v_glass_ms_p50"] = v }
+    }
     fputs("  video  enc \(sv)/s  dec \(dv)/s  \(String(format: "%.2f", mbps)) Mbps  \(perFrame) B/frame"
         + "  luma \(venc?.lastLuma ?? -1) motion \(venc?.lastDiff ?? -1)"
         + "  encLat \(f(e.p(0.50)))  decLat \(f(dl.p(0.50)))"
@@ -1354,6 +1374,15 @@ func reportLoop() {
         + " lastErr=\(audio.lastRenderErr)"
         + (audio.capCallbacks == 0 ? "  -- the input callback is NOT FIRING (device or permission)" : "")
         + "\n", stderr)
+  }
+
+  // LAST in the loop, on purpose: every section above has now computed its
+  // numbers, so the beat and the lines printed beside it cannot disagree about
+  // what this second looked like.
+  if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
+    Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
+                             played: d.played, concealed: d.concealed, cap: d.cap,
+                             p50: p50, p95: p95, p99: p99))
   }
 }
 }

@@ -64,6 +64,32 @@ function analyse(c) {
   const lin = num(c.lp_in), lout = num(c.lp_out);
   if (lin && lout) push('compression', (lin / lout).toFixed(2) + '×', 'lossless', 'good');
 
+  // ── Picture ────────────────────────────────────────────────────────────────
+  const fpsOut = num(c.v_dec_ps), fpsIn = num(c.v_enc_ps);
+  if (fpsIn !== null || fpsOut !== null) {
+    push('frame rate', (fpsOut ?? fpsIn) + '/s',
+         fpsIn !== null && fpsOut !== null && fpsIn !== fpsOut ? 'sending ' + fpsIn + '/s' : 'received',
+         grade(30 - (fpsOut ?? 0), 6, 15));
+  }
+  if (num(c.v_mbps) !== null) {
+    push('picture data', num(c.v_mbps).toFixed(2) + ' Mbps',
+         num(c.v_bytes_frame) ? num(c.v_bytes_frame) + ' B/frame' : '', '');
+  }
+  if (num(c.v_frames_lost) !== null) {
+    push('frames lost', String(num(c.v_frames_lost)),
+         num(c.v_repair_keys) ? num(c.v_repair_keys) + ' repairs asked' : 'none needed',
+         grade(num(c.v_frames_lost), 0, 60));
+  }
+  // A percentile over a tenth of the frames is not a latency, so below half
+  // coverage this refuses to show a number rather than showing a flattering one.
+  const cov = num(c.v_glass_cov), glass = num(c.v_glass_ms_p50);
+  if (glass !== null && cov !== null) {
+    if (cov >= 0.5) push('decode to screen', glass.toFixed(2) + ' ms',
+                         Math.round(cov * 100) + '% of frames', grade(glass, 8, 25));
+    else push('decode to screen', 'withheld',
+              'only ' + Math.round(cov * 100) + '% of frames were shown', 'warn');
+  }
+
   // Things the person on the call cannot see, and would never think to mention.
   const faults = [];
   const fault = (n, label) => { if (num(n)) faults.push(num(n) + ' ' + label); };
@@ -75,6 +101,10 @@ function analyse(c) {
   fault(c.relocks, 're-found the peer');
   fault(c.snaps, 'cursor jump(s)');
   fault(c.lp_bad, 'undecodable payload(s)');
+  fault(c.v_dec_fails, 'video frame(s) failed to decode');
+  fault(c.v_partial_drops, 'part-arrived video frame(s) dropped');
+  fault(c.v_no_fmt, 'video frame(s) arrived before the format did');
+  fault(c.v_enq_fail, 'frame(s) the window refused');
   fault(c.crypt_bad, 'packets failed to decrypt');
   if (num(c.audit_delta)) faults.push('SAMPLE AUDIT OFF BY ' + num(c.audit_delta));
   if (num(c.crypt) === 0) faults.push('NOT ENCRYPTED');
