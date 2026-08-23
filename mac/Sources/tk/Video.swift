@@ -140,6 +140,32 @@ final class VEncoder {
   /// A unit in a name is a claim; this project has now been wrong about one
   /// four times.
   var encLatMs = Quantiles()
+
+  /// Change the quality target on a live session. The controller in VQuality
+  /// drives this, so the picture can retreat without tearing down the encoder --
+  /// a rebuild would cost a keyframe, and the moment a link is struggling is the
+  /// worst possible moment to send one.
+  @discardableResult func setQuality(_ q: Double) -> Bool {
+    guard let sess = session else { return false }
+    let st = VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_Quality,
+                                  value: NSNumber(value: q))
+    // READ IT BACK. `noErr` from VTSessionSetProperty means "accepted", and this
+    // codebase has already been burned twice today by properties that were
+    // accepted and did something other than advertised. If the session does not
+    // report the value we just set, the controller is steering nothing.
+    var back: CFNumber?
+    VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_Quality,
+                          allocator: nil, valueOut: &back)
+    let now = (back as NSNumber?)?.doubleValue
+    qualityNow = now
+    qualityAsked = q
+    return st == noErr && now != nil && abs(now! - q) < 0.01
+  }
+  /// What the session is actually set to, for the report line. Not what was asked
+  /// for -- those have differed before.
+  var qualityNow: Double?
+  /// What the controller last asked for, so asked and in-effect can be compared.
+  var qualityAsked: Double?
   private var wantKey = false
 
   init(width: Int, height: Int, bitrate: Int, quality: Double? = nil) throws {
@@ -173,6 +199,7 @@ final class VEncoder {
     // is a separate knob and was never set.
     if let q = quality {
       set(kVTCompressionPropertyKey_Quality, NSNumber(value: q), "Quality")
+      qualityNow = q
       // NO DataRateLimits HERE, and that is a measured decision, not an omission.
       //
       // Quality overrides AverageBitRate -- q=1.0 against a 3 Mbps target produced

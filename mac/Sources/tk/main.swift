@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.22.0"
+let VERSION = "0.23.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -525,6 +525,9 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 // input is what makes two runs comparable. The file is a REAL talking head: a
 // synthetic pattern compresses to almost nothing, so a call carrying one measures
 // an empty pipe and reports it as video.
+// AIM AT VISUALLY LOSSLESS AND RETREAT WHEN THE LINK SAYS NO. `--vquality <n>`
+// caps it; `--vquality 0` reproduces the old always-unset behaviour.
+let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) })
 let videoArg = arg("video") ?? "off"
 var vsource: FrameSource?
 var venc: VEncoder?
@@ -642,9 +645,11 @@ if videoArg != "off" {
     let src: FrameSource = videoArg == "camera"
       ? CameraSource()
       : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
+    // The controller owns the quality from here; the flag only sets its ceiling.
+    // `--vquality 0` pins it to the old unset behaviour.
     let e = try VEncoder(width: 1280, height: 720,
                          bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000,
-                         quality: arg("vquality").flatMap { Double($0) })
+                         quality: vq.quality)
     e.requestKeyframe()
     src.onFrame = { pb, host in e.encode(pb, hostTime: host) }
     e.onEncoded = { data, host, _ in
@@ -1190,6 +1195,8 @@ nonisolated(unsafe) var shuttingDown = false
 /// Video figures, stashed by the report loop's video section for the beat that
 /// follows it at the end of the same pass.
 nonisolated(unsafe) var videoBeat: [String: Any] = [:]
+/// Previous-tick values for the picture-quality controller.
+nonisolated(unsafe) var lastVqLost = 0, lastVqConc = 0, lastVqJit = 0
 
 /// One beat's worth of fields. Raw numbers only -- no verdicts, no thresholds.
 /// The dashboard decides what "good" means, so changing that opinion does not
@@ -1445,6 +1452,10 @@ func reportLoop() {
     ]
     if let v = e.p(0.50) { videoBeat["v_enc_ms_p50"] = v }
     if let v = dl.p(0.50) { videoBeat["v_dec_ms_p50"] = v }
+    videoBeat["v_q_level"] = vq.level
+    videoBeat["v_q_downs"] = vq.stepDowns
+    videoBeat["v_q_ups"] = vq.stepUps
+    if let q = venc?.qualityNow { videoBeat["v_quality"] = q }
     videoBeat["v_dq_queued"] = dq.queued
     videoBeat["v_dq_inline_full"] = dq.inlineFull
     videoBeat["v_dq_inline_big"] = dq.inlineTooBig
@@ -1469,6 +1480,7 @@ func reportLoop() {
         // purpose is to keep decode off the receive thread, and which quietly
         // falls back to doing it there when full, is a queue that looks like it is
         // working while the defect continues.
+        + "  picture \(vq.describe)"
         + "  decodeq \(dq.queued) queued, depth<=\(dq.maxDepth)"
         + (dq.inlineFull + dq.inlineTooBig > 0
            ? "  INLINE \(dq.inlineFull) full + \(dq.inlineTooBig) oversize" : "")
@@ -1502,6 +1514,23 @@ func reportLoop() {
         + " lastErr=\(audio.lastRenderErr)"
         + (audio.capCallbacks == 0 ? "  -- the input callback is NOT FIRING (device or permission)" : "")
         + "\n", stderr)
+  }
+
+  // Steer the picture. One tick per second, on the harm that happened during it.
+  if let e = venc {
+    let lostNow = vasm.missing, concNow = r.concealed
+    let jitGrew = audio.jitTarget > lastVqJit
+    let changed = vq.tick(now: Double(beatTick),
+                          framesLost: lostNow - lastVqLost,
+                          concealed: concNow - lastVqConc,
+                          jitGrew: jitGrew)
+    lastVqLost = lostNow; lastVqConc = concNow; lastVqJit = audio.jitTarget
+    if let newQ = changed {
+      let ok = e.setQuality(newQ)
+      fputs("  picture: \(vq.describe)"
+          + "  encoder now \(e.qualityNow.map { String(format: "%.2f", $0) } ?? "nil")"
+          + (ok ? "" : "  -- THE ENCODER DID NOT TAKE IT") + "\n", stderr)
+    }
   }
 
   // LAST in the loop, on purpose: every section above has now computed its

@@ -10827,3 +10827,69 @@ quality arm would have run as a control arm and I would have concluded the knob
 does nothing. The flag guard from 17.102 refused it out loud — `unknown option
 --vquality 0.7` — which is exactly what that guard exists for. Third time it has
 paid for itself.
+
+## 17.105 Aim at lossless, retreat when the link says no
+
+17.104 measured that visually lossless costs about 1.2 Mbps and then declined to
+switch it on, because nothing watched what happened next. This is that controller.
+
+### The rules are the jitter buffer's, in the mirror
+
+- **Asymmetric on purpose.** Down on the first sign of harm; up only after fifteen
+  quiet seconds. The buffer grows instantly and shrinks slowly for the same
+  reason, in the other direction.
+- **Remember failed levels, with backoff**, doubling to a 480 s cap. Without it
+  the thing steps up into the level that just failed, hurts, steps down, waits out
+  its timer and repeats forever — the exact 2→1→2→1 cycle the buffer showed.
+- **Only harm this action can fix.** A lost video frame and a grown audio buffer
+  are both "the link is unhappy about volume", which less video volume addresses.
+  Round-trip time is not, and a device stall is not, so neither is wired in.
+- **Ignore the first eight seconds.** A call's opening is full of meaningless harm:
+  the buffer finding its level, the first keyframe, estimators converging. Observed
+  on a perfectly clean link — an immediate step down to 0.6, then fifteen seconds
+  of waiting to climb back, costing real picture quality on every call's first
+  half-minute.
+
+### Measured
+
+Rotated arms, 120 s each, clean rig, lossless-video arm FIRST so a win for the
+cheap arm cannot be warm-up:
+
+| arm | m2e p50 | jit | video | picture |
+|---|---|---|---|---|
+| q0.7 | 9.90 | 3 | 1.02 Mbps | visually lossless |
+| off | 9.96 | 3 | 0.06 Mbps | — |
+| off | 9.90 | 3 | 0.06 Mbps | — |
+| q0.7 | 10.02 | 3 | 1.04 Mbps | visually lossless |
+
+**Visually lossless video costs zero audio latency.** Overlapping ranges, `jit 3`
+in all four arms, no concealment anywhere. Which is only true because of 17.104's
+decode-queue fix — before that, video cost 1.8 ms whatever its bitrate.
+
+Under 3% injected loss it retreats 0.7 → 0.6 → 0.5 → 0.3 and stays there. On a
+clean link: zero transitions in 80 s, holding q0.7.
+
+### Two bugs found by running it
+
+**The floor was `nil`, and `VTSessionSetProperty(Quality, nil)` is refused.** So
+the retreat printed `0.7 → 0.6 → 0.5 → off` while the encoder quietly stayed at
+0.5: the one step that mattered most was the one that did not happen. All levels
+are numbers now, and the floor is 0.3 (0.089 Mbps) rather than unset (0.122) —
+measured, so it is a genuine retreat below the old behaviour and not a relabelling
+of it. `0.4` turns out to be indistinguishable from unset, 37.5 dB against 37.9.
+
+**And the readback is now part of the setter.** `noErr` means accepted, and this
+file has been burned twice in one day by properties that were accepted and did
+something else — `DataRateLimits` above, and an `encLatUs` that held milliseconds.
+`setQuality` returns false unless the session reports back the value it was given,
+and the report line prints what the encoder holds next to what the controller
+asked for.
+
+### Open, and named rather than hidden
+
+Under 3% loss the SEND bitrate inflates to 1.4–2.4 Mbps even at quality 0.3, where
+a clean link at the same setting sends 0.05. Keyframe repairs are rate-limited to
+one per 0.4 s and only 56 fired in 80 s, so they account for roughly 7% of it; the
+rest is unexplained. The controller's response is still correct — it retreats —
+but "loss makes us send more" is the shape of congestion collapse and deserves its
+own investigation. Recorded here rather than left as a number nobody looked at.
