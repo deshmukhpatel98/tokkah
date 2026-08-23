@@ -32,6 +32,54 @@ enum Launcher {
   /// Show the window and block until the user joins or closes it. Returns the
   /// room name, or nil if they closed it -- in which case the caller must exit
   /// rather than fall through to a call with no destination.
+  // ── An invite should be a link, not a room name to retype ─────────────────
+  //
+  // `tokkah://join/<room>` arrives as an Apple Event, not as an argument, and it
+  // can arrive BEFORE or AFTER the join window is on screen depending on whether
+  // the app was already running. So the handler is installed first and simply
+  // records the room; whoever is waiting picks it up.
+  //
+  // Registered in Info.plist rather than by any runtime call, because
+  // LaunchServices reads the bundle -- which is the whole reason this program ships
+  // as one.
+  nonisolated(unsafe) private static var urlRoom: String?
+
+  static func installURLHandler() {
+    NSAppleEventManager.shared().setEventHandler(
+      Handler.shared,
+      andSelector: #selector(Handler.handle(event:reply:)),
+      forEventClass: AEEventClass(kInternetEventClass),
+      andEventID: AEEventID(kAEGetURL))
+  }
+
+  final class Handler: NSObject {
+    static let shared = Handler()
+    @objc func handle(event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+      guard let s = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+            let u = URL(string: s), u.scheme == "tokkah" else { return }
+      // tokkah://join/<room> and tokkah://<room> both work: people will write
+      // either, and refusing one of them would be pedantry with a cost.
+      var name = u.path.hasPrefix("/") ? String(u.path.dropFirst()) : u.path
+      if name.isEmpty { name = u.host ?? "" }
+      if u.host == "join", name.isEmpty { name = "" }
+      let ok = !name.isEmpty && name.count <= 64
+        && name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+      guard ok else {
+        fputs("url: refusing \(s) -- a room is letters, numbers, - and _ only\n", stderr)
+        return
+      }
+      Launcher.urlRoom = name
+      fputs("url: joining \(name)\n", stderr)
+    }
+  }
+
+  /// A room handed over by a `tokkah://` link, if one arrived. Consumed once.
+  static func takeURLRoom() -> String? {
+    let r = urlRoom
+    urlRoom = nil
+    return r
+  }
+
   static func askRoom() -> String? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
@@ -111,9 +159,16 @@ enum Launcher {
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.
     while !t.done {
-      guard let e = app.nextEvent(matching: .any, until: .distantFuture,
-                                 inMode: .default, dequeue: true) else { continue }
+      // A short timeout rather than distantFuture: a `tokkah://` link can arrive
+      // while this window is open, and with no events at all the loop would sit
+      // there forever having already been told where to go.
+      guard let e = app.nextEvent(matching: .any, until: Date().addingTimeInterval(0.2),
+                                 inMode: .default, dequeue: true) else {
+        if let r = urlRoom { t.picked = r; urlRoom = nil; t.done = true }
+        continue
+      }
       app.sendEvent(e)
+      if let r = urlRoom { t.picked = r; urlRoom = nil; t.done = true }
       if !w.isVisible { t.done = true }             // they closed it
     }
     w.orderOut(nil)

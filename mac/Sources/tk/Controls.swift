@@ -16,6 +16,10 @@ final class CallControls: NSView {
   private let statusLabel = NSTextField(labelWithString: "")
   private let micButton = NSButton()
   private let camButton = NSButton()
+  /// How tall the bar is, published so the self-view can sit above it instead of
+  /// a second file guessing 72 and drifting.
+  static let barHeight: CGFloat = 72
+
   private let inviteButton = NSButton()
   private let leaveButton = NSButton()
 
@@ -34,7 +38,7 @@ final class CallControls: NSView {
 
   init(room: String, width: CGFloat) {
     self.room = room
-    super.init(frame: NSRect(x: 0, y: 0, width: width, height: 72))
+    super.init(frame: NSRect(x: 0, y: 0, width: width, height: CallControls.barHeight))
     autoresizingMask = [.width]
 
     roomLabel.stringValue = room

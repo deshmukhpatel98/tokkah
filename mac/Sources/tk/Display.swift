@@ -18,6 +18,39 @@ import QuartzCore
 final class Display {
   private var win: NSWindow?
   private let layer = AVSampleBufferDisplayLayer()
+  // ── Yourself, in the corner ────────────────────────────────────────────────
+  //
+  // A second display layer, not compositing of our own: the window server already
+  // composites layers for free, and the alternative is a shader written twice
+  // (once here, once for Metal) and then kept agreeing with itself.
+  //
+  // It matters for a reason beyond vanity. Without it you cannot tell "my camera
+  // is broken" from "they are not sending" from "the app is frozen" -- all three
+  // look like a still picture of somebody else. Watching yourself move is the only
+  // in-app proof that YOUR end works, which is why the web app has had it from
+  // early on ("hold to see yourself") and why every video app on earth does.
+  private let selfLayer = AVSampleBufferDisplayLayer()
+  private(set) var selfShown = 0
+  /// Off until a remote picture exists, because until then the main layer is
+  /// already showing you full-screen and a duplicate in the corner is just noise.
+  var selfViewOn = false {
+    didSet {
+      guard selfViewOn != oldValue else { return }
+      let on = selfViewOn
+      DispatchQueue.main.async { [weak self] in self?.selfLayer.isHidden = !on }
+    }
+  }
+
+  /// Where the corner view sits for a given content rect. One place, so the first
+  /// layout and every resize cannot disagree about it.
+  static func selfFrame(in r: NSRect) -> NSRect {
+    let w = max(140, r.width * 0.2)
+    let h = w * 9.0 / 16.0
+    let pad = max(12, r.width * 0.015)
+    // Bottom-RIGHT, lifted clear of the control bar. Not over the buttons: a
+    // self-view sitting on the mute button is a mute button you cannot press.
+    return NSRect(x: r.width - w - pad, y: pad + CallControls.barHeight, width: w, height: h)
+  }
   private(set) var shown = 0, enqueueFails = 0
   /// Screen refresh period, so the display term in the budget is stated rather
   /// than quietly omitted: a frame handed to the compositor still waits, on
@@ -57,6 +90,18 @@ final class Display {
     layer.videoGravity = .resizeAspect
     layer.backgroundColor = NSColor.black.cgColor
     videoView.layer = layer
+    // A SUBLAYER of the hosted layer, not a subview. The comment above is explicit
+    // that this layer-hosting view may not have subviews -- that mistake already
+    // cost this file an invisible control bar. Sublayers are fine.
+    selfLayer.videoGravity = .resizeAspectFill
+    selfLayer.isHidden = true
+    selfLayer.cornerRadius = 8
+    selfLayer.masksToBounds = true
+    selfLayer.borderWidth = 1
+    selfLayer.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
+    selfLayer.backgroundColor = NSColor.black.cgColor
+    selfLayer.frame = Display.selfFrame(in: rect)
+    layer.addSublayer(selfLayer)
     videoView.autoresizingMask = [.width, .height]
     root.addSubview(videoView)
     if let room {
@@ -165,21 +210,36 @@ final class Display {
       var f = win.frame
       f.size = NSSize(width: w, height: h)
       win.setFrame(f, display: true)
-      self.layer.frame = NSRect(x: 0, y: 0, width: w, height: h)
+      let r = NSRect(x: 0, y: 0, width: w, height: h)
+      self.layer.frame = r
+      self.selfLayer.frame = Display.selfFrame(in: r)
     }
   }
 
   /// Called from the decoder's output callback. Wraps the decoded buffer with no
   /// copy and asks for immediate display.
+  /// Your own camera frame, into the corner. Same wrapping as `show`, different
+  /// layer, and it returns immediately while the corner is hidden -- so before the
+  /// call connects this costs one branch per frame, not a second enqueue.
+  func showSelf(_ img: CVImageBuffer) {
+    guard selfViewOn else { return }
+    if enqueue(img, into: selfLayer) { selfShown += 1 }
+  }
+
   func show(_ img: CVImageBuffer) {
+    if enqueue(img, into: layer) { shown += 1 }
+  }
+
+  @discardableResult
+  private func enqueue(_ img: CVImageBuffer, into target: AVSampleBufferDisplayLayer) -> Bool {
     var fmt: CMVideoFormatDescription?
     guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: img,
-      formatDescriptionOut: &fmt) == noErr, let fd = fmt else { enqueueFails += 1; return }
+      formatDescriptionOut: &fmt) == noErr, let fd = fmt else { enqueueFails += 1; return false }
     var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
     var sb: CMSampleBuffer?
     guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: img,
       formatDescription: fd, sampleTiming: &timing, sampleBufferOut: &sb) == noErr,
-      let s = sb else { enqueueFails += 1; return }
+      let s = sb else { enqueueFails += 1; return false }
     if let arr = CMSampleBufferGetSampleAttachmentsArray(s, createIfNecessary: true),
        CFArrayGetCount(arr) > 0 {
       let d = unsafeBitCast(CFArrayGetValueAtIndex(arr, 0), to: CFMutableDictionary.self)
@@ -190,8 +250,8 @@ final class Display {
     // A layer that has failed needs a flush before it will accept anything again;
     // without this a single transient error freezes the picture for the whole call
     // while every counter still reads healthy.
-    if layer.status == .failed { layer.flush() }
-    layer.enqueue(s)
-    shown += 1
+    if target.status == .failed { target.flush() }
+    target.enqueue(s)
+    return true
   }
 }

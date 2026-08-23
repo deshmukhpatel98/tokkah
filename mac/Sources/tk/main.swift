@@ -112,6 +112,10 @@ let videoArg = resolveVideoArg()
 //
 // After flag validation, so a typo is still refused, and before anything touches
 // the microphone, the camera or a socket -- the window has to finish first.
+// The URL handler goes in before anything can wait on it, and before the join
+// window, since a link can arrive either side of it.
+Launcher.installURLHandler()
+
 if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
                          hasPeer: arg("peer") != nil,
                          forced: flag("gui")) {
@@ -300,7 +304,8 @@ if videoArg != "off", display != nil || mdisplay != nil {
     // Self-view. Replaced the moment a decoded frame from the far end arrives:
     // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
     // set so the two are never fighting over the same surface.
-    if sawRemote { return }
+    // Once they are on screen you move to the corner rather than disappearing.
+    if sawRemote { display?.showSelf(pb); return }
     display?.show(pb)
     mdisplay?.show(pb, at: Clock.now())
   }
@@ -847,6 +852,8 @@ vdec.onDecoded = { img, capHost in
   // you, and says so.
   if !sawRemote {
     sawRemote = true
+    // Their picture takes the window; yours moves to the corner.
+    display?.selfViewOn = true
     setWindowTitle("Tokkah — connected")
     display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
     fputs("the other side's picture is on screen\n", stderr)
@@ -894,8 +901,13 @@ if videoArg != "off" {
       // last frame simply stays put.
       if camOff { return }
       e.encode(pb, hostTime: host)
-      // Keep showing yourself until the other person's picture arrives.
-      if !sawRemote {
+      if sawRemote {
+        // They have the window, you get the corner. This is the only thing in the
+        // app that proves YOUR camera is alive -- a frozen remote picture, a dead
+        // remote camera and a hung app look identical without it.
+        display?.showSelf(pb)
+      } else {
+        // Nobody yet, so you have the whole window.
         display?.show(pb)
         mdisplay?.show(pb, at: Clock.now())
       }

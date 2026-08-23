@@ -5,6 +5,16 @@
   <key>CFBundleName</key>                  <string>Tokkah</string>
   <key>CFBundleDisplayName</key>           <string>Tokkah</string>
   <key>CFBundleIdentifier</key>            <string>com.tokkah.tk</string>
+  <!-- tokkah://join/<room>, so an invite is a link somebody clicks rather than a
+       room name they have to retype correctly. Registered here because LaunchServices
+       reads the bundle, which is the whole reason this app is a bundle. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>    <string>Tokkah call</string>
+      <key>CFBundleURLSchemes</key> <array><string>tokkah</string></array>
+    </dict>
+  </array>
   <key>CFBundleExecutable</key>            <string>Tokkah</string>
   <key>CFBundleIconFile</key>              <string>AppIcon</string>
   <key>CFBundlePackageType</key>           <string>APPL</string>
