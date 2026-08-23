@@ -1843,11 +1843,19 @@ export class Health implements DurableObject {
       return json({ ok: true });
     }
 
-    // Calls with a beat in the last 90 s, newest beat per call: the live view.
+    // Calls with a beat in the last 90 s AND NO FINAL BEAT: still going.
+    //
+    // "Recent beat" alone is not the same as "in progress" -- a call that ended
+    // thirty seconds ago has a recent beat too, and showed under "Happening now"
+    // for a minute and a half after everyone hung up. A call that said goodbye is
+    // over, whatever its timestamps say.
     if (url.pathname === '/mac/live') {
       const rows = [...this.sql.exec(
         `SELECT call, install, version, model, phase, MAX(wall) AS wall, fields
-           FROM mac_beats WHERE wall > ? GROUP BY call ORDER BY wall DESC LIMIT 40`,
+           FROM mac_beats
+          WHERE wall > ?
+            AND call NOT IN (SELECT call FROM mac_beats WHERE phase = 'final')
+          GROUP BY call ORDER BY wall DESC LIMIT 40`,
         Date.now() / 1000 - 90)];
       return json({ now: Date.now() / 1000, calls: rows.map(shapeMacRow) });
     }
