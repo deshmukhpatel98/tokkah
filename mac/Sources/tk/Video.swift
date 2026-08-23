@@ -142,7 +142,7 @@ final class VEncoder {
   var encLatMs = Quantiles()
   private var wantKey = false
 
-  init(width: Int, height: Int, bitrate: Int) throws {
+  init(width: Int, height: Int, bitrate: Int, quality: Double? = nil) throws {
     var s: VTCompressionSession?
     let st = VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
       codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
@@ -165,10 +165,48 @@ final class VEncoder {
     set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 100_000), "MaxKeyFrameInterval")
     set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 100_000), "MaxKeyFrameIntervalDuration")
     set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30), "ExpectedFrameRate")
+    // ── AverageBitRate alone did not spend the budget ─────────────────────────
+    //
+    // Measured with --vpsnr: asked for 20 Mbps, the encoder produced 0.639, and
+    // stopped at 42.8 dB PSNR -- which is neither the requested rate nor a
+    // transparent picture, so the bitrate was not the binding constraint. Quality
+    // is a separate knob and was never set.
+    if let q = quality {
+      set(kVTCompressionPropertyKey_Quality, NSNumber(value: q), "Quality")
+      // NO DataRateLimits HERE, and that is a measured decision, not an omission.
+      //
+      // Quality overrides AverageBitRate -- q=1.0 against a 3 Mbps target produced
+      // 25 Mbps -- so a hard cap seemed obviously right. It was tried, as
+      // [bytes, 1 second] at 1.5x the target, and READ BACK as in effect
+      // (562500, 1). What it actually did:
+      //
+      //   without cap   q 0.5 -> 40.0 dB   0.6 -> 42.9   0.7 -> 45.5   0.8 -> 47.8
+      //   with cap      q 0.5 -> 37.5 dB   0.6 -> 37.5   0.7 -> 37.6   0.8 -> 37.6
+      //
+      // It collapsed every quality setting onto one bad operating point (0.105
+      // Mbps, worse than no quality setting at all) AND did not bind where it was
+      // needed: q=1.0 still produced 44 Mbps through a 4.5 Mbps cap. So it made the
+      // picture worse everywhere and enforced nothing anywhere.
+      //
+      // The real cap has to be the app's own: pick the quality, then watch what
+      // comes out. That controller does not exist yet, which is why the default
+      // stays unset -- see DESIGN 17.104.
+    }
     if !refused.isEmpty { fputs("encoder: REFUSED \(refused.joined(separator: " "))\n", stderr) }
     // Read the bitrate BACK. Setting is not applying.
     var got: CFTypeRef?
     VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, allocator: nil, valueOut: &got)
+    // READ BACK the cap too. A property that returns noErr and does nothing is
+    // this project's most repeated trap, and VideoToolbox has plenty of them:
+    // "accepted" is not "in effect".
+    var drl: CFArray?
+    VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_DataRateLimits,
+                          allocator: nil, valueOut: &drl)
+    var q: CFNumber?
+    VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_Quality,
+                          allocator: nil, valueOut: &q)
+    fputs("encoder: DataRateLimits readback \(drl.map { String(describing: $0 as NSArray) } ?? "nil")"
+        + "  Quality readback \(q.map { "\($0 as NSNumber)" } ?? "nil")\n", stderr)
     let gotBps = (got as? NSNumber)?.intValue ?? -1
     fputs("encoder: H.264 \(width)x\(height) bitrate asked \(bitrate) got \(gotBps), B-frames off\n", stderr)
     VTCompressionSessionPrepareToEncodeFrames(sess)

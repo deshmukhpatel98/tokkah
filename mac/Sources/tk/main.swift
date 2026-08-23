@@ -44,7 +44,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "no-telemetry", "tel-endpoint",
+  "selftest-lpc", "no-lp", "gui", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -328,6 +328,110 @@ audio.cursorAheadMs = Double(arg("cursor-ahead") ?? "0") ?? 0
 // speech, then the shapes that break bit-packers -- silence, full scale, the
 // alternating extremes that maximise every residual, and pseudo-random noise
 // where prediction cannot help and the raw fallback must engage.
+// ── Is the picture actually lossless? ────────────────────────────────────────
+//
+// "Video visually lossless" is half the goal and there has been no instrument for
+// it. A bitrate cannot answer it and neither can a frame rate: this project has
+// already shipped an upside-down camera past a green rig. So: push a real file
+// through the real encoder into the real decoder, IN ONE PROCESS -- the two ends
+// of a call are separate processes carrying different video, so there is nothing
+// there to compare -- and measure what the codec did to it.
+//
+//   tk --vpsnr <file.mp4> [--vpsnr-frames 300] [--vbitrate 3000000]
+//
+// PSNR on the luma plane. Rough reading: above ~45 dB is visually lossless, 40-45
+// is very good, 35-40 shows on detail, below 30 is visible. Reported with the p05
+// as well as the p50, because the frame people notice is the worst one.
+if let path = arg("vpsnr") {
+  let want = Int(arg("vpsnr-frames") ?? "300") ?? 300
+  let br = Int(arg("vbitrate") ?? "3000000") ?? 3_000_000
+  var psnr = Quantiles(cap: 4096)
+  var bytes = 0, frames = 0, compared = 0, sizeMismatch = 0
+  var worst = (db: 1e9, at: 0)
+  // capHost -> the source luma, so a decoded frame is compared against the exact
+  // frame it came from rather than a neighbouring one.
+  var srcLuma = [UInt64: (buf: [UInt8], w: Int, h: Int)]()
+  let lock = NSLock()
+  let done = DispatchSemaphore(value: 0)
+
+  func luma(_ pb: CVPixelBuffer) -> (buf: [UInt8], w: Int, h: Int)? {
+    CVPixelBufferLockBaseAddress(pb, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return nil }
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+    let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0)
+    let p = base.assumingMemoryBound(to: UInt8.self)
+    var out = [UInt8](repeating: 0, count: w * h)
+    for y in 0..<h { memcpy(&out[y * w], p + y * stride, w) }
+    return (out, w, h)
+  }
+
+  do {
+    let dec = VDecoder()
+    let enc = try VEncoder(width: 1280, height: 720, bitrate: br,
+                           quality: arg("vquality").flatMap { Double($0) })
+    enc.requestKeyframe()
+    dec.onDecoded = { img, capHost in
+      guard let pb = img as CVPixelBuffer?, let got = luma(pb) else { return }
+      lock.lock()
+      let original = srcLuma.removeValue(forKey: capHost)
+      lock.unlock()
+      guard let a = original else { return }
+      // REFUSE rather than resample. Comparing a scaled picture to an unscaled one
+      // measures the scaler, and would report the codec as far worse than it is.
+      guard a.w == got.w, a.h == got.h else { sizeMismatch += 1; return }
+      var sum = 0.0
+      for i in 0..<(a.w * a.h) {
+        let d = Double(Int(a.buf[i]) - Int(got.buf[i]))
+        sum += d * d
+      }
+      let mse = sum / Double(a.w * a.h)
+      // Identical frames give MSE 0 and infinite PSNR; cap it so a run of perfect
+      // frames does not poison a percentile with infinities.
+      let db = mse <= 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 / mse)
+      psnr.add(db)
+      compared += 1
+      if db < worst.db { worst = (db, compared) }
+      if compared >= want { done.signal() }
+    }
+    enc.onEncoded = { data, host, _ in
+      bytes += data.count
+      dec.decode(data, hostTime: host)
+    }
+    let src = FileSource(path: path, fps: Double(arg("fps") ?? "30") ?? 30)
+    src.onFrame = { pb, host in
+      guard frames < want else { return }
+      frames += 1
+      if let l = luma(pb) { lock.lock(); srcLuma[host] = l; lock.unlock() }
+      enc.encode(pb, hostTime: host)
+    }
+    fputs("vpsnr: \(path) -> H.264 1280x720 @ \(br / 1000) kbps, \(want) frames\n", stderr)
+    try src.start()
+    // The file plays in real time, so bound the wait by that plus slack rather
+    // than spinning: 300 frames at 30 fps is ten seconds.
+    _ = done.wait(timeout: .now() + Double(want) / 25.0 + 15.0)
+  } catch {
+    fputs("vpsnr: \(error)\n", stderr)
+    exit(1)
+  }
+  let secs = Double(frames) / (Double(arg("fps") ?? "30") ?? 30)
+  fputs("vpsnr: \(compared) frames compared of \(frames) encoded"
+      + (sizeMismatch > 0 ? "  (\(sizeMismatch) REFUSED for size mismatch -- the source is not 1280x720,"
+         + " so the scaler would be measured instead of the codec)" : "")
+      + "\n  PSNR p50 \(psnr.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
+      + "  p05 \(psnr.p(0.05).map { String(format: "%.1f", $0) } ?? "-") dB"
+      + "  worst \(String(format: "%.1f", worst.db)) dB at frame \(worst.at)"
+      + "\n  \(bytes / 1024) KiB in \(String(format: "%.1f", secs)) s"
+      + " = \(String(format: "%.3f", Double(bytes) * 8 / 1e6 / max(secs, 0.001))) Mbps"
+      + ", \(compared > 0 ? bytes / max(frames, 1) : 0) B/frame\n", stderr)
+  let p50 = psnr.p(0.50) ?? 0
+  fputs("  verdict: " + (p50 >= 45 ? "visually lossless"
+                       : p50 >= 40 ? "very good, not lossless"
+                       : p50 >= 35 ? "good; detail is being lost"
+                       : "visibly compressed") + "\n", stderr)
+  exit(compared > 0 ? 0 : 1)
+}
+
 if let path = arg("selftest-lpc") {
   var fail = 0, packets = 0, inBytes = 0, outBytes = 0
   var raws = 0
@@ -538,7 +642,9 @@ if videoArg != "off" {
     let src: FrameSource = videoArg == "camera"
       ? CameraSource()
       : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
-    let e = try VEncoder(width: 1280, height: 720, bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000)
+    let e = try VEncoder(width: 1280, height: 720,
+                         bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000,
+                         quality: arg("vquality").flatMap { Double($0) })
     e.requestKeyframe()
     src.onFrame = { pb, host in e.encode(pb, hostTime: host) }
     e.onEncoded = { data, host, _ in

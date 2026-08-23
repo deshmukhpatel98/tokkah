@@ -10736,3 +10736,94 @@ reads as corroboration.* *A metric sampled on an exact coincidence is sampled on
 whether that coincidence is reachable.* *When a comment states an asymmetry,
 check that the code implements it in magnitude and not only in sign.* *Verify the
 rig is empty, not merely quiet.*
+
+## 17.104 A ruler for the picture, and a knob nobody had turned
+
+"Video visually lossless" is half the goal and there was no instrument for it. A
+bitrate cannot answer it and neither can a frame rate — this project has already
+shipped an upside-down camera past a green rig.
+
+### The ruler
+
+`tk --vpsnr <file>` pushes a real file through the real encoder into the real
+decoder, in one process, and measures what the codec did. One process because the
+two ends of a call are separate processes carrying *different* video, so there is
+nothing there to compare. The capture stamp keys the comparison, so a decoded
+frame is measured against the exact frame it came from rather than a neighbour.
+
+Two rules it enforces on itself:
+
+- **Refuse, do not resample.** If the source and decoded geometries differ it
+  counts a mismatch and skips the frame, because comparing a scaled picture to an
+  unscaled one measures the scaler and would report the codec as far worse than it
+  is.
+- **Report p05 as well as p50**, because the frame people notice is the worst one.
+
+Validated before use, on inputs it must rank differently: 20 Mbps → 42.8 dB,
+3 Mbps → 38.6, 300 kbps → 35.3. Monotonic, correctly ordered.
+
+### The first thing it found: the bitrate was not the constraint
+
+    asked 20000 kbps -> produced 0.639 Mbps, 42.8 dB
+    asked  3000 kbps -> produced 0.136 Mbps, 38.6 dB
+    asked   600 kbps -> produced 0.079 Mbps, 36.3 dB
+
+Three to thirty times *under* the requested rate, and stopping well short of
+transparency. So `AverageBitRate` was not what was limiting the picture.
+`kVTCompressionPropertyKey_Quality` had never been set. With it (240 frames,
+3 Mbps target):
+
+| quality | PSNR p50 | p05 | achieved | verdict |
+|---|---|---|---|---|
+| unset | 37.9 dB | 35.8 | 0.122 Mbps | detail is being lost |
+| 0.5 | 40.1 | 39.7 | 0.221 | very good |
+| 0.6 | 43.0 | 42.5 | 0.485 | very good |
+| **0.7** | **45.5** | **45.0** | **1.185** | **visually lossless** |
+| 0.8 | 47.7 | 47.2 | 3.059 | visually lossless |
+| 1.0 | 99.0 (MSE 0) | 99.0 | 44.1 | bit-exact |
+
+**Visually lossless costs about 1.19 Mbps.** Against the 1.16 Mbps the voice now
+costs, a call that is lossless in both directions is ~2.4 Mbps.
+
+### The cap that made everything worse and enforced nothing
+
+Quality overrides `AverageBitRate` — q=1.0 against a 3 Mbps target produced
+25 Mbps — so a hard `DataRateLimits` cap looked obviously right. It was set at
+[bytes, 1 second] for 1.5× the target and **read back as in effect**: `(562500, 1)`.
+What it did:
+
+    without cap   q 0.5 -> 40.1 dB   0.6 -> 43.0   0.7 -> 45.5   0.8 -> 47.7
+    with cap      q 0.5 -> 37.5 dB   0.6 -> 37.5   0.7 -> 37.6   0.8 -> 37.6
+
+It collapsed every setting onto one bad operating point — 0.105 Mbps, *worse than
+setting no quality at all* — and still did not bind where it mattered: q=1.0 went
+on producing 44 Mbps through a 4.5 Mbps ceiling. Worse everywhere, enforced
+nowhere. Removed.
+
+`readback == accepted` is not `in effect`, and this is the second flavour of that:
+not a silent no-op, but a property that is genuinely applied and does something
+other than what it says.
+
+### Why the default is not being changed yet
+
+Nothing in the native app watches what the encoder actually emits. Setting quality
+0.7 statically would put 1.19 Mbps on the wire with no way to notice or recover if
+the link cannot carry it — and a flooded link costs latency, which is the point of
+the whole program. The knob and the ruler ship; the default waits for the
+controller.
+
+### Process notes, both of them mine
+
+**I compared runs that differed in two variables.** A 30-frame arm against a
+120-frame arm, and a 2 Mbps target against a 3 Mbps one, and drew conclusions from
+the differences. The clip gets more complex later, so frame count alone moves the
+answer. Every number above is 240 frames at one target, and the earlier 120-frame
+sweep agrees with it to within 0.2 dB — which is the only reason the earlier
+numbers can be trusted at all.
+
+**The zsh word-splitting trap, fourth instance.** `A="--vquality $Q"` then `$A`
+unquoted: zsh does not word-split, so the whole thing arrived as one token. Every
+quality arm would have run as a control arm and I would have concluded the knob
+does nothing. The flag guard from 17.102 refused it out loud — `unknown option
+--vquality 0.7` — which is exactly what that guard exists for. Third time it has
+paid for itself.
