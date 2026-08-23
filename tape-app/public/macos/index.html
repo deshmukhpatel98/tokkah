@@ -59,6 +59,7 @@
     <tr><td>jitter buffer</td><td class=n>sizes itself, 2.7&ndash;30 ms</td></tr>
     <tr><td>device buffer</td><td class=n>1.33 ms (64 frames)</td></tr>
     <tr><td>format</td><td class=n>32-bit float, uncompressed</td></tr>
+    <tr><td>encryption</td><td class=n>AES-256-GCM, 0.78 &micro;s/packet</td></tr>
     <tr><th>Video</th><th></th></tr>
     <tr><td>capture &rarr; decoded</td><td class=n>5.6 ms p50, 8.2 ms p95</td></tr>
     <tr><td>+ display pipeline (60 Hz)</td><td class=n>~23 ms measured</td></tr>
@@ -77,9 +78,12 @@
 
   <h2>Honest limits</h2>
   <p class=note>Apple silicon only. It is a command-line tool that can open a window, not yet
-     an app with buttons. <strong>No encryption on the wire yet</strong> &mdash; audio and video
-     cross the internet in the clear, so treat a call as overheard. There is no forward error
-     correction: a lost packet is a concealed millisecond of audio, and a lost video frame is
+     an app with buttons. Audio and video are encrypted with AES-256-GCM,
+     keys agreed per call over X25519 and salted with the room code &mdash; so a listener on any
+     hop gets nothing, and neither does anyone who was not told the code. What it does
+     <em>not</em> stop is someone who knows the code and can sit in the middle of the path:
+     that needs an identity that outlives a call, which does not exist here yet. There is no
+     forward error correction: a lost packet is a concealed millisecond of audio, and a lost video frame is
      repaired by asking for a new keyframe, which costs about one frame. Two machines behind
      ordinary routers find each other with <code>--room</code> and talk directly, with no relay
      in the middle; a symmetric NAT on either side will defeat that, and there is no fallback

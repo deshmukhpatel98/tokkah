@@ -16,6 +16,12 @@
     "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.swiftdeps",
     "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.dia"
   },
+  "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Crypto.swift": {
+    "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.swift.o",
+    "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto~partial.swiftmodule",
+    "swift-dependencies": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.swiftdeps",
+    "diagnostics": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.dia"
+  },
   "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift": {
     "object": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swift.o",
     "swiftmodule": "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display~partial.swiftmodule",

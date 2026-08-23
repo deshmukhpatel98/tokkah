@@ -389,6 +389,35 @@ if impair.enabled {
   fputs("IMPAIRED: \(impair.description) -- numbers from this run describe a damaged path on purpose\n", stderr)
 }
 
+// Encryption. On by default; --no-crypt exists for interop with an older build
+// and for reading packets in a capture while debugging, and it says so loudly.
+//
+// The room code is the HKDF salt when there is one. It is the one secret that
+// never crosses the wire -- one person says it to the other -- so it is what
+// makes the exchange authenticated rather than merely private.
+// --secret sets the shared secret independently of how the two ends found each
+// other. The room code is a sensible default for it, but tying the two together
+// was wrong: it meant a pair using --peer directly could not have an
+// authenticated channel at all, and it made "change the key" and "change where
+// you look for the peer" the same act -- which is also what made the first
+// mismatched-key test measure nothing.
+let cryptoSalt = arg("secret") ?? arg("room") ?? ""
+let crypto: Crypto? = flag("no-crypt") ? nil : Crypto(roomSalt: cryptoSalt)
+if let c = crypto {
+  wire.crypto = c
+  Thread {
+    // Fast until a key exists, then slow. The slow beat is not idle chatter: it
+    // is how a peer that restarts with a fresh key gets re-keyed without anyone
+    // restarting the call.
+    while true {
+      wire.sendHandshake()
+      Thread.sleep(forTimeInterval: c.established ? 5.0 : 0.25)
+    }
+  }.start()
+} else {
+  fputs("crypto: DISABLED by --no-crypt -- audio and video go out in the clear\n", stderr)
+}
+
 // Clock sync, before the receive loop exists to answer probes.
 let tsync = TimeSync()
 wire.tsync = tsync
@@ -624,6 +653,10 @@ func reportLoop() {
       + "  net rtt \(tsync.bestRttMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " jit \(tsync.rttSpreadMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " (\(tsync.samples) probes)"
+      + (crypto.map { c in c.established
+           ? "  crypt on (\(c.sealed)/\(c.opened) sealed/opened, \(c.openFails) bad"
+             + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "") + ")"
+           : "  CRYPT PENDING (plaintext \(c.plaintextTx) sent)" } ?? "  crypt off")
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "") + "\n", stderr)
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.

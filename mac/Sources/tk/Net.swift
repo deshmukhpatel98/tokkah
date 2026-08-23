@@ -1,3 +1,4 @@
+import Foundation
 import Darwin
 
 let SR = 48_000.0
@@ -8,6 +9,8 @@ let RING = 1024           // packets == 1.37 s. Generous: the ring is not the
                          // latency, the read cursor's DISTANCE behind the write
                          // head is, and a big ring only buys recovery headroom.
 let HDR = 20             // magic(4) seq(4) capHost(8) frames(4)
+let HMAGIC: UInt32 = 0x544B_0006   // key handshake; the ONLY packet always in the clear
+let HPKT = 4 + 32
 let MAGIC: UInt32 = 0x544B_0001
 /// "send me a keyframe". Eight bytes, no payload, sent by a receiver that cannot
 /// decode. Necessary because H.264 parameter sets ride only with keyframes and
@@ -151,6 +154,19 @@ final class Wire {
   var fmtMismatch = 0
   var tsync: TimeSync?
   var impair: Impair?
+  var crypto: Crypto?
+  /// Sent in the clear, necessarily: it is what establishes the key. Contains a
+  /// public key and nothing else -- no identity, no room code, nothing that is
+  /// worth anything to a listener on its own.
+  func sendHandshake() {
+    guard let c = crypto else { return }
+    var out = [UInt8](repeating: 0, count: HPKT)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: HMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+    }
+    c.myPublic.copyBytes(to: &out[4], count: 32)
+    out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
+  }
   private(set) var delayQ: DelayQueue?
   func armDelayQueue() { delayQ = DelayQueue { [weak self] p, n in self?.wireSend(p, n) } }
   /// Exposed so STUN can run on THIS socket. A mapping discovered on any other
@@ -238,6 +254,36 @@ final class Wire {
     // same treatment a real path would give them. Impairing the clock probes is
     // deliberate: the offset estimator's min-delay filter is supposed to survive
     // a lossy jittery path, and if it does not I want to find out here.
+    // Encrypt FIRST, then impair: the network sees ciphertext, so a rig that
+    // models the network must too.
+    //
+    // Stack scratch, not a shared buffer: three threads reach this, and one
+    // shared output buffer would interleave two packets into each other. Stack
+    // allocation makes the question disappear rather than answering it with a
+    // second lock.
+    if let c = crypto, c.established {
+      var sentOK = false
+      withUnsafeTemporaryAllocation(byteCount: n + 32, alignment: 8) { tmp in
+        let out = tmp.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        if let m = c.seal(p, n, into: out) {
+          sentOK = true
+          if let im = impair, im.enabled {
+            if im.shouldDrop() { return }
+            let d = im.delayTicks()
+            if d > 0, let q = delayQ { q.push(out, m, due: Clock.now() + d); return }
+          }
+          wireSend(out, m)
+        }
+      }
+      if sentOK { return }
+      // Sealing failed. Falling through to plaintext would silently undo the
+      // encryption, so it does not: the packet is dropped and counted.
+      cryptSendFails += 1
+      return
+    }
+    // No key yet. Plaintext is permitted only in this window, and it is counted
+    // so that a call which never encrypts cannot look like one that did.
+    crypto?.notePlaintextTx()
     if let im = impair, im.enabled {
       if im.shouldDrop() { return }
       let d = im.delayTicks()
@@ -245,6 +291,8 @@ final class Wire {
     }
     wireSend(p, n)
   }
+
+  private(set) var cryptSendFails = 0
 
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
     let r = withUnsafePointer(to: &peer) { pp in
@@ -362,6 +410,9 @@ final class Wire {
     // means two NAT bindings, and the second one is the one that fails.
     let cap = max(HDR + FPP * 4, VHDR + VPAYLOAD) + 128
     let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
+    // One receive thread, so one decrypt scratch is safe -- unlike the send side,
+    // which is reached from three.
+    let dbuf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
     while true {
       var src = sockaddr_in()
       var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -371,29 +422,67 @@ final class Wire {
         }
       }
       if n < 8 { if n < 0 { usleep(200) }; continue }
-      let magic = buf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
-      // A recognised magic from a reachable address is all the proof needed. Not
-      // authentication -- that is what encryption will be for -- but enough to
-      // stop adopting unrelated traffic that happens to hit the port.
+      var magic = buf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+
+      // THE HANDSHAKE, and it is the one thing never encrypted -- it is what
+      // creates the key. Answered from this thread so the exchange completes in
+      // one round trip.
+      if magic == HMAGIC, Int(n) >= HPKT {
+        if !locked { adopt(src) }
+        if let c = crypto {
+          let was = c.established
+          if c.adoptPeer(Data(bytes: buf + 4, count: 32)), !was {
+            fputs("crypto: \(c.summary)\n", stderr)
+          }
+          // Always reply. The peer may have started after us, or restarted with a
+          // new key, and a one-way handshake leaves whichever side booted first
+          // waiting forever.
+          sendHandshake()
+        }
+        continue
+      }
+
+      // Decrypt, then treat the PLAINTEXT as the packet. A datagram that fails to
+      // decrypt is not dispatched at all: accepting it as plaintext would let
+      // anyone who can reach the port inject audio into a call that believes
+      // itself encrypted.
+      var plain: UnsafeMutablePointer<UInt8> = buf
+      var plainN = Int(n)
+      if let c = crypto, c.established {
+        if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
+          // A recognised magic in the clear while a key exists: an old build on
+          // the far end, or someone probing. Counted, never used.
+          c.notePlaintextRx()
+          continue
+        }
+        guard let m = c.open(buf, Int(n), into: dbuf) else { continue }
+        plain = dbuf
+        plainN = m
+        magic = dbuf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+      }
+
+      // A recognised magic from a reachable address is enough to point media
+      // there. Once encryption is up this is genuine authentication: the packet
+      // decrypted, so it came from someone holding the key.
       if !locked, magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
         adopt(src)
       }
       if magic == VMAGIC {
-        guard let v = video, n >= VHDR else { continue }
-        let seq = Int32(bitPattern: (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
-        let cap8 = (buf + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-        let frag = Int((buf + 16).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
-        let nfrag = Int((buf + 18).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
+        guard let v = video, plainN >= VHDR else { continue }
+        let seq = Int32(bitPattern: (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+        let cap8 = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        let frag = Int((plain + 16).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
+        let nfrag = Int((plain + 18).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
         if nfrag < 1 || nfrag > 4096 || frag >= nfrag { continue }
-        v.take(seq: seq, frag: frag, nfrag: nfrag, capHost: cap8, bytes: buf + VHDR, n: Int(n) - VHDR)
+        v.take(seq: seq, frag: frag, nfrag: nfrag, capHost: cap8, bytes: plain + VHDR, n: plainN - VHDR)
         continue
       }
       if magic == KMAGIC { onKeyRequest?(); continue }
       if magic == TMAGIC {
-        guard Int(n) >= TPKT else { continue }
+        guard plainN >= TPKT else { continue }
         let t4 = Clock.now()   // stamp FIRST: everything after this is our own cost
-        let kind = (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
-        let t1 = (buf + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        let kind = (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+        let t1 = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
         if kind == 0 {
           // A request. Reply from THIS thread, immediately -- handing it to
           // another thread would put that thread's scheduling delay inside t3-t2,
@@ -409,16 +498,16 @@ final class Wire {
           }
           out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
         } else {
-          let t2 = (buf + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-          let t3 = (buf + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+          let t2 = (plain + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+          let t3 = (plain + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           tsync?.note(t1: t1, t2: t2, t3: t3, t4: t4)
         }
         continue
       }
-      if magic != MAGIC || n < HDR { continue }
-      let seq = Int32(bitPattern: (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
-      let cap = (buf + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-      let frames = Int((buf + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+      if magic != MAGIC || plainN < HDR { continue }
+      let seq = Int32(bitPattern: (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+      let cap = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+      let frames = Int((plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
       // EXACTLY our packet size, or nothing. The old test was `frames > FPP`,
       // which is wrong in both directions during a rollout -- and the two machines
       // in a call update up to 60 s apart, so a rollout is guaranteed.
@@ -431,7 +520,7 @@ final class Wire {
       //
       // Now it is neither. A mismatch is refused and named, so the failure tells
       // you what it is and which side to fix.
-      if frames <= 0 || Int(n) < HDR + frames * 4 { continue }
+      if frames <= 0 || plainN < HDR + frames * 4 { continue }
       if frames != FPP {
         fmtMismatch += 1
         if fmtMismatch == 1 || fmtMismatch % 4000 == 0 {
@@ -441,7 +530,7 @@ final class Wire {
         }
         continue
       }
-      (buf + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
+      (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
     }
   }
 }

@@ -9342,3 +9342,76 @@ Honest video accounting as it stands:
     capture -> encoded -> wire -> decoded    5.6 ms   measured
     decoded -> glass                        29.2 ms   measured (20.5 with vsync off)
     total                                  ~34.8 ms  (~26.1 with vsync off)
+
+## 17.82 Encryption, for 0.78 microseconds
+
+The download page said it plainly: audio and video crossed the internet in the
+clear, so treat a call as overheard. For a tool whose entire purpose is that two
+people talk every day, that is not a footnote.
+
+X25519 over the media socket, AES-256-GCM per packet. **Measured at the real
+packet size: 0.78 µs to seal 276 bytes, worst of 300,000 seals 15 µs, against a
+1333 µs audio deadline.** 0.06% typical, 1.1% worst. That measurement is the
+whole reason CryptoKit was acceptable despite allocating — the allocator's worst
+case is two orders of magnitude inside the budget, so this runs on the capture
+callback with no thread hop and no added latency. (`CCCryptorGCMOneshot`, the
+allocation-free path, is not exposed to Swift; the alternative was hand-rolled
+AES-CTR plus HMAC, which is more code and more ways to be wrong for no measurable
+gain.)
+
+### Two keys, and this one is not decoration
+
+Both ends derive the same shared secret. One key plus a counter starting at zero
+means **every packet number is a nonce reuse** — and a repeated nonce under GCM
+does not weaken the cipher, it forfeits it: the authentication key falls out of
+the pair. So HKDF produces two keys from the one secret, and the ends agree on
+who uses which by comparing public keys, which costs no extra message.
+
+Same reasoning one level down: `rawSend` is reached from three threads — the audio
+capture callback, the video encoder callback, the probe thread. A raced counter
+hands two packets the same nonce. The seal holds a lock for its whole 0.8 µs,
+about 0.6 ms per second of wall time, and the question disappears rather than
+being answered with a cleverer argument. The output buffer is a stack temporary
+for the same reason: one shared scratch would interleave two packets.
+
+### What it actually protects against
+
+- A passive listener on any hop: completely.
+- Anyone not told the room code: yes. The code is the HKDF salt and it travels
+  between the two people out of band — one says it to the other — so it
+  authenticates the exchange.
+- An active man-in-the-middle who *does* know the code: no. That needs identity
+  that outlives a call, which does not exist here.
+- Someone who can suppress packets: they can hold the call in plaintext, because
+  plaintext is accepted while the handshake is outstanding. Deliberate, for the
+  reason in the next section, and **reported, never silent**.
+
+Overclaiming here would be worse than the plaintext was.
+
+### The first test of it measured nothing
+
+Mismatched-key arm: two ends with different `--room` codes. Audio did not flow —
+and not because of encryption. `--room` is *also* the discovery mechanism, so two
+different rooms never found each other in the directory and neither side ever
+started media. The coupling was the real defect: a pair using `--peer` directly
+could not have an authenticated channel at all, and "change the key" and "change
+where you look for the peer" were the same act. `--secret` now sets it
+independently, defaulting to the room code.
+
+With that separated, the test says something:
+
+    same secret        recv 751/s  played 750/s (100.0%)  11633 opened, 0 bad
+    different secret   recv   0/s  played   0/s (  0.0%)      0 opened, 11576 bad
+
+Not one packet through. And `m2e` printed `—` rather than a number, which is the
+honest-instrument work from §17.78 doing its job unprompted.
+
+### Rollout, because bricking the far machine is a known hazard here
+
+Encryption on by default would break every call to a machine that has not updated
+yet, and the two ends update as much as a minute apart. So plaintext is accepted
+while no key exists, and the state is labelled `CRYPT PENDING (plaintext N sent)`
+so an unencrypted call cannot pass for an encrypted one. Verified against **the
+real 0.8.0 binary fetched from prod**: 759 and 754 packets/s both directions, call
+unaffected. Steady state between two updated ends: `crypt on (11628/11633
+sealed/opened, 0 bad)`, m2e 15.93 ms — unchanged.

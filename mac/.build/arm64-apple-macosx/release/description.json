@@ -32,6 +32,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Crypto.swift"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift"
         },
         {
@@ -85,6 +89,7 @@
       "objects" : [
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Audio.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.swift.o",
+        "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Impair.swift.o",
         "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/MetalDisplay.swift.o",
@@ -155,6 +160,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.swift.o"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Display.swift.o"
         },
         {
@@ -202,6 +211,7 @@
       "sources" : [
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift",
+        "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Crypto.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Impair.swift",
         "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/MetalDisplay.swift",
@@ -230,6 +240,7 @@
       "-c",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Audio.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Clock.swift",
+      "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Crypto.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Impair.swift",
       "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/MetalDisplay.swift",
@@ -339,6 +350,10 @@
         },
         {
           "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Crypto.swift"
+        },
+        {
+          "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/Sources/tk/Display.swift"
         },
         {
@@ -394,6 +409,10 @@
         {
           "kind" : "file",
           "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Clock.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/deveshpatel/Downloads/video calling/mac/.build/arm64-apple-macosx/release/tk.build/Crypto.swift.o"
         },
         {
           "kind" : "file",
