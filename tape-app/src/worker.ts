@@ -27,6 +27,7 @@ interface Env {
   // page, installer and signed manifest are ordinary static assets.
   MACREL?: R2Bucket;
   ROOM: DurableObjectNamespace;
+  MAC_DASH_KEY?: string;
   HEALTH: DurableObjectNamespace;
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
@@ -2252,6 +2253,46 @@ export default {
     // Call-health beacon. POST is the client's beat; GET /summary is aggregate
     // numbers only (no per-call rows are ever served). The per-IP cap bounds a
     // hostile flooder; the DO's allowlist bounds a careless client.
+    // ── Who may READ the call dashboard ──────────────────────────────────────
+    //
+    // The beats carry no room name, no audio and nothing identifying a person --
+    // but they do say when someone was on a call and how it went, and that is the
+    // operator's business rather than the public's. Ingest stays open, because the
+    // app is AGPL and ships as a binary: any key embedded in it is a public key,
+    // so the honest defence there is the rate limit, not a secret.
+    //
+    // One click to get in: open the dashboard once with ?key=..., which sets a
+    // cookie and redirects to a clean URL so the key stops appearing in the
+    // address bar, in history, or in a screenshot.
+    const dashKey = env.MAC_DASH_KEY;
+    const dashOK = (): boolean => {
+      if (!dashKey) return true;                        // unset: open, as before
+      if (url.searchParams.get('key') === dashKey) return true;
+      const c = request.headers.get('cookie') ?? '';
+      return c.split(';').some((p) => p.trim() === `tk_dash=${dashKey}`);
+    };
+    if (url.pathname === '/macos/calls' || url.pathname === '/macos/calls.html'
+        || url.pathname === '/macos/calls.js') {
+      if (!dashOK()) {
+        return new Response(
+          '<!doctype html><meta charset=utf-8><title>Tokkah calls</title>'
+          + '<style>body{background:#0e1014;color:#8b93a3;font:15px/1.6 -apple-system,sans-serif;'
+          + 'display:grid;place-items:center;height:100vh;margin:0;text-align:center}'
+          + 'b{color:#e8eaf0;display:block;font-size:19px;margin-bottom:6px}</style>'
+          + '<div><b>Tokkah calls</b>This dashboard is private.<br>Open it with the link you were given.</div>',
+          { status: 403, headers: { 'content-type': 'text/html; charset=utf-8' } });
+      }
+      if (url.searchParams.get('key') === dashKey) {
+        const clean = new URL(url); clean.searchParams.delete('key');
+        return new Response(null, { status: 302, headers: {
+          location: clean.pathname + (clean.search || ''),
+          // A year, HttpOnly so a script cannot read it back out, Lax so a link
+          // from elsewhere still works.
+          'set-cookie': `tk_dash=${dashKey}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax`,
+        } });
+      }
+    }
+
     // ── Native macOS call telemetry ──────────────────────────────────────────
     //
     // Rate limited per IP like the web heartbeat: a beat every five seconds from
@@ -2274,6 +2315,7 @@ export default {
     if (url.pathname.startsWith('/api/mac/') && request.method === 'GET') {
       const tail = url.pathname.slice('/api/mac/'.length);
       if (!['live', 'recent', 'call'].includes(tail)) return json({ error: 'no' }, 404);
+      if (!dashOK()) return json({ error: 'private' }, 403);
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/mac/${tail}${url.search}`),
       );

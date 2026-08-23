@@ -90,6 +90,9 @@ function analyse(c) {
   let verdict = 'Good', vcls = 'good';
   if (reasons.length) { verdict = 'Needs fixing'; vcls = 'bad'; }
   else if (warnCards.length) { verdict = 'Usable, not ideal'; vcls = 'warn'; }
+  // A beat with nothing in it is not a good call, it is no information. Grading it
+  // "Good" is a verdict that cannot fail, which is the same as no verdict at all.
+  else if (!cards.length) { verdict = 'No data'; vcls = 'dim'; }
   return { cards, faults, reasons, verdict, vcls, over, m2e };
 }
 
