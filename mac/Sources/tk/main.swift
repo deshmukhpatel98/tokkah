@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.3"
+let VERSION = "0.9.4"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -757,6 +757,7 @@ func reportLoop() {
   fputs("cap \(d.cap)/s  sent \(d.sent)/s  recv \(d.recv)/s  played \(d.played)/s (\(pct)%)"
       + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals)"
       + " recovered \(r.recovered)\(audio.redundancy ? " FEC-on" : ""))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
+      + (r.restarts > 0 ? " peer-restarts \(r.restarts)" : "")
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
       + "  jit \(audio.jitTarget) snap \(r.snaps)"

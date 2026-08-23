@@ -91,6 +91,10 @@ final class RecvRing {
   /// Packets that would have been a click and were not, because a later packet
   /// carried a second copy.
   var recovered = 0
+  /// Consecutive refusals-as-too-old with no successful write between them. Only
+  /// a peer whose sequence numbers went backwards produces a run of these.
+  private var oldRun = 0
+  var restarts = 0
   var concealLost = 0, concealStarved = 0
   // Occupancy error in ms, published by the audio thread so the buffer
   // controller can tell "the buffer is roomy" from "the cursor is behind".
@@ -142,7 +146,39 @@ final class RecvRing {
     // corrupt audio about to be played.
     if pos >= 0 {
       let curSeq = Int64(pos) / Int64(FPP)
-      if Int64(seq) < curSeq - Int64(RING) { tooOld += 1; return }
+      if Int64(seq) < curSeq - Int64(RING) {
+        tooOld += 1
+        oldRun += 1
+        // A PEER THAT RESTARTED IS NOT A LATE PACKET, AND THIS WAS FATAL.
+        //
+        // Sequence numbers begin at zero. After thirteen minutes the cursor is
+        // past a million, so every packet from a restarted peer is "older than
+        // the ring" and refused -- which means hiSeq never moves, the cursor
+        // never re-anchors, and the call is dead for good. Measured exactly that
+        // way when both ends took a self-update mid-call: old 1518/s (every
+        // packet arriving), conceal 1494/s, played 1.8%, and m2e p95 66 SECONDS
+        // from the handful of ancient samples still in the ring.
+        //
+        // It was live in every release, and shipping a self-updater is what made
+        // restarts routine enough to find it: the update mechanism manufactured
+        // the condition that exposed the bug it would go on to trigger.
+        //
+        // One stray old packet must not reset anything, so the test is a RUN of
+        // them with no successful write in between -- 64 packets, about 43 ms.
+        // Nothing but a restarted stream produces that.
+        if oldRun >= 64 {
+          restarts += 1
+          tags.update(repeating: -1, count: RING)
+          hiSeq = -1
+          pos = -1          // the render callback re-primes from the new stream
+          oldRun = 0
+          // fall through and write this packet as the first of the new stream
+        } else {
+          return
+        }
+      } else {
+        oldRun = 0
+      }
     }
     if pos >= 0 {
       // Deadline of this packet's first sample, minus where the cursor is now.

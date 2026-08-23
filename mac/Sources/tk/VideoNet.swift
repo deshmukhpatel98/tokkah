@@ -144,12 +144,30 @@ final class VideoAssembler {
   //
   // Sequence gaps are the answer, and they are exact.
   private(set) var missing = 0
+  private var staleRun = 0
+  private(set) var restarts = 0
   private(set) var lastDone: Int32 = -1
   var onFrame: ((Data, UInt64) -> Void)?
 
   func take(seq: Int32, frag: Int, nfrag: Int, capHost: UInt64, bytes: UnsafePointer<UInt8>, n: Int) {
     fragsIn += 1
-    if seq <= lastDone { return }                       // already delivered
+    // Same restart trap as the audio ring, and just as fatal: after a peer
+    // restart every frame number is <= lastDone, so every frame is discarded as
+    // "already delivered" and the picture never returns. A run of them with
+    // nothing accepted in between is a restarted sender, not a late frame.
+    if seq <= lastDone {
+      staleRun += 1
+      if staleRun >= 30 {          // one second of video and not a frame accepted
+        restarts += 1
+        staleRun = 0
+        lastDone = -1
+        for i in 0..<VRING { slots[i].seq = -1 }
+      } else {
+        return
+      }
+    } else {
+      staleRun = 0
+    }
     let idx = Int(seq) % VRING
     if slots[idx].seq != seq {
       if slots[idx].seq >= 0 && slots[idx].have < slots[idx].nfrag { dropped += 1 }

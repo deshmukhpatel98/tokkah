@@ -9604,3 +9604,54 @@ at 0.4% of playback rate and therefore inaudible.
 The 784 KB of RSS growth over ten minutes is not yet explained and is being
 watched; it is small enough not to matter for a call and large enough to be worth
 a name if it turns out to be linear.
+
+## 17.88 A peer restart killed the call permanently, and the self-updater is what found it
+
+The stability run in §17.87 was still going when 0.9.4 shipped, so both ends took
+the update mid-call. Both survived the re-exec — that part had been tested. Then:
+
+    cap 1518/s  recv 1518/s  played 27/s (1.8%)
+    conceal 1494/s   old 1518   jump 3
+    m2e p50 13.59  p95 66608.74  p99 72884.73 ms
+
+Every arriving packet refused. `old 1518` per second is *every packet*. And an m2e
+p95 of sixty-six seconds, from the few ancient samples still left in the ring.
+
+**Sequence numbers start at zero.** After thirteen minutes the read cursor is past
+a million, so a restarted peer's `seq 0, 1, 2…` all satisfy
+`seq < curSeq - RING` and are refused as older than the ring. Nothing is written,
+so `hiSeq` never moves, so the cursor never re-anchors — and the call is dead for
+good. Not degraded. Dead, until someone kills both processes.
+
+`VideoAssembler` had the identical trap one line long: `if seq <= lastDone
+{ return }` discards every frame from a restarted sender as already delivered.
+
+This was live in **every release**. And the thing that found it is the thing that
+makes it common: shipping a self-updater turned "peer restarts" from a rare event
+into a routine one, and the update mechanism manufactured the exact condition that
+exposed the bug it would then go on to trigger on every future update.
+
+### The fix
+
+A stray old packet must not reset anything, so the test is a **run** of refusals
+with no successful write between them — 64 packets, about 43 ms of audio, and one
+second for video. Nothing but a restarted stream produces that. On detection the
+ring is cleared, `hiSeq` reset, and `pos` set to −1, which is the existing
+re-prime path: *the stream is the truth, and re-anchor from the write head*.
+
+Verified by killing one side mid-call and starting it again:
+
+    peer-restarts 1
+    played 1505–1516/s (100.3–101.1%)   m2e p50 13.01 ms   crypt on
+    video dec 30/s   frames-lost 0   decLuma 94
+
+Audio, video and the key exchange all recover on their own — the new process
+generates a fresh X25519 key, the peer sees a key it does not have, re-derives,
+and replies once (§17.84).
+
+### One unavoidable cost, stated plainly
+
+A receiver bug cannot be fixed from the sender's side. Every copy in the field is
+0.9.4, which still has it, so during the 0.9.4 → 0.9.5 rollout the side that
+updates *second* will refuse the first side's packets until it too updates — up to
+one poll interval of one-way audio. After that, every restart is clean forever.
