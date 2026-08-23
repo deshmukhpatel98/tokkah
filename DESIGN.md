@@ -10482,3 +10482,107 @@ new side:  2.42 Mbps   m2e 10.02   conceal 0/s      (correctly fell back to floa
 0.9.8:     2.41 Mbps   m2e 13.15   conceal 0/s
 format complaints on the old side: 0
 ```
+
+## 17.102 Echo cancellation, and four ways a control loop can eat itself
+
+Without echo cancellation this app needs headphones, which is the opposite of the thing
+it is for. And a canceller cannot be built without a way to test it, which normally
+means playing sound into a room — not available at six in the morning with everything
+muted.
+
+But the echo path is a delay, a gain and an impulse response, and this program already
+has the exact samples it played and the exact samples it captured. So the path was built
+in software: `--echo-sim <ms>:<gain>` takes what was played, delays it, attenuates it,
+adds three early reflections at 3.1/7.2/13.1 ms, and mixes it into what was captured. A
+pure delay is the one echo path no room produces, and a canceller that only ever meets a
+single tap can pass a test it would fail in a room.
+
+Verified before use: own-voice correlation in the far end's playout goes from 8.3x median
+to 26.1x with the path armed.
+
+### Finding the echo, which this app is unusually well placed to do
+
+A canceller needs to know *where* the echo is. A general-purpose one has to search, and
+covering 0–200 ms needs 9600 taps and 460M multiply-adds a second. This one is told,
+because it owns both signals on one clock: a normalised cross-correlation of capture
+against playout, decimated by eight to 6 kHz — 0.7M multiply-adds per estimate instead
+of 46M — on a background thread, never in a callback.
+
+| simulated | found | correlation |
+|---|---|---|
+| none | 86 ms (spurious) | 0.13 |
+| 18 ms, -10 dB | 21.5 ms | 0.15 |
+| 45 ms, -6 dB | 45.7 ms | 0.23 |
+| 18 ms, -2 dB | 19.8 ms | 0.36 |
+
+Accurate under **continuous double talk**, which is the hardest case — both files talking
+all the time, no far-end-only period to lock onto. The few ms of overshoot is the
+reflection taps pulling the centroid past the direct path, which is correct.
+
+The first version of this used a 100 ms window and reported 0.26 with no echo path at
+all: two unrelated speech signals correlate, because both have speech's spectral envelope
+and a pitch in the same octave, and the best of 1200 candidate lags finds something. The
+threshold had been set at 0.20 — under the null. Window lengthened to 400 ms (the floor
+goes as 1/sqrt(window), so 0.13), and the threshold set at 0.45 from the measured floor
+rather than from taste.
+
+### Then the canceller, and it went backwards
+
+1024-tap NLMS at the measured delay, 21.3 ms of span, 98M multiply-adds a second.
+
+```
+aec: erle -21.7 dB
+```
+
+**Negative.** Twenty-one decibels LOUDER. And -21.6 dB with no echo path armed at all,
+which is what localised it: the double-talk gate read `abs(e) < abs(mic) * 2`, true of
+essentially every sample, so adaptation never froze — and NLMS driven by near-end speech
+against an uncorrelated reference does not converge slowly, it **random walks**.
+
+The gate has to answer "could the far end alone explain what the microphone hears?" A
+loudspeaker-to-microphone coupling is below unity, so a microphone *louder* than the
+reference means something else is in the room, and that something is the near end
+talking. Energies over the filter window, not single samples.
+
+And the test rig was wrong for what it was testing: both ends talked continuously, so
+there was never a far-end-only period in which to converge. Correct arm: far end talking,
+near end quiet.
+
+### Three more self-inflicted loops, each visible only after the last was fixed
+
+- **Re-aim on every twitch.** The filter zeroed its 1024 taps whenever the delay estimate
+  moved 2 ms — 46 times in 90 seconds, restarting convergence each time. The taps span
+  21 ms and the estimate is placed 5 ms in, so a few ms of wobble is already covered.
+- **The canceller blinded the estimator that aims it.** The history the estimator reads
+  was written *after* cancellation, so the moment cancellation worked the correlation
+  collapsed to 0.08, the best lag became whichever noise peak won, and the canceller
+  re-aimed at it and destroyed itself. Record the **raw** microphone; cancel after. Same
+  shape as every other control-loop failure here: the loop was reading a signal its own
+  action had removed.
+- **A re-aim has to be earned.** One disagreeing window is noise; three in a row is the
+  path actually moving. Re-aims: 46 → 9 → 1.
+
+### Where it ended
+
+| | ERLE now | over the call | re-aims | steps | cost |
+|---|---|---|---|---|---|
+| echo at 18 ms, -6 dB | **13.1 dB** | 11.3 dB | 1 | 6.0M | 19 us of 333 (6%) |
+| no echo | 0.0 dB | 0.0 dB | 0 | **0** | **0 us** |
+
+Reported two ways on purpose: the lifetime figure includes every second of cold-start
+convergence and answers "what did this call get"; the recent figure answers "what is it
+doing now". Quoting only the first understates a converged filter and only the second
+hides how long it took.
+
+With no echo it does **nothing at all** — zero steps, zero cost — because the gate is set
+at 0.30 against a measured null of 0.09. An earlier 0.10 had it running on calls with no
+echo, removing 1.6 dB of energy from a signal that had nothing in it to remove.
+
+**What this is and is not.** 11–13 dB on a *simulated linear* path is a working first
+stage, not a finished canceller: real cancellers reach 20–40 dB, and the missing pieces
+are a residual suppressor for the reverb tail and anything at all for loudspeaker
+nonlinearity — which is precisely what this rig cannot produce. So `--aec` is **off by
+default**, and it stays off until it has been measured against a real speaker in a real
+room. The estimator, by contrast, runs always and on every call: "your speaker is feeding
+your microphone at 18 ms with 0.7 correlation" is worth saying out loud whether or not
+anything can be done about it yet.

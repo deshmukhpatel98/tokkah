@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.16.0"
+let VERSION = "0.17.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -27,6 +27,45 @@ func arg(_ name: String) -> String? {
   return a[i + 1]
 }
 func flag(_ name: String) -> Bool { CommandLine.arguments.contains("--" + name) }
+
+// ── A MISSPELLED FLAG MUST NOT BE A SILENT NO-OP ────────────────────────────
+//
+// `arg()` looks for "--name" followed by a separate value, so "--echo-sim=18" is
+// one unrecognised token and reads as absent. Which means a test arm can run with
+// its impairment, its format, or its whole feature switched off, produce a clean
+// result, and be labelled as the damaged one. That has happened twice in this
+// project -- once through zsh not word-splitting an unquoted variable, and once
+// through this exact `=` mistake, where the echo-simulation arm and the control
+// arm returned the same number because they WERE the same arm.
+//
+// The list is maintained by hand on purpose: adding a flag and forgetting to
+// register it fails immediately and loudly, which is the cheap direction to fail.
+let KNOWN_FLAGS: Set<String> = [
+  "aec",
+  "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
+  "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
+  "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
+  "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
+  "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
+  "window", "version", "help",
+]
+for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
+  let name = String(a.dropFirst(2))
+  if KNOWN_FLAGS.contains(name) { continue }
+  // Name a likely intent rather than just refusing: "--echo-sim=18" and
+  // "--echosim" are the two mistakes actually made.
+  let bare = name.split(separator: "=").first.map(String.init) ?? name
+  var hint = ""
+  if KNOWN_FLAGS.contains(bare) {
+    hint = " -- values are separate words here: --\(bare) <value>"
+  } else if let near = KNOWN_FLAGS.first(where: { $0.replacingOccurrences(of: "-", with: "") == bare.replacingOccurrences(of: "-", with: "") }) {
+    hint = " -- did you mean --\(near)?"
+  }
+  fputs("unknown option \(a)\(hint)\n"
+      + "a misspelled flag would otherwise be ignored in silence, and an arm running"
+      + " without the thing it is named after is worse than no arm at all.\n", stderr)
+  exit(2)
+}
 
 let listenPort = UInt16(arg("listen") ?? "7001") ?? 7001
 let peerSpec = arg("peer") ?? "127.0.0.1:7002"
@@ -252,6 +291,14 @@ if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
+if flag("aec") { fputs(audio.enableAec() + "\n", stderr) }
+if let ed = arg("echo-sim") {
+  // "18" or "18:0.3" -- delay in ms, optional linear gain.
+  let parts = ed.split(separator: ":")
+  let d = Double(parts[0]) ?? 18
+  let g = parts.count > 1 ? (Double(parts[1]) ?? 0.3) : 0.3
+  fputs(audio.armEchoSim(delayMs: d, gain: g) + "\n", stderr)
+}
 audio.concealZeros = (arg("conceal") == "zeros")
 audio.concealGrain = (arg("conceal") == "grain")
 audio.interpLinear = (arg("interp") == "linear")
@@ -1033,6 +1080,29 @@ func reportLoop() {
                + " (\(String(format: "%.0f", 1000.0 / audio.plcPeriodMs.p(0.50)!)) Hz)" : ", no pitch found")
           + "\n", stderr)
     }
+  }
+  // Is the speaker feeding the microphone? A question worth an answer on every
+  // call, not only when a canceller is being tested.
+  if audio.echoDelayMs >= 0 {
+    fputs("  echo: \(String(format: "%.2f", audio.echoCorr)) correlation at "
+        + "\(String(format: "%.1f", audio.echoDelayMs)) ms"
+        + (audio.echoSim ? "  [SIMULATED echo path armed]" : "")
+        // 0.45, not 0.2. The null -- two unrelated speech signals, no echo path at
+        // all -- measured 0.26, so a threshold under that reports an echo on every
+        // healthy call. The floor was measured before the threshold was chosen.
+        + (audio.echoCorr > 0.45
+           ? "  -- ECHO: the far end is hearing itself, headphones or cancellation needed" : "")
+        + "\n", stderr)
+  }
+  if audio.aecEnabled {
+    let budgetUs = Double(Audio.devBuf) / SR * 1_000_000.0
+    let c = audio.aecCost.p(0.95) ?? 0
+    fputs("  aec: erle \(String(format: "%.1f", audio.erleRecentDb)) dB now,"
+        + " \(String(format: "%.1f", audio.erleDb)) dB over the call"
+        + "  \(audio.aecUpdates) steps, \(audio.aecFreezes) frozen, \(audio.aecReaims) re-aims"
+        + " (\(Int(Double(audio.aecFreezes) / Double(max(1, audio.aecUpdates + audio.aecFreezes)) * 100))% double-talk)"
+        + "  cost p95 \(String(format: "%.0f", c)) us of \(String(format: "%.0f", budgetUs)) us"
+        + " (\(String(format: "%.0f", c / budgetUs * 100))%)\n", stderr)
   }
   if audio.acoustic {
     let heard = audio.acRound.p(0.50)

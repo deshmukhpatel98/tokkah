@@ -260,6 +260,209 @@ final class Audio {
     return "playout dump: \(path) -- raw float32 mono @48000, up to \(Int(seconds)) s"
   }
 
+  // ── A speaker-to-microphone path, in software ──────────────────────────────
+  //
+  // Without echo cancellation this app needs headphones, which is the opposite of
+  // the thing it is for. And an echo canceller cannot be built without a way to
+  // test it, which normally means playing sound into a room.
+  //
+  // But the echo path is a delay, a gain and an impulse response, and this program
+  // already has the exact samples it played and the exact host time it played
+  // them. So the path can be built in software: take what was played, delay it,
+  // attenuate it, smear it with a few reflections, and add it to what was
+  // captured. That is a real echo as far as everything downstream is concerned --
+  // the canceller sees precisely what it would see in a room, minus the
+  // loudspeaker's nonlinearity and the late reverb tail.
+  //
+  // What this rig proves: convergence, echo return loss, and behaviour when both
+  // people talk at once. What it cannot prove: anything about a real loudspeaker.
+  // That distinction is stated everywhere the numbers appear.
+  private static let ECHO_MAX = 48000                 // one second of history
+  private var echoHist: UnsafeMutablePointer<Float>?
+  private var echoW = 0
+  private var echoDelay = 0
+  private var echoGain: Float = 0
+  private var echoTaps: [(Int, Float)] = []
+  private var echoArmed = false
+  var echoSim: Bool { echoArmed }
+
+  /// Arm the simulated echo path. Delay in ms, gain as a linear factor.
+  func armEchoSim(delayMs: Double, gain: Double) -> String {
+    echoArmed = true
+    echoDelay = max(1, Int(delayMs / 1000.0 * SR))
+    echoGain = Float(gain)
+    // A direct path plus three early reflections at decreasing amplitude. A pure
+    // delay is the one echo path no room produces, and a canceller that only ever
+    // meets a single tap can pass a test it would fail in a room.
+    echoTaps = [(0, 1.0), (Int(0.0031 * SR), 0.55), (Int(0.0072 * SR), 0.33), (Int(0.0131 * SR), 0.18)]
+    return "echo sim: playout fed back at \(String(format: "%.1f", delayMs)) ms, gain "
+         + "\(String(format: "%.2f", gain)) (\(String(format: "%.0f", 20 * log10(gain))) dB), "
+         + "4 taps out to \(String(format: "%.1f", 13.1 + delayMs)) ms -- SIMULATED, not a real room"
+  }
+
+  // ── How much of what I play comes back into my microphone ──────────────────
+  //
+  // The first thing an echo canceller needs is WHERE the echo is, and this program
+  // is unusually well placed to find out: it has the exact samples it played and
+  // the exact samples it captured, on one clock, with no guessing. So a normalised
+  // cross-correlation of capture against playout over a 0-200 ms search says both
+  // where the echo is and how much of it there is.
+  //
+  // Decimated by eight before correlating -- 6 kHz is ample for locating a delay,
+  // speech has almost no energy above it that matters here, and the cost drops
+  // sixty-four fold: 0.7M multiply-adds per estimate instead of 46M. And it runs on
+  // a background thread reading snapshots, never in a callback, because an
+  // instrument whose own cost lands in the number it reports is worse than none.
+  private static let CAPH = 131072                    // 2.7 s of capture history
+  private var capHist: UnsafeMutablePointer<Float>?
+  private var capHistW = 0
+  private(set) var echoDelayMs: Double = -1
+  private(set) var echoCorr: Double = 0
+  private(set) var echoErleDb: Double = 0
+
+  // ── The canceller ──────────────────────────────────────────────────────────
+  //
+  // Normalised least-mean-squares, 1024 taps at 48 kHz = 21.3 ms, positioned at
+  // the delay the estimator found. That covers the direct path and the early
+  // reflections, which is where nearly all the echo energy is; the late reverb
+  // tail leaks through and is what a residual suppressor would be for.
+  //
+  // Positioned, rather than long enough to search. A filter that has to cover
+  // 0-200 ms needs 9600 taps and 460M multiply-adds a second; one that is TOLD
+  // where to look needs 1024 and 98M. This program knows where to look because it
+  // has both signals on one clock -- which is the whole advantage of doing this
+  // inside the app that owns the playout rather than in a general-purpose library.
+  //
+  // ADAPTATION FREEZES DURING DOUBLE TALK. When the near end speaks, the residual
+  // is dominated by their voice, and an LMS update driven by that will happily
+  // "cancel" the person who is talking -- it diverges, and the failure sounds like
+  // the near end being chewed up. So the step is taken only when the far end is
+  // clearly the louder explanation for what the microphone hears.
+  private static let AEC_TAPS = 1024
+  private var aecW: UnsafeMutablePointer<Float>?
+  private var aecOn = false
+  private var aecDelay = 0
+  private var aecFrozen = 0
+  private(set) var aecUpdates = 0
+  private(set) var aecFreezes = 0
+  private(set) var aecReaims = 0
+  private var aimDisagree = 0
+  private var micE: Double = 0
+  private var refE: Double = 0
+  private var erleMicE: Double = 0
+  private var erleOutE: Double = 0
+  var aecCost = Quantiles(cap: 1024)
+  var aecEnabled: Bool { aecOn }
+  /// Echo return loss enhancement: how much quieter the microphone signal got.
+  ///
+  /// Reported two ways on purpose. The lifetime figure includes every second of
+  /// cold-start convergence and is the honest "what did this call get"; the recent
+  /// figure is a leaky average over about a second and is the honest "what is it
+  /// doing now". Quoting only the first understates a converged filter; quoting
+  /// only the second hides how long it took to get there.
+  var erleDb: Double {
+    guard erleMicE > 1e-12, erleOutE > 1e-12 else { return 0 }
+    return 10 * log10(erleMicE / erleOutE)
+  }
+  private var erleMicR: Double = 0
+  private var erleOutR: Double = 0
+  var erleRecentDb: Double {
+    guard erleMicR > 1e-12, erleOutR > 1e-12 else { return 0 }
+    return 10 * log10(erleMicR / erleOutR)
+  }
+
+  func enableAec() -> String {
+    let w = UnsafeMutablePointer<Float>.allocate(capacity: Audio.AEC_TAPS)
+    w.initialize(repeating: 0, count: Audio.AEC_TAPS)
+    aecW = w
+    aecOn = true
+    return "echo cancellation ON -- \(Audio.AEC_TAPS) taps"
+         + " (\(String(format: "%.1f", Double(Audio.AEC_TAPS) / SR * 1000)) ms),"
+         + " positioned from the measured delay, frozen during double talk"
+  }
+
+  /// Subtract the estimated echo from what the microphone delivered, then take one
+  /// NLMS step if the far end is the dominant explanation for it.
+  private func cancelEcho(_ n: Int) {
+    guard let w = aecW, let eh = echoHist else { return }
+    // The filter sits at the measured delay, rounded to a sample. Until the
+    // estimator has an answer, do nothing: a filter aimed at the wrong place
+    // adapts to noise and then has to unlearn it.
+    let dms = echoDelayMs
+    // 0.30, and the null matters: with no echo path at all the estimator reads
+    // about 0.09 and its "best lag" wanders, so a canceller armed at 0.10 runs on
+    // a call that has no echo -- 116 re-aims in two minutes and 1.6 dB of energy
+    // removed from a signal that had nothing in it to remove.
+    guard dms >= 0, echoCorr > 0.30 else { return }
+    let d = max(0, Int(dms / 1000.0 * SR) - Audio.AEC_TAPS / 4)
+    // Re-aim only on a move the filter cannot absorb. The taps span 21 ms and the
+    // estimate is placed 5 ms in, so a wobble of a few ms is already covered --
+    // and zeroing the weights every time the estimate twitched meant restarting
+    // convergence every two seconds, forever.
+    // And a re-aim has to be EARNED. A single window disagreeing is noise; three
+    // in a row is the echo path actually having moved (someone turned the volume
+    // up, picked the laptop up, changed output device). Zeroing 1024 converged
+    // taps on one twitchy estimate costs more than the twitch ever did.
+    if abs(d - aecDelay) > Int(0.008 * SR) {
+      aimDisagree += 1
+      if aimDisagree >= 3 {
+        aecDelay = d
+        w.update(repeating: 0, count: Audio.AEC_TAPS)
+        aecReaims += 1
+        aimDisagree = 0
+      }
+    } else {
+      aimDisagree = 0
+    }
+    let t0 = Clock.now()
+    let base = echoW - n - aecDelay
+    guard base - Audio.AEC_TAPS >= 0 else { return }
+    for k in 0..<n {
+      let end = base + k                             // newest reference sample
+      var y: Float = 0
+      var xe: Float = 0
+      for j in 0..<Audio.AEC_TAPS {
+        let x = eh[(end - j) % Audio.ECHO_MAX]
+        y += w[j] * x
+        xe += x * x
+      }
+      let mic = inScratch[k]
+      let e = mic - y
+      erleMicE += Double(mic) * Double(mic)
+      erleOutE += Double(e) * Double(e)
+      erleMicR = erleMicR * 0.99998 + Double(mic) * Double(mic)
+      erleOutR = erleOutR * 0.99998 + Double(e) * Double(e)
+      inScratch[k] = e
+      // DOUBLE TALK, and the first version of this gate was worthless. It read
+      // `abs(e) < abs(mic) * 2`, which is true of essentially every sample, so
+      // adaptation never froze -- and NLMS driven by near-end speech against an
+      // uncorrelated far-end reference does not converge slowly, it RANDOM WALKS.
+      // Measured: erle -21.7 dB, the canceller making the signal twenty-one
+      // decibels LOUDER, and -21.6 dB with no echo path armed at all, which is
+      // what localised it.
+      //
+      // The gate has to answer "could the far end alone explain what the
+      // microphone is hearing?" A loudspeaker-to-microphone coupling is below
+      // unity, so if the microphone is LOUDER than the reference, something else is
+      // in the room and that something is the near end talking. Energies over the
+      // filter window, not single samples: one sample says nothing about which
+      // signal is present.
+      let micWinE = micE * 0.98 + Double(mic) * Double(mic)
+      micE = micWinE
+      refE = refE * 0.98 + Double(xe) / Double(Audio.AEC_TAPS)
+      let farEndExplains = refE > 1e-7 && micE < refE * 4.0
+      if farEndExplains {
+        let mu: Float = 0.25
+        let g = mu * e / (xe + 1e-6)
+        for j in 0..<Audio.AEC_TAPS { w[j] += g * eh[(end - j) % Audio.ECHO_MAX] }
+        aecUpdates += 1
+      } else {
+        aecFreezes += 1
+      }
+    }
+    aecCost.add(Clock.ms(Clock.now() - t0) * 1000.0)
+  }
+
   var acoustic = false
 
   /// The pitch period of what was just playing, by normalised autocorrelation.
@@ -334,6 +537,61 @@ final class Audio {
       if step > edgeWinMax { edgeWinMax = step }
       edgeWinLeft -= 1
       if edgeWinLeft == 0 { jumpAtEdge.add(Double(edgeWinMax)) }
+    }
+  }
+
+  /// Find the echo: where in the playout history the microphone signal correlates,
+  /// and how strongly. Runs forever on its own thread from `start()`.
+  private func echoEstimator() {
+    let D = 8                                   // decimation -> 6 kHz
+    // 400 ms of evidence, not 100. Two UNRELATED speech signals correlate: both
+    // have speech's spectral envelope and a pitch in the same octave, so the best
+    // of 1200 candidate lags finds something. Measured null with no echo path at
+    // all: 0.26. A window four times longer drops that chance floor by half,
+    // because the floor goes as 1/sqrt(window).
+    let win = 19200 / D                         // 400 ms of evidence
+    let maxLag = Int(0.200 * SR) / D            // search out to 200 ms
+    var mic = [Float](repeating: 0, count: win)
+    var spk = [Float](repeating: 0, count: win + maxLag)
+    while true {
+      Thread.sleep(forTimeInterval: 0.5)
+      guard let ch = capHist, let eh = echoHist else { continue }
+      let cw = capHistW, ew = echoW
+      guard cw > win * D + 2000, ew > (win + maxLag) * D + 2000 else { continue }
+      // Decimate by averaging, not by dropping: dropping aliases everything above
+      // 3 kHz down into the band the correlation is computed in.
+      for i in 0..<win {
+        var a: Float = 0
+        for j in 0..<D { a += ch[(cw - (win - i) * D + j) % Audio.CAPH] }
+        mic[i] = a / Float(D)
+      }
+      for i in 0..<(win + maxLag) {
+        var a: Float = 0
+        for j in 0..<D { a += eh[(ew - (win + maxLag - i) * D + j) % Audio.ECHO_MAX] }
+        spk[i] = a / Float(D)
+      }
+      var micE: Float = 0
+      for v in mic { micE += v * v }
+      guard micE > 1e-6 else { continue }       // a silent mic has no echo to find
+
+      var best = -1, bestScore: Float = 0
+      for lag in 0..<maxLag {
+        var num: Float = 0, den: Float = 0
+        let off = maxLag - lag
+        for i in 0..<win {
+          let sv = spk[i + off]
+          num += mic[i] * sv
+          den += sv * sv
+        }
+        guard den > 1e-9 else { continue }
+        // Normalised by BOTH energies, so the score is a correlation coefficient
+        // rather than a number that grows with how loud the speaker happens to be.
+        let r = abs(num) / (den * micE).squareRoot()
+        if r > bestScore { bestScore = r; best = lag }
+      }
+      guard best >= 0 else { continue }
+      echoCorr = Double(bestScore)
+      echoDelayMs = Double(best * D) / SR * 1000.0
     }
   }
 
@@ -442,6 +700,17 @@ final class Audio {
     lastGood.initialize(repeating: 0, count: FPP)
     hist = .allocate(capacity: Audio.HIST)
     hist.initialize(repeating: 0, count: Audio.HIST)
+    // Playout and capture history exist whenever the estimator does, which is
+    // always: "is my speaker feeding my microphone" is a question worth answering
+    // on every call, not only when a canceller is being tested.
+    echoHist = {
+      let b = UnsafeMutablePointer<Float>.allocate(capacity: Audio.ECHO_MAX)
+      b.initialize(repeating: 0, count: Audio.ECHO_MAX); return b
+    }()
+    capHist = {
+      let b = UnsafeMutablePointer<Float>.allocate(capacity: Audio.CAPH)
+      b.initialize(repeating: 0, count: Audio.CAPH); return b
+    }()
     inScratch = .allocate(capacity: 4096)
     inScratch.initialize(repeating: 0, count: 4096)
     inBufList = .allocate(capacity: 1)
@@ -591,6 +860,7 @@ final class Audio {
     started = true
     watchRate()
     watchStalls()
+    Thread { [weak self] in self?.echoEstimator() }.start()
   }
 
   /// Tell me the moment the rate moves, and put it back.
@@ -762,6 +1032,43 @@ final class Audio {
         if srcPos >= srcCount { srcPos = 0 }
       }
     }
+
+    // Add the simulated echo to what the microphone "heard". After the file
+    // substitution, because the echo is added to whatever the near end is saying,
+    // which is exactly the relationship a room has.
+    if echoArmed, let e = echoHist, echoW > echoDelay {
+      let w = echoW
+      for k in 0..<Int(n) {
+        var acc: Float = 0
+        for (t, a) in echoTaps {
+          let idx = w - echoDelay - t - (Int(n) - k)
+          if idx >= 0 { acc += a * e[idx % Audio.ECHO_MAX] }
+        }
+        inScratch[k] += acc * echoGain
+      }
+    }
+
+    // THE ESTIMATOR MUST SEE THE RAW MICROPHONE, NOT THE CANCELLED SIGNAL.
+    //
+    // The history is written BEFORE cancellation, and the order matters more than
+    // it looks. The estimator finds the echo by correlating this history against
+    // the playout, and it is what tells the canceller where to aim. Recording the
+    // cancelled signal instead meant that the moment cancellation started working
+    // the correlation collapsed to 0.08, the "best lag" became whichever noise
+    // peak won, and the canceller re-aimed at it and destroyed itself -- 46 re-aims
+    // in 90 seconds, each one zeroing the filter and restarting convergence.
+    //
+    // The canceller's success switched off the evidence stream that aimed it. Same
+    // shape as every other control-loop failure in this project: the loop was
+    // reading a signal its own action had removed.
+    if let ch = capHist {
+      for k in 0..<Int(n) { ch[(capHistW + k) % Audio.CAPH] = inScratch[k] }
+      capHistW += Int(n)
+    }
+
+    // Cancel after: the acoustic detector and the packetiser must see the cleaned
+    // signal, which is what a real microphone path would have delivered.
+    if aecOn { cancelEcho(Int(n)) }
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.
@@ -994,6 +1301,7 @@ final class Audio {
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
+        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
         sigSumSq += Double(val) * Double(val); sigN += 1
         // History is what was actually PLAYED, and only the good path writes it:
         // feeding synthesis back in would make the cursor chase its own tail.
@@ -1053,6 +1361,7 @@ final class Audio {
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
+        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
         if off == 0 {
           if concealRun < 1_000_000 { concealRun += 1 }
           ring.concealed += 1
