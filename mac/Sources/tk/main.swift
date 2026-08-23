@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.15.0"
+let VERSION = "0.16.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -249,6 +249,7 @@ let fecAllowed = !flag("no-fec")
 // Must be set before the units are built: the buffer size is a device property.
 if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
 if flag("no-rt") { Wire.noRealtime = true }
+if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 audio.concealZeros = (arg("conceal") == "zeros")

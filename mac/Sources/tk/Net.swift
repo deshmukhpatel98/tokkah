@@ -25,6 +25,14 @@ let RING = 2048           // packets == 1.37 s. Generous: the ring is not the
 let HDR = 20             // magic(4) seq(4) capHost(8) frames(4)
 let HMAGIC: UInt32 = 0x544B_0006   // key handshake; the ONLY packet always in the clear
 let HPKT = 4 + 32
+// ── and four bytes of "what I can receive" ──────────────────────────────────
+//
+// Appended past HPKT, and the receive path already tests `n >= HPKT`, so a build
+// that predates this reads its 36 bytes exactly as before and simply advertises
+// nothing. Which is the point: a format change that assumes the far end can parse
+// it is a silent break, and the two ends of a call update up to 60 s apart.
+let HPKTX = HPKT + 4
+let CAP_PCM16: UInt32 = 1 << 0
 let MAGIC: UInt32 = 0x544B_0001
 /// "send me a keyframe". Eight bytes, no payload, sent by a receiver that cannot
 /// decode. Necessary because H.264 parameter sets ride only with keyframes and
@@ -289,13 +297,36 @@ final class Wire {
   /// worth anything to a listener on its own.
   func sendHandshake() {
     guard let c = crypto else { return }
-    var out = [UInt8](repeating: 0, count: HPKT)
+    var out = [UInt8](repeating: 0, count: HPKTX)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: HMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
     }
     c.myPublic.copyBytes(to: &out[4], count: 32)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: Wire.myCaps.littleEndian, toByteOffset: HPKT, as: UInt32.self)
+    }
     out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
   }
+  /// Float in [-1,1] to signed 16-bit. Clamped, because a microphone CAN exceed
+  /// full scale and a wrapped sample is a click at full amplitude. 32767 both ways
+  /// so the round trip is exact rather than off by one part in 32768.
+  @inline(__always) private func unpack16(_ src: UnsafePointer<UInt8>, _ n: Int,
+                                          into dst: UnsafeMutablePointer<Float>) {
+    src.withMemoryRebound(to: Int16.self, capacity: n) { p in
+      for i in 0..<n { dst[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
+    }
+  }
+
+  @inline(__always) private func pack16(_ src: UnsafePointer<Float>, _ n: Int,
+                                        into dst: UnsafeMutablePointer<UInt8>) {
+    dst.withMemoryRebound(to: Int16.self, capacity: n) { out in
+      for i in 0..<n {
+        let v = max(-1.0, min(1.0, src[i])) * 32767.0
+        out[i] = Int16(v.rounded())
+      }
+    }
+  }
+
   private(set) var delayQ: DelayQueue?
   func armDelayQueue() { delayQ = DelayQueue { [weak self] p, n in self?.wireSend(p, n) } }
   /// Exposed so STUN can run on THIS socket. A mapping discovered on any other
@@ -379,13 +410,27 @@ final class Wire {
     scratch.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
     (scratch + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
     (scratch + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
-    (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(n).littleEndian }
-    memcpy(scratch + HDR, src, n * 4)
-    var total = HDR + n * 4
+    // ── 16-bit on the wire, when the far end says it can read it ────────────
+    //
+    // The audio was costing 2.43 Mbps and the VIDEO of a person talking costs
+    // 0.15 -- sixteen times less -- because the samples went out as 32-bit float.
+    // A microphone's own noise floor is nowhere near 96 dB down, so the bottom
+    // sixteen bits of every sample are the preamp's noise sent at full price.
+    //
+    // The format rides in the high bits of the frame count, which is only safe
+    // because a packet is never sent in this format until the peer has advertised
+    // it in the handshake. Guessing here would mean an old build computing
+    // frames = 65568 and dropping the packet in silence.
+    let pcm16 = sendPcm16
+    let bps = pcm16 ? 2 : 4
+    let tag = UInt32(n) | (pcm16 ? (1 << 16) : 0)
+    (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = tag.littleEndian }
+    if pcm16 { pack16(src, n, into: scratch + HDR) } else { memcpy(scratch + HDR, src, n * 4) }
+    var total = HDR + n * bps
     if let r = redundant {
       (scratch + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
-      memcpy(scratch + total + 8, r, n * 4)
-      total += 8 + n * 4
+      if pcm16 { pack16(r, n, into: scratch + total + 8) } else { memcpy(scratch + total + 8, r, n * 4) }
+      total += 8 + n * bps
       redundantSent += 1
     }
     // Through rawSend, not sendto. This path used to call sendto directly, which
@@ -539,6 +584,12 @@ final class Wire {
   /// `--no-rt` exists so the thread policy can be A/B'd against itself. A change
   /// nobody can turn off is a claim, not a measurement.
   nonisolated(unsafe) static var noRealtime = false
+  /// What this build can receive, and what the far end says it can.
+  nonisolated(unsafe) static var myCaps: UInt32 = CAP_PCM16
+  /// `--pcm32` forces the old format so the change can be A/B'd from either side.
+  nonisolated(unsafe) static var forceFloat = false
+  private(set) var peerCaps: UInt32 = 0
+  var sendPcm16: Bool { !Wire.forceFloat && (peerCaps & CAP_PCM16) != 0 }
   private(set) var peerRxLost: Int = 0
   private(set) var peerRxRecovered: Int = 0
   /// Whether the far end reports at all. False means an older build, and the
@@ -671,6 +722,9 @@ final class Wire {
     // One receive thread, so one decrypt scratch is safe -- unlike the send side,
     // which is reached from three.
     let dbuf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
+    // One float scratch for unpacking 16-bit payloads. Safe as a single buffer for
+    // the same reason dbuf is: there is exactly one receive thread.
+    let fbuf = UnsafeMutablePointer<Float>.allocate(capacity: FPP + 8)
     while true {
       var src = sockaddr_in()
       var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -688,6 +742,13 @@ final class Wire {
       // one round trip.
       if magic == HMAGIC, Int(n) >= HPKT {
         if !locked { adopt(src) }
+        if Int(n) >= HPKTX {
+          let c2 = (buf + HPKT).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          if c2 != peerCaps {
+            peerCaps = c2
+            fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\n", stderr)
+          }
+        }
         if let c = crypto {
           // REPLY ONLY WHEN THE KEY WAS NEW. The previous version replied to every
           // handshake it received, and so did the peer, so a reply provoked a
@@ -790,7 +851,9 @@ final class Wire {
       if magic != MAGIC || plainN < HDR { continue }
       let seq = Int32(bitPattern: (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
       let cap = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-      let frames = Int((plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+      let tag = (plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+      let frames = Int(tag & 0xffff)
+      let bps = (tag >> 16) == 1 ? 2 : 4
       // EXACTLY our packet size, or nothing. The old test was `frames > FPP`,
       // which is wrong in both directions during a rollout -- and the two machines
       // in a call update up to 60 s apart, so a rollout is guaranteed.
@@ -803,7 +866,7 @@ final class Wire {
       //
       // Now it is neither. A mismatch is refused and named, so the failure tells
       // you what it is and which side to fix.
-      if frames <= 0 || plainN < HDR + frames * 4 { continue }
+      if frames <= 0 || plainN < HDR + frames * bps { continue }
       if frames != FPP {
         fmtMismatch += 1
         // The far end is on another build and this call is going nowhere until one
@@ -818,18 +881,28 @@ final class Wire {
         }
         continue
       }
-      (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
+      if bps == 2 {
+        unpack16(plain + HDR, frames, into: fbuf)
+        ring.write(seq: seq, cap: cap, src: fbuf, n: frames)
+      } else {
+        (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
+      }
       // A trailing block means this packet is also carrying an earlier one. Fill
       // the hole only if it IS a hole -- ring.write already refuses a duplicate,
       // and refuses anything the cursor has passed, so nothing here can overwrite
       // audio about to play.
-      let redOff = HDR + frames * 4
-      if plainN >= redOff + 8 + frames * 4, seq > 0 {
+      let redOff = HDR + frames * bps
+      if plainN >= redOff + 8 + frames * bps, seq > 0 {
         let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
         let rSeq = seq - 1
         if !ring.present(rSeq) {
-          (plain + redOff + 8).withMemoryRebound(to: Float.self, capacity: frames) {
-            ring.write(seq: rSeq, cap: rCap, src: $0, n: frames)
+          if bps == 2 {
+            unpack16(plain + redOff + 8, frames, into: fbuf)
+            ring.write(seq: rSeq, cap: rCap, src: fbuf, n: frames)
+          } else {
+            (plain + redOff + 8).withMemoryRebound(to: Float.self, capacity: frames) {
+              ring.write(seq: rSeq, cap: rCap, src: $0, n: frames)
+            }
           }
           if ring.present(rSeq) { ring.recovered += 1 }
         }

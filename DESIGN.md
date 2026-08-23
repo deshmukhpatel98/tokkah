@@ -10413,3 +10413,72 @@ Three bugs, and each was only visible once the previous one was fixed — the se
 behind the first, the third behind the second. Which is the argument for fixing a fault
 and then **running the same test again** rather than moving on: the first green result
 after a fix is the least informative one available.
+
+## 17.101 The voice cost sixteen times the picture
+
+A measurement from §17.98 that deserved its own look. Real talking-head video, 720p30
+through the H.264 encoder at a 3 Mbps target:
+
+```
+video  enc 30/s  dec 30/s  0.15 Mbps  620 B/frame  luma 91 motion 2
+audio                       2.43 Mbps
+```
+
+**The voice cost sixteen times the picture.** Verified against the source rather than
+assumed — extracting frames a second apart and differencing them gives a mean absolute
+difference of 3 of 255, exactly what the app's own motion probe reported, so a person
+sitting still and talking genuinely is a 0.15 Mbps problem and a good encoder spends
+620 bytes on a frame of it.
+
+The audio was 2.43 Mbps because samples went out as 32-bit float. A microphone's own
+noise floor is nowhere near 96 dB down, so the bottom sixteen bits of every sample were
+the preamp's noise, sent at full price. And the fleet says where this matters:
+**118 of 183 real sessions were on 4G**, where 2.4 Mbps up is marginal and 1.6 is not.
+
+### Negotiated, because a format change that assumes is a silent break
+
+Four bytes of capabilities appended past `HPKT` in the handshake. The receive path
+already tested `n >= HPKT`, so a build predating this reads its 36 bytes exactly as
+before and advertises nothing. The format then rides in the high bits of the frame
+count — safe *only* because a packet is never sent in that format until the peer has
+said it can read it. Guessing would mean an old build computing `frames = 65568` and
+dropping the packet in silence, which is the failure mode §17.x already paid for once.
+
+Clamped at ±1 on the way out, because a microphone can exceed full scale and a wrapped
+sample is a click at full amplitude. 32767 in both directions so the round trip is exact
+rather than off by one part in 32768.
+
+### Measured, with the §17.99 instrument
+
+| | bandwidth | under 1% loss (repair on) | SNR p50 | SNR p05 |
+|---|---|---|---|---|
+| **16-bit** | **1.64 Mbps** | **2.49 Mbps** | 72.9 dB | 37.0 dB |
+| 32-bit float | 2.41 Mbps | 4.02 Mbps | 87.2 dB | 57.5 dB |
+
+**32% saved clean, 38% under loss**, and loss recovery is bit-for-bit unchanged
+(1531 of 1591 repaired in both arms, concealment 0/s in both).
+
+The 14 dB is real and it is also exactly what theory predicts, which is the useful part:
+the signal sits at -27 dBFS, 16-bit gives 96 dB at full scale, so 96 - 27 = 69 dB is the
+expectation and 72.9 is the measurement. Instrument and arithmetic agree, so the number
+is understood rather than merely observed. And 73 dB is below the self-noise of any
+microphone this will ever run on — the float32 arm's 87.2 dB is itself near the
+analyser's own 92 dB ceiling.
+
+So: **transparent, not lossless.** The goal says "audio lossless", and the honest
+statement is that 16-bit is lossless with respect to what the microphone actually
+captured and lossy with respect to the float the OS hands over. `--pcm32` forces the old
+format from either side. Defaulted on because bandwidth headroom is what prevents
+congestion, congestion is what causes loss, and loss is what causes the concealment that
+is audible — a 38% cut on a 4G uplink buys more real quality than 14 dB of margin below
+a noise floor.
+
+### Mixed versions, tested rather than reasoned about
+
+New build against a freshly built 0.9.8, which advertises nothing:
+
+```
+new side:  2.42 Mbps   m2e 10.02   conceal 0/s      (correctly fell back to float32)
+0.9.8:     2.41 Mbps   m2e 13.15   conceal 0/s
+format complaints on the old side: 0
+```

@@ -74,12 +74,14 @@
     <tr><td>jitter buffer</td><td class=n>sizes itself, 2.0&ndash;30 ms</td></tr>
     <tr><td>device buffer</td><td class=n>0.33 ms (16 frames)</td></tr>
     <tr><td>when a packet is lost</td><td class=n>filled at the speaker's pitch period</td></tr>
-    <tr><td>format</td><td class=n>32-bit float, uncompressed</td></tr>
+    <tr><td>format</td><td class=n>16-bit pcm, uncompressed, no codec</td></tr>
+    <tr><td>measured signal-to-noise</td><td class=n>73 dB end to end</td></tr>
     <tr><td>encryption</td><td class=n>AES-256-GCM, 0.78 &micro;s/packet</td></tr>
-    <tr><td>bandwidth</td><td class=n>2.4 Mbps each way (4.0 while repairing loss)</td></tr>
+    <tr><td>bandwidth</td><td class=n>1.6 Mbps each way (2.5 while repairing loss)</td></tr>
     <tr><td>cost</td><td class=n>6% of one core</td></tr>
     <tr><th>Video</th><th></th></tr>
-    <tr><td>capture &rarr; decoded</td><td class=n>5.6 ms p50, 8.2 ms p95</td></tr>
+    <tr><td>capture &rarr; decoded</td><td class=n>3.9 ms p50</td></tr>
+    <tr><td>bandwidth, person talking</td><td class=n>0.15 Mbps</td></tr>
     <tr><td>+ display pipeline (60 Hz)</td><td class=n>~23 ms measured</td></tr>
     <tr><td>= capture &rarr; glass</td><td class=n>~28 ms</td></tr>
     <tr><td>hardware encode</td><td class=n>2.8 ms</td></tr>
