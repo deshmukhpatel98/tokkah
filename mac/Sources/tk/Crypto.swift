@@ -57,6 +57,34 @@ final class Crypto {
 
   var myPublic: Data { mine.publicKey.rawRepresentation }
 
+  // ── THE CODE YOU READ ALOUD ─────────────────────────────────────────────────
+  //
+  // The web app shows one and this did not, which is the difference between "the
+  // traffic is encrypted" and "you can CHECK that nobody is in the middle".
+  // Encryption without a way to verify the other end's key is protection against
+  // a passive listener only; a machine that can substitute keys defeats it
+  // silently, and the only defence anybody has ever found is two humans comparing
+  // a short string out loud.
+  //
+  // Same construction as `computeSafetyCode()` in app.js: hash the two identities
+  // SORTED -- so both ends compute the same string without agreeing who is first --
+  // and take 8 characters of 5 bits. 40 bits is not brute-forceable inside a live
+  // handshake and is short enough to say. Same 32-character alphabet, with 0/O/1/I
+  // left out because this gets read down a phone line.
+  //
+  // The web app hashes DTLS certificate fingerprints; there are none here, so it
+  // hashes the X25519 public keys that actually produced the session keys. Same
+  // property: change either key and the code changes.
+  static let codeAlphabet = Array("23456789ABCDEFGHJKLMNPQRSTUVWXYZ")
+  var safetyCode: String? {
+    guard established, !peerKeyHex.isEmpty else { return nil }
+    let mineHex = myPublic.map { String(format: "%02x", $0) }.joined()
+    let joined = [mineHex, peerKeyHex].sorted().joined(separator: "|")
+    let digest = SHA256.hash(data: Data(joined.utf8))
+    let out = digest.prefix(8).map { String(Crypto.codeAlphabet[Int($0 & 31)]) }.joined()
+    return String(out.prefix(4)) + " " + String(out.suffix(4))
+  }
+
   /// `roomSalt` is the room code when there is one. It is the only thing an
   /// attacker cannot obtain from the wire, so it is what turns this from
   /// "unauthenticated, stops eavesdroppers" into "authenticated against anyone
@@ -133,7 +161,7 @@ final class Crypto {
 
   var summary: String {
     established
-      ? "encrypted (aes-256-gcm, peer \(peerKeyHex.prefix(8))…)"
+      ? "encrypted (aes-256-gcm, peer \(peerKeyHex.prefix(8))…, code \(safetyCode ?? "-"))"
         + (plaintextRx > 0 ? ", \(plaintextRx) plaintext received before handshake" : "")
       : "PLAINTEXT -- handshake not complete"
   }

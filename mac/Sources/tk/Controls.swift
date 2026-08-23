@@ -139,9 +139,19 @@ enum Glyph {
     rr(p, k, 2.6, 10.2, 11.4, 10.2, 2.6)
     m(p, k, 13.9, 13.7); l(p, k, 19.4, 10.7); l(p, k, 19.4, 19.3); l(p, k, 13.9, 16.3)
     p.close()
+    // `a 7.8 7.8 0 0 1 13.6 -0.8` -- a real elliptical arc, and the first version
+    // guessed two cubic control points at it by eye. That is why the switch-camera
+    // glyph did not match: the arc over the camera body was the wrong shape, and it
+    // is the only part of this icon that carries the meaning.
+    //
+    // Solved rather than eyeballed. Chord (5.2,7.6)->(18.8,6.8) is 13.623 long, so
+    // with r=7.8 the centre sits h=sqrt(r^2-(d/2)^2)=3.801 off the chord midpoint
+    // (12.0,7.2) along its perpendicular. large-arc=0 with sweep=1 picks the centre
+    // BELOW the chord, which is the one whose minor arc bulges upward over the
+    // camera: (12.223, 10.994), swept from -154.2 deg to -32.5 deg.
     m(p, k, 5.2, 7.6)
-    p.curve(to: NSPoint(x: 18.8 * k, y: 6.8 * k),
-            controlPoint1: NSPoint(x: 7.6 * k, y: 3.2 * k), controlPoint2: NSPoint(x: 15.2 * k, y: 2.8 * k))
+    p.appendArc(withCenter: NSPoint(x: 12.223 * k, y: 10.994 * k), radius: 7.8 * k,
+                startAngle: -154.2, endAngle: -32.5, clockwise: false)
     m(p, k, 18.9, 2.9); l(p, k, 18.9, 6.9); l(p, k, 14.9, 6.9)
     m(p, k, 5.1, 3.4); l(p, k, 5.1, 7.4); l(p, k, 9.1, 7.4)
   } }, filled: false)
@@ -193,6 +203,21 @@ enum Glyph {
     m(p, k, 10, 20); l(p, k, 10, 4)
     m(p, k, 16, 20); l(p, k, 16, 13)
     m(p, k, 22, 20); l(p, k, 2, 20)
+  } }, filled: false)
+
+  /// `#c-safety`: <rect x=4 y=10.5 width=16 height=10.5 rx=2.5/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>
+  static let lock = Shape(build: { box in path(box) { p, k in
+    rr(p, k, 4, 10.5, 16, 10.5, 2.5)
+    m(p, k, 8, 10.5); l(p, k, 8, 7)
+    // `a 4 4 0 0 1 8 0` -- a half circle of radius 4 centred at (12, 7). sweep=1
+    // arcs UPWARD on screen, which is toward SMALLER y in this viewBox and therefore
+    // BELOW the centre in the y-up space these paths are built in, so the angle
+    // increases and the arc is counter-clockwise. `mic` next door has the opposite
+    // sweep and is therefore clockwise; getting this backwards drew the shackle
+    // inside the body and the padlock came out as a notched box.
+    p.appendArc(withCenter: NSPoint(x: 12 * k, y: 7 * k), radius: 4 * k,
+                startAngle: 180, endAngle: 360, clockwise: false)
+    l(p, k, 16, 10.5)
   } }, filled: false)
 
   /// A chain link, for the invite row. Not in the web app's set -- it has no link
@@ -255,6 +280,15 @@ final class IconButton: NSButton {
   var on = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
   /// The one filled control.
   var destructive = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
+  // ── PRESS AND HOLD ─────────────────────────────────────────────────────────
+  //
+  // `#peek` is `pointerdown` -> show, `pointerup` -> hide. Not a toggle: the web
+  // app's own comment is explicit that a persistent mirror is "the #1 measured
+  // fatigue driver", and hold-to-peek exists precisely to avoid it. Built here as
+  // a mode on the button rather than a second button class, because everything
+  // else about it -- the circle, the glass, the glyph -- is identical.
+  var onHold: ((Bool) -> Void)?
+  private(set) var holding = false
 
   init(_ shape: Glyph.Shape, size: CGFloat = 58, help: String) {
     self.shape = shape
@@ -289,6 +323,26 @@ final class IconButton: NSButton {
   }
   override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true; ink.needsDisplay = true }
   override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true; ink.needsDisplay = true }
+
+  override func mouseDown(with event: NSEvent) {
+    guard onHold != nil else { super.mouseDown(with: event); return }
+    setHolding(true)
+    // Track the drag ourselves so a release ANYWHERE ends the hold. `setPointerCapture`
+    // is what the web app does for the same reason: letting go outside the circle
+    // must not leave the self-view stuck on screen.
+    while let e = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+      if e.type == .leftMouseUp { break }
+    }
+    setHolding(false)
+  }
+  private func setHolding(_ on: Bool) {
+    guard holding != on else { return }
+    holding = on
+    self.on = on
+    onHold?(on)
+  }
+  /// For `--press`: a hold long enough to be photographed, then released.
+  func simulateHold(_ on: Bool) { setHolding(on) }
 
   override func layout() {
     super.layout()
@@ -425,6 +479,8 @@ final class SheetRow: NSButton {
   var ruled = false { didSet { needsDisplay = true } }
   /// A fact about this call: nothing to press.
   var inert = false
+  /// `.sheet .row .code` -- a monospaced value pinned right, for the encryption code.
+  var value: String = "" { didSet { needsDisplay = true } }
 
   // ── SAY WHICH WAY IS UP ────────────────────────────────────────────────────
   //
@@ -498,6 +554,14 @@ final class SheetRow: NSButton {
         path.stroke()
       }
     }
+    if !value.isEmpty {
+      let f = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+      let a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: Palette.fg]
+      let sz = (value as NSString).size(withAttributes: a)
+      (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - 12,
+                                          y: (bounds.height - sz.height) / 2),
+                               withAttributes: a)
+    }
     if checked {
       // `.tick`: stroke 2.2, var(--ok), right-aligned.
       let t = NSBezierPath()
@@ -508,6 +572,27 @@ final class SheetRow: NSButton {
       t.lineWidth = 2.2; t.lineCapStyle = .round; t.lineJoinStyle = .round
       Palette.ok.setStroke(); t.stroke()
     }
+  }
+}
+
+/// `.sheet .hint { font-size: 11px; color: var(--muted); padding: 8px 12px 2px }`
+final class SheetHint: NSView {
+  private let label = NSTextField(labelWithString: "")
+  init(_ text: String) {
+    super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 30))
+    label.stringValue = text
+    label.font = .systemFont(ofSize: 11)
+    label.textColor = Palette.muted
+    label.maximumNumberOfLines = 2
+    label.lineBreakMode = .byWordWrapping
+    label.backgroundColor = .clear
+    label.isBordered = false
+    addSubview(label)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override func layout() {
+    super.layout()
+    label.frame = NSRect(x: 12, y: 2, width: bounds.width - 24, height: bounds.height - 4)
   }
 }
 
@@ -528,15 +613,20 @@ final class Sheet: NSView {
   }
   required init?(coder: NSCoder) { fatalError() }
 
-  func setRows(_ r: [SheetRow]) {
-    rows.forEach { $0.removeFromSuperview() }
-    rows = r
-    r.forEach(addSubview)
+  /// Rows and hints, in the order they should appear top to bottom.
+  private var items: [NSView] = []
+  func setItems(_ v: [NSView]) {
+    items.forEach { $0.removeFromSuperview() }
+    items = v
+    rows = v.compactMap { $0 as? SheetRow }
+    v.forEach(addSubview)
     needsLayout = true
   }
 
-  /// Height for the rows it holds: 10 top padding + grip + rows + 26 bottom.
-  var wantedHeight: CGFloat { 10 + 14 + CGFloat(rows.count) * 48 + 26 }
+  private func height(of v: NSView) -> CGFloat { v is SheetHint ? 34 : 48 }
+
+  /// 10 top padding + grip + the items + 26 bottom.
+  var wantedHeight: CGFloat { 10 + 14 + items.reduce(0) { $0 + height(of: $1) } + 26 }
 
   override func layout() {
     super.layout()
@@ -547,9 +637,10 @@ final class Sheet: NSView {
     glass.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
     grip.frame = NSRect(x: (bounds.width - 36) / 2, y: bounds.height - 14, width: 36, height: 4)
     var y = bounds.height - 24
-    for r in rows {
-      y -= 48
-      r.frame = NSRect(x: 10, y: y, width: bounds.width - 20, height: 48)
+    for v in items {
+      let h = height(of: v)
+      y -= h
+      v.frame = NSRect(x: 10, y: y, width: bounds.width - 20, height: h)
     }
   }
 }
@@ -766,6 +857,14 @@ final class CallControls: NSView {
   var onLeave: (() -> Void)?
   var onCamPick: ((Int) -> Void)?
   var inviteText = "" { didSet { onMain { [weak self] in self?.waiting.url = self?.inviteText ?? "" } } }
+  /// Set once the key exchange has happened; blank until then, and a blank code
+  /// shows as "…" rather than as an empty row that reads as broken.
+  private(set) var safetyCode = ""
+  func setSafetyCode(_ c: String) {
+    guard c != safetyCode else { return }
+    safetyCode = c
+    onMain { [weak self] in if self?.moreOpen == true { self?.rebuildSheet() } }
+  }
   private let room: String
   private var startedAt: Date?
   private var status = "waiting for the other person"
@@ -809,7 +908,7 @@ final class CallControls: NSView {
     }
     micButton.target = self; micButton.action = #selector(toggleMic)
     camButton.target = self; camButton.action = #selector(toggleCam)
-    peekButton.target = self; peekButton.action = #selector(peek)
+    peekButton.onHold = { [weak self] on in self?.onPeek?(on); self?.peeking = on }
     flipButton.target = self; flipButton.action = #selector(nextCamera)
     xlateButton.target = self; xlateButton.action = #selector(toggleXlate)
     leaveButton.target = self; leaveButton.action = #selector(leave)
@@ -1103,12 +1202,7 @@ final class CallControls: NSView {
   // taking the window: same question answered ("is my camera working"), without
   // covering the person who is talking.
   var onPeek: ((Bool) -> Void)?
-  private(set) var peeking = false
-  @objc func peek() {
-    peeking.toggle()
-    peekButton.on = peeking
-    onPeek?(peeking)
-  }
+  fileprivate(set) var peeking = false
 
   /// `#flip`: the next camera in the list. Hidden while there is only one, exactly
   /// as `display: none` does, so the row is six buttons or five and never a dead one.
@@ -1171,6 +1265,9 @@ final class CallControls: NSView {
   }
   /// Armed once the window exists: the row is visible on arrival and then settles.
   func armBarAutoHide() { showBar() }
+  /// A press is activity. Without this, `--press` drove the controls while the row
+  /// was invisible and every photograph of the result was of an empty bar.
+  func nudgeBar() { showBar() }
 
   private(set) var moreOpen = false
   @objc func toggleMore() {
@@ -1215,7 +1312,16 @@ final class CallControls: NSView {
     hud.target = self; hud.action = #selector(toggleNumbers)
     rows.append(hud)
     if let first = rows.dropFirst().first { first.ruled = true }
-    sheet.setRows(rows)
+
+    // `#c-safety`: neither a switch nor an action -- a fact about this call, with
+    // nothing to press, because there is no decision here for anyone to make.
+    let safety = SheetRow("Encryption code", glyph: Glyph.lock)
+    safety.inert = true
+    safety.value = safetyCode.isEmpty ? "…" : safetyCode
+    var items: [NSView] = rows
+    items.append(safety)
+    items.append(SheetHint("Read it aloud. Same code on both screens means nobody is in the middle."))
+    sheet.setItems(items)
   }
 
   private(set) var numbersShown = false
@@ -1267,7 +1373,8 @@ final class CallControls: NSView {
     case "mic": toggleMic()
     case "cam": toggleCam()
     case "invite": invite()
-    case "peek": peek()
+    case "peek": peekButton.simulateHold(true)
+    case "unpeek": peekButton.simulateHold(false)
     case "flip": nextCamera()
     case "xlate": toggleXlate()
     case "more": toggleMore()

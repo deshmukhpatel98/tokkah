@@ -31,26 +31,30 @@ final class Display {
   // early on ("hold to see yourself") and why every video app on earth does.
   private let selfLayer = AVSampleBufferDisplayLayer()
   private(set) var selfShown = 0
-  /// Off until a remote picture exists, because until then the main layer is
-  /// already showing you full-screen and a duplicate in the corner is just noise.
-  var selfViewOn = false {
-    didSet {
-      guard selfViewOn != oldValue else { return }
-      let on = selfViewOn
-      DispatchQueue.main.async { [weak self] in self?.selfLayer.isHidden = !on }
-    }
-  }
+  /// Kept only as "the far end is on screen", which is what decides whether YOUR
+  /// camera goes to the window or nowhere. It no longer shows a corner tile: see
+  /// `peeking`.
+  var selfViewOn = false
 
   /// Where the corner view sits for a given content rect. One place, so the first
   /// layout and every resize cannot disagree about it.
   static func selfFrame(in r: NSRect) -> NSRect {
-    let w = max(140, r.width * 0.2)
+    // ── `#selfSense`, TRANSCRIBED ─────────────────────────────────────────────
+    //
+    //   #selfSense { left: 12px; bottom: max(76px, ...);
+    //                width: clamp(96px, 18vmin, 160px); aspect-ratio: 16/9;
+    //                border-radius: 12px; transform: scaleX(-1);
+    //                box-shadow: 0 4px 18px rgba(0,0,0,.45) }
+    //   #selfSense.peeking { width: clamp(140px, 26vmin, 240px) }
+    //
+    // Bottom-LEFT, not bottom-right, and the peeking width -- because peeking is
+    // the only time it is ever on screen here.
+    let vmin = min(r.width, r.height)
+    let w = max(140, min(vmin * 0.26, 240))
     let h = w * 9.0 / 16.0
-    let pad = max(12, r.width * 0.015)
-    // Bottom-RIGHT, lifted clear of the control bar. Not over the buttons: a
-    // self-view sitting on the mute button is a mute button you cannot press.
-    return NSRect(x: r.width - w - pad, y: pad + CallControls.barHeight, width: w, height: h)
+    return NSRect(x: 12, y: 76, width: w, height: h)
   }
+
   private(set) var shown = 0, enqueueFails = 0
   /// Screen refresh period, so the display term in the budget is stated rather
   /// than quietly omitted: a frame handed to the compositor still waits, on
@@ -111,9 +115,13 @@ final class Display {
     // cost this file an invisible control bar. Sublayers are fine.
     selfLayer.videoGravity = .resizeAspectFill
     selfLayer.isHidden = true
-    selfLayer.cornerRadius = 8
+    selfLayer.cornerRadius = 12
     selfLayer.masksToBounds = true
-    selfLayer.borderWidth = 1
+    selfLayer.borderWidth = 0
+    // `transform: scaleX(-1)`. A self-view that is not mirrored is the one thing
+    // everybody notices instantly and cannot name: you raise your left hand and the
+    // wrong hand moves.
+    selfLayer.transform = CATransform3DMakeScale(-1, 1, 1)
     // The web app's glass line, and a real shadow so the corner reads as floating
     // above the picture rather than punched into it.
     selfLayer.cornerRadius = 12
@@ -215,7 +223,8 @@ final class Display {
   var describeTree: String {
     guard let v = win?.contentView else { return "no content view" }
     var out = "content \(Int(v.bounds.width))x\(Int(v.bounds.height)) subviews \(v.subviews.count)"
-    out += "  peeking=\(peeking) selfView=\(selfViewOn) shown=\(shown) selfShown=\(selfShown)"
+    out += "  peeking=\(peeking) tile=\(selfLayer.isHidden ? "hidden" : "shown")"
+      + " localFrames=\(localFrames) shown=\(shown) selfShown=\(selfShown)"
     if let c = controls { out += "\n  " + c.describeTree }
     out += ":"
     for sv in v.subviews {
@@ -287,33 +296,58 @@ final class Display {
   // Rather than covering the other person, the two pictures trade places: you take
   // the window, they take the corner. Same question answered -- "is my camera
   // alive" -- without losing sight of who is talking.
+  // ── NO PERSISTENT MIRROR ────────────────────────────────────────────────────
+  //
+  // The web app has no ambient self-view at all, on purpose: *"No persistent mirror
+  // (the #1 measured fatigue driver), no ambient tile: you look exactly when you
+  // choose to, for exactly as long as you choose to."* This app had a corner tile
+  // that appeared on the first remote frame and stayed for the whole call -- the
+  // exact thing that design decision exists to prevent.
+  //
+  // So `peeking` is the only thing that puts it on screen, and releasing the button
+  // takes it away.
   var peeking = false {
     didSet {
       guard peeking != oldValue else { return }
-      // The corner has to exist while peeking even before anyone arrives, or the
-      // swap has nowhere to put them.
-      let on = peeking || selfViewOn
-      DispatchQueue.main.async { [weak self] in self?.selfLayer.isHidden = !on }
+      let on = peeking
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        // AND ONLY IF THERE IS SOMETHING IN IT. Holding the button with no camera
+        // permission put an empty box on screen -- reported as "a window is
+        // appearing, but there is nothing to see", which is worse than no button:
+        // it looks like the feature works and the camera is broken.
+        if on, self.localFrames == 0 {
+          fputs("peek: no camera frames to show -- not opening an empty tile."
+              + " System Settings > Privacy & Security > Camera\n", stderr)
+          self.selfLayer.isHidden = true
+          return
+        }
+        self.selfLayer.isHidden = !on
+        if !on { self.selfLayer.flushAndRemoveImage() }
+      }
     }
   }
+  /// Proof that our own camera is producing anything at all, which is what decides
+  /// whether the tile has content to show.
+  private(set) var localFrames = 0
 
-  /// Your own camera. Goes to the corner once the far end is on screen, to the
-  /// window before that -- and to the window again while peeking.
+
+  /// Your own camera. The window before anyone arrives, the peek tile while the
+  /// button is held, and nowhere at all otherwise -- which is the whole point.
   func showSelf(_ img: CVImageBuffer) {
+    localFrames += 1
     if peeking {
-      if enqueue(img, into: layer) { shown += 1 }
-      return
-    }
-    guard selfViewOn else { return }
-    if enqueue(img, into: selfLayer) { selfShown += 1 }
-  }
-
-  /// The far end's picture. Takes the corner while peeking, the window otherwise.
-  func show(_ img: CVImageBuffer) {
-    if peeking, selfViewOn {
       if enqueue(img, into: selfLayer) { selfShown += 1 }
       return
     }
+    // Before the far end arrives you ARE the window.
+    if !selfViewOn { if enqueue(img, into: layer) { shown += 1 } }
+  }
+
+
+  /// The far end's picture: always the window. Peeking puts YOU in the corner tile
+  /// on top, it does not displace the person talking.
+  func show(_ img: CVImageBuffer) {
     if enqueue(img, into: layer) { shown += 1 }
   }
 

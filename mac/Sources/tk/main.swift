@@ -325,6 +325,7 @@ if flag("window") {
 // One place that knows what a press means, called by both --press-after and the
 // --shot path, so the two can never drift into pressing different things.
 func pressControl(_ name: String) {
+  display?.controls?.nudgeBar()
   // `selfview` is the one control that does not live on the bar: it is a Display
   // property, and it normally flips when the other side's first frame lands.
   // Reaching the connected layout otherwise needs two machines, which is a slow
@@ -359,8 +360,18 @@ func pressControl(_ name: String) {
 // happen while the app is still alive. So the presses get their own timer,
 // separate from the shot that used to exit immediately after them.
 if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(afterS) {
-  DispatchQueue.main.asyncAfter(deadline: .now() + after) {
-    for name in seq.split(separator: ",") { pressControl(String(name)) }
+  // A `~` token is a 3 s pause, so a PRESS-AND-HOLD can be photographed while held
+  // and then released in the same run: `--press "peek,~,unpeek"`. Without it a hold
+  // and its release were two separate runs, and "the tile went away" could never be
+  // shown to be caused by the release.
+  var t = after
+  for name in seq.split(separator: ",") {
+    let token = String(name)
+    if token == "~" { t += 3.0; continue }
+    let at = t
+    DispatchQueue.main.asyncAfter(deadline: .now() + at) { pressControl(token) }
+  }
+  DispatchQueue.main.asyncAfter(deadline: .now() + t) {
     fputs("presses done -- window is live for capture\n", stderr)
   }
 }
@@ -389,11 +400,11 @@ if videoArg != "off", display != nil || mdisplay != nil {
     // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
     // set so the two are never fighting over the same surface.
     // Once they are on screen you move to the corner rather than disappearing.
-    // Display owns the routing now, because `peek` swaps the two surfaces and two
-    // call sites deciding independently is how they end up disagreeing.
-    if sawRemote || display?.peeking == true { display?.showSelf(pb); return }
-    display?.show(pb)
-    mdisplay?.show(pb, at: Clock.now())
+    // Display owns the routing entirely: the window before anyone arrives, the peek
+    // tile while the button is held, nowhere otherwise. Two call sites deciding this
+    // independently is exactly how they end up disagreeing.
+    display?.showSelf(pb)
+    if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
   }
   // The call path asks too, in case the app was started from the command line and
   // never saw the join window. Blocking here is fine and deliberate: the answer is
@@ -1028,17 +1039,9 @@ if videoArg != "off" {
       // last frame simply stays put.
       if camOff { return }
       e.encode(pb, hostTime: host)
-      if sawRemote || display?.peeking == true {
-        // They have the window, you get the corner. This is the only thing in the
-        // app that proves YOUR camera is alive -- a frozen remote picture, a dead
-        // remote camera and a hung app look identical without it. While peeking it
-        // is the other way round, which `showSelf` handles.
-        display?.showSelf(pb)
-      } else {
-        // Nobody yet, so you have the whole window.
-        display?.show(pb)
-        mdisplay?.show(pb, at: Clock.now())
-      }
+      // Same single owner as the early-camera path above.
+      display?.showSelf(pb)
+      if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
     }
     e.onEncoded = { data, host, _ in
       wire.sendVideo(seq: vseq, capHost: host, payload: data, scratch: vscratch)
@@ -1744,6 +1747,9 @@ func reportLoop() {
     // when the sound is already off -- teaches people to ignore the warnings that
     // are real, so it is suppressed at the source rather than explained away.
     c.setEcho(audio.mute ? 0 : audio.echoCorr)
+    // The code both people read aloud. Only exists once the key exchange has
+    // happened, and it is stable for the rest of the call.
+    if let code = wire.crypto?.safetyCode { c.setSafetyCode(code) }
   }
 
   // ── WHERE THE BANDWIDTH WENT ────────────────────────────────────────────────

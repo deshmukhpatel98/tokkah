@@ -11970,3 +11970,100 @@ sweep across the glyph, and a stacked-outline bloom to fake a blur. Both are goo
 current flat white on near-black was explicitly liked. Worth knowing they exist for the day
 the mark needs more presence at 16 px, where a detailed line glyph is always going to
 struggle.
+
+## 17.119 Parity is not a look, it is behaviour — hold-to-peek, a code you read aloud, and an arc I guessed
+
+Four reports, all of them right, all of them about the web app's *behaviour* rather than
+its colours. Checked the deployed page first: `room.tokkah.com` differs from the repo copy
+by exactly one injected Cloudflare script, so the repo is what is live and is the reference.
+
+### The self-view was a persistent mirror, which the web app deliberately does not have
+
+> as soon as I release it, the self view should vanish… it has to be a press and hold thing
+
+`#peek` is `pointerdown` → show, `pointerup` → hide, and the web app's comment says why in
+so many words: *"No persistent mirror (the #1 measured fatigue driver), no ambient tile:
+you look exactly when you choose to, for exactly as long as you choose to."*
+
+This app had a corner tile that appeared on the first remote frame and stayed for the whole
+call — precisely the thing that design decision exists to prevent — plus a `peek` button
+that was a **toggle**. Both wrong, and the second one wrong in a way that made the first
+one look intentional.
+
+Now: the tile exists only while the button is held. `mouseDown` starts the hold and the
+event loop is tracked until mouse-up, so **releasing anywhere ends it** — the same reason
+the web app calls `setPointerCapture`, because letting go outside the circle must not leave
+the self-view stuck on screen. Geometry is `#selfSense` transcribed: bottom-**left**,
+`clamp(140px, 26vmin, 240px)` wide, 16:9, radius 12, and `transform: scaleX(-1)` — a
+self-view that is not mirrored is the thing everybody notices instantly and cannot name,
+because you raise your left hand and the wrong hand moves.
+
+### "A window is appearing, but there is nothing to see"
+
+Holding the button with no camera permission opened an empty tile. That is worse than no
+button at all: it looks like the feature works and the camera is broken. The tile now
+refuses to open when our own camera has produced zero frames, and says so on stderr with
+the settings path. The count is the honest gate — not "is the camera object non-nil", which
+is true on a machine that will never deliver a frame.
+
+### End-to-end encryption was real and unverifiable
+
+The traffic was already X25519 + HKDF + AES-256-GCM. What was missing is the part that
+makes it *checkable*: encryption without a way to compare the other end's key protects you
+from a passive listener only, and a machine that can substitute keys defeats it in silence.
+The only defence anyone has found is two people reading a short string out loud.
+
+So `#c-safety` is here, and it is the same construction as `computeSafetyCode()` in
+`app.js`: hash the two identities **sorted** — so both ends reach the same string without
+negotiating who is first — and take 8 characters of 5 bits from the same 32-character
+alphabet with `0/O/1/I` left out, because this gets read down a phone line. 40 bits is not
+grindable inside a live handshake and is short enough to say. The web app hashes DTLS
+certificate fingerprints; there are none here, so it hashes the X25519 public keys that
+actually produced the session keys. Same property: change either key and the code changes.
+
+Verified the only way it is worth verifying — two ends, and they agree:
+
+    end 1:  code 9QFU WJ58
+    end 2:  code 9QFU WJ58
+
+It sits in the sheet as a fact with nothing to press, under the web app's own sentence:
+"Read it aloud. Same code on both screens means nobody is in the middle."
+
+### The switch-camera icon was wrong because I guessed at an arc
+
+> the camera rotation icon is also not the one that is there in the main web app
+
+`a 7.8 7.8 0 0 1 13.6 -0.8` is an elliptical arc, and I had approximated it with two cubic
+control points placed by eye. The arc over the camera body is the only part of that glyph
+carrying the meaning, so getting its shape wrong is getting the icon wrong.
+
+Solved instead of eyeballed: the chord is 13.623 long, so with r = 7.8 the centre sits
+h = √(r² − (d/2)²) = 3.801 off the chord midpoint along its perpendicular, and
+`large-arc=0, sweep=1` selects the centre *below* the chord — the one whose minor arc bulges
+up over the camera. Swept from −154.2° to −32.5°.
+
+The padlock had the same class of error in the opposite direction: `sweep=1` arcs upward on
+screen, which is toward *smaller* y in a `0 0 24 24` viewBox and therefore *below* the
+centre in the y-up space these paths are built in — so the angle increases and the arc is
+counter-clockwise. `mic` next door has the opposite sweep and is clockwise. Getting it
+backwards drew the shackle inside the body and the padlock came out as a notched box.
+
+**The lesson worth keeping:** an SVG arc flag is not a hint, it is two bits that select one
+of four arcs. Guessing control points reproduces the endpoints exactly and the shape not at
+all — which is the kind of wrong that survives every check except looking at it.
+
+### And a press harness that could not photograph a press
+
+`--press` drove the controls while the auto-hiding row was invisible, so every photograph of
+a result was of an empty bar. A press is activity; it now shows the row. And `--press
+"peek,~,unpeek"` takes a `~` pause token, so a hold can be photographed *while held* and
+then released in the same run — otherwise "the tile went away" can never be shown to have
+been caused by the release.
+
+### Still missing from the web app, stated plainly
+
+Live translation (the button is present and says it is web-only), the microphone picker
+(the audio graph is built around one device and switching it means rebuilding the AUHAL that
+every latency number depends on), the full `#hud` panel behind "Connection numbers", the
+headphone check, Frame Sense edge cues, the two-step "tap to leave" confirm, and the
+`#floorIcon` ambient loud-room icon — which is currently a pill instead.
