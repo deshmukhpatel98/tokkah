@@ -44,7 +44,17 @@ case ":$PATH:" in
   *) echo ""; echo "add it to your PATH:"; echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
 esac
 echo ""
-echo "to make a call, on each Mac:"
-echo "  tk --listen 7001 --peer <the-other-mac-ip>:7001"
+# This text is the whole of the instructions most people will ever read, so it has
+# to be the command that actually works. It used to say --peer <the-other-mac-ip>,
+# which cannot work between two houses -- neither machine has a routable address.
+echo "to make a call, pick any room name and run this on BOTH Macs:"
+echo "  tk --room ripe-mango-jam --window"
 echo ""
-echo "it keeps itself up to date, and will ask for microphone permission the first time."
+echo "they find each other and then talk directly, with no server in between."
+echo "the room name is also the encryption key, so choose something only the two"
+echo "of you would say, and say it to each other rather than typing it anywhere."
+echo ""
+echo "it keeps itself up to date, and will ask for microphone permission the first"
+echo "time -- because tk is a command-line tool, macOS grants that to the terminal"
+echo "you ran it from, so allow Terminal (or iTerm) under System Settings >"
+echo "Privacy & Security > Microphone if it says the mic was denied."

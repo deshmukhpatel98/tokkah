@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.6"
+let VERSION = "0.9.7"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -521,6 +521,7 @@ do { try audio.start() } catch {
 // already inverted a result in this project, and a rate you can verify by
 // arithmetic is worth more than a smooth one.
 var last = (sent: 0, recv: 0, played: 0, concealed: 0, dup: 0, tooOld: 0, jumps: 0, cap: 0)
+var lastBytes = (up: 0, down: 0)
 var lastV = (dec: 0, sent: 0, bytes: 0)
 var lastVBytesPrev = 0
 let expected = SR / Double(FPP)   // 375 packets/s at 128 frames
@@ -781,11 +782,15 @@ func reportLoop() {
     fputs("WARNING: sending \(d.sent)/s against \(d.cap)/s captured "
         + "-- \(d.sent / max(d.cap, 1))x more packets than anything asked for\n", stderr)
   }
+  let upMbps = Double(wire.sentBytes - lastBytes.up) * 8.0 / 1_000_000.0
+  let downMbps = Double(wire.recvBytes - lastBytes.down) * 8.0 / 1_000_000.0
+  lastBytes = (wire.sentBytes, wire.recvBytes)
   fputs("cap \(d.cap)/s  sent \(d.sent)/s  recv \(d.recv)/s  played \(d.played)/s (\(pct)%)"
       + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals)"
       + " recovered \(r.recovered)\(audio.redundancy ? " FEC-on" : ""))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + (r.restarts > 0 ? " peer-restarts \(r.restarts)" : "")
       + (wire.relocks > 0 ? " re-found-peer \(wire.relocks)" : "")
+      + "  \(String(format: "%.2f", upMbps))/\(String(format: "%.2f", downMbps)) Mbps up/down"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
       + "  jit \(audio.jitTarget) snap \(r.snaps)"

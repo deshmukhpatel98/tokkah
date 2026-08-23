@@ -385,8 +385,15 @@ final class Wire {
         sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
       }
     }
-    if r < 0 { sendErrs += 1 } else { sent += 1 }
+    if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += n + 28 }
   }
+
+  /// Bytes actually put on the wire, plus 28 for the UDP and IP headers each
+  /// datagram carries. Reported because this is uncompressed float32 audio and
+  /// the number is not small -- someone on a home connection is entitled to know
+  /// what a call costs them before it starts stuttering.
+  private(set) var sentBytes = 0
+  private(set) var recvBytes = 0
 
   // Blocking receive loop, run on its own thread.
   /// Point the media at a different address, once rendezvous has found the peer.
@@ -530,6 +537,7 @@ final class Wire {
         }
       }
       if n < 8 { if n < 0 { usleep(200) }; continue }
+      recvBytes += Int(n) + 28
       var magic = buf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
 
       // THE HANDSHAKE, and it is the one thing never encrypted -- it is what
