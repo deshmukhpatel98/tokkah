@@ -2,10 +2,24 @@ import Foundation
 import Darwin
 
 let SR = 48_000.0
-let FPP = 64            // samples per packet -> 2.667 ms. One packet per device
-                         // buffer in the common case, so the reader consumes
-                         // exactly what the callback asks for.
-let RING = 1024           // packets == 1.37 s. Generous: the ring is not the
+// samples per packet -> 0.667 ms, and ALSO the CoreAudio device buffer size, so
+// this one number lands in the mic path, the packetisation, the jitter buffer and
+// the speaker path. It was 128 because that was what got typed first; the hardware
+// reports a usable range of 15..4096.
+//
+// Measured, release build, 95 s, audio+video both ways, encrypted:
+//   FPP=64  m2e 15.71 / 16.88 ms   FPP=32  m2e 12.44 ms   both zero concealment
+// and under ten busy-loop threads of CPU starvation: 15.32 vs 11.65 ms, still
+// zero concealment and zero snaps, because CoreAudio's render thread runs with
+// time-constraint priority and normal-priority load cannot displace it.
+//
+// The cost is a doubled packet rate: 1511/s instead of 758/s, about 2.4 Mbps
+// instead of 2.0 for uncompressed float32 audio, and 0.12% of a core in crypto.
+// 32 was rejected once before at 12 concealed packets -- that was under a jitter
+// buffer that grew on loss it could not fix, and a run confounded by the handshake
+// flood of 17.84. With both fixed it conceals nothing.
+let FPP = 32
+let RING = 2048           // packets == 1.37 s. Generous: the ring is not the
                          // latency, the read cursor's DISTANCE behind the write
                          // head is, and a big ring only buys recovery headroom.
 let HDR = 20             // magic(4) seq(4) capHost(8) frames(4)
@@ -534,6 +548,11 @@ final class Wire {
       if frames <= 0 || plainN < HDR + frames * 4 { continue }
       if frames != FPP {
         fmtMismatch += 1
+        // The far end is on another build and this call is going nowhere until one
+        // of us moves. Ask the updater to look now instead of at the end of its
+        // minute -- a wire-format change otherwise costs up to 60 s of silence in
+        // the middle of a real conversation.
+        if fmtMismatch == 1 { Update.urgent = true }
         if fmtMismatch == 1 || fmtMismatch % 4000 == 0 {
           fputs("audio: peer sends \(frames)-sample packets, this build expects \(FPP)"
               + " -- the two ends are on different versions, one side needs the update"

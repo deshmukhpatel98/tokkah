@@ -1,1 +1,1 @@
-{"version":"0.9.1","url":"https://room.tokkah.com/macos/dl/tk-0.9.1.tar.gz","sha256":"b10c3379993e0c3800ceef548296e48653b2b044f676c17b83226f3e62c834f0","size":144618,"notes":"--display metal --fullscreen --vsync 0: decode-to-glass 3.8 ms measured, vs 24.6 on the default path"}
+{"version":"0.9.2","url":"https://room.tokkah.com/macos/dl/tk-0.9.2.tar.gz","sha256":"697e4e2a0af775b4ecae2278c138f21a190dbd782513ab3004f970f316d74e0b","size":144900,"notes":"urgent: the key handshake was echoing itself at 20,000 packets a second -- fixed"}

@@ -142,10 +142,27 @@ enum Update {
 
   /// Background poll. Applies and re-execs; a few seconds of interruption beats
   /// a machine 15 km away running last week's code.
+  /// Set when the peer is provably running a different build -- a refused wire
+  /// format, today. That is not a hint that an update might exist, it is proof,
+  /// and waiting out the rest of a 60 s poll while a live call sits silent is a
+  /// minute nobody should have to spend. Checked once and cleared, so a peer that
+  /// is genuinely OLDER than us cannot turn this into a poll loop.
+  nonisolated(unsafe) static var urgent = false
+
   static func startPolling(current: String, every seconds: Double) {
     Thread {
+      var waited = 0.0
       while true {
-        Thread.sleep(forTimeInterval: seconds)
+        Thread.sleep(forTimeInterval: 0.5)
+        waited += 0.5
+        var due = waited >= seconds
+        if urgent {
+          urgent = false
+          due = true
+          fputs("update: peer is on a different build -- checking now rather than waiting\n", stderr)
+        }
+        guard due else { continue }
+        waited = 0
         if let (m, _) = available(current: current) { apply(m) }
       }
     }.start()
