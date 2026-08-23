@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import Security
 
 // ── The join screen, for a Tokkah.app that was double-clicked ────────────────
 //
@@ -23,11 +24,33 @@ enum Launcher {
   /// typed: inside an .app bundle, and with nothing on the command line that says
   /// where to call. A terminal user running the bundled binary directly gets the
   /// same window, which is the behaviour they would want anyway.
+  // ── NOBODY IS ASKED FOR A ROOM NAME ────────────────────────────────────────
+  //
+  // The web app never asks. You open it and the call is already running: your own
+  // camera fills the window, a link is minted, and the middle of the screen says
+  // "Waiting for the other person…" with that link under it. Naming a room is a
+  // question, and a question is a thing to get wrong before anything has happened.
+  //
+  // The native app asked. That was a whole extra screen in front of the same call,
+  // and the report was that the web app's flow is the one to have -- *"whenever you
+  // hit the site, the meeting starts, and this is the link that is being displayed
+  // instead of asking you the room name"*.
+  //
+  // So the join window is gone from the default path. It is still reachable with
+  // `--join-window` for the case where somebody wants to type a name, but nothing
+  // reaches it by default any more.
   static func shouldPrompt(hasRoom: Bool, hasPeer: Bool, forced: Bool) -> Bool {
-    if forced { return true }
-    if hasRoom || hasPeer { return false }
-    let path = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
-    return path.contains("/Contents/MacOS/")
+    forced
+  }
+
+  /// `xxx-xxxx-xxx`, lowercase, exactly as `mintRoom()` does it: 26^10 ~ 47 bits,
+  /// the same budget Meet spends, and short enough to read down a phone.
+  static func mintRoom() -> String {
+    var b = [UInt8](repeating: 0, count: 10)
+    _ = SecRandomCopyBytes(kSecRandomDefault, b.count, &b)
+    let c = String(b.map { Character(UnicodeScalar(97 + ($0 % 26))) })
+    let s = Array(c)
+    return String(s[0..<3]) + "-" + String(s[3..<7]) + "-" + String(s[7..<10])
   }
 
   /// Show the window and block until the user joins or closes it. Returns the

@@ -141,6 +141,10 @@ final class Display {
       c.inviteText = invite
       root.addSubview(c)
       controls = c
+      // The window has to accept mouse-moved events for the bar to know anything
+      // is happening; without this the row would appear once and never come back.
+      window.acceptsMouseMovedEvents = true
+      c.armBarAutoHide()
     }
     window.contentView = root
     if let onLeave {

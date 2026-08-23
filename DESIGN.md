@@ -11748,3 +11748,68 @@ declared explicitly instead of inherited.
 
 Scrim brightness down the window: 170.6 → 36.4 → 40.2. The buttons sit on the dark end,
 which is the whole reason the gradient exists.
+
+## 17.117 The web app never asks you anything, and now neither does this
+
+Two screenshots of the web app settled what "the exact interface" meant, and it was not
+only the bar:
+
+> the exact logic UI UX of the web app where it just... whenever you hit the site, the
+> meeting starts, and this is the link that is being displayed instead of asking you the
+> room name and stuff like that
+
+The native app had a **join screen**. You double-clicked Tokkah and it asked you to name a
+room — a whole extra surface in front of the same call, and a question you can get wrong
+before anything has happened. The web app asks nothing: you open it, your camera is
+already on, a link is minted, and the middle of the screen says where the call is.
+
+### What launch does now
+
+No prompt. `Launcher.shouldPrompt` returns `forced` and nothing else, so only `--gui`
+reaches the join window. The bundle path mints a room, remembers it, and re-execs
+straight into the call. A room that arrived over `tokkah://` wins over a fresh mint,
+because someone clicking an invite is trying to reach a call, not start one.
+
+The code is `mintRoom()` from `app.js`, transcribed: ten random lowercase letters as
+`xxx-xxxx-xxx`. 26^10 ≈ 47 bits — the same budget Meet spends, and short enough to read
+down a phone. Verified from a bundle: `room uiv-uddb-epz: waiting for the other person...`
+
+And the invite is now **just the link**. `roomURL()` is one line and the clipboard, the
+waiting card and the log all read it, so they cannot disagree — the old invite was a
+four-line message with a `curl` command in it, which is a thing you send a developer, not
+a person you want to talk to.
+
+### `#waiting`, `#status`, `#elapsed`
+
+The centre of the window is the web app's card: "Waiting for the other person…", then
+"This link is the key — anyone who has it can join", then a mono link pill with **share**
+and **copy** beside it, over a `radial-gradient(ellipse at center, rgba(6,8,13,.55),
+transparent 72%)` wash. Clicking the link copies it, and `copy` becomes a green
+"copied ✓" — a confirmation, not a dead control. `share` opens the real macOS share sheet.
+
+The room *name* is gone from the call surface. `#status` is a small pill top-CENTRE that
+says what is happening and then fades, `#elapsed` is a chrome-less clock above it, and
+neither of them is a room name — because the web app never shows one. The pill that used
+to say `studio · connected` in the corner was answering a question the new flow does not
+raise.
+
+### And the bar gets out of the way
+
+`.bar { opacity: 0 }` / `.bar.show { opacity: 1 }`: the row appears on pointer activity
+and fades after 3.5 s, unless the sheet it opened is standing on it. Six circles parked
+permanently over someone's face is the fatigue the design exists to remove — and the
+user's own screenshot of the web app waiting screen has no bar in it at all.
+
+### Two bugs worth naming
+
+**`#waiting` is `inset: 0`, which in CSS is harmless and here was not.** The wash has to
+be centred on the window, so the card covers the whole surface — and as a subview added
+last it swallowed every click on mic, camera and leave. In CSS the bar's z-index settles
+it; in AppKit the overlay had to be taught to hit-test only its own three controls. A
+live call that ignores its own buttons looks frozen while being perfectly fine.
+
+**Swift does not run property observers during initialisation.** `title2 = text` inside
+`PillButton.init` never fired the `didSet` that measures the word and sizes the pill, so
+**share** and **copy** existed, drew nothing, and sat in a zero-width frame. Invisible and
+un-clickable, from an assignment that reads as obviously working. Now an explicit
+`setTitle()` that both the initialiser and the setter call.

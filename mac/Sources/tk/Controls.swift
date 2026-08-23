@@ -546,6 +546,175 @@ final class Sheet: NSView {
   }
 }
 
+// ── `#waiting`, TRANSCRIBED ───────────────────────────────────────────────────
+//
+//   #waiting { position:absolute; inset:0; display:grid; place-items:center;
+//              text-align:center; text-shadow: 0 1px 8px rgba(0,0,0,.85);
+//              background: radial-gradient(ellipse at center,
+//                            rgba(6,8,13,.55), transparent 72%); }
+//   "Waiting for the other person…"                 16px
+//   "This link is the key — anyone who has it can join"  12px, --muted
+//   #shareUrl { width:320px; radius:999px; rgba(8,11,18,.9); 1px --glass-line; 12px mono }
+//   #copy, #shareBtn { radius:999px; padding:9px 16px; 12px; --glass-text; glass }
+//
+// This is the whole first experience of the app: no name to invent, no lobby, no
+// button to press before anything happens. The call is already live behind this
+// card -- the card is only how you tell somebody else where it is.
+final class WaitingCard: NSView {
+  private let wash = CAGradientLayer()
+  private let title = NSTextField(labelWithString: "Waiting for the other person…")
+  private let hint = NSTextField(labelWithString: "This link is the key — anyone who has it can join")
+  private let urlField = NSTextField(labelWithString: "")
+  private let urlGlass = Glass(radius: 14)
+  private let shareButton = PillButton("share")
+  private let copyButton = PillButton("copy")
+  var url = "" { didSet { urlField.stringValue = url; needsLayout = true } }
+  var onCopy: (() -> Void)?
+  var onShare: (() -> Void)?
+
+  /// `#copy:disabled { opacity: 1; color: var(--ok) }` -- "copied ✓" is a
+  /// confirmation, not a dead control.
+  func confirmCopied() {
+    copyButton.title2 = "copied ✓"
+    copyButton.tint = Palette.ok
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
+      self?.copyButton.title2 = "copy"
+      self?.copyButton.tint = Palette.fg
+    }
+  }
+
+  init() {
+    super.init(frame: .zero)
+    wantsLayer = true
+    // `radial-gradient(ellipse at center, rgba(6,8,13,.55), transparent 72%)`.
+    wash.type = .radial
+    wash.colors = [NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: 0.55).cgColor,
+                   NSColor.clear.cgColor]
+    wash.locations = [0, 0.72]
+    wash.startPoint = CGPoint(x: 0.5, y: 0.5)
+    wash.endPoint = CGPoint(x: 1.0, y: 1.0)
+    layer?.addSublayer(wash)
+
+    for (t, size, colour) in [(title, 16.0, Palette.fg), (hint, 12.0, Palette.muted)] as [(NSTextField, Double, NSColor)] {
+      t.font = .systemFont(ofSize: size)
+      t.textColor = colour
+      t.alignment = .center
+      t.backgroundColor = .clear
+      t.isBordered = false
+      // `text-shadow: 0 1px 8px rgba(0,0,0,.85)` -- a soft shadow is what keeps
+      // white text legible over an unknown frame without putting it on a slab.
+      t.shadow = { let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.85)
+                   sh.shadowBlurRadius = 8; sh.shadowOffset = NSSize(width: 0, height: -1); return sh }()
+      addSubview(t)
+    }
+    urlField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    urlField.textColor = Palette.fg
+    urlField.alignment = .center
+    urlField.backgroundColor = .clear
+    urlField.isBordered = false
+    urlField.isSelectable = true
+    urlGlass.layer?.backgroundColor = NSColor(srgbRed: 8/255, green: 11/255, blue: 18/255, alpha: 0.9).cgColor
+    addSubview(urlGlass)
+    addSubview(urlField)
+    shareButton.onPress = { [weak self] in self?.onShare?() }
+    copyButton.onPress = { [weak self] in self?.onCopy?() }
+    addSubview(shareButton)
+    addSubview(copyButton)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  // ── A FULL-SURFACE OVERLAY MUST NOT EAT THE BAR ────────────────────────────
+  //
+  // `#waiting` is `inset: 0` so its wash is centred on the window rather than on a
+  // box, which means it covers the buttons too. In CSS that is harmless -- the bar
+  // has a higher z-index. Here it is a subview added last, so without this it would
+  // swallow every click on mic, camera and leave, and the call would look frozen
+  // while being perfectly fine.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let p = convert(point, from: superview)
+    for v in [urlGlass, shareButton, copyButton] where v.frame.contains(p) { return self }
+    return nil
+  }
+
+  /// The link itself copies when clicked -- `#shareUrl { cursor: pointer }`.
+  override func mouseDown(with event: NSEvent) {
+    let p = convert(event.locationInWindow, from: nil)
+    if urlGlass.frame.contains(p) { onCopy?(); return }
+    if shareButton.frame.contains(p) { onShare?(); return }
+    if copyButton.frame.contains(p) { onCopy?(); return }
+    super.mouseDown(with: event)
+  }
+  override func resetCursorRects() { addCursorRect(urlGlass.frame, cursor: .pointingHand) }
+
+  override func layout() {
+    super.layout()
+    wash.frame = bounds
+    let cx = bounds.midX, cy = bounds.midY
+    title.frame = NSRect(x: 0, y: cy + 22, width: bounds.width, height: 22)
+    hint.frame = NSRect(x: 0, y: cy + 2, width: bounds.width, height: 16)
+    // `#shareBox { margin-top: 14px }`, the three controls centred as one row.
+    let uw = min(320, bounds.width * 0.7), uh: CGFloat = 34
+    let gap: CGFloat = 10
+    let rowW = uw + gap + shareButton.frame.width + gap + copyButton.frame.width
+    var x = cx - rowW / 2
+    let y = cy - 16 - uh
+    urlGlass.frame = NSRect(x: x, y: y, width: uw, height: uh)
+    urlGlass.layer?.cornerRadius = uh / 2
+    urlField.frame = NSRect(x: x + 12, y: y + (uh - 15) / 2, width: uw - 24, height: 15)
+    x += uw + gap
+    shareButton.frame.origin = NSPoint(x: x, y: y + (uh - shareButton.frame.height) / 2)
+    x += shareButton.frame.width + gap
+    copyButton.frame.origin = NSPoint(x: x, y: y + (uh - copyButton.frame.height) / 2)
+  }
+}
+
+/// `#copy, #shareBtn`: a 999 px glass pill with a word in it.
+final class PillButton: NSView {
+  private let glass = Glass(radius: 14)
+  private let label = NSTextField(labelWithString: "")
+  private var hovering = false
+  var onPress: (() -> Void)?
+  var tint: NSColor = Palette.fg { didSet { label.textColor = tint } }
+  private var title2Storage = ""
+  var title2: String {
+    get { title2Storage }
+    set { setTitle(newValue) }
+  }
+  init(_ text: String) {
+    super.init(frame: .zero)
+    wantsLayer = true
+    addSubview(glass)
+    label.font = .systemFont(ofSize: 12, weight: .medium)
+    label.alignment = .center
+    label.backgroundColor = .clear
+    label.isBordered = false
+    addSubview(label)
+    // NOT `title2 = text`. Swift does not run property observers during
+    // initialisation, so the didSet that measures the word and sizes the pill never
+    // fired -- both buttons existed, drew nothing, and occupied a zero-width frame.
+    // Invisible and un-clickable, from one assignment that looks like it works.
+    setTitle(text)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  private func setTitle(_ t: String) {
+    title2Storage = t
+    label.stringValue = t
+    let w = ceil((t as NSString).size(withAttributes: [.font: label.font!]).width) + 32
+    setFrameSize(NSSize(width: w, height: 30))
+    needsLayout = true
+  }
+
+  override func layout() {
+    super.layout()
+    glass.frame = bounds
+    glass.layer?.cornerRadius = bounds.height / 2
+    label.frame = NSRect(x: 4, y: (bounds.height - 15) / 2, width: bounds.width - 8, height: 15)
+  }
+  override func mouseDown(with event: NSEvent) { onPress?() }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
 final class CallControls: NSView {
   /// Space at the bottom the video should not put anything important in. Published
   /// so the self-view sits above the bar rather than a second file guessing.
@@ -569,6 +738,12 @@ final class CallControls: NSView {
   /// `#more`, top-right corner, out of the thumb row -- 48 px, not 58.
   private let moreButton = IconButton(Glyph.more, size: 48, help: "more")
   private let sheet = Sheet()
+  private let waiting = WaitingCard()
+  /// `#status`: a pill, TOP-CENTRE, not a room name in the corner. The room's name
+  /// is not something the web app ever shows -- the link is.
+  private let statusPill = Pill(font: .systemFont(ofSize: 11))
+  /// `#elapsed`: the clock, chrome-less, above the status pill.
+  private let elapsedLabel = NSTextField(labelWithString: "")
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
   private let sheetScrim = NSView()
@@ -582,10 +757,10 @@ final class CallControls: NSView {
   var onCam: ((Bool) -> Void)?
   var onLeave: (() -> Void)?
   var onCamPick: ((Int) -> Void)?
-  var inviteText = ""
+  var inviteText = "" { didSet { onMain { [weak self] in self?.waiting.url = self?.inviteText ?? "" } } }
   private let room: String
   private var startedAt: Date?
-  private var status = "waiting for the other side"
+  private var status = "waiting for the other person"
 
   init(room: String, width: CGFloat) {
     self.room = room
@@ -647,8 +822,29 @@ final class CallControls: NSView {
     // keeps the irreversible button the only one that looks irreversible.
     leaveButton.destructive = true
 
-    roomPill.text = room
+    // The room pill is gone from the call surface: `#status` says what is
+    // happening and the waiting card says where the call is. A room NAME is a
+    // detail of the old flow, and this window no longer has that flow.
+    roomPill.isHidden = true
     addSubview(roomPill)
+    statusPill.text = "waiting for the other person"
+    addSubview(statusPill)
+    elapsedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    elapsedLabel.textColor = NSColor(white: 232.0 / 255, alpha: 0.62)
+    elapsedLabel.alignment = .center
+    elapsedLabel.backgroundColor = .clear
+    elapsedLabel.isBordered = false
+    elapsedLabel.shadow = { let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.95)
+                            sh.shadowBlurRadius = 3; return sh }()
+    addSubview(elapsedLabel)
+    waiting.onCopy = { [weak self] in
+      guard let self else { return }
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(self.inviteText, forType: .string)
+      self.waiting.confirmCopied()
+    }
+    waiting.onShare = { [weak self] in self?.share() }
+    addSubview(waiting)
     addSubview(qualityPill)
     echoPill.textColor = Palette.warn
     addSubview(echoPill)
@@ -721,6 +917,15 @@ final class CallControls: NSView {
     // 36 pt clears the standard 28 pt title bar area with room to spare, and BOTH
     // top pills use it so the top row stays level. One constant, so the left side
     // cannot drift away from the right.
+    // `#waiting { inset: 0 }` -- it is the whole surface, so the wash is centred on
+    // the window and not on a box.
+    waiting.frame = bounds
+
+    // `#status { top:14px; left:50%; translateX(-50%) }` and `#elapsed` above it.
+    statusPill.setFrameOrigin(NSPoint(x: (w - statusPill.frame.width) / 2,
+                                      y: h - statusPill.frame.height - 14))
+    elapsedLabel.frame = NSRect(x: 0, y: h - statusPill.frame.height - 32, width: w, height: 14)
+
     // The pills stack down the LEFT, because `#more` owns the top-right corner in
     // the web app and two things cannot have it. 36 pt clears the traffic lights,
     // which now float over the picture -- `.fullSizeContentView` put them there,
@@ -755,12 +960,32 @@ final class CallControls: NSView {
     status = s
     onMain { [weak self] in
       guard let self else { return }
-      self.roomPill.text = "\(self.room)  ·  \(s)"
+      self.statusPill.text = s
       self.needsLayout = true
     }
   }
 
-  func markConnected() { if startedAt == nil { startedAt = Date() } }
+  /// `#waiting.gone` -- the card goes the moment there is someone to look at, and
+  /// `#status.gone`: "connected" is said once and then gets out of the face's way.
+  func markConnected() {
+    if startedAt == nil { startedAt = Date() }
+    onMain { [weak self] in
+      guard let self else { return }
+      self.waiting.isHidden = true
+      self.statusPill.text = "connected"
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+        self?.statusPill.isHidden = true
+      }
+      self.needsLayout = true
+    }
+  }
+
+  /// `share`: macOS has a real share sheet, so the button opens it rather than
+  /// pretending a second copy button is a different feature.
+  @objc func share() {
+    let picker = NSSharingServicePicker(items: [inviteText])
+    picker.show(relativeTo: .zero, of: self, preferredEdge: .minY)
+  }
 
   /// Latency and the fraction of audio that had to be invented, once a second.
   /// Turns the numbers into a sentence and a colour.
@@ -768,7 +993,8 @@ final class CallControls: NSView {
     var parts: [String] = []
     if let t = startedAt {
       let s = Int(Date().timeIntervalSince(t))
-      parts.append(String(format: "%d:%02d", s / 60, s % 60))
+      // The clock lives on its own, chrome-less, where `#elapsed` puts it.
+      onMain { [weak self] in self?.elapsedLabel.stringValue = String(format: "%d:%02d", s / 60, s % 60) }
     }
     var word = "", colour = Palette.fg
     if let ms = m2eMs, ms > 0 {
@@ -886,6 +1112,49 @@ final class CallControls: NSView {
 
   /// `#more`: the sheet. Native's equivalents of its rows are the camera picker and
   /// the invite, so the button reveals those rather than an empty panel.
+  // ── `.bar.show` ─────────────────────────────────────────────────────────────
+  //
+  //   .bar { opacity: 0; pointer-events: none; transition: opacity .22s }
+  //   .bar.show { opacity: 1; pointer-events: auto }
+  //
+  // Driven by `#call.barShown` in the web app, which the app puts on for a few
+  // seconds after any pointer activity. The middle of the screen is a face, and
+  // six circles permanently parked over it is the fatigue this design exists to
+  // remove.
+  private var barShown = true
+  private var barTimer: Timer?
+  private static let barLinger: TimeInterval = 3.5
+
+  private func showBar() {
+    barTimer?.invalidate()
+    setBar(visible: true)
+    barTimer = Timer.scheduledTimer(withTimeInterval: CallControls.barLinger, repeats: false) { [weak self] _ in
+      // Never hide the row while the sheet it opened is standing on top of it.
+      guard let self, !self.moreOpen else { return }
+      self.setBar(visible: false)
+    }
+  }
+  private func setBar(visible: Bool) {
+    guard visible != barShown else { return }
+    barShown = visible
+    let row: [NSView] = [micButton, camButton, peekButton, flipButton, xlateButton, leaveButton, moreButton]
+    NSAnimationContext.runAnimationGroup { ctx in
+      ctx.duration = 0.22
+      for v in row { v.animator().alphaValue = visible ? 1 : 0 }
+    }
+  }
+  override func mouseMoved(with event: NSEvent) { showBar() }
+  override func mouseEntered(with event: NSEvent) { showBar() }
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    trackingAreas.forEach(removeTrackingArea)
+    addTrackingArea(NSTrackingArea(rect: bounds,
+                                   options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+                                   owner: self, userInfo: nil))
+  }
+  /// Armed once the window exists: the row is visible on arrival and then settles.
+  func armBarAutoHide() { showBar() }
+
   private(set) var moreOpen = false
   @objc func toggleMore() {
     moreOpen.toggle()

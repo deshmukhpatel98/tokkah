@@ -151,6 +151,22 @@ let videoArg = resolveVideoArg()
 // window, since a link can arrive either side of it.
 Launcher.installURLHandler()
 
+// ── A DOUBLE-CLICK STARTS A CALL ────────────────────────────────────────────
+//
+// No prompt, no lobby, no decision: the app opens, the camera comes on, and a
+// freshly minted `xxx-xxxx-xxx` room is live with its link in the middle of the
+// window. Exactly the web app, which is the flow that was asked for.
+//
+// A link that arrived via `tokkah://` wins over a fresh mint, because somebody
+// clicking an invite is trying to reach a specific call and not to start one.
+if arg("room") == nil, arg("peer") == nil, !flag("gui"),
+   (Bundle.main.executableURL?.path ?? CommandLine.arguments[0]).contains("/Contents/MacOS/") {
+  let room = Launcher.takeURLRoom() ?? Launcher.mintRoom()
+  Launcher.remember(room)
+  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"])
+}
+
+// `--gui` still opens the join window, for typing a name on purpose.
 if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
                          hasPeer: arg("peer") != nil,
                          forced: flag("gui")) {
@@ -197,16 +213,12 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
 // The URL is a real page (see /macos/join) that names the room and carries the
 // install line, so the person who receives this can act on it whether or not they
 // already have the app.
-func inviteText(room: String) -> String {
-  """
-  Join me on Tokkah — room: \(room)
-
-  https://room.tokkah.com/macos/join?room=\(room)
-
-  Don't have it yet? One line in Terminal:
-  curl -fsSL https://room.tokkah.com/macos/install.sh | sh
-  """
-}
+/// THE LINK IS THE INVITE. `roomUrl()` in the web app is one line -- the short
+/// path form for a minted code -- and the clipboard, the waiting screen and the
+/// address bar all read it from the same place so they cannot disagree. Same here:
+/// one function, and what you copy is exactly what is on screen.
+func roomURL(_ room: String) -> String { "https://room.tokkah.com/\(room)" }
+func inviteText(room: String) -> String { roomURL(room) }
 
 /// Leave means leave: report the call's last numbers, then go. Same path as the
 /// signal handler, because a person clicking Leave and a person pressing Ctrl-C
@@ -266,7 +278,7 @@ if flag("window") {
   app.setActivationPolicy(.regular)
   if displayKind == "metal" {
     if let m = MetalDisplay(vsyncOff: arg("vsync") == "0", fullscreen: flag("fullscreen")) {
-      m.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720)
+      m.open(title: "Tokkah — waiting for the other person", w: 1280, h: 720)
       mdisplay = m
       fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on")"
           + "\(m.fullscreen ? ", fullscreen" : ""), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
@@ -277,12 +289,12 @@ if flag("window") {
   if mdisplay == nil {
     let d = Display()
     let roomName = arg("room") ?? "direct"
-    d.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720,
+    d.open(title: "Tokkah — waiting for the other person", w: 1280, h: 720,
            room: roomName,
            onMic: { m in
              gMicMuted = m
              fputs("mic \(m ? "muted" : "live")\n", stderr)
-             d.controls?.setStatus(m ? "you are muted" : (sawRemote ? "connected" : "waiting for the other side"))
+             d.controls?.setStatus(m ? "you are muted" : (sawRemote ? "connected" : "waiting for the other person"))
            },
            onCam: { off in
              camOff = off
@@ -305,7 +317,7 @@ if flag("window") {
 // --shot <path> [--shot-after <s>]: photograph this window's controls and exit.
 // The app's own camera on itself, so verifying a UI change never requires
 // capturing the whole screen -- and armed HERE, before the rendezvous, because
-// the interesting state is "waiting for the other side" and the code after the
+// the interesting state is "waiting for the other person" and the code after the
 // rendezvous never runs when nobody comes.
 // One place that knows what a press means, called by both --press-after and the
 // --shot path, so the two can never drift into pressing different things.
@@ -426,7 +438,7 @@ if videoArg != "off", display != nil || mdisplay != nil {
     // Not fatal. A call with no camera is still a call, and saying so beats a
     // blank window with no explanation.
     fputs("preview: unavailable (\(error)) -- continuing without a picture\n", stderr)
-    setWindowTitle("Tokkah — no camera; waiting for the other side")
+    setWindowTitle("Tokkah — no camera; waiting for the other person")
   }
 }
 
@@ -504,7 +516,7 @@ if let room = arg("room") {
       found = true
       break
     }
-    if attempt == 1 { fputs("room \(room): waiting for the other side...\n", stderr) }
+    if attempt == 1 { fputs("room \(room): waiting for the other person...\n", stderr) }
     // PUMP THE EVENT LOOP, do not just sleep. With a window open this loop owns
     // the main thread, and a main thread inside usleep is a window that does not
     // draw, does not move and shows the spinning cursor -- which is worse than no
