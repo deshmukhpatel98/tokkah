@@ -45,6 +45,43 @@ final class CallControls: NSView {
     if startedAt == nil { startedAt = Date() }
   }
 
+  // ── "YOUR ROOM IS LOUD" ───────────────────────────────────────────────────
+  //
+  // The web app has warned about this from early on, and it is the one call problem
+  // whose fix belongs entirely to the person: the microphone is hearing the
+  // speaker. They hear themselves back, and every word they say arrives at the far
+  // end wrapped in the far end's own voice. No amount of cancellation makes a hard
+  // room with the volume up sound like headphones.
+  //
+  // The measurement already exists -- cross-correlation of capture against playout
+  // over a 0-200 ms search, printed on every report line and shown to nobody. Above
+  // 0.30 the same detector is already trusted enough to feed the delay estimator,
+  // so that is the threshold, and it is said in the one sentence that helps:
+  // put headphones on.
+  // ── APPLY NOW IF WE ARE ALREADY ON MAIN ───────────────────────────────────
+  //
+  // These setters are called from the report thread, so they hop to main. But
+  // `simulate` calls them FROM main, and `DispatchQueue.main.async` from the main
+  // thread defers to the next loop iteration -- which is after the snapshot that
+  // was supposed to photograph the result. The echo warning was set, photographed
+  // as absent, and looked exactly like a warning that had never been wired up.
+  //
+  // An unconditional async is also a real (if small) defect outside the test: the
+  // bar is always one loop iteration stale for no reason.
+  private func onMain(_ work: @escaping () -> Void) {
+    if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+  }
+
+  private let echoLabel = NSTextField(labelWithString: "")
+  func setEcho(_ correlation: Double) {
+    let loud = correlation > 0.30
+    let text = loud ? "your room is loud — try headphones" : ""
+    onMain { [weak self] in
+      self?.echoLabel.stringValue = text
+      self?.echoLabel.isHidden = !loud
+    }
+  }
+
   /// Latency in ms and the fraction of audio that had to be invented, once a
   /// second. Turns the numbers into a sentence, and a colour.
   func setQuality(m2eMs: Double?, concealPct: Double, lossPct: Double) {
@@ -72,7 +109,7 @@ final class CallControls: NSView {
     }
     if !word.isEmpty { parts.append(word) }
     let text = parts.joined(separator: " · ")
-    DispatchQueue.main.async { [weak self] in
+    onMain { [weak self] in
       self?.qualityLabel.stringValue = text
       self?.qualityLabel.textColor = colour
     }
@@ -81,6 +118,36 @@ final class CallControls: NSView {
   /// True means muted / camera off, matching what the button then offers to undo.
   private(set) var micMuted = false
   private(set) var camOff = false
+
+  // ── Which camera ──────────────────────────────────────────────────────────
+  //
+  // Shown ONLY when there is more than one, because a picker with one entry is a
+  // control that teaches the person nothing and takes up the space of one that
+  // would. Titles carry the device name and the index maps to the list handed in,
+  // so there is no parallel array to fall out of step with the menu.
+  private let camPicker = NSPopUpButton()
+  private var camNames: [String] = []
+  /// Called with the index of the chosen camera.
+  var onCamPick: ((Int) -> Void)?
+
+  /// Populate and reveal the picker. An empty or single-entry list hides it.
+  func setCameras(_ names: [String], current: Int) {
+    camNames = names
+    onMain { [weak self] in
+      guard let self else { return }
+      self.camPicker.removeAllItems()
+      // Prefixed, because a bare list of device names in a call window reads as
+      // participants rather than hardware.
+      self.camPicker.addItems(withTitles: names.map { "Camera: \($0)" })
+      if current >= 0, current < names.count { self.camPicker.selectItem(at: current) }
+      self.camPicker.isHidden = names.count < 2
+      self.needsLayout = true
+    }
+  }
+
+  @objc private func camPicked() {
+    onCamPick?(camPicker.indexOfSelectedItem)
+  }
 
   var onMic: ((Bool) -> Void)?
   var onCam: ((Bool) -> Void)?
@@ -110,6 +177,19 @@ final class CallControls: NSView {
     qualityLabel.textColor = NSColor.white.withAlphaComponent(0.55)
     qualityLabel.alignment = .right
     addSubview(qualityLabel)
+
+    camPicker.isHidden = true
+    camPicker.bezelStyle = .rounded
+    camPicker.font = .systemFont(ofSize: 11)
+    camPicker.target = self
+    camPicker.action = #selector(camPicked)
+    addSubview(camPicker)
+
+    echoLabel.font = .systemFont(ofSize: 11, weight: .medium)
+    echoLabel.textColor = NSColor.systemOrange
+    echoLabel.alignment = .right
+    echoLabel.isHidden = true
+    addSubview(echoLabel)
 
     styleRound(micButton, symbol: "mic.fill", action: #selector(toggleMic))
     styleRound(camButton, symbol: "video.fill", action: #selector(toggleCam))
@@ -172,6 +252,17 @@ final class CallControls: NSView {
     // Right of centre, left of the invite/leave buttons: the middle belongs to the
     // mic and camera, which are the two things reached for in a hurry.
     qualityLabel.frame = NSRect(x: w / 2 + 70, y: h / 2 - 8, width: max(80, w / 2 - 300), height: 16)
+    // Bottom-left under the room name, out of the way of the buttons in the middle
+    // and the two that end or share the call on the right.
+    camPicker.frame = NSRect(x: 20, y: h / 2 - 34, width: 220, height: 22)
+    // Directly under the quality readout, since both answer "how is this call
+    // going" and one of them is the actionable half.
+    echoLabel.frame = NSRect(x: w / 2 + 40, y: h / 2 - 26, width: max(120, w / 2 - 270), height: 16)
+    if !camPicker.isHidden {
+      // Room and status shift up so the picker is not sitting on the status text.
+      roomLabel.frame = NSRect(x: 20, y: h / 2 + 12, width: 240, height: 18)
+      statusLabel.frame = NSRect(x: 20, y: h / 2 - 6, width: 300, height: 16)
+    }
     let mid = w / 2
     micButton.frame = NSRect(x: mid - 50, y: h / 2 - 22, width: 44, height: 44)
     camButton.frame = NSRect(x: mid + 6, y: h / 2 - 22, width: 44, height: 44)
@@ -264,6 +355,19 @@ final class CallControls: NSView {
     case "cam": toggleCam()
     case "invite": invite()
     case "leave": leave()
+    // "cam2" selects the second camera. A picker that draws and does nothing is
+    // this project's most repeated defect, so the selection path is exercisable
+    // rather than assumed from the fact that a menu appeared.
+    // Forces the echo warning on. It only appears above a correlation this rig
+    // cannot produce while muted, and an invisible warning is indistinguishable
+    // from one that was never wired up.
+    case "echo": setEcho(0.9)
+    case let c where c.hasPrefix("cam#"):
+      guard let n = Int(c.dropFirst(4)), n >= 1, n <= camPicker.numberOfItems else {
+        fputs("press: no camera \(c)\n", stderr); return
+      }
+      camPicker.selectItem(at: n - 1)
+      camPicked()
     default: fputs("press: no control called \(what)\n", stderr)
     }
   }

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.29.0"
+let VERSION = "0.30.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -57,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -313,6 +313,29 @@ if videoArg != "off", display != nil || mdisplay != nil {
     try c.start()
     earlyCam = c
     fputs("preview: \(c.describe) on screen before the call connects\n", stderr)
+    // ── THE PICKER BELONGS HERE, NOT AFTER THE RENDEZVOUS ──────────────────
+    //
+    // Wired after the rendezvous it never appeared at all while waiting -- and
+    // "is my camera the right one" is precisely the question a person has while
+    // waiting for someone to join. Third time this file has put something the
+    // user needs behind a barrier that only lifts once the other person arrives.
+    //
+    // `--cam-picker-test 3` fills it with placeholders: this Mac has exactly one
+    // camera, so the picker is correctly hidden and therefore unverifiable, and a
+    // hidden control returns the same nothing as a broken one.
+    if let n = arg("cam-picker-test").flatMap({ Int($0) }), n > 1 {
+      display?.controls?.setCameras((1...n).map { "Test camera \($0)" }, current: 0)
+      display?.controls?.onCamPick = { i in fputs("camera: picker chose index \(i)\n", stderr) }
+    } else if let cam = c as? CameraSource {
+      let devs = CameraSource.available()
+      display?.controls?.setCameras(devs.map { $0.localizedName },
+                                    current: devs.firstIndex { $0.uniqueID == cam.current?.uniqueID } ?? 0)
+      display?.controls?.onCamPick = { i in
+        let list = CameraSource.available()
+        guard i >= 0, i < list.count else { return }
+        cam.switchTo(list[i])
+      }
+    }
   } catch {
     // Not fatal. A call with no camera is still a call, and saying so beats a
     // blank window with no explanation.
@@ -1608,6 +1631,7 @@ func reportLoop() {
     lastUiLost = r.concealLost; lastUiRecovered = r.recovered
     let lossPct = lostNow / expectedPkts * 100.0
     c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
+    c.setEcho(audio.echoCorr)
   }
 
   // ── WHERE THE BANDWIDTH WENT ────────────────────────────────────────────────

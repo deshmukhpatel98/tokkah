@@ -118,9 +118,63 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   private var name = "?"
   var describe: String { "camera \(name)" }
 
+  // ── EVERY CAMERA, NOT JUST THE DEFAULT ────────────────────────────────────
+  //
+  // `AVCaptureDevice.default(for: .video)` picks one and offers no way to change
+  // it, which on a Mac is wrong more often than it is right: an external webcam, a
+  // Continuity Camera iPhone and the built-in one are all plausible, and the
+  // default is whichever macOS decided. The web app has had a camera picker from
+  // early on for exactly this reason.
+  //
+  // External devices first in the list, because a person who plugged one in did so
+  // on purpose.
+  static func available() -> [AVCaptureDevice] {
+    let types: [AVCaptureDevice.DeviceType] = [.external, .continuityCamera, .builtInWideAngleCamera]
+    let s = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
+    return s.devices
+  }
+  /// Remembered across launches: choosing a camera every call is not a feature.
+  private static let pickKey = "tk.cameraId"
+  static var preferred: AVCaptureDevice? {
+    guard let id = UserDefaults.standard.string(forKey: pickKey) else { return nil }
+    return available().first { $0.uniqueID == id }
+  }
+  static func remember(_ d: AVCaptureDevice) {
+    UserDefaults.standard.set(d.uniqueID, forKey: pickKey)
+  }
+  private(set) var current: AVCaptureDevice?
+
+  /// Swap the camera on a live session. Configuration is atomic between begin and
+  /// commit, so frames stop for the swap and resume -- no teardown of the session,
+  /// which would drop the output delegate and the encoder's frame supply with it.
+  func switchTo(_ dev: AVCaptureDevice) {
+    session.beginConfiguration()
+    for i in session.inputs { session.removeInput(i) }
+    if let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
+      session.addInput(input)
+      current = dev
+      name = dev.localizedName
+      CameraSource.remember(dev)
+      fputs("camera: switched to \(dev.localizedName)\n", stderr)
+    } else {
+      fputs("camera: could not switch to \(dev.localizedName) -- keeping the old one\n", stderr)
+    }
+    session.commitConfiguration()
+    configure(current)
+  }
+
   func start() throws {
-    guard let dev = AVCaptureDevice.default(for: .video) else { throw Err.e("no camera") }
+    let devs = CameraSource.available()
+    // The remembered one if it is still plugged in, else whatever macOS prefers,
+    // else the first thing we can find.
+    guard let dev = CameraSource.preferred ?? AVCaptureDevice.default(for: .video) ?? devs.first
+    else { throw Err.e("no camera") }
+    current = dev
     name = dev.localizedName
+    if devs.count > 1 {
+      fputs("cameras: \(devs.map { $0.localizedName }.joined(separator: ", "))"
+          + " -- using \(dev.localizedName)\n", stderr)
+    }
     let input = try AVCaptureDeviceInput(device: dev)
     session.beginConfiguration()
     guard session.canAddInput(input) else { throw Err.e("cannot add camera input") }
@@ -133,6 +187,15 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     guard session.canAddOutput(out) else { throw Err.e("cannot add video output") }
     session.addOutput(out)
     session.commitConfiguration()
+    configure(dev)
+    session.startRunning()
+  }
+
+  /// 720p at the highest frame rate the device offers. Factored out so a switched
+  /// camera gets the same treatment as the first one -- otherwise the second camera
+  /// runs at whatever default it likes and the frame rate silently halves.
+  private func configure(_ dev: AVCaptureDevice?) {
+    guard let dev else { return }
     // Highest frame rate the format allows: fewer, older frames is the one thing
     // that cannot be fixed downstream.
     if let f = dev.formats.last(where: {
@@ -145,7 +208,6 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(best))
       dev.unlockForConfiguration()
     }
-    session.startRunning()
   }
 
   func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {

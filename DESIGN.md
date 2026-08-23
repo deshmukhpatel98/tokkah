@@ -11522,3 +11522,67 @@ Signed manifest, Ed25519, verified before anything is written. Nobody reinstalls
 Named rather than implied: device pickers (choose or switch camera and microphone),
 the "your room is loud" echo warning, and live translation. Translation is a feature
 rather than a control and is not started.
+
+## 17.114 The camera you meant, and the one problem only the person can fix
+
+Two more controls the web app has had for a long time, closing the gap on the bar.
+
+### Every camera, not just the default
+
+`AVCaptureDevice.default(for: .video)` picked one and offered no way to change it,
+which on a Mac is wrong more often than it is right: an external webcam, a
+Continuity Camera iPhone and the built-in one are all plausible, and the default is
+whichever macOS decided. Externals sort first, because a person who plugged one in
+did so on purpose. The choice is remembered, so it is answered once and not every
+call.
+
+Switching happens **inside `beginConfiguration`/`commitConfiguration`** on the live
+session rather than by tearing it down: a teardown drops the output delegate and
+with it the encoder's frame supply. And the 720p/max-framerate setup is factored
+out, so a switched camera gets the same treatment as the first one — otherwise the
+second camera quietly runs at whatever default it likes and the frame rate halves.
+
+The picker is hidden when there is one camera, because a one-entry menu teaches
+nothing and occupies the space of something that would.
+
+### And "your room is loud"
+
+The one call problem whose fix belongs entirely to the person: the microphone is
+hearing the speaker. They hear themselves back, and every word they say reaches the
+far end wrapped in the far end's own voice. No canceller makes a hard room with the
+volume up sound like headphones.
+
+The measurement already existed — cross-correlation of capture against playout over
+a 0–200 ms search, printed on every report line since the echo work and shown to
+nobody. Above 0.30 the same detector is already trusted to feed the delay estimator,
+so that is the threshold, and it says the only sentence that helps.
+
+### Three testability defects, each of which would have shipped a dead control
+
+**The picker was wired after the rendezvous** — so it never appeared while waiting,
+which is exactly when a person asks "is this the right camera". Third time this file
+has put something the user needs behind a barrier that only lifts when the other
+person arrives.
+
+**One camera makes a picker unverifiable.** Correctly hidden and therefore
+indistinguishable from broken, so `--cam-picker-test 3` fills it with placeholders
+and `--press cam#3` selects one: `camera: picker chose index 2`. A menu that draws
+and does nothing is this project's most repeated defect and it does not get to be
+assumed.
+
+**And the echo warning photographed as absent while being present.** `setEcho` hopped
+to main with `DispatchQueue.main.async`, but `--press` runs *on* main, where async
+defers to the next loop iteration — which is after the snapshot. It looked exactly
+like a warning that had never been wired up. Now all three setters apply immediately
+when already on main, which also removes a real if small defect: the bar was always
+one loop iteration stale for no reason.
+
+Verified by the window photographing itself rather than by capturing the screen —
+`screencapture` returned the user's chess game twice, which is both useless as
+evidence and not an acceptable price for looking at a button.
+
+### Still missing from the web app
+
+The microphone picker, and live translation. The mic is deliberately last: the audio
+graph is built around a device, and switching it means rebuilding the AUHAL that
+every latency number in this file depends on.
