@@ -11586,3 +11586,165 @@ evidence and not an acceptable price for looking at a button.
 The microphone picker, and live translation. The mic is deliberately last: the audio
 graph is built around a device, and switching it means rebuilding the AUHAL that
 every latency number in this file depends on.
+
+## 17.115 The screenshot could not see the picture, so the design was judged against nothing
+
+The request was narrow and specific: *"just look wise, we need better. Otherwise, our
+web app was way too good."* Not the flow — the flow is right, the call starts, you copy
+a link. The look.
+
+So the control bar was rebuilt in the web app's own tokens, photographed, and it looked
+correct. It was not correct. Three defects were sitting in that photograph and none of
+them could be seen, because **the app's own snapshot cannot see the video.**
+
+`snapshot(to:)` renders the layer tree. An `AVSampleBufferDisplayLayer` is not in the
+layer tree in any readable sense — the window server composites it — and neither is the
+blur behind an `NSVisualEffectView`. Its own comment said so. So every design check was
+a photograph of glass and pills **over pure black**, which is the one background against
+which a contrast device cannot be judged at all.
+
+A contrast device can only be evaluated against the thing it exists to give contrast
+against. The instrument that could see it was `screencapture -l <window id>` — one
+window, named by the app itself on stdout, which is what makes it safe: an untargeted
+screen grab had already photographed the user's own chess game twice, and that is not
+an acceptable way to test a video app.
+
+### What one real frame showed immediately
+
+**The scrim was upside down.** `CAGradientLayer` defaults to start `(0.5, 0)` → end
+`(0.5, 1)`, and in an unflipped AppKit layer `(0,0)` is the *bottom*. So `[clear, dark]`
+ran dark at the TOP of the scrim and cleared toward the bottom: a hard dark edge
+straight across the picture 190 pt up, and the buttons sitting on the brightest,
+least-protected part of the frame. Measured on the capture — average brightness 97.6
+above the edge, 37.0 just below it, 139.2 at the very bottom. Precisely backwards, and
+doing harm at both ends. Fixed by stating the direction instead of inheriting it:
+
+| | before | after |
+|---|---|---|
+| largest vertical step in the lower half | 64.6 | **3.5** |
+| brightness 72% → 99% down | 139 → 55 *(rising into the buttons)* | 187 → 55 *(falling, monotone)* |
+
+**The room pill sheared the last letter off.** `size(withAttributes:)` is a point or two
+short of what `NSTextField` draws — the final glyph's right bearing lands outside it — and
+the label was sized to exactly that measurement. "studio · connected" lost the stem of
+its "d". Fixed by centring a label wider than the text, so the fix is independent of
+*how* wrong the measurement is rather than correct for one guessed amount of slack.
+
+**And the title bar was an opaque grey band across the top of a face.** FaceTime has no
+title bar; neither does the web app. `.fullSizeContentView` with a transparent titlebar
+puts the picture edge to edge — and the moment it did, the room pill sliced through all
+three traffic lights, an overlap that could not have existed the second before. Both top
+pills now share one 36 pt constant that clears them.
+
+### One more, from looking at the muted state rather than the wiring
+
+Mic and camera turn red when off, so with both off there are three red circles in a row
+and colour no longer marks the one irreversible button. The gap does: 26 pt before the
+hang-up instead of 12. Leaving a call was otherwise one misplaced click away from muting
+yourself, and only one of those is undoable.
+
+### `--help` had to open a microphone to tell you it did nothing
+
+It was in `KNOWN_FLAGS`, so the misspelled-flag guard waved it through, and then nothing
+read it. This is not an ignored option: with no `--room` tk falls back to a loopback peer
+and **starts a call**, so the most common first thing anybody types at a new binary turned
+on their microphone and printed statistics until they found Ctrl-C. Found by typing it.
+
+Registered-but-unread is the same class as misspelled-and-ignored, and the existing guard
+is structurally blind to it — it only checks names it does *not* know. So the release
+script now greps `KNOWN_FLAGS` against every `arg("…")`, `flag("…")` and
+`arguments.contains("--…")` in the source and refuses to build if any name is never read.
+Validated both ways before being trusted: it fails on a planted dead flag and passes on
+the clean tree. `--help` was the only one, of 58.
+
+### And a warning that could not have been true
+
+"your room is loud — try headphones" on a call with playout muted. With nothing coming
+out of the speaker there is no acoustic path back into the microphone, so whatever the
+estimator correlated, it was not echo. Advice that is impossible to act on teaches people
+to ignore the warnings that are real. Suppressed when muted — at the source, not in the
+wording. The stderr diagnostic still reports the correlation, because that is a
+measurement and not advice.
+
+### Measured after, on a real two-end call
+
+m2e p50 **11.3 ms**, 0 concealment, video 30/s both directions, glass-to-glass p50
+**3.95 ms**, 0 enqueue failures, 1 lost frame in 5,366 fragments, crypto on. The design
+pass cost nothing.
+
+### What the instrument now is
+
+`--press-after <s>` fires the controls and *keeps running*, so a window-server capture
+can photograph the result — `--shot` exited immediately after pressing, which is why the
+presses and the picture could never appear in the same image. `--press selfview` reaches
+the connected layout without needing two machines, and the window prints its own id.
+
+Test media rebuilt from the xiph derf sequences — real people talking, not a synthetic
+pattern — with `setsar=1`, because the first encode kept CIF's 4:3 display aspect and
+pillarboxed a 16:9 window in a way that looked exactly like an app bug.
+
+## 17.116 The tokens were copied and the layout was invented, which is not the same as copying the design
+
+17.115 rebuilt the control bar "in the web app's design language" and verified it over a
+real frame. It was still wrong, and the report was exact:
+
+> why don't we have the exact interface as we have in the web app what the hell is happening
+
+The honest answer: this file had been designed **from** the web app's colours rather than
+**copied from** its layout. Every token was right — `--glass-bg`, `--glass-line`,
+`--bad`, the 62% scrim, the 999 px pills — and the arrangement was mine. Taking a palette
+from a design and then inventing the structure produces something that is provably
+consistent with the design and looks nothing like it, which is the worst of both: it
+passes every check you thought to write.
+
+So `index.html` was read and transcribed.
+
+### What was actually different
+
+**There is no capsule.** `.bar` is a full-width flex row — `gap: 18px`,
+`padding: 26px 12px 14px` — and *the scrim is the bar*. The buttons float individually on
+the gradient. The rounded glass container holding four circles was invented here, and it
+was the single biggest reason the window did not look like the web app.
+
+**The icons are 1.8 px stroked line art in a 24×24 box, not SF Symbols.** Apple's are
+filled and weighted to Apple's taste; next to the web app's outlines they read as a
+different product. All seven glyphs are now transcribed from the SVG paths in
+`index.html` — same viewBox numbers, same stroke width, same round caps and joins.
+
+**OFF does not fill the circle red.** `.icon-btn[data-off="1"]` turns the *glyph* red and
+reveals a `.slash` path; the surface stays glass. 17.115 filled the whole circle, which
+put three red discs in a row and is why it needed a 26 px gap to tell the irreversible
+button apart. The web app's own rule — *"the only filled control on the screen. One
+filled thing per screen is the rule that keeps the rest calm"* — solves that without a
+gap, and the gap is gone.
+
+**The row is six buttons, not four**: mic, cam, peek, flip, xlate, leave. `flip` hides
+itself with one camera exactly as `display: none` does. `xlate` is present and off,
+because live translation is web-only so far and a button that says so is better than a
+row that is missing one.
+
+**`#more` is a separate 48 px button in the top-right corner**, and the invite lives in
+the sheet it opens — the web app has no link button among the six. The pills moved to a
+left-hand stack, because two things cannot both own the top-right corner.
+
+**And the sheet is `.sheet`**: 20 px rounded top corners only, `rgba(8,11,18,.90)`, a
+36×4 grip, 48 px rows, a green tick on the live camera, and an action ruled off from the
+toggles so it never reads as a fifth switch.
+
+### Two bugs that were the same bug
+
+The glyphs did not draw at all on the first attempt: six empty discs, and exactly one
+button — `leave` — with an icon. `NSVisualEffectView` is a *subview*, and subviews draw
+after their parent's `draw(_:)`, so the glass painted over every glyph. `leave` hides its
+glass because it is filled, which is why the one button that looked right was the one
+proving the others were being covered. The drawing code was correct throughout. The glyph
+now renders in an overlay above the blur, transparent to the mouse.
+
+Then in the sheet, the tick drew as a caret and the divider landed one row low. Two
+symptoms, one cause — a coordinate system assumed rather than stated. `isFlipped` is now
+declared explicitly instead of inherited.
+
+### The bar is measured, not admired
+
+Scrim brightness down the window: 170.6 → 36.4 → 40.2. The buttons sit on the dark end,
+which is the whole reason the gradient exists.

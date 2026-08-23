@@ -68,9 +68,25 @@ final class Display {
             onLeave: (() -> Void)? = nil, invite: String = "") {
     let rect = NSRect(x: 0, y: 0, width: w, height: h)
     let window = NSWindow(contentRect: rect,
-      styleMask: [.titled, .closable, .resizable, .miniaturizable],
+      styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
       backing: .buffered, defer: false)
     window.title = title
+    // ── THE PICTURE RUNS UNDER THE TITLE BAR ──────────────────────────────────
+    //
+    // A standard title bar puts an opaque grey strip across the top of the window,
+    // and the whole point of the layout below is that the picture is full-bleed and
+    // the controls float on it. With the strip there, the window read as "a video
+    // in an app" rather than "a call" -- FaceTime has no visible title bar at all,
+    // and neither does the web app, because a face is the content and a chrome band
+    // above it is just a smaller face.
+    //
+    // `.fullSizeContentView` extends the content under the bar; transparent and
+    // hidden-title leave only the three traffic lights, which have to stay: they
+    // are how a person closes a call window, and closing it ends the call.
+    window.titlebarAppearsTransparent = true
+    window.titleVisibility = .hidden
+    window.isMovableByWindowBackground = true
+    window.backgroundColor = Palette.bg
     window.center()
     // ── LAYER-HOSTING VIEWS MUST NOT HAVE SUBVIEWS ────────────────────────────
     //
@@ -88,7 +104,7 @@ final class Display {
     videoView.wantsLayer = true
     layer.frame = rect
     layer.videoGravity = .resizeAspect
-    layer.backgroundColor = NSColor.black.cgColor
+    layer.backgroundColor = Palette.bg.cgColor
     videoView.layer = layer
     // A SUBLAYER of the hosted layer, not a subview. The comment above is explicit
     // that this layer-hosting view may not have subviews -- that mistake already
@@ -98,14 +114,29 @@ final class Display {
     selfLayer.cornerRadius = 8
     selfLayer.masksToBounds = true
     selfLayer.borderWidth = 1
-    selfLayer.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
-    selfLayer.backgroundColor = NSColor.black.cgColor
+    // The web app's glass line, and a real shadow so the corner reads as floating
+    // above the picture rather than punched into it.
+    selfLayer.cornerRadius = 12
+    selfLayer.borderColor = Palette.glassLine.cgColor
+    selfLayer.backgroundColor = Palette.bg.cgColor
+    selfLayer.shadowColor = NSColor.black.cgColor
+    selfLayer.shadowOpacity = 0.45
+    selfLayer.shadowRadius = 14
+    selfLayer.shadowOffset = CGSize(width: 0, height: -4)
+    // masksToBounds clips the shadow, so the rounding is done by the corner radius
+    // on a layer that is allowed to draw outside itself.
+    selfLayer.masksToBounds = true
     selfLayer.frame = Display.selfFrame(in: rect)
     layer.addSublayer(selfLayer)
     videoView.autoresizingMask = [.width, .height]
     root.addSubview(videoView)
     if let room {
+      // FULL-WINDOW OVERLAY, not a strip. Information pills sit at the top, the
+      // action bar floats at the bottom, and the picture runs full-bleed under
+      // both -- which is what FaceTime does and what the web app does. As a strip
+      // it could only ever be a black band across the bottom of someone's face.
       let c = CallControls(room: room, width: CGFloat(w))
+      c.frame = rect
       c.onMic = onMic; c.onCam = onCam; c.onLeave = onLeave
       c.inviteText = invite
       root.addSubview(c)
@@ -119,6 +150,21 @@ final class Display {
     }
     window.makeKeyAndOrderFront(nil)
     win = window
+    // ── SAY WHICH WINDOW THIS IS ───────────────────────────────────────────────
+    //
+    // The app's own snapshot renders the layer tree, and the layer tree does not
+    // contain the picture: an AVSampleBufferDisplayLayer is composited by the
+    // window server, and so is the glass blur behind the controls. So every design
+    // photograph taken that way showed the bar over pure black -- which is judging
+    // the one thing the redesign is not about. The controls exist to be legible
+    // OVER A FACE.
+    //
+    // A window-server capture can see all of it, and printing the id is what makes
+    // that capture safe: `screencapture -l <id>` photographs THIS window and
+    // nothing else. The alternative, a plain screen grab, once captured the user's
+    // own desktop -- a real screenshot of a game they were playing -- and that must
+    // not be the way this app gets tested.
+    fputs("window id \(window.windowNumber) -- screencapture -l \(window.windowNumber) -x out.png\n", stderr)
     if let sid = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
       let hz = CGDisplayCopyDisplayMode(CGDirectDisplayID(sid.uint32Value))?.refreshRate ?? 0
       refreshMs = hz > 0 ? 1000.0 / hz : 0
@@ -160,7 +206,7 @@ final class Display {
   var describeTree: String {
     guard let v = win?.contentView else { return "no content view" }
     var out = "content \(Int(v.bounds.width))x\(Int(v.bounds.height)) subviews \(v.subviews.count)"
-    if let c = controls { out += "  [micMuted=\(c.micMuted) camOff=\(c.camOff)]" }
+    if let c = controls { out += "\n  " + c.describeTree }
     out += ":"
     for sv in v.subviews {
       out += "\n    \(type(of: sv)) frame \(Int(sv.frame.origin.x)),\(Int(sv.frame.origin.y))"

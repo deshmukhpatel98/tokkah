@@ -21,6 +21,41 @@ let VERSION = "0.30.0"
 // is the smoke test that keeps a bad release from bricking the far machine.
 if CommandLine.arguments.contains("--version") { print(VERSION); exit(0) }
 
+// ── `--help` HAD TO OPEN A MICROPHONE TO TELL YOU IT DID NOTHING ────────────
+//
+// It was in KNOWN_FLAGS, so the misspelled-flag guard waved it through, and then
+// nothing read it. The result was not an ignored option: with no --room and no
+// --peer, tk falls back to listen=7001/peer=127.0.0.1:7002 and STARTS A CALL --
+// so the most common first thing anybody types at a new binary turned on their
+// microphone and their speakers and printed statistics at them until they found
+// Ctrl-C. Registered-but-unread is the same silent-no-op class as a misspelled
+// flag, and it is worse here, because the no-op behaviour is live hardware.
+//
+// So it prints, and it exits, and it touches nothing -- same contract as
+// --version, and beside it, so the next person adding a query flag sees both.
+if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-h") {
+  print("""
+  tk \(VERSION) -- a video call that tries to be as fast as light allows.
+
+  tk                                   join from the window (asks for a room name)
+  tk --room <name> --video camera      join a room with the camera on
+  tk --room <name>                     join a room, audio only
+
+    --room <name>      the room to meet in; both sides type the same one
+    --video camera     the camera  |  off  audio only  |  <path>  an .mp4, for measuring
+    --window           show a window (the app bundle passes this itself)
+    --fullscreen       fill the screen
+    --mute             do not play audio out (TK_MUTE=1 does the same)
+    --no-update        do not check for a newer version
+    --version          print the version and exit
+    --help             print this and exit
+
+  Everything else is a measurement or impairment switch; the source is the reference
+  and an unknown option is refused rather than ignored. AGPL-3.0, tokkah.com.
+  """)
+  exit(0)
+}
+
 func arg(_ name: String) -> String? {
   let a = CommandLine.arguments
   guard let i = a.firstIndex(of: "--" + name), i + 1 < a.count else { return nil }
@@ -61,7 +96,7 @@ let KNOWN_FLAGS: Set<String> = [
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
-  "window", "version", "help",
+  "window", "version", "help", "press-after",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -272,21 +307,55 @@ if flag("window") {
 // capturing the whole screen -- and armed HERE, before the rendezvous, because
 // the interesting state is "waiting for the other side" and the code after the
 // rendezvous never runs when nobody comes.
+// One place that knows what a press means, called by both --press-after and the
+// --shot path, so the two can never drift into pressing different things.
+func pressControl(_ name: String) {
+  // `selfview` is the one control that does not live on the bar: it is a Display
+  // property, and it normally flips when the other side's first frame lands.
+  // Reaching the connected layout otherwise needs two machines, which is a slow
+  // way to check that a corner is in the corner.
+  if name == "selfview" {
+    sawRemote = true
+    display?.selfViewOn = true
+    display?.controls?.markConnected()
+    display?.controls?.setStatus("connected")
+    // The window title too, or every screenshot taken this way says "waiting for
+    // the other side" over a connected call -- an instrument that lies quietly
+    // about the state it was built to record.
+    setWindowTitle("Tokkah — connected")
+    fputs("pressed selfview: corner on\n", stderr)
+    return
+  }
+  display?.controls?.simulate(name)
+  // Read the CONTROL's state, not `audio`'s. `audio` is a global created after the
+  // rendezvous, and touching it from a timer that fires while still waiting traps
+  // on an uninitialised global -- a shape that has killed this process silently
+  // three times.
+  let c = display?.controls
+  fputs("pressed \(name): micMuted=\(c?.micMuted ?? false) camOff=\(c?.camOff ?? false)"
+      + " clipboard=\(NSPasteboard.general.string(forType: .string)?.count ?? 0) chars\n", stderr)
+}
+
+// ── --press-after: PRESS, AND KEEP RUNNING ──────────────────────────────────
+//
+// `--shot` photographs the layer tree, and the layer tree does not contain the
+// picture -- the window server composites the video, so the app cannot see it.
+// The capture that CAN see it is `screencapture -l <window id>`, and that has to
+// happen while the app is still alive. So the presses get their own timer,
+// separate from the shot that used to exit immediately after them.
+if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(afterS) {
+  DispatchQueue.main.asyncAfter(deadline: .now() + after) {
+    for name in seq.split(separator: ",") { pressControl(String(name)) }
+    fputs("presses done -- window is live for capture\n", stderr)
+  }
+}
+
 if let shot = arg("shot") {
   let after = Double(arg("shot-after") ?? "6") ?? 6
   DispatchQueue.main.asyncAfter(deadline: .now() + after) {
     // --press mic,cam,invite: exercise the wiring before photographing it.
-    if let seq = arg("press") {
-      for name in seq.split(separator: ",") {
-        display?.controls?.simulate(String(name))
-        // Read the CONTROL's state, not `audio`'s. `audio` is a global created after
-        // the rendezvous, and touching it from a timer that fires while still
-        // waiting traps on an uninitialised global -- the third time today that
-        // exact shape has killed the process without a word.
-        let c = display?.controls
-        fputs("pressed \(name): micMuted=\(c?.micMuted ?? false) camOff=\(c?.camOff ?? false)"
-            + " clipboard=\(NSPasteboard.general.string(forType: .string)?.count ?? 0) chars\n", stderr)
-      }
+    if arg("press-after") == nil, let seq = arg("press") {
+      for name in seq.split(separator: ",") { pressControl(String(name)) }
     }
     fputs("tree: \(display?.describeTree ?? "no display")\n", stderr)
     let ok = display?.snapshot(to: shot) ?? false
@@ -308,6 +377,23 @@ if videoArg != "off", display != nil || mdisplay != nil {
     if sawRemote { display?.showSelf(pb); return }
     display?.show(pb)
     mdisplay?.show(pb, at: Clock.now())
+  }
+  // The call path asks too, in case the app was started from the command line and
+  // never saw the join window. Blocking here is fine and deliberate: the answer is
+  // needed before the camera can produce a frame, the window is already on screen,
+  // and the system draws the prompt -- not us.
+  if videoArg == "camera" {
+    let gate = DispatchSemaphore(value: 0)
+    var got = CameraSource.Access.denied
+    CameraSource.requestAccess { a in got = a; gate.signal() }
+    // A minute is longer than anyone takes to answer, and expiring is not fatal:
+    // the call continues without a picture rather than never starting.
+    _ = gate.wait(timeout: .now() + 60)
+    if got != .granted {
+      fputs("camera: not permitted (\(got)) -- continuing with audio only."
+          + " System Settings > Privacy & Security > Camera\n", stderr)
+      display?.controls?.setStatus("camera off — check Privacy settings")
+    }
   }
   do {
     try c.start()
@@ -1631,7 +1717,15 @@ func reportLoop() {
     lastUiLost = r.concealLost; lastUiRecovered = r.recovered
     let lossPct = lostNow / expectedPkts * 100.0
     c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
-    c.setEcho(audio.echoCorr)
+    // ── NO SPEAKER, NO ECHO ───────────────────────────────────────────────────
+    //
+    // "your room is loud -- try headphones" appeared on a call with playout muted,
+    // which cannot be true: with nothing coming out of the speaker there is no
+    // acoustic path back into the microphone, so whatever the estimator correlated
+    // was not echo. Advice that is impossible to act on -- headphones do not help
+    // when the sound is already off -- teaches people to ignore the warnings that
+    // are real, so it is suppressed at the source rather than explained away.
+    c.setEcho(audio.mute ? 0 : audio.echoCorr)
   }
 
   // ── WHERE THE BANDWIDTH WENT ────────────────────────────────────────────────

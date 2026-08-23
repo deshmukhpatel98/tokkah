@@ -150,25 +150,68 @@ enum Launcher {
     hint.frame = NSRect(x: 20, y: H - PREVIEW / 2 - 9, width: W - 40, height: 18)
     v.addSubview(hint)
 
+    // ── ASK FOR THE CAMERA, HERE, AND SAY WHAT HAPPENED ───────────────────────
+    //
+    // Starting a capture session prompts implicitly, and if the person does not
+    // answer -- clicks away, misses it behind another window -- the session simply
+    // never delivers a frame and the app shows black forever with no explanation.
+    // That is exactly what happened: `notDetermined` on a machine where the app had
+    // been opened repeatedly and the window was always empty, and the report was
+    // the only true summary available -- "I still don't see the self view."
+    //
+    // So it is requested explicitly, at the moment the person is looking at the
+    // window it is about, and each of the three outcomes says something different.
     let session = AVCaptureSession()
-    var preview: AVCaptureVideoPreviewLayer?
-    if let dev = AVCaptureDevice.default(for: .video),
-       let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
+    hint.stringValue = "Starting camera…"
+    let settingsButton = NSButton(title: "Open Settings", target: nil, action: nil)
+    settingsButton.bezelStyle = .rounded
+    settingsButton.frame = NSRect(x: (W - 140) / 2, y: H - PREVIEW / 2 - 46, width: 140, height: 28)
+    settingsButton.isHidden = true
+    v.addSubview(settingsButton)
+
+    final class Opener: NSObject {
+      @objc func go() {
+        // The exact pane, not the top of Settings: "go and find it" is how a person
+        // gives up on an app.
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+          NSWorkspace.shared.open(u)
+        }
+      }
+    }
+    let opener = Opener()
+    settingsButton.target = opener
+    settingsButton.action = #selector(Opener.go)
+
+    func startPreview() {
+      guard let dev = AVCaptureDevice.default(for: .video) ?? CameraSource.available().first,
+            let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) else {
+        hint.stringValue = "No camera found — this call will be audio only."
+        return
+      }
       session.addInput(input)
       let pl = AVCaptureVideoPreviewLayer(session: session)
       pl.videoGravity = .resizeAspectFill
       pl.frame = CGRect(x: 0, y: 0, width: W, height: PREVIEW)
       host.addSublayer(pl)
-      preview = pl
+      hint.stringValue = ""
       DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
-    } else {
-      // Said plainly, in the window. A black rectangle with no caption is how a
-      // person concludes the app is broken when the answer is one settings toggle.
-      hint.stringValue = "No camera available — audio only.\nAllow camera access in System Settings › Privacy & Security."
-      hint.maximumNumberOfLines = 2
-      hint.frame = NSRect(x: 20, y: H - PREVIEW / 2 - 18, width: W - 40, height: 36)
     }
-    _ = preview
+
+    CameraSource.requestAccess { access in
+      DispatchQueue.main.async {
+        switch access {
+        case .granted:
+          startPreview()
+        case .denied:
+          hint.stringValue = "Camera access is off, so they will not see you."
+          settingsButton.isHidden = false
+          fputs("camera: access DENIED -- the call will be audio only\n", stderr)
+        case .restricted:
+          hint.stringValue = "Camera use is restricted on this Mac — audio only."
+          fputs("camera: access restricted by policy\n", stderr)
+        }
+      }
+    }
 
     let title = NSTextField(labelWithString: "Join a call")
     title.font = .systemFont(ofSize: 20, weight: .semibold)

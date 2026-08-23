@@ -26,6 +26,26 @@ if [ "$SRCVER" != "$VER" ]; then
   sed -i '' "s/let VERSION = \"$SRCVER\"/let VERSION = \"$VER\"/" Sources/tk/main.swift
 fi
 
+# ── A REGISTERED FLAG THAT NOTHING READS IS A NO-OP WITH CONSEQUENCES ────────
+#
+# `--help` sat in KNOWN_FLAGS for weeks, so the misspelled-flag guard accepted it
+# and then nobody read it -- and because tk with no --room falls back to a
+# loopback peer, the most common first command anyone types STARTED A CALL and
+# opened the microphone. The guard only catches names it does not know; this
+# catches names it knows and ignores. Checked at release, not at runtime, because
+# the answer is a property of the source.
+echo "== flags =="
+python3 - <<'EOF'
+import re, io, glob, sys
+src = "".join(io.open(f, encoding="utf-8").read() for f in glob.glob("Sources/tk/*.swift"))
+names = re.findall(r'"([^"]+)"', re.search(r"let KNOWN_FLAGS: Set<String> = \[(.*?)\]", src, re.S).group(1))
+seen = set(re.findall(r'(?:arg|flag)\("([^"]+)"\)', src)) | set(re.findall(r'arguments\.contains\("--([^"]+)"\)', src))
+dead = [n for n in names if n not in seen]
+print("  %d flags registered, all read" % len(names) if not dead
+      else "  REGISTERED BUT NEVER READ: %s" % ", ".join(dead))
+sys.exit(1 if dead else 0)
+EOF
+
 echo "== build =="
 swift build -c release
 BIN=.build/release/tk

@@ -128,6 +128,29 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   //
   // External devices first in the list, because a person who plugged one in did so
   // on purpose.
+  // ── ASK FOR THE CAMERA, DO NOT HOPE FOR IT ────────────────────────────────
+  //
+  // Starting an AVCaptureSession prompts implicitly, and if the person does not
+  // answer -- clicks away, misses it behind another window -- the session simply
+  // never delivers a frame. The app then shows a black rectangle forever with no
+  // explanation, which is exactly what happened: `notDetermined` on a machine
+  // where the app had been launched repeatedly and the window was always empty.
+  //
+  // So it is asked FOR, explicitly, and every one of the four answers has a
+  // consequence the person can see. `.denied` is the important one: only System
+  // Settings can undo it, so the app has to say so instead of looking broken.
+  enum Access { case granted, denied, restricted }
+  static func requestAccess(_ done: @escaping (Access) -> Void) {
+    switch AVCaptureDevice.authorizationStatus(for: .video) {
+    case .authorized: done(.granted)
+    case .denied: done(.denied)
+    case .restricted: done(.restricted)
+    case .notDetermined:
+      AVCaptureDevice.requestAccess(for: .video) { ok in done(ok ? .granted : .denied) }
+    @unknown default: done(.denied)
+    }
+  }
+
   static func available() -> [AVCaptureDevice] {
     let types: [AVCaptureDevice.DeviceType] = [.external, .continuityCamera, .builtInWideAngleCamera]
     let s = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
