@@ -138,6 +138,11 @@ final class Display {
       let c = CallControls(room: room, width: CGFloat(w))
       c.frame = rect
       c.onMic = onMic; c.onCam = onCam; c.onLeave = onLeave
+      // The one control whose effect lives here rather than in main.swift.
+      c.onPeek = { [weak self] on in
+        self?.peeking = on
+        fputs("peek \(on ? "on -- you have the window" : "off")\n", stderr)
+      }
       c.inviteText = invite
       root.addSubview(c)
       controls = c
@@ -210,6 +215,7 @@ final class Display {
   var describeTree: String {
     guard let v = win?.contentView else { return "no content view" }
     var out = "content \(Int(v.bounds.width))x\(Int(v.bounds.height)) subviews \(v.subviews.count)"
+    out += "  peeking=\(peeking) selfView=\(selfViewOn) shown=\(shown) selfShown=\(selfShown)"
     if let c = controls { out += "\n  " + c.describeTree }
     out += ":"
     for sv in v.subviews {
@@ -271,12 +277,43 @@ final class Display {
   /// Your own camera frame, into the corner. Same wrapping as `show`, different
   /// layer, and it returns immediately while the corner is hidden -- so before the
   /// call connects this costs one branch per frame, not a second enqueue.
+  // ── peek: THE TWO PICTURES SWAP ────────────────────────────────────────────
+  //
+  // `#peek` in the web app -- "hold to see yourself" -- and the button existed here
+  // with `onPeek` declared, called, and ASSIGNED NOWHERE. Pressing it did nothing
+  // at all, which is what "the selfie feature is not working" was: a dead control,
+  // the same class of defect as a camera picker that draws and picks nothing.
+  //
+  // Rather than covering the other person, the two pictures trade places: you take
+  // the window, they take the corner. Same question answered -- "is my camera
+  // alive" -- without losing sight of who is talking.
+  var peeking = false {
+    didSet {
+      guard peeking != oldValue else { return }
+      // The corner has to exist while peeking even before anyone arrives, or the
+      // swap has nowhere to put them.
+      let on = peeking || selfViewOn
+      DispatchQueue.main.async { [weak self] in self?.selfLayer.isHidden = !on }
+    }
+  }
+
+  /// Your own camera. Goes to the corner once the far end is on screen, to the
+  /// window before that -- and to the window again while peeking.
   func showSelf(_ img: CVImageBuffer) {
+    if peeking {
+      if enqueue(img, into: layer) { shown += 1 }
+      return
+    }
     guard selfViewOn else { return }
     if enqueue(img, into: selfLayer) { selfShown += 1 }
   }
 
+  /// The far end's picture. Takes the corner while peeking, the window otherwise.
   func show(_ img: CVImageBuffer) {
+    if peeking, selfViewOn {
+      if enqueue(img, into: selfLayer) { selfShown += 1 }
+      return
+    }
     if enqueue(img, into: layer) { shown += 1 }
   }
 

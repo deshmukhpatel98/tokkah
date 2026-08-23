@@ -132,6 +132,57 @@ enum Update {
     guard rename(staging.path, me.path) == 0 else {
       fputs("update: rename failed (errno \(errno))\n", stderr); return
     }
+    // ── THE BUNDLE, NOT JUST THE BINARY ──────────────────────────────────────
+    //
+    // The tarball used to be exactly one executable, so `Contents/` was frozen at
+    // install time forever. The evidence was sitting on this machine: a bundle
+    // whose Info.plist said 0.28.0 wrapped around a binary reporting 0.33.0, five
+    // releases later. Cosmetic on its own -- and fatal the moment a release changes
+    // anything OUTSIDE the executable. A new icon, a new URL scheme, a new usage
+    // string for a permission prompt: all of it would ship, verify, install, and
+    // reach nobody who already had the app.
+    //
+    // So the archive now carries an optional `bundle/` directory and it is applied
+    // here, before the re-sign, since the signature has to cover what is actually
+    // on disk. Best-effort per file: a bundle that updated its binary and kept an
+    // old icon still works, and refusing the whole update over a resource would
+    // throw away the fix it was carrying.
+    if me.path.contains("/Contents/MacOS/") {
+      let contents = me.deletingLastPathComponent().deletingLastPathComponent()
+      let src = tmp.appendingPathComponent("bundle")
+      var applied: [String] = []
+      // Info.plist carries the version macOS shows, so it is templated the same way
+      // release.sh does it -- the archive holds __VERSION__ and the placeholder is
+      // filled in here rather than shipping a plist per release.
+      if let raw = try? String(contentsOf: src.appendingPathComponent("Info.plist"), encoding: .utf8) {
+        let filled = raw.replacingOccurrences(of: "__VERSION__", with: m.version)
+        if (try? filled.write(to: contents.appendingPathComponent("Info.plist"),
+                              atomically: true, encoding: .utf8)) != nil {
+          applied.append("Info.plist")
+        }
+      }
+      let res = contents.appendingPathComponent("Resources")
+      try? fm.createDirectory(at: res, withIntermediateDirectories: true)
+      for name in ["AppIcon.icns"] {
+        let from = src.appendingPathComponent(name)
+        guard fm.fileExists(atPath: from.path) else { continue }
+        let to = res.appendingPathComponent(name)
+        try? fm.removeItem(at: to)
+        if (try? fm.copyItem(at: from, to: to)) != nil { applied.append(name) }
+      }
+      if !applied.isEmpty {
+        fputs("update: refreshed \(applied.joined(separator: ", "))\n", stderr)
+        // The icon is cached by the Dock and Finder per bundle path, so a new one
+        // is invisible until something tells them to look again. `touch` on the
+        // bundle is what LaunchServices watches.
+        let touch = Process()
+        touch.executableURL = URL(fileURLWithPath: "/usr/bin/touch")
+        touch.arguments = [contents.deletingLastPathComponent().path]
+        touch.standardError = FileHandle.nullDevice
+        if (try? touch.run()) != nil { touch.waitUntilExit() }
+      }
+    }
+
     // ── Re-sign, when we live inside an app bundle ────────────────────────────
     //
     // macOS ties a microphone or camera grant to the CODE SIGNATURE of the thing

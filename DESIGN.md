@@ -11824,3 +11824,80 @@ wants it. The pill now starts hidden and the sheet carries the switch, glyph and
 One trap: `Pill.text` hides itself when empty and **shows** itself otherwise, so the
 opt-in was being undone a second later by the next quality update. The switch decides,
 and the setter asks it.
+
+## 17.118 The updater could only ever update the binary, which meant the icon could never ship
+
+Asked to test everything and change the app icon. The icon turned out to be the
+harder half, and not for any reason to do with drawing.
+
+### The self-updater was shipping one file
+
+`release.sh` built a tarball containing exactly `tk`, and `Update.apply` replaced exactly
+the executable. Everything else in `Contents/` was frozen at install time — and the proof
+was sitting on this machine:
+
+    /Applications/Tokkah.app/Contents/Info.plist   CFBundleShortVersionString  0.28.0
+    /Applications/Tokkah.app/Contents/MacOS/Tokkah --version                   0.33.0
+
+Five releases apart, in one bundle. On its own that is cosmetic. What it actually means is
+that **nothing outside the executable could ever reach anybody who already had the app**:
+not a new icon, not a new URL scheme, not a new `NSCameraUsageDescription` — the string
+macOS reads aloud when it asks for the camera. All of it would build, sign, upload, verify
+from the outside, and land nowhere.
+
+So the archive now carries an optional `bundle/` directory, and the updater applies it
+before re-signing, since the signature has to cover what is on disk. Best-effort per
+file: a bundle that took the new binary and kept an old icon still works, and refusing
+the whole update over a resource would throw away the fix it was carrying. Old binaries
+ignore the extra directory, so this is backward compatible in both directions. Info.plist
+travels with its `__VERSION__` placeholder intact and is filled in on the way in, so
+there is no per-release plist to keep in step. And the bundle gets `touch`ed, because the
+Dock caches icons per path and a new one is otherwise invisible until something tells
+LaunchServices to look again.
+
+### The icon, and why there is a path parser in the repo now
+
+Material Symbols Outlined `conversation` — two faces mid-sentence. There is no SVG tool
+on this machine, the browser sandbox refuses scripts on `file://` pages, and pulling
+170 KB of base64 out of a canvas is an absurd way to move an icon. AppKit already fills
+paths with the nonzero winding rule, which is the only part that matters — the glyph has
+holes, and even-odd punches the wrong ones out. So the missing piece was a parser, and it
+only needs what Material emits: `M L H V Q T Z` and their relative forms.
+`mac/bundle/mkicon.swift` draws all ten sizes and `release.sh` regenerates it every time,
+so the icon cannot drift from the path it claims to come from.
+
+**One flip, counted twice.** The first render put the glyph a full tile above the
+squircle. `(x, y) → (x·k, −y·k)` is the entire coordinate change — SVG's y grows downward
+and this viewBox is `0 -960 960 960`, so one sign flip does it; I also translated by −960
+"to account for the offset" and doubled it. It drew perfectly, in the wrong place, and the
+"is anything actually drawn?" check passed because the centre pixel of an opaque tile is
+opaque whether or not the glyph is anywhere near it. It also now fits the glyph's
+**measured** bounds rather than the nominal box, because Material glyphs do not fill their
+viewBox — `conversation` spans 40…920.
+
+### And the selfie button did nothing at all
+
+> the selfie feature is not working
+
+`onPeek` was declared, called from the button, and **assigned nowhere**. Pressing "see
+yourself" was a no-op — the same class as a camera picker that draws and picks nothing,
+which this file has now produced twice.
+
+Wired, and not by covering the other person: the two pictures **trade places**. You take
+the window, they take the corner. Same question answered — "is my camera alive" — without
+losing sight of who is talking. Routing moved into `Display`, because `peek` swaps two
+surfaces and the two call sites that were each deciding independently are exactly how they
+end up disagreeing.
+
+### Tested, on a call that had to find itself
+
+Two ends, no `--peer`, a freshly minted room, both discovering each other through
+room.tokkah.com the way two machines do:
+
+    room kku-cmoz-hvy: I am mac-84935, public 103.170.53.214:59963
+    room kku-cmoz-hvy: connected via 192.168.1.105:7102
+    both ends: recv ~1513/s, played 100%, conceal 0/s, frames-lost 0
+    g2g p50 4.49 ms and 3.61 ms
+
+Both windows photographed: each end shows the other person full-bleed with its own camera
+in the corner. Then `peek` on one of them, photographed again — the pictures had swapped.

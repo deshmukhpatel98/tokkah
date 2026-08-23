@@ -386,7 +386,9 @@ if videoArg != "off", display != nil || mdisplay != nil {
     // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
     // set so the two are never fighting over the same surface.
     // Once they are on screen you move to the corner rather than disappearing.
-    if sawRemote { display?.showSelf(pb); return }
+    // Display owns the routing now, because `peek` swaps the two surfaces and two
+    // call sites deciding independently is how they end up disagreeing.
+    if sawRemote || display?.peeking == true { display?.showSelf(pb); return }
     display?.show(pb)
     mdisplay?.show(pb, at: Clock.now())
   }
@@ -1023,10 +1025,11 @@ if videoArg != "off" {
       // last frame simply stays put.
       if camOff { return }
       e.encode(pb, hostTime: host)
-      if sawRemote {
+      if sawRemote || display?.peeking == true {
         // They have the window, you get the corner. This is the only thing in the
         // app that proves YOUR camera is alive -- a frozen remote picture, a dead
-        // remote camera and a hung app look identical without it.
+        // remote camera and a hung app look identical without it. While peeking it
+        // is the other way round, which `showSelf` handles.
         display?.showSelf(pb)
       } else {
         // Nobody yet, so you have the whole window.

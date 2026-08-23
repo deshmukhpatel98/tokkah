@@ -52,11 +52,27 @@ BIN=.build/release/tk
 codesign -s - -f "$BIN" 2>/dev/null || echo "  (ad-hoc sign skipped)"
 test "$("$BIN" --version)" = "$VER" || { echo "binary reports $("$BIN" --version), expected $VER"; exit 1; }
 
+echo "== icon =="
+# Regenerated every release from the Material Symbols path, so the icon in the
+# repo can never drift from the source it claims to come from.
+swift bundle/mkicon.swift bundle/AppIcon.icns
+
 echo "== package =="
 STAGE=$(mktemp -d)
 cp "$BIN" "$STAGE/tk"
+# ── The archive carries the BUNDLE too ────────────────────────────────────────
+#
+# It used to be exactly one binary, which meant Contents/ was frozen at install
+# time: a machine here had a 0.28.0 Info.plist around a 0.33.0 binary. Anything
+# outside the executable -- the icon, the URL scheme, the permission strings --
+# could ship and reach nobody who already had the app. The self-updater applies
+# these when it finds them, and ignores them when it does not, so an old binary
+# updating to a new release is unaffected by their presence.
+mkdir -p "$STAGE/bundle"
+cp bundle/Info.plist "$STAGE/bundle/Info.plist"
+cp bundle/AppIcon.icns "$STAGE/bundle/AppIcon.icns"
 TAR="tk-$VER.tar.gz"
-tar -czf "/tmp/$TAR" -C "$STAGE" tk
+tar -czf "/tmp/$TAR" -C "$STAGE" tk bundle
 SHA=$(shasum -a 256 "/tmp/$TAR" | awk '{print $1}')
 SIZE=$(stat -f%z "/tmp/$TAR")
 echo "  $TAR  $SIZE bytes  sha256 $SHA"
