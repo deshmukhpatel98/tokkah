@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.31.0"
+let VERSION = "0.32.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
