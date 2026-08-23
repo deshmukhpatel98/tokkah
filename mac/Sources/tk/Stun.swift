@@ -22,6 +22,30 @@ enum Stun {
 
   struct Mapped { let ip: String; let port: UInt16 }
 
+  /// The servers to ask, in order. One hardcoded hostname is one outage away from
+  /// an app that will not start, and the failure mode was `exit(1)` before a window
+  /// ever appeared -- from the Dock that looks like the app simply vanishing.
+  static let servers = ["stun.cloudflare.com", "stun.l.google.com:19302", "stun1.l.google.com:19302"]
+
+  /// Ask each in turn and take the first answer. Costs one 20-byte datagram per
+  /// server, and only pays the timeout for the ones that are actually down.
+  static func discoverAny(fd: Int32, servers list: [String]? = nil, timeoutMs: Int = 1200) -> Mapped? {
+    for entry in list ?? servers {
+      var host = entry
+      var port: UInt16 = 3478
+      // `host:port`, because Google's STUN does not live on 3478.
+      if let colon = entry.lastIndex(of: ":"), let p = UInt16(entry[entry.index(after: colon)...]) {
+        host = String(entry[..<colon]); port = p
+      }
+      if let m = discover(fd: fd, server: host, port: port, timeoutMs: timeoutMs) {
+        if entry != (list ?? servers).first { fputs("stun: \(entry) answered\n", stderr) }
+        return m
+      }
+      fputs("stun: no answer from \(entry)\n", stderr)
+    }
+    return nil
+  }
+
   static func discover(fd: Int32, server: String, port: UInt16 = 3478, timeoutMs: Int = 1200) -> Mapped? {
     var req = [UInt8](repeating: 0, count: 20)
     req[0] = 0x00; req[1] = 0x01                      // Binding Request
@@ -43,11 +67,28 @@ enum Stun {
       sendto(fd, b.baseAddress!, 20, 0, ai.pointee.ai_addr, ai.pointee.ai_addrlen)
     }
 
-    // The media receive loop is not running yet when this is called, so reading
-    // here cannot steal a media packet. A short timeout, because a STUN server
-    // that does not answer in a second is not going to.
-    var tv = timeval(tv_sec: 0, tv_usec: Int32(timeoutMs * 1000))
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    // ── THE TIMEOUT THAT WAS NEVER INSTALLED ─────────────────────────────────
+    //
+    // This read used to hang the app forever. `tv_usec` is the SUB-SECOND part of a
+    // `timeval` and must be under 1,000,000; `1200 * 1000` is 1.2 million, so
+    // `setsockopt` returned EINVAL, nobody looked, and the socket kept its default
+    // of "block until a packet arrives". Every STUN server that answered hid it.
+    // One that did not answer froze the main thread in `recvfrom` -- no window, no
+    // room join, no way out but Activity Monitor. Found by a test that clicked a
+    // button and waited: the click never landed because the process was already
+    // dead on its feet at startup.
+    //
+    // So: carry the seconds in the seconds field, and check the return value,
+    // because a timeout that fails to install is exactly as dangerous as no
+    // timeout at all and says nothing either way.
+    var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: Int32((timeoutMs % 1000) * 1000))
+    if setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size)) != 0 {
+      // Refuse to read at all rather than read without a deadline. No STUN mapping
+      // costs us a direct path on some networks; a frozen app costs everything.
+      fputs("stun: cannot set a \(timeoutMs) ms receive timeout (\(errno)) -- skipping discovery"
+          + " rather than risking a blocking read on the main thread\n", stderr)
+      return nil
+    }
     defer {
       var zero = timeval(tv_sec: 0, tv_usec: 0)
       setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &zero, socklen_t(MemoryLayout<timeval>.size))

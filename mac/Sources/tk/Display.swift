@@ -65,6 +65,7 @@ final class Display {
   /// Held so neither is deallocated the moment `open` returns -- AppKit keeps only
   /// weak references to a window delegate.
   private(set) var controls: CallControls?
+  private var keyMonitor: Any?
   private var closer: WindowCloser?
 
   func open(title: String, w: Int, h: Int, room: String? = nil,
@@ -149,7 +150,9 @@ final class Display {
       // The one control whose effect lives here rather than in main.swift.
       c.onPeek = { [weak self] on in
         self?.peeking = on
-        fputs("peek \(on ? "on -- you have the window" : "off")\n", stderr)
+        fputs("peek \(on ? "on" : "off") localFrames=\(self?.localFrames ?? -1)"
+            + " selfShown=\(self?.selfShown ?? -1) hidden=\(self?.selfLayer.isHidden ?? true)"
+            + " frame=\(self?.selfLayer.frame ?? .zero)\n", stderr)
       }
       c.inviteText = invite
       root.addSubview(c)
@@ -158,6 +161,17 @@ final class Display {
       // is happening; without this the row would appear once and never come back.
       window.acceptsMouseMovedEvents = true
       c.armBarAutoHide()
+      // A local monitor rather than `keyDown` on a view: the first responder here is
+      // whatever AppKit last handed focus to, and a reflex like Escape has to work
+      // from wherever the pointer happens to have left it.
+      keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak c] e in
+        (c?.handleKey(e) ?? false) ? nil : e
+      }
+      // A real menu bar, so Command-Q, Command-W and Command-M mean what they mean
+      // everywhere else. Installed here because this is the path that has a window.
+      Menu.controls = c
+      Menu.onQuit = onLeave
+      Menu.install()
     }
     window.contentView = root
     if let onLeave {
@@ -166,6 +180,11 @@ final class Display {
       closer = cl
     }
     window.makeKeyAndOrderFront(nil)
+    // A call window that opens behind whatever you were reading is a call you miss.
+    // Every other call app on this machine comes forward when it starts; this one
+    // opened unfocused, which also meant the first click on any control was spent
+    // activating the app instead of pressing the button.
+    NSApp.activate(ignoringOtherApps: true)
     win = window
     // ── SAY WHICH WINDOW THIS IS ───────────────────────────────────────────────
     //
@@ -310,7 +329,15 @@ final class Display {
     didSet {
       guard peeking != oldValue else { return }
       let on = peeking
-      DispatchQueue.main.async { [weak self] in
+      // ── A HOLD OWNS THE MAIN THREAD ──────────────────────────────────────────
+      //
+      // This used to be an unconditional `DispatchQueue.main.async`, and holding the
+      // button is exactly the moment that cannot wait for the main queue: the hold
+      // is implemented as a nested `nextEvent(matching:)` loop, so the block that
+      // was supposed to reveal the tile sat behind the hold that asked for it and
+      // ran after the release -- which then immediately hid it again. The button
+      // appeared to do nothing at all.
+      let apply: () -> Void = { [weak self] in
         guard let self else { return }
         // AND ONLY IF THERE IS SOMETHING IN IT. Holding the button with no camera
         // permission put an empty box on screen -- reported as "a window is
@@ -325,6 +352,7 @@ final class Display {
         self.selfLayer.isHidden = !on
         if !on { self.selfLayer.flushAndRemoveImage() }
       }
+      if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
   }
   /// Proof that our own camera is producing anything at all, which is what decides

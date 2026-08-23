@@ -12067,3 +12067,170 @@ Live translation (the button is present and says it is web-only), the microphone
 every latency number depends on), the full `#hud` panel behind "Connection numbers", the
 headphone check, Frame Sense edge cues, the two-step "tap to leave" confirm, and the
 `#floorIcon` ambient loud-room icon — which is currently a pill instead.
+
+## 17.120 Six controls that a finger could not press, and a timeout that was never installed
+
+The instruction was "test everything end to end is working. All the clicks and
+buttons and steps." The word that mattered was *clicks*. Every test up to here had
+called handlers: `--press mic` runs `toggleMic()`, which proves the handler works
+and proves nothing whatever about the button. The last three interaction bugs in
+this app had all lived in that gap — six discs drawn with no glyph on them, a share
+button whose `didSet` never fired so it laid out at zero size, a full-bleed waiting
+card whose `hitTest` swallowed the entire control bar. A handler test passes every
+one of them.
+
+So the harness learned to click. `--press @mic` builds a real `NSEvent` at the
+control's own centre and sends it through `window.sendEvent`, which is the path the
+window server uses, and therefore through every `hitTest` on the way down.
+`--press ?` walks everything currently on screen and reports, per control, which
+view a click there would actually reach. `@peek:2` holds for two seconds.
+
+The first run found that **not one button on the control bar was pressable.**
+
+### The glass was eating every click
+
+`hitTest` said the click would land on `Glass`, the `NSVisualEffectView` that draws
+the blur inside each button. That is true and it was fine — `NSView.mouseDown`
+forwards to `nextResponder`, which is the button. What is not fine is that
+`acceptsFirstMouse` is asked of *the view the hit test returned*, and
+`NSVisualEffectView` says no. So while the app was not frontmost, every click on
+every glass-backed control was spent activating the app and thrown away.
+
+That is not an exotic state for a video call. It is *the* state: you are reading
+something else, the call is behind it, and you reach for mute. The app requires two
+clicks and the first one is silently discarded — which is exactly how a person
+concludes a button is broken.
+
+The fix is not to add `acceptsFirstMouse` everywhere. It is to notice that a pane of
+glass has nothing to do with a click:
+
+```swift
+final class Glass: NSVisualEffectView {
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+```
+
+Decoration is not a target. With the glass transparent to hit-testing the click
+lands on the `IconButton` itself, which does accept first mouse, and the audit
+flipped from six `FAIL`s to six `OK`s.
+
+The same rule caught the sheet rows, whose `NSTextField` label was taking their
+clicks, and it is the rule to reach for first whenever a control contains anything
+it did not intend to be pressed.
+
+### A row that drew perfectly and could not be clicked
+
+The sheet rows still did nothing. `mouseDown` was reaching them — traced — and
+returning without sending an action. The cause was three sessions old and looked
+like a fix:
+
+```swift
+override var isFlipped: Bool { false }
+```
+
+That line exists because the tick drew as a caret and a divider landed one row low.
+`NSButton.isFlipped` is `true`; overriding it to `false` is what makes the drawing
+land where it is written. It also silently disables the button, because
+`NSButtonCell.trackMouse` lays the cell rect out in the coordinate system the view
+claims and then tests the mouse point in the other one. The cell decides the finger
+is outside itself, returns "not a click", and no action is ever sent. The row keeps
+its target, keeps its action, keeps highlighting on hover, and is dead.
+
+A drawing fix that disables the control is a genuinely nasty shape, because
+everything you would check by eye still looks right. The row now tracks its own
+click, where the geometry belongs to us and `NSCell` cannot disagree with the
+drawing — and gets a pressed state out of it, which it did not have.
+
+### A press-and-hold that starved the thing it was for
+
+`peek` is press-and-hold, implemented the classic AppKit way:
+
+```swift
+while let e = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) { ... }
+```
+
+Holding it for six seconds enqueued **169 frames into a visible layer with a
+correct frame** and drew a black rectangle. The loop blocks the main thread for as
+long as the finger is down, so Core Animation never got a turn to put any of those
+frames on screen. `Display.peeking`'s `didSet` made it worse by deferring its work
+to `DispatchQueue.main.async` — the block that reveals the tile was queued behind
+the hold that asked for it, and ran after the release, which hid it again.
+
+Both are gone. The reveal happens synchronously when it is already on the main
+thread, and the hold is a plain `mouseUp` override: after a `mouseDown` AppKit
+routes every following mouse event to that view until the button comes up, wherever
+the pointer has wandered, which is the release-anywhere behaviour the loop was
+written to get — for free, without holding the thread hostage.
+
+The test then found that a hold can lose its release: an open sheet ate the
+posted mouse-up and the self-view stayed on screen for the rest of the call. The
+same thing happens to a person who holds peek and then Command-Tabs away, so the
+window server now gets the last word — if no mouse button is physically down,
+nothing is being held, whatever the view believes.
+
+### The app was frozen before any of this, on some networks
+
+Chasing the clicks turned up a process that had never reached its own room join.
+`sample` put the main thread here:
+
+```
+main.swift:525
+  Stun.discover(fd:server:port:timeoutMs:)  Stun.swift:59
+    __recvfrom
+```
+
+A blocking receive on the main thread, with a timeout that had never been
+installed:
+
+```swift
+var tv = timeval(tv_sec: 0, tv_usec: Int32(timeoutMs * 1000))   // 1_200_000
+```
+
+`tv_usec` is the sub-second part of a `timeval` and must be under 1,000,000.
+`1200 * 1000` is 1.2 million, so `setsockopt` returned `EINVAL`, nobody checked the
+return value, and the socket kept its default of *block until a packet arrives*.
+Every STUN server that answered promptly hid this. One that did not answer froze the
+app: no window, no room join, no way out but Activity Monitor.
+
+Seconds in the seconds field, and the return value is now checked — a timeout that
+fails to install is exactly as dangerous as no timeout, and says nothing either
+way, so the read is now refused rather than attempted without a deadline.
+
+Underneath it was a second failure with a worse ending. When STUN found nothing the
+code called `exit(1)`. On any network that blocks UDP 3478 — a hotel, a guest VLAN,
+a captive portal — double-clicking the app made it appear in the Dock and vanish,
+with the reason on a stderr stream nobody launched it from. Two machines on the same
+wifi never needed a public address in the first place, so it now asks three servers
+instead of one, and if none answer it advertises the local address, says
+"same-network only" on screen, and lets the call try.
+
+### And the parts that were not bugs
+
+Two of the three things reported were the app being faithful. The rotate-camera
+button is absent because this Mac reports exactly one camera and the web app hides
+it below two — its own comment says a flip button on a single-camera laptop is a lie
+about the hardware. The encryption code showed `…` because there was no peer yet, so
+no key exchange had happened; on a live call it reads a code, the same on both
+screens.
+
+The globe was the third, and it *was* a lie. Live translation is not in the native
+app, so the button answered "web-only for now" — which is the exact thing the web
+app refuses to do with `flip`. It is hidden until it can translate.
+
+### The menu bar that was not there
+
+Last, the thing that made the app feel least like a Mac app had nothing to do with
+drawing. There was no menu bar. Command-Q did not quit, Command-W did not close,
+Command-M did not minimise, and the app's own name had nothing under it. Four
+reflexes a Mac user has before they have a thought. There is a menu now, built in
+code because there is no nib, with the two shortcuts every Mac video app agrees on
+— Command-Shift-A for the microphone, Command-Shift-V for the camera — and Escape
+closing the sheet and disarming the hang-up, which is what the web app's `keydown`
+already did.
+
+Verified on a live two-end call through the real room rendezvous: mic and camera
+both ways, hold-to-peek showing a mirrored tile and losing it on release, the sheet
+opening and closing by button, scrim, swipe and Escape, "Copy invite link" reaching
+the clipboard, connection numbers ticking on, the encryption code agreeing across
+both ends, the hang-up arming into "tap to leave" with its four neighbours collapsed
+to nothing, and both destructive paths — confirmed leave and closing the window —
+ending the process.

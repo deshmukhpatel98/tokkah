@@ -364,12 +364,40 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
   // and then released in the same run: `--press "peek,~,unpeek"`. Without it a hold
   // and its release were two separate runs, and "the tile went away" could never be
   // shown to be caused by the release.
+  // `@name` is a REAL CLICK -- a synthetic NSEvent at the control's own centre,
+  // routed through `window.sendEvent` and therefore through every `hitTest` on the
+  // way down. `?` runs the hit-test audit over everything currently on screen.
+  // Both exist because a handler call cannot fail the way a finger fails.
   var t = after
   for name in seq.split(separator: ",") {
     let token = String(name)
     if token == "~" { t += 3.0; continue }
     let at = t
-    DispatchQueue.main.asyncAfter(deadline: .now() + at) { pressControl(token) }
+    // Every token gets its own moment. They used to share one, so a nine-step
+    // sequence fired nine handlers inside the same runloop turn and the log read
+    // like one instant -- which is exactly the evidence a step-by-step test is for.
+    t += 0.7
+    DispatchQueue.main.asyncAfter(deadline: .now() + at) {
+      if token == "?" {
+        for line in display?.controls?.auditClicks() ?? ["no controls"] {
+          fputs("audit \(line)\n", stderr)
+        }
+        fputs("audit state \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else if token.hasPrefix("@") {
+        // `@peek:2.5` presses and holds for 2.5 s, so a hold can be photographed
+        // while it is held rather than inferred from the state after it ended.
+        var n = String(token.dropFirst())
+        var hold: TimeInterval = 0
+        if let colon = n.lastIndex(of: ":"), let d = Double(n[n.index(after: colon)...]) {
+          hold = d; n = String(n[..<colon])
+        }
+        display?.controls?.nudgeBar()
+        let sent = display?.controls?.click(n, holdFor: hold) ?? false
+        fputs("click \(n): \(sent ? "sent" : "NOT ON SCREEN") -> \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else {
+        pressControl(token)
+      }
+    }
   }
   DispatchQueue.main.asyncAfter(deadline: .now() + t) {
     fputs("presses done -- window is live for capture\n", stderr)
@@ -500,12 +528,32 @@ if flag("stun") {
 // the wrong one and the honest answer would have been a relay.
 if let room = arg("room") {
   let me = arg("id") ?? "mac-\(getpid())"
-  guard let mapped = Stun.discover(fd: wire.fd, server: arg("stunserver") ?? "stun.cloudflare.com") else {
-    fputs("room: STUN found no mapping -- cannot advertise an address\n", stderr); exit(1)
-  }
-  let mine = "\(mapped.ip):\(mapped.port)"
+  // ── NO PUBLIC ADDRESS IS NOT THE END OF THE CALL ──────────────────────────
+  //
+  // This used to be `exit(1)`. On any network that blocks UDP 3478 -- a hotel, a
+  // corporate guest VLAN, a captive portal -- double-clicking the app made it
+  // appear in the Dock and disappear, with the reason on a stderr stream nobody
+  // launched it from. Two machines on the same wifi never needed the public
+  // address in the first place, so the honest behaviour is to publish what we do
+  // know, say so on screen, and let the call try.
+  let mapped = Stun.discoverAny(fd: wire.fd,
+                                servers: arg("stunserver").map { [$0] })
   let myLocal = localIPv4().map { "\($0):\(listenPort)" }
-  fputs("room \(room): I am \(me), public \(mine)\(myLocal.map { ", local " + $0 } ?? "")\n", stderr)
+  let mine = mapped.map { "\($0.ip):\($0.port)" }
+  if mine == nil {
+    if myLocal == nil {
+      fputs("room: no public address and no local address -- this machine has no"
+          + " usable network route\n", stderr)
+      display?.controls?.setStatus("no network")
+      DispatchQueue.main.asyncAfter(deadline: .now() + 8) { exit(1) }
+    } else {
+      fputs("room: STUN found no mapping -- advertising \(myLocal!) only,"
+          + " so a call on this network still works\n", stderr)
+      display?.controls?.setStatus("same-network only")
+    }
+  }
+  fputs("room \(room): I am \(me), public \(mine ?? "unknown")"
+      + "\(myLocal.map { ", local " + $0 } ?? "")\n", stderr)
   var found = false
   for attempt in 1...60 {
     // Re-publish every poll: the lease is short on purpose, because an address is

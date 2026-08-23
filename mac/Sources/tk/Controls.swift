@@ -46,6 +46,16 @@ enum Palette {
 /// app's `backdrop-filter: blur(18px)` has an exact native counterpart and there is
 /// no reason to fake it with a flat fill.
 final class Glass: NSVisualEffectView {
+  // ── DECORATION IS NOT A TARGET ─────────────────────────────────────────────
+  //
+  // The blur is a subview of the button it sits inside, so `hitTest` handed every
+  // click to the glass and not to the button. Two consequences, both invisible in
+  // a handler test: `acceptsFirstMouse` was asked of the glass (which says no), so
+  // the first click on a background window was always eaten; and every audit that
+  // started at the content view happily reported the right control was reachable.
+  // A pane of glass has nothing to do with a click. It passes them through.
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   init(radius: CGFloat, circle: Bool = false) {
     super.init(frame: .zero)
     material = .hudWindow
@@ -290,6 +300,18 @@ final class IconButton: NSButton {
   var onHold: ((Bool) -> Void)?
   private(set) var holding = false
 
+  // ── THE CIRCLE MORPHS IN PLACE ─────────────────────────────────────────────
+  //
+  //   .icon-btn.leave.confirming { width: 150px; border-radius: 24px; gap: 8px;
+  //                                grid-auto-flow: column }
+  //   .icon-btn.leave.confirming .lbl { display: block }
+  //
+  // "are you sure" is not a thing an icon can say, so the button says a word. Not
+  // a modal: a modal over a live face is worse than the mistake it prevents, and it
+  // moves the target under a finger that is already travelling.
+  var confirmLabel: String?
+  var confirming = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
+
   init(_ shape: Glyph.Shape, size: CGFloat = 58, help: String) {
     self.shape = shape
     self.box = size
@@ -327,14 +349,31 @@ final class IconButton: NSButton {
   override func mouseDown(with event: NSEvent) {
     guard onHold != nil else { super.mouseDown(with: event); return }
     setHolding(true)
-    // Track the drag ourselves so a release ANYWHERE ends the hold. `setPointerCapture`
-    // is what the web app does for the same reason: letting go outside the circle
-    // must not leave the self-view stuck on screen.
-    while let e = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
-      if e.type == .leftMouseUp { break }
-    }
-    setHolding(false)
+    startHoldWatchdog()
   }
+
+  // ── A HOLD THAT NEVER ENDS ─────────────────────────────────────────────────
+  //
+  // `mouseUp` is the normal way out and it is not guaranteed to arrive. A test
+  // found it first -- an open sheet ate the release and the self-view stayed on
+  // screen for the rest of the call -- but the same thing happens to a person who
+  // holds peek and then Command-Tabs away, and a self-view stuck on is not a
+  // cosmetic bug. So the window server gets the last word: if no mouse button is
+  // physically down, nothing is being held, whatever this view believes.
+  private var watchdog: Timer?
+  private func startHoldWatchdog() {
+    watchdog?.invalidate()
+    let t = Timer(timeInterval: 0.15, repeats: true) { [weak self] timer in
+      guard let self, self.holding else { timer.invalidate(); return }
+      guard !self.syntheticHold else { return }
+      if NSEvent.pressedMouseButtons & 1 == 0 { timer.invalidate(); self.setHolding(false) }
+    }
+    watchdog = t
+    RunLoop.main.add(t, forMode: .common)
+  }
+  /// Set only by the click harness, whose "button" is not a finger and so is not
+  /// visible to `pressedMouseButtons`. Nothing in the app sets it.
+  var syntheticHold = false
   private func setHolding(_ on: Bool) {
     guard holding != on else { return }
     holding = on
@@ -342,7 +381,40 @@ final class IconButton: NSButton {
     onHold?(on)
   }
   /// For `--press`: a hold long enough to be photographed, then released.
+  // ── A HOLD MUST NOT OWN THE MAIN THREAD ────────────────────────────────────
+  //
+  // The hold used to be a nested `while let e = window?.nextEvent(matching:)` loop,
+  // which is the classic AppKit tracking idiom and was wrong here for one reason:
+  // it blocks the main thread for as long as the finger is down. Everything the
+  // hold is FOR then starves. Six seconds of holding peek enqueued 169 frames into
+  // a visible layer with a correct frame and drew a black rectangle, because Core
+  // Animation never got a turn to put them on screen.
+  //
+  // Plain `mouseUp` instead. After a `mouseDown` AppKit routes every following
+  // mouse event to this view until the button comes up, wherever the pointer has
+  // wandered to -- which is the release-anywhere behaviour the loop was written to
+  // get, for free and without holding the thread hostage.
+  override func mouseUp(with event: NSEvent) {
+    guard onHold != nil else { super.mouseUp(with: event); return }
+    setHolding(false)
+  }
+  override func mouseDragged(with event: NSEvent) {
+    guard onHold == nil else { return }   // a hold survives the pointer leaving
+    super.mouseDragged(with: event)
+  }
+
   func simulateHold(_ on: Bool) { setHolding(on) }
+
+
+  // ── THE FIRST CLICK COUNTS ─────────────────────────────────────────────────
+  //
+  // Without this, a click that arrives while the app is behind another window is
+  // spent activating the app and thrown away: the button does nothing and you
+  // click it again. On a call that is unacceptable -- "mute me now" is pressed
+  // precisely when this window is NOT the one you were typing in, and the whole
+  // point of a hang-up is that it works the first time. Apple's own call controls
+  // accept first mouse for the same reason.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
   override func layout() {
     super.layout()
@@ -354,8 +426,10 @@ final class IconButton: NSButton {
 
   override func draw(_ dirty: NSRect) {
     let d = min(bounds.width, bounds.height)
-    let circle = NSBezierPath(ovalIn: NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2,
-                                             width: d, height: d))
+    let circle: NSBezierPath = confirming
+      ? NSBezierPath(roundedRect: bounds, xRadius: 24, yRadius: 24)
+      : NSBezierPath(ovalIn: NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2,
+                                    width: d, height: d))
     if destructive {
       // `.icon-btn.leave { background: var(--bad) }`, and #f26464 on hover.
       (hovering ? Palette.hex(0xf26464) : Palette.bad).setFill()
@@ -371,6 +445,26 @@ final class IconButton: NSButton {
   /// Called by the overlay, so it lands on top of the blur.
   fileprivate func drawGlyph(in bounds: NSRect) {
     let d = min(bounds.width, bounds.height)
+    if confirming, let text = confirmLabel {
+      // Glyph and word side by side, the pair centred: `gap: 8px`, 13px semibold.
+      let gsize: CGFloat = 22
+      let f = NSFont.systemFont(ofSize: 13, weight: .semibold)
+      let a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
+      let tw = (text as NSString).size(withAttributes: a)
+      let total = gsize + 8 + tw.width
+      var x = (bounds.width - total) / 2
+      let g = shape.build(gsize)
+      let t = NSAffineTransform()
+      t.translateX(by: x, yBy: (bounds.height - gsize) / 2)
+      g.transform(using: t as AffineTransform)
+      NSColor.white.setFill(); NSColor.white.setStroke()
+      if shape.filled { g.fill() } else {
+        g.lineWidth = 1.8 * (gsize / 24); g.lineCapStyle = .round; g.lineJoinStyle = .round; g.stroke()
+      }
+      x += gsize + 8
+      (text as NSString).draw(at: NSPoint(x: x, y: (bounds.height - tw.height) / 2), withAttributes: a)
+      return
+    }
     if on {
       // `box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.35)`.
       let r = NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
@@ -475,12 +569,19 @@ final class SheetRow: NSButton {
   private let text: NSTextField
   private var hovering = false
   var checked = false { didSet { needsDisplay = true } }
+  /// Held down. Drawn like hover, a shade stronger -- feedback under the finger.
+  private var pressed = false { didSet { needsDisplay = true } }
   /// An action, not a toggle -- ruled off above so it never reads as a switch.
   var ruled = false { didSet { needsDisplay = true } }
   /// A fact about this call: nothing to press.
   var inert = false
   /// `.sheet .row .code` -- a monospaced value pinned right, for the encryption code.
   var value: String = "" { didSet { needsDisplay = true } }
+
+  /// What this row actually says, for a test that has to read the screen.
+  var spoken: String {
+    text.stringValue + (checked ? " ✓" : "") + (value.isEmpty ? "" : " = \(value)")
+  }
 
   // ── SAY WHICH WAY IS UP ────────────────────────────────────────────────────
   //
@@ -489,6 +590,59 @@ final class SheetRow: NSButton {
   // rather than a coordinate system. `NSButton` is not documented to be flipped
   // and the containing `Sheet` is not, so the geometry below was written for y-up
   // and is now guaranteed to get it.
+
+  // ── THE FIRST CLICK COUNTS ─────────────────────────────────────────────────
+  //
+  // Without this, a click that arrives while the app is behind another window is
+  // spent activating the app and thrown away: the button does nothing and you
+  // click it again. On a call that is unacceptable -- "mute me now" is pressed
+  // precisely when this window is NOT the one you were typing in, and the whole
+  // point of a hang-up is that it works the first time. Apple's own call controls
+  // accept first mouse for the same reason.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  // A row is one target, not a label with a row behind it. `hitTest` was handing
+  // clicks to the `NSTextField` that draws the words -- which does nothing, and
+  // whose `acceptsFirstMouse` says no -- so whether the row worked depended on
+  // whether the window happened to be key. Same lesson as the glass: everything
+  // inside a control is decoration.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    // `point` arrives in the SUPERVIEW's coordinates, so it belongs against
+    // `frame`, which is also in the superview's coordinates. Converting it into our
+    // own space first and then testing `frame` compares a local point to a parent
+    // rectangle: it answers "no" for every row that is not near the sheet's origin,
+    // which is every row.
+    guard isEnabled, !isHidden else { return nil }
+    return frame.contains(point) ? self : nil
+  }
+
+  // ── THE DRAWING FIX THAT DISABLED THE BUTTON ───────────────────────────────
+  //
+  // `NSButton.isFlipped` is `true`. Overriding it to `false` below is what makes
+  // the tick and the divider land where they are drawn -- and it also silently
+  // stopped every row from firing, because `NSButtonCell.trackMouse` lays out the
+  // cell rect in the coordinate system the view claims and then tests the mouse
+  // point in the other one. The cell decided the finger was outside itself, so it
+  // returned "not a click" and no action was ever sent. The row still drew
+  // perfectly, still highlighted on hover, still had a target and an action.
+  //
+  // So the click is tracked here instead, where the geometry is ours. `NSCell` is
+  // not involved and cannot disagree with the drawing.
+  override func mouseDown(with event: NSEvent) {
+    pressed = true
+    var inside = true
+    while let e = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+      inside = bounds.contains(convert(e.locationInWindow, from: nil))
+      pressed = inside
+      if e.type == .leftMouseUp { break }
+    }
+    pressed = false
+    // Released outside the row is a cancelled press, the way every Mac button
+    // behaves: you can slide off a row you did not mean to hit.
+    guard inside, let t = target, let a = action else { return }
+    NSApp.sendAction(a, to: t, from: self)
+  }
+
   override var isFlipped: Bool { false }
 
   init(_ label: String, glyph: Glyph.Shape? = nil) {
@@ -528,8 +682,8 @@ final class SheetRow: NSButton {
   }
 
   override func draw(_ dirty: NSRect) {
-    if hovering {
-      NSColor(white: 1, alpha: 0.06).setFill()
+    if hovering || pressed {
+      NSColor(white: 1, alpha: pressed ? 0.12 : 0.06).setFill()
       NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
     }
     if ruled {
@@ -555,8 +709,19 @@ final class SheetRow: NSButton {
       }
     }
     if !value.isEmpty {
-      let f = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
-      let a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: Palette.fg]
+      // `.sheet .code { font: 600 13px/1 ui-monospace; letter-spacing: .09em;
+      //                 color: var(--fg) }`
+      // `.sheet .code[data-pending="1"] { color: var(--muted); font-weight: 400;
+      //                                  letter-spacing: 0 }`
+      // The pending state is a DIFFERENT weight and colour on purpose: a dim "…"
+      // reads as "not yet", where the same treatment as a real code reads as a
+      // code that failed to print.
+      let pending = value == "…"
+      let f = NSFont.monospacedSystemFont(ofSize: 13, weight: pending ? .regular : .semibold)
+      var a: [NSAttributedString.Key: Any] = [
+        .font: f, .foregroundColor: pending ? Palette.muted : Palette.fg,
+      ]
+      if !pending { a[.kern] = 13.0 * 0.09 }
       let sz = (value as NSString).size(withAttributes: a)
       (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - 12,
                                           y: (bounds.height - sz.height) / 2),
@@ -615,6 +780,22 @@ final class Sheet: NSView {
 
   /// Rows and hints, in the order they should appear top to bottom.
   private var items: [NSView] = []
+  /// See IconButton.acceptsFirstMouse.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  /// `e.clientY - y0 > 40` -- a downward drag throws the sheet away.
+  var onSwipeDown: (() -> Void)?
+  private var dragStart: CGFloat?
+  override func mouseDown(with event: NSEvent) {
+    dragStart = event.locationInWindow.y
+    super.mouseDown(with: event)
+  }
+  override func mouseUp(with event: NSEvent) {
+    if let y0 = dragStart, y0 - event.locationInWindow.y > 40 { onSwipeDown?() }
+    dragStart = nil
+    super.mouseUp(with: event)
+  }
+
   func setItems(_ v: [NSView]) {
     items.forEach { $0.removeFromSuperview() }
     items = v
@@ -729,6 +910,15 @@ final class WaitingCard: NSView {
   // has a higher z-index. Here it is a subview added last, so without this it would
   // swallow every click on mic, camera and leave, and the call would look frozen
   // while being perfectly fine.
+  /// A card that appears the instant the app opens: its first click is the one
+  /// that matters most, and it used to be eaten by activation.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  /// The three things on this card a finger can hit.
+  var clickTargets: [(String, NSView)] {
+    [("share", shareButton), ("copy", copyButton), ("link", urlGlass)]
+  }
+
   override func hitTest(_ point: NSPoint) -> NSView? {
     let p = convert(point, from: superview)
     for v in [urlGlass, shareButton, copyButton] where v.frame.contains(p) { return self }
@@ -769,6 +959,8 @@ final class WaitingCard: NSView {
 
 /// `#copy, #shareBtn`: a 999 px glass pill with a word in it.
 final class PillButton: NSView {
+  /// See IconButton.acceptsFirstMouse.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   private let glass = Glass(radius: 14)
   private let label = NSTextField(labelWithString: "")
   private var hovering = false
@@ -845,7 +1037,7 @@ final class CallControls: NSView {
   private let elapsedLabel = NSTextField(labelWithString: "")
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
-  private let sheetScrim = NSView()
+  private let sheetScrim = ScrimView()
   private let camPicker = NSPopUpButton()
   private let camGlass = Glass(radius: 13)
   private var camNames: [String] = []
@@ -914,6 +1106,11 @@ final class CallControls: NSView {
     leaveButton.target = self; leaveButton.action = #selector(leave)
     moreButton.target = self; moreButton.action = #selector(toggleMore)
     sheetScrim.isHidden = true
+    // It was added, framed, and wired to nothing: `moreScrim` in the web app is
+    // `onclick = () => setSheet(false)`, and here a click on it went nowhere, so the
+    // only way to shut the sheet was to find the same 48 px disc again.
+    sheetScrim.onClick = { [weak self] in self?.closeMore() }
+    sheet.onSwipeDown = { [weak self] in self?.closeMore() }
     addSubview(sheetScrim)
     sheet.isHidden = true
     addSubview(sheet)
@@ -923,6 +1120,7 @@ final class CallControls: NSView {
     // it rather than absent from a row the web app has six buttons in.
     flipButton.isHidden = true
     xlateButton.off = true
+    xlateButton.isHidden = true
     // `.icon-btn.leave` is the only filled control on the screen -- the web app's
     // own rule, and the reason mic and camera turn their GLYPH red rather than
     // their whole circle. One filled thing per screen keeps the rest calm, and it
@@ -1000,11 +1198,24 @@ final class CallControls: NSView {
     let bw: CGFloat = 58, gap: CGFloat = 18, bottomPad: CGFloat = 14
     let row = [micButton, camButton, peekButton, flipButton, xlateButton, leaveButton]
       .filter { !$0.isHidden }
-    let rowW = CGFloat(row.count) * bw + CGFloat(max(0, row.count - 1)) * gap
-    var x = (w - rowW) / 2
-    for b in row {
-      b.frame = NSRect(x: x, y: bottomPad, width: bw, height: bw)
-      x += bw + gap
+    if leaveArmed {
+      // `.bar.confirming .icon-btn:not(.leave) { width: 0; opacity: 0;
+      //  pointer-events: none }` -- the row contracts to the one decision. Six
+      // circles plus a 150 px pill overflowed a phone, and the overflow left a live
+      // mute button under the finger already travelling toward "leave".
+      for b in row where b !== leaveButton {
+        b.frame = NSRect(x: w / 2, y: bottomPad, width: 0, height: bw)
+        b.alphaValue = 0
+      }
+      leaveButton.frame = NSRect(x: (w - 150) / 2, y: bottomPad, width: 150, height: bw)
+    } else {
+      let rowW = CGFloat(row.count) * bw + CGFloat(max(0, row.count - 1)) * gap
+      var x = (w - rowW) / 2
+      for b in row {
+        b.frame = NSRect(x: x, y: bottomPad, width: bw, height: bw)
+        if barShown { b.alphaValue = 1 }
+        x += bw + gap
+      }
     }
     // `#more`: top-right, 14 px in, riding the same row as the pills but in the
     // corner the web app puts it in.
@@ -1080,7 +1291,9 @@ final class CallControls: NSView {
   /// `#waiting.gone` -- the card goes the moment there is someone to look at, and
   /// `#status.gone`: "connected" is said once and then gets out of the face's way.
   func markConnected() {
-    if startedAt == nil { startedAt = Date() }
+    let first = startedAt == nil
+    if first { startedAt = Date() }
+    if first { onMain { [weak self] in self?.showBar(pin: true) } }
     onMain { [weak self] in
       guard let self else { return }
       self.waiting.isHidden = true
@@ -1173,6 +1386,7 @@ final class CallControls: NSView {
   @objc private func camPicked() { onCamPick?(camPicker.indexOfSelectedItem) }
 
   @objc func toggleMic() {
+    showBar(pin: true)
     micMuted.toggle()
     micButton.off = micMuted
     onMic?(micMuted)
@@ -1180,6 +1394,7 @@ final class CallControls: NSView {
   }
 
   @objc func toggleCam() {
+    showBar(pin: true)
     camOff.toggle()
     camButton.off = camOff
     onCam?(camOff)
@@ -1208,6 +1423,8 @@ final class CallControls: NSView {
   /// as `display: none` does, so the row is six buttons or five and never a dead one.
   @objc func nextCamera() {
     guard camNames.count > 1 else { return }
+    // "a flip is a state change; the bar earns its 10 s again"
+    showBar(pin: true)
     let next = (camPicker.indexOfSelectedItem + 1) % camNames.count
     camPicker.selectItem(at: next)
     onCamPick?(next)
@@ -1217,6 +1434,12 @@ final class CallControls: NSView {
   /// `#xlate`: live translation. It exists in the web app and not yet here, so the
   /// button is present and OFF -- pressing it says so rather than doing nothing,
   /// because a control that swallows a click is worse than one that declines it.
+  // Live translation is not in the native app yet. The web app states the rule for
+  // exactly this case, about its own flip button: "The control only exists where it
+  // can do something... A flip button on a single-camera laptop is a lie about the
+  // hardware, and finding out by tapping it is worse than not having it." A globe
+  // that answers "web-only for now" is the same lie about the app, so it is hidden
+  // until it can translate, and `simulate("xlate")` still says so out loud.
   @objc func toggleXlate() {
     setStatus("live translation is web-only for now")
   }
@@ -1234,14 +1457,39 @@ final class CallControls: NSView {
   // remove.
   private var barShown = true
   private var barTimer: Timer?
-  private static let barLinger: TimeInterval = 3.5
+  /// `Math.max(2600, barPinnedUntil - now)`.
+  private static let barStillness: TimeInterval = 2.6
+  /// `showBar(true)` pins for 10 s -- a state change earns the row that long.
+  private static let barPin: TimeInterval = 10.0
+  private var barPinnedUntil = Date.distantPast
 
-  private func showBar() {
+  /// `pin: true` for a state change (a mute, a camera swap): the row has just said
+  /// something and taking it away in 2.6 s is taking away the confirmation.
+  private func showBar(pin: Bool = false) {
     barTimer?.invalidate()
     setBar(visible: true)
-    barTimer = Timer.scheduledTimer(withTimeInterval: CallControls.barLinger, repeats: false) { [weak self] _ in
-      // Never hide the row while the sheet it opened is standing on top of it.
-      guard let self, !self.moreOpen else { return }
+    if pin { barPinnedUntil = max(barPinnedUntil, Date().addingTimeInterval(CallControls.barPin)) }
+    scheduleBarHide()
+  }
+
+  private func scheduleBarHide() {
+    barTimer?.invalidate()
+    // ── NOT BEFORE THE CALL ───────────────────────────────────────────────────
+    //
+    // `if (!joined) return;` -- "Before the call the screen is your own mirror and
+    // one button, and hiding the controls there just makes the app look broken."
+    // This app hid them anyway, so the waiting screen sat there with a link and no
+    // visible way to mute, turn the camera off, or leave.
+    guard startedAt != nil else { return }
+    // Whichever ends later: 2.6 s of stillness, or the pin. Sizing the timer to the
+    // ACTUAL remaining time is the difference between the row disappearing where the
+    // rule says and up to one tick later.
+    let wait = max(CallControls.barStillness, barPinnedUntil.timeIntervalSinceNow)
+    barTimer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
+      guard let self else { return }
+      // A sheet open or a leave half-confirmed is a decision in progress, and taking
+      // the controls away mid-decision is how you get a hang-up nobody meant.
+      if self.moreOpen || self.leaveArmed { self.scheduleBarHide(); return }
       self.setBar(visible: false)
     }
   }
@@ -1269,7 +1517,15 @@ final class CallControls: NSView {
   /// was invisible and every photograph of the result was of an empty bar.
   func nudgeBar() { showBar() }
 
+  /// Half-confirmed leave. Declared here because the auto-hide has to know about it:
+  /// the row must not vanish between the two clicks.
+  private(set) var leaveArmed = false
+
   private(set) var moreOpen = false
+  /// Open it if it is closed. The menu item says "Show Encryption Code", and a
+  /// menu item that sometimes closes the thing it offers to show is a trick.
+  @objc func openMore() { if !moreOpen { toggleMore() } }
+
   @objc func toggleMore() {
     moreOpen.toggle()
     moreButton.on = moreOpen
@@ -1340,18 +1596,51 @@ final class CallControls: NSView {
     closeMore()
   }
 
-  @objc func leave() { onLeave?() }
+  private var leaveTimer: Timer?
+  @objc func leave() {
+    if leaveArmed {
+      cancelLeaveConfirm()
+      onLeave?()
+      return
+    }
+    leaveArmed = true
+    leaveButton.confirming = true
+    leaveButton.confirmLabel = "tap to leave"
+    showBar(pin: true)
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    // Three seconds and it forgets, because an armed hang-up left on screen is a
+    // trap for the next click that lands anywhere near it.
+    leaveTimer?.invalidate()
+    leaveTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+      self?.cancelLeaveConfirm()
+    }
+  }
+
+  func cancelLeaveConfirm() {
+    guard leaveArmed else { return }
+    leaveArmed = false
+    leaveTimer?.invalidate()
+    leaveButton.confirming = false
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    scheduleBarHide()
+  }
 
   /// What is actually in the window, printed, because a snapshot that comes back
   /// empty cannot distinguish "nothing is there" from "the capture does not work".
   /// The row as it actually renders, for the tests -- a button hidden by
   /// `isHidden` is invisible to a screenshot and would otherwise be indistinguishable
   /// from one that was never added.
+  /// What is on the bar RIGHT NOW. It used to be a hardcoded list with one `if` in
+  /// it, so it reported five buttons through a confirm that had collapsed four of
+  /// them to zero width -- an instrument describing the code's intent instead of
+  /// the screen.
   var visibleRowNames: [String] {
-    var out = ["mic", "cam", "peek"]
-    if !flipButton.isHidden { out.append("flip") }
-    out += ["xlate", "leave"]
-    return out
+    [("mic", micButton), ("cam", camButton), ("peek", peekButton), ("flip", flipButton),
+     ("xlate", xlateButton), ("leave", leaveButton)]
+      .filter { !$0.1.isHidden && $0.1.alphaValue > 0.01 && $0.1.frame.width > 4 }
+      .map { $0.0 }
   }
 
   var describeTree: String {
@@ -1362,14 +1651,84 @@ final class CallControls: NSView {
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"
-      + "  more=\(moreOpen ? "open" : "closed") peek=\(peeking)"
+      + "  more=\(moreOpen ? "open" : "closed") peek=\(peeking)\(peekButton.holding ? "/held" : "")"
+      + "  leave=\(leaveArmed ? "ARMED" : "idle") bar=\(barShown ? "shown" : "hidden")"
+      + "  clip=\(NSPasteboard.general.string(forType: .string) ?? "-")"
+      + (moreOpen ? "\n  sheet=[" + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]" : "")
   }
 
   /// --press mic,cam,invite,leave,echo,cam#2 -- exercise the wiring before
   /// photographing it. A control that draws and does nothing is this project's
   /// most repeated defect and does not get to be assumed.
+  // ── THE KEYS A MAC USER ALREADY PRESSES ────────────────────────────────────
+  //
+  // Escape closes the sheet and disarms the hang-up, exactly as the web app's
+  // `keydown` does. The other two are the shortcuts every Mac video app has
+  // agreed on -- Command-Shift-A for the microphone, Command-Shift-V for the
+  // camera -- and reaching for them and getting nothing is a large part of what
+  // makes a native app feel like a web page in a frame.
+  @discardableResult
+  func handleKey(_ event: NSEvent) -> Bool {
+    let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    if event.keyCode == 53 {  // esc
+      guard moreOpen || leaveArmed else { return false }
+      closeMore(); cancelLeaveConfirm(); nudgeBar()
+      return true
+    }
+    guard mods == [.command, .shift], let ch = event.charactersIgnoringModifiers?.lowercased() else {
+      return false
+    }
+    switch ch {
+    case "a": toggleMic(); nudgeBar(); return true
+    case "v": toggleCam(); nudgeBar(); return true
+    default: return false
+    }
+  }
+
   func simulate(_ what: String) {
     switch what {
+    case "esc", "cmd-mic", "cmd-cam":
+      let ch = what == "esc" ? "\u{1b}" : (what == "cmd-mic" ? "a" : "v")
+      let code: UInt16 = what == "esc" ? 53 : (what == "cmd-mic" ? 0 : 9)
+      let mods: NSEvent.ModifierFlags = what == "esc" ? [] : [.command, .shift]
+      if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods,
+                                  timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0,
+                                  context: nil, characters: ch, charactersIgnoringModifiers: ch,
+                                  isARepeat: false, keyCode: code) {
+        fputs("key \(what): handled=\(handleKey(e))\n", stderr)
+      }
+    // Reading the menu bar back rather than photographing it: a screenshot of the
+    // menu bar is a screenshot of whatever app is frontmost, which on a test
+    // machine is not this one -- and is somebody's private screen.
+    case "menu":
+      guard let m = NSApp.mainMenu else { fputs("menu: NONE INSTALLED\n", stderr); break }
+      for top in m.items {
+        // AppKit shows the SUBMENU's title for a top-level item whose own title is
+        // empty, so that is the name a person actually reads up there.
+        let name = top.title.isEmpty ? (top.submenu?.title.isEmpty == false
+                                        ? top.submenu!.title : "(app)") : top.title
+        let kids = (top.submenu?.items ?? []).map { i -> String in
+          if i.isSeparatorItem { return "--" }
+          var k = i.title
+          if !i.keyEquivalent.isEmpty {
+            let mods = i.keyEquivalentModifierMask
+            var pre = ""
+            if mods.contains(.command) { pre += "cmd-" }
+            if mods.contains(.shift) { pre += "shift-" }
+            if mods.contains(.option) { pre += "opt-" }
+            let ch = i.keyEquivalent == "\u{8}" ? "delete" : i.keyEquivalent
+            k += " [\(pre)\(ch)]"
+          }
+          if i.action == nil && i.submenu == nil { k += " (DEAD)" }
+          return k
+        }
+        fputs("menu \(name): \(kids.joined(separator: ", "))\n", stderr)
+      }
+    case "swipe-sheet": sheet.onSwipeDown?()
+    // The red X, not the red circle. Closing the window has to end the call, and
+    // the only way to know it does is to close the window.
+    case "close-window": window?.performClose(nil)
+    case "scrim": closeMore()
     case "mic": toggleMic()
     case "cam": toggleCam()
     case "invite": invite()
@@ -1379,6 +1738,7 @@ final class CallControls: NSView {
     case "xlate": toggleXlate()
     case "more": toggleMore()
     case "leave": leave()
+    case "unleave": cancelLeaveConfirm()
     case "echo": setEcho(0.9)
     case "quality": markConnected(); setQuality(m2eMs: 11, concealPct: 0, lossPct: 0)
     case let c where c.hasPrefix("cam#"):
@@ -1403,4 +1763,129 @@ final class WindowCloser: NSObject, NSWindowDelegate {
   private let onClose: () -> Void
   init(onClose: @escaping () -> Void) { self.onClose = onClose }
   func windowWillClose(_ notification: Notification) { onClose() }
+}
+
+// ── EVERY CONTROL, CLICKED WHERE IT ACTUALLY IS ──────────────────────────────
+//
+// `--press mic` calls `toggleMic()`. That proves the handler works and proves
+// nothing at all about the button, and the last three interaction bugs here were
+// all in the gap: six discs with no glyph on them, a share button `didSet` never
+// sized so it drew at zero, and a full-bleed waiting card whose `hitTest`
+// swallowed the whole bar. Every one of those passes a handler test.
+//
+// So the audit asks the question a finger asks: at the middle of this control,
+// which view does `hitTest` hand the click to? Then it sends a real
+// `NSEvent` through `window.sendEvent`, the same path the window server uses,
+// and reads the state back.
+extension CallControls {
+  /// Everything a person can click, and where. Only what is on screen right now.
+  var clickTargets: [(String, NSView)] {
+    var out: [(String, NSView)] = []
+    func add(_ n: String, _ v: NSView) {
+      guard !v.isHidden, v.alphaValue > 0.01, v.bounds.width > 4, v.bounds.height > 4,
+            !v.frame.isEmpty else { return }
+      out.append((n, v))
+    }
+    add("mic", micButton); add("cam", camButton); add("peek", peekButton)
+    add("flip", flipButton); add("xlate", xlateButton); add("leave", leaveButton)
+    add("more", moreButton)
+    if moreOpen { for (i, r) in sheet.rows.enumerated() where r.isEnabled { add("row#\(i)", r) } }
+    if !waiting.isHidden { for (n, v) in waiting.clickTargets { add(n, v) } }
+    return out
+  }
+
+  /// `hitTest` from the content view down, exactly as a click arrives.
+  func auditClicks() -> [String] {
+    guard let win = window, let root = win.contentView else { return ["no window"] }
+    // The audit converts to window coordinates and hit-tests the content view,
+    // whose `hitTest` takes points in its SUPERVIEW's space. Those agree only while
+    // the content view sits at the window origin -- true under
+    // `.fullSizeContentView`, and a silently wrong answer the day it isn't.
+    guard root.frame.origin == .zero else { return ["content view is not at the window origin"] }
+    var lines: [String] = []
+    for (name, v) in clickTargets {
+      let mid = NSPoint(x: v.bounds.midX, y: v.bounds.midY)
+      let p = v.convert(mid, to: nil)
+      let hit = root.hitTest(p)
+      // The glyph overlay and the glass blur are both subviews of the button, so a
+      // hit on either IS a hit on the button. Anything else is a control a finger
+      // cannot reach.
+      var reached = false
+      var walk: NSView? = hit
+      while let w = walk { if w === v { reached = true; break }; walk = w.superview }
+      // A card that claims its own bounds and routes by frame in `mouseDown` is a
+      // legitimate third answer, so it gets its own word. Calling it FAIL made the
+      // audit cry wolf about the one card that works.
+      var forwards = false
+      if !reached, let h = hit {
+        var up: NSView? = v.superview
+        while let u = up { if u === h { forwards = true; break }; up = u.superview }
+      }
+      let got = hit.map { "\(type(of: $0))" } ?? "nil"
+      let verdict = reached ? "OK  " : (forwards ? "SELF" : "FAIL")
+      lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)")
+    }
+    return lines
+  }
+
+  /// A real click, through the window, at the control's own centre.
+  /// `holdFor` keeps the button down that long, for press-and-hold controls.
+  func click(_ name: String, holdFor: TimeInterval = 0) -> Bool {
+    guard let win = window else { return false }
+    guard let (_, v) = clickTargets.first(where: { $0.0 == name }) else {
+      fputs("click: \(name) is not on screen\n", stderr); return false
+    }
+    let p = v.convert(NSPoint(x: v.bounds.midX, y: v.bounds.midY), to: nil)
+    func ev(_ t: NSEvent.EventType) -> NSEvent? {
+      NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
+                         timestamp: ProcessInfo.processInfo.systemUptime,
+                         windowNumber: win.windowNumber, context: nil,
+                         eventNumber: 0, clickCount: 1, pressure: t == .leftMouseUp ? 0 : 1)
+    }
+    guard let down = ev(.leftMouseDown), let up = ev(.leftMouseUp) else { return false }
+    let hitNow = win.contentView?.hitTest(p)
+    fputs("  click \(name) at (\(Int(p.x)),\(Int(p.y))) frame=\(v.frame) hit=\(hitNow.map { "\(type(of: $0))" } ?? "nil")"
+        + " key=\(win.isKeyWindow) active=\(NSApp.isActive)\n", stderr)
+    // Queue the release FIRST. Press-and-hold runs its own event loop on
+    // `nextEvent(matching: .leftMouseUp)`, and a synthetic press with no release
+    // behind it hangs the process there forever -- waiting for a finger that does
+    // not exist.
+    if holdFor <= 0 {
+      win.postEvent(up, atStart: false)
+      win.sendEvent(down)
+      return true
+    }
+    // A real hold. The release cannot go through `DispatchQueue.main`: the hold's
+    // own `nextEvent(matching:)` owns the main thread until the release arrives, so
+    // the release would be queued behind the thing it is meant to release. A
+    // `Timer` in `.common` modes fires during event tracking, which is exactly the
+    // mode a hold puts the runloop into.
+    // The release goes STRAIGHT to the view, not through `postEvent`. AppKit gives a
+    // real drag an implicit capture -- every event after a `mouseDown` goes to the
+    // view that received it, wherever the pointer has moved to. A posted event gets
+    // hit-tested afresh instead, so an open sheet over the bar swallowed the
+    // release and the hold never ended. Delivering it directly is what models the
+    // capture a finger actually gets.
+    (v as? IconButton)?.syntheticHold = true
+    let t = Timer(timeInterval: holdFor, repeats: false) { _ in
+      (v as? IconButton)?.syntheticHold = false
+      v.mouseUp(with: up)
+    }
+    RunLoop.main.add(t, forMode: .common)
+    win.sendEvent(down)
+    return true
+  }
+}
+
+/// `.sheetScrim`: the dark nothing behind an open sheet. Its whole job is to take
+/// one click and close what is in front of it.
+final class ScrimView: NSView {
+  /// See IconButton.acceptsFirstMouse.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+  var onClick: (() -> Void)?
+  override func mouseDown(with event: NSEvent) { onClick?() }
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    // Superview coordinates in, superview-coordinate `frame` to test. See SheetRow.
+    isHidden ? nil : (frame.contains(point) ? self : nil)
+  }
 }
