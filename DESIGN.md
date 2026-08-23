@@ -9798,3 +9798,144 @@ The right version of this is a runtime `--fpp`, so the packet size can follow th
 link instead of being chosen at compile time for everyone. That refactor touches the
 hottest loop in the program for a flag most people would never set, so it waits
 until something needs it. Recorded here so the measurement is not lost.
+
+## 17.94 Concealment at the pitch period, not the packet
+
+A packet is 32 samples. Repeating it to cover a dropout repeats at 1500 Hz, which is
+not a continuation of a voice, it is a buzzer -- and the join was phase-broken as
+well, because `lastGood[off]` walks the packet offset, so a run began by stepping
+from the grain's last sample back to its first.
+
+Both of those are audible and neither was visible, because the only instrument was a
+single sample-to-sample step at the seam. Two changes made the question answerable:
+
+- **The signal got a level.** `--audio <file>` overwrites the captured samples after
+  the input unit has rendered, so every timestamp and every downstream stage is the
+  path the microphone takes and only the content changes. Every audio quality
+  measurement before this was taken on a quiet room at 6am, which is noise, and noise
+  is not periodic at 0.67 ms -- so the first A/B came back saying the waveform repeat
+  was worse than silence, and I believed the wrong explanation for it.
+- **The metric got a denominator and a window.** A step of 0.01 is a loud click on
+  room noise and inaudible on speech, so the step is reported against the signal RMS
+  measured on the same samples in the same callback. And a single-sample step is
+  gameable by ANY smoothing, including smoothing that destroys the signal, so the
+  reading is now the worst step in the 64 samples either side of a seam.
+
+With those in place the answer changed but the verdict on grain-repeat did not: it
+really is worse than silence. The fix is to repeat at the pitch period.
+
+Keep a rolling 42 ms of what was actually played. At the first concealed sample of an
+outage -- once, not per sample -- find the period by normalised autocorrelation over
+80-500 Hz, coarse-to-fine, then read forward through history wrapping back by exactly
+one period. The seam is then where the waveform already repeats itself. Hold the
+level 10 ms, fade over 40 ms. And cross-fade the returning signal's first 1.3 ms
+against the synthesis that is still running, which costs no latency at all -- the real
+samples still play at their real time, they are only mixed.
+
+Six rotated arms, 3% loss in 20 ms bursts, real speech, hypothesis-favoured arm first
+so a win cannot be warm-up. Worst step at a seam, over signal RMS:
+
+| concealment | four readings | median |
+|---|---|---|
+| **pitch PLC** | 1.29, 1.10, 0.80, 0.70 | **0.95** |
+| zeros | 1.15, 1.76, 1.51, 1.66 | 1.59 |
+| grain repeat | 1.89, 2.54, 2.79, 2.61 | 2.58 |
+
+40% better than silence, 63% better than the grain repeat, and the period it finds is
+123-145 Hz, which is a real speaking fundamental rather than an artefact of the
+search. The search runs on the render thread on purpose -- the alternative is a period
+computed for a different phoneme -- so its cost is printed beside the result rather
+than asserted: 17 us of a 667 us callback, 2.5%. On a clean path it never runs at all
+and m2e is unchanged at 11.76 ms.
+
+This is a discontinuity measurement, not a listening test. It says the seams got
+smoother by a factor the rig can see three ways; it does not say how it sounds.
+
+## 17.95 Loss is a direction, and the controller was reading the wrong end of it
+
+The redundancy controller read this machine's own receive counters -- `concealLost`
+and `recovered` -- and used them to turn on redundancy in this machine's TRANSMIT
+path. So a machine whose *downlink* was lossy protected its *uplink*.
+
+On a symmetric path that is accidentally correct. The loopback rig is perfectly
+symmetric, both ends were always impaired together, and both ends therefore always
+turned redundancy on together -- so the recovery rate looked right, the bandwidth
+looked right, and no test in this repo could have shown the defect. It is the same
+shape as every other control-loop bug here: the loop was steering on a signal that
+happened to agree with the truth in the only conditions ever tested.
+
+Only the far end can see what the path from here did. So the time-sync probe that
+already runs both ways carries the report: eight bytes appended past `TPKT`, the
+receiver's cumulative `concealLost` and `recovered`, on both the request and the
+reply so it flows at the full probe rate in both directions. Appended, not inserted,
+so a build predating this reads its 32 bytes exactly as before and simply never
+reports -- and when it doesn't, the controller falls back to local counters and
+*prints that it is doing so*, because a silent fallback to the wrong signal is the
+bug being fixed.
+
+The proof needed an asymmetric path, which is precisely what the rig had never built.
+Impair only A's send, 3% uniform, 55 s:
+
+```
+A  (lossy uplink, clean downlink)
+   redundancy ON (102 lost in 2 s, as reported by the far end)
+   local: conceal 0/s (lost 0 late 0 recovered 0 FEC-on)
+   bandwidth 3.97/2.43 Mbps up/down
+
+B  (lossy downlink, clean uplink)
+   (no redundancy)
+   local: conceal 0/s (lost 175 late 0 recovered 2213)
+   bandwidth 2.43/3.98 Mbps up/down
+```
+
+A turned redundancy on while its own loss counters read **zero** -- a controller
+reading local counters could not have fired at all. B declined to protect a clean
+path. The bandwidth is now spent on the direction that needs it: 1.55 Mbps of
+redundancy on the lossy uplink, nothing on the clean one. Before this it was exactly
+the mirror image -- B paying for protection nothing needed while A's lossy uplink went
+bare -- and 92.7% of the loss that is now repaired would have been concealed instead.
+
+Note what the two sections together say about packet size. FPP=32 makes each packet
+0.67 ms, so a one-packet redundancy offset repairs a 0.67 ms outage; at 20 ms
+packetisation the same offset would repair 20 ms. Small packets buy latency and cost
+burst resilience, and the controller measures the consequence directly -- 19% recovery
+under 20 ms bursts, at which point it says so and stops paying. Repairing an outage of
+duration D requires carrying the copy D later, which requires a jitter buffer of D.
+That is not a coding limit, it is the trade, and it is now visible in the log rather
+than hidden in a constant.
+
+### 17.95a The old build, watched making the mistake
+
+Worth running rather than reasoning about, because the self-updater makes mixed
+versions routine: 0.10.0 with the lossy uplink, a freshly built 0.9.8 on the far end,
+3% uniform loss on one direction only.
+
+```
+NEW 0.10.0 (lossy uplink, 0.9.8 peer)
+  redundancy: the far end does not report its receive loss (older build), so this
+  is steering on LOCAL loss -- correct only if both directions lose equally
+  conceal 0/s (lost 0 late 1 recovered 0)
+
+OLD 0.9.8 (lossy downlink)
+  redundancy ON (105 lost in 2 s) -- each packet now carries the previous one
+  redundancy OFF -- recovered only 0 of 443 (0%), so these are bursts and a
+  one-packet offset cannot reach them. Not spending the bandwidth; retrying in 60 s
+  conceal 38/s (lost 1981 late 1 recovered 0)   m2e p50 11.99
+```
+
+Compatibility holds -- 44 stat windows both sides, m2e 11.99 on the old end, zero
+decrypt failures, zero format mismatches, and the new end names the degradation
+instead of hiding it.
+
+But look at what 0.9.8 concluded. It turned redundancy on because *its own downlink*
+was losing packets, protected its already-clean uplink, measured **0 of 443 recovered**
+and reported *"so these are bursts"*. The loss was uniform 3%. There were no bursts.
+Recovery was zero because the protection was on the wrong path entirely, and the
+controller then blamed the network for it, printed a confident wrong diagnosis, and
+backed off with a doubling timer -- leaving 38 concealed packets a second unrepaired
+for the rest of the call.
+
+So the cost of reading the wrong end was not only 1.55 Mbps spent in the wrong
+direction. It was a controller that **misdiagnosed the path and then acted correctly
+on the misdiagnosis**, which is the failure mode that no amount of looking at the log
+would have caught, because the log was internally consistent and completely wrong.

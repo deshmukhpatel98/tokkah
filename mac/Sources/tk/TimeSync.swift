@@ -38,6 +38,21 @@ import Foundation
 // short enough to forget a stale one.
 let TMAGIC: UInt32 = 0x544B_0005
 let TPKT = 4 + 4 + 8 + 8 + 8      // magic, kind, t1, t2, t3
+// ── and eight bytes of "here is what YOUR packets did on arrival" ────────────
+//
+// Loss is a property of a DIRECTION, and only the far end can see it. Until now
+// the redundancy controller read this machine's own receive counters and then
+// turned on redundancy in this machine's TRANSMIT path -- so a machine whose
+// downlink was lossy protected its uplink, which was fine. On a symmetric path
+// that is accidentally correct, and the loopback rig is perfectly symmetric, so
+// no test here could ever have shown it. It is the same shape as every other
+// control-loop bug in this project: the loop was steering on the wrong signal
+// and the instrument could not tell.
+//
+// So the probe that already runs both ways carries the report. Appended past
+// TPKT rather than inserted, so a build that predates this reads its 32 bytes
+// exactly as before and simply never reports.
+let TPKTX = TPKT + 8              // + rxLost, rxRecovered (cumulative, UInt32)
 
 final class TimeSync {
   private struct S { let delayNs: Int64; let thetaNs: Int64 }

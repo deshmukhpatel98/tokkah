@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import AudioToolbox
 import CoreAudio
 import Darwin
@@ -75,7 +76,208 @@ final class Audio {
   //
   // Needs to make a sound, so it is a flag and not a default, and it refuses to
   // run muted rather than reporting a silent negative.
+  // ── Concealment that is not silence ────────────────────────────────────────
+  //
+  // A missing packet used to be filled with zeros, which is the most audible
+  // possible choice: a hole in a waveform is a click, and a click is exactly what
+  // the ear is built to notice. That made every concealed packet expensive, which
+  // in turn made the jitter buffer's grow/shrink trade look worse than it is --
+  // 2.7 ms of latency on every word to avoid one 0.67 ms gap every seven seconds.
+  //
+  // Repeating the last good packet instead is the oldest trick in the book and it
+  // works: over 0.67 ms a voice is essentially periodic, so the substitution is
+  // continuous in amplitude and close in phase. A run of them decays to silence
+  // rather than buzzing, because repeating one grain forever turns a dropout into
+  // a tone, which is worse than a hole.
+  private var lastGood: UnsafeMutablePointer<Float>
+  private var haveLastGood = false
+  private var concealRun = 0
+
+  // ── Packet loss concealment, at the pitch period ───────────────────────────
+  //
+  // The grain-repeat above is wrong twice, and the measurement said so on real
+  // speech (step/rms 2.53 for repeat against 2.09 for silence, four rotated arms):
+  //
+  //   1. A packet is 32 samples. Repeating it turns a dropout into a 1500 Hz
+  //      tone -- 1/0.67ms -- which is not a continuation of a voice, it is a
+  //      buzzer. Speech is periodic at its PITCH, 80-500 Hz, so the shortest
+  //      honest unit of repetition is 2-12 ms: four to eighteen packets.
+  //   2. The join was phase-broken. `lastGood[off]` walks the packet offset, so
+  //      when a run began the output stepped from the grain's last sample back to
+  //      its first -- a jump backwards through the waveform, once per packet.
+  //
+  // So: keep a rolling 42 ms of what was actually played, find the pitch period
+  // by normalised autocorrelation once per outage, and read forward through
+  // history at that period. The seam is then continuous by construction, and the
+  // repetition is at the frequency the voice already has.
+  //
+  // Cost: the search runs ONCE at the start of an outage, not per sample, and is
+  // decimated by two -- about 60k multiply-adds. It is on the render thread on
+  // purpose (the alternative is a stale period computed for a different sound),
+  // and the callback cost is measured, not assumed: see `plcSearchUs`.
+  private static let HIST = 2048           // 42.7 ms, power of two for masking
+  private static let HMASK = HIST - 1
+  private static let PMIN = 96             // 500 Hz
+  private static let PMAX = 600            // 80 Hz
+  private static let XFADE = 64            // 1.3 ms, both seams
+  private var hist: UnsafeMutablePointer<Float>
+  private var histW = 0                    // next write position
+  private var plcPeriod = 0
+  private var plcCursor = 0
+  private var plcSamples = 0               // length of this outage, in samples
+  private var xfade = 0                    // samples of exit cross-fade left
+  var plcSearchUs = Quantiles(cap: 256)
+  var plcPeriodMs = Quantiles(cap: 256)
+  /// zeros | grain | plc. Three arms, because an improvement that cannot be
+  /// attributed to the thing that changed is not an improvement, it is a hope.
+  var concealZeros = false
+  var concealGrain = false
+  /// THE SIZE OF THE CLICK, measured rather than argued about. A click is a
+  /// discontinuity in the waveform, so the biggest sample-to-sample step at the
+  /// edge of a concealed packet IS the artifact. Filling with zeros steps by the
+  /// full signal amplitude; repeating the last grain should step by almost
+  /// nothing. Cannot be listened to at 6am, can be measured at any hour.
+  var jumpAtEdge = Quantiles(cap: 1024)
+  // A single sample step is gameable: ANY smoothing flatters it, including
+  // smoothing that destroys the signal. So the window is 64 samples wide either
+  // side of a seam and the reading is the WORST step inside it -- which catches
+  // both the click at the join and the onset of a buzz just after it.
+  private var edgeWinLeft = 0
+  private var edgeWinMax: Float = 0
+  // A step of 0.01 is a loud click on room noise and inaudible on speech. The
+  // step alone is therefore not a quality number -- it only means something
+  // against the level of the signal it interrupts, so the level is measured on
+  // the same samples, in the same callback, and printed beside it.
+  private var sigSumSq: Double = 0
+  private var sigN: Int = 0
+  var sigRms: Double { sigN > 0 ? (sigSumSq / Double(sigN)).squareRoot() : 0 }
+  private var prevOut: Float = 0
+  private var wasConcealing = false
+  // ── Real speech instead of a quiet room ────────────────────────────────────
+  //
+  // Every audio measurement in this project so far was taken with whatever the
+  // microphone happened to hear, which at six in the morning is a quiet room --
+  // near-silence plus noise. Timing does not care what the samples contain, so m2e
+  // and the buffer behaviour are unaffected. QUALITY does: the concealment A/B came
+  // back saying that repeating the last waveform grain was WORSE than filling with
+  // zeros, which is true of noise (uncorrelated at 0.67 ms) and false of speech
+  // (a pitch period is 3-12 ms, so a 0.67 ms grain is a continuation). I was
+  // measuring the wrong signal and it produced a confident, inverted answer.
+  //
+  // The file replaces the samples AFTER the input unit has rendered, so every
+  // timestamp, every callback and every downstream stage is byte-for-byte the same
+  // path the microphone takes. Only the content changes.
+  private var srcSamples: UnsafeMutablePointer<Float>?
+  private var srcCount = 0
+  private var srcPos = 0
   var acoustic = false
+
+  /// The pitch period of what was just playing, by normalised autocorrelation.
+  /// Coarse-to-fine so it fits in a render callback: decimated by four over the
+  /// whole 80-500 Hz range, then refined at full resolution around the winner.
+  /// Returns 0 when the history has no signal in it -- repeating silence at an
+  /// invented period is just a slower way of outputting zeros.
+  private func findPeriod() -> Int {
+    let W = 480                              // 10 ms of evidence
+    var e0: Float = 0
+    for i in stride(from: 0, to: W, by: 4) {
+      let v = hist[(histW - 1 - i) & Audio.HMASK]
+      e0 += v * v
+    }
+    if e0 < 1e-6 { return 0 }
+
+    var best = 0
+    var bestScore: Float = 0
+    for lag in stride(from: Audio.PMIN, through: Audio.PMAX, by: 2) {
+      var num: Float = 0, den: Float = 0
+      for i in stride(from: 0, to: W, by: 4) {
+        let a = hist[(histW - 1 - i) & Audio.HMASK]
+        let b = hist[(histW - 1 - i - lag) & Audio.HMASK]
+        num += a * b
+        den += b * b
+      }
+      if den < 1e-9 { continue }
+      let score = num / den.squareRoot()
+      if score > bestScore { bestScore = score; best = lag }
+    }
+    if best == 0 { return 0 }
+
+    // Refine. A period wrong by one sample is a phase error of 1/48000 s at the
+    // seam, which is exactly the click this is meant to remove.
+    var fine = best
+    var fineScore: Float = 0
+    for lag in max(Audio.PMIN, best - 3)...min(Audio.PMAX, best + 3) {
+      var num: Float = 0, den: Float = 0
+      for i in 0..<W {
+        let a = hist[(histW - 1 - i) & Audio.HMASK]
+        let b = hist[(histW - 1 - i - lag) & Audio.HMASK]
+        num += a * b
+        den += b * b
+      }
+      if den < 1e-9 { continue }
+      let score = num / den.squareRoot()
+      if score > fineScore { fineScore = score; fine = lag }
+    }
+    return fine
+  }
+
+  /// One concealed sample: read forward through history, wrapping back by exactly
+  /// one pitch period, so the repetition happens where the waveform already
+  /// repeats itself instead of wherever the packet happened to end.
+  @inline(__always) private func plcNext() -> Float {
+    if plcPeriod <= 0 { return 0 }
+    let v = hist[plcCursor & Audio.HMASK]
+    plcCursor += 1
+    if plcCursor >= histW { plcCursor -= plcPeriod }
+    plcSamples += 1
+    // Hold the level for 10 ms, then fade over 40 ms. A voice that stops dead is
+    // a click; a voice that hangs on forever is a robot.
+    let ms = Double(plcSamples) / SR * 1000.0
+    let g: Float = ms <= 10 ? 1 : Float(max(0.0, 1.0 - (ms - 10) / 40.0))
+    return v * g
+  }
+
+  /// The worst sample-to-sample step in the window around a seam.
+  @inline(__always) private func noteEdge(_ val: Float) {
+    if edgeWinLeft > 0 {
+      let step = abs(val - prevOut)
+      if step > edgeWinMax { edgeWinMax = step }
+      edgeWinLeft -= 1
+      if edgeWinLeft == 0 { jumpAtEdge.add(Double(edgeWinMax)) }
+    }
+  }
+
+  /// Load a file as 48 kHz mono float32 to stand in for the microphone.
+  func loadAudioSource(_ path: String) -> String {
+    guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)) else {
+      return "cannot open \(path)"
+    }
+    guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SR,
+                                  channels: 1, interleaved: false),
+          let conv = AVAudioConverter(from: file.processingFormat, to: fmt) else {
+      return "cannot convert \(path) to 48 kHz mono"
+    }
+    let frames = AVAudioFrameCount(file.length)
+    guard let inBuf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames),
+          (try? file.read(into: inBuf)) != nil else { return "cannot read \(path)" }
+    let outCap = AVAudioFrameCount(Double(file.length) * SR / file.processingFormat.sampleRate) + 4096
+    guard let outBuf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: outCap) else { return "no buffer" }
+    var done = false
+    var err: NSError?
+    conv.convert(to: outBuf, error: &err) { _, status in
+      if done { status.pointee = .noDataNow; return nil }
+      done = true; status.pointee = .haveData; return inBuf
+    }
+    if let e = err { return "convert failed: \(e.localizedDescription)" }
+    let n = Int(outBuf.frameLength)
+    guard n > 0, let ch = outBuf.floatChannelData?[0] else { return "no samples in \(path)" }
+    let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
+    buf.update(from: ch, count: n)
+    srcSamples = buf
+    srcCount = n
+    srcPos = 0
+    return "audio source: \(path) -- \(n) samples, \(String(format: "%.1f", Double(n) / SR)) s, looping"
+  }
   private var acPlayAt: UInt64 = 0        // host time of the impulse we emitted
   private var acWaiting = false
   private var acNext: UInt64 = 0          // do not fire again until this time
@@ -102,6 +304,10 @@ final class Audio {
     capScratch.initialize(repeating: 0, count: scratchBytes)
     prevBuf = .allocate(capacity: FPP)
     prevBuf.initialize(repeating: 0, count: FPP)
+    lastGood = .allocate(capacity: FPP)
+    lastGood.initialize(repeating: 0, count: FPP)
+    hist = .allocate(capacity: Audio.HIST)
+    hist.initialize(repeating: 0, count: Audio.HIST)
     inScratch = .allocate(capacity: 4096)
     inScratch.initialize(repeating: 0, count: 4096)
     inBufList = .allocate(capacity: 1)
@@ -272,6 +478,15 @@ final class Audio {
     let host0 = (ts.pointee.mFlags.contains(.hostTimeValid) && ts.pointee.mHostTime != 0)
       ? ts.pointee.mHostTime : Clock.now()
 
+    // Substitute the file, if one was given, before anything looks at the samples.
+    if let src = srcSamples, srcCount > 0 {
+      for k in 0..<Int(n) {
+        inScratch[k] = src[srcPos]
+        srcPos += 1
+        if srcPos >= srcCount { srcPos = 0 }
+      }
+    }
+
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.
     if acoustic, acWaiting {
@@ -421,7 +636,37 @@ final class Audio {
         let nSeq = Int32(nextI / Int64(FPP)), nOff = Int(nextI % Int64(FPP))
         let b = ring.present(nSeq) ? ring.samples[(Int(nSeq) % RING) * FPP + nOff] : a
         let fr = Float(absF - Double(absI))
-        out[i] = mute ? 0 : a + (b - a) * fr
+        // The value the algorithm produces, measured BEFORE muting. Muting is a
+        // property of this test rig, not of the concealment, and a metric that
+        // reads zero for both arms because the speaker is off would have made
+        // this whole comparison meaningless while looking like a result.
+        var val = a + (b - a) * fr
+        if wasConcealing {
+          // Do not step into the returning signal either. Cross-fade its first
+          // 1.3 ms against the synthesis that is already running -- the real
+          // samples still play at their real time, they are only mixed, so this
+          // costs no latency at all.
+          wasConcealing = false
+          xfade = Audio.XFADE
+          edgeWinLeft = Audio.XFADE * 2
+          edgeWinMax = 0
+        }
+        if xfade > 0 {
+          let w = Float(Audio.XFADE - xfade) / Float(Audio.XFADE)
+          let synth = plcNext()
+          val = val * w + synth * (1 - w)
+          xfade -= 1
+          if xfade == 0 { plcPeriod = 0; plcSamples = 0 }
+        }
+        out[i] = mute ? 0 : val
+        noteEdge(val)
+        prevOut = val
+        sigSumSq += Double(val) * Double(val); sigN += 1
+        // History is what was actually PLAYED, and only the good path writes it:
+        // feeding synthesis back in would make the cursor chase its own tail.
+        hist[histW & Audio.HMASK] = val; histW += 1
+        lastGood[off] = a
+        if off == FPP - 1 { haveLastGood = true; concealRun = 0 }
         if off == 0 {
           ring.played += 1
           // capture -> this sample at the DAC, plus the output hardware the
@@ -442,8 +687,40 @@ final class Audio {
           recvToPlay.add(Clock.msSigned(earHost, ring.recvHost[slot]))
         }
       } else {
-        out[i] = 0
+        // Repeat the last good packet, fading out over about 20 ms so a real
+        // outage becomes quiet rather than a held note.
+        if !wasConcealing {
+          // First concealed sample of this outage. The period is decided ONCE,
+          // here, from the sound that was actually playing -- not per sample, and
+          // not from a cached estimate belonging to a different phoneme.
+          wasConcealing = true
+          xfade = 0
+          plcSamples = 0
+          plcPeriod = 0
+          if !concealZeros, !concealGrain {
+            let t0 = Clock.now()
+            plcPeriod = findPeriod()
+            plcSearchUs.add(Clock.ms(Clock.now() - t0) * 1000.0)
+            if plcPeriod > 0 { plcPeriodMs.add(Double(plcPeriod) / SR * 1000.0) }
+            plcCursor = histW - max(plcPeriod, 1)
+          }
+          edgeWinLeft = Audio.XFADE * 2
+          edgeWinMax = 0
+        }
+        var val: Float = 0
+        if concealGrain {
+          if haveLastGood {
+            let fade = max(0.0, 1.0 - Double(concealRun) / 30.0)
+            val = lastGood[off] * Float(fade)
+          }
+        } else if !concealZeros {
+          val = plcNext()
+        }
+        out[i] = mute ? 0 : val
+        noteEdge(val)
+        prevOut = val
         if off == 0 {
+          if concealRun < 1_000_000 { concealRun += 1 }
           ring.concealed += 1
           // Already past this sequence and it never came: lost. Not yet reached
           // by the stream: starved, which a bigger buffer does address.

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.8"
+let VERSION = "0.10.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -246,6 +246,9 @@ let fecAllowed = !flag("no-fec")
 // --acoustic measures the real speaker->air->mic path, which is the only thing
 // that can settle whether the device-latency terms are already inside the
 // timestamps we add them to (17.89). It has to make a sound.
+if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
+audio.concealZeros = (arg("conceal") == "zeros")
+audio.concealGrain = (arg("conceal") == "grain")
 audio.acoustic = flag("acoustic")
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
 if audio.acoustic && audio.mute {
@@ -622,6 +625,7 @@ if audio.jitAuto {
     // is not a neutral act; it can be the thing that pushes it over.
     var fecRecovered0 = 0, fecLost0 = 0, fecWindows = 0
     var fecUselessUntil = 0.0, fecBackoff = 60.0
+    var fecLocalWarned = false
     // A LEVEL THAT FAILED IS REMEMBERED. Without this the controller shrinks,
     // hears a click, grows, waits out its hold and shrinks into the same click
     // forever -- observed on this rig cycling 2 -> 1 -> 2 -> 1 with three
@@ -648,14 +652,34 @@ if audio.jitAuto {
       //
       // Driven by LOST, not by concealed: concealment also covers starvation, and
       // a second copy of a packet that has not been sent yet is not a thing.
-      let lostNow = r.concealLost - lastLostForFec
-      lastLostForFec = r.concealLost
+      //
+      // AND IT IS THE PEER'S LOSS THAT MATTERS, not this machine's. Redundancy
+      // here protects the path from here to there, and only the far end can see
+      // what that path did. Reading the local counters -- which is what this did
+      // until now -- protects the wrong direction; it is right only when the two
+      // directions are equally lossy, which the loopback rig always is and a real
+      // asymmetric uplink never is.
+      let usePeer = wire.peerReportsLoss
+      let lostTotal = usePeer ? wire.peerRxLost : r.concealLost
+      let recTotal = usePeer ? wire.peerRxRecovered : r.recovered
+      if !usePeer, !fecLocalWarned, t > 20 {
+        fecLocalWarned = true
+        fputs("redundancy: the far end does not report its receive loss (older build), "
+            + "so this is steering on LOCAL loss -- correct only if both directions "
+            + "lose equally\n", stderr)
+      }
+      // A peer restart zeroes its counters, so the delta can be negative. That is
+      // not a repair, it is a new baseline.
+      var lostNow = lostTotal - lastLostForFec
+      if lostNow < 0 { lostNow = 0; fecRecovered0 = recTotal; fecLost0 = lostTotal }
+      lastLostForFec = lostTotal
       if fecAllowed, lostNow > 0, !audio.redundancy, t >= fecUselessUntil {
         audio.redundancy = true
-        fecRecovered0 = r.recovered
-        fecLost0 = r.concealLost
+        fecRecovered0 = recTotal
+        fecLost0 = lostTotal
         fecWindows = 0
-        fputs("redundancy ON (\(lostNow) lost in 2 s) -- each packet now carries the previous one\n", stderr)
+        fputs("redundancy ON (\(lostNow) lost in 2 s\(usePeer ? ", as reported by the far end" : ", LOCAL -- peer does not report")) "
+            + "-- each packet now carries the previous one\n", stderr)
         fecCalm = 0
       } else if audio.redundancy {
         fecWindows += 1
@@ -663,8 +687,8 @@ if audio.jitAuto {
         // recovery rate this low means the losses are bursts, and an offset of one
         // packet cannot reach past a burst -- so the bandwidth is being spent for
         // almost nothing and is better not spent.
-        let rec = r.recovered - fecRecovered0
-        let lost = r.concealLost - fecLost0
+        let rec = max(0, recTotal - fecRecovered0)
+        let lost = max(0, lostTotal - fecLost0)
         if fecWindows >= 5, rec + lost >= 20 {
           let rate = Double(rec) / Double(rec + lost)
           if rate < 0.4 {
@@ -827,6 +851,25 @@ func reportLoop() {
   // Where the milliseconds actually are. cap->send is this machine's send side;
   // recv->play is this machine's receive side including the jitter buffer. What
   // m2e has left over after those two and the two device latencies is the wire.
+  if let j = audio.jumpAtEdge.p(0.95), audio.jumpAtEdge.count > 4 {
+    let rms = audio.sigRms
+    fputs("  conceal edges: \(audio.jumpAtEdge.count) sampled, step p95 \(String(format: "%.4f", j))"
+        + "  signal rms \(String(format: "%.4f", rms))"
+        + (rms > 1e-9 ? "  step/rms \(String(format: "%.2f", j / rms))" : "  step/rms n/a (silent input)")
+        + " (\(audio.concealZeros ? "zeros" : audio.concealGrain ? "grain repeat" : "pitch plc"))\n", stderr)
+    // The search runs on the render thread. If it ever approached the callback
+    // budget it would cause the very glitch it exists to prevent, so its cost is
+    // printed beside the result rather than argued about.
+    if let us = audio.plcSearchUs.p(0.95), audio.plcSearchUs.count > 0 {
+      let budgetUs = Double(FPP) / SR * 1_000_000.0
+      fputs("  plc: \(audio.plcSearchUs.count) searches, p95 \(String(format: "%.0f", us)) us"
+          + " of a \(String(format: "%.0f", budgetUs)) us callback (\(String(format: "%.1f", us / budgetUs * 100))%)"
+          + (audio.plcPeriodMs.p(0.50) != nil
+             ? ", period p50 \(String(format: "%.2f", audio.plcPeriodMs.p(0.50)!)) ms"
+               + " (\(String(format: "%.0f", 1000.0 / audio.plcPeriodMs.p(0.50)!)) Hz)" : ", no pitch found")
+          + "\n", stderr)
+    }
+  }
   if audio.acoustic {
     let heard = audio.acRound.p(0.50)
     let devSum = audio.inLatencyMs + audio.outLatencyMs

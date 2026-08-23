@@ -436,11 +436,12 @@ final class Wire {
   /// the same packet.
   func probeAllCandidates() {
     guard !locked else { return }
-    var out = [UInt8](repeating: 0, count: TPKT)
+    var out = [UInt8](repeating: 0, count: TPKTX)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
       p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
+      appendRxReport(p)
     }
     for c in candidates {
       var a = c
@@ -462,6 +463,28 @@ final class Wire {
   /// the past, and the only evidence a path still works is traffic on it.
   private(set) var lastRecvHost: UInt64 = 0
   private(set) var relocks = 0
+
+  /// What the PEER has lost and recovered on the path FROM HERE. Cumulative, so
+  /// a reader that samples at any cadence gets a true delta -- a windowed average
+  /// read on the wrong cadence has inverted an A/B in this project before.
+  private(set) var peerRxLost: Int = 0
+  private(set) var peerRxRecovered: Int = 0
+  /// Whether the far end reports at all. False means an older build, and the
+  /// controller must then fall back to the local numbers and SAY SO -- a silent
+  /// fallback to the wrong signal is the bug this field exists to fix.
+  private(set) var peerReportsLoss = false
+  /// The ring whose counters get reported to the peer. Set when the receive loop
+  /// starts; nil before that, which reports zeros and is harmless.
+  private weak var reportRing: RecvRing?
+
+  /// Append this machine's receive-side counters to a time-sync packet.
+  private func appendRxReport(_ p: UnsafeMutableRawBufferPointer) {
+    let r = reportRing
+    let lost = UInt32(truncatingIfNeeded: r?.concealLost ?? 0)
+    let rec = UInt32(truncatingIfNeeded: r?.recovered ?? 0)
+    p.storeBytes(of: lost.littleEndian, toByteOffset: TPKT, as: UInt32.self)
+    p.storeBytes(of: rec.littleEndian, toByteOffset: TPKT + 4, as: UInt32.self)
+  }
 
   /// Nothing has arrived for a while, so the address we locked onto is no longer
   /// true. Reasons this happens on a real daily call and not just in a test: the
@@ -510,16 +533,18 @@ final class Wire {
   /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
   /// media socket so it measures the path the media actually takes.
   func sendTimeProbe() {
-    var out = [UInt8](repeating: 0, count: TPKT)
+    var out = [UInt8](repeating: 0, count: TPKTX)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
       p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
+      appendRxReport(p)
     }
     out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
   }
 
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
+    reportRing = ring
     // One buffer big enough for either kind. Audio and video share the socket, so
     // the loop dispatches on the magic rather than owning two sockets: two ports
     // means two NAT bindings, and the second one is the one that fails.
@@ -610,18 +635,31 @@ final class Wire {
         let t4 = Clock.now()   // stamp FIRST: everything after this is our own cost
         let kind = (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
         let t1 = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        // The far end's view of the path FROM HERE, on both the request and the
+        // reply, so the report flows at the full probe rate in both directions.
+        if plainN >= TPKTX {
+          let l = (plain + TPKT).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          let rv = (plain + TPKT + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          // Taken as-is. These CAN go backwards -- a peer restart zeroes them --
+          // so the reader has to tolerate a negative delta rather than this end
+          // pretending the counter is monotonic when it is not.
+          peerRxLost = Int(l)
+          peerRxRecovered = Int(rv)
+          peerReportsLoss = true
+        }
         if kind == 0 {
           // A request. Reply from THIS thread, immediately -- handing it to
           // another thread would put that thread's scheduling delay inside t3-t2,
           // where it is indistinguishable from network asymmetry and biases the
           // offset by half of it.
-          var out = [UInt8](repeating: 0, count: TPKT)
+          var out = [UInt8](repeating: 0, count: TPKTX)
           out.withUnsafeMutableBytes { p in
             p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
             p.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 4, as: UInt32.self)
             p.storeBytes(of: t1.littleEndian, toByteOffset: 8, as: UInt64.self)
             p.storeBytes(of: t4.littleEndian, toByteOffset: 16, as: UInt64.self)   // t2
             p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 24, as: UInt64.self)  // t3
+            appendRxReport(p)
           }
           out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count) }
         } else {
