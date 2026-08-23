@@ -52,18 +52,20 @@
   <h2>Where it is</h2>
   <table>
     <tr><th>Audio</th><th></th></tr>
-    <tr><td>mouth-to-ear</td><td class=n>21–24 ms</td></tr>
-    <tr><td>packets played</td><td class=n>100%</td></tr>
-    <tr><td>concealment</td><td class=n>0</td></tr>
-    <tr><td>jitter, p50 → p99</td><td class=n>0.03 ms</td></tr>
-    <tr><td>device buffer</td><td class=n>2.67 ms (128 frames)</td></tr>
+    <tr><td>mouth-to-ear</td><td class=n>15.6 ms</td></tr>
+    <tr><td>&hellip; at 1% packet loss</td><td class=n>16.3 ms</td></tr>
+    <tr><td>&hellip; at 3% bursty loss</td><td class=n>17.4 ms</td></tr>
+    <tr><td>concealment, clean path</td><td class=n>1 packet in 3 minutes</td></tr>
+    <tr><td>jitter buffer</td><td class=n>sizes itself, 2.7&ndash;30 ms</td></tr>
+    <tr><td>device buffer</td><td class=n>1.33 ms (64 frames)</td></tr>
     <tr><td>format</td><td class=n>32-bit float, uncompressed</td></tr>
     <tr><th>Video</th><th></th></tr>
-    <tr><td>capture → decoded</td><td class=n>3.96 ms p50, 4.9 ms p95</td></tr>
+    <tr><td>capture &rarr; decoded</td><td class=n>5.6 ms p50, 8.2 ms p95</td></tr>
     <tr><td>+ compositor (60 Hz)</td><td class=n>~8 ms mean, 16.7 ms worst</td></tr>
     <tr><td>hardware encode</td><td class=n>2.8 ms</td></tr>
     <tr><td>hardware decode</td><td class=n>1.1 ms</td></tr>
     <tr><td>frame rate</td><td class=n>30 fps sustained, 0 dropped</td></tr>
+    <tr><td>after a lost frame</td><td class=n>repairs itself, ~1 frame</td></tr>
     <tr><td>B-frames</td><td class=n>none, by design</td></tr>
   </table>
   <p class=note>Measured between two processes on one Mac, so the network contributes nothing
@@ -74,9 +76,13 @@
 
   <h2>Honest limits</h2>
   <p class=note>Apple silicon only. It is a command-line tool that can open a window, not yet
-     an app with buttons. There is no call setup: you type the other machine's address. No
-     encryption on the wire yet. No forward error correction, so real packet loss will show as
-     a brief freeze until the next keyframe. It is signed by us, not notarised by Apple, which
-     is exactly why the install goes through <code>curl</code>. And it is an early build being
-     changed several times a day — it updates itself, so it will not stay this one for long.</p>
+     an app with buttons. <strong>No encryption on the wire yet</strong> &mdash; audio and video
+     cross the internet in the clear, so treat a call as overheard. There is no forward error
+     correction: a lost packet is a concealed millisecond of audio, and a lost video frame is
+     repaired by asking for a new keyframe, which costs about one frame. Two machines behind
+     ordinary routers find each other with <code>--room</code> and talk directly, with no relay
+     in the middle; a symmetric NAT on either side will defeat that, and there is no fallback
+     yet when it does. It is signed by us, not notarised by Apple, which is exactly why the
+     install goes through <code>curl</code>. And it is an early build being changed several
+     times a day &mdash; it updates itself, so it will not stay this one for long.</p>
 </main>

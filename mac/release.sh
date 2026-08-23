@@ -57,7 +57,29 @@ echo "== deploy =="
 (cd "$REPO/tape-app" && npx wrangler deploy -c wrangler.prod.jsonc | tail -3)
 
 echo "== verify from the outside =="
-sleep 3
-curl -fsS https://room.tokkah.com/macos/manifest.json && echo
-curl -fsSI "https://room.tokkah.com/macos/dl/$TAR" | grep -iE '^(HTTP|content-length)' || true
+# This used to print the manifest and then say "released" regardless of what came
+# back. It printed a STALE 0.6.0 manifest immediately after shipping 0.7.0 and
+# still reported success -- so a genuinely failed deploy would have passed too.
+# A verification that cannot fail is decoration. Now it polls until the edge
+# agrees, checks the tarball is actually fetchable and hashes to what the
+# manifest promises, and exits non-zero if any of that is untrue.
+ok=""
+for i in $(seq 1 20); do
+  got="$(curl -fsS "https://room.tokkah.com/macos/manifest.json?cb=$$-$i" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
+  if [ "$got" = "$VER" ]; then ok=1; break; fi
+  printf '  edge still on %s, waiting (%s/20)\n' "${got:-?}" "$i"
+  sleep 3
+done
+[ -n "$ok" ] || { echo "FAILED: edge never served $VER"; exit 1; }
+
+# The updater will fetch this exact URL and check this exact hash. If either is
+# wrong, every running copy refuses the update -- so verify it the way the
+# updater will, not the way that is convenient.
+want="$(python3 -c 'import json;print(json.load(open("../tape-app/public/macos/manifest.json"))["sha256"])')"
+tmp="$(mktemp)"
+curl -fsS "https://room.tokkah.com/macos/dl/$TAR" -o "$tmp" || { echo "FAILED: tarball not fetchable"; exit 1; }
+have="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+rm -f "$tmp"
+[ "$want" = "$have" ] || { echo "FAILED: served tarball hashes $have, manifest promises $want"; exit 1; }
+echo "  manifest $VER, tarball fetched and hash matches"
 echo "released $VER"

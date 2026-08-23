@@ -1,1 +1,1 @@
-{"version":"0.6.0","url":"https://room.tokkah.com/macos/dl/tk-0.6.0.tar.gz","sha256":"03e679615dc7e79d661f4985ab3d98e68521a63a25c138aa25a877b099a6f08d","size":111503,"notes":"clock sync: m2e and g2g are now measurable between two machines; wire-format mismatch named instead of silent"}
+{"version":"0.7.1","url":"https://room.tokkah.com/macos/dl/tk-0.7.1.tar.gz","sha256":"5aa8f7de9cd8c43a59718327baadaeca637fb168e1e859db780eb70b333de324","size":117430,"notes":"release verification actually verifies now"}
