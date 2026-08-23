@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.25.0"
+let VERSION = "0.26.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -57,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -540,7 +540,7 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 // an empty pipe and reports it as video.
 // AIM AT VISUALLY LOSSLESS AND RETREAT WHEN THE LINK SAYS NO. `--vquality <n>`
 // caps it; `--vquality 0` reproduces the old always-unset behaviour.
-let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) })
+let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) }, hold: flag("vq-hold"))
 // ── Prove a live encoder property, or do not believe it ─────────────────────
 //
 // `--vq-step 30:400000` drops the bitrate ceiling to 400 kbps at t=30 s on an
@@ -1435,7 +1435,7 @@ func reportLoop() {
     fputs("  packet gate: \(audio.offZeroMiss) of \(audio.renderTicks) callbacks crossed no"
         + " packet boundary, longest run \(audio.offZeroRunMax)"
         + " (\(String(format: "%.0f", Double(audio.offZeroRunMax) * Double(Audio.devBuf) / SR * 1000)) ms)"
-        + "  n \(audio.nHist.sorted { $0.key < $1.key }.map { "\($0.key)x\($0.value)" }.joined(separator: " "))\n", stderr)
+        + "  n \(audio.nHistDescribe)\n", stderr)
     fputs("  buffer \(Audio.devBuf) frames (\(String(format: "%.2f", budgetUs / 1000)) ms):"
         + " skips \(audio.capSkips)/\(audio.capTicks) in, \(audio.renderSkips)/\(audio.renderTicks) out"
         + "  renderErrs \(audio.xruns)"
@@ -1505,8 +1505,24 @@ func reportLoop() {
         + "  mic \(String(format: "%.2f", audio.inLatencyMs))"
         + "  spk \(String(format: "%.2f", audio.outLatencyMs))"
         + "  = \(String(format: "%.2f", acct)) ms accounted"
-        + (audio.m2eLast > 0 ? ", m2e \(String(format: "%.2f", audio.m2eLast))"
-           + ", unexplained \(String(format: "%.2f", audio.m2eLast - acct))" : "") + "\n", stderr)
+        // ── NAME THE PROPAGATION, OR THE CHECK IS USELESS ────────────────────
+        //
+        // This said "unexplained 104.89" on an antipodal call, where 103 ms of it
+        // was the speed of light. A residual that is 98% propagation trains a
+        // reader to ignore the line, which is the opposite of what an accounting
+        // line is for -- and this project's whole target is stated as overhead
+        // ABOVE propagation, so the interesting number was the one being buried.
+        //
+        // rtt/2 is the one-way wire time the clock probes measured, so it is
+        // subtracted explicitly and what remains is genuinely unnamed.
+        + (audio.m2eLast > 0 ? { () -> String in
+            let wire = (tsync.bestRttMs ?? 0) / 2.0
+            let left = audio.m2eLast - acct - wire
+            return ", m2e \(String(format: "%.2f", audio.m2eLast))"
+                 + "  = wire \(String(format: "%.2f", wire)) (rtt/2)"
+                 + " + \(String(format: "%.2f", acct)) accounted"
+                 + " + \(String(format: "%.2f", left)) unnamed"
+          }() : "") + "\n", stderr)
   }
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
@@ -1521,33 +1537,42 @@ func reportLoop() {
     // Stashed for the telemetry beat at the end of the loop. These deltas only
     // exist inside this block, and a beat built before it ran said nothing at all
     // about the picture -- on a video call, which is most of them.
-    videoBeat = [
+    // ── PUBLISHED WITH ONE STORE, NOT MUTATED IN PLACE ───────────────────────
+    //
+    // `videoBeat` is iterated by audioBeat(), which the shutdown signal handler
+    // also calls -- from a different queue. Mutating a Dictionary in place while
+    // another thread walks it is the same defect that crashed the render-callback
+    // histogram, just rarer because it needs the call to be ending. Built into a
+    // local and assigned once: a reference store, so a reader sees the old map or
+    // the new one and both are whole.
+    var vb: [String: Any] = [
       "v_enc_ps": sv, "v_dec_ps": dv, "v_mbps": mbps, "v_bytes_frame": perFrame,
       "v_frags": vasm.fragsIn, "v_frames_lost": vasm.missing,
       "v_partial_drops": vasm.dropped, "v_dec_fails": vdec.decFails,
       "v_no_fmt": vdec.noFormat, "v_repair_keys": keyAsksOnLoss,
       "v_luma": venc?.lastLuma ?? -1, "v_motion": venc?.lastDiff ?? -1,
     ]
-    if let v = e.p(0.50) { videoBeat["v_enc_ms_p50"] = v }
-    if let v = dl.p(0.50) { videoBeat["v_dec_ms_p50"] = v }
-    videoBeat["v_q_level"] = vq.level
-    videoBeat["v_q_downs"] = vq.stepDowns
-    videoBeat["v_q_ups"] = vq.stepUps
-    if let q = venc?.qualityNow { videoBeat["v_quality"] = q }
-    videoBeat["v_dq_queued"] = dq.queued
-    videoBeat["v_dq_inline_full"] = dq.inlineFull
-    videoBeat["v_dq_inline_big"] = dq.inlineTooBig
-    videoBeat["v_dq_depth_max"] = dq.maxDepth
-    if let d = display { videoBeat["v_shown"] = d.shown; videoBeat["v_enq_fail"] = d.enqueueFails }
+    if let v = e.p(0.50) { vb["v_enc_ms_p50"] = v }
+    if let v = dl.p(0.50) { vb["v_dec_ms_p50"] = v }
+    vb["v_q_level"] = vq.level
+    vb["v_q_downs"] = vq.stepDowns
+    vb["v_q_ups"] = vq.stepUps
+    if let q = venc?.qualityNow { vb["v_quality"] = q }
+    vb["v_dq_queued"] = dq.queued
+    vb["v_dq_inline_full"] = dq.inlineFull
+    vb["v_dq_inline_big"] = dq.inlineTooBig
+    vb["v_dq_depth_max"] = dq.maxDepth
+    if let d = display { vb["v_shown"] = d.shown; vb["v_enq_fail"] = d.enqueueFails }
     if let m = mdisplay {
-      videoBeat["v_shown"] = m.shown
+      vb["v_shown"] = m.shown
       // Coverage travels WITH the number, because a percentile over a tenth of the
       // frames is not a latency -- and it once looked like the best result of the
       // day. The dashboard can refuse to draw it; it cannot invent the coverage
       // after the fact.
-      videoBeat["v_glass_cov"] = m.shown > 0 ? Double(m.present.count) / Double(m.shown) : 0
-      if let v = m.present.p(0.50) { videoBeat["v_glass_ms_p50"] = v }
+      vb["v_glass_cov"] = m.shown > 0 ? Double(m.present.count) / Double(m.shown) : 0
+      if let v = m.present.p(0.50) { vb["v_glass_ms_p50"] = v }
     }
+    videoBeat = vb
     fputs("  video  enc \(sv)/s  dec \(dv)/s  \(String(format: "%.2f", mbps)) Mbps  \(perFrame) B/frame"
         + "  luma \(venc?.lastLuma ?? -1) motion \(venc?.lastDiff ?? -1)"
         + "  encLat \(f(e.p(0.50)))  decLat \(f(dl.p(0.50)))"

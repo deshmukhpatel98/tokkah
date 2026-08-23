@@ -11152,3 +11152,86 @@ floor (1.33) and the render lead (1.34). Halving the packet would buy 0.33 ms an
 cost roughly 100% more audio bandwidth, because the header is already larger than the
 payload. There is no large software win left on loopback, which means the remaining
 work is on the things loopback cannot show.
+
+## 17.109 A dictionary on the realtime thread, found by not shrugging
+
+An A/B arm died after three seconds with no message. It did not reproduce, which is
+the point at which a measurement gets rerun and the death gets forgotten. The crash
+report says otherwise:
+
+```
+EXC_BAD_ACCESS (SIGSEGV) at 0x8000000000000010
+Dictionary.count.getter <- _copyCollectionToContiguousArray
+  <- Sequence.sorted(by:) <- reportLoop()
+```
+
+`nHist` — the histogram of frame counts CoreAudio asks for — was `[Int: Int]`,
+incremented **inside the render callback** and sorted from both the reporter and the
+watchdog. Swift's Dictionary is not thread-safe, so an insert that triggered a
+rehash freed the storage a reader was walking. It is rare because a *new* key is
+rare: `n` is 16 on this device for 176,561 consecutive callbacks. It needs a new
+bucket to appear at the same moment a reader is copying, and then the process is
+gone. On a live call, with no message. A user reports that as "it randomly quit".
+
+Now a fixed `[Int]` indexed by `n`, with everything at or above 4096 in the last
+bucket. It cannot rehash and cannot allocate — which is what a realtime audio thread
+requires of every line in it anyway — and the worst a concurrent increment can do is
+lose a count. A diagnostic missing a digit instead of a process missing its address
+space.
+
+**The class, not the instance.** Auditing every `nonisolated(unsafe)` collection
+found one more: `videoBeat` is mutated key-by-key by the reporter and iterated by
+`audioBeat()`, which the shutdown signal handler also calls from a different queue.
+Same defect, rarer, because it needs the call to be ending. It is now built into a
+local and published with a single reference store, so a reader sees the old map or
+the new one and both are whole.
+
+Three 60 s soaks of the configuration that crashed: both ends survived all three,
+zero crash reports, histogram intact.
+
+### And the retreat at 1% loss turns out to be right
+
+17.106's controller drops to the quality floor on any sustained outbound loss, which
+looked far too aggressive: 1% loss is an ordinary internet path, and the floor is
+35.6 dB. Testing it needed a control arm that could actually hold a level —
+`--vquality` sets a *ceiling* and the controller descends from it anyway, so the
+first attempt at this A/B pinned neither arm and measured nothing. `--vq-hold`
+freezes it.
+
+Three runs, 1% loss both directions, one end held at each level:
+
+| held at | frames lost of ~1800 | partial drops | keyframe asks | bandwidth |
+|---|---|---|---|---|
+| q0.7 "visually lossless" | 126 / 143 / 152 — **7.8%** | 125 / 143 / 152 | 67 / 75 / 73 | 2.4–2.9 Mbps |
+| q0.3 floor | 12 / 17 / 21 — **0.9%** | 3 / 1 / 0 | 9 / 15 / 21 | 0.08–0.09 Mbps |
+
+**8× fewer lost frames for 1/30th of the bandwidth.** The arithmetic predicted it: a
+q0.7 P-frame is 7,451 B — six fragments — so 1% loss breaks 1-0.99^6 = 5.9% of
+frames, while a 293 B q0.3 P-frame is one fragment and breaks 1%. Measured 7.8% and
+0.9%. A soft picture that moves beats a sharp one that stutters, and this is the
+first time that trade has been a measurement here rather than an assertion.
+
+### Naming the propagation
+
+The stage accounting said `unexplained 104.89` on an antipodal call, where 103 ms of
+it was the speed of light. A residual that is 98% propagation teaches a reader to
+skip the line — and this project states its own target as overhead *above*
+propagation, so the interesting number was the one being buried. It now reads:
+
+```
+m2e 116.66  = wire 103.0 (rtt/2) + 11.78 accounted + 1.88 unnamed
+```
+
+### The goal, on the native app
+
+Both directions impaired with delay, jitter and loss together — never a constant
+pipe:
+
+| distance | m2e p50 | p99 | propagation | **above light** | concealed |
+|---|---|---|---|---|---|
+| Delhi↔NL, 45 ms one-way, 4 ms jitter, 1% loss | 59.2 / 59.6 | 59.4 | 47.4 | **11.8 ms** | 0.032% |
+| **Antipodal, 100 ms one-way, 6 ms jitter, 1% loss** | **116.7 / 115.6** | 116.7 | 103.0 | **13.7 ms** | 0.068% |
+
+**116.7 ms at the worst distance on earth**, with the redundancy repairing 97% of
+what the path dropped. The 150 ms target has 33 ms of headroom at the antipodes,
+and 13.7 ms of what remains is not propagation.

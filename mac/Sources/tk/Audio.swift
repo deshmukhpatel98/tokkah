@@ -167,7 +167,35 @@ final class Audio {
   nonisolated(unsafe) var offZeroMiss = 0
   nonisolated(unsafe) var offZeroRun = 0
   nonisolated(unsafe) var offZeroRunMax = 0
-  nonisolated(unsafe) var nHist = [Int: Int]()
+  // ── A DICTIONARY ON THE REALTIME THREAD KILLED A CALL ─────────────────────
+  //
+  // This was `[Int: Int]`, incremented inside the render callback and sorted from
+  // both the reporter and the watchdog. Swift's Dictionary is not thread-safe, so
+  // an insert that triggered a rehash freed the storage a reader was walking:
+  //
+  //   EXC_BAD_ACCESS (SIGSEGV) at 0x8000000000000010
+  //   Dictionary.count.getter <- _copyCollectionToContiguousArray
+  //   <- Sequence.sorted(by:) <- reportLoop()
+  //
+  // A live call, 25 seconds in, no message -- the shape a user reports as "it
+  // randomly quit". Found because a measurement arm died and an unexplained
+  // process death got chased instead of shrugged at.
+  //
+  // A fixed array cannot rehash and cannot allocate, which is also what a
+  // realtime audio thread requires of every line in it. The worst a concurrent
+  // increment can now do is lose a count -- a diagnostic missing a digit instead
+  // of a process missing its address space.
+  static let N_HIST = 4096
+  nonisolated(unsafe) var nHist = [Int](repeating: 0, count: Audio.N_HIST + 1)
+  /// Non-empty buckets, formatted. `n` is a frame count, so anything at or above
+  /// the cap lands in the last bucket rather than being dropped silently.
+  var nHistDescribe: String {
+    var out: [String] = []
+    for (n, c) in nHist.enumerated() where c > 0 {
+      out.append("\(n == Audio.N_HIST ? ">=\(Audio.N_HIST)" : "\(n)")x\(c)")
+    }
+    return out.joined(separator: " ")
+  }
   nonisolated(unsafe) var cursorAheadMs = 0.0
   nonisolated(unsafe) var cursorAheadDone = false
   nonisolated(unsafe) var aheadRun = 0
@@ -962,7 +990,7 @@ final class Audio {
               + "*** accepted \(got)  played \(played)  concealed \(r.concealed)"
               + " (lost \(r.concealLost) starved \(r.concealStarved))  snaps \(r.snaps)"
               + "  renderTicks \(r2)  capCallbacks \(c)\n"
-              + "*** offZeroMiss \(self.offZeroMiss) run \(self.offZeroRun) max \(self.offZeroRunMax)  n \(self.nHist.sorted { $0.key < $1.key })\n"
+              + "*** offZeroMiss \(self.offZeroMiss) run \(self.offZeroRun) max \(self.offZeroRunMax)  n \(self.nHistDescribe)\n"
               + "*** Re-anchoring.\n\n", stderr)
           self.ring.pos = -1
           continue
@@ -1473,7 +1501,7 @@ final class Audio {
       offZeroMiss += 1; offZeroRun += 1
       if offZeroRun > offZeroRunMax { offZeroRunMax = offZeroRun }
     }
-    nHist[Int(n), default: 0] += 1
+    nHist[min(Int(n), Audio.N_HIST)] += 1
     ring.pos += Double(n) * ring.rate
 
     if acoustic, !mute, !acWaiting, dueHost > acNext {

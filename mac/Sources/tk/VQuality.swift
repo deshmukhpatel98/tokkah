@@ -61,7 +61,14 @@ final class VQuality {
   /// Seconds at the start of a call during which nothing counts as harm.
   private let warmup = 8
 
-  init(ceiling: Double? = nil) {
+  /// Freeze the controller at its ceiling. `--vquality 0.7` sets a ceiling and the
+  /// controller still descends from it, so there was no way to compare two levels
+  /// under identical impairment -- an A/B of "is retreating the right call" pinned
+  /// neither arm and measured nothing. A control arm has to be holdable.
+  private let held: Bool
+
+  init(ceiling: Double? = nil, hold: Bool = false) {
+    held = hold
     // A `--vquality` value pins the ceiling; without one the ceiling is the top
     // rung, which is the point of the exercise.
     if let c = ceiling {
@@ -79,6 +86,7 @@ final class VQuality {
   /// One tick per second, with what happened since the last one. Returns the new
   /// quality when it changed, so the caller only touches the encoder on a change.
   func tick(now: Double, framesLost: Int, concealed: Int, jitGrew: Bool) -> Double? {
+    if held { return nil }
     // ── Ignore the first seconds entirely ────────────────────────────────────
     //
     // A call's opening is full of harm that means nothing: the buffer finding its
@@ -115,7 +123,7 @@ final class VQuality {
   }
 
   var describe: String {
-    "q\(String(format: "%.1f", quality))"
+    (held ? "HELD q" : "q") + String(format: "%.1f", quality)
       + " (level \(level)/\(ceiling), \(stepDowns) down \(stepUps) up"
       + (refusedUps > 0 ? " \(refusedUps) up-refused" : "") + ")"
   }
