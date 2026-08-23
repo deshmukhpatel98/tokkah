@@ -1566,6 +1566,7 @@ func reportLoop() {
             "  keyframes \(v.keyFrames) avg \(v.keyFrames > 0 ? v.keyBytes / v.keyFrames : 0) B"
             + " | P \(v.pFrames) avg \(v.pFrames > 0 ? v.pBytes / v.pFrames : 0) B" } ?? "")
         + "  decodeq \(dq.queued) queued, depth<=\(dq.maxDepth)"
+
         + (dq.inlineFull + dq.inlineTooBig > 0
            ? "  INLINE \(dq.inlineFull) full + \(dq.inlineTooBig) oversize" : "")
         + (display != nil ? "  window \(display!.state) shown \(display!.shown) enqFail \(display!.enqueueFails) refresh \(String(format: "%.1f", display!.refreshMs))ms" : "")

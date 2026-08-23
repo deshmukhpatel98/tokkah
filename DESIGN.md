@@ -11098,3 +11098,57 @@ rig's noise floor for this measurement, which is worth knowing on its own.
 
 `--jit-shrink-margin` exists so the constant can be moved without a rebuild, because
 a number this consequential should not be reachable only by editing it.
+
+## 17.108 Negative result: protecting keyframes cannot fix a P-frame problem
+
+17.106 left the keyframe repair loop as "converges now instead of diverging, but it
+has not been designed." The obvious design was to protect the keyframe: there are no
+B-frames and the keyframe interval is effectively infinite, so one lost fragment
+breaks prediction until a keyframe arrives — and a keyframe is the biggest thing this
+program sends, so it is the likeliest frame to lose a fragment. Lose a fragment, ask
+for a keyframe, lose one of its fragments, ask again.
+
+The arithmetic was persuasive. A 20 KB keyframe is ~14 fragments and survives a 3%
+path 0.97^14 = 65% of the time; sent twice, 98.7%. And keyframes should then stop
+being needed, so the expected total ought to fall.
+
+It does not. Rotated, doubling off first, 110 s per arm, 3% loss one-directional:
+
+| arm | frames lost | keyframe asks | partial drops | sender's video |
+|---|---|---|---|---|
+| off | 146 | 78 | 71 | 0.15 Mbps |
+| **on** | 123 | 81 | 46 | **0.22 Mbps** |
+| off | 158 | 87 | 74 | 0.14 Mbps |
+| **on** | 147 | 100 | 58 | **0.25 Mbps** |
+
+**+62% video bandwidth for 11% fewer lost frames.** Reverted.
+
+The number that explains it is the one that did not move: keyframe asks, 78/87
+against 81/100. If protecting keyframes were breaking the loop, the asks would fall.
+They did not, because **the loop is driven by P-frame loss, not keyframe loss.** At
+quality 0.3 a P-frame is 910 B — a single fragment — so 3% loss kills ~0.9 frames
+per second, and each one costs a keyframe request. That is exactly the observed ask
+rate. The keyframe leg was never the bottleneck; it was just the leg with the
+impressive arithmetic attached to it.
+
+The real answer is periodic intra refresh or reference-picture selection, so that a
+lost P-frame does not require a full keyframe to recover from. VideoToolbox exposes
+neither for H.264. Recorded so the next attempt starts from the measurement instead
+of from the same persuasive arithmetic.
+
+### What the budget looks like now
+
+The app attributes its own mouth-to-ear, and at 9.23 ms there is 0.08 ms it cannot
+name:
+
+```
+stages: cap->send 1.67  recv->play 3.01  mic 1.88  spk 2.58  = 9.15 ms accounted,
+        m2e 9.23, unexplained 0.08
+```
+
+**4.46 ms of 9.23 is the microphone and the speaker.** The software half is one
+packet of fill (0.67), CoreAudio's input scheduling (0.67), the jitter buffer at its
+floor (1.33) and the render lead (1.34). Halving the packet would buy 0.33 ms and
+cost roughly 100% more audio bandwidth, because the header is already larger than the
+payload. There is no large software win left on loopback, which means the remaining
+work is on the things loopback cannot show.
