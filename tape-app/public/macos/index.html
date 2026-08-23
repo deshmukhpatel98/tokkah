@@ -25,6 +25,7 @@
   a { color:var(--accent); }
   .tag { display:inline-block; font-size:.72rem; letter-spacing:.09em; text-transform:uppercase;
          border:1px solid var(--line); color:var(--dim); border-radius:99px; padding:3px 10px; margin-bottom:1.6em; }
+  .sub2 { color: var(--dim, #8b93a3); font-size: 11px; font-weight: 400; }
 </style>
 <main>
   <div class=tag>early build · apple silicon · audio + video</div>
@@ -108,6 +109,24 @@
     <tr><td>other side changes network</td><td class=n>re-found in ~3 s</td></tr>
     <tr><td>B-frames</td><td class=n>none, by design</td></tr>
   </table>
+  <h2>Over distance</h2>
+  <table>
+    <tr><th>path</th><th>mouth-to-ear</th></tr>
+    <tr><td>same room</td><td class=n>9.2 ms</td></tr>
+    <tr><td>Delhi &harr; Netherlands<br><span class=sub2>45&nbsp;ms each way, 4&nbsp;ms jitter, 1% loss</span></td>
+        <td class=n>59.2 ms<br><span class=sub2>11.8 ms above the speed of light</span></td></tr>
+    <tr><td>opposite sides of the planet<br><span class=sub2>100&nbsp;ms each way, 6&nbsp;ms jitter, 1% loss</span></td>
+        <td class=n>116.7 ms<br><span class=sub2>13.7 ms above the speed of light</span></td></tr>
+    <tr><td>audio lost to the network, repaired</td><td class=n>97%</td></tr>
+    <tr><td>audio the listener never got</td><td class=n>0.07%</td></tr>
+  </table>
+  <p class=note><b>These two are a simulated path, not two real machines.</b> The delay, jitter and
+     loss are injected on one Mac &mdash; real distance is the next thing to measure, and it will be
+     worse in ways a rig cannot invent. What the numbers do establish is the part that is <em>not</em>
+     the speed of light: about 12&ndash;14 ms of it, whatever the distance. Light through fibre is the
+     floor nobody can move, so that residue is the only number worth optimising, and it is the one
+     quoted here.</p>
+
   <p class=note>Measured between two processes on one Mac, so the network contributes nothing
      and both ends share one clock — these are the pipeline itself, not an estimate. Audio and
      video ride one UDP socket, so there is one port and one hole to punch. Keyframes are sent

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.26.0"
+let VERSION = "0.27.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -57,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-vparity", "vq-harm-pct", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -81,6 +81,33 @@ for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   exit(2)
 }
 
+// ── WHAT `--video` ACCEPTS, SAID OUT LOUD ──────────────────────────────────
+//
+// The source used to be `videoArg == "camera" ? CameraSource() : FileSource(path:
+// videoArg)`, so EVERY other string was a filename. The launcher passed `--video
+// on` -- the obvious thing to write and the obvious thing to mean -- and it became
+// a hunt for a file called "on", which failed. So the double-clicked app never
+// once had a camera, and it never asked for a window either: a person opening
+// Tokkah.app got a name prompt and then an invisible process. Not a video calling
+// app, and the one defect a user notices before any amount of latency.
+//
+// Resolved HERE, beside the unknown-flag guard, because it used to be checked
+// after the peer rendezvous -- so a typo waited for someone to answer before
+// admitting it was a typo.
+func resolveVideoArg() -> String {
+  let v = arg("video") ?? "off"
+  if v == "off" || v == "camera" { return v }
+  if v == "on" || v == "cam" { return "camera" }
+  if FileManager.default.fileExists(atPath: v) { return v }
+  fputs("--video \(v): not \"camera\", not \"off\", and not a file that exists.\n"
+      + "  --video camera   the built-in camera\n"
+      + "  --video off      audio only\n"
+      + "  --video <path>   an .mp4/.mov file, for measuring things\n"
+      + "(a path containing spaces needs quoting)\n", stderr)
+  exit(2)
+}
+let videoArg = resolveVideoArg()
+
 // ── Double-clicked from the Finder? Ask where to call, then be a normal call ──
 //
 // After flag validation, so a typo is still refused, and before anything touches
@@ -91,7 +118,11 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   guard let room = Launcher.askRoom() else { exit(0) }   // closed the window
   // Video on by default here and off for the command line: someone who typed
   // `tk` is measuring something, someone who double-clicked wants a video call.
-  Launcher.reexec(room: room, extra: ["--video", "on"])
+  // A WINDOW, TOO. Without `--window` nothing ever creates one, so the app that
+  // was just double-clicked showed a name prompt and then vanished into the dock
+  // while running a perfectly good audio call nobody could see. A video calling
+  // app that opens no video is the one bug a user notices before any latency.
+  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"])
 }
 
 let listenPort = UInt16(arg("listen") ?? "7001") ?? 7001
@@ -115,6 +146,91 @@ if !flag("no-update") {
 
 guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) else {
   fputs("socket/bind failed on port \(listenPort)\n", stderr); exit(1)
+}
+
+// ── A WINDOW AND A PICTURE BEFORE THERE IS ANYONE TO CALL ────────────────────
+//
+// All of this used to happen AFTER the rendezvous, so double-clicking Tokkah.app
+// produced a name prompt and then nothing at all: no window, no camera light, no
+// sign the program was alive, for as long as it took the other person to join --
+// up to two minutes, and forever if they never did. Every latency number in this
+// file was irrelevant next to that, because the app did not look like it worked.
+//
+// So the window opens first, the camera starts first, and you watch yourself while
+// you wait. The title carries the state, because a window that shows a picture and
+// says nothing is indistinguishable from a call that has already connected.
+// Whether anything has been decoded from the far end yet. Switches the window from
+// self-view to the other person, and is the only thing that makes those two paths
+// mutually exclusive.
+nonisolated(unsafe) var sawRemote = false
+
+/// The window's title is the only status this app has. Set from whatever thread
+/// notices the state changed, hopped to main because AppKit requires it.
+func setWindowTitle(_ t: String) {
+  DispatchQueue.main.async { NSApplication.shared.windows.forEach { $0.title = t } }
+}
+var display: Display?
+var mdisplay: MetalDisplay?
+// --display metal draws the frame by hand so that (a) the time it actually
+// reaches the panel can be READ from Metal instead of inferred from a refresh
+// rate, and (b) --vsync 0 can skip the compositor's synchronised pass. Default
+// stays the AVSampleBufferDisplayLayer path until the measurement says otherwise.
+let displayKind = arg("display") ?? "avsbdl"
+if flag("window") {
+  // NSApplication FIRST. AppKit will build an NSWindow before the application
+  // object exists and simply never show it -- decode ran at 31 fps into a window
+  // that was not on screen, which looks like a display bug and is an ordering
+  // bug. Touching .shared here is what creates it.
+  let app = NSApplication.shared
+  app.setActivationPolicy(.regular)
+  if displayKind == "metal" {
+    if let m = MetalDisplay(vsyncOff: arg("vsync") == "0", fullscreen: flag("fullscreen")) {
+      m.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720)
+      mdisplay = m
+      fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on")"
+          + "\(m.fullscreen ? ", fullscreen" : ""), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
+    } else {
+      fputs("display: metal unavailable, falling back\n", stderr)
+    }
+  }
+  if mdisplay == nil {
+    let d = Display()
+    d.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720)
+    display = d
+  }
+}
+
+// The camera, started before there is anywhere to send it, so the preview is live
+// while waiting. The encoder attaches to this same instance later -- one camera,
+// opened once, so the permission prompt happens once and at the moment the person
+// is actually looking at the app.
+// Any source, not just the camera: a file source takes the identical path, which
+// is the only way this feature can be verified without a person present to click
+// Allow on a camera prompt. An instrument that cannot see the thing it tests
+// reports the same value as a real failure.
+var earlyCam: FrameSource?
+if videoArg != "off", display != nil || mdisplay != nil {
+  let c: FrameSource = videoArg == "camera"
+    ? CameraSource()
+    : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
+  c.onFrame = { pb, _ in
+    // Self-view. Replaced the moment a decoded frame from the far end arrives:
+    // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
+    // set so the two are never fighting over the same surface.
+    if sawRemote { return }
+    display?.show(pb)
+    mdisplay?.show(pb, at: Clock.now())
+  }
+  do {
+    try c.start()
+    earlyCam = c
+    fputs("preview: \(c.describe) on screen before the call connects\n", stderr)
+  } catch {
+    // Not fatal. A call with no camera is still a call, and saying so beats a
+    // blank window with no explanation.
+    fputs("preview: unavailable (\(error)) -- continuing without a picture\n", stderr)
+    setWindowTitle("Tokkah — no camera; waiting for the other side")
+  }
 }
 
 // --stun: print what the outside world sees this socket as, and exit. The
@@ -187,11 +303,26 @@ if let room = arg("room") {
       // an address known to work.
       wire.setPeer(ip: p.ip, port: p.port)
       fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
+      setWindowTitle("Tokkah — connecting")
       found = true
       break
     }
     if attempt == 1 { fputs("room \(room): waiting for the other side...\n", stderr) }
-    usleep(2_000_000)
+    // PUMP THE EVENT LOOP, do not just sleep. With a window open this loop owns
+    // the main thread, and a main thread inside usleep is a window that does not
+    // draw, does not move and shows the spinning cursor -- which is worse than no
+    // window at all. Same hand-driven loop Launcher.askRoom uses.
+    if display != nil || mdisplay != nil {
+      let app = NSApplication.shared
+      let until = Date().addingTimeInterval(2.0)
+      while Date() < until {
+        guard let e = app.nextEvent(matching: .any, until: until, inMode: .default, dequeue: true)
+        else { break }
+        app.sendEvent(e)
+      }
+    } else {
+      usleep(2_000_000)
+    }
   }
   if !found {
     fputs("room \(room): nobody else arrived in 2 minutes.\n", stderr)
@@ -556,7 +687,20 @@ let vqStep: (at: Double, q: Double)? = arg("vq-step").flatMap { spec in
   return (t, q)
 }
 var vqStepDone = false
-let videoArg = arg("video") ?? "off"
+let vParityOff = flag("no-vparity")
+var lastVqHarmed = false
+// ── WHAT `--video` ACCEPTS, SAID OUT LOUD ──────────────────────────────────
+//
+// This was `videoArg == "camera" ? CameraSource() : FileSource(path: videoArg)`,
+// so EVERY other string was a filename. The launcher passes `--video on`, which
+// is the obvious thing to write and the obvious thing to mean -- and it became a
+// hunt for a file called "on", which failed, so the double-clicked app has never
+// once had a camera. It also never asked for a window. A person opening Tokkah.app
+// got a name prompt and then an invisible process: not a video calling app.
+//
+// "on" is now an alias for the camera, and an argument that is neither a known
+// keyword nor an existing file is refused with the list of what works, rather than
+// being quietly treated as a path that happens not to exist.
 var vsource: FrameSource?
 var venc: VEncoder?
 let vdec = VDecoder()
@@ -591,36 +735,6 @@ vasm.onFrame = { data, host in
 // verification; everything else is a proxy for it.
 // --window opens a real window and shows the peer. Without it tk is a meter;
 // with it, it is a call.
-var display: Display?
-var mdisplay: MetalDisplay?
-// --display metal draws the frame by hand so that (a) the time it actually
-// reaches the panel can be READ from Metal instead of inferred from a refresh
-// rate, and (b) --vsync 0 can skip the compositor's synchronised pass. Default
-// stays the AVSampleBufferDisplayLayer path until the measurement says otherwise.
-let displayKind = arg("display") ?? "avsbdl"
-if flag("window") {
-  // NSApplication FIRST. AppKit will build an NSWindow before the application
-  // object exists and simply never show it -- decode ran at 31 fps into a window
-  // that was not on screen, which looks like a display bug and is an ordering
-  // bug. Touching .shared here is what creates it.
-  let app = NSApplication.shared
-  app.setActivationPolicy(.regular)
-  if displayKind == "metal" {
-    if let m = MetalDisplay(vsyncOff: arg("vsync") == "0", fullscreen: flag("fullscreen")) {
-      m.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
-      mdisplay = m
-      fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on")"
-          + "\(m.fullscreen ? ", fullscreen" : ""), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
-    } else {
-      fputs("display: metal unavailable, falling back\n", stderr)
-    }
-  }
-  if mdisplay == nil {
-    let d = Display()
-    d.open(title: "tokkah — \(peerHost)", w: 1280, h: 720)
-    display = d
-  }
-}
 
 let dumpTo = arg("dump")
 var dumped = false
@@ -646,6 +760,13 @@ vdec.onDecoded = { img, capHost in
   // offset this is not a latency, it is the difference between two epochs.
   if gThetaValid { vg2g.add(Clock.msSigned(Clock.now(), capHost) + gThetaMs) }
   vDecoded += 1
+  // The other person's first frame. From here the window shows them instead of
+  // you, and says so.
+  if !sawRemote {
+    sawRemote = true
+    setWindowTitle("Tokkah — connected")
+    fputs("the other side's picture is on screen\n", stderr)
+  }
   display?.show(img)
   // Stamped HERE, not inside show(): the measurement is decode-to-glass, and a
   // timestamp taken after the draw call would quietly exclude the draw.
@@ -670,21 +791,33 @@ vdec.onDecoded = { img, capHost in
 
 if videoArg != "off" {
   do {
-    let src: FrameSource = videoArg == "camera"
-      ? CameraSource()
-      : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
+    // Reuse the preview camera. Opening a second AVCaptureSession on the same
+    // device is how you get two permission prompts and one black picture.
+    let src: FrameSource = earlyCam
+      ?? (videoArg == "camera" ? CameraSource()
+                              : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30))
+    let reusing = earlyCam != nil
     // The controller owns the quality from here; the flag only sets its ceiling.
     // `--vquality 0` pins it to the old unset behaviour.
     let e = try VEncoder(width: 1280, height: 720,
                          bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000,
                          quality: vq.quality)
     e.requestKeyframe()
-    src.onFrame = { pb, host in e.encode(pb, hostTime: host) }
+    src.onFrame = { pb, host in
+      e.encode(pb, hostTime: host)
+      // Keep showing yourself until the other person's picture arrives.
+      if !sawRemote {
+        display?.show(pb)
+        mdisplay?.show(pb, at: Clock.now())
+      }
+    }
     e.onEncoded = { data, host, _ in
       wire.sendVideo(seq: vseq, capHost: host, payload: data, scratch: vscratch)
       vseq += 1; vSentFrames += 1; vBytesSent += data.count
     }
-    try src.start()
+    // Already running if it was the preview camera; starting a live session again
+    // throws.
+    if !reusing { try src.start() }
     vsource = src; venc = e
     fputs("video: \(src.describe) -> H.264 1280x720, no B-frames, realtime\n", stderr)
   } catch {
@@ -1591,6 +1724,11 @@ func reportLoop() {
             "  keyframes \(v.keyFrames) avg \(v.keyFrames > 0 ? v.keyBytes / v.keyFrames : 0) B"
             + " | P \(v.pFrames) avg \(v.pFrames > 0 ? v.pBytes / v.pFrames : 0) B" } ?? "")
         + "  decodeq \(dq.queued) queued, depth<=\(dq.maxDepth)"
+        + (wire.parityFragsSent > 0 || vasm.parityUsed > 0
+           ? "  parity sent \(wire.parityFragsSent) got \(vasm.parityUsed)"
+             + " REPAIRED \(vasm.parityRecovered)"
+             + " (\(vasm.parityLate) arrived after the frame was already whole)"
+             + (vasm.parityWasted > 0 ? " wasted \(vasm.parityWasted)" : "") : "")
 
         + (dq.inlineFull + dq.inlineTooBig > 0
            ? "  INLINE \(dq.inlineFull) full + \(dq.inlineTooBig) oversize" : "")
@@ -1678,8 +1816,39 @@ func reportLoop() {
             + "direction and can lower the picture for a problem it cannot fix\n", stderr)
       }
     }
+    // Same evidence, same direction, a different action: a path that is dropping
+    // packets gets a parity fragment per frame, so a sharp picture stops being
+    // fragile. `--no-vparity` exists so it can be A/B'd against itself. Armed on
+    // ANY loss, because it is cheap and it measured out cheaper than the keyframe
+    // storm it prevents.
+    wire.videoParity = !vParityOff && outboundHarm > 0
+
+    // ── HARM IS A RATE, NOT A COUNT ────────────────────────────────────────────
+    //
+    // `outboundHarm > 0` collapsed the picture to the floor on any path losing
+    // anything at all, and 1% loss is an ordinary internet path. That was the
+    // right call while a sharp picture was fragile -- measured: q0.7 lost 7.8% of
+    // frames against q0.3's 0.9%. Parity changes the answer. At 1% loss q0.7 with
+    // parity loses 0.26%, which is BETTER than the floor was without it, so
+    // retreating now costs quality and buys nothing.
+    //
+    // Parity recovers any ONE lost fragment of seven, so it fails when two go
+    // missing: 0.2% of frames at 1% loss, 1.7% at 3%, 4.5% at 5%. The picture is
+    // therefore safe to hold up to roughly 3%, and 2% is the line -- expressed as
+    // a fraction of what was sent, so it means the same thing at every packet rate
+    // rather than being a hidden function of one.
+    let sentNow = max(1, d.sent)
+    let harmRate = Double(outboundHarm) / Double(sentNow)
+    let HARM_RETREAT = Double(arg("vq-harm-pct") ?? "2") ?? 2.0
+    let harmed = harmRate * 100.0 > HARM_RETREAT
+    if harmed != lastVqHarmed {
+      lastVqHarmed = harmed
+      fputs("  picture: outbound loss \(String(format: "%.2f", harmRate * 100))% of packets"
+          + " -- \(harmed ? "above" : "below") the \(String(format: "%.1f", HARM_RETREAT))% line,"
+          + " so quality \(harmed ? "retreats" : "holds")\n", stderr)
+    }
     let changed = vq.tick(now: Double(beatTick),
-                          framesLost: outboundHarm,
+                          framesLost: harmed ? outboundHarm : 0,
                           concealed: 0,
                           jitGrew: false)
     lastVqLost = vasm.missing; lastVqConc = r.concealed; lastVqJit = audio.jitTarget

@@ -508,6 +508,9 @@ final class Wire {
   // bandwidth number is always really asking. `sentBytes` still measures what
   // reached the socket, so the difference is exactly the impairment.
   enum TxCls { case audio, video, probe, ctl }
+  /// Armed from the peer's own report of loss on the path from here. See sendVideo.
+  nonisolated(unsafe) var videoParity = false
+  nonisolated(unsafe) var parityFragsSent = 0
   private(set) var genAudio = 0, genVideo = 0, genProbe = 0, genCtl = 0
   /// Of `genAudio`, the bytes that were a second copy of an earlier packet. This
   /// is the price of loss repair, and it should be readable on its own.
@@ -917,8 +920,14 @@ final class Wire {
         let cap8 = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
         let frag = Int((plain + 16).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
         let nfrag = Int((plain + 18).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
-        if nfrag < 1 || nfrag > 4096 || frag >= nfrag { continue }
-        v.take(seq: seq, frag: frag, nfrag: nfrag, capHost: cap8, bytes: plain + VHDR, n: plainN - VHDR)
+        let vflags = Int((plain + 20).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
+        let isPar = vflags & 1 == 1
+        let parLast = Int((plain + 22).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
+        // A parity fragment rides at frag == nfrag, one past the data. Everything
+        // else must still be a real index, so the bound only relaxes for parity.
+        if nfrag < 1 || nfrag > 4096 || frag > nfrag || (!isPar && frag == nfrag) { continue }
+        v.take(seq: seq, frag: frag, nfrag: nfrag, capHost: cap8, bytes: plain + VHDR, n: plainN - VHDR,
+               parity: isPar, parLastLen: parLast)
         continue
       }
       if magic == KMAGIC { onKeyRequest?(); continue }

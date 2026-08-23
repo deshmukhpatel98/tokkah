@@ -129,7 +129,15 @@ final class VideoAssembler {
     var buf = [UInt8]()
     var sizes = [Int]()
     var capHost: UInt64 = 0
+    /// XOR of every data fragment, zero-padded to VPAYLOAD. One of these recovers
+    /// any single missing fragment. See `sendVideo`.
+    var par = [UInt8]()
+    var havePar = false
+    /// The final data fragment is short, and reconstructing it needs its length,
+    /// which the parity fragment carries. Every other fragment is exactly VPAYLOAD.
+    var parLastLen = 0
   }
+  private(set) var parityUsed = 0, parityRecovered = 0, parityWasted = 0, parityLate = 0
   private var slots = [Slot](repeating: Slot(), count: VRING)
   private(set) var complete = 0, dropped = 0, dupFrag = 0, fragsIn = 0
   // FRAMES THAT NEVER ARRIVED AT ALL.
@@ -149,8 +157,20 @@ final class VideoAssembler {
   private(set) var lastDone: Int32 = -1
   var onFrame: ((Data, UInt64) -> Void)?
 
-  func take(seq: Int32, frag: Int, nfrag: Int, capHost: UInt64, bytes: UnsafePointer<UInt8>, n: Int) {
+  func take(seq: Int32, frag: Int, nfrag: Int, capHost: UInt64, bytes: UnsafePointer<UInt8>, n: Int,
+            parity: Bool = false, parLastLen: Int = 0) {
     fragsIn += 1
+    // ── A LATE PARITY FRAGMENT IS NOT A RESTARTED SENDER ──────────────────────
+    //
+    // Parity is sent after the data, so on a healthy frame it arrives once the
+    // frame is already assembled and delivered -- 2472 of 2627 of them in one
+    // 90 s run, which is the mechanism working, not a fault. But `seq <= lastDone`
+    // is the restart detector's input, and 27 of these a second would keep
+    // `staleRun` climbing toward the 30 that declares the peer restarted and wipes
+    // every in-flight frame. Data fragments arriving in between reset it, so it
+    // does not fire today -- which is to say it is one video stall away from
+    // firing. Discarded here, before it can be mistaken for evidence.
+    if parity, seq <= lastDone { parityLate += 1; return }
     // Same restart trap as the audio ring, and just as fatal: after a peer
     // restart every frame number is <= lastDone, so every frame is discarded as
     // "already delivered" and the picture never returns. A run of them with
@@ -175,6 +195,22 @@ final class VideoAssembler {
                         buf: [UInt8](repeating: 0, count: nfrag * VPAYLOAD), sizes: [Int](repeating: 0, count: nfrag),
                         capHost: capHost)
     }
+    // Parity is not a fragment of the picture, so it is stored beside the data and
+    // never counted in `have`. Counting it would complete a frame that is short a
+    // real fragment.
+    if parity {
+      guard n == VPAYLOAD, slots[idx].nfrag == nfrag else { return }
+      if !slots[idx].havePar {
+        slots[idx].par = [UInt8](UnsafeBufferPointer(start: bytes, count: n))
+        slots[idx].havePar = true
+        slots[idx].parLastLen = parLastLen
+        parityUsed += 1
+      }
+      // A frame that arrived complete before its parity did needs nothing; a frame
+      // one fragment short can now be rebuilt.
+      if slots[idx].have == nfrag - 1 { repairAndDeliver(idx) }
+      return
+    }
     guard frag < slots[idx].nfrag else { return }
     if slots[idx].mask[frag] { dupFrag += 1; return }
     slots[idx].mask[frag] = true
@@ -183,8 +219,41 @@ final class VideoAssembler {
       memcpy(b.baseAddress! + frag * VPAYLOAD, bytes, n)
     }
     slots[idx].have += 1
+    if slots[idx].have == slots[idx].nfrag - 1, slots[idx].havePar {
+      repairAndDeliver(idx)
+      return
+    }
     guard slots[idx].have == slots[idx].nfrag else { return }
+    deliver(idx)
+  }
 
+  /// Rebuild the one missing fragment from parity, then deliver. XOR of every
+  /// present fragment against the parity gives back the absent one, because the
+  /// parity is the XOR of all of them and each byte position is independent.
+  private func repairAndDeliver(_ idx: Int) {
+    guard let miss = (0..<slots[idx].nfrag).first(where: { !slots[idx].mask[$0] }) else { return }
+    let last = slots[idx].nfrag - 1
+    // Every fragment but the last is exactly VPAYLOAD; the last one's length rides
+    // in the parity header. Without it the rebuilt tail would be VPAYLOAD of
+    // zero-padding appended to the frame, which the decoder would refuse.
+    let len = miss == last ? slots[idx].parLastLen : VPAYLOAD
+    guard len > 0, len <= VPAYLOAD else { parityWasted += 1; return }
+    slots[idx].buf.withUnsafeMutableBufferPointer { b in
+      let dst = b.baseAddress! + miss * VPAYLOAD
+      slots[idx].par.withUnsafeBufferPointer { pb in memcpy(dst, pb.baseAddress!, VPAYLOAD) }
+      for f in 0..<slots[idx].nfrag where f != miss {
+        let srcp = b.baseAddress! + f * VPAYLOAD
+        for i in 0..<VPAYLOAD { dst[i] ^= srcp[i] }
+      }
+    }
+    slots[idx].mask[miss] = true
+    slots[idx].sizes[miss] = len
+    slots[idx].have += 1
+    parityRecovered += 1
+    deliver(idx)
+  }
+
+  private func deliver(_ idx: Int) {
     var out = Data(capacity: slots[idx].sizes.reduce(0, +))
     for f in 0..<slots[idx].nfrag {
       slots[idx].buf.withUnsafeBufferPointer { b in
@@ -192,6 +261,7 @@ final class VideoAssembler {
       }
     }
     complete += 1
+    let seq = slots[idx].seq
     if lastDone >= 0 && seq > lastDone + 1 { missing += Int(seq - lastDone - 1) }
     lastDone = seq
     onFrame?(out, slots[idx].capHost)
@@ -203,9 +273,38 @@ extension Wire {
   /// Split one encoded frame across datagrams. Sent oldest-fragment-first with no
   /// pacing: the frame is already late by the time it exists, and a pacer here
   /// would only add the delay it is trying to smooth.
+  /// ── ONE PARITY FRAGMENT, AND THE PICTURE STOPS BEING FRAGILE ──────────────
+  ///
+  /// A frame is broken by ONE lost fragment, so its survival falls off a cliff as
+  /// it gets bigger. Measured at 1% loss, held quality, 60 s arms:
+  ///
+  ///   q0.7  P-frame 7451 B = 6 fragments   7.8% of frames never displayed
+  ///   q0.3  P-frame  293 B = 1 fragment    0.9%
+  ///
+  /// That is why the quality controller collapses to the floor on an ordinary 1%
+  /// path: not because the bandwidth is unavailable, but because a sharp picture
+  /// is *fragile*. Those are different problems and only one of them needs a soft
+  /// picture as its answer.
+  ///
+  /// XOR every fragment together and send the result as one extra fragment. Any
+  /// single missing fragment comes back exactly, because XOR is its own inverse
+  /// and each byte position is independent. Cost is 1/nfrag -- 17% for a
+  /// six-fragment frame -- and it turns 1-0.99^6 = 5.9% frame loss into the chance
+  /// of losing TWO of seven, which is 0.2%. Thirty times better for a sixth more
+  /// bandwidth, where doubling the keyframes (17.108) was 62% more for 11% better.
+  ///
+  /// The parity rides at `frag == nfrag`, which every older build already rejects
+  /// with `frag >= nfrag`, so it is ignored rather than misparsed. `nfrag == 1` is
+  /// skipped: parity of one fragment is a duplicate, which 17.108 measured as not
+  /// worth its bandwidth.
+  ///
+  /// Only when the far end reports loss on the path from here -- the same evidence,
+  /// and the same direction, the quality controller steers on.
   func sendVideo(seq: Int32, capHost: UInt64, payload: Data, scratch: UnsafeMutablePointer<UInt8>) {
     let n = payload.count
     let nfrag = max(1, (n + VPAYLOAD - 1) / VPAYLOAD)
+    let wantParity = videoParity && nfrag >= 2
+    var par = [UInt8](repeating: 0, count: wantParity ? VPAYLOAD : 0)
     payload.withUnsafeBytes { raw in
       let src = raw.bindMemory(to: UInt8.self).baseAddress!
       for f in 0..<nfrag {
@@ -219,7 +318,29 @@ extension Wire {
         (scratch + 20).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
         (scratch + 22).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
         memcpy(scratch + VHDR, src + off, len)
+        // Accumulated against a zero-padded fragment, which is exactly how the
+        // receiver's freshly-allocated slot holds a short final fragment. The two
+        // sides have to agree on the padding or the XOR rebuilds garbage.
+        if wantParity {
+          par.withUnsafeMutableBufferPointer { pb in
+            let d = pb.baseAddress!
+            for i in 0..<len { d[i] ^= src[off + i] }
+          }
+        }
         rawSend(scratch, VHDR + len, .video)
+      }
+      if wantParity {
+        let lastLen = n - (nfrag - 1) * VPAYLOAD
+        scratch.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = VMAGIC.littleEndian }
+        (scratch + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
+        (scratch + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = capHost.littleEndian }
+        (scratch + 16).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(nfrag).littleEndian }
+        (scratch + 18).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(nfrag).littleEndian }
+        (scratch + 20).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(1).littleEndian }  // parity
+        (scratch + 22).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(lastLen).littleEndian }
+        par.withUnsafeBufferPointer { pb in memcpy(scratch + VHDR, pb.baseAddress!, VPAYLOAD) }
+        rawSend(scratch, VHDR + VPAYLOAD, .video)
+        parityFragsSent += 1
       }
     }
   }

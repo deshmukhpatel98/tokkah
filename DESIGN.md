@@ -11235,3 +11235,122 @@ pipe:
 **116.7 ms at the worst distance on earth**, with the redundancy repairing 97% of
 what the path dropped. The 150 ms target has 33 ms of headroom at the antipodes,
 and 13.7 ms of what remains is not propagation.
+
+## 17.110 One parity fragment, and the picture stops being fragile
+
+17.108 established that the keyframe repair loop is driven by P-frame loss and that
+protecting keyframes cannot fix it. This is the fix aimed at the right frame.
+
+A frame dies if **one** of its fragments is lost, so its survival collapses as it
+gets bigger. Measured at 1% loss with quality held, 60 s arms:
+
+| quality | P-frame | fragments | frames never displayed |
+|---|---|---|---|
+| q0.7 | 7,451 B | 6 | **7.8%** |
+| q0.3 | 293 B | 1 | 0.9% |
+
+That is why the controller collapsed to the floor on an ordinary 1% path — not
+because the bandwidth was unavailable, but because a sharp picture is *fragile*.
+Two different problems, and only one of them needs a soft picture as its answer.
+
+XOR every fragment of a frame together and send the result as one more fragment.
+Any single missing fragment comes back exactly, because XOR is its own inverse and
+each byte position is independent. It rides at `frag == nfrag`, which every older
+build already rejects via `frag >= nfrag`, so no version handshake is needed.
+
+**Measured, rotated, parity off first, 1% loss, q0.7 held:**
+
+| | frames lost | keyframe asks | sender's video |
+|---|---|---|---|
+| off | 214 | 114 | 2.52 Mbps |
+| **on** | **7** | **5** | **2.22 Mbps** |
+| off | 217 | 113 | 2.45 Mbps |
+| **on** | **7** | **6** | **2.25 Mbps** |
+
+**31× fewer lost frames, and the bandwidth went DOWN.** Parity costs 17% per frame
+and removes ~108 keyframe requests of ~53 KB each, so it more than pays for itself.
+Where 17.108's keyframe doubling was +62% for 11% better, this is −10% for 3100%
+better, because it is aimed at the frames that were actually dying.
+
+### Which makes the old retreat rule wrong
+
+`outboundHarm > 0` collapsed the picture on any loss at all. With parity, q0.7 at 1%
+loss loses 0.26% of frames — *better than the floor managed without it* — so
+retreating now costs quality and buys nothing. Harm is a **rate** now, not a count:
+parity fails only when two of seven fragments go missing, which is 0.2% of frames at
+1% loss, 1.7% at 3% and 4.5% at 5%. The line is 2%, and it is expressed as a
+fraction of what was sent so it means the same thing at every packet rate.
+
+Verified end to end with the controller in charge: at 1% loss it **holds q0.7** for
+88 seconds and the receiver loses 10 frames; at 3% it reports `outbound loss 6.35%
+of packets -- above the 2.0% line` and retreats to the floor as before.
+
+### A late parity fragment is not a restarted sender
+
+Parity is sent after the data, so on a healthy frame it arrives once the frame is
+already assembled — 2,472 of 2,627 in one run, which is the mechanism working. But
+`seq <= lastDone` is the restart detector's input, and 27 of those a second would
+walk `staleRun` toward the 30 that declares the peer restarted and wipes every
+in-flight frame. Data fragments arriving in between reset it, so it never fired —
+which is to say it was one video stall away from firing. Discarded before it can be
+mistaken for evidence.
+
+## 17.111 The app was not opening like an app
+
+Everything above is worth nothing if the program does not look like it works, and it
+did not. Asked directly: *why is the app not opening like a normal video calling
+app?*
+
+Three defects, stacked:
+
+**The launcher asked for a camera in a way the code did not accept.** `Launcher`
+re-executed with `--video on`, and the source was
+`videoArg == "camera" ? CameraSource() : FileSource(path: videoArg)` — so every
+other string was a **filename**. `on` is the obvious thing to write and the obvious
+thing to mean, and it became a search for a file called `on`. The double-clicked app
+has never once had a camera. `on` and `cam` are aliases now, and a value that is
+neither a keyword nor an existing file is refused with the list of what works,
+beside the unknown-flag guard rather than after the peer rendezvous — it used to
+wait for someone to answer before admitting it was a typo.
+
+**It never asked for a window.** No `--window` in the re-exec, and nothing else
+creates one. So the app showed a name prompt and then became an invisible process
+with a dock icon, running a perfectly good audio call nobody could see.
+
+**And the window could not have helped, because it came last.** The window, the
+camera and the audio were all created *after* the rendezvous, which is a blocking
+loop. Double-click, type a room, and get nothing at all — no window, no camera
+light, no sign of life — until the other person joined. Up to two minutes, and
+forever if they never came.
+
+So the window opens first, the camera starts first, and you watch yourself while you
+wait. The rendezvous **pumps the AppKit event loop** instead of sleeping, because a
+main thread inside `usleep` is a window that does not draw and shows the spinning
+cursor — worse than no window. The title carries the state (`waiting for the other
+side` → `connecting` → `connected`), because a window showing a picture and saying
+nothing is indistinguishable from a call that already connected. One camera instance,
+started once and handed to the encoder later, so there is one permission prompt and
+not two sessions fighting over one device.
+
+Verified by the app's own instrument rather than by looking at a screenshot:
+
+```
+preview: file realA.mp4 @30fps on screen before the call connects
+window visible/onscreen/layer:rendering shown 649 enqFail 0 refresh 16.7ms
+the other side's picture is on screen
+dec 30/s  g2g p50 3.72
+```
+
+### The bug that this hid, twice
+
+Moving the camera earlier read `videoArg` — a global initialised 350 lines further
+down. Swift top-level globals initialise in statement order, so the process trapped
+on an uninitialised global and **vanished after printing two lines, with no
+message.** Exactly the silent death 17.109 had just finished learning to chase
+rather than rerun, and it happened twice in ten minutes. The generalisation held the
+second time too: read the crash report.
+
+Also: the preview was wired for the camera only, which made the feature untestable
+without a person present to click Allow on a permission prompt. A file source takes
+the identical path, so it takes it now — an instrument that cannot see the thing it
+tests returns the same value as a real failure.
