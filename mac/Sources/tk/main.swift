@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.21.0"
+let VERSION = "0.22.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -434,7 +434,18 @@ var vDecoded = 0, vSentFrames = 0, vBytesSent = 0
 // RECEIVING is wired unconditionally. A peer that sends no video must still be
 // able to show yours -- tying the receive path to the send path made the
 // receiver look like a decoder failure when it had simply never been connected.
-vasm.onFrame = { data, host in vdec.decode(data, hostTime: host) }
+// Decode on its OWN thread, not on the one receiving audio. See DecodeQueue for
+// the measurement: inline decode cost 1.8 ms of audio latency on every video call
+// by blocking the receive loop, and the cadence instrument proved it was arrival
+// jitter rather than the sender.
+let dq = DecodeQueue { p, n, host in
+  vdec.decode(Data(bytes: p, count: n), hostTime: host)
+}
+vasm.onFrame = { data, host in
+  data.withUnsafeBytes { raw in
+    dq.submit(raw.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, host)
+  }
+}
 // GLASS TO GLASS, the only honest way: the capture instant travels with the
 // frame and the subtraction happens at decoder output. No estimate, no clock
 // model -- on loopback both ends share one host clock, so this is the pipeline
@@ -1328,6 +1339,10 @@ func reportLoop() {
     ]
     if let v = e.p(0.50) { videoBeat["v_enc_ms_p50"] = v }
     if let v = dl.p(0.50) { videoBeat["v_dec_ms_p50"] = v }
+    videoBeat["v_dq_queued"] = dq.queued
+    videoBeat["v_dq_inline_full"] = dq.inlineFull
+    videoBeat["v_dq_inline_big"] = dq.inlineTooBig
+    videoBeat["v_dq_depth_max"] = dq.maxDepth
     if let d = display { videoBeat["v_shown"] = d.shown; videoBeat["v_enq_fail"] = d.enqueueFails }
     if let m = mdisplay {
       videoBeat["v_shown"] = m.shown
@@ -1344,6 +1359,13 @@ func reportLoop() {
         + "  g2g p50 \(f(g.p(0.50))) p95 \(f(g.p(0.95))) ms"
         + "  frags \(vasm.fragsIn) frames-lost \(vasm.missing) partial-drops \(vasm.dropped) decFails \(vdec.decFails) noFmt \(vdec.noFormat)"
         + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
+        // Say how many frames took the INLINE path anyway. A queue whose whole
+        // purpose is to keep decode off the receive thread, and which quietly
+        // falls back to doing it there when full, is a queue that looks like it is
+        // working while the defect continues.
+        + "  decodeq \(dq.queued) queued, depth<=\(dq.maxDepth)"
+        + (dq.inlineFull + dq.inlineTooBig > 0
+           ? "  INLINE \(dq.inlineFull) full + \(dq.inlineTooBig) oversize" : "")
         + (display != nil ? "  window \(display!.state) shown \(display!.shown) enqFail \(display!.enqueueFails) refresh \(String(format: "%.1f", display!.refreshMs))ms" : "")
         + (mdisplay != nil ? { () -> String in
             let m = mdisplay!
