@@ -104,16 +104,22 @@ if let room = arg("room") {
     // only true while the NAT binding behind it lives.
     let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
     if let p = peers.first {
-      // SAME public IP means the same NAT, which means the same network: take the
-      // LAN path. It is shorter, and it does not depend on the router being
-      // willing to hairpin a packet back to its own public address.
-      if p.ip == mapped.ip, let lip = p.localIP, let lport = p.localPort {
-        wire.setPeer(ip: lip, port: lport)
-        fputs("room \(room): peer \(p.id) is on this network -- using LAN \(lip):\(lport)\n", stderr)
-      } else {
-        wire.setPeer(ip: p.ip, port: p.port)
-        fputs("room \(room): peer \(p.id) at \(p.ip):\(p.port) (\(p.ageMs) ms old) -- punching\n", stderr)
+      // BOTH addresses, and let the network decide. Guessing between them -- same
+      // public IP means same LAN, so use the private address -- is right most of
+      // the time and produces a call that never starts when it is wrong. Hairpin
+      // support, carrier-grade NAT, a VPN on one side: each breaks a different
+      // guess. Racing them costs two 32-byte probes.
+      wire.addCandidate(ip: p.ip, port: p.port)
+      var cands = ["\(p.ip):\(p.port)"]
+      if let lip = p.localIP, let lport = p.localPort {
+        wire.addCandidate(ip: lip, port: lport)
+        cands.append("\(lip):\(lport)")
       }
+      // A provisional destination so media has somewhere to go in the moments
+      // before a probe comes back; the first packet that arrives replaces it with
+      // an address known to work.
+      wire.setPeer(ip: p.ip, port: p.port)
+      fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
       found = true
       break
     }
@@ -134,14 +140,36 @@ if let room = arg("room") {
   // audio. The correct fix is to demultiplex STUN inside the media loop, and
   // until that exists the mapping does not need rediscovering: 375 audio packets
   // a second keep the NAT binding alive far more reliably than a probe would.
+  // Punch every candidate until one answers. Fast while unresolved, because this
+  // is the window the user experiences as "is it connecting?", and both NATs need
+  // an outbound packet before either will pass an inbound one.
+  Thread {
+    var announced = false
+    while true {
+      if wire.locked {
+        if !announced {
+          announced = true
+          fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        continue
+      }
+      wire.probeAllCandidates()
+      Thread.sleep(forTimeInterval: 0.2)
+    }
+  }.start()
+
   Thread {
     while true {
       Thread.sleep(forTimeInterval: 20)
       let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
-      if let p = peers.first, "\(p.ip):\(p.port)" != wire.peerDescription,
-         !(p.ip == mapped.ip && "\(p.localIP ?? ""):\(p.localPort ?? 0)" == wire.peerDescription) {
-        fputs("room \(room): peer moved to \(p.ip):\(p.port) -- re-pointing\n", stderr)
-        wire.setPeer(ip: p.ip, port: p.port)
+      // Only worth acting on while unresolved. Once a packet has arrived, the
+      // address it came from is better evidence than anything the rendezvous can
+      // tell us -- and re-pointing a working call at a directory entry is how a
+      // live call gets broken by bookkeeping.
+      if let p = peers.first, !wire.locked {
+        wire.addCandidate(ip: p.ip, port: p.port)
+        if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
       }
     }
   }.start()

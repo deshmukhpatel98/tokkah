@@ -263,6 +263,70 @@ final class Wire {
     peer.sin_addr.s_addr = inet_addr(ip)
   }
 
+  // ── Candidate racing ────────────────────────────────────────────────────────
+  //
+  // Two machines behind two routers have more than one plausible address for each
+  // other, and picking one is a guess. The old code guessed: same public IP means
+  // same LAN, so use the private address, otherwise use the public one. When that
+  // guess is wrong the call does not degrade, it simply never starts -- and the
+  // first real attempt at this is between two houses I cannot test from here.
+  //
+  // So: send to EVERY candidate, and let the one that works identify itself. A
+  // packet that arrives carries the only address that is definitely reachable --
+  // the one it came from. Adopt it. This is the useful half of what ICE does, and
+  // it needs no state machine: probe everything, lock onto whatever answers.
+  private var candidates: [sockaddr_in] = []
+  private(set) var locked = false
+  private(set) var lockedFrom = ""
+
+  func addCandidate(ip: String, port: UInt16) {
+    var a = sockaddr_in()
+    a.sin_family = sa_family_t(AF_INET)
+    a.sin_port = port.bigEndian
+    a.sin_addr.s_addr = inet_addr(ip)
+    if !candidates.contains(where: { $0.sin_addr.s_addr == a.sin_addr.s_addr && $0.sin_port == a.sin_port }) {
+      candidates.append(a)
+    }
+  }
+
+  func clearCandidates() { candidates.removeAll() }
+
+  /// Punch every candidate. Cheap: a 32-byte clock probe doubles as the probe
+  /// that opens the NAT binding, so connectivity and offset are established by
+  /// the same packet.
+  func probeAllCandidates() {
+    guard !locked else { return }
+    var out = [UInt8](repeating: 0, count: TPKT)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+      p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
+      p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
+    }
+    for c in candidates {
+      var a = c
+      out.withUnsafeBufferPointer { b in
+        _ = withUnsafePointer(to: &a) { pp in
+          pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(fd, b.baseAddress!, b.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
+        }
+      }
+    }
+  }
+
+  /// A packet arrived and parsed. Whatever address it came from is reachable, so
+  /// that is the peer from now on. Only the FIRST one wins: after that, changing
+  /// the peer on arriving traffic would let a stray packet steal the call.
+  private func adopt(_ from: sockaddr_in) {
+    guard !locked else { return }
+    peer = from
+    locked = true
+    var ipb = [CChar](repeating: 0, count: 64)
+    var f = from
+    inet_ntop(AF_INET, &f.sin_addr, &ipb, 64)
+    lockedFrom = "\(String(cString: ipb)):\(UInt16(bigEndian: from.sin_port))"
+  }
+
   var peerDescription: String {
     var b = [CChar](repeating: 0, count: 32)
     var a = peer.sin_addr
@@ -299,9 +363,21 @@ final class Wire {
     let cap = max(HDR + FPP * 4, VHDR + VPAYLOAD) + 128
     let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
     while true {
-      let n = recvfrom(fd, buf, cap, 0, nil, nil)
+      var src = sockaddr_in()
+      var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+      let n = withUnsafeMutablePointer(to: &src) { sp in
+        sp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          recvfrom(fd, buf, cap, 0, $0, &srcLen)
+        }
+      }
       if n < 8 { if n < 0 { usleep(200) }; continue }
       let magic = buf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+      // A recognised magic from a reachable address is all the proof needed. Not
+      // authentication -- that is what encryption will be for -- but enough to
+      // stop adopting unrelated traffic that happens to hit the port.
+      if !locked, magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
+        adopt(src)
+      }
       if magic == VMAGIC {
         guard let v = video, n >= VHDR else { continue }
         let seq = Int32(bitPattern: (buf + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
