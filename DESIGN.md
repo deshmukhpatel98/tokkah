@@ -9233,3 +9233,46 @@ parameter expansions.** A loop passing `$FLAGS` handed the binary one argument
 instead of four, the impairment never armed, and the arm reported a clean path
 under its damaged label. The banner is printed on every impaired run for exactly
 this reason — and it was its absence that gave the game away.
+
+## 17.80 The display is the biggest number in the app, and I had been quoting a third of it
+
+Every video figure here ended with "+ ~8 ms mean compositor wait at 60 Hz", which
+made capture-to-glass about 14 ms. That 8 ms was an *assumption* — half of a
+16.7 ms refresh period — and this project has a rule about assumed numbers.
+
+`CVDisplayLink` on this machine, 3 seconds, 180 callbacks:
+
+    period p50 16.666 ms -> 60.0 Hz
+    predicted-display minus now: p50 22.977 ms   (min 22.949, max 24.808)
+
+`inOutputTime - inNow` is what the system tells you: a frame handed over at this
+instant is predicted on glass **23 ms** later, about 1.4 refresh periods. The
+8.3 ms figure was only the wait for the next vsync and silently ignored the
+pipeline *after* it — compositing pass, then scanout.
+
+So the honest accounting for video is:
+
+    capture -> encoded -> wire -> decoded      5.6 ms   (measured, p50)
+    decoded -> glass                          ~23 ms   (measured, compositor lead)
+    total                                     ~28 ms
+
+Which reorders the whole project's priorities. **The display path is now the
+single largest latency component in this app** — larger than the entire audio
+mouth-to-ear (15.6 ms), and four times the cost of everything the codec and the
+network do put together. Every millisecond I have been mining out of packet sizes
+and jitter buffers is being spent three times over by CoreAnimation.
+
+The lever is real but it is not free: a `CAMetalLayer` with
+`displaySyncEnabled = false` presents as soon as the GPU is done rather than
+waiting for the compositor's synchronised pass, which should recover most of a
+refresh period at the cost of tearing. For a talking head, tearing is close to
+invisible; for a latency target of 150 ms end to end, 16 ms is a tenth of the
+entire budget.
+
+**Not built, because it cannot yet be measured.** Proving it needs the enqueue
+time compared against when the pixels actually change, which means screen capture
+(ScreenCaptureKit, needing a permission grant) or a camera pointed at the panel.
+Building an unmeasurable optimisation is how this codebase acquires its worst
+bugs, so this is recorded as the largest known win and left unbuilt until it can
+be shown. The page now says ~23 ms and ~28 ms, because the old number was wrong
+in the direction that flattered us.
