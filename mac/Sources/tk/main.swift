@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.18.0"
+let VERSION = "0.19.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -44,7 +44,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp",
+  "selftest-lpc", "no-lp", "gui",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -66,6 +66,19 @@ for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
       + "a misspelled flag would otherwise be ignored in silence, and an arm running"
       + " without the thing it is named after is worse than no arm at all.\n", stderr)
   exit(2)
+}
+
+// ── Double-clicked from the Finder? Ask where to call, then be a normal call ──
+//
+// After flag validation, so a typo is still refused, and before anything touches
+// the microphone, the camera or a socket -- the window has to finish first.
+if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
+                         hasPeer: arg("peer") != nil,
+                         forced: flag("gui")) {
+  guard let room = Launcher.askRoom() else { exit(0) }   // closed the window
+  // Video on by default here and off for the command line: someone who typed
+  // `tk` is measuring something, someone who double-clicked wants a video call.
+  Launcher.reexec(room: room, extra: ["--video", "on"])
 }
 
 let listenPort = UInt16(arg("listen") ?? "7001") ?? 7001

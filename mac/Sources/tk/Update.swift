@@ -132,6 +132,36 @@ enum Update {
     guard rename(staging.path, me.path) == 0 else {
       fputs("update: rename failed (errno \(errno))\n", stderr); return
     }
+    // ── Re-sign, when we live inside an app bundle ────────────────────────────
+    //
+    // macOS ties a microphone or camera grant to the CODE SIGNATURE of the thing
+    // that asked. Replacing the executable inside a signed bundle leaves the
+    // bundle's signature describing a binary that is no longer there, and the next
+    // launch is treated as a different application: the permission prompts come
+    // back, mid-conversation, on the far machine. Re-signing ad-hoc restores one
+    // stable identity across the update.
+    //
+    // /usr/bin/codesign is part of base macOS, not the Xcode tools, so this works
+    // on a Mac that has never seen a developer install. And it is best-effort by
+    // design: a failure here costs a permission prompt, while refusing to update
+    // over it would cost the fix the update was carrying.
+    if me.path.contains("/Contents/MacOS/") {
+      let appDir = me.deletingLastPathComponent()   // MacOS
+        .deletingLastPathComponent()                // Contents
+        .deletingLastPathComponent()                // Tokkah.app
+      let cs = Process()
+      cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+      cs.arguments = ["--force", "--sign", "-", appDir.path]
+      cs.standardOutput = FileHandle.nullDevice
+      cs.standardError = FileHandle.nullDevice
+      if (try? cs.run()) != nil {
+        cs.waitUntilExit()
+        if cs.terminationStatus != 0 {
+          fputs("update: re-sign returned \(cs.terminationStatus)"
+              + " -- macOS may ask for microphone permission again\n", stderr)
+        }
+      }
+    }
     fputs("update: installed \(m.version) -- restarting\n", stderr)
     var argv = CommandLine.arguments.map { strdup($0) }
     argv.append(nil)

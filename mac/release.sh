@@ -41,14 +41,36 @@ SHA=$(shasum -a 256 "/tmp/$TAR" | awk '{print $1}')
 SIZE=$(stat -f%z "/tmp/$TAR")
 echo "  $TAR  $SIZE bytes  sha256 $SHA"
 
+# ── Tokkah.app, and a .dmg for people who would rather drag than curl ────────
+#
+# The TARBALL STAYS EXACTLY ONE BINARY, because that is what every running copy's
+# self-updater fetches and expects. The bundle is assembled around that same
+# binary -- here for the .dmg, and on the user's own machine by install.sh -- so
+# there is one artefact to hash and one thing that can be stale.
+echo "== bundle =="
+APPDIR=$(mktemp -d)
+./bundle/mkapp.sh "$VER" "$BIN" "$APPDIR" >/dev/null
+DMG="Tokkah-$VER.dmg"
+rm -f "/tmp/$DMG"
+STAGE2=$(mktemp -d)
+cp -R "$APPDIR/Tokkah.app" "$STAGE2/"
+ln -s /Applications "$STAGE2/Applications"
+hdiutil create -quiet -volname "Tokkah $VER" -srcfolder "$STAGE2" -ov -format UDZO "/tmp/$DMG"
+DMGSHA=$(shasum -a 256 "/tmp/$DMG" | awk '{print $1}')
+echo "  $DMG  $(stat -f%z "/tmp/$DMG") bytes"
+# The icon travels as a static asset so install.sh can assemble a bundle without a
+# second archive to keep in step.
+cp bundle/AppIcon.icns "$REPO/tape-app/public/macos/AppIcon.icns"
+
 echo "== upload =="
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$TAR" --file="/tmp/$TAR" --remote >/dev/null)
+(cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$DMG" --file="/tmp/$DMG" --remote >/dev/null)
 
 echo "== manifest =="
 OUT="$REPO/tape-app/public/macos"
 mkdir -p "$OUT"
 cat > "$OUT/manifest.json" <<JSON
-{"version":"$VER","url":"https://room.tokkah.com/macos/dl/$TAR","sha256":"$SHA","size":$SIZE,"notes":"$NOTES"}
+{"version":"$VER","url":"https://room.tokkah.com/macos/dl/$TAR","sha256":"$SHA","size":$SIZE,"notes":"$NOTES","dmg":"https://room.tokkah.com/macos/dl/$DMG","dmgSha256":"$DMGSHA"}
 JSON
 ./tools/sign "$OUT/manifest.json" > "$OUT/manifest.json.sig"
 echo "  signed ($(wc -c < "$OUT/manifest.json.sig" | tr -d ' ') bytes)"

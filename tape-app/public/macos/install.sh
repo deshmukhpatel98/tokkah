@@ -39,22 +39,72 @@ mv "$TMP/tk" "$DEST/tk"
 chmod +x "$DEST/tk"
 
 echo "installed $DEST/tk ($("$DEST/tk" --version))"
+
+# ── Tokkah.app, so this is something you can hand to another person ──────────
+#
+# The bundle is assembled HERE rather than downloaded, so there is still exactly
+# one archive in the world and it cannot fall out of step with the binary the
+# self-updater fetches.
+#
+# It matters for more than the icon: a bare command-line binary has no code
+# identity of its own, so macOS attributes its microphone and camera grants to
+# whichever terminal launched it -- they cannot be reviewed in System Settings and
+# they do not follow the program. A bundle owns its permissions.
+APPS="/Applications"
+[ -w "$APPS" ] || APPS="$HOME/Applications"
+mkdir -p "$APPS"
+APP="$APPS/Tokkah.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$DEST/tk" "$APP/Contents/MacOS/Tokkah"
+chmod +x "$APP/Contents/MacOS/Tokkah"
+printf 'APPL????' > "$APP/Contents/PkgInfo"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Tokkah</string>
+  <key>CFBundleDisplayName</key><string>Tokkah</string>
+  <key>CFBundleIdentifier</key><string>com.tokkah.tk</string>
+  <key>CFBundleExecutable</key><string>Tokkah</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$VER</string>
+  <key>CFBundleVersion</key><string>$VER</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Tokkah needs the microphone to carry your voice on a call.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Tokkah needs the camera to send your picture on a call.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Tokkah connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>
+PLIST
+# Best-effort: a missing icon is a generic app tile, not a broken install.
+curl -fsSL "$BASE/AppIcon.icns" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null || true
+# Ad-hoc signature gives the bundle one stable identity, which is what the
+# permission grants attach to. The updater re-signs after it replaces the binary.
+codesign -s - -f --deep "$APP" >/dev/null 2>&1 || true
+# Tell the Finder to notice the new icon straight away.
+touch "$APP"
+echo "installed $APP"
+echo ""
+echo "OPEN IT: double-click Tokkah in $APPS, type a room name, press Join."
+echo "Both people type the SAME room name and you are connected -- directly, with"
+echo "no server in between. The room name is also the encryption key, so choose"
+echo "something only the two of you would say."
+echo ""
+echo "It keeps itself up to date on its own; you never install it again."
+echo ""
+echo "The first call will ask for microphone and camera permission. Allow both."
+echo ""
+echo "There is a command-line version too, for measuring things:"
+echo "  tk --room ripe-mango-jam --window"
 case ":$PATH:" in
   *":$DEST:"*) ;;
-  *) echo ""; echo "add it to your PATH:"; echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
+  *) echo ""; echo "for that, add it to your PATH:"; echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
 esac
-echo ""
-# This text is the whole of the instructions most people will ever read, so it has
-# to be the command that actually works. It used to say --peer <the-other-mac-ip>,
-# which cannot work between two houses -- neither machine has a routable address.
-echo "to make a call, pick any room name and run this on BOTH Macs:"
-echo "  tk --room ripe-mango-jam --window"
-echo ""
-echo "they find each other and then talk directly, with no server in between."
-echo "the room name is also the encryption key, so choose something only the two"
-echo "of you would say, and say it to each other rather than typing it anywhere."
-echo ""
-echo "it keeps itself up to date, and will ask for microphone permission the first"
-echo "time -- because tk is a command-line tool, macOS grants that to the terminal"
-echo "you ran it from, so allow Terminal (or iTerm) under System Settings >"
-echo "Privacy & Security > Microphone if it says the mic was denied."

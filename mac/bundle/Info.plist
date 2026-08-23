@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                  <string>Tokkah</string>
+  <key>CFBundleDisplayName</key>           <string>Tokkah</string>
+  <key>CFBundleIdentifier</key>            <string>com.tokkah.tk</string>
+  <key>CFBundleExecutable</key>            <string>Tokkah</string>
+  <key>CFBundleIconFile</key>              <string>AppIcon</string>
+  <key>CFBundlePackageType</key>           <string>APPL</string>
+  <key>CFBundleShortVersionString</key>    <string>__VERSION__</string>
+  <key>CFBundleVersion</key>               <string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key>        <string>13.0</string>
+  <key>NSHighResolutionCapable</key>       <true/>
+  <!-- The reason a proper bundle matters beyond the icon: a bare CLI binary has
+       no identity of its own, so the microphone and camera grants land on
+       whichever terminal launched it and cannot be managed in System Settings.
+       A bundle owns its own permissions, and these strings are what the prompt
+       actually says. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Tokkah needs the microphone to carry your voice on a call.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Tokkah needs the camera to send your picture on a call.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Tokkah connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+</dict>
+</plist>
