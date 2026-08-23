@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join a Tokkah call</title>
+<style>
+  :root { --bg:#0e1014; --panel:#16191f; --line:#262b34; --fg:#e8eaf0; --dim:#8b93a3; --go:#35c46a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); display:flex;
+         justify-content:center; padding:8vh 20px 60px;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  main { width:100%; max-width:560px; }
+  h1 { font-size:26px; margin:0 0 6px; font-weight:600; }
+  .sub { color:var(--dim); margin:0 0 28px; }
+  .room { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+          padding:18px 20px; margin-bottom:26px; }
+  .room .k { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); }
+  .room .v { font-size:28px; font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+             margin-top:2px; word-break:break-all; }
+  ol { padding-left:22px; margin:0; }
+  li { margin-bottom:20px; }
+  code { background:#11141a; border:1px solid var(--line); border-radius:8px; display:block;
+         padding:12px 14px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px;
+         overflow-x:auto; white-space:pre; margin-top:8px; }
+  button { background:var(--go); color:#06240f; border:0; border-radius:8px; padding:8px 14px;
+           font:600 13px/1 inherit; cursor:pointer; margin-top:8px; }
+  .note { color:var(--dim); font-size:13px; margin-top:34px; border-top:1px solid var(--line);
+          padding-top:18px; }
+  a { color:#79a6f6; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Someone wants to talk to you</h1>
+  <p class="sub">Tokkah is a small, direct video call for macOS. Audio is sent losslessly and
+     nothing goes through a server &mdash; the two machines talk to each other.</p>
+
+  <div class="room">
+    <div class="k">Room name</div>
+    <div class="v" id="room">&mdash;</div>
+  </div>
+
+  <ol>
+    <li><b>Install it</b> &mdash; one line in Terminal, about ten seconds.
+      <code id="inst">curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code>
+      <button id="copy">Copy this line</button>
+    </li>
+    <li><b>Open Tokkah</b> from your Applications folder. Allow the camera and
+      microphone when macOS asks &mdash; it needs both to be a call.</li>
+    <li><b>Type the room name above</b> and press Join. You will see yourself straight
+      away; the other person appears when they join the same room.</li>
+  </ol>
+
+  <p class="note">Both people have to be in the call at the same time &mdash; there is no ringing
+     and nothing is stored. The room name is also the encryption key, so pick a fresh one
+     for anything you would not say in public, and it never leaves your two machines.
+     <a href="/macos/">What this is and how fast it is</a>.</p>
+</main>
+<script src="join.js"></script>
+</body>
+</html>

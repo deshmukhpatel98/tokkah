@@ -11354,3 +11354,85 @@ Also: the preview was wired for the camera only, which made the feature untestab
 without a person present to click Allow on a permission prompt. A file source takes
 the identical path, so it takes it now — an instrument that cannot see the thing it
 tests returns the same value as a real failure.
+
+## 17.112 Controls, an invite, and a window that closing actually ends
+
+Asked, fairly: *no controls and nothing for video calling like it was in the web app.
+No link to share. So what the hell?* All true. 17.111 got a picture on screen and
+stopped there, which left a window you could not mute, could not leave, and could
+not invite anybody to. Twelve milliseconds above the speed of light is worth nothing
+in a program nobody can operate.
+
+### What there now is
+
+A bar along the bottom of the call: the room name and what the call is currently
+doing, a **mic** toggle, a **camera** toggle, **Copy invite**, and **Leave**. Five
+things, each of which a person needs inside the first ten seconds and none of which
+existed.
+
+- **Mute zeroes the wire, it does not stop sending.** A gap in the sequence is loss
+  to the far end and it would conceal it — inventing speech out of a deliberate
+  silence. Zeroed samples also compress to almost nothing, so muting *reduces*
+  bandwidth. (`mute` already existed and means the opposite end of the pipe: silence
+  the speaker, which is what a loopback rig needs.)
+- **Camera off stops encoding**, rather than sending black. Black frames still cost
+  an encode, a packet and a decode, and the far end cannot tell them from a dark
+  room. Sending nothing is unambiguous and the receiver's last frame stays put.
+- **Copy invite** puts the room, a landing page and the install line on the
+  clipboard, because the two ends of a native call are two installed apps and a bare
+  URL cannot install one. `/macos/join?room=…` names the room and carries the
+  one-liner, so whoever receives it can act on it either way.
+- **Closing the window ends the call.** It did not. The window had `.closable` and no
+  delegate, so closing it left the process running with no window at all: camera
+  light on, microphone open, and Activity Monitor the only way out. That is a privacy
+  bug, not a tidiness one.
+
+### Four blank photographs, and what they were telling me
+
+Verifying a UI change meant a full-screen `screencapture`, which sweeps up whatever
+else the person has open — not an acceptable price for looking at a button, and
+unreliable besides, since the window is usually behind something and fronting it
+needs accessibility permission. So the app photographs its own window (`--shot`).
+
+The first four came back blank, and each blank meant something different:
+
+1. `cacheDisplay` drives `draw(_:)`, and every control was styled with **CALayer
+   background colours**, which have no draw. Invisible to any in-process capture.
+2. `CALayer.render(in:)` produced an empty bitmap too.
+3. Then the real one: the content view had `wantsLayer = true` **and** a manually
+   assigned layer, which makes it layer-*hosting*, and Apple is explicit that such a
+   view may not have subviews. The control bar was a subview of exactly that view.
+   **It was never drawn — not in a snapshot, on screen either.** The camera that
+   looked broken was reporting the truth about the window.
+4. And the fix for (3) dropped `window.contentView = view` in the edit, so the window
+   had an empty default content view. `content 1280x720 subviews 0` said so the
+   moment the structure was printed instead of photographed.
+
+A capture that returns empty cannot distinguish "nothing is there" from "the capture
+does not work", so the structure is now printed alongside it (`tree:`), and the bar
+draws itself in `draw(_:)` — which also means the photograph exercises the same code
+the screen does.
+
+### Two bugs the rig then found in the controls themselves
+
+**The camera button rendered as a filled red disc at startup**, with `camOff=false`
+printed right next to it. Not the drawing: macOS filling the focused control with the
+user's accent colour. It said "camera off" while the camera was on, which is the worst
+thing that particular button can be wrong about. Call controls are pointed at, not
+tabbed through — `refusesFirstResponder`, no focus ring.
+
+**And pressing mute before the call connected killed the app.** The handler wrote to
+`audio.micMuted`, and `audio` is created after the rendezvous, while the controls now
+exist before it — an uninitialised global, and the process vanishes. Third instance
+of that exact shape today, and the first one that a user would have hit on their own,
+because clicking mute in the first thirty seconds of a call is not an edge case. The
+flag is file-scope now and safe from the moment the button is drawn.
+
+`--press mic,cam,invite` exercises the wiring, because a button that is drawn and
+connected to nothing looks identical in a photograph:
+
+```
+pressed mic:    micMuted=true  camOff=false  clipboard=0 chars
+pressed cam:    micMuted=true  camOff=true   clipboard=0 chars
+pressed invite: micMuted=true  camOff=true   clipboard=183 chars
+```

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.27.0"
+let VERSION = "0.28.0"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -57,7 +57,7 @@ let KNOWN_FLAGS: Set<String> = [
   "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-vparity", "vq-harm-pct", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -148,6 +148,46 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
   fputs("socket/bind failed on port \(listenPort)\n", stderr); exit(1)
 }
 
+// ── WHAT YOU SEND SOMEONE TO GET THEM INTO THE CALL ─────────────────────────
+//
+// There was nothing. The web app had a link you could paste to a person; this had
+// a room name you had to tell them out loud and an install command they had to be
+// told about separately. So the invite is both, as text, because the two ends of a
+// native call are two installed apps and a bare URL cannot install one.
+//
+// The URL is a real page (see /macos/join) that names the room and carries the
+// install line, so the person who receives this can act on it whether or not they
+// already have the app.
+func inviteText(room: String) -> String {
+  """
+  Join me on Tokkah — room: \(room)
+
+  https://room.tokkah.com/macos/join?room=\(room)
+
+  Don't have it yet? One line in Terminal:
+  curl -fsSL https://room.tokkah.com/macos/install.sh | sh
+  """
+}
+
+/// Leave means leave: report the call's last numbers, then go. Same path as the
+/// signal handler, because a person clicking Leave and a person pressing Ctrl-C
+/// want exactly the same thing and the record should not be able to tell them
+/// apart.
+func leaveCall() -> Never {
+  shuttingDown = true
+  if Telemetry.enabled {
+    Telemetry.post(audioBeat(uptime: Double(beatTick),
+                             up: lastRates.up, down: lastRates.down,
+                             played: lastRates.played, concealed: lastRates.concealed,
+                             cap: lastRates.cap,
+                             p50: audio.m2e.p(0.50), p95: audio.m2e.p(0.95),
+                             p99: audio.m2e.p(0.99)), final: true)
+    usleep(400_000)
+  }
+  fputs("left the call\n", stderr)
+  exit(0)
+}
+
 // ── A WINDOW AND A PICTURE BEFORE THERE IS ANYONE TO CALL ────────────────────
 //
 // All of this used to happen AFTER the rendezvous, so double-clicking Tokkah.app
@@ -163,6 +203,8 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
 // self-view to the other person, and is the only thing that makes those two paths
 // mutually exclusive.
 nonisolated(unsafe) var sawRemote = false
+/// Set from the control bar's camera button.
+nonisolated(unsafe) var camOff = false
 
 /// The window's title is the only status this app has. Set from whatever thread
 /// notices the state changed, hopped to main because AppKit requires it.
@@ -195,7 +237,20 @@ if flag("window") {
   }
   if mdisplay == nil {
     let d = Display()
-    d.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720)
+    let roomName = arg("room") ?? "direct"
+    d.open(title: "Tokkah — waiting for the other side", w: 1280, h: 720,
+           room: roomName,
+           onMic: { m in
+             gMicMuted = m
+             fputs("mic \(m ? "muted" : "live")\n", stderr)
+             d.controls?.setStatus(m ? "you are muted" : (sawRemote ? "connected" : "waiting for the other side"))
+           },
+           onCam: { off in
+             camOff = off
+             fputs("camera \(off ? "off" : "on")\n", stderr)
+           },
+           onLeave: { leaveCall() },
+           invite: inviteText(room: roomName))
     display = d
   }
 }
@@ -208,6 +263,34 @@ if flag("window") {
 // is the only way this feature can be verified without a person present to click
 // Allow on a camera prompt. An instrument that cannot see the thing it tests
 // reports the same value as a real failure.
+// --shot <path> [--shot-after <s>]: photograph this window's controls and exit.
+// The app's own camera on itself, so verifying a UI change never requires
+// capturing the whole screen -- and armed HERE, before the rendezvous, because
+// the interesting state is "waiting for the other side" and the code after the
+// rendezvous never runs when nobody comes.
+if let shot = arg("shot") {
+  let after = Double(arg("shot-after") ?? "6") ?? 6
+  DispatchQueue.main.asyncAfter(deadline: .now() + after) {
+    // --press mic,cam,invite: exercise the wiring before photographing it.
+    if let seq = arg("press") {
+      for name in seq.split(separator: ",") {
+        display?.controls?.simulate(String(name))
+        // Read the CONTROL's state, not `audio`'s. `audio` is a global created after
+        // the rendezvous, and touching it from a timer that fires while still
+        // waiting traps on an uninitialised global -- the third time today that
+        // exact shape has killed the process without a word.
+        let c = display?.controls
+        fputs("pressed \(name): micMuted=\(c?.micMuted ?? false) camOff=\(c?.camOff ?? false)"
+            + " clipboard=\(NSPasteboard.general.string(forType: .string)?.count ?? 0) chars\n", stderr)
+      }
+    }
+    fputs("tree: \(display?.describeTree ?? "no display")\n", stderr)
+    let ok = display?.snapshot(to: shot) ?? false
+    fputs("shot: \(ok ? "wrote" : "FAILED") \(shot)\n", stderr)
+    exit(ok ? 0 : 1)
+  }
+}
+
 var earlyCam: FrameSource?
 if videoArg != "off", display != nil || mdisplay != nil {
   let c: FrameSource = videoArg == "camera"
@@ -765,6 +848,7 @@ vdec.onDecoded = { img, capHost in
   if !sawRemote {
     sawRemote = true
     setWindowTitle("Tokkah — connected")
+    display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
     fputs("the other side's picture is on screen\n", stderr)
   }
   display?.show(img)
@@ -804,6 +888,11 @@ if videoArg != "off" {
                          quality: vq.quality)
     e.requestKeyframe()
     src.onFrame = { pb, host in
+      // Camera off: stop encoding entirely rather than sending black. Black frames
+      // still cost an encode, a packet and a decode, and the far end cannot tell
+      // them from a dark room. Nothing sent is unambiguous, and the receiver's
+      // last frame simply stays put.
+      if camOff { return }
       e.encode(pb, hostTime: host)
       // Keep showing yourself until the other person's picture arrives.
       if !sawRemote {

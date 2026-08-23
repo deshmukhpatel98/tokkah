@@ -1,4 +1,15 @@
 import Foundation
+
+// ── The mute flag outlives the audio engine, and has to ─────────────────────
+//
+// This was a property on `Audio`, and the mute button's handler wrote to it. But
+// the window and its controls now exist BEFORE the call connects, and `audio` is
+// created after the rendezvous -- so pressing mute while waiting for the other
+// side wrote to an uninitialised global and killed the process. A person clicking
+// mute in the first thirty seconds of every call is not an edge case.
+//
+// File scope, so the button is safe from the moment it is drawn.
+nonisolated(unsafe) var gMicMuted = false
 import AVFoundation
 import AudioToolbox
 import CoreAudio
@@ -1166,6 +1177,16 @@ final class Audio {
         let cap = d >= 0 ? host0 + Clock.ticks(ns: offNs) : host0 - Clock.ticks(ns: offNs)
         capToSend.add(Clock.msSigned(Clock.now(), cap))
         defer { sendCost.add(Clock.msSigned(Clock.now(), entry)) }
+        // ── MUTE MEANS SILENCE ON THE WIRE, NOT SILENCE ON THE SPEAKER ──────────
+        //
+        // `mute` up at the top of this file silences PLAYOUT, which is what a
+        // loopback rig needs. A person pressing a mute button means the opposite
+        // end: do not send what my microphone hears. Zeroed here rather than by
+        // skipping the send, because a gap in the sequence is loss to the far end
+        // and it would conceal it -- inventing speech out of a deliberate silence.
+        // Silence also compresses to almost nothing, so muting costs bandwidth
+        // rather than adding it.
+        if gMicMuted { memset(capBuf, 0, FPP * 4) }
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
                    redundant: (redundancy && havePrev) ? prevBuf : nil,
                    redundantCap: prevCap)
