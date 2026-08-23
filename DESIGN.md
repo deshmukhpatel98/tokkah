@@ -9525,3 +9525,82 @@ The FPP 32-vs-64 re-test was measured with the flood active — and at *differen
 rates in each arm (20,972/s versus 14,422/s), so the two arms carried different
 amounts of parasitic traffic. Its result, that FPP=32 buys 3.7 ms, is void and
 has to be re-run.
+
+## 17.86 Redundancy that pays for itself, and withdraws when it does not
+
+A concealed packet is an audible click, and at 32-sample packets even 0.1% loss
+is about 1.5 clicks a second. The standard answer is to send a second copy of
+each packet, offset in time.
+
+### It needed no format change, which is the whole reason it exists
+
+A new header field would break every peer on an older build and cost another
+silent-until-updated cycle (§17.85). It turned out not to need one: the header
+already declares `frames`, and the receiver only requires the datagram to be *at
+least* that long, so **bytes past the declared payload are ignored by every build
+that does not know to look**. The redundant block rides there — `capHost(8) +
+payload` — and an old peer sees a slightly larger datagram and behaves exactly as
+before. The receiver fills a hole only if it *is* a hole; `ring.write` already
+refuses duplicates and anything the cursor has passed, so nothing here can
+overwrite audio about to play.
+
+### 1% uniform loss: 18x less concealment for 1.2 ms
+
+    fec off   944 concealed   0 recovered    m2e 11.07 ms   buf 3
+    fec on     52 concealed  916 recovered   m2e 12.25 ms   buf 5
+
+**916 of 966 recovered, 94.8%.** The buffer grows by one packet because the second
+copy arrives one packet behind the first, which is where the 1.2 ms goes. The
+remaining 52 are consecutive losses, where the copy dies with the original.
+
+### 3% loss in 20 ms bursts: it does not work, so it stops
+
+    fec off  2688 concealed    0 recovered
+    fec on   2617 concealed   87 recovered      (2.6% better)
+
+A burst takes the original and the copy together, because they are one packet
+apart and the burst is thirty. So redundancy doubles the audio payload to buy
+almost nothing — and on a link already dropping 3% in bursts, adding 2 Mbps is not
+a neutral act; it can be the thing that pushes it over.
+
+So it is judged on its own record. Once there are at least twenty loss events to
+judge, a recovery rate under 40% means these are bursts, and it turns itself off
+with a doubling backoff before it tries again:
+
+    redundancy OFF -- recovered only 14 of 84 (16%), so these are bursts and a
+    one-packet offset cannot reach them. Not spending the bandwidth; retrying in 60 s
+
+Verified both ways: on and staying on at 1% uniform, on and then off under bursts.
+And it is driven by **lost**, not by concealed — concealment also covers
+starvation, and a second copy of a packet that has not been sent yet is not a
+thing.
+
+A one-packet offset is a deliberate limit. Reaching past a burst means an offset as
+long as the burst, and that offset is latency for every packet whether it is needed
+or not. That is a different trade and it deserves its own decision, not a quiet
+ride along inside this one.
+
+## 17.87 Twelve minutes, which is the first test long enough to fail
+
+Every measurement until now was two minutes or less. A real call is twenty, two
+crystals drift by parts per million, and the specific failure this project has
+already written down is *a call that felt immediate at minute one and laggy at
+minute ten*.
+
+697 seconds, audio and video both directions, encrypted, release build:
+
+    m2e   12.73 -> 14.12 -> 11.40 -> 12.27 -> 12.90 ms
+    buf       6 ->     8 ->     4 ->     5 ->     6
+    concealed 15 packets total (one 0.67 ms gap every 46 s)
+    snaps 0    send-rate warnings 0    rss 60.8 -> 61.6 MB
+
+**No monotonic creep.** The buffer came back *down* from 8 to 4 before settling at
+6, so the controller is hunting the right level rather than ratcheting — which is
+exactly the failure mode the asymmetric grow/shrink and the failed-level memory
+were built to prevent, now observed over a realistic duration rather than argued
+for. Eight adjustments in twelve minutes, each 0.67 ms, absorbed by the governor
+at 0.4% of playback rate and therefore inaudible.
+
+The 784 KB of RSS growth over ten minutes is not yet explained and is being
+watched; it is small enough not to matter for a call and large enough to be worth
+a name if it turns out to be linear.

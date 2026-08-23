@@ -40,6 +40,15 @@ final class Audio {
   private var capFill = 0
   private var capBuf: UnsafeMutablePointer<Float>
   private var capScratch: UnsafeMutablePointer<UInt8>
+  // The packet before this one, kept so it can ride along with the next one when
+  // the path is losing. Two buffers, not a queue: the redundancy offset is one
+  // packet, which is what fixes ISOLATED loss -- the common case on a wired or
+  // decent wireless link. A burst needs an offset as long as the burst, and that
+  // is latency, so it is a separate decision and not this one.
+  private var prevBuf: UnsafeMutablePointer<Float>
+  private var prevCap: UInt64 = 0
+  private var havePrev = false
+  var redundancy = false
   private var inBufList: UnsafeMutablePointer<AudioBufferList>
   private var inScratch: UnsafeMutablePointer<Float>
 
@@ -56,8 +65,14 @@ final class Audio {
   init() {
     capBuf = .allocate(capacity: FPP)
     capBuf.initialize(repeating: 0, count: FPP)
-    capScratch = .allocate(capacity: HDR + FPP * 4 + 64)
-    capScratch.initialize(repeating: 0, count: HDR + FPP * 4 + 64)
+    // Room for the primary payload AND a redundant copy with its own capture
+    // stamp, so turning redundancy on never needs a reallocation on the audio
+    // thread.
+    let scratchBytes = HDR + FPP * 4 + 8 + FPP * 4 + 64
+    capScratch = .allocate(capacity: scratchBytes)
+    capScratch.initialize(repeating: 0, count: scratchBytes)
+    prevBuf = .allocate(capacity: FPP)
+    prevBuf.initialize(repeating: 0, count: FPP)
     inScratch = .allocate(capacity: 4096)
     inScratch.initialize(repeating: 0, count: 4096)
     inBufList = .allocate(capacity: 1)
@@ -238,7 +253,12 @@ final class Audio {
         // the samples already consumed from it.
         let off = UInt64(Double(i - FPP) / SR * 1_000_000_000.0)
         let cap = host0 + Clock.ticks(ns: off)
-        wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch)
+        wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
+                   redundant: (redundancy && havePrev) ? prevBuf : nil,
+                   redundantCap: prevCap)
+        memcpy(prevBuf, capBuf, FPP * 4)
+        prevCap = cap
+        havePrev = true
         capSeq += 1; capFill = 0; capturedPkts += 1
       }
     }

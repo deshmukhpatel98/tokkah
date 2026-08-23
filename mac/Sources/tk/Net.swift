@@ -88,6 +88,9 @@ final class RecvRing {
   // The test is exact and already available -- a late arrival is one with
   // negative slack.
   var lateArrivals = 0
+  /// Packets that would have been a click and were not, because a later packet
+  /// carried a second copy.
+  var recovered = 0
   var concealLost = 0, concealStarved = 0
   // Occupancy error in ms, published by the audio thread so the buffer
   // controller can tell "the buffer is roomy" from "the cursor is behind".
@@ -244,19 +247,42 @@ final class Wire {
     peer.sin_addr.s_addr = inet_addr(peerHost)
   }
 
-  func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>) {
+  /// REDUNDANCY THAT NEEDS NO FORMAT CHANGE.
+  ///
+  /// A concealed packet is an audible click, and at FPP=32 even 0.1% loss is
+  /// about 1.5 clicks a second. The fix is to carry a second copy of an earlier
+  /// packet -- but a new header field would break every peer on an older build
+  /// and cost another silent-until-updated cycle (17.85).
+  ///
+  /// It does not need one. The header already declares `frames`, and the receiver
+  /// only requires the datagram to be AT LEAST that long, so bytes past the
+  /// declared payload are ignored by every build that does not know to look. The
+  /// redundant block rides there: capHost(8) + payload. An old peer sees a
+  /// slightly larger datagram and behaves exactly as before.
+  ///
+  /// `redundantOf` is the sequence the extra copy belongs to. Sent only when the
+  /// path has actually been losing packets, so a clean call pays nothing.
+  func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>,
+            redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) {
     scratch.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
     (scratch + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
     (scratch + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
     (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(n).littleEndian }
     memcpy(scratch + HDR, src, n * 4)
+    var total = HDR + n * 4
+    if let r = redundant {
+      (scratch + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
+      memcpy(scratch + total + 8, r, n * 4)
+      total += 8 + n * 4
+      redundantSent += 1
+    }
     // Through rawSend, not sendto. This path used to call sendto directly, which
     // meant the impairment gate -- and anything else that ever belongs on the way
     // out -- saw video fragments and clock probes but never a single audio packet.
     // A 20% loss arm dropped 13 packets out of twelve thousand and the receiver
     // reported zero concealment, so the rig said the app shrugs off heavy loss
     // while actually testing nothing. One send path, one gate.
-    rawSend(scratch, HDR + n * 4)
+    rawSend(scratch, total)
   }
 
   /// One datagram, already framed by the caller. Shared by the audio and video
@@ -308,6 +334,7 @@ final class Wire {
 
   private(set) var cryptSendFails = 0
   private(set) var handshakeReplies = 0
+  private(set) var redundantSent = 0
 
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
     let r = withUnsafePointer(to: &peer) { pp in
@@ -561,6 +588,21 @@ final class Wire {
         continue
       }
       (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
+      // A trailing block means this packet is also carrying an earlier one. Fill
+      // the hole only if it IS a hole -- ring.write already refuses a duplicate,
+      // and refuses anything the cursor has passed, so nothing here can overwrite
+      // audio about to play.
+      let redOff = HDR + frames * 4
+      if plainN >= redOff + 8 + frames * 4, seq > 0 {
+        let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        let rSeq = seq - 1
+        if !ring.present(rSeq) {
+          (plain + redOff + 8).withMemoryRebound(to: Float.self, capacity: frames) {
+            ring.write(seq: rSeq, cap: rCap, src: $0, n: frames)
+          }
+          if ring.present(rSeq) { ring.recovered += 1 }
+        }
+      }
     }
   }
 }

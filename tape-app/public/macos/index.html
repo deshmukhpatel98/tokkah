@@ -43,11 +43,25 @@
      <a href="/macos/install.sh">right here</a>, 50 lines.</p>
 
   <h2>Use it</h2>
-  <pre><code>tk --listen 7001 --peer &lt;other-mac-ip&gt;:7001 --window</code></pre>
-  <p class=note>Run it on both Macs. <code>--window</code> opens the picture; without it you get
-     audio and a latency read-out. Add <code>--video camera</code> to send your camera, or
-     <code>--video &lt;clip.mov&gt;</code> to send a file. It asks for microphone and camera
-     permission the first time, prints its latency budget on start, and then one line a second.</p>
+  <pre><code>tk --room ripe-mango-jam --window</code></pre>
+  <p class=note>Pick any room name and run the same command on both Macs &mdash; that is the
+     whole setup. They find each other through a rendezvous at room.tokkah.com, then talk
+     <strong>directly</strong>, peer to peer, with no relay carrying your call. Two Macs on one
+     wifi take the LAN path automatically; two Macs in different houses punch through both
+     routers. The room name is also the encryption salt, so choose something only the two of
+     you would say, and say it to each other rather than typing it anywhere.</p>
+  <p class=note><code>--window</code> opens the picture; without it you get audio and a
+     latency read-out. Add <code>--video camera</code> to send your camera, or
+     <code>--video clip.mov</code> to send a file. <code>--display metal --fullscreen
+     --vsync 0</code> is the lowest-latency picture &mdash; 3.8&nbsp;ms to glass instead of
+     24.6, at the cost of some tearing. If both Macs are on the same network you can skip the
+     rendezvous entirely with <code>--peer 192.168.1.50:7001</code>.</p>
+  <p class=note>It asks for microphone and camera permission the first time. Because
+     <code>tk</code> is a command-line tool it has no identity of its own, so macOS grants that
+     to the <em>terminal</em> you launched it from &mdash; if it says the microphone was denied,
+     enable Terminal (or iTerm, or VS Code) under System&nbsp;Settings &rarr;
+     Privacy&nbsp;&amp;&nbsp;Security &rarr; Microphone. It prints its latency budget on start
+     and then one line a second.</p>
 
   <h2>Where it is</h2>
   <table>

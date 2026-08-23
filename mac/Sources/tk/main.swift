@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import CoreImage
 import Darwin
@@ -13,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.9.2"
+let VERSION = "0.9.3"
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -188,6 +189,42 @@ audio.wire = wire
 // commands is a flag you will forget on the forty-first, and here the cost of
 // forgetting is landing on someone's speakers while they are asleep. An exported
 // variable is remembered once.
+// MICROPHONE PERMISSION, ASKED AND ANSWERED BEFORE ANYTHING ELSE.
+//
+// A denied microphone produces "cap 0/s" and nothing else -- identical to a
+// muted mic, a wrong default device, or a bug in this code. That ambiguity has
+// already cost me a whole false root cause once in this project, and it is the
+// single most likely thing to stop someone the first time they run this on a
+// machine I cannot see. So it is checked explicitly and named.
+//
+// A command-line tool has no bundle, so macOS attributes the grant to the
+// terminal that launched it -- which is why the fix names the terminal app and
+// not "tk".
+switch AVCaptureDevice.authorizationStatus(for: .audio) {
+case .authorized:
+  break
+case .notDetermined:
+  let sem = DispatchSemaphore(value: 0)
+  var granted = false
+  AVCaptureDevice.requestAccess(for: .audio) { granted = $0; sem.signal() }
+  fputs("microphone: asking permission (look for a dialog)...\n", stderr)
+  _ = sem.wait(timeout: .now() + 60)
+  if !granted {
+    fputs("microphone: NOT GRANTED. tk will play the other side but send silence.\n"
+        + "  Grant it to the app you launched this from (Terminal, iTerm, VS Code...) in\n"
+        + "  System Settings > Privacy & Security > Microphone, then run tk again.\n", stderr)
+  }
+case .denied, .restricted:
+  fputs("microphone: DENIED. You will hear the other person and they will hear silence.\n"
+      + "  Enable the app you launched this from (Terminal, iTerm, VS Code...) in\n"
+      + "  System Settings > Privacy & Security > Microphone, then run tk again.\n", stderr)
+@unknown default:
+  break
+}
+
+// --no-fec exists so redundancy can be A/B'd against itself. A feature that
+// cannot be turned off cannot be measured, and this one costs bandwidth.
+let fecAllowed = !flag("no-fec")
 audio.mute = flag("mute") || (ProcessInfo.processInfo.environment["TK_MUTE"] == "1")
 // SAID OUT LOUD, because "played 754/s" is identical whether the samples are
 // audio or zeros -- the counter cannot tell me the speaker is silent, and a
@@ -529,6 +566,16 @@ if audio.jitAuto {
     var lastConcealed = 0
     var lastSnaps = 0
     var lastLate = 0
+    var lastLostForFec = 0
+    var fecCalm = 0
+    // Redundancy has to earn its bandwidth. Measured: at 1% UNIFORM loss it
+    // recovered 916 of 966 (94.8%) and cut concealment 18x. At 3% loss in 20 ms
+    // BURSTS it recovered 87 of 430 (20%) and cut concealment by 2.6% -- because
+    // the second copy travels one packet behind the first, and a burst takes both.
+    // Paying double for the audio payload on a link already dropping 3% in bursts
+    // is not a neutral act; it can be the thing that pushes it over.
+    var fecRecovered0 = 0, fecLost0 = 0, fecWindows = 0
+    var fecUselessUntil = 0.0, fecBackoff = 60.0
     // A LEVEL THAT FAILED IS REMEMBERED. Without this the controller shrinks,
     // hears a click, grows, waits out its hold and shrinks into the same click
     // forever -- observed on this rig cycling 2 -> 1 -> 2 -> 1 with three
@@ -547,6 +594,54 @@ if audio.jitAuto {
       lastConcealed = r.concealed
       let late = r.lateArrivals - lastLate
       lastLate = r.lateArrivals
+
+      // REDUNDANCY FOLLOWS THE EVIDENCE, not a setting. It doubles the audio
+      // payload, so a clean call must not pay for it -- and a call that IS losing
+      // packets should not wait for anyone to notice. One lost packet in a
+      // two-second window turns it on; thirty seconds clean turns it off.
+      //
+      // Driven by LOST, not by concealed: concealment also covers starvation, and
+      // a second copy of a packet that has not been sent yet is not a thing.
+      let lostNow = r.concealLost - lastLostForFec
+      lastLostForFec = r.concealLost
+      if fecAllowed, lostNow > 0, !audio.redundancy, t >= fecUselessUntil {
+        audio.redundancy = true
+        fecRecovered0 = r.recovered
+        fecLost0 = r.concealLost
+        fecWindows = 0
+        fputs("redundancy ON (\(lostNow) lost in 2 s) -- each packet now carries the previous one\n", stderr)
+        fecCalm = 0
+      } else if audio.redundancy {
+        fecWindows += 1
+        // Judge it on its own record, once there is enough of one to judge. A
+        // recovery rate this low means the losses are bursts, and an offset of one
+        // packet cannot reach past a burst -- so the bandwidth is being spent for
+        // almost nothing and is better not spent.
+        let rec = r.recovered - fecRecovered0
+        let lost = r.concealLost - fecLost0
+        if fecWindows >= 5, rec + lost >= 20 {
+          let rate = Double(rec) / Double(rec + lost)
+          if rate < 0.4 {
+            audio.redundancy = false
+            fecUselessUntil = t + fecBackoff
+            fecBackoff = min(fecBackoff * 2, 600)
+            fputs("redundancy OFF -- recovered only \(rec) of \(rec + lost) "
+                + "(\(Int(rate * 100))%), so these are bursts and a one-packet offset "
+                + "cannot reach them. Not spending the bandwidth; retrying in \(Int(fecBackoff / 2)) s\n", stderr)
+            fecCalm = 0
+            continue
+          }
+        }
+        if lostNow > 0 { fecCalm = 0 } else {
+          fecCalm += 1
+          if fecCalm >= 15 {
+            audio.redundancy = false
+            fecCalm = 0
+            fecBackoff = 60
+            fputs("redundancy OFF (30 s without a lost packet)\n", stderr)
+          }
+        }
+      }
       let snapped = r.snaps - lastSnaps
       lastSnaps = r.snaps
       guard let p01 = r.slackWin.p(0.01) else { continue }
@@ -660,7 +755,8 @@ func reportLoop() {
         + "-- \(d.sent / max(d.cap, 1))x more packets than anything asked for\n", stderr)
   }
   fputs("cap \(d.cap)/s  sent \(d.sent)/s  recv \(d.recv)/s  played \(d.played)/s (\(pct)%)"
-      + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
+      + "  conceal \(d.concealed)/s (lost \(r.concealLost) late \(r.lateArrivals)"
+      + " recovered \(r.recovered)\(audio.redundancy ? " FEC-on" : ""))  dup \(d.dup)  old \(d.tooOld)  jump \(d.jumps)"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
       + "  jit \(audio.jitTarget) snap \(r.snaps)"
