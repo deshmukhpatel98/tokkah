@@ -187,6 +187,14 @@ enum Glyph {
     }
   } }, filled: true)
 
+  /// `#c-hud`: <path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/>
+  static let bars = Shape(build: { box in path(box) { p, k in
+    m(p, k, 4, 20); l(p, k, 4, 10)
+    m(p, k, 10, 20); l(p, k, 10, 4)
+    m(p, k, 16, 20); l(p, k, 16, 13)
+    m(p, k, 22, 20); l(p, k, 2, 20)
+  } }, filled: false)
+
   /// A chain link, for the invite row. Not in the web app's set -- it has no link
   /// button -- so it is drawn in the same language rather than borrowed from a
   /// different icon family, which is what makes a set look like a set.
@@ -829,6 +837,11 @@ final class CallControls: NSView {
     addSubview(roomPill)
     statusPill.text = "waiting for the other person"
     addSubview(statusPill)
+    // `#hud` is OPT-IN in the web app -- "more sheet -> Connection numbers" -- and
+    // its default is off. A permanent latency readout over someone's face is
+    // instrumentation, and this app has plenty of that on stderr for whoever wants
+    // it. So the pill starts hidden and the sheet row turns it on.
+    qualityPill.isHidden = true
     elapsedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
     elapsedLabel.textColor = NSColor(white: 232.0 / 255, alpha: 0.62)
     elapsedLabel.alignment = .center
@@ -1012,9 +1025,13 @@ final class CallControls: NSView {
     if !word.isEmpty { parts.append(word) }
     let text = parts.joined(separator: "  ·  ")
     onMain { [weak self] in
-      self?.qualityPill.textColor = colour
-      self?.qualityPill.text = text
-      self?.needsLayout = true
+      guard let self else { return }
+      self.qualityPill.textColor = colour
+      self.qualityPill.text = text
+      // `Pill.text` hides itself when empty and SHOWS itself otherwise, which would
+      // undo the opt-in a second after it was set. The switch decides.
+      self.qualityPill.isHidden = !self.numbersShown || text.isEmpty
+      self.needsLayout = true
     }
   }
 
@@ -1192,8 +1209,21 @@ final class CallControls: NSView {
       r.target = self; r.action = #selector(pickCameraRow(_:))
       rows.append(r)
     }
+    // `#c-hud`: "Connection numbers", a switch with a tick.
+    let hud = SheetRow("Connection numbers", glyph: Glyph.bars)
+    hud.checked = numbersShown
+    hud.target = self; hud.action = #selector(toggleNumbers)
+    rows.append(hud)
     if let first = rows.dropFirst().first { first.ruled = true }
     sheet.setRows(rows)
+  }
+
+  private(set) var numbersShown = false
+  @objc private func toggleNumbers() {
+    numbersShown.toggle()
+    qualityPill.isHidden = !numbersShown || qualityPill.text.isEmpty
+    rebuildSheet()
+    needsLayout = true
   }
 
   @objc private func inviteFromSheet() { invite(); closeMore() }

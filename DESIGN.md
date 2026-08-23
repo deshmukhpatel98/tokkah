@@ -11813,3 +11813,14 @@ live call that ignores its own buttons looks frozen while being perfectly fine.
 **share** and **copy** existed, drew nothing, and sat in a zero-width frame. Invisible and
 un-clickable, from an assignment that reads as obviously working. Now an explicit
 `setTitle()` that both the initialiser and the setter call.
+
+### Postscript: the numbers are opt-in, because they are in the web app
+
+`#hud` is off by default and reached through *more → Connection numbers*. The native
+window had a permanent latency pill in the corner, which is instrumentation parked over
+someone's face — and this app already prints far more of it to stderr for anyone who
+wants it. The pill now starts hidden and the sheet carries the switch, glyph and all.
+
+One trap: `Pill.text` hides itself when empty and **shows** itself otherwise, so the
+opt-in was being undone a second later by the next quality update. The switch decides,
+and the setter asks it.
