@@ -404,13 +404,6 @@ final class Audio {
   // "cancel" the person who is talking -- it diverges, and the failure sounds like
   // the near end being chewed up. So the step is taken only when the far end is
   // clearly the louder explanation for what the microphone hears.
-  private static let AEC_TAPS = 1024
-  private var aecW: UnsafeMutablePointer<Float>?
-  private var aecOn = false
-  private var aecDelay = 0
-  private var aecFrozen = 0
-  private(set) var aecUpdates = 0
-  private(set) var aecFreezes = 0
   // ── WAS THE MICROPHONE BEING OVERLOADED ──────────────────────────────────────
   //
   // "It felt like the mic was hit hard from both sides" is a description of
@@ -431,14 +424,8 @@ final class Audio {
   /// Seconds the report thread has been ticking. Kept because it is the
   /// denominator for anything expressed as "for how long".
   private(set) var qualityTicks = 0
-  private(set) var aecReaims = 0
-  private var aimDisagree = 0
   private var micE: Double = 0
   private var refE: Double = 0
-  private var erleMicE: Double = 0
-  private var erleOutE: Double = 0
-  var aecCost = Quantiles(cap: 1024)
-  var aecEnabled: Bool { aecOn }
   /// Echo return loss enhancement: how much quieter the microphone signal got.
   ///
   /// Reported two ways on purpose. The lifetime figure includes every second of
@@ -613,108 +600,40 @@ final class Audio {
     qualityTicks += 1
   }
 
-  var erleDb: Double {
-    guard erleMicE > 1e-12, erleOutE > 1e-12 else { return 0 }
-    return 10 * log10(erleMicE / erleOutE)
+  // ERLE -- how much quieter a canceller made the microphone -- is gone with the
+  // canceller. It measured the success of subtracting, and nothing subtracts now.
+  // What replaces it in the record is who held the floor and for how long, which
+  // is the thing this design can actually be judged on.
+  var floorHeldPct: Double {
+    let open = Double(dgate.openFrames), closed = Double(dgate.closedFrames)
+    return open + closed > 0 ? open / (open + closed) * 100 : 100
   }
-  private var erleMicR: Double = 0
-  private var erleOutR: Double = 0
-  var erleRecentDb: Double {
-    guard erleMicR > 1e-12, erleOutR > 1e-12 else { return 0 }
-    return 10 * log10(erleMicR / erleOutR)
-  }
+  var backchannels: Int { dgate.backchannels }
+  var floorClaims: Int { dgate.claims }
 
-  func enableAec() -> String {
-    let w = UnsafeMutablePointer<Float>.allocate(capacity: Audio.AEC_TAPS)
-    w.initialize(repeating: 0, count: Audio.AEC_TAPS)
-    aecW = w
-    aecOn = true
-    return "echo cancellation ON -- \(Audio.AEC_TAPS) taps"
-         + " (\(String(format: "%.1f", Double(Audio.AEC_TAPS) / SR * 1000)) ms),"
-         + " positioned from the measured delay, frozen during double talk"
-  }
-
-  /// Subtract the estimated echo from what the microphone delivered, then take one
-  /// NLMS step if the far end is the dominant explanation for it.
-  private func cancelEcho(_ n: Int) {
-    guard let w = aecW, let eh = echoHist else { return }
-    // The filter sits at the measured delay, rounded to a sample. Until the
-    // estimator has an answer, do nothing: a filter aimed at the wrong place
-    // adapts to noise and then has to unlearn it.
-    let dms = echoDelayMs
-    // 0.30, and the null matters: with no echo path at all the estimator reads
-    // about 0.09 and its "best lag" wanders, so a canceller armed at 0.10 runs on
-    // a call that has no echo -- 116 re-aims in two minutes and 1.6 dB of energy
-    // removed from a signal that had nothing in it to remove.
-    guard dms >= 0, echoCorr > 0.30 else { return }
-    let d = max(0, Int(dms / 1000.0 * SR) - Audio.AEC_TAPS / 4)
-    // Re-aim only on a move the filter cannot absorb. The taps span 21 ms and the
-    // estimate is placed 5 ms in, so a wobble of a few ms is already covered --
-    // and zeroing the weights every time the estimate twitched meant restarting
-    // convergence every two seconds, forever.
-    // And a re-aim has to be EARNED. A single window disagreeing is noise; three
-    // in a row is the echo path actually having moved (someone turned the volume
-    // up, picked the laptop up, changed output device). Zeroing 1024 converged
-    // taps on one twitchy estimate costs more than the twitch ever did.
-    if abs(d - aecDelay) > Int(0.008 * SR) {
-      aimDisagree += 1
-      if aimDisagree >= 3 {
-        aecDelay = d
-        w.update(repeating: 0, count: Audio.AEC_TAPS)
-        aecReaims += 1
-        aimDisagree = 0
-      }
-    } else {
-      aimDisagree = 0
-    }
-    let t0 = Clock.now()
-    let base = echoW - n - aecDelay
-    guard base - Audio.AEC_TAPS >= 0 else { return }
-    for k in 0..<n {
-      let end = base + k                             // newest reference sample
-      var y: Float = 0
-      var xe: Float = 0
-      for j in 0..<Audio.AEC_TAPS {
-        let x = eh[(end - j) % Audio.ECHO_MAX]
-        y += w[j] * x
-        xe += x * x
-      }
-      let mic = inScratch[k]
-      let e = mic - y
-      erleMicE += Double(mic) * Double(mic)
-      erleOutE += Double(e) * Double(e)
-      erleMicR = erleMicR * 0.99998 + Double(mic) * Double(mic)
-      erleOutR = erleOutR * 0.99998 + Double(e) * Double(e)
-      inScratch[k] = e
-      // DOUBLE TALK, and the first version of this gate was worthless. It read
-      // `abs(e) < abs(mic) * 2`, which is true of essentially every sample, so
-      // adaptation never froze -- and NLMS driven by near-end speech against an
-      // uncorrelated far-end reference does not converge slowly, it RANDOM WALKS.
-      // Measured: erle -21.7 dB, the canceller making the signal twenty-one
-      // decibels LOUDER, and -21.6 dB with no echo path armed at all, which is
-      // what localised it.
-      //
-      // The gate has to answer "could the far end alone explain what the
-      // microphone is hearing?" A loudspeaker-to-microphone coupling is below
-      // unity, so if the microphone is LOUDER than the reference, something else is
-      // in the room and that something is the near end talking. Energies over the
-      // filter window, not single samples: one sample says nothing about which
-      // signal is present.
-      let micWinE = micE * 0.98 + Double(mic) * Double(mic)
-      micE = micWinE
-      refE = refE * 0.98 + Double(xe) / Double(Audio.AEC_TAPS)
-      let farEndExplains = refE > 1e-7 && micE < refE * 4.0
-      if farEndExplains {
-        let mu: Float = 0.25
-        let g = mu * e / (xe + 1e-6)
-        for j in 0..<Audio.AEC_TAPS { w[j] += g * eh[(end - j) % Audio.ECHO_MAX] }
-        aecUpdates += 1
-      } else {
-        aecFreezes += 1
-      }
-    }
-    aecCost.add(Clock.ms(Clock.now() - t0) * 1000.0)
-  }
+  // ── NO ECHO CANCELLATION. THE ECHO IS NOT CREATED. ────────────────────────
+  //
+  // There used to be an adaptive filter here: 1024 taps of normalised LMS aimed
+  // at the measured delay and frozen during double talk. It is gone, and not
+  // because it was badly built.
+  //
+  // Cancelling is a losing fight by construction. You hold a copy of what was
+  // SENT to the speaker and nothing at all of what the room did to it, so the
+  // subtraction is always approximate, and the leftover has to be attacked by
+  // guessing which parts of a person's voice are echo. That guessing is the
+  // robotic, underwater sound of every video call, and no amount of taps
+  // removes the need for it.
+  //
+  // Turn-taking makes the whole problem not exist. Echo requires two microphones
+  // open at once; keep one open and there is nothing to subtract, nothing to
+  // guess at, and nothing to damage. What replaces the canceller is not a
+  // quieter canceller -- it is knowing whose turn it is.
+  //
+  // THE DETECTOR STAYS, because it answers a different question. `echoCorr` and
+  // `echoDelayMs` say whether this machine's speaker reaches its own microphone
+  // at all, which is precisely the fact that decides whether turn-taking is
+  // needed here. It measures a property of the room; it no longer feeds anything
+  // that tries to undo it.
 
   var acoustic = false
 
@@ -1977,11 +1896,9 @@ final class Audio {
       capHistW += Int(n)
     }
 
-    // Cancel after: the acoustic detector and the packetiser must see the cleaned
-    // signal, which is what a real microphone path would have delivered.
-    if aecOn { cancelEcho(Int(n)) }
-
-    // And then the gate, on whatever cancellation left behind.
+    // NOTHING SUBTRACTS HERE ANY MORE. The microphone reaches the wire exactly
+    // as it was captured, or turned down whole -- never filtered, never guessed
+    // at. Whose turn it is is the only thing between the room and the far end.
     duplexGate(inScratch, Int(n))
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any

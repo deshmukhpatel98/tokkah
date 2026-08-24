@@ -240,7 +240,6 @@ if let logPath = arg("log") {
 // The list is maintained by hand on purpose: adding a flag and forgetting to
 // register it fails immediately and loudly, which is the cheap direction to fail.
 let KNOWN_FLAGS: Set<String> = [
-  "aec",
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
   "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
@@ -1866,7 +1865,6 @@ if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float force
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
-if flag("aec") { fputs(audio.enableAec() + "\n", stderr) }
 if let ed = arg("echo-sim") {
   // "18" or "18:0.3" -- delay in ms, optional linear gain.
   let parts = ed.split(separator: ":")
@@ -3021,7 +3019,7 @@ func audioBeat(uptime: Double, up: Double, down: Double,
       ? Double(audio.micClipped) * 100.0 / Double(audio.micSamples) : 0,
     "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
     "a_quality_s": audio.qualityTicks,
-    "erle_db": audio.erleDb, "mic_access": gMicAccess,
+    "floor_held_pct": audio.floorHeldPct, "mic_access": gMicAccess,
     "v_rx_w": gRxWidth, "v_rx_h": gRxHeight,
     "peer_rx_lost": wire.peerRxLost, "peer_rx_recovered": wire.peerRxRecovered,
     "peer_reports": wire.peerReportsLoss ? 1 : 0,
@@ -3030,7 +3028,8 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "route": wire.lockedFrom.hasPrefix("relay") ? 2 : (wire.lockedFrom.isEmpty ? 0 : 1),
     "turn_ok": wire.turn != nil ? 1 : 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
-    "echo_corr": audio.echoCorr, "aec_freezes": audio.aecFreezes,
+    "echo_corr": audio.echoCorr, "backchannels": audio.backchannels,
+    "floor_claims": audio.floorClaims,
     "dec_luma": gDecLuma,
     "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,
     "agc_on": Audio.agcOn ? 1 : 0, "devbuf": Audio.devBuf,
@@ -3281,26 +3280,24 @@ func reportLoop() {
   }
   // Is the speaker feeding the microphone? A question worth an answer on every
   // call, not only when a canceller is being tested.
+  // Is the speaker feeding the microphone? Not so that anything can subtract it
+  // -- nothing subtracts any more -- but because it is the fact that decides
+  // whether this end has to take turns at all.
   if audio.echoDelayMs >= 0 {
-    fputs("  echo: \(String(format: "%.2f", audio.echoCorr)) correlation at "
-        + "\(String(format: "%.1f", audio.echoDelayMs)) ms"
-        + (audio.echoSim ? "  [SIMULATED echo path armed]" : "")
-        // 0.45, not 0.2. The null -- two unrelated speech signals, no echo path at
-        // all -- measured 0.26, so a threshold under that reports an echo on every
-        // healthy call. The floor was measured before the threshold was chosen.
-        + (audio.echoCorr > 0.45
-           ? "  -- ECHO: the far end is hearing itself, headphones or cancellation needed" : "")
-        + "\n", stderr)
+    let corr = String(format: "%.2f", audio.echoCorr)
+    let at = String(format: "%.1f", audio.echoDelayMs)
+    // 0.45, not 0.2. The null -- two unrelated speech signals, no echo path at
+    // all -- measured 0.26, so a threshold under that reports an echo on every
+    // healthy call. The floor was measured before the threshold was chosen.
+    let verdict = audio.echoCorr > 0.45
+      ? "  -- this machine's speaker reaches its own microphone" : ""
+    let sim = audio.echoSim ? "  [SIMULATED echo path armed]" : ""
+    fputs("  room: \(corr) correlation at \(at) ms\(sim)\(verdict)\n", stderr)
   }
-  if audio.aecEnabled {
-    let budgetUs = Double(Audio.devBuf) / SR * 1_000_000.0
-    let c = audio.aecCost.p(0.95) ?? 0
-    fputs("  aec: erle \(String(format: "%.1f", audio.erleRecentDb)) dB now,"
-        + " \(String(format: "%.1f", audio.erleDb)) dB over the call"
-        + "  \(audio.aecUpdates) steps, \(audio.aecFreezes) frozen, \(audio.aecReaims) re-aims"
-        + " (\(Int(Double(audio.aecFreezes) / Double(max(1, audio.aecUpdates + audio.aecFreezes)) * 100))% double-talk)"
-        + "  cost p95 \(String(format: "%.0f", c)) us of \(String(format: "%.0f", budgetUs)) us"
-        + " (\(String(format: "%.0f", c / budgetUs * 100))%)\n", stderr)
+  if Audio.gate.on {
+    let held = String(format: "%.0f", audio.floorHeldPct)
+    fputs("  floor: yours \(held)% of the call"
+        + "  \(audio.backchannels) listening noises, \(audio.floorClaims) bids to speak\n", stderr)
   }
   if audio.acoustic {
     let heard = audio.acRound.p(0.50)
