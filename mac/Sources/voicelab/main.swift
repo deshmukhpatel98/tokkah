@@ -701,7 +701,7 @@ enum Echo {
   /// Speech-shaped noise. A probe should look like the thing whose echo is the
   /// problem: measuring with a click flatters the estimate, because a click has
   /// energy everywhere and a voice does not.
-  static func probe(seconds: Double) -> [Float] {
+  static func probe(seconds: Double, level: Float = 0.55) -> [Float] {
     var seed: UInt64 = 0x9E3779B97F4A7C15
     func rnd() -> Float {
       seed = seed &* 6364136223846793005 &+ 1442695040888963407
@@ -709,7 +709,7 @@ enum Echo {
     }
     var x = (0..<Int(SR * seconds)).map { _ in rnd() }
     let lo = Spatial.onePole(x, 150), hi = lowpassSteep(x, 3800)
-    for i in 0..<x.count { x[i] = (hi[i] - lo[i]) * 0.55 }
+    for i in 0..<x.count { x[i] = (hi[i] - lo[i]) * level }
     // Ease both ends so the probe starts and stops without a thump.
     let ramp = Int(SR * 0.05)
     for i in 0..<ramp {
@@ -775,36 +775,90 @@ enum Echo {
   }
 
   struct Room {
-    var delayMs = 0.0, tail60Ms = 0.0, erlDb = 0.0
+    /// Where the strongest arrival sits RELATIVE TO THE ALIGNMENT POINT, not
+    /// relative to the speaker. The absolute speaker-to-microphone delay cannot
+    /// be recovered here: correlation aligns to the arrival itself, so the delay
+    /// is absorbed into the alignment. This number is a check that alignment
+    /// landed where it was aimed (at the margin), and the window origin for
+    /// everything below.
+    var peakAtMs = 0.0
+    var tail60Ms = 0.0, erlDb = 0.0
+    /// Cancellation measured over short segments. A path that is cancellable
+    /// within half a second but not over four is DRIFTING; one that is not
+    /// cancellable even briefly is NON-LINEAR. Same low number, opposite fixes.
+    var segmentDb: [Double] = []
+    /// How far the alignment peak stands above the noise. Under about 8 the
+    /// measurement did not find the probe and nothing below is worth reading.
+    var confidence = 0.0
     var within: [(ms: Double, pct: Double)] = []
     var erleByTaps: [(taps: Int, ms: Double, db: Double)] = []
   }
 
-  /// The microphone is opened before the probe starts, so the recording begins
-  /// with an unknown amount of silence. Nothing downstream can tell that apart
-  /// from a very long echo delay, so it is cut off here: the probe fades in over
-  /// 50 ms and is far louder than a quiet room, so its arrival is unambiguous.
-  static func trimToOnset(_ mic: [Float]) -> [Float] {
-    let win = Int(SR * 0.01)
-    guard mic.count > win * 20 else { return mic }
-    var floorE: Double = 0
-    for i in 0..<win { floorE += Double(mic[i]) * Double(mic[i]) }
-    floorE = max(floorE / Double(win), 1e-10)
-    var i = win
-    while i + win < mic.count {
-      var e = 0.0
-      for k in i..<(i + win) { e += Double(mic[k]) * Double(mic[k]) }
-      if e / Double(win) > floorE * 25 {
-        return Array(mic[max(0, i - Int(SR * 0.02))...])
+  /// Where the recording sits relative to the probe, by cross-correlation.
+  ///
+  /// The first version looked for the probe's onset by energy and it failed
+  /// intermittently on real recordings -- and a failed alignment produces
+  /// exactly 0.0 dB, which is indistinguishable from a room that cannot be
+  /// cancelled at all. Two runs minutes apart in the same room read 0.0 and
+  /// 11.1 dB. Correlation has no threshold to get wrong.
+  static func coarseLag(_ ref: [Float], _ mic: [Float]) -> (lag: Int, confidence: Double) {
+    let n = 1 << 17                                   // ~11 s at the analysis rate
+    guard ref.count > 64, mic.count > 64, ref.count < n, mic.count < n else { return (0, 0) }
+    let log2n = vDSP_Length(17)
+    guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else { return (0, 0) }
+    defer { vDSP_destroy_fftsetup(setup) }
+    func fwd(_ x: [Float]) -> (re: [Float], im: [Float]) {
+      var pad = [Float](repeating: 0, count: n)
+      for i in 0..<x.count { pad[i] = x[i] }
+      var re = [Float](repeating: 0, count: n / 2), im = re
+      pad.withUnsafeBufferPointer { p in
+        p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { c in
+          var sp = DSPSplitComplex(realp: &re, imagp: &im)
+          vDSP_ctoz(c, 2, &sp, 1, vDSP_Length(n / 2))
+          vDSP_fft_zrip(setup, &sp, 1, log2n, FFTDirection(FFT_FORWARD))
+        }
       }
-      i += win
+      return (re, im)
     }
-    return mic
+    let a = fwd(ref), b = fwd(mic)
+    // conj(A) * B, then back to the time domain: the peak is the lag.
+    var cr = [Float](repeating: 0, count: n / 2), ci = cr
+    for i in 0..<n / 2 {
+      cr[i] = a.re[i] * b.re[i] + a.im[i] * b.im[i]
+      ci[i] = a.re[i] * b.im[i] - a.im[i] * b.re[i]
+    }
+    var out = [Float](repeating: 0, count: n)
+    cr.withUnsafeMutableBufferPointer { rp in
+      ci.withUnsafeMutableBufferPointer { ip in
+        var sp = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+        vDSP_fft_zrip(setup, &sp, 1, log2n, FFTDirection(FFT_INVERSE))
+        out.withUnsafeMutableBufferPointer { op in
+          op.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { c in
+            vDSP_ztoc(&sp, 1, c, 2, vDSP_Length(n / 2))
+          }
+        }
+      }
+    }
+    var peak = 0; var pv: Float = 0
+    let limit = min(n / 2, Int(AR * 3))               // the probe cannot be 3 s late
+    for i in 0..<limit where abs(out[i]) > pv { pv = abs(out[i]); peak = i }
+    // How far the peak stands above the rest -- a real alignment towers over it.
+    var mean = 0.0
+    for i in 0..<limit { mean += Double(abs(out[i])) }
+    mean /= Double(limit)
+    return (peak, mean > 1e-12 ? Double(pv) / mean : 0)
   }
 
   static func analyse(played: [Float], mic: [Float]) -> Room {
     var r = Room()
-    let ref = decimate(played), rec = decimate(trimToOnset(mic))
+    let ref0 = decimate(played), mic0 = decimate(mic)
+    let (lag, conf) = coarseLag(ref0, mic0)
+    r.confidence = conf
+    // Cut the recording back to just before the probe arrives, keeping a little
+    // room so the filter still sees the leading edge.
+    let cut = max(0, lag - Int(AR * 0.03))
+    let ref = ref0
+    let rec = cut < mic0.count - 1000 ? Array(mic0[cut...]) : mic0
     // How much quieter the room already makes it. This is the head start a
     // canceller gets for free, and on a laptop it is usually small.
     let pe = rms(ref), me = rms(rec)
@@ -818,7 +872,7 @@ enum Echo {
 
     var peak = 0, pv: Float = 0
     for (i, v) in ir.enumerated() where abs(v) > pv { pv = abs(v); peak = i }
-    r.delayMs = Double(peak) / AR * 1000
+    r.peakAtMs = Double(peak) / AR * 1000
 
     var total = 0.0
     for i in peak..<taps { total += Double(ir[i]) * Double(ir[i]) }
@@ -838,22 +892,42 @@ enum Echo {
     }
 
     // And the number that actually decides the design: what a canceller of each
-    // length would achieve in THIS room. Aimed at the measured delay first,
-    // because that is what the real one does -- a filter that has to spend its
-    // first 12 ms covering the gap before the echo arrives is being scored on a
-    // handicap it does not have.
-    // Short of the measured delay ON PURPOSE. A filter only sees the past, so
-    // aligning exactly -- or a hair past, which is what the peak estimate does
-    // -- puts the echo's arrival before the earliest tap and leaves it
-    // uncancellable. That alone pinned every reading at 6 dB and read as
-    // "filter length makes no difference".
-    let skip = max(0, Int(r.delayMs / 1000 * AR) - 24)
-    let aimed = skip > 0 && skip < rec.count / 2 ? Array(rec[skip...]) : rec
+    // length would achieve in THIS room.
+    //
+    // The filter is given the delay AS EXTRA SPAN rather than by shifting the
+    // recording to meet it. Shifting is the obvious way and it is a trap: a
+    // filter only sees the past, so aligning to the estimated delay puts the
+    // echo's arrival before the earliest tap whenever the estimate is a hair
+    // long -- and the result is 0 dB, which is indistinguishable from a room
+    // that cannot be cancelled. Extra taps covering the gap learn zeros there
+    // and cost only a little convergence.
+    let lead = max(0, Int(r.peakAtMs / 1000 * AR))
     for t48 in [1024, 2048, 4096, 8192] {
       let ms = Double(t48) / SR * 1000
-      let t = max(16, Int(ms / 1000 * AR))
-      let (_, db) = learn(ref: ref, mic: aimed, taps: t)
+      let t = lead + max(16, Int(ms / 1000 * AR))
+      let (_, db) = learn(ref: ref, mic: rec, taps: t)
       r.erleByTaps.append((t48, ms, db))
+    }
+
+    // ── DRIFT OR DISTORTION? ─────────────────────────────────────────────────
+    //
+    // A low number over the whole recording has two completely different causes.
+    // If the speaker and the microphone run on clocks that are not quite the
+    // same, the echo path slides continuously and a fixed filter is always
+    // slightly out of date -- that shows up as good cancellation inside a short
+    // window and poor cancellation across a long one. If the speaker is
+    // distorting, no linear filter helps over any span at all. One wants
+    // resampling, the other wants turning the volume down; telling them apart is
+    // the difference between fixing this and guessing at it.
+    let segLen = Int(AR * 0.5)
+    let span = lead + max(16, Int(0.0213 * AR))
+    var at = 0
+    while at + segLen + span < min(ref.count, rec.count) && r.segmentDb.count < 6 {
+      let a = Array(ref[at..<(at + segLen + span)])
+      let b = Array(rec[at..<(at + segLen + span)])
+      let (_, db) = learn(ref: a, mic: b, taps: span, passes: 8)
+      r.segmentDb.append(db)
+      at += segLen
     }
     return r
   }
@@ -1279,7 +1353,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     echoBtn.enabled = true
     recBtn.enabled = true
     // Every number here goes to the log; the screen gets a sentence.
-    fputs("echo: device \(device)  micPeak \(micPeak)  startsAt \(room.delayMs) ms"
+    fputs("echo: device \(device)  micPeak \(micPeak)  startsAt \(room.peakAtMs) ms"
         + "  ERL \(room.erlDb) dB\n", stderr)
     for w in room.within { fputs(String(format: "echo:   %.0f%% within %.0f ms\n", w.pct, w.ms), stderr) }
     for e in room.erleByTaps {
@@ -1409,6 +1483,82 @@ if let v = argVal("--wide-gain") { Spatial.wideGain = Float(v) }
 // and every number it prints will be believed. So first it gets a room that was
 // built on purpose: a known delay, a known decay, and a known amount of energy
 // past the window a 1024-tap canceller can see.
+// The same measurement without the window, so it can be run from a script and
+// at a chosen level -- a quiet room takes a quiet probe perfectly well, and a
+// measurement nobody can run at 2am is a measurement that waits until morning.
+if CommandLine.arguments.contains("--echo-measure") {
+  let level = Float(argVal("--level") ?? 0.35)
+  let probe = Echo.probe(seconds: 4, level: level)
+  let r = Recorder()
+  r.pureMic = true
+  do { try r.start() } catch {
+    print("  cannot open the microphone: \(error.localizedDescription)"); exit(1)
+  }
+  let player = Player()
+  // STARTUP POISONS THIS. A microphone that has just opened is not yet
+  // reporting the room: the first take read a "quiet" period LOUDER than the
+  // probe, which is impossible for background noise and was in fact the device
+  // settling. Give it a second and a half, then measure the room, then play.
+  Thread.sleep(forTimeInterval: 1.5)
+  player.play(probe, probe)
+  Thread.sleep(forTimeInterval: 4.9)
+  player.stop(); r.stop()
+  let mic = r.samples
+  // PEAK IS THE WRONG STATISTIC HERE. One keystroke outranks four seconds of
+  // probe, so a peak that does not scale with the probe proves nothing. The RMS
+  // over the probe's own window does: if THAT fails to track the level, the
+  // capture chain is riding a gain and the echo path is not a fixed one.
+  func rmsOf(_ x: ArraySlice<Float>) -> Double {
+    guard !x.isEmpty else { return 0 }
+    var a = 0.0; for v in x { a += Double(v) * Double(v) }
+    return (a / Double(x.count)).squareRoot()
+  }
+  let head = mic.count > Int(SR * 1.4) ? rmsOf(mic[Int(SR * 1.0)..<Int(SR * 1.4)]) : 0
+  let body = mic.count > Int(SR * 5.0) ? rmsOf(mic[Int(SR * 2.0)..<Int(SR * 5.0)]) : 0
+  let snr = body > 0 && head > 0 ? 20 * log10(body / head) : 0
+  print(String(format: "  probe level %.2f -> mic rms %.5f, settled room %.5f, probe is %.1f dB above the room",
+               level, body, head, snr))
+  if snr < 10 {
+    print(String(format: "  the probe is only %.1f dB above the room noise -- there is a ceiling of about"
+                 + " %.1f dB on anything measured below, because most of what the microphone hears is not"
+                 + " the speaker at all", snr, snr))
+  }
+  guard r.peak > 0.004 else {
+    print("  the microphone barely heard the speaker -- raise the volume or the level"); exit(1)
+  }
+  let room = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  alignment confidence %.0f%@", room.confidence,
+               room.confidence < 8 ? "  <- DID NOT FIND THE PROBE, ignore what follows" : ""))
+  print(String(format: "  echo starts at %.1f ms", room.peakAtMs))
+  for w in room.within { print(String(format: "    %.0f%% of the echo lands within %.0f ms", w.pct, w.ms)) }
+  for e in room.erleByTaps {
+    print(String(format: "    a %d-tap canceller (%.0f ms) gets %.1f dB", e.taps, e.ms, e.db))
+  }
+  // A VERDICT FROM A BLIND INSTRUMENT IS WORSE THAN NO VERDICT. Cancellation is
+  // bounded by how much of what the microphone hears is actually the speaker: if
+  // the probe is 4 dB above the room, no canceller can score more than about 4,
+  // and every reading below would otherwise be reported as a property of the
+  // room. Three separate runs here confidently announced "the speaker is
+  // distorting" when the truth was that the probe was quieter than a fan.
+  guard snr >= 15 else {
+    print("  NO VERDICT -- the speaker needs to be clearly louder than the room for this to"
+        + " measure anything. Turn the volume up and run it again.")
+    exit(3)
+  }
+  if !room.segmentDb.isEmpty {
+    let best = room.segmentDb.max() ?? 0
+    let whole = room.erleByTaps.first?.db ?? 0
+    print("  over half-second windows: "
+      + room.segmentDb.map { String(format: "%.1f", $0) }.joined(separator: "  ") + " dB")
+    print(best > whole + 4
+      ? String(format: "  -> DRIFT. %.1f dB in a short window against %.1f dB over four seconds:"
+               + " the path is moving, and a fixed filter is always out of date.", best, whole)
+      : String(format: "  -> NOT DRIFT. Only %.1f dB even in half a second, so the echo is not a"
+               + " linear copy of what was played -- the speaker is distorting it.", best))
+  }
+  exit(0)
+}
+
 if CommandLine.arguments.contains("--echo-selftest") {
   let delayMs = 12.0, rt60Ms = 150.0
   let probe = Echo.probe(seconds: 3)
@@ -1424,26 +1574,35 @@ if CommandLine.arguments.contains("--echo-selftest") {
     let t = Double(i - d0) / SR
     ir[i] = rnd() * 0.16 * Float(pow(10, -3 * t / (rt60Ms / 1000)))
   }
-  var mic = [Float](repeating: 0, count: probe.count)
+  var conv = [Float](repeating: 0, count: probe.count)
   for k in 0..<ir.count where abs(ir[k]) > 1e-6 {
     let g = ir[k]
-    for i in k..<probe.count { mic[i] += g * probe[i - k] }
+    for i in k..<probe.count { conv[i] += g * probe[i - k] }
   }
+  // SHAPED LIKE A REAL RECORDING, not like a clean convolution. The microphone
+  // opens before the probe starts, so a real take begins with several hundred
+  // milliseconds of room noise; the alignment step has to find the probe inside
+  // that, and it is the step that failed on real audio while passing here.
+  let pre = Int(SR * 0.45)
+  var mic = [Float](repeating: 0, count: pre + conv.count + Int(SR * 0.3))
+  for i in 0..<conv.count { mic[pre + i] = conv[i] }
+  for i in 0..<mic.count { mic[i] += rnd() * 0.002 }
   let r = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  alignment confidence %.0f (needs 8)", r.confidence))
   print(String(format: "  built a room: echo starts at %.0f ms, rings for %.0f ms", delayMs, rt60Ms))
-  print(String(format: "  measured:     echo starts at %.1f ms", r.delayMs))
+  print(String(format: "  alignment landed %.1f ms before the arrival (aimed at 30)", r.peakAtMs))
   for w in r.within { print(String(format: "                %.0f%% of it lands within %.0f ms", w.pct, w.ms)) }
   for e in r.erleByTaps {
     print(String(format: "                a %d-tap canceller (%.0f ms) would get %.1f dB", e.taps, e.ms, e.db))
   }
-  let delayOK = abs(r.delayMs - delayMs) < 2
+  let delayOK = abs(r.peakAtMs - 30) < 5
   let risesOK = (r.erleByTaps.last?.db ?? 0) > (r.erleByTaps.first?.db ?? 0) + 3
   let shortSees = r.within.first?.pct ?? 100
   let partialOK = shortSees < 95 && shortSees > 20
   print(delayOK && risesOK && partialOK
     ? "  ECHO SELFTEST PASSED -- finds the delay, and a longer filter measurably does better"
     : "  ECHO SELFTEST FAILED"
-      + (delayOK ? "" : " (delay wrong)")
+      + (delayOK ? "" : " (alignment did not land where it was aimed)")
       + (risesOK ? "" : " (length makes no difference -- it cannot tell filters apart)")
       + (partialOK ? "" : " (a 21 ms window scores \(Int(shortSees))%, which is not a room)"))
   exit(delayOK && risesOK && partialOK ? 0 : 1)
@@ -1466,6 +1625,82 @@ if CommandLine.arguments.contains("--vs-call") { }
 // and every number it prints will be believed. So first it gets a room that was
 // built on purpose: a known delay, a known decay, and a known amount of energy
 // past the window a 1024-tap canceller can see.
+// The same measurement without the window, so it can be run from a script and
+// at a chosen level -- a quiet room takes a quiet probe perfectly well, and a
+// measurement nobody can run at 2am is a measurement that waits until morning.
+if CommandLine.arguments.contains("--echo-measure") {
+  let level = Float(argVal("--level") ?? 0.35)
+  let probe = Echo.probe(seconds: 4, level: level)
+  let r = Recorder()
+  r.pureMic = true
+  do { try r.start() } catch {
+    print("  cannot open the microphone: \(error.localizedDescription)"); exit(1)
+  }
+  let player = Player()
+  // STARTUP POISONS THIS. A microphone that has just opened is not yet
+  // reporting the room: the first take read a "quiet" period LOUDER than the
+  // probe, which is impossible for background noise and was in fact the device
+  // settling. Give it a second and a half, then measure the room, then play.
+  Thread.sleep(forTimeInterval: 1.5)
+  player.play(probe, probe)
+  Thread.sleep(forTimeInterval: 4.9)
+  player.stop(); r.stop()
+  let mic = r.samples
+  // PEAK IS THE WRONG STATISTIC HERE. One keystroke outranks four seconds of
+  // probe, so a peak that does not scale with the probe proves nothing. The RMS
+  // over the probe's own window does: if THAT fails to track the level, the
+  // capture chain is riding a gain and the echo path is not a fixed one.
+  func rmsOf(_ x: ArraySlice<Float>) -> Double {
+    guard !x.isEmpty else { return 0 }
+    var a = 0.0; for v in x { a += Double(v) * Double(v) }
+    return (a / Double(x.count)).squareRoot()
+  }
+  let head = mic.count > Int(SR * 1.4) ? rmsOf(mic[Int(SR * 1.0)..<Int(SR * 1.4)]) : 0
+  let body = mic.count > Int(SR * 5.0) ? rmsOf(mic[Int(SR * 2.0)..<Int(SR * 5.0)]) : 0
+  let snr = body > 0 && head > 0 ? 20 * log10(body / head) : 0
+  print(String(format: "  probe level %.2f -> mic rms %.5f, settled room %.5f, probe is %.1f dB above the room",
+               level, body, head, snr))
+  if snr < 10 {
+    print(String(format: "  the probe is only %.1f dB above the room noise -- there is a ceiling of about"
+                 + " %.1f dB on anything measured below, because most of what the microphone hears is not"
+                 + " the speaker at all", snr, snr))
+  }
+  guard r.peak > 0.004 else {
+    print("  the microphone barely heard the speaker -- raise the volume or the level"); exit(1)
+  }
+  let room = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  alignment confidence %.0f%@", room.confidence,
+               room.confidence < 8 ? "  <- DID NOT FIND THE PROBE, ignore what follows" : ""))
+  print(String(format: "  echo starts at %.1f ms", room.peakAtMs))
+  for w in room.within { print(String(format: "    %.0f%% of the echo lands within %.0f ms", w.pct, w.ms)) }
+  for e in room.erleByTaps {
+    print(String(format: "    a %d-tap canceller (%.0f ms) gets %.1f dB", e.taps, e.ms, e.db))
+  }
+  // A VERDICT FROM A BLIND INSTRUMENT IS WORSE THAN NO VERDICT. Cancellation is
+  // bounded by how much of what the microphone hears is actually the speaker: if
+  // the probe is 4 dB above the room, no canceller can score more than about 4,
+  // and every reading below would otherwise be reported as a property of the
+  // room. Three separate runs here confidently announced "the speaker is
+  // distorting" when the truth was that the probe was quieter than a fan.
+  guard snr >= 15 else {
+    print("  NO VERDICT -- the speaker needs to be clearly louder than the room for this to"
+        + " measure anything. Turn the volume up and run it again.")
+    exit(3)
+  }
+  if !room.segmentDb.isEmpty {
+    let best = room.segmentDb.max() ?? 0
+    let whole = room.erleByTaps.first?.db ?? 0
+    print("  over half-second windows: "
+      + room.segmentDb.map { String(format: "%.1f", $0) }.joined(separator: "  ") + " dB")
+    print(best > whole + 4
+      ? String(format: "  -> DRIFT. %.1f dB in a short window against %.1f dB over four seconds:"
+               + " the path is moving, and a fixed filter is always out of date.", best, whole)
+      : String(format: "  -> NOT DRIFT. Only %.1f dB even in half a second, so the echo is not a"
+               + " linear copy of what was played -- the speaker is distorting it.", best))
+  }
+  exit(0)
+}
+
 if CommandLine.arguments.contains("--echo-selftest") {
   let delayMs = 12.0, rt60Ms = 150.0
   let probe = Echo.probe(seconds: 3)
@@ -1481,26 +1716,35 @@ if CommandLine.arguments.contains("--echo-selftest") {
     let t = Double(i - d0) / SR
     ir[i] = rnd() * 0.16 * Float(pow(10, -3 * t / (rt60Ms / 1000)))
   }
-  var mic = [Float](repeating: 0, count: probe.count)
+  var conv = [Float](repeating: 0, count: probe.count)
   for k in 0..<ir.count where abs(ir[k]) > 1e-6 {
     let g = ir[k]
-    for i in k..<probe.count { mic[i] += g * probe[i - k] }
+    for i in k..<probe.count { conv[i] += g * probe[i - k] }
   }
+  // SHAPED LIKE A REAL RECORDING, not like a clean convolution. The microphone
+  // opens before the probe starts, so a real take begins with several hundred
+  // milliseconds of room noise; the alignment step has to find the probe inside
+  // that, and it is the step that failed on real audio while passing here.
+  let pre = Int(SR * 0.45)
+  var mic = [Float](repeating: 0, count: pre + conv.count + Int(SR * 0.3))
+  for i in 0..<conv.count { mic[pre + i] = conv[i] }
+  for i in 0..<mic.count { mic[i] += rnd() * 0.002 }
   let r = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  alignment confidence %.0f (needs 8)", r.confidence))
   print(String(format: "  built a room: echo starts at %.0f ms, rings for %.0f ms", delayMs, rt60Ms))
-  print(String(format: "  measured:     echo starts at %.1f ms", r.delayMs))
+  print(String(format: "  alignment landed %.1f ms before the arrival (aimed at 30)", r.peakAtMs))
   for w in r.within { print(String(format: "                %.0f%% of it lands within %.0f ms", w.pct, w.ms)) }
   for e in r.erleByTaps {
     print(String(format: "                a %d-tap canceller (%.0f ms) would get %.1f dB", e.taps, e.ms, e.db))
   }
-  let delayOK = abs(r.delayMs - delayMs) < 2
+  let delayOK = abs(r.peakAtMs - 30) < 5
   let risesOK = (r.erleByTaps.last?.db ?? 0) > (r.erleByTaps.first?.db ?? 0) + 3
   let shortSees = r.within.first?.pct ?? 100
   let partialOK = shortSees < 95 && shortSees > 20
   print(delayOK && risesOK && partialOK
     ? "  ECHO SELFTEST PASSED -- finds the delay, and a longer filter measurably does better"
     : "  ECHO SELFTEST FAILED"
-      + (delayOK ? "" : " (delay wrong)")
+      + (delayOK ? "" : " (alignment did not land where it was aimed)")
       + (risesOK ? "" : " (length makes no difference -- it cannot tell filters apart)")
       + (partialOK ? "" : " (a 21 ms window scores \(Int(shortSees))%, which is not a room)"))
   exit(delayOK && risesOK && partialOK ? 0 : 1)
