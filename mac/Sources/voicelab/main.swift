@@ -92,6 +92,35 @@ enum Spatial {
   }
 }
 
+// ── Keeping a take ───────────────────────────────────────────────────────────
+//
+// Every comparison so far has been thrown away the moment the process ended, so
+// "the one from before" could never be played again -- and a judgement you
+// cannot repeat tomorrow is not a judgement. Takes go to the Desktop as ordinary
+// WAV files: playable in anything, mailable, and still there next week.
+enum Wav {
+  static func write(_ L: [Float], _ R: [Float]?, to url: URL) {
+    let ch = R == nil ? 1 : 2
+    let n = R == nil ? L.count : min(L.count, R!.count)
+    var pcm = Data(capacity: n * ch * 2)
+    for i in 0..<n {
+      func s16(_ v: Float) -> Int16 { Int16(max(-32768, min(32767, v * 32767))) }
+      withUnsafeBytes(of: s16(L[i]).littleEndian) { pcm.append(contentsOf: $0) }
+      if let R { withUnsafeBytes(of: s16(R[i]).littleEndian) { pcm.append(contentsOf: $0) } }
+    }
+    var d = Data()
+    func str(_ x: String) { d.append(x.data(using: .ascii)!) }
+    func u32(_ x: UInt32) { withUnsafeBytes(of: x.littleEndian) { d.append(contentsOf: $0) } }
+    func u16(_ x: UInt16) { withUnsafeBytes(of: x.littleEndian) { d.append(contentsOf: $0) } }
+    str("RIFF"); u32(UInt32(36 + pcm.count)); str("WAVE")
+    str("fmt "); u32(16); u16(1); u16(UInt16(ch)); u32(UInt32(SR))
+    u32(UInt32(Int(SR) * ch * 2)); u16(UInt16(ch * 2)); u16(16)
+    str("data"); u32(UInt32(pcm.count))
+    d.append(pcm)
+    try? d.write(to: url)
+  }
+}
+
 // ── Capture ──────────────────────────────────────────────────────────────────
 final class Recorder {
   private let engine = AVAudioEngine()
@@ -106,6 +135,20 @@ final class Recorder {
   /// above the hiss, and no processing anywhere downstream can undo it -- the
   /// quiet parts were already thrown away by the converter. Set the gain BEFORE
   /// the converter and none of it happens.
+  /// Which of Apple's microphone modes is in force. It is a Control Center
+  /// toggle an app is not allowed to set -- `preferredMicrophoneMode` is
+  /// class/readonly -- so the only honest thing to do is report it, because two
+  /// takes made under different modes are not comparable and nothing else on
+  /// screen would say so.
+  static func micMode() -> String {
+    switch AVCaptureDevice.activeMicrophoneMode {
+    case .voiceIsolation: return "Voice Isolation ON"
+    case .wideSpectrum: return "Wide Spectrum"
+    case .standard: return "Standard"
+    @unknown default: return "unknown"
+    }
+  }
+
   static func raiseInputIfLow() -> String {
     var dev = AudioDeviceID(0); var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
     var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
@@ -128,9 +171,19 @@ final class Recorder {
     return String(format: "mic input raised %d%% -> %d%%", Int(cur * 100), Int(got * 100))
   }
 
+  /// PURE means nothing between the microphone and the file: no echo canceller,
+  /// no gain control, no Voice Isolation. macOS applies its microphone modes only
+  /// to apps that use voice processing, so switching this off is also the only
+  /// way to hear the room as the microphone actually hears it -- which is the
+  /// reference every processed version should be judged against.
+  var pureMic = true
+
   func start() throws {
     samples.removeAll(); samples.reserveCapacity(48000 * 30); peak = 0
     let input = engine.inputNode
+    // Must be set BEFORE the format is read: turning voice processing on changes
+    // the node's format, and a converter built from the old one produces silence.
+    try? input.setVoiceProcessingEnabled(!pureMic)
     let inFmt = input.outputFormat(forBus: 0)
     let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SR,
                                channels: 1, interleaved: false)!
@@ -296,21 +349,32 @@ final class Lab: NSObject, NSApplicationDelegate {
   var status = NSTextField(labelWithString: "")
   var advice = NSTextField(labelWithString: "")
   var plays: [Btn] = []
+  var modeBtns: [Btn] = []
+  var takeNo = 0
+  var lastFolder: URL?
+  var openBtn = Btn()
   var takes: [(String, [Float], [Float])] = []
   var recording = false
   var timer: Timer?
   var startedAt = Date()
 
   func applicationDidFinishLaunching(_ n: Notification) {
-    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 470),
+    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
                      styleMask: [.titled, .closable, .miniaturizable],
                      backing: .buffered, defer: false)
     w.title = "Voice Lab"
     w.backgroundColor = Ink.bg
     w.center()
-    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 470))
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 560))
     root.wantsLayer = true
     root.layer?.backgroundColor = Ink.bg.cgColor
+
+    // AppKit measures from the bottom; people read from the top. Every position
+    // below is "distance down from the top edge", converted once here. The
+    // previous version nudged bottom-up constants one at a time and three
+    // elements ended up drawn on top of each other.
+    let H: CGFloat = 560
+    func top(_ down: CGFloat, _ h: CGFloat) -> CGFloat { H - down - h }
 
     func label(_ s: String, _ size: CGFloat, _ col: NSColor, _ y: CGFloat, _ weight: NSFont.Weight = .regular) -> NSTextField {
       let f = NSTextField(labelWithString: s)
@@ -321,21 +385,37 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(f)
       return f
     }
-    _ = label("Record your voice, then hear it three ways.", 15, Ink.fg, 418, .semibold)
-    _ = label("Wear headphones. The whole effect is the difference between your two ears.", 12, Ink.warn, 396)
+    _ = label("Record your voice, then hear it three ways.", 15, Ink.fg, top(18, 25), .semibold)
+    _ = label("Wear headphones. The whole effect is the difference between your two ears.", 12, Ink.warn, top(46, 22))
 
-    recBtn.frame = NSRect(x: 180, y: 320, width: 200, height: 54)
+    // ── WHAT THE MICROPHONE IS ALLOWED TO DO TO YOU ──────────────────────────
+    //
+    // Two capture chains, chosen before recording, because they cannot be
+    // compared any other way: processing happens at capture and cannot be undone
+    // afterwards. "Pure" is the reference -- the room as the microphone actually
+    // hears it. "Like a call" is Kin's own chain, echo canceller and all, which
+    // is also the only mode macOS applies Voice Isolation to.
+    for (i, t) in [("Pure mic", "nothing between you and the file"),
+                   ("Like a call", "echo canceller + gain control")].enumerated() {
+      let b = Btn(frame: NSRect(x: 40 + CGFloat(i) * 245, y: top(84, 46), width: 235, height: 46))
+      b.title = t.0; b.sub = t.1
+      b.playing = (i == 0)
+      b.onTap = { [weak self] in self?.setMode(pure: i == 0) }
+      root.addSubview(b)
+      modeBtns.append(b)
+    }
+    recBtn.frame = NSRect(x: 180, y: top(146, 54), width: 200, height: 54)
     recBtn.title = "Record"
     recBtn.onTap = { [weak self] in self?.toggle() }
     root.addSubview(recBtn)
 
-    meter.frame = NSRect(x: 100, y: 292, width: 360, height: 10)
+    meter.frame = NSRect(x: 100, y: top(212, 10), width: 360, height: 10)
     root.addSubview(meter)
 
     status.font = .systemFont(ofSize: 12)
     status.textColor = Ink.dim
     status.alignment = .center
-    status.frame = NSRect(x: 20, y: 264, width: 520, height: 18)
+    status.frame = NSRect(x: 20, y: top(232, 18), width: 520, height: 18)
     status.stringValue = "Press Record and talk for about ten seconds."
     root.addSubview(status)
 
@@ -346,16 +426,24 @@ final class Lab: NSObject, NSApplicationDelegate {
       // TOP TO BOTTOM in the order they should be heard. AppKit lays subviews out
       // from the bottom, so index 0 at y=60 put "as it is today" -- the thing you
       // compare everything against -- underneath its own comparisons.
-      let b = Btn(frame: NSRect(x: 40, y: CGFloat(60 + (2 - i) * 66), width: 480, height: 56))
+      let b = Btn(frame: NSRect(x: 40, y: top(266 + CGFloat(i) * 66, 56), width: 480, height: 56))
       b.title = t.0; b.sub = t.1; b.enabled = false
       b.onTap = { [weak self] in self?.playTake(i) }
       root.addSubview(b)
       plays.append(b)
     }
+    openBtn.frame = NSRect(x: 190, y: top(494, 34), width: 180, height: 34)
+    openBtn.title = "Show recordings"
+    openBtn.enabled = false
+    openBtn.onTap = { [weak self] in
+      if let f = self?.lastFolder { NSWorkspace.shared.open(f) }
+    }
+    root.addSubview(openBtn)
+
     advice.font = .systemFont(ofSize: 11)
     advice.textColor = Ink.dim
     advice.alignment = .center
-    advice.frame = NSRect(x: 20, y: 26, width: 520, height: 18)
+    advice.frame = NSRect(x: 20, y: top(468, 18), width: 520, height: 18)
     root.addSubview(advice)
 
     w.contentView = root
@@ -363,7 +451,18 @@ final class Lab: NSObject, NSApplicationDelegate {
     NSApp.activate(ignoringOtherApps: true)
     win = w
     player.onDone = { [weak self] in self?.plays.forEach { $0.playing = false } }
-    advice.stringValue = Recorder.raiseInputIfLow()
+    advice.stringValue = Recorder.raiseInputIfLow() + "   ·   macOS mic mode: " + Recorder.micMode()
+  }
+
+  func setMode(pure: Bool) {
+    guard !recording else { return }
+    rec.pureMic = pure
+    modeBtns[0].playing = pure
+    modeBtns[1].playing = !pure
+    status.textColor = Ink.dim
+    status.stringValue = pure
+      ? "Pure mic — the room exactly as the microphone hears it."
+      : "Like a call — echo canceller and gain control on, same as Kin."
   }
 
   func toggle() {
@@ -419,7 +518,51 @@ final class Lab: NSObject, NSApplicationDelegate {
     takes.append(("Beside you", a.0, a.1))
     takes.append(("Beside you, in a room", b.0, b.1))
     plays.forEach { $0.enabled = true }
+    save(raw: norm)
     advice.stringValue = "Play them in order. Ask where the voice is, not whether it is clean."
+  }
+
+  /// Written the moment a take is judged usable, not on a button, because the
+  /// take that gets lost is always the one nobody thought to keep.
+  func save(raw: [Float]) {
+    takeNo += 1
+    let stamp = ISO8601DateFormatter().string(from: Date())
+      .replacingOccurrences(of: ":", with: "-")
+      .replacingOccurrences(of: "T", with: " ")
+      .prefix(19)
+    let mode = rec.pureMic ? "pure-mic" : "like-a-call"
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Desktop/Voice Lab/\(stamp) \(mode)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    Wav.write(raw, nil, to: dir.appendingPathComponent("0 raw mono.wav"))
+    let names = ["1 as it is today.wav", "2 beside you.wav", "3 beside you in a room.wav"]
+    for (i, t) in takes.enumerated() where i < names.count {
+      Wav.write(t.1, t.2, to: dir.appendingPathComponent(names[i]))
+    }
+    // A note in the folder, because in a week the folder name will not be enough
+    // to say what was different about this take.
+    let note = """
+      Voice Lab take \(takeNo)
+      capture:      \(mode)
+      macOS mic:    \(Recorder.micMode())
+      input level:  \(Recorder.raiseInputIfLow())
+      length:       \(String(format: "%.1f", Double(raw.count) / SR)) s
+      voice above room noise: \(String(format: "%.0f", rec.snrDb)) dB
+
+      0 raw mono   what the microphone captured, mono
+      1 today      the same signal in both ears -- what a call sounds like now
+      2 beside you head model only: time and level difference between your ears
+      3 in a room  head model plus early reflections, arriving AFTER the direct
+                   sound, so it costs no latency
+
+      Listen on headphones. The effect is entirely interaural and collapses
+      on speakers.
+      """
+    try? note.write(to: dir.appendingPathComponent("what this is.txt"),
+                    atomically: true, encoding: .utf8)
+    lastFolder = dir
+    openBtn.enabled = true
+    openBtn.title = "Show recordings (\(takeNo))"
   }
 
   func playTake(_ i: Int) {
