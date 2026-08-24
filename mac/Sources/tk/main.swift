@@ -14,7 +14,54 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.40.0"
+let VERSION = "0.54.0"
+
+// ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
+//
+// Declared here, as top-level code in main.swift, because top-level statements
+// run in order at process start. A `static let` on a type would be LAZY -- it
+// would stamp itself whenever something first asked, which is not launch, and
+// every number measured against it would be quietly too small.
+let launchT0 = Clock.now()
+@inline(__always) func sinceLaunch() -> Int { Int(Clock.msSigned(Clock.now(), launchT0)) }
+
+// ── AN APP THAT WAS DOUBLE-CLICKED HAS NOWHERE TO SAY ANYTHING ───────────────
+//
+// Every diagnostic this app prints -- which camera, which pixel format, which
+// encoder, why a peer was re-found, what the picture quality did -- goes to
+// stderr, and a bundle launched from the Dock or by a link has no stderr worth
+// having. So the answer to "why was that call bad on the other Mac" was: open a
+// terminal, reproduce it, and hope it happens again.
+//
+// The rule for redirecting is narrow on purpose. A regular file means somebody
+// already aimed stderr somewhere (`open --stderr`, a shell redirect) and taking
+// that away would break every rig in this repo. A terminal means a person is
+// watching it. Anything else -- /dev/null, a closed descriptor, whatever
+// LaunchServices hands a double-clicked app -- is nowhere, and nowhere is what
+// this replaces.
+func teeStderrToLogIfNowhere() {
+  if isatty(2) == 1 { return }
+  var st = stat()
+  if fstat(2, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG { return }
+  let dir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Logs/Kin", isDirectory: true)
+  try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+  let path = dir.appendingPathComponent("kin.log").path
+  // Rotated by size, not by date: this is a ring buffer for the last few calls,
+  // not an archive, and it must never be the reason a disk fills up.
+  if let a = try? FileManager.default.attributesOfItem(atPath: path),
+     let size = a[.size] as? Int, size > 4_000_000 {
+    try? FileManager.default.removeItem(atPath: dir.appendingPathComponent("kin.1.log").path)
+    try? FileManager.default.moveItem(atPath: path,
+                                      toPath: dir.appendingPathComponent("kin.1.log").path)
+  }
+  let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+  guard fd >= 0 else { return }
+  dup2(fd, 2)
+  if fd != 2 { close(fd) }
+  setvbuf(stderr, nil, _IOLBF, 0)
+}
+teeStderrToLogIfNowhere()
 
 // --version must work, exit 0, and touch no hardware: the updater probes a
 // candidate binary with it before allowing it to replace a running one, so this
@@ -33,6 +80,83 @@ if CommandLine.arguments.contains("--version") { print(VERSION); exit(0) }
 //
 // So it prints, and it exits, and it touches nothing -- same contract as
 // --version, and beside it, so the next person adding a query flag sees both.
+// Runs before anything opens a socket or a camera: it is a pure filesystem test
+// in a temp directory, and release.sh gates on it.
+if flag("selftest-rename") {
+  let ok = Update.selftestRename()
+  fputs("selftest-rename: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// Same contract and the same reason: relocateIfHomeless runs once, on someone
+// else's Mac, and moves the app the user just downloaded. Pure filesystem work in
+// a temp directory, and release.sh gates on it.
+if flag("selftest-install") {
+  let ok = Install.selftest()
+  fputs("selftest-install: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// Same contract again: pure derivation, no network, no disk write. A handle
+// nobody typed is the one part of identity that can be wrong in a way the person
+// notices immediately -- being called `deveshs` or `2devesh` -- so the derivation
+// is checkable without claiming anything.
+if flag("selftest-identity") {
+  let ok = Identity.selftest()
+  fputs("selftest-identity: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// Claim synchronously and say what happened, so the ladder can be exercised
+// against a real server without launching a call. Unlike the selftests above this
+// one DOES touch the network and DOES write identity.json -- point HOME somewhere
+// disposable if you do not mean to claim for real.
+if flag("claim") {
+  Identity.claim()
+  fputs("claim: handle=@\(Identity.handle) claimed=\(Identity.claimed)"
+      + " key=\(Identity.publicKeyB64.prefix(12))... file=\(Identity.file.path)\n", stderr)
+  exit(Identity.claimed ? 0 : 1)
+}
+// Silent mode from the command line, so the network half can be exercised
+// without the sheet in the loop. `--quiet on|off`.
+if let want = arg("quiet") {
+  guard want == "on" || want == "off" else {
+    fputs("--quiet takes on or off, not \(want)\n", stderr); exit(2)
+  }
+  let ok = Identity.setQuiet(want == "on")
+  fputs("quiet: asked \(want), server says \(Identity.quietOn ? "on" : "off")"
+      + " agreed=\(ok)\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// Ring somebody and print the room, without a window or a call. The two halves
+// of handle-dialling are testable from a terminal before either has any pixels.
+if let who = arg("ring-only") {
+  let room = Launcher.mintRoom()
+  if let got = Identity.ring(to: who, room: room) {
+    fputs("ring-only: rang @\(who), room \(got)\n", stderr); exit(0)
+  }
+  exit(1)
+}
+// Drain the mailbox once, or listen for a while. Prints every ring it verifies.
+if flag("rings") || arg("rings-for") != nil {
+  let secs = Double(arg("rings-for") ?? "0") ?? 0
+  let deadline = Date().addingTimeInterval(secs)
+  var seen = 0
+  repeat {
+    for r in Identity.poll() {
+      seen += 1
+      fputs("ring from @\(r.from) room \(r.room) age \(r.ageMs) ms"
+          + " known=\(r.known) keyChanged=\(r.keyChanged)\n", stderr)
+    }
+    if Date() < deadline { Thread.sleep(forTimeInterval: 2.2) }
+  } while Date() < deadline
+  fputs("rings: \(seen) verified\n", stderr)
+  exit(seen > 0 ? 0 : 1)
+}
+// The headless watcher, and the three commands that manage it.
+if flag("watch") {
+  Watch.run(gapMs: Int(arg("ring-gap") ?? "4000") ?? 4000)
+}
+if flag("watch-install") { fputs(Watch.install() + "\n", stderr); exit(0) }
+if flag("watch-remove") { fputs(Watch.uninstall() + "\n", stderr); exit(0) }
+if flag("watch-status") { fputs(Watch.status() + "\n", stderr); exit(0) }
 if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-h") {
   print("""
   tk \(VERSION) -- a video call that tries to be as fast as light allows.
@@ -76,6 +200,33 @@ func arg(_ name: String) -> String? {
 }
 func flag(_ name: String) -> Bool { CommandLine.arguments.contains("--" + name) }
 
+// ── STDERR, WHEN THERE IS NO TERMINAL TO SEE IT ─────────────────────────────
+//
+// The camera is the one thing on this Mac that cannot be measured from a shell,
+// and the reason is not the signature. TCC attributes a camera request to the
+// RESPONSIBLE process, and a binary exec'd by a shell is attributed to whatever
+// terminal is at the top of that chain -- so a probe bundle launched that way is
+// answered `.denied` however it was signed, `startRunning()` succeeds, the
+// session is "up", and not one frame ever arrives. Every camera number measured
+// that way is a measurement of the denial path.
+//
+// `open` fixes the attribution -- LaunchServices makes the app its own
+// responsible process, so the bundle's own grant applies -- and `open` gives us
+// no stderr at all. So the rig can name a file. Redirected here, before the first
+// line is written, and the terminal is told where its output went.
+if let logPath = arg("log") {
+  let fd = Darwin.open(logPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+  if fd >= 0 {
+    fputs("log: everything after this goes to \(logPath)\n", stderr)
+    dup2(fd, 2)
+    Darwin.close(fd)
+    fputs("log: tk \(VERSION) pid \(getpid()) -- \(CommandLine.arguments.dropFirst().joined(separator: " "))\n",
+          stderr)
+  } else {
+    fputs("log: cannot write \(logPath) (errno \(errno)) -- keeping stderr\n", stderr)
+  }
+}
+
 // ── A MISSPELLED FLAG MUST NOT BE A SILENT NO-OP ────────────────────────────
 //
 // `arg()` looks for "--name" followed by a separate value, so "--echo-sim=18" is
@@ -95,8 +246,12 @@ let KNOWN_FLAGS: Set<String> = [
   "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
-  "secret", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
-  "window", "version", "help", "press-after",
+  "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
+  "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
+  "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
+  "ring-only", "rings", "rings-for", "ring-gap", "call", "no-rings", "io", "no-agc",
+  "watch", "watch-install", "watch-remove", "watch-status", "incoming",
+  "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -149,6 +304,23 @@ let videoArg = resolveVideoArg()
 // the microphone, the camera or a socket -- the window has to finish first.
 // The URL handler goes in before anything can wait on it, and before the join
 // window, since a link can arrive either side of it.
+// ── BE SOMEWHERE INSTALLABLE BEFORE DOING ANYTHING ELSE ──────────────────────
+//
+// FIRST, and the position is the whole point. This started three lines above the
+// update check, which reads as early enough and is not: with no --room, the app
+// prompts for a room name and then Launcher.reexec's ITSELF, so a double-clicked
+// copy would have shown its window, taken the user's room, and re-exec'd -- all
+// from the read-only DMG -- before this line was ever reached. The relocation has
+// to precede the URL handler, the room prompt, and the re-exec, because every one
+// of them is something the wrong copy would otherwise do first.
+//
+// Also necessarily ahead of the update check (a translocated mount cannot be
+// written, so every update would fail to stage and retry forever) and ahead of any
+// audio or camera device, so the user's one permission prompt is not spent on a
+// bundle that is about to move -- macOS ties those grants to the signature at the
+// path that asked.
+Install.relocateIfHomeless()
+
 Launcher.installURLHandler()
 
 // ── A DOUBLE-CLICK STARTS A CALL ────────────────────────────────────────────
@@ -161,9 +333,16 @@ Launcher.installURLHandler()
 // clicking an invite is trying to reach a specific call and not to start one.
 if arg("room") == nil, arg("peer") == nil, !flag("gui"),
    (Bundle.main.executableURL?.path ?? CommandLine.arguments[0]).contains("/Contents/MacOS/") {
-  let room = Launcher.takeURLRoom() ?? Launcher.mintRoom()
+  // WAIT for the link, do not merely check for it: the Apple Event carrying the
+  // room is dispatched by the runloop, so a read taken here without turning it is
+  // guaranteed nil and every invite became a freshly minted room instead.
+  //
+  // 0.25 and not 0.7: awaitURLRoom now also returns the instant the LAUNCH event
+  // arrives, so this is the backstop for a launch that delivers neither event, not
+  // the price of every double-click. Measured AE delivery was 27 ms.
+  let room = Launcher.awaitURLRoom(within: 0.25) ?? Launcher.mintRoom()
   Launcher.remember(room)
-  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"])
+  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
 }
 
 // `--gui` still opens the join window, for typing a name on purpose.
@@ -177,7 +356,37 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   // was just double-clicked showed a name prompt and then vanished into the dock
   // while running a perfectly good audio call nobody could see. A video calling
   // app that opens no video is the one bug a user notices before any latency.
-  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"])
+  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+}
+
+// ── A LINK CLICKED WHILE A CALL IS ALREADY UP ────────────────────────────────
+//
+// The launch path reads the URL mailbox exactly once, and this process is long
+// past it: it IS the re-exec'd call. So a second invite -- someone sends a link
+// while the app sits in a room -- set `Launcher.urlRoom` and was read by nobody,
+// which looked to the user like clicking the link did nothing at all.
+//
+// Re-exec into the new room, the same move the launch path makes. execv keeps the
+// pid, the dock icon and the permission grants, and the only fd that would
+// collide is the UDP socket, which carries FD_CLOEXEC for precisely this reason
+// (Net.swift) -- the self-updater already re-execs mid-run through this same
+// needle. The dedup in `reexec` drops the stale `--room` inherited from argv, so
+// the new image sees one room and it is this one.
+//
+// INSTALLED HERE, not down by `NSApplication.run()`, and the position is the
+// whole point: the rendezvous wait above the media loop pumps AppKit events
+// itself, so a link clicked while the window says "waiting for the other
+// person" is dispatched hundreds of lines before run() is ever called. That is
+// exactly when a second invite arrives, and with the hook installed later it
+// fell into the mailbox nobody reads -- measured: `url: joining fix-warm-three`
+// with no switch behind it.
+Launcher.onURLRoom = { r in
+  guard r != arg("room") else { return }   // the link we are already in
+  DispatchQueue.main.async {
+    fputs("url: switching to \(r)\n", stderr)
+    Launcher.remember(r)
+    Launcher.reexec(room: r, extra: ["--video", "camera", "--window"], why: "url")
+  }
 }
 
 let listenPort = UInt16(arg("listen") ?? "7001") ?? 7001
@@ -189,21 +398,150 @@ guard parts.count == 2, let pPort = UInt16(parts[1]) else {
 let peerHost = String(parts[0])
 
 fputs("tk \(VERSION)  listen=\(listenPort) peer=\(peerHost):\(pPort) timebase=\(Clock.timebaseDescription)\n", stderr)
+// pid and argv on the banner: this process re-execs itself on several paths, so
+// a log with four banners in it is either four launches or one process changing
+// its mind four times, and those call for opposite fixes.
+fputs("pid \(getpid()) argv: \(CommandLine.arguments.dropFirst().joined(separator: " "))\n", stderr)
 fputs("packet=\(FPP) frames (\(String(format: "%.2f", Double(FPP) / SR * 1000)) ms)  ring=\(RING) pkts\n", stderr)
 
-// UPDATE BEFORE TOUCHING THE AUDIO DEVICES. On launch the check is synchronous
-// and cheap; if a newer build exists we re-exec into it and never open a device
-// with stale code. --no-update is for bisecting a regression, nothing else.
+// ── NOTHING ON THE LAUNCH PATH TALKS TO THE UPDATE SERVER ────────────────────
+//
+// "On launch the check is synchronous and cheap" was the comment here, and the
+// check was two sequential BLOCKING HTTPS GETs with a 12 s timeout each, on the
+// main thread, BEFORE the window was created: 1155 ms of nothing, measured, on
+// every launch. A/B: window at 2036 ms by default against 881 ms with
+// --no-update. The claim was never tested; the word "cheap" was doing the work.
+//
+// The poller below is a strict superset -- same available(), same stage(), and it
+// commits the instant nothing is live -- so nothing is lost by deleting the
+// launch check outright. Its `firstAfter` grace is what preserves "you get today's
+// build today". --no-update is for bisecting a regression, nothing else.
+//
+// GRACE, NAMED, AND NOT SMALL: callIsLive() is false for the whole of call setup,
+// so a short first tick re-execs while the user is reading their invite link.
+let UPDATE_FIRST_CHECK_GRACE = 10.0
 if !flag("no-update") {
-  if let (m, _) = Update.available(current: VERSION) { Update.apply(m) }
+  // A held update has to be visible or it is just a stall. The poller lands it by
+  // itself the moment the call ends, so this is a notice and not a demand -- there
+  // is a "Restart to update" item in the menu for anyone who would rather not wait.
+  // ASSIGNED BEFORE startPolling: the poller can fire this on its first tick.
+  Update.onPending = { v in
+    DispatchQueue.main.async {
+      display?.controls?.setStatus("update \(v) ready — restarts when the call ends")
+    }
+  }
   // And if we are already current but our BUNDLE is not -- an old updater took the
   // binary and left the icon behind -- fix that too, once, quietly.
-  Update.repairBundleIfStale(current: VERSION)
-  Update.startPolling(current: VERSION, every: 60)
+  //
+  // ON ITS OWN THREAD, because "free on a healthy install" is only true when it
+  // does not fire: when it DOES it is 2 GETs plus a tarball download at
+  // timeout:120, and it was doing all of that on the main thread ahead of the
+  // window -- the same bug as the deleted check above, a hundred times worse, just
+  // rarer. Not the poller's thread: the poller's half-second cadence is what lands
+  // a pending update the moment a call ends, and a tarball download would stall it.
+  Thread { Update.repairBundleIfStale(current: VERSION) }.start()
+  // A handle nobody asked for, claimed on a thread nobody waits for. If this
+  // never completes the app is exactly as usable as it was before handles
+  // existed, which is the only acceptable cost for a convenience.
+  Identity.start()
+  // Being callable is the point of having a handle, so an installed copy makes
+  // itself reachable rather than waiting to be told. Only from /Applications
+  // (Watch.install refuses anything else), only when absent or stale, and never
+  // on a rig build -- --no-relocate marks a copy that is not somebody's install.
+  if !flag("no-relocate") {
+    Thread {
+      guard !Watch.healthy() else { Metrics.count("watch_present"); return }
+      // Say WHY it is being rewritten. "installed" on a Mac that already had a
+      // login item reads as a bug until you know the old one pointed at a copy
+      // that a self-update had replaced.
+      // "absent" and "unreadable" are different findings, and staleReason cannot
+      // tell them apart -- a file that is not there does not read either.
+      let was = !Watch.installed ? "absent"
+              : (Watch.staleReason().map { "stale: \($0)" } ?? "present but not loaded")
+      let said = Watch.install()
+      Metrics.count(said.contains("installed") ? "watch_installed" : "watch_install_fail")
+      fputs("watch: was \(was) -- \(said)\n", stderr)
+    }.start()
+  }
+  // Rig override, sibling of TK_UPDATE_BASE: a test that proves the poller in
+  // seconds must not sit through the production minute. Floor at 1 s so a typo
+  // cannot turn the poller into a busy loop against the real server.
+  let pollEvery = max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_POLL"] ?? "") ?? 60)
+  // The grace gets a rig override of its own, for the same reason: a 10 s wait is
+  // right for a person and wrong for a test that has to prove the first tick.
+  let firstAfter = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "")
+                            ?? UPDATE_FIRST_CHECK_GRACE)
+  Update.startPolling(current: VERSION, every: pollEvery, firstAfter: firstAfter)
 }
 
 guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) else {
   fputs("socket/bind failed on port \(listenPort)\n", stderr); exit(1)
+}
+
+// TELEMETRY SETTINGS BEFORE ANYTHING CAN POST. These two lines used to sit next
+// to the audio engine, several hundred lines and one rendezvous later -- so a
+// person who ran with --no-telemetry and then left while still waiting for the
+// other side posted a beat anyway, to the production endpoint, because the line
+// that would have switched it off had not been reached yet. Same ordering fault
+// as the crash above it: the window can act before the setup below it exists.
+if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
+if let e = arg("tel-endpoint") { Telemetry.endpoint = e }
+// ── AN IMAGE THAT IS ABOUT TO BE REPLACED FILES ITS REPORT FIRST ─────────────
+//
+// And hands its call id to its successor. The id is random per PROCESS, so a
+// ring answered in four seconds was two rows on the dashboard with nothing
+// joining them -- the first row missing entirely, because it never lived long
+// enough to send a beat at all. Now the first row exists, says why it ended, and
+// the second one names it.
+Launcher.beforeReexec = {
+  postFinalBeat(why: "re-exec")
+  return ["--prev-call", Telemetry.call]
+}
+
+// ── ASK FOR THE MICROPHONE HERE, WHERE THE PROCESS IS STILL ALIVE ────────────
+//
+// The request used to live several hundred lines below, under the room block --
+// and the room block calls `exit(1)` when nobody else arrives inside two minutes.
+// So on a solo launch the process died before the microphone was ever asked for.
+// tccd proved it: kTCCServiceMicrophone sat at `Unknown (None)` after every
+// launch, with no prompt ever recorded, while Camera read `Allowed (User
+// Consent)` because it is asked early. The first person to actually get a call
+// therefore met the permission dialog in the middle of a conversation.
+//
+// Two properties matter, and they are the two the camera path already has:
+//
+//   EARLY -- above the rendezvous, above `--stun`'s exit, above every other exit
+//   in this file, so no failure to find a peer can outrun the question.
+//   ASYNC -- the answer arrives on a callback and nothing waits for it. The old
+//   code blocked the main thread on a semaphore for up to 60 seconds with no
+//   runloop turning, which is a frozen window in the one moment the app most
+//   needs to look alive. The system draws the dialog, not us; we only need to not
+//   be dead when the answer comes back.
+//
+// It runs on EVERY launch, solo included, so the grant is settled before there is
+// a call to interrupt. Already-decided is free: `authorizationStatus` short
+// circuits and no dialog appears.
+/// 1 granted, 0 denied, -1 still unanswered. Reported, because "they heard
+/// silence" and "the microphone was never allowed" are the same symptom.
+nonisolated(unsafe) var gMicAccess = -1
+switch AVCaptureDevice.authorizationStatus(for: .audio) {
+case .authorized:
+  gMicAccess = 1
+  fputs("mic: already granted\n", stderr)
+case .notDetermined:
+  fputs("mic: asking for permission (look for a dialog)\n", stderr)
+  AVCaptureDevice.requestAccess(for: .audio) { ok in
+    gMicAccess = ok ? 1 : 0
+    fputs(ok ? "mic: granted\n"
+             : "mic: denied -- they will hear silence from this end."
+             + " System Settings > Privacy & Security > Microphone\n", stderr)
+  }
+case .denied, .restricted:
+  gMicAccess = 0
+  fputs("mic: denied -- they will hear silence from this end."
+      + " System Settings > Privacy & Security > Microphone\n", stderr)
+@unknown default:
+  break
 }
 
 // ── WHAT YOU SEND SOMEONE TO GET THEM INTO THE CALL ─────────────────────────
@@ -213,31 +551,81 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
 // told about separately. So the invite is both, as text, because the two ends of a
 // native call are two installed apps and a bare URL cannot install one.
 //
-// The URL is a real page (see /macos/join) that names the room and carries the
-// install line, so the person who receives this can act on it whether or not they
-// already have the app.
+// The URL is a real page -- the invite funnel at /join, which the worker rewrite
+// serves -- that names the room and either deep-links `tokkah://join/<room>`
+// straight into the app or offers the download, so the person who receives this
+// can act on it whether or not they already have the app.
 /// THE LINK IS THE INVITE. `roomUrl()` in the web app is one line -- the short
 /// path form for a minted code -- and the clipboard, the waiting screen and the
 /// address bar all read it from the same place so they cannot disagree. Same here:
 /// one function, and what you copy is exactly what is on screen.
-func roomURL(_ room: String) -> String { "https://room.tokkah.com/\(room)" }
+// The invite link is the product's face: it is what gets pasted, read aloud and
+// typed wrong. `kin.tokkah.com` is three letters of host before the dot, and both
+// it and `room.tokkah.com` are the same worker -- so every link already sent to
+// anybody keeps working, which is the only rule a link shortener has to obey.
+func roomURL(_ room: String) -> String {
+  // Two shapes, and only one of them works per room. `app.js` has had this right
+  // the whole time -- `MEET_RE.test(room) ? origin/room : origin/?r=room` -- and
+  // this copy used the short path for everything, so any NAMED room (`--room
+  // standup`) produced a link that 404s. Minted rooms are 3-4-3 and were fine,
+  // which is why every test of the normal flow passed over it.
+  let minted = room.count == 12 && room.split(separator: "-").map(\.count) == [3, 4, 3]
+    && room.allSatisfy { $0 == "-" || ("a"..."z").contains(String($0)) }
+  guard minted else {
+    // Hyphens survive: `?r=team%2Dstandup` is valid and unreadable, and this string
+    // is meant to be read by a person before it is followed by a browser.
+    var ok = CharacterSet.alphanumerics; ok.insert(charactersIn: "-_")
+    let esc = room.addingPercentEncoding(withAllowedCharacters: ok) ?? room
+    return "https://kin.tokkah.com/?r=\(esc)"
+  }
+  return "https://kin.tokkah.com/\(room)"
+}
 func inviteText(room: String) -> String { roomURL(room) }
+
+/// False until every global `audioBeat` reads has been created. Declared here,
+/// ahead of the window, because the controls that can call the beat exist from
+/// the moment the window is drawn and this flag has to be readable before its own
+/// initialiser has run -- a Bool reads false out of zeroed memory, an object
+/// reference reads as a null pointer, which is the whole bug.
+nonisolated(unsafe) var beatReady = false
 
 /// Leave means leave: report the call's last numbers, then go. Same path as the
 /// signal handler, because a person clicking Leave and a person pressing Ctrl-C
 /// want exactly the same thing and the record should not be able to tell them
 /// apart.
+/// Post this process's last numbers and WAIT briefly for the post to land.
+///
+/// Shared by Leave and by every re-exec, because they are the same event as far
+/// as the record is concerned: this process is about to stop existing. `why`
+/// rides along so the dashboard can tell a hang-up from an image that handed the
+/// call to its successor -- otherwise every answered ring looks like a call that
+/// ended after four seconds.
+@discardableResult
+func postFinalBeat(why: String) -> Bool {
+  guard Telemetry.enabled else { return false }
+  // Last second's percentiles, not a live sort of the audio-thread buffer.
+  var beat = audioBeat(uptime: Double(beatTick),
+                       up: lastRates.up, down: lastRates.down,
+                       played: lastRates.played, concealed: lastRates.concealed,
+                       cap: lastRates.cap,
+                       p50: lastM2e.p50, p95: lastM2e.p95, p99: lastM2e.p99)
+  beat["ended"] = why
+  let done = DispatchSemaphore(value: 0)
+  let before = Telemetry.sent
+  Telemetry.post(beat, final: true) { done.signal() }
+  // A report is not worth hanging a quit on: the person clicked Leave because
+  // they wanted out, so 1.5 s and go regardless. Said out loud either way,
+  // because a beat believed-sent and never sent is the worse of the two.
+  let inTime = done.wait(timeout: .now() + 1.5) == .success
+  let ok = inTime && Telemetry.sent > before
+  fputs("final beat (\(why)): \(ok ? "sent" : "NOT SENT (\(Telemetry.lastError))")"
+      + " uptime \(beatTick)s\n", stderr)
+  return ok
+}
+
 func leaveCall() -> Never {
   shuttingDown = true
-  if Telemetry.enabled {
-    Telemetry.post(audioBeat(uptime: Double(beatTick),
-                             up: lastRates.up, down: lastRates.down,
-                             played: lastRates.played, concealed: lastRates.concealed,
-                             cap: lastRates.cap,
-                             p50: audio.m2e.p(0.50), p95: audio.m2e.p(0.95),
-                             p99: audio.m2e.p(0.99)), final: true)
-    usleep(400_000)
-  }
+  postFinalBeat(why: "leave")
   fputs("left the call\n", stderr)
   exit(0)
 }
@@ -259,6 +647,14 @@ func leaveCall() -> Never {
 nonisolated(unsafe) var sawRemote = false
 /// Set from the control bar's camera button.
 nonisolated(unsafe) var camOff = false
+/// ── THE LINK SAID NO, SO NOTHING LEAVES ──────────────────────────────────────
+///
+/// Written once a second by the reporter, read at the camera's frame rate by the
+/// capture thread. A plain Bool, deliberately: the capture callback must not take
+/// a lock, and the worst a torn read could do is send or skip one frame during
+/// the single tick when it changes -- which is 33 ms of an event that lasts
+/// seconds. `camOff` above is the same shape for the same reason.
+nonisolated(unsafe) var gVideoPaused = false
 
 /// The window's title is the only status this app has. Set from whatever thread
 /// notices the state changed, hopped to main because AppKit requires it.
@@ -272,6 +668,90 @@ var mdisplay: MetalDisplay?
 // rate, and (b) --vsync 0 can skip the compositor's synchronised pass. Default
 // stays the AVSampleBufferDisplayLayer path until the measurement says otherwise.
 let displayKind = arg("display") ?? "avsbdl"
+
+// ── THE SENSOR IS THE SLOWEST THING, SO IT STARTS FIRST ─────────────────────
+//
+// `startRunning()` returning is not a picture, and until this file measured the
+// FIRST FRAME nothing here knew the difference. Measured from a signed bundle
+// with a real grant, launched through LaunchServices: session up at 138 ms, first
+// frame at 464 ms (n=4, 456-467) -- and 807 ms on the first launch after the
+// camera has been idle a while. The gap is sensor power-up and exposure
+// convergence: ~325 ms warm, ~670 ms cold, none of which this program can shorten.
+//
+// What it CAN do is stop making the sensor wait its turn. Everything below --
+// NSApplication, the window, the control bar, `makeKeyAndOrderFront` -- is ~95 ms
+// during which nothing has asked the camera for anything. Asked here instead, the
+// bring-up begins at 14 ms rather than ~110, and the window is built while the
+// sensor warms up: first frame 511 -> 464 ms, and the window itself lands SOONER
+// (256 -> 192 ms) because the camera is no longer on the thread that draws it.
+//
+// ONLY on the already-authorized path, and that restriction is the point: on a
+// first run the system draws a modal permission dialog, and it must appear over
+// a window rather than over nothing. That was the whole reason the explicit
+// request exists (Launcher.swift) -- an unanswered prompt shows black forever
+// with no explanation, and it happened. So first runs keep the old order exactly,
+// and every run after the first gets the head start.
+var earlyCam: FrameSource?
+
+/// The self-view sink and the picker, for a camera whose bring-up is in flight.
+/// One function, called from the early path and the late one, so the two cannot
+/// drift into showing different pictures or different camera lists.
+func attachCamera(_ cam: CameraSource) {
+  cam.onFrame = { pb, _ in
+    // Self-view. Replaced the moment a decoded frame from the far end arrives:
+    // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
+    // set so the two are never fighting over the same surface.
+    // Once they are on screen you move to the corner rather than disappearing.
+    // Display owns the routing entirely: the window before anyone arrives, the peek
+    // tile while the button is held, nowhere otherwise. Two call sites deciding this
+    // independently is exactly how they end up disagreeing.
+    display?.showSelf(pb)
+    if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
+  }
+  cam.startOffMain { err in
+    if let err {
+      // Not fatal. A call with no camera is still a call, and saying so beats a
+      // blank window with no explanation.
+      fputs("preview: unavailable (\(err)) -- continuing without a picture\n", stderr)
+      setWindowTitle("Kin — no camera; waiting for the other person")
+      // Cleared so the reuse below the rendezvous builds a fresh source instead of
+      // adopting a dead session -- which is also how a camera plugged in after
+      // launch still gets picked up. The join loop pumps the main queue on every
+      // poll, so this is always drained before that line is read.
+      DispatchQueue.main.async { earlyCam = nil }
+      return
+    }
+    fputs("preview: \(cam.describe) on screen before the call connects"
+        + " (session up at \(sinceLaunch()) ms)\n", stderr)
+    // Discovery is a device call, so it stays off main with the rest of the
+    // bring-up; only the two AppKit lines hop, with the answers already in hand.
+    let devs = CameraSource.available()
+    let names = devs.map { $0.localizedName }
+    let mine = devs.firstIndex { $0.uniqueID == cam.current?.uniqueID } ?? 0
+    DispatchQueue.main.async {
+      // `--cam-picker-test` owns the picker when it is on: its placeholder list is
+      // the thing under test, and the real one-camera list would erase it.
+      guard (arg("cam-picker-test").flatMap { Int($0) } ?? 0) <= 1 else { return }
+      display?.controls?.setCameras(names, current: mine)
+      display?.controls?.onCamPick = { i in
+        // `switchTo` does its own work on the session queue, so the click returns
+        // immediately and the window never freezes on a camera swap.
+        let list = CameraSource.available()
+        guard i >= 0, i < list.count else { return }
+        cam.switchTo(list[i])
+      }
+    }
+  }
+}
+
+if videoArg == "camera", flag("window"),
+   AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+  fputs("camera: already granted at \(sinceLaunch()) ms -- starting it before the window\n", stderr)
+  let cam = CameraSource()
+  earlyCam = cam
+  attachCamera(cam)
+}
+
 if flag("window") {
   // NSApplication FIRST. AppKit will build an NSWindow before the application
   // object exists and simply never show it -- decode ran at 31 fps into a window
@@ -281,7 +761,7 @@ if flag("window") {
   app.setActivationPolicy(.regular)
   if displayKind == "metal" {
     if let m = MetalDisplay(vsyncOff: arg("vsync") == "0", fullscreen: flag("fullscreen")) {
-      m.open(title: "Tokkah — waiting for the other person", w: 1280, h: 720)
+      m.open(title: "Kin — waiting for the other person", w: 1280, h: 720)
       mdisplay = m
       fputs("display: metal, vsync \(m.vsyncOff ? "OFF (tearing allowed)" : "on")"
           + "\(m.fullscreen ? ", fullscreen" : ""), refresh \(String(format: "%.2f", m.refreshMs)) ms\n", stderr)
@@ -292,7 +772,7 @@ if flag("window") {
   if mdisplay == nil {
     let d = Display()
     let roomName = arg("room") ?? "direct"
-    d.open(title: "Tokkah — waiting for the other person", w: 1280, h: 720,
+    d.open(title: "Kin — waiting for the other person", w: 1280, h: 720,
            room: roomName,
            onMic: { m in
              gMicMuted = m
@@ -306,6 +786,25 @@ if flag("window") {
            onLeave: { leaveCall() },
            invite: inviteText(room: roomName))
     display = d
+    // ── WHEN CAN THE LINK ACTUALLY BE COPIED ──────────────────────────────────
+    //
+    // Not when `inviteText` is assigned. That happens inside `open()` above, on a
+    // main thread that then walks straight into the camera and does not return to
+    // the runloop -- so the card holds the URL, draws it, and every click on it
+    // sits in the queue unhandled. "Present" and "clickable" are two different
+    // times and only the second one is the product.
+    //
+    // A main-queue block is the honest marker precisely because it is dispatched
+    // through the same queue a click is: it cannot run until main is back in the
+    // runloop, which is the first instant a press on `copy` could be serviced.
+    // The URL is already set before this is queued, so the block firing means
+    // both halves are true at once.
+    let urlAtOpen = d.controls?.inviteText ?? ""
+    DispatchQueue.main.async {
+      Metrics.mark("link_copyable_ms", sinceLaunch())
+      fputs("link: copyable at \(sinceLaunch()) ms"
+          + " (\(urlAtOpen.isEmpty ? "NO URL SET" : urlAtOpen))\n", stderr)
+    }
   }
 }
 
@@ -338,7 +837,7 @@ func pressControl(_ name: String) {
     // The window title too, or every screenshot taken this way says "waiting for
     // the other side" over a connected call -- an instrument that lies quietly
     // about the state it was built to record.
-    setWindowTitle("Tokkah — connected")
+    setWindowTitle("Kin — connected")
     fputs("pressed selfview: corner on\n", stderr)
     return
   }
@@ -369,20 +868,49 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
   // way down. `?` runs the hit-test audit over everything currently on screen.
   // Both exist because a handler call cannot fail the way a finger fails.
   var t = after
+  // ── A PRESS THAT FIRES LATE IS NOT A PRESS THAT WORKED ──────────────────────
+  //
+  // `asyncAfter` computes its deadline HERE, but the block runs only when main is
+  // back in the runloop. So a press armed for 500 ms that executes at 1440 ms is
+  // reporting a control that a person would have clicked and watched do nothing
+  // for most of a second -- and the log line, printed at execution, looked
+  // identical to a press that was serviced instantly. Measured: exactly that,
+  // 940 ms of queueing behind a synchronous camera open.
+  //
+  // So each press states when it was DUE and how long it waited. A late press is
+  // now a number in the log rather than an absence in it.
+  let armedAt = sinceLaunch()
   for name in seq.split(separator: ",") {
     let token = String(name)
     if token == "~" { t += 3.0; continue }
     let at = t
+    let dueAt = armedAt + Int(at * 1000)
     // Every token gets its own moment. They used to share one, so a nine-step
     // sequence fired nine handlers inside the same runloop turn and the log read
     // like one instant -- which is exactly the evidence a step-by-step test is for.
     t += 0.7
     DispatchQueue.main.asyncAfter(deadline: .now() + at) {
+      let ran = sinceLaunch()
+      fputs("press \(token): due at \(dueAt) ms, ran at \(ran) ms"
+          + " -- queued \(ran - dueAt) ms\n", stderr)
       if token == "?" {
         for line in display?.controls?.auditClicks() ?? ["no controls"] {
           fputs("audit \(line)\n", stderr)
         }
         fputs("audit state \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else if token.hasPrefix("%") {
+        // `%Check for Updates…` -- a MENU item, through AppKit's own dispatch.
+        // Separate from `@` because the menu is not in `controls` and a handler
+        // called directly cannot fail the way a menu item with no target fails.
+        let title = String(token.dropFirst())
+        fputs("menu \"\(title)\": \(Menu.click(title))"
+            + " -> \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else if token.hasPrefix("+") {
+        // `+kinpeer7759` types into whatever a preceding `@dial` focused.
+        let text = String(token.dropFirst())
+        let ok = display?.controls?.typeText(text) ?? false
+        fputs("type \(text): \(ok ? "sent" : "NO WINDOW")"
+            + " -> \(display?.controls?.describeTree ?? "-")\n", stderr)
       } else if token.hasPrefix("@") {
         // `@peek:2.5` presses and holds for 2.5 s, so a hold can be photographed
         // while it is held rather than inferred from the state after it ended.
@@ -418,29 +946,27 @@ if let shot = arg("shot") {
   }
 }
 
-var earlyCam: FrameSource?
-if videoArg != "off", display != nil || mdisplay != nil {
-  let c: FrameSource = videoArg == "camera"
-    ? CameraSource()
-    : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
-  c.onFrame = { pb, _ in
-    // Self-view. Replaced the moment a decoded frame from the far end arrives:
-    // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
-    // set so the two are never fighting over the same surface.
-    // Once they are on screen you move to the corner rather than disappearing.
-    // Display owns the routing entirely: the window before anyone arrives, the peek
-    // tile while the button is held, nowhere otherwise. Two call sites deciding this
-    // independently is exactly how they end up disagreeing.
-    display?.showSelf(pb)
-    if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
-  }
-  // The call path asks too, in case the app was started from the command line and
-  // never saw the join window. Blocking here is fine and deliberate: the answer is
-  // needed before the camera can produce a frame, the window is already on screen,
-  // and the system draws the prompt -- not us.
+// ── THE CAMERA CASES THE FAST PATH DELIBERATELY DID NOT TAKE ────────────────
+//
+// An authorized camera was already started above, before the window, because the
+// sensor is the slowest thing here and it should not wait for AppKit. What is
+// left is what could not go there: a file source, and a camera whose permission
+// is not yet settled -- where the system's modal dialog has to appear over a
+// window that already exists, so it can only be asked for from here.
+if earlyCam == nil, videoArg != "off", display != nil || mdisplay != nil {
   if videoArg == "camera" {
+    // The call path asks too, in case the app was started from the command line and
+    // never saw the join window. Blocking here is fine and deliberate: the answer is
+    // needed before the camera can produce a frame, the window is already on screen,
+    // and the system draws the prompt -- not us.
+    //
+    // Reached only when the status was not already `.authorized` when the window
+    // was built -- a first run, or a refusal -- so this wait is once-ever rather
+    // than once per launch. Every other launch took the path above and never
+    // touched a semaphore.
     let gate = DispatchSemaphore(value: 0)
     var got = CameraSource.Access.denied
+    fputs("camera: asking for permission at \(sinceLaunch()) ms\n", stderr)
     CameraSource.requestAccess { a in got = a; gate.signal() }
     // A minute is longer than anyone takes to answer, and expiring is not fatal:
     // the call continues without a picture rather than never starting.
@@ -450,39 +976,212 @@ if videoArg != "off", display != nil || mdisplay != nil {
           + " System Settings > Privacy & Security > Camera\n", stderr)
       display?.controls?.setStatus("camera off — check Privacy settings")
     }
-  }
-  do {
-    try c.start()
-    earlyCam = c
-    fputs("preview: \(c.describe) on screen before the call connects\n", stderr)
-    // ── THE PICKER BELONGS HERE, NOT AFTER THE RENDEZVOUS ──────────────────
-    //
-    // Wired after the rendezvous it never appeared at all while waiting -- and
-    // "is my camera the right one" is precisely the question a person has while
-    // waiting for someone to join. Third time this file has put something the
-    // user needs behind a barrier that only lifts once the other person arrives.
-    //
-    // `--cam-picker-test 3` fills it with placeholders: this Mac has exactly one
-    // camera, so the picker is correctly hidden and therefore unverifiable, and a
-    // hidden control returns the same nothing as a broken one.
-    if let n = arg("cam-picker-test").flatMap({ Int($0) }), n > 1 {
-      display?.controls?.setCameras((1...n).map { "Test camera \($0)" }, current: 0)
-      display?.controls?.onCamPick = { i in fputs("camera: picker chose index \(i)\n", stderr) }
-    } else if let cam = c as? CameraSource {
-      let devs = CameraSource.available()
-      display?.controls?.setCameras(devs.map { $0.localizedName },
-                                    current: devs.firstIndex { $0.uniqueID == cam.current?.uniqueID } ?? 0)
-      display?.controls?.onCamPick = { i in
-        let list = CameraSource.available()
-        guard i >= 0, i < list.count else { return }
-        cam.switchTo(list[i])
-      }
+    let cam = CameraSource()
+    earlyCam = cam
+    attachCamera(cam)
+  } else {
+    let f = FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
+    f.onFrame = { pb, _ in
+      display?.showSelf(pb)
+      if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
     }
-  } catch {
-    // Not fatal. A call with no camera is still a call, and saying so beats a
-    // blank window with no explanation.
-    fputs("preview: unavailable (\(error)) -- continuing without a picture\n", stderr)
-    setWindowTitle("Tokkah — no camera; waiting for the other person")
+    do {
+      // A file source's `start()` spawns its own reader thread and returns at
+      // once, so there is nothing here to move off main.
+      try f.start()
+      earlyCam = f
+      fputs("preview: \(f.describe) on screen before the call connects"
+          + " (session up at \(sinceLaunch()) ms)\n", stderr)
+    } catch {
+      // Not fatal. A call with no camera is still a call, and saying so beats a
+      // blank window with no explanation.
+      fputs("preview: unavailable (\(error)) -- continuing without a picture\n", stderr)
+      setWindowTitle("Kin — no camera; waiting for the other person")
+    }
+  }
+}
+
+// ── THE PICKER BELONGS HERE, NOT AFTER THE RENDEZVOUS ───────────────────────
+//
+// Wired after the rendezvous it never appeared at all while waiting -- and "is my
+// camera the right one" is precisely the question a person has while waiting for
+// someone to join. Third time this file has put something the user needs behind a
+// barrier that only lifts once the other person arrives.
+//
+// `--cam-picker-test 3` fills it with placeholders: this Mac has exactly one
+// camera, so the picker is correctly hidden and therefore unverifiable, and a
+// hidden control returns the same nothing as a broken one. It needs no hardware,
+// so it no longer waits behind one either -- it used to be wired inside the
+// camera bring-up, which meant the control that exists to be testable was itself
+// gated on the thing under test.
+if videoArg != "off", let n = arg("cam-picker-test").flatMap({ Int($0) }), n > 1 {
+  display?.controls?.setCameras((1...n).map { "Test camera \($0)" }, current: 0)
+  display?.controls?.onCamPick = { i in fputs("camera: picker chose index \(i)\n", stderr) }
+}
+
+// ── THE HANDLE AND THE SILENT SWITCH, JOINED UP ─────────────────────────────
+//
+// Both directions are asynchronous and both are deliberate. The name appears in
+// the sheet only once the server has agreed it is ours, and the switch moves only
+// once the server has agreed to silence us -- so nobody is told they are
+// unreachable while a stranger's call is still landing.
+Metrics.mark("identity_ready", sinceLaunch())
+Identity.onClaimed = { name in
+  Metrics.mark("handle_claimed", sinceLaunch())
+  display?.controls?.setHandle(name)
+}
+// Already claimed on a previous launch: the sheet should not wait for a network
+// round trip to show a name that is on this disk.
+if Identity.claimed {
+  display?.controls?.setHandle(Identity.handle)
+  // onClaimed fires only the FIRST time a handle is won. Every launch after that
+  // would have skipped the login item entirely -- including every launch by the
+  // user who has had a handle for a month and still cannot be rung.
+  // And the switch, from disk, so a restart does not show "you can be reached"
+  // to somebody who is still silenced.
+  display?.controls?.setSilent(Identity.quietOn)
+}
+display?.controls?.onSilent = { want in
+  // Off main: this is an HTTPS round trip, and it is on the thread that draws.
+  Thread {
+    let ok = Identity.setQuiet(want)
+    let now = Identity.quietOn
+    display?.controls?.setSilent(now)
+    if !ok {
+      display?.controls?.setStatus(now == want ? "silent" : "could not change that")
+    } else {
+      display?.controls?.setStatus(want ? "silent" : "you can be reached")
+    }
+  }.start()
+}
+
+// ── DIALLING A NAME, AND BEING DIALLED ───────────────────────────────────────
+//
+// Both directions end in the same place: `reexec` into the room the ring named.
+// That is deliberate and it is the reason this feature is small -- joining a room
+// is a thing this program already does perfectly, from the first line of main,
+// with every path tested. Re-entering it costs ~150 ms and inherits the whole
+// call stack rather than growing a second one that can disagree with it.
+// `tk --call devesh`: the same path the field takes, reachable without a mouse.
+// Fired once the controls exist, so it cannot race the window into being.
+if let who = arg("call") {
+  DispatchQueue.main.async { display?.controls?.dial(who) }
+}
+// Handed a ring by the watcher. The mailbox has already been drained by the
+// watcher's poll, so this cannot be re-discovered -- it arrives in argv or not
+// at all, and the room is the one the caller minted.
+// ── ONE OFFERED RING, TWO WAYS IN ──────────────────────────────────────────
+//
+// A ring reaches this process either from the in-app poll or, when Kin was
+// closed, from the watcher via argv. `onAnswerRing` reads exactly one variable,
+// because an answer path that only understands one of the two routes is a button
+// that works or does nothing depending on how the call arrived -- and the
+// watcher route is precisely the one nobody would test by hand.
+nonisolated(unsafe) var gOffered: Identity.Ring?
+if let from = arg("incoming"), let r = arg("room") {
+  // No signature to check here: the watcher already verified it before deciding
+  // to launch this process at all. No key either, so this contact is not
+  // remembered on answer -- it will be, the next time they ring an open app.
+  gOffered = Identity.Ring(from: from, room: r, t: 0, k: "", ageMs: 0,
+                           known: false, keyChanged: false)
+  Metrics.count("ring_recv_watch")
+  DispatchQueue.main.async {
+    display?.controls?.showIncoming(from: from, room: r)
+    Ringer.start(raising: display?.callWindow)
+  }
+}
+display?.controls?.onCall = { who in
+  // Off main: signing and an HTTPS round trip, on the thread that draws.
+  Thread {
+    let room = Launcher.mintRoom()
+    Metrics.count("ring_sent_try")
+    guard let got = Identity.ring(to: who, room: room) else {
+      Metrics.count("ring_sent_fail")
+      // Honest, and vague on purpose. A 200 means the ring is in their mailbox;
+      // anything else means we could not put it there. Neither says whether they
+      // are awake, and silence is indistinguishable from away by design.
+      display?.controls?.setStatus("could not reach @\(who)")
+      return
+    }
+    Metrics.count("ring_sent_ok")
+    Metrics.mark("ring_sent_ms", sinceLaunch())
+    DispatchQueue.main.async {
+      display?.controls?.setStatus("ringing @\(who)…")
+      Launcher.reexec(room: got, extra: ["--video", "camera", "--window"], why: "call placed")
+    }
+  }.start()
+}
+
+// Listening. One thread, one poll every `--ring-gap` ms (the server refuses more
+// than one poll per 2 s per handle, so the floor is not ours to choose).
+// ── ANSWER AND DECLINE ARE WIRED UNCONDITIONALLY ───────────────────────────
+//
+// These used to live inside the poll block, so a ring delivered by the WATCHER
+// -- the one route that exists precisely because the app was not running -- would
+// draw a card with two buttons that did nothing. The poll loop is conditional;
+// being able to answer is not.
+display?.controls?.onAnswerRing = {
+  // WHAT PRESSED IT. Answering re-execs the process, so by the time anything is
+  // wrong the evidence is gone -- and an answer that fires with nobody at the
+  // keyboard is indistinguishable in every other log line from one a person
+  // pressed. `currentEvent` is the event AppKit is dispatching right now: a real
+  // press says leftMouseUp with a location, and anything else says this did not
+  // come from a finger.
+  let e = NSApp.currentEvent
+  fputs("ring: answer committed by "
+      + (e.map { "\($0.type) at \($0.locationInWindow)" } ?? "NO EVENT -- not a click")
+      + "\n", stderr)
+  Ringer.stop()
+  guard let o = gOffered else { Metrics.tap("answer", ok: false); return }
+  Metrics.tap("answer")
+  Metrics.count("ring_answered")
+  // Remembered on ANSWER, not on arrival: binding a name to a key when the ring
+  // merely turns up would let whoever rings first own the name.
+  //
+  // SYNCHRONOUSLY, and that is not a style choice. `reexec` is `execv`: it
+  // replaces this image on the next line. A background thread doing the write
+  // would be killed mid-file, and the file it was writing is the contact list.
+  // Only when we actually hold the key. The watcher route carries none, and
+  // binding a name to an empty string would poison the contact list.
+  if !o.k.isEmpty { Identity.remember(handle: o.from, key: o.k) }
+  display?.controls?.setStatus("joining @\(o.from)…")
+  Launcher.reexec(room: o.room, extra: ["--video", "camera", "--window"], why: "ring answered")
+}
+display?.controls?.onDeclineRing = {
+  Ringer.stop()
+  Metrics.tap("decline")
+  Metrics.count("ring_declined")
+  gOffered = nil
+}
+
+if Identity.claimed, !flag("no-rings") {
+  // The whole ring, not a pair of strings: answering has to remember the KEY that
+  // rang, and an earlier version of this line kept only the name and bound the
+  // contact to an empty string -- which would have made every later ring from
+  // that person read as a changed key.
+
+  Identity.startRinging(gapMs: Int(arg("ring-gap") ?? "5000") ?? 5000) { r in
+    // A ring older than its lease is not a call, it is a record of one.
+    guard r.ageMs < 60_000 else { return }
+    if r.keyChanged {
+      // The name is one we know and the key is not. Say the name is in doubt
+      // rather than dropping it: a reinstall looks exactly like this, and so
+      // does somebody claiming a name that is not theirs.
+      fputs("ring: @\(r.from) rang with a DIFFERENT key than we remember\n", stderr)
+    }
+    gOffered = r
+    Metrics.count("ring_recv")
+    Metrics.mark("ring_recv_ms", sinceLaunch())
+    if r.keyChanged { Metrics.count("ring_key_changed") }
+    if r.known { Metrics.count("ring_known") }
+    fputs("ring: @\(r.from) is calling -- room \(r.room), age \(r.ageMs) ms,"
+        + " known=\(r.known)\n", stderr)
+    display?.controls?.showIncoming(from: r.from, room: r.room)
+    // This line was missing entirely. A ring that arrived while Kin was open --
+    // the ORDINARY case, the one that does not need a watcher at all -- drew a
+    // card in a window that was very probably behind something, made no sound,
+    // and did not bounce the dock. It was a silent call.
+    Ringer.start(raising: display?.callWindow)
   }
 }
 
@@ -536,10 +1235,102 @@ if let room = arg("room") {
   // launched it from. Two machines on the same wifi never needed the public
   // address in the first place, so the honest behaviour is to publish what we do
   // know, say so on screen, and let the call try.
-  let mapped = Stun.discoverAny(fd: wire.fd,
-                                servers: arg("stunserver").map { [$0] })
+  // ── PAINT BEFORE THE NETWORK ────────────────────────────────────────────────
+  //
+  // The window is created 500 lines above here and the camera is already running.
+  // Neither of them needs a socket -- CameraSource.start is pure AVFoundation and
+  // the frame sink only calls display?.showSelf, so the local picture is ALREADY
+  // above the network in program order. The only reason nothing was on screen was
+  // that the main thread walked out of the camera straight into STUN -> TURN ->
+  // rendezvous and did not return to the runloop for 2878 ms: the window existed,
+  // was key, and was blank glass for the best part of three seconds.
+  //
+  // So the cheapest correct fix is not "move the network", it is "turn the runloop
+  // before it". This one call is most of the win. The thread below is what keeps
+  // the window alive and clickable while the network happens.
+  if display != nil || mdisplay != nil {
+    Launcher.pumpAppKit(until: Date().addingTimeInterval(0.06))
+  }
+
+  // ── ONE READER ON wire.fd. ALWAYS ───────────────────────────────────────────
+  //
+  // Stun.discover and TurnClient.roundTrip both recvfrom on the media socket, both
+  // setsockopt(SO_RCVTIMEO) on it, and roundTrip's defer hands it back BLOCKING.
+  // So the two of them stay serialized with each other on this one thread, and the
+  // media recv loop is not allowed to start until this thread has finished (the
+  // wait is below, right after the join). Two readers on this descriptor is
+  // intermittent unattributable audio loss at call start, plus a TURN allocate
+  // that fails for no visible reason.
+  //
+  // TurnClient.fetch() is pure HTTPS and never touches the socket -- that is the
+  // free parallelism, and it runs while STUN is still in flight.
+  let stunDone = DispatchSemaphore(value: 0)
+  let turnDone = DispatchSemaphore(value: 0)
+  let fetchDone = DispatchSemaphore(value: 0)
+  let relay = RelayBox()
+  var mapped: Stun.Mapped?
+  var creds: TurnClient?
+  DispatchQueue.global().async {
+    creds = TurnClient.fetch()
+    fetchDone.signal()
+  }
+  Thread {
+    mapped = Stun.discoverAny(fd: wire.fd,
+                              servers: arg("stunserver").map { [$0] })
+    stunDone.signal()
+    // TURN on the same socket, after STUN and before the media loop exists.
+    // Fail-open: a missing relay still leaves STUN + LAN, which is how every call
+    // used to work.
+    // THE RESULT OF THE WAIT IS THE PERMISSION TO READ. This was
+    // `_ = fetchDone.wait(...)` followed by `if let tc = creds`, which on the
+    // timeout path reads a refcounted class reference while the other thread may
+    // still be storing it -- a torn retain, which is the crash `runPumping` in
+    // Launcher.swift spells out in its own comment and deliberately avoids. On
+    // timeout there is nothing to read, so nothing is read.
+    if fetchDone.wait(timeout: .now() + 8) == .success, let tc = creds {
+      if tc.allocate(fd: wire.fd) {
+        wire.turn = tc
+        relay.set(tc.relayed)     // the poll loop republishes with it on its next turn
+      } else {
+        fputs("turn: allocate failed -- racing STUN and LAN only\n", stderr)
+      }
+    } else {
+      fputs("turn: no credentials (or /api/mac/turn unreachable or still fetching after 8 s)"
+          + " -- racing STUN and LAN only\n", stderr)
+    }
+    turnDone.signal()
+  }.start()
+
+  // Pump AppKit until STUN answers, in 20 ms slices, so the wait ends within a
+  // frame of the answer instead of at some fixed timeout.
+  //
+  // ── AND THE FALLBACK PUMPS TOO ──────────────────────────────────────────────
+  //
+  // This loop used to give up pumping after 15 s and fall through to a bare
+  // `stunDone.wait()`, on the stated grounds that it was better to block than to
+  // "read a variable another thread is still writing". That reasoning does not
+  // require a deadline: `mapped` is read only after a wait on `stunDone` has
+  // SUCCEEDED, and a zero-timeout wait publishes exactly as much as a blocking one
+  // -- the semaphore is the barrier, not the blocking. What the deadline did buy
+  // was a main thread inside a bare wait(), which is a window that does not draw,
+  // does not move, and shows the spinning cursor, for as long as STUN is stuck.
+  // Every other wait in this file pumps; so does this one now, for as long as it
+  // takes, and the barrier is unchanged.
+  var stunReady = false
+  while !stunReady {
+    if display != nil || mdisplay != nil {
+      Launcher.pumpAppKit(until: Date().addingTimeInterval(0.02))
+    } else {
+      usleep(5_000)
+    }
+    if stunDone.wait(timeout: .now()) == .success { stunReady = true }
+  }
+
   let myLocal = localIPv4().map { "\($0):\(listenPort)" }
   let mine = mapped.map { "\($0.ip):\($0.port)" }
+  // These diagnostics deliberately stay on the MAIN thread: setStatus is AppKit,
+  // and off-main AppKit mutation is the class of bug that has already SIGSEGV'd
+  // this process. Nothing here is slow -- the waiting happened above.
   if mine == nil {
     if myLocal == nil {
       fputs("room: no public address and no local address -- this machine has no"
@@ -555,51 +1346,130 @@ if let room = arg("room") {
   fputs("room \(room): I am \(me), public \(mine ?? "unknown")"
       + "\(myLocal.map { ", local " + $0 } ?? "")\n", stderr)
   var found = false
-  for attempt in 1...60 {
+  var bindTarget: (String, UInt16)?
+  // ── A DEADLINE, NOT A COUNT ─────────────────────────────────────────────────
+  //
+  // This was `for attempt in 1...60` with a two-second sleep, and the message at
+  // the bottom says "nobody else arrived in 2 minutes" -- so 60 was two minutes
+  // only as long as nobody touched the cadence. Speeding the polls up would have
+  // collapsed the give-up window to about six seconds while the message went on
+  // claiming two minutes, and a peer ten seconds late would have been met with
+  // exit(1). Same class as every RTT-blind timeout in this codebase: a threshold
+  // expressed in the wrong unit is a hidden limit. The unit is now seconds.
+  let giveUp = Date().addingTimeInterval(120)
+  let joinStart = Date()
+  var attempt = 0
+  while Date() < giveUp {
+    attempt += 1
     // Re-publish every poll: the lease is short on purpose, because an address is
     // only true while the NAT binding behind it lives.
-    let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
+    //
+    // `relay.get()` and not a captured value: the relay may not exist yet and the
+    // join does not wait for it. /rv is an in-memory Map write with a 90 s lease
+    // and no rate limit, and it overwrites the entry every time, so republishing
+    // with a relay a second later costs nothing and TURN latency costs the join
+    // nothing at all -- fixed allocate or not.
+    // OFF MAIN, PUMPING. The exchange is a blocking HTTPS round trip and this
+    // loop owns the main thread for the entire time the waiting screen is up --
+    // which is precisely when the person is trying to copy the link. The peers
+    // still arrive here, on this thread, in this order; only the wait moves.
+    // A nil return is a poll that did not answer in time, which is what the next
+    // iteration is for.
+    let relayNow = relay.get()
+    let peers = Launcher.runPumping(pump: display != nil || mdisplay != nil) {
+      Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relayNow)
+    } ?? []
     if let p = peers.first {
-      // BOTH addresses, and let the network decide. Guessing between them -- same
-      // public IP means same LAN, so use the private address -- is right most of
-      // the time and produces a call that never starts when it is wrong. Hairpin
-      // support, carrier-grade NAT, a VPN on one side: each breaks a different
-      // guess. Racing them costs two 32-byte probes.
+      // Every address we have, raced by measured RTT — LAN, public, and the
+      // peer's TURN relayed address. First-packet-wins was the public internet
+      // as often as the short path.
       wire.addCandidate(ip: p.ip, port: p.port)
       var cands = ["\(p.ip):\(p.port)"]
       if let lip = p.localIP, let lport = p.localPort {
         wire.addCandidate(ip: lip, port: lport)
         cands.append("\(lip):\(lport)")
       }
+      if let rip = p.relayIP, let rport = p.relayPort {
+        wire.addCandidate(ip: rip, port: rport)
+        cands.append("relay \(rip):\(rport)")
+      }
+      // NOT HERE. bindPeer does two round-trips on wire.fd, and the TURN thread
+      // above may still be inside its own -- two readers on one descriptor, the
+      // exact race this file spends 40 lines warning about. Remembered, and done
+      // once that thread has signalled, a few lines below.
+      bindTarget = (p.ip, p.port)
       // A provisional destination so media has somewhere to go in the moments
       // before a probe comes back; the first packet that arrives replaces it with
       // an address known to work.
       wire.setPeer(ip: p.ip, port: p.port)
       fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
-      setWindowTitle("Tokkah — connecting")
+      setWindowTitle("Kin — connecting")
       found = true
       break
     }
     if attempt == 1 { fputs("room \(room): waiting for the other person...\n", stderr) }
+    // ── FAST WHILE IT MATTERS ───────────────────────────────────────────────────
+    //
+    // A flat two seconds cost the first arriver 2104 ms of "waiting for the other
+    // person" for no reason: the peer had published, and we were asleep. The
+    // seconds that matter are the first few, so spend polls there and back off
+    // afterwards. Real cadence is exchange latency PLUS this sleep -- the exchange
+    // is synchronous, ~400 ms -- so the fast end is about 500 ms, and two peers
+    // come to roughly 5 requests a second against one in-memory Map. Nothing.
+    let age = Date().timeIntervalSince(joinStart)
+    let gap: Double = attempt <= 10 ? 0.1 : (age < 3 ? 0.25 : (age < 10 ? 0.5 : 2.0))
     // PUMP THE EVENT LOOP, do not just sleep. With a window open this loop owns
     // the main thread, and a main thread inside usleep is a window that does not
     // draw, does not move and shows the spinning cursor -- which is worse than no
-    // window at all. Same hand-driven loop Launcher.askRoom uses.
+    // window at all. Same pump as everywhere else.
     if display != nil || mdisplay != nil {
-      let app = NSApplication.shared
-      let until = Date().addingTimeInterval(2.0)
-      while Date() < until {
-        guard let e = app.nextEvent(matching: .any, until: until, inMode: .default, dequeue: true)
-        else { break }
-        app.sendEvent(e)
-      }
+      Launcher.pumpAppKit(until: min(Date().addingTimeInterval(gap), giveUp))
     } else {
-      usleep(2_000_000)
+      usleep(UInt32(gap * 1_000_000))
     }
   }
   if !found {
     fputs("room \(room): nobody else arrived in 2 minutes.\n", stderr)
     exit(1)
+  }
+  // ── THE SOCKET IS OURS AGAIN ────────────────────────────────────────────────
+  //
+  // Everything below this line -- the probe threads, the media recv loop, the
+  // audio graph -- shares wire.fd, so the STUN/TURN thread has to be finished
+  // first. This is the barrier that makes "one reader on wire.fd" true, and it is
+  // also what publishes wire.turn to this thread.
+  //
+  // PUMPED, not blocked. This was a bare `turnDone.wait(timeout: .now() + 20)`, and
+  // the window at this point in the launch says "connecting" -- so a slow TURN
+  // allocate froze that window solid, on the main thread, for up to twenty seconds.
+  // That is exactly the class of defect the launch work just removed everywhere
+  // else. A zero-timeout wait in a pumping loop is the same memory barrier as a
+  // blocking one, so `wire.turn` is still read only after a wait that SUCCEEDED.
+  let turnDeadline = Date().addingTimeInterval(20)
+  var turnJoined = false
+  while Date() < turnDeadline {
+    if display != nil || mdisplay != nil {
+      Launcher.pumpAppKit(until: min(Date().addingTimeInterval(0.02), turnDeadline))
+    } else {
+      usleep(5_000)
+    }
+    if turnDone.wait(timeout: .now()) == .success { turnJoined = true; break }
+  }
+  if turnJoined {
+    if let t = wire.turn, let b = bindTarget, t.bindPeer(fd: wire.fd, ip: b.0, port: b.1) {
+      fputs("turn: channel bound to \(b.0):\(b.1)\n", stderr)
+    }
+  } else {
+    // Never seen; said out loud rather than raced past, because this branch is a
+    // FAIL-OPEN and not a barrier: carrying on means a still-running TURN thread
+    // becomes a second reader on the media socket from here to the end of the call,
+    // which is intermittent unattributable audio loss and nothing in the log to
+    // attribute it to. Left as it is on purpose -- closing it means giving that
+    // thread a way to be told to stop touching the socket, which is a change to
+    // TurnClient and not to this line -- but it is written down rather than implied
+    // by a timeout that reads like a safety margin.
+    fputs("turn: still working after 20 s -- carrying on without the relay"
+        + " (that thread is now a second reader on the media socket)\n", stderr)
   }
   // Keep the lease alive and keep re-reading: if the peer restarts, its NAT port
   // changes and the old address goes dead silently.
@@ -623,8 +1493,18 @@ if let room = arg("room") {
       if wire.locked {
         if announcedFor != wire.lockedFrom {
           announcedFor = wire.lockedFrom
+          Metrics.mark("connected_ms", sinceLaunch())
+          Metrics.count("connects")
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
-          if sawRemote { display?.controls?.setStatus("connected") }
+          if sawRemote {
+            display?.controls?.setStatus("connected")
+            // The other half of the door. `markConnected` fires once per process
+            // (`if !sawRemote`), so if the waiting card came back on a departure,
+            // this is the only thing that can take it away again -- otherwise it
+            // would sit on top of the returning peer's picture for the rest of the
+            // call, which is a worse fault than the one it was added to fix.
+            display?.controls?.setPeerPresent(true)
+          }
           gone = 0
         }
         // SILENCE IS THE SIGNAL. Three seconds with nothing arriving means the
@@ -633,6 +1513,7 @@ if let room = arg("room") {
         // old code locked once and could never reconsider, so any of those ended
         // the call permanently and silently.
         if wire.lastRecvHost != 0, Clock.msSigned(Clock.now(), wire.lastRecvHost) > 3000 {
+          Metrics.count("rediscoveries")
           fputs("room \(room): nothing from \(wire.lockedFrom) for 3 s -- looking again\n", stderr)
           wire.unlockForRediscovery()
           announcedFor = ""
@@ -651,7 +1532,7 @@ if let room = arg("room") {
       }
       // Unlocked: refresh the directory as well as probing, because if the peer
       // moved, its old address is exactly the one we would otherwise keep trying.
-      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
+      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get())
       // ── A BLIP AND A DEPARTURE ARE NOT THE SAME THING ────────────────────
       //
       // From the media side they are identical: silence. From the DIRECTORY they
@@ -661,23 +1542,31 @@ if let room = arg("room") {
       // frozen face over a running clock. But every entry carries `ageMs`, the time
       // since that peer last said it was there, so the answer arrives in seconds
       // and needs no change to the protocol.
-      if let p = peers.first, p.ageMs < 4000 {
-        gone = 0
+      func addAll(_ p: Rendezvous.Peer) {
         wire.addCandidate(ip: p.ip, port: p.port)
         if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+        if let rip = p.relayIP, let rport = p.relayPort { wire.addCandidate(ip: rip, port: rport) }
+      }
+      if let p = peers.first, p.ageMs < 4000 {
+        gone = 0
+        addAll(p)
       } else if sawRemote {
         gone += 1
         if gone == 4 {
           let why = peers.isEmpty ? "not in the room" : "silent for \(peers[0].ageMs / 1000)s"
           fputs("room \(room): peer is \(why) -- telling the window\n", stderr)
           display?.controls?.setStatus("the other person left")
+          // And bring the waiting screen back. Saying "the other person left" over
+          // their last frozen frame, with no link and nothing to press, describes
+          // the situation and offers nothing about it. This screen already has the
+          // invite link and both ways to copy it, and it is now the ONLY place that
+          // does -- the sheet's invite row was removed because this exists.
+          Metrics.count("peer_left")
+          display?.controls?.setPeerPresent(false)
         }
         // Keep probing anyway: a peer that comes BACK republishes, and the status
         // is a report, not a decision to stop trying.
-        if let p = peers.first {
-          wire.addCandidate(ip: p.ip, port: p.port)
-          if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
-        }
+        if let p = peers.first { addAll(p) }
       }
       wire.probeAllCandidates()
       Thread.sleep(forTimeInterval: 0.5)
@@ -687,7 +1576,7 @@ if let room = arg("room") {
   Thread {
     while true {
       Thread.sleep(forTimeInterval: 20)
-      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal)
+      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get())
       // Only worth acting on while unresolved. Once a packet has arrived, the
       // address it came from is better evidence than anything the rendezvous can
       // tell us -- and re-pointing a working call at a directory entry is how a
@@ -695,15 +1584,58 @@ if let room = arg("room") {
       if let p = peers.first, !wire.locked {
         wire.addCandidate(ip: p.ip, port: p.port)
         if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+        if let rip = p.relayIP, let rport = p.relayPort { wire.addCandidate(ip: rip, port: rport) }
       }
     }
   }.start()
 }
 
 var keyAsksOnLoss = 0
+/// Inbound keyframe requests. Every one of these is the far end saying "I lost
+/// video from you" -- a video-derived, OUTBOUND-direction harm signal that was
+/// already arriving and being thrown away. Counted first and steered on later:
+/// attribute before acting.
+var keyAsksIn = 0
 var gDumpedMetal = false
 var gDecLuma: Double = -1
+/// Width of the last picture DECODED from the far end. Not what we asked them
+/// for -- what actually arrived, which is the only number that can answer "why
+/// does their video look soft". One Int, written from the decode callback.
+nonisolated(unsafe) var gRxWidth = 0
+nonisolated(unsafe) var gRxHeight = 0
 var gDecLumaTick = 0
+
+// ── BLOCKINESS, MEASURED ON THE PICTURE A PERSON IS LOOKING AT ───────────────
+//
+// The first attempt at this counted frames whose bits-per-pixel fell below a
+// threshold while the scene moved. It failed its own calibration immediately: at
+// the FULL 3 Mbps it called 23 of 30 moving frames blocky, because a talking head
+// is cheap to encode and a low bitrate on easy content is not damage. Bits are
+// not quality. That version is gone.
+//
+// The SECOND attempt measured steps on the 8-pixel block grid against steps
+// everywhere else. It also failed calibration, and backwards: at quality 0.9 it
+// reported 1.356 and flagged 42 of 49 samples, and at quality 0.05 -- a picture
+// visibly destroyed, 702 bytes a frame against 8994 -- it reported 1.155 and
+// flagged NONE. Two reasons, both fundamental: H.264 runs an in-loop deblocking
+// filter whose entire job is to erase that signature, and a picture starved of
+// bits goes SMOOTH, so edge and interior gradients collapse together and the
+// ratio walks back towards 1. The ratio is still reported, because it is nearly
+// free, but nothing is allowed to conclude anything from it.
+//
+// What ranked correctly is the absolute amount of detail left in the decoded
+// picture. Bits buy detail; when they run out, detail is what goes. Paired with
+// how much the picture was MOVING, that separates "a still, plain scene" -- which
+// is legitimately low-detail and looks perfect -- from "a moving scene being
+// scrubbed flat", which is the complaint.
+//
+// Measured where the complaint is -- on the DECODED far-end picture -- because
+// "his picture goes blocky" is a statement about what arrived, and the sender's
+// own numbers cannot see the network that came after them.
+var gDecMotion: Double = -1
+nonisolated(unsafe) var gDecPrev = [UInt8](repeating: 0, count: 4096)
+nonisolated(unsafe) var gDecCur = [UInt8](repeating: 0, count: 4096)
+var gDecPrevN = 0
 var gThetaMs: Double = 0
 var gThetaValid = false
 let audio = Audio()
@@ -713,31 +1645,30 @@ audio.wire = wire
 // commands is a flag you will forget on the forty-first, and here the cost of
 // forgetting is landing on someone's speakers while they are asleep. An exported
 // variable is remembered once.
-// MICROPHONE PERMISSION, ASKED AND ANSWERED BEFORE ANYTHING ELSE.
+// MICROPHONE PERMISSION: REPORTED HERE, ASKED FOR MUCH EARLIER.
 //
 // A denied microphone produces "cap 0/s" and nothing else -- identical to a
 // muted mic, a wrong default device, or a bug in this code. That ambiguity has
-// already cost me a whole false root cause once in this project, and it is the
-// single most likely thing to stop someone the first time they run this on a
-// machine I cannot see. So it is checked explicitly and named.
+// already cost me a whole false root cause once in this project, so the state is
+// still named out loud, right where the audio devices are about to be opened.
+//
+// What is NOT here any more is the request itself, or the 60-second semaphore
+// that used to wait for it on the main thread. Both moved up above the
+// rendezvous: this line sits below a block that can `exit(1)`, so on a solo
+// launch it never ran at all and the microphone was never asked for. Reading the
+// status is free and cannot block; the answer may still be in flight, and
+// `notDetermined` here means "the dialog above is still on screen", which is not
+// an error.
 //
 // A command-line tool has no bundle, so macOS attributes the grant to the
-// terminal that launched it -- which is why the fix names the terminal app and
-// not "tk".
+// terminal that launched it -- which is why this names the terminal app and not
+// "tk".
 switch AVCaptureDevice.authorizationStatus(for: .audio) {
 case .authorized:
   break
 case .notDetermined:
-  let sem = DispatchSemaphore(value: 0)
-  var granted = false
-  AVCaptureDevice.requestAccess(for: .audio) { granted = $0; sem.signal() }
-  fputs("microphone: asking permission (look for a dialog)...\n", stderr)
-  _ = sem.wait(timeout: .now() + 60)
-  if !granted {
-    fputs("microphone: NOT GRANTED. tk will play the other side but send silence.\n"
-        + "  Grant it to the app you launched this from (Terminal, iTerm, VS Code...) in\n"
-        + "  System Settings > Privacy & Security > Microphone, then run tk again.\n", stderr)
-  }
+  fputs("microphone: still waiting on the permission dialog -- answer it and this\n"
+      + "  end starts sending. Nothing here blocks on it.\n", stderr)
 case .denied, .restricted:
   fputs("microphone: DENIED. You will hear the other person and they will hear silence.\n"
       + "  Enable the app you launched this from (Terminal, iTerm, VS Code...) in\n"
@@ -753,12 +1684,39 @@ let fecAllowed = !flag("no-fec")
 // that can settle whether the device-latency terms are already inside the
 // timestamps we add them to (17.89). It has to make a sound.
 // Must be set before the units are built: the buffer size is a device property.
+// `--io hal` is the control arm: the old two-unit raw-hardware path, no echo
+// cancellation, exactly as every call before this shipped.
+if let io = arg("io") {
+  guard io == "vp" || io == "hal" else {
+    fputs("--io takes vp or hal, not \(io)\n", stderr); exit(2)
+  }
+  Audio.ioKind = io
+}
+if flag("no-agc") { Audio.agcOn = false }
+
+// 16 frames is the HAL path's floor and it is measured, not guessed. Under
+// VoiceProcessingIO it is the WRONG floor: that unit does its own block
+// processing, and a 16-frame device buffer fights it -- swept on a loopback call
+// with real speech, 16 gave 31.7% concealment where 64 gave none.
+//
+//    devbuf   m2e p50   conceal      (VoiceProcessingIO, loopback, real speech)
+//      16      9.4 ms   455/s   <- unusable, the unit is being starved
+//      64     14.8 ms     0/s   then 322/s on the very next run -- MARGINAL
+//     128     20.8 ms     0/s   x3 (20.81 / 20.67 / 21.02) <- chosen
+//     256     32.0 ms     0/s   x2
+//     480     50.7 ms   272/s
+//
+// 64 is the number a single run would have chosen, and it is wrong: the repeat
+// concealed 322/s and played 77.9%. Only 128 held across three runs, which is
+// the difference between a measurement and a lucky sample. Cost against the HAL
+// control (11.2 ms) is +9.6 ms, paid for an echo canceller that actually exists.
+//
+// So the default is per-path, and an explicit --devbuf still wins over both.
+if Audio.ioKind == "vp" { Audio.devBuf = 128 }
 if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
 if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
-if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
-if let e = arg("tel-endpoint") { Telemetry.endpoint = e }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if flag("aec") { fputs(audio.enableAec() + "\n", stderr) }
@@ -774,6 +1732,7 @@ audio.concealGrain = (arg("conceal") == "grain")
 audio.interpLinear = (arg("interp") == "linear")
 audio.acoustic = flag("acoustic")
 audio.cursorAheadMs = Double(arg("cursor-ahead") ?? "0") ?? 0
+audio.stallOutAfterS = Double(arg("stall-out") ?? "0") ?? 0
 
 // ── Self-test: decode(encode(x)) must equal x, for every x ────────────────────
 //
@@ -980,7 +1939,14 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 // an empty pipe and reports it as video.
 // AIM AT VISUALLY LOSSLESS AND RETREAT WHEN THE LINK SAYS NO. `--vquality <n>`
 // caps it; `--vquality 0` reproduces the old always-unset behaviour.
-let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) }, hold: flag("vq-hold"))
+// `--no-vpause` is the control arm: a link bad enough to stop the picture is
+// exactly the link where "is stopping it actually better" needs an answer, and
+// an arm that cannot be pinned measures nothing. `--vpause-after 1` makes a
+// ten-second rig prove in ten seconds what a real bad link takes minutes to do.
+let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) }, hold: flag("vq-hold"),
+                  pause: !flag("no-vpause"),
+                  pauseAfter: arg("vpause-after").flatMap { Int($0) } ?? 3,
+                  resumeQuiet: arg("vpause-quiet").flatMap { Int($0) } ?? 8)
 // ── Prove a live encoder property, or do not believe it ─────────────────────
 //
 // `--vq-step 30:400000` drops the bitrate ceiling to 400 kbps at t=30 s on an
@@ -1048,6 +2014,7 @@ vasm.onFrame = { data, host in
 let dumpTo = arg("dump")
 var dumped = false
 vdec.onDecoded = { img, capHost in
+  gRxWidth = CVPixelBufferGetWidth(img); gRxHeight = CVPixelBufferGetHeight(img)
   // What the far end's picture actually looks like after decoding. Both ends of
   // the test rig play the same file, so a decoded mean luma that wanders away
   // from the encoder's reported luma is corruption -- the one symptom that
@@ -1062,6 +2029,22 @@ vdec.onDecoded = { img, capHost in
       var sum = 0, n = 0, y = 0
       while y < h { var x = 0; while x < w { sum += Int(p[y * stride + x]); n += 1; x += 8 }; y += 8 }
       if n > 0 { gDecLuma = Double(sum) / Double(n) }
+
+      // And how much the far end's picture was MOVING, from the same samples --
+      // so "blocky" can be separated from "blocky while he moved", which are
+      // different bugs with different fixes.
+      var m = 0, mn = 0, yz = 0, w2 = 0
+      while yz < h && w2 < gDecCur.count {
+        var x = 0
+        while x < w && w2 < gDecCur.count { gDecCur[w2] = p[yz * stride + x]; w2 += 1; x += 16 }
+        yz += 16
+      }
+      if gDecPrevN == w2 && w2 > 0 {
+        for i in 0..<w2 { m += abs(Int(gDecCur[i]) - Int(gDecPrev[i])); mn += 1 }
+        if mn > 0 { gDecMotion = Double(m) / Double(mn) }
+      }
+      for i in 0..<w2 { gDecPrev[i] = gDecCur[i] }
+      gDecPrevN = w2
     }
     CVPixelBufferUnlockBaseAddress(pb, .readOnly)
   }
@@ -1076,7 +2059,7 @@ vdec.onDecoded = { img, capHost in
     // Their picture takes the window; yours moves to the corner.
     display?.selfViewOn = true
     display?.controls?.markConnected()
-    setWindowTitle("Tokkah — connected")
+    setWindowTitle("Kin — connected")
     display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
     fputs("the other side's picture is on screen\n", stderr)
   }
@@ -1109,6 +2092,11 @@ if videoArg != "off" {
     let src: FrameSource = earlyCam
       ?? (videoArg == "camera" ? CameraSource()
                               : FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30))
+    // Non-nil means a source was built and adopted, not that its hardware came up:
+    // the camera's bring-up is asynchronous now. A bring-up that FAILED clears
+    // `earlyCam` on the main queue, and the rendezvous loop above drains that queue
+    // on every poll, so by the time this line runs the pointer is honest. Belt and
+    // braces at the other end too -- `CameraSource.bringUp` refuses to run twice.
     let reusing = earlyCam != nil
     // The controller owns the quality from here; the flag only sets its ceiling.
     // `--vquality 0` pins it to the old unset behaviour.
@@ -1122,6 +2110,19 @@ if videoArg != "off" {
       // them from a dark room. Nothing sent is unambiguous, and the receiver's
       // last frame simply stays put.
       if camOff { return }
+      // ── PAUSED: STILL YOUR CAMERA, JUST NOT THEIR PROBLEM ────────────────────
+      //
+      // The frame is dropped BEFORE the encoder, not after it: encoding a picture
+      // and then discarding it would burn the same CPU and the same battery for a
+      // packet nobody sends, on a machine whose link is already in trouble.
+      //
+      // But the self-view keeps updating. Your own camera did not fail, and a
+      // corner tile that freezes at the same moment as the main picture is how
+      // "their connection is weak" gets misread as "this app has hung".
+      if gVideoPaused {
+        display?.showSelf(pb)
+        return
+      }
       e.encode(pb, hostTime: host)
       // Same single owner as the early-camera path above.
       display?.showSelf(pb)
@@ -1148,7 +2149,7 @@ if videoArg != "off" {
 // never sends one and a blind one recovers in a fifth of a second. Rate limited,
 // because the condition that produces it produces it on every single frame.
 let kscratch = UnsafeMutablePointer<UInt8>.allocate(capacity: 32)
-wire.onKeyRequest = { venc?.requestKeyframe() }
+wire.onKeyRequest = { keyAsksIn += 1; venc?.requestKeyframe() }
 Thread {
   var lastAsk = 0.0
   var lastDecodes = -1
@@ -1193,7 +2194,8 @@ let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
                     jitterMs: Double(arg("imp-jitter") ?? "0") ?? 0,
                     delayMs: Double(arg("imp-delay") ?? "0") ?? 0,
                     spikeMs: Double(arg("imp-spike") ?? "0") ?? 0,
-                    spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3)
+                    spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3,
+                    untilS: Double(arg("imp-until") ?? "0") ?? 0)
 if impair.enabled {
   wire.impair = impair
   if impair.holdsPackets { wire.armDelayQueue() }
@@ -1685,6 +2687,9 @@ var signalSources: [DispatchSourceSignal] = []
 /// send zeros for these, which the dashboard then displayed as a call that used
 /// 0.00 Mbps -- a made-up number is worse than a missing one.
 var lastRates = (up: 0.0, down: 0.0, played: 0, concealed: 0, cap: 0)
+/// Percentiles the report loop already computed. leaveCall and SIGTERM read
+/// these instead of sorting the live histogram — that sort was the hang-up crash.
+var lastM2e = (p50: Optional<Double>.none, p95: Optional<Double>.none, p99: Optional<Double>.none)
 /// Set the moment a quit is requested. Without it the report loop kept beating
 /// during the handler's grace period and posted a LIVE beat after the FINAL one
 /// -- so the last beat of the call was not the final beat, and a dashboard that
@@ -1698,7 +2703,26 @@ nonisolated(unsafe) var videoBeat: [String: Any] = [:]
 /// Previous-tick values for the picture-quality controller.
 nonisolated(unsafe) var lastVqLost = 0, lastVqConc = 0, lastVqJit = 0
 nonisolated(unsafe) var lastVqPeerLost = 0, lastVqPeerRec = 0
+/// Whether `lastVqPeerLost`/`lastVqPeerRec` have been set from a real report yet.
+/// See the priming block at the controller: the peer's counters are cumulative
+/// since ITS process start, so subtracting a zero baseline books the peer's entire
+/// history as one second of harm.
+// Pause bookkeeping. Seconds rather than events alone: two pauses of one second
+// each and one pause of forty are the same count and completely different calls.
+nonisolated(unsafe) var vPausedSecs = 0
+nonisolated(unsafe) var vPeerPausedSecs = 0
+nonisolated(unsafe) var vPeerPauses = 0
+nonisolated(unsafe) var lastPeerPaused = false
+nonisolated(unsafe) var lastPeerCamOff = false
+nonisolated(unsafe) var vqPrimed = false
+/// Separate from `vqPrimed`: the peer's baseline is only valid once the peer has
+/// actually reported. See the comment at the priming site.
+nonisolated(unsafe) var vqPrimedPeer = false
 nonisolated(unsafe) var vqWarnedLocal = false
+
+// Everything the beat reads now exists. Set HERE, on the line after the last of
+// those globals, so the flag cannot drift away from the thing it describes.
+beatReady = true
 
 /// One beat's worth of fields. Raw numbers only -- no verdicts, no thresholds.
 /// The dashboard decides what "good" means, so changing that opinion does not
@@ -1706,12 +2730,129 @@ nonisolated(unsafe) var vqWarnedLocal = false
 func audioBeat(uptime: Double, up: Double, down: Double,
                played: Int, concealed: Int, cap: Int,
                p50: Double?, p95: Double?, p99: Double?) -> [String: Any] {
+  // A BEAT FOR A CALL THAT NEVER STARTED.
+  //
+  // Every global below -- `audio`, `tsync`, `vg2g`, `videoBeat` -- is created by
+  // the top-level code AFTER the rendezvous. The window and its Leave button are
+  // created BEFORE it. So `leave` clicked while the title still says "waiting for
+  // the other person" ran this function against zero-filled memory and read
+  // `audio.ring` off a null pointer: SIGSEGV at 0x40, which is exactly where
+  // `ring` sits in Audio's layout. Confirmed from a user's 0.44.0 crash report
+  // (main.swift:1800, leaveCall, closure #15) and reproduced with
+  // `--room <empty> --press leave,leave`. Fourth instance of this shape in this
+  // file: `mute` (Audio.swift's header) and `pressControl` both carry the scar.
+  //
+  // The beat is NOT skipped. A person who waited thirty seconds and gave up is
+  // the single most interesting thing this app can report, and a call that ends
+  // with no final record at all reads on the dashboard like a call still running.
+  // So it goes out with the numbers that are honestly known -- the caller passes
+  // those by value -- and `pre_connect` says why the rest is missing, instead of
+  // zeros pretending to be measurements.
+  //
+  // The percentiles are dropped rather than forwarded on this path. `lastM2e` is
+  // one of the globals that does not exist yet, and a zero-filled
+  // Optional<Double> does not read back as nil -- Double has no spare bits, so
+  // the tag byte is 0 and the value reads as `.some(0.0)`. Forwarding it would
+  // post a mouth-to-ear of 0.00 ms for a call with no audio at all, which is the
+  // one kind of number this file refuses to invent.
+  guard beatReady else {
+    // ── WHAT IS TRUE BEFORE A CALL CONNECTS IS STILL TRUE ────────────────────
+    //
+    // The counters below are not measurements of a media pipeline that does not
+    // exist yet -- they are a record of what the PERSON did, and it is complete
+    // whether or not anyone ever answered. Leaving them out meant a call that
+    // never connected reported no button presses at all, which is exactly the
+    // call where somebody pressed things and gave up: three runs pressing eight
+    // controls each produced `taps` absent, `events` absent, every time.
+    let m = Metrics.snapshot()   // same call, one lock, see the note below
+    return [
+      "uptime_s": uptime,
+      // Zero because the report loop never ran, not because it measured zero --
+      // `pre_connect` is what tells those two apart.
+      "up_mbps": up, "down_mbps": down,
+      "played_ps": played, "conceal_ps": concealed, "cap_ps": cap,
+      "pre_connect": 1,
+      "taps": m.taps, "tap_fails": m.fails, "marks": m.marks, "events": m.counts,
+      "facts": m.facts,
+      "mic_access": gMicAccess, "io": Audio.ioKind,
+      "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
+    ]
+  }
   let r = audio.ring
+  let mSnap = Metrics.snapshot()
   var f: [String: Any] = [
     "uptime_s": uptime,
     "up_mbps": up, "down_mbps": down,
     "played_ps": played, "conceal_ps": concealed, "cap_ps": cap,
     "jit": audio.jitTarget,
+    // ── THE AUDIO FACTS THE DIAGNOSIS WAS ASKING FOR ────────────────────────
+    //
+    // Every audio verdict on the server reads fields the client had never sent:
+    // in_rate, out_rate, aec_on. A rule whose evidence never arrives returns the
+    // same "unknown" as a healthy call, which is how a call nobody could hear
+    // produced a clean dashboard.
+    // ── THE FAR END, THE MIC, AND THE PATH ──────────────────────────────────
+    //
+    // All nine of these were already sitting in memory and none of them were
+    // reported, which is why the dashboard could not name either fault from a
+    // real call: "they cannot hear me" needs the PEER's numbers, and "why is the
+    // picture soft" needs to know whether we are on a relay.
+    //
+    // `peer_rx_lost` is the closest thing available to "is the far end actually
+    // playing what I send". The true answer needs the peer's played count, and the
+    // probe packet carries exactly two counters today (Net.swift appendRxReport),
+    // so that one is a wire change and therefore two releases away -- an old peer
+    // cannot send a field it has never heard of.
+    // ── WHICH BUTTON, HOW MANY TIMES, AND DID IT WORK ───────────────────────
+    //
+    // Four objects rather than forty fields, so `packFields` can drop the whole
+    // group under the size cap instead of truncating one -- a truncated JSON
+    // prefix once turned an oversized beat into a record that read as fully
+    // blind. Empty dictionaries are sent deliberately: "nobody pressed anything"
+    // and "the field went missing" must not look alike.
+    // One snapshot, not four: the previous line called it once per field, which
+    // took the lock four times and could interleave a camera switch between them.
+    "taps": mSnap.taps, "tap_fails": mSnap.fails,
+    "marks": mSnap.marks, "events": mSnap.counts,
+    // What this call was made WITH -- camera, its pixel format, the encoder, the
+    // audio devices. The result numbers say a call was bad; these say what it was
+    // running on, which is the half you need to fix it rather than notice it.
+    "facts": mSnap.facts,
+    // The far end's own state, from the TPKTY arm. `peer_played` is what makes
+    // "they cannot hear me" a verdict instead of a guess: a peer playing nothing
+    // while we send 1500 packets a second is one-way audio, and no amount of
+    // local instrumentation could ever have said so.
+    "peer_played": wire.peerPlayed, "mute": wire.peerMuted ? 1 : 0,
+    "peer_q_level": wire.peerQLevel, "peer_status": wire.peerStatus,
+    "peer_state_reports": wire.peerReportsState ? 1 : 0,
+    "sig_rms": audio.sigRms, "cap_callbacks": audio.capCallbacks,
+    // ── THE THREE QUESTIONS A PERSON ACTUALLY ASKS ABOUT AUDIO ────────────────
+    //
+    // "Was I too loud / distorted" (clipping, which nothing downstream can undo),
+    // "did I lose a word" (the LONGEST hole, not the average number of holes),
+    // and "did they hear themselves" (how long the canceller was leaking, in
+    // seconds, rather than a correlation nobody can act on).
+    "a_mic_peak": audio.micPeak,
+    "a_mic_rms": audio.micRms,
+    "a_clip_pct": audio.micSamples > 0
+      ? Double(audio.micClipped) * 100.0 / Double(audio.micSamples) : 0,
+    "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
+    "a_quality_s": audio.qualityTicks,
+    "erle_db": audio.erleDb, "mic_access": gMicAccess,
+    "v_rx_w": gRxWidth, "v_rx_h": gRxHeight,
+    "peer_rx_lost": wire.peerRxLost, "peer_rx_recovered": wire.peerRxRecovered,
+    "peer_reports": wire.peerReportsLoss ? 1 : 0,
+    // 1 direct, 2 relayed, 0 not locked yet. A relayed call is a different
+    // product to a direct one and the dashboard could not tell them apart.
+    "route": wire.lockedFrom.hasPrefix("relay") ? 2 : (wire.lockedFrom.isEmpty ? 0 : 1),
+    "turn_ok": wire.turn != nil ? 1 : 0,
+    "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
+    "echo_corr": audio.echoCorr, "aec_freezes": audio.aecFreezes,
+    "dec_luma": gDecLuma,
+    "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,
+    "agc_on": Audio.agcOn ? 1 : 0, "devbuf": Audio.devBuf,
+    "in_rate": Int(audio.hwInRate), "out_rate": Int(audio.hwOutRate),
+    "in_lat_ms": audio.inLatencyMs, "out_lat_ms": audio.outLatencyMs,
     "conceal_total": r.concealed, "conceal_lost": r.concealLost,
     "conceal_starved": r.concealStarved,
     "late": r.lateArrivals, "near_late": r.nearLate,
@@ -1762,6 +2903,7 @@ func reportLoop() {
   last = (wire.sent, r.recv, r.played, r.concealed, r.dup, r.tooOld, r.jumps, audio.capturedPkts)
 
   let p50 = audio.m2e.p(0.50), p95 = audio.m2e.p(0.95), p99 = audio.m2e.p(0.99)
+  lastM2e = (p50, p95, p99)
   func f(_ x: Double?) -> String { x == nil ? "-" : String(format: "%.2f", x!) }
   let heard = Double(d.played) / expected * 100
 
@@ -1824,12 +2966,12 @@ func reportLoop() {
     c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
     // ── NO SPEAKER, NO ECHO ───────────────────────────────────────────────────
     //
-    // "your room is loud -- try headphones" appeared on a call with playout muted,
-    // which cannot be true: with nothing coming out of the speaker there is no
-    // acoustic path back into the microphone, so whatever the estimator correlated
-    // was not echo. Advice that is impossible to act on -- headphones do not help
-    // when the sound is already off -- teaches people to ignore the warnings that
-    // are real, so it is suppressed at the source rather than explained away.
+    // The on-screen echo warning is gone (Controls.setEcho), so this line no
+    // longer shows anything. The mute clamp stays because it is the correct
+    // reading and not just a display rule: with nothing coming out of the speaker
+    // there is no acoustic path back into the microphone, so a correlation
+    // measured with playout muted is not echo. Keep it here, next to the mute
+    // flag it depends on, for whatever reads the correlation next.
     c.setEcho(audio.mute ? 0 : audio.echoCorr)
     // The code both people read aloud. Only exists once the key exchange has
     // happened, and it is stable for the rest of the call.
@@ -2032,13 +3174,59 @@ func reportLoop() {
       "v_frags": vasm.fragsIn, "v_frames_lost": vasm.missing,
       "v_partial_drops": vasm.dropped, "v_dec_fails": vdec.decFails,
       "v_no_fmt": vdec.noFormat, "v_repair_keys": keyAsksOnLoss,
+      "v_key_asks_in": keyAsksIn,
       "v_luma": venc?.lastLuma ?? -1, "v_motion": venc?.lastDiff ?? -1,
+      // ── THE TWO QUESTIONS A PERSON ACTUALLY ASKS ABOUT A PICTURE ───────────
+      //
+      // "Did it go blocky when he moved" and "did it freeze". Neither was
+      // answerable from anything above: a rate stays healthy through both.
+      //
+      // Measured on the decoded far-end picture, not inferred from bitrate. The
+      // bitrate version of this failed calibration at full quality and is gone.
+      // ── NO PICTURE-QUALITY NUMBER IS COMPUTED FROM THE IMAGE HERE ──────────
+      //
+      // Three were tried and two were caught by their own calibration:
+      //   bits per pixel under motion -- called 23 of 30 frames blocky at FULL
+      //     quality, because a talking head is cheap and cheap is not damage;
+      //   block-edge contrast -- ranked BACKWARDS (1.356 at quality 0.9, 1.155 at
+      //     0.05), because H.264 deblocking erases that signature by design and a
+      //     starved picture goes smooth rather than blocky;
+      //   decoded detail -- moved 1.99 -> 1.87 -> 1.88 while the sender's bytes
+      //     per frame moved twelve-fold, i.e. it was reading the CONTENT.
+      //
+      // What is left is the honest one, and it needs no image analysis at all:
+      // the far end already tells us which rung of its own quality ladder it
+      // settled on, per direction, over the wire. `peer_q_level` is that. A
+      // picture pinned to the bottom rung IS the pixelation complaint, said by
+      // the only party that knows -- the one that made the picture.
+      "v_dec_motion": gDecMotion,
+      "v_freeze_ms_max": display?.freezeMaxMs ?? 0,
+      "v_freezes_150": display?.freezes150 ?? 0,
+      "v_freezes_400": display?.freezes400 ?? 0,
     ]
     if let v = e.p(0.50) { vb["v_enc_ms_p50"] = v }
     if let v = dl.p(0.50) { vb["v_dec_ms_p50"] = v }
     vb["v_q_level"] = vq.level
     vb["v_q_downs"] = vq.stepDowns
     vb["v_q_ups"] = vq.stepUps
+    // ── THE PAUSE, FROM BOTH ENDS ────────────────────────────────────────────
+    //
+    // Both directions, because they are different faults with the same name: our
+    // uplink giving out is something this machine could act on, theirs is not,
+    // and a single "video was paused" field would merge the two into a number
+    // that cannot be acted on at all. Second instance of the rule that a
+    // directional property has to be recorded at the end that owns it.
+    vb["v_pauses"] = vq.pauses
+    vb["v_paused_s"] = vPausedSecs
+    vb["v_paused_now"] = gVideoPaused ? 1 : 0
+    vb["v_peer_pauses"] = vPeerPauses
+    vb["v_peer_paused_s"] = vPeerPausedSecs
+    vb["v_peer_paused_now"] = lastPeerPaused ? 1 : 0
+    vb["v_peer_cam_off"] = lastPeerCamOff ? 1 : 0
+    // Which arm this call ran, so a pause that never happened can be told from a
+    // pause that was switched off. An A/B with an unlabelled control arm is not
+    // an A/B.
+    if flag("no-vpause") { vb["v_pause_armed"] = 0 }
     if let q = venc?.qualityNow { vb["v_quality"] = q }
     vb["v_dq_queued"] = dq.queued
     vb["v_dq_inline_full"] = dq.inlineFull
@@ -2150,14 +3338,67 @@ func reportLoop() {
     // alone: our own FEC repaired 4209 of 4443 outbound losses in the run above,
     // so watching only what survived would report a 3% path as healthy. A packet
     // that had to be repaired still did not arrive the first time.
+    // Our half of the peer report. Set here, once a second, on the thread that
+    // already computes all of this -- never from the send path, which runs at
+    // 375 packets a second and must not read main-thread state.
+    wire.selfMuted = display?.controls?.micMuted ?? false
+    wire.selfQLevel = vq.level
     let pLost = wire.peerRxLost, pRec = wire.peerRxRecovered
+    // ── THE FIRST REPORT IS A BASELINE, NOT A DELTA ───────────────────────────
+    //
+    // `wire.peerRxLost` and `peerRxRecovered` are CUMULATIVE since the PEER's
+    // process start, and these baselines start at zero. So the first report that
+    // ever arrived was subtracted from nothing and the whole of the peer's history
+    // -- a peer that had been up for an hour, or a leg restarted by the updater --
+    // was booked as harm inside one second. That is a free step down handed to
+    // every fresh call before a single packet of ours had been lost, and the
+    // picture then needed fifteen quiet seconds to earn the rung back.
+    //
+    // Startup poisons estimators: sampling before the inputs are aligned learns a
+    // large wrong value. Prime, then measure.
+    // Two baselines, primed on two different events, because they become true at
+    // different moments. The LOCAL counters are this process's own and monotonic
+    // from the first tick, so the first tick is the right place for them. The
+    // PEER's counters do not exist until its first report arrives, and priming
+    // them on a tick that beat that report captures a baseline of zero -- which
+    // books the peer's entire accumulated history as one second of harm the
+    // instant it does report. That is the startup-poisoning bug verbatim, so the
+    // peer baseline waits for the evidence it is a baseline OF.
+    if !vqPrimed {
+      vqPrimed = true
+      lastVqConc = r.concealLost; lastVqLost = vasm.missing
+    }
+    if !vqPrimedPeer, wire.peerReportsLoss {
+      vqPrimedPeer = true
+      lastVqPeerLost = pLost; lastVqPeerRec = pRec
+    }
     var outboundHarm = (pLost - lastVqPeerLost) + (pRec - lastVqPeerRec)
+    // ── A PEER RESTART IS A NEW BASELINE, NOT A REPAIR ────────────────────────
+    //
+    // These are the PEER's counters, cumulative since the PEER's process start,
+    // and its process restarts for real: the self-updater does it, and the field
+    // beside this one exists because it happens. When it does, both counters drop
+    // to zero and this delta is one large NEGATIVE number for exactly one tick.
+    //
+    // A negative harm is not "less than no loss". It armed nothing and, worse, it
+    // flickered `wire.videoParity` OFF at the precise moment the peer came back --
+    // which is the moment its receive path is least able to afford a missing
+    // fragment. The redundancy controller a few hundred lines up already gets this
+    // right in the same shape: clamp to zero, and re-baseline on the new counters
+    // (the assignment below is the re-baseline, and runs either way).
+    if outboundHarm < 0 { outboundHarm = 0 }
     lastVqPeerLost = pLost; lastVqPeerRec = pRec
     // An older peer does not report, and falling back silently to the local
     // numbers would restore the exact bug this comment describes. So it falls
     // back and SAYS SO, once.
     if !wire.peerReportsLoss {
-      outboundHarm = (r.concealed - lastVqConc) + (vasm.missing - lastVqLost)
+      // `concealLost`, not `concealed`. The redundancy controller above says why
+      // in its own words: concealment also covers STARVATION, which is this
+      // machine's own receive buffer running dry -- and no amount of sending less
+      // picture can improve it. Using the aggregate here let a jitter buffer one
+      // packet too small drive the picture down three rungs on a call whose
+      // uplink was never the problem.
+      outboundHarm = (r.concealLost - lastVqConc) + (vasm.missing - lastVqLost)
       if !vqWarnedLocal, beatTick > 10 {
         vqWarnedLocal = true
         fputs("picture: the far end does not report its receive loss (older build), "
@@ -2196,11 +3437,49 @@ func reportLoop() {
           + " -- \(harmed ? "above" : "below") the \(String(format: "%.1f", HARM_RETREAT))% line,"
           + " so quality \(harmed ? "retreats" : "holds")\n", stderr)
     }
+    let wasPaused = vq.paused
     let changed = vq.tick(now: Double(beatTick),
                           framesLost: harmed ? outboundHarm : 0,
                           concealed: 0,
                           jitGrew: false)
-    lastVqLost = vasm.missing; lastVqConc = r.concealed; lastVqJit = audio.jitTarget
+    // ── STOPPING THE PICTURE, AND SAYING SO IN THREE PLACES ───────────────────
+    //
+    // The decision is made here and has to reach three separate consumers, none
+    // of which can work it out for itself: the capture thread (stop handing
+    // frames to the encoder), the far end (blur and explain), and the record
+    // (how long, how often -- a pause nobody can see afterwards cannot be judged
+    // as a good trade or a bad one).
+    //
+    // `--vpause-test` forces the state without needing a bad link, which is the
+    // only way to prove the far end's half on a clean LAN. It is deliberately
+    // crude: the point is to exercise the wire bit, the blur and the sentence.
+    if let at = arg("vpause-test").flatMap({ Int($0) }) {
+      gVideoPaused = beatTick >= at && beatTick < at + 20
+    } else {
+      gVideoPaused = vq.paused
+    }
+    if vq.paused != wasPaused {
+      Metrics.count(vq.paused ? "video_pause" : "video_resume")
+      fputs("  picture: video \(vq.paused ? "PAUSED -- the link could not carry the floor" : "resumed")"
+          + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)\n", stderr)
+    }
+    if gVideoPaused { vPausedSecs += 1 }
+    // Our half of the status byte. Both bits every tick rather than a bitwise
+    // update, so a stale bit cannot survive a state change -- an OR-only status
+    // byte is a latch, and a latch is how "their camera is off" outlives the
+    // moment they turned it back on.
+
+
+    // `r.concealLost`, matching the priming above and the read below it. This line
+    // said `r.concealed`, and one word was the whole defect: `concealed` is exactly
+    // `concealLost + concealStarved` (Audio.swift), and `concealStarved` is
+    // cumulative and monotonic, so from the second tick onward the baseline sat
+    // permanently ABOVE the quantity it is subtracted from. The harm delta carried
+    // a growing negative bias, `wire.videoParity` never armed, the picture never
+    // retreated, and the log said "below the line, so quality holds" the whole
+    // time. Three sites read and write this quantity -- the prime, the fallback
+    // read, and this write -- and all three must name the same expression.
+    lastVqLost = vasm.missing; lastVqConc = r.concealLost; lastVqJit = audio.jitTarget
     if let newQ = changed {
       // Hand it to the encoder thread, which rebuilds the session. NOT setQuality:
       // that is accepted, reads back, and changes nothing on a live session.
@@ -2210,9 +3489,42 @@ func reportLoop() {
     }
   }
 
+  // ── WHAT THE FAR END SAYS ABOUT ITSELF ──────────────────────────────────────
+  //
+  // OUTSIDE the encoder block above, and that placement is the point: a machine
+  // with no camera still has to blur and explain when THEIR picture stops. Tying
+  // this to `venc` would mean the person who joined without a camera -- the one
+  // with the least other evidence about what is happening -- is the one shown a
+  // frozen face with no caption.
+  //
+  // Counted as a duration because that is what a person complains about: "video
+  // was gone for forty seconds" is a report, "the status bit was set" is not.
+  // Our half of the same byte. Both bits are written every tick rather than
+  // OR'd in, so a stale bit cannot survive the state changing -- an OR-only
+  // status byte is a latch, and a latch is how "their camera is off" outlives
+  // the moment they switched it back on.
+  wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
+                  | (camOff ? Wire.ST_CAMOFF : 0)
+  let pPaused = wire.peerVideoPaused, pCamOff = wire.peerCamOff
+  if pPaused { vPeerPausedSecs += 1 }
+  if pPaused != lastPeerPaused {
+    lastPeerPaused = pPaused
+    if pPaused { vPeerPauses += 1 }
+    Metrics.count(pPaused ? "peer_video_pause" : "peer_video_resume")
+    fputs("  picture: the far end's video \(pPaused ? "PAUSED (their link)" : "resumed")\n", stderr)
+  }
+  if pCamOff != lastPeerCamOff {
+    lastPeerCamOff = pCamOff
+    Metrics.count(pCamOff ? "peer_cam_off" : "peer_cam_on")
+  }
+  display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff)
+
   // LAST in the loop, on purpose: every section above has now computed its
   // numbers, so the beat and the lines printed beside it cannot disagree about
   // what this second looked like.
+  // Once a second, on the report thread: turns two instantaneous signals into a
+  // duration. Never from a callback -- see the note in Audio.sampleQuality.
+  audio.sampleQuality()
   if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
     Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
                              played: d.played, concealed: d.concealed, cap: d.cap,
@@ -2236,18 +3548,14 @@ for sig in [SIGINT, SIGTERM] {
   let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
   src.setEventHandler {
     shuttingDown = true
-    if Telemetry.enabled {
-      let done = DispatchSemaphore(value: 0)
-      Telemetry.post(audioBeat(uptime: Double(beatTick),
-                               up: lastRates.up, down: lastRates.down,
-                               played: lastRates.played, concealed: lastRates.concealed,
-                               cap: lastRates.cap,
-                               p50: audio.m2e.p(0.50), p95: audio.m2e.p(0.95),
-                               p99: audio.m2e.p(0.99)), final: true)
-      // Give it a moment, then go regardless. A report is not worth hanging a
-      // quit on -- the person pressed Ctrl-C because they wanted out.
-      _ = done.wait(timeout: .now() + 1.5)
-    }
+    // THE SAME FUNCTION as Leave and as a re-exec, not the same shape as them.
+    // It used to be a second copy of the wait-for-the-post logic, and the copies
+    // had already drifted: this one sent no `ended`, so a dashboard reading that
+    // field found it on some final beats and missing on others -- which reads as
+    // a call that ended in a way nobody named, rather than as an un-instrumented
+    // code path. `audioBeat` is safe here even before the audio engine exists: it
+    // checks `beatReady` and sends the pre-connect beat instead.
+    postFinalBeat(why: sig == SIGINT ? "interrupt" : "terminated")
     fputs("\nbye\n", stderr)
     exit(0)
   }

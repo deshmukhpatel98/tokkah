@@ -207,13 +207,9 @@ enum Glyph {
     }
   } }, filled: true)
 
-  /// `#c-hud`: <path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/>
-  static let bars = Shape(build: { box in path(box) { p, k in
-    m(p, k, 4, 20); l(p, k, 4, 10)
-    m(p, k, 10, 20); l(p, k, 10, 4)
-    m(p, k, 16, 20); l(p, k, 16, 13)
-    m(p, k, 22, 20); l(p, k, 2, 20)
-  } }, filled: false)
+  // `#c-hud`'s bar glyph was here. It had exactly one user -- the "Connection
+  // numbers" row -- and that row is gone, so the glyph went with it. Not kept "for
+  // parity": the web app's `#c-hud` is not something this app offers.
 
   /// `#c-safety`: <rect x=4 y=10.5 width=16 height=10.5 rx=2.5/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>
   static let lock = Shape(build: { box in path(box) { p, k in
@@ -230,32 +226,36 @@ enum Glyph {
     l(p, k, 16, 10.5)
   } }, filled: false)
 
-  /// A chain link, for the invite row. Not in the web app's set -- it has no link
-  /// button -- so it is drawn in the same language rather than borrowed from a
-  /// different icon family, which is what makes a set look like a set.
-  static let link = Shape(build: { box in path(box) { p, k in
-    m(p, k, 10, 14)
-    p.curve(to: NSPoint(x: 14 * k, y: 10 * k),
-            controlPoint1: NSPoint(x: 11.2 * k, y: 12.8 * k), controlPoint2: NSPoint(x: 12.8 * k, y: 11.2 * k))
-    m(p, k, 8.5, 11)
-    p.curve(to: NSPoint(x: 5.5 * k, y: 14 * k),
-            controlPoint1: NSPoint(x: 7.5 * k, y: 12 * k), controlPoint2: NSPoint(x: 6.5 * k, y: 13 * k))
-    p.curve(to: NSPoint(x: 10 * k, y: 18.5 * k),
-            controlPoint1: NSPoint(x: 3 * k, y: 16.5 * k), controlPoint2: NSPoint(x: 7.5 * k, y: 21 * k))
-    p.curve(to: NSPoint(x: 13 * k, y: 15.5 * k),
-            controlPoint1: NSPoint(x: 11 * k, y: 17.5 * k), controlPoint2: NSPoint(x: 12 * k, y: 16.5 * k))
-    m(p, k, 15.5, 13)
-    p.curve(to: NSPoint(x: 18.5 * k, y: 10 * k),
-            controlPoint1: NSPoint(x: 16.5 * k, y: 12 * k), controlPoint2: NSPoint(x: 17.5 * k, y: 11 * k))
-    p.curve(to: NSPoint(x: 14 * k, y: 5.5 * k),
-            controlPoint1: NSPoint(x: 21 * k, y: 7.5 * k), controlPoint2: NSPoint(x: 16.5 * k, y: 3 * k))
-    p.curve(to: NSPoint(x: 11 * k, y: 8.5 * k),
-            controlPoint1: NSPoint(x: 13 * k, y: 6.5 * k), controlPoint2: NSPoint(x: 12 * k, y: 7.5 * k))
-  } }, filled: false)
+  // The chain link went with the invite row it was drawn for. It had one user and
+  // it is not in the web app's set either, so there is nothing it keeps parity with.
 
   /// The slash that appears over a glyph that is OFF: <path d="M4 4l16 16"/>.
   static let slash = Shape(build: { box in path(box) { p, k in
     m(p, k, 4, 4); l(p, k, 20, 20)
+  } }, filled: false)
+
+  /// <circle cx=12 cy=8.5 r=3.6/><path d="M5 19.5c1.3-3.4 3.9-5 7-5s5.7 1.6 7 5"/>
+  /// `peek` without its frame -- the frame is what makes that one mean "see
+  /// yourself", and a name is about a person, not a viewfinder.
+  static let person = Shape(build: { box in path(box) { p, k in
+    p.appendOval(in: NSRect(x: (12 - 3.6) * k, y: (8.5 - 3.6) * k,
+                            width: 7.2 * k, height: 7.2 * k))
+    m(p, k, 5, 19.5)
+    p.curve(to: NSPoint(x: 19 * k, y: 19.5 * k),
+            controlPoint1: NSPoint(x: 8 * k, y: 13 * k),
+            controlPoint2: NSPoint(x: 16 * k, y: 13 * k))
+  } }, filled: false)
+
+  /// <path d="M6.5 17V10a5.5 5.5 0 0 1 11 0v7"/><path d="M4.5 17h15"/><path d="M10 20a2 2 0 0 0 4 0"/>
+  static let bell = Shape(build: { box in path(box) { p, k in
+    m(p, k, 6.5, 17); l(p, k, 6.5, 10)
+    p.appendArc(withCenter: NSPoint(x: 12 * k, y: 10 * k), radius: 5.5 * k,
+                startAngle: 180, endAngle: 0, clockwise: false)
+    l(p, k, 17.5, 17)
+    m(p, k, 4.5, 17); l(p, k, 19.5, 17)
+    m(p, k, 10, 20)
+    p.appendArc(withCenter: NSPoint(x: 12 * k, y: 20 * k), radius: 2 * k,
+                startAngle: 180, endAngle: 0, clockwise: true)
   } }, filled: false)
 }
 
@@ -848,9 +848,68 @@ final class WaitingCard: NSView {
   private let urlGlass = Glass(radius: 14)
   private let shareButton = PillButton("share")
   private let copyButton = PillButton("copy")
+  // ── CALLING A NAME INSTEAD OF SENDING A LINK ────────────────────────────────
+  //
+  // The one editable thing in this app, and it lives here because this screen is
+  // where somebody already is when they want to reach a person: the link is for
+  // people you have never called, the field is for the ones you have.
+  private let dialGlass = Glass(radius: 14)
+  private let dialField = NSTextField()
+  private let callButton = PillButton("call")
+  private let answerButton = PillButton("answer")
+  private let declineButton = PillButton("decline")
   var url = "" { didSet { urlField.stringValue = url; needsLayout = true } }
   var onCopy: (() -> Void)?
   var onShare: (() -> Void)?
+  /// A handle was typed and confirmed. The card does not know how to ring, only
+  /// that somebody asked to.
+  var onCall: ((String) -> Void)?
+  var onAnswer: (() -> Void)?
+  var onDecline: (() -> Void)?
+
+  /// Somebody is ringing. Set to switch the card from "invite" to "answer": the
+  /// two states share a layout on purpose, because they are the same screen
+  /// answering the same question -- who is going to be on this call.
+  private(set) var incoming: (from: String, room: String)?
+
+  func setIncoming(from: String, room: String) {
+    incoming = (from, room)
+    title.stringValue = "@\(from) is calling"
+    hint.stringValue = "answer and you will both be in the same room"
+    applyMode()
+  }
+
+  func clearIncoming() {
+    incoming = nil
+    title.stringValue = "Waiting for the other person…"
+    hint.stringValue = "This link is the key — anyone who has it can join"
+    applyMode()
+  }
+
+  /// One place decides what is on screen, so the two states cannot both be.
+  private func applyMode() {
+    let ringing = incoming != nil
+    for v in [urlGlass, urlField, shareButton, copyButton, dialGlass, dialField, callButton] {
+      v.isHidden = ringing
+    }
+    answerButton.isHidden = !ringing
+    declineButton.isHidden = !ringing
+    needsLayout = true
+    needsDisplay = true
+  }
+
+  /// What is typed in the field, cleaned up the way the server will see it.
+  private func dialled() -> String? {
+    let raw = dialField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    return Identity.sanitize(raw.hasPrefix("@") ? String(raw.dropFirst()) : raw)
+  }
+
+  @objc private func dialConfirmed() {
+    guard let h = dialled() else { Metrics.tap("call", ok: false); return }
+    Metrics.tap("call")
+    dialField.stringValue = ""
+    onCall?(h)
+  }
 
   /// `#copy:disabled { opacity: 1; color: var(--ok) }` -- "copied ✓" is a
   /// confirmation, not a dead control.
@@ -900,6 +959,37 @@ final class WaitingCard: NSView {
     copyButton.onPress = { [weak self] in self?.onCopy?() }
     addSubview(shareButton)
     addSubview(copyButton)
+
+    dialGlass.layer?.backgroundColor = NSColor(srgbRed: 8/255, green: 11/255,
+                                               blue: 18/255, alpha: 0.9).cgColor
+    dialField.font = .systemFont(ofSize: 13)
+    dialField.textColor = Palette.fg
+    dialField.alignment = .center
+    dialField.backgroundColor = .clear
+    dialField.drawsBackground = false
+    dialField.isBordered = false
+    dialField.isEditable = true
+    dialField.isSelectable = true
+    dialField.focusRingType = .none
+    dialField.placeholderString = "call a name, like @devesh"
+    // Enter sends the action. A field you have to reach for a button after is a
+    // field people type into and then wonder why nothing happened.
+    dialField.target = self
+    dialField.action = #selector(dialConfirmed)
+    addSubview(dialGlass)
+    addSubview(dialField)
+    // See the note above mouseDown: `call` commits on release, via the card.
+    addSubview(callButton)
+
+    answerButton.tint = Palette.ok
+    // Deliberately NO `onPress` on these three: the card routes them through
+    // mouseDown/mouseUp above so they commit on release. Wiring `onPress` as well
+    // would give them a second, press-to-commit path -- the exact thing being
+    // removed.
+    answerButton.isHidden = true
+    declineButton.isHidden = true
+    addSubview(answerButton)
+    addSubview(declineButton)
   }
   required init?(coder: NSCoder) { fatalError() }
 
@@ -914,24 +1004,61 @@ final class WaitingCard: NSView {
   /// that matters most, and it used to be eaten by activation.
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-  /// The three things on this card a finger can hit.
+  /// Only what is actually on screen, so the `?` audit cannot report a control
+  /// the current mode has hidden.
   var clickTargets: [(String, NSView)] {
-    [("share", shareButton), ("copy", copyButton), ("link", urlGlass)]
+    if incoming != nil { return [("answer", answerButton), ("decline", declineButton)] }
+    return [("share", shareButton), ("copy", copyButton), ("link", urlGlass),
+            ("dial", dialField), ("call", callButton)]
   }
 
   override func hitTest(_ point: NSPoint) -> NSView? {
     let p = convert(point, from: superview)
-    for v in [urlGlass, shareButton, copyButton] where v.frame.contains(p) { return self }
+    // ── THE ONE THING THAT MUST NOT BE ROUTED TO SELF ────────────────────────
+    //
+    // Every other target here answers `self`, because the card handles its own
+    // presses. A TEXT FIELD cannot work that way: typing needs it to become first
+    // responder, and that only happens if the click actually reaches it. Routing
+    // it to `self` like the rest would give a field that draws, highlights on
+    // hover, and can never be typed into.
+    if !dialField.isHidden, dialGlass.frame.contains(p) { return dialField }
+    for v in [urlGlass, shareButton, copyButton, callButton, answerButton, declineButton]
+    where !v.isHidden && v.frame.contains(p) { return self }
     return nil
   }
+
+  // ── THE THREE CONSEQUENTIAL ONES COMMIT ON RELEASE ─────────────────────────
+  //
+  // Copy and share are harmless and fire on press, as they always have. Answer,
+  // decline and call are not: answering joins a room, and a control that commits
+  // on mouse-DOWN commits to whatever the pointer happened to be over. One
+  // unattributed auto-answer during testing was enough -- press-then-release
+  // inside the same pill is what every Mac button does, and it also lets somebody
+  // slide off a pill they did not mean to hit.
+  private var armed: NSView?
 
   /// The link itself copies when clicked -- `#shareUrl { cursor: pointer }`.
   override func mouseDown(with event: NSEvent) {
     let p = convert(event.locationInWindow, from: nil)
-    if urlGlass.frame.contains(p) { onCopy?(); return }
-    if shareButton.frame.contains(p) { onShare?(); return }
-    if copyButton.frame.contains(p) { onCopy?(); return }
+    armed = nil
+    for v in [answerButton, declineButton, callButton] as [NSView]
+    where !v.isHidden && v.frame.contains(p) { armed = v; return }
+    if !urlGlass.isHidden, urlGlass.frame.contains(p) { onCopy?(); return }
+    if !shareButton.isHidden, shareButton.frame.contains(p) { onShare?(); return }
+    if !copyButton.isHidden, copyButton.frame.contains(p) { onCopy?(); return }
     super.mouseDown(with: event)
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    let p = convert(event.locationInWindow, from: nil)
+    let was = armed
+    armed = nil
+    guard let v = was, !v.isHidden, v.frame.contains(p) else {
+      super.mouseUp(with: event); return
+    }
+    if v === answerButton { onAnswer?() }
+    else if v === declineButton { onDecline?() }
+    else if v === callButton { dialConfirmed() }
   }
   override func resetCursorRects() { addCursorRect(urlGlass.frame, cursor: .pointingHand) }
 
@@ -954,6 +1081,26 @@ final class WaitingCard: NSView {
     shareButton.frame.origin = NSPoint(x: x, y: y + (uh - shareButton.frame.height) / 2)
     x += shareButton.frame.width + gap
     copyButton.frame.origin = NSPoint(x: x, y: y + (uh - copyButton.frame.height) / 2)
+
+    // The dial row, one row below the link row and built the same way, so the two
+    // read as alternatives rather than as two unrelated features.
+    let dw = min(260, bounds.width * 0.55)
+    let drowW = dw + gap + callButton.frame.width
+    var dx = cx - drowW / 2
+    let dy = y - 12 - uh
+    dialGlass.frame = NSRect(x: dx, y: dy, width: dw, height: uh)
+    dialGlass.layer?.cornerRadius = uh / 2
+    dialField.frame = NSRect(x: dx + 14, y: dy + (uh - 17) / 2, width: dw - 28, height: 17)
+    dx += dw + gap
+    callButton.frame.origin = NSPoint(x: dx, y: dy + (uh - callButton.frame.height) / 2)
+
+    // Answering shares the link row's line: it is the same decision in the same
+    // place, and `answer` sits on the left where `copy` is not.
+    let arowW = answerButton.frame.width + gap + declineButton.frame.width
+    var ax = cx - arowW / 2
+    answerButton.frame.origin = NSPoint(x: ax, y: y + (uh - answerButton.frame.height) / 2)
+    ax += answerButton.frame.width + gap
+    declineButton.frame.origin = NSPoint(x: ax, y: y + (uh - declineButton.frame.height) / 2)
   }
 }
 
@@ -1013,13 +1160,19 @@ final class CallControls: NSView {
   static let barHeight: CGFloat = 98
 
   private let roomPill = Pill(font: .systemFont(ofSize: 12, weight: .semibold))
-  private let qualityPill = Pill(font: .monospacedDigitSystemFont(ofSize: 12, weight: .medium))
-  private let echoPill = Pill(font: .systemFont(ofSize: 12, weight: .medium))
   private let scrim = CAGradientLayer()
+  /// ── THE READOUT IS A STRING NOW, NOT A VIEW ────────────────────────────────
+  ///
+  /// `qualityPill` used to draw this over the picture whenever the "Connection
+  /// numbers" switch was on. The switch is gone, so nothing could ever have shown
+  /// the pill again and it went with it. The SENTENCE is kept: `setQuality` still
+  /// composes it, `describeTree` still reports it, so the harness that reads the
+  /// screen and the `--press quality` token both still see what the call looked
+  /// like. Removing the display is not removing the measurement.
+  private(set) var qualityText = ""
 
-  // THE WEB APP'S ROW, IN ITS ORDER: mic, cam, peek, flip, xlate, leave. `flip`
-  // hides itself with one camera exactly as `#flip` does, and `peek` is the
-  // hold-to-see-yourself button the web app has had since early on.
+  // THE ROW: mic, cam, peek, flip, leave. Translation is parked — not this
+  // release. Flip hides itself with one camera exactly as `#flip` does.
   private let micButton = IconButton(Glyph.mic, help: "microphone")
   private let camButton = IconButton(Glyph.cam, help: "camera")
   private let peekButton = IconButton(Glyph.peek, help: "hold to see yourself")
@@ -1033,8 +1186,19 @@ final class CallControls: NSView {
   /// `#status`: a pill, TOP-CENTRE, not a room name in the corner. The room's name
   /// is not something the web app ever shows -- the link is.
   private let statusPill = Pill(font: .systemFont(ofSize: 11))
-  /// `#elapsed`: the clock, chrome-less, above the status pill.
-  private let elapsedLabel = NSTextField(labelWithString: "")
+  /// ── THE ONE WARNING THAT EARNS ITS PLACE OVER A FACE ───────────────────────
+  ///
+  /// The readout this replaces was a diagnostics panel -- millisecond figures
+  /// behind a "Connection numbers" switch -- and it was removed for being one.
+  /// This is not that. It carries a sentence, never a number, it appears only
+  /// when the picture has actually stopped, and it explains a thing the person
+  /// can otherwise only misread: a still face that is not a crash.
+  ///
+  /// Amber, not red. Red is for a call that has failed; this one is still
+  /// working, and the audio -- which is the call -- has not lost a sample.
+  private let warnPill = Pill(font: .systemFont(ofSize: 11, weight: .medium))
+  // `#elapsed`, the mm:ss clock above the status pill, was here. Removed on
+  // request; see the note in `init` for why that loses no signal.
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
   private let sheetScrim = ScrimView()
@@ -1095,14 +1259,19 @@ final class CallControls: NSView {
     scrim.locations = [0, 0.62]
     layer?.addSublayer(scrim)
 
-    for b in [micButton, camButton, peekButton, flipButton, xlateButton, leaveButton, moreButton] {
+    for b in [micButton, camButton, peekButton, flipButton, leaveButton, moreButton] {
       addSubview(b)
     }
     micButton.target = self; micButton.action = #selector(toggleMic)
     camButton.target = self; camButton.action = #selector(toggleCam)
-    peekButton.onHold = { [weak self] on in self?.onPeek?(on); self?.peeking = on }
+    peekButton.onHold = { [weak self] on in
+      self?.onPeek?(on)
+      self?.peeking = on
+      // Counted on the way DOWN only, so one hold is one press and not two. It
+      // was the last control on the bar that left no trace of having been used.
+      if on { Metrics.tap("peek", ok: self?.peeking == true) }
+    }
     flipButton.target = self; flipButton.action = #selector(nextCamera)
-    xlateButton.target = self; xlateButton.action = #selector(toggleXlate)
     leaveButton.target = self; leaveButton.action = #selector(leave)
     moreButton.target = self; moreButton.action = #selector(toggleMore)
     sheetScrim.isHidden = true
@@ -1115,9 +1284,8 @@ final class CallControls: NSView {
     sheet.isHidden = true
     addSubview(sheet)
     rebuildSheet()
-    // `#flip { display: none }` until there is more than one camera, and live
-    // translation is off until it exists natively -- shown, off, and honest about
-    // it rather than absent from a row the web app has six buttons in.
+    // `#flip { display: none }` until there is more than one camera.
+    // Translation is parked (not this release) — the globe is not in the row.
     flipButton.isHidden = true
     xlateButton.off = true
     xlateButton.isHidden = true
@@ -1134,30 +1302,44 @@ final class CallControls: NSView {
     addSubview(roomPill)
     statusPill.text = "waiting for the other person"
     addSubview(statusPill)
-    // `#hud` is OPT-IN in the web app -- "more sheet -> Connection numbers" -- and
-    // its default is off. A permanent latency readout over someone's face is
-    // instrumentation, and this app has plenty of that on stderr for whoever wants
-    // it. So the pill starts hidden and the sheet row turns it on.
-    qualityPill.isHidden = true
-    elapsedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-    elapsedLabel.textColor = NSColor(white: 232.0 / 255, alpha: 0.62)
-    elapsedLabel.alignment = .center
-    elapsedLabel.backgroundColor = .clear
-    elapsedLabel.isBordered = false
-    elapsedLabel.shadow = { let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.95)
-                            sh.shadowBlurRadius = 3; return sh }()
-    addSubview(elapsedLabel)
+    warnPill.textColor = Palette.warn
+    warnPill.text = ""
+    addSubview(warnPill)
+    // ── TWO THINGS THAT USED TO SIT OVER SOMEBODY'S FACE ──────────────────────
+    //
+    // `#hud`, the latency pill, was here behind an opt-in switch, and `#elapsed`,
+    // the mm:ss call clock, was here unconditionally. Both are gone at the user's
+    // request, and the reasoning is the same for both: this is a consumer app, and
+    // a number laid over the person you are talking to is instrumentation wearing
+    // the app's clothes. Every figure either one showed is still on stderr once a
+    // second and in the telemetry beat.
+    //
+    // The clock had one real job -- a running counter over a frozen picture was the
+    // only way to tell a dead call from a still one. That job now belongs to the
+    // held/paused state, which says it in words instead of leaving a person to
+    // interpret a number. The signal is not lost, the worse version of it is.
     waiting.onCopy = { [weak self] in
       guard let self else { return }
       NSPasteboard.general.clearContents()
       NSPasteboard.general.setString(self.inviteText, forType: .string)
       self.waiting.confirmCopied()
+      // Read the clipboard BACK. "The handler ran" is not the same claim as
+      // "the link is on the clipboard", and only the second one is the feature.
+      Metrics.tap("copy_link",
+                  ok: NSPasteboard.general.string(forType: .string) == self.inviteText)
     }
     waiting.onShare = { [weak self] in self?.share() }
+    waiting.onCall = { [weak self] h in
+      self?.setStatus("calling @\(h)…")
+      self?.onCall?(h)
+    }
+    waiting.onAnswer = { [weak self] in self?.onAnswerRing?() }
+    waiting.onDecline = { [weak self] in
+      self?.waiting.clearIncoming()
+      self?.setStatus("declined")
+      self?.onDeclineRing?()
+    }
     addSubview(waiting)
-    addSubview(qualityPill)
-    echoPill.textColor = Palette.warn
-    addSubview(echoPill)
 
     // The one stock control left, so it gets a glass backing rather than the grey
     // AppKit bezel that made the whole bottom-left corner look like a preferences
@@ -1196,7 +1378,7 @@ final class CallControls: NSView {
     // that this file was designed from the web app's colours instead of copied
     // from its layout.
     let bw: CGFloat = 58, gap: CGFloat = 18, bottomPad: CGFloat = 14
-    let row = [micButton, camButton, peekButton, flipButton, xlateButton, leaveButton]
+    let row = [micButton, camButton, peekButton, flipButton, leaveButton]
       .filter { !$0.isHidden }
     if leaveArmed {
       // `.bar.confirming .icon-btn:not(.leave) { width: 0; opacity: 0;
@@ -1244,22 +1426,27 @@ final class CallControls: NSView {
     // the window and not on a box.
     waiting.frame = bounds
 
-    // `#status { top:14px; left:50%; translateX(-50%) }` and `#elapsed` above it.
+    // `#status { top:14px; left:50%; translateX(-50%) }`. `#elapsed` used to sit
+    // 18 pt below this; nothing takes its place, and the pill's own position is
+    // measured from the top of the window rather than from the clock, so removing
+    // it moves nothing.
     statusPill.setFrameOrigin(NSPoint(x: (w - statusPill.frame.width) / 2,
                                       y: h - statusPill.frame.height - 14))
-    elapsedLabel.frame = NSRect(x: 0, y: h - statusPill.frame.height - 32, width: w, height: 14)
+    // THE SAME SLOT, and they cannot collide: `#status` hides itself once the
+    // call connects, and the picture cannot pause before it connects. Giving the
+    // warning its own row below would leave a permanent gap under a pill that is
+    // almost never there.
+    warnPill.setFrameOrigin(NSPoint(x: (w - warnPill.frame.width) / 2,
+                                    y: h - warnPill.frame.height - 14))
 
     // The pills stack down the LEFT, because `#more` owns the top-right corner in
     // the web app and two things cannot have it. 36 pt clears the traffic lights,
     // which now float over the picture -- `.fullSizeContentView` put them there,
     // and at 20 pt the room pill sliced straight through all three.
     let topPad: CGFloat = 36
-    var py = h - roomPill.frame.height - topPad
+    // Was a stack of two; the quality pill below it is gone, so there is one.
+    let py = h - roomPill.frame.height - topPad
     roomPill.setFrameOrigin(NSPoint(x: 20, y: py))
-    py -= qualityPill.frame.height + 8
-    qualityPill.setFrameOrigin(NSPoint(x: 20, y: py))
-    py -= echoPill.frame.height + 8
-    echoPill.setFrameOrigin(NSPoint(x: 20, y: py))
     // Bottom-left, level with the action bar.
     let cpW: CGFloat = 210, cpH: CGFloat = 28, cpY: CGFloat = 22 + (46 + 28 - cpH) / 2
     camGlass.frame = NSRect(x: 20, y: cpY, width: cpW, height: cpH)
@@ -1288,6 +1475,45 @@ final class CallControls: NSView {
     }
   }
 
+  // ── PRESENCE IS A STATE, AND IT HAS TWO DIRECTIONS ──────────────────────────
+  //
+  // `markConnected` sets `waiting.isHidden = true`, and NOTHING set it back. A
+  // one-way door: the other person left, and what you were left with was a dead
+  // frame, no card, no link and nothing to do -- and with the sheet's "Copy invite
+  // link" row now gone, no route to a link at all. That row was only ever safe to
+  // remove because this exists.
+  //
+  // It is also the right screen on its own merits. "The other person left" IS the
+  // waiting state; the app already has a screen for it, and that screen already
+  // holds the link and both ways to copy it. There was never a second thing to
+  // build, only a boolean that was never set back.
+  //
+  // Why this is not `markConnected` doing double duty: `markConnected` is called
+  // behind `if !sawRemote` and therefore fires exactly once per process. It cannot
+  // be what hides the card again when somebody comes BACK, and a card left on top
+  // of a returning peer's picture is a worse bug than the one being fixed. So the
+  // two directions live in one call that cannot be half-wired.
+  func setPeerPresent(_ present: Bool) {
+    onMain { [weak self] in
+      guard let self else { return }
+      // Re-stated, not trusted. `inviteText`'s observer is what normally pushes the
+      // URL into the card, and it last ran before the call; this is the one place
+      // that reads it back out after a whole call has happened.
+      if !present { self.waiting.url = self.inviteText }
+      // A ring that arrived and was never answered must not be sitting on this
+      // card when the peer leaves and it comes back -- the room in it is long
+      // expired, and "answer" would join an empty one.
+      if !present { self.waiting.clearIncoming() }
+      if present { self.sawPeer = true }
+      self.waiting.isHidden = present
+      // The control row must not fade out while this card is the only way off this
+      // screen. Bounded pin, the same one `markConnected` uses.
+      if !present { self.showBar(pin: true) }
+      self.needsLayout = true
+      self.layoutSubtreeIfNeeded()
+    }
+  }
+
   /// `#waiting.gone` -- the card goes the moment there is someone to look at, and
   /// `#status.gone`: "connected" is said once and then gets out of the face's way.
   func markConnected() {
@@ -1308,19 +1534,39 @@ final class CallControls: NSView {
   /// `share`: macOS has a real share sheet, so the button opens it rather than
   /// pretending a second copy button is a different feature.
   @objc func share() {
+    Metrics.tap("share")
     let picker = NSSharingServicePicker(items: [inviteText])
     picker.show(relativeTo: .zero, of: self, preferredEdge: .minY)
   }
 
   /// Latency and the fraction of audio that had to be invented, once a second.
   /// Turns the numbers into a sentence and a colour.
+  /// The picture stopped, and this says why in words. An empty string clears it.
+  /// `Pill.text` hides itself when empty, so there is no second visibility flag
+  /// to keep in agreement with the string -- the two have drifted apart in this
+  /// file before.
+  func setWarning(_ line: String) {
+    guard line != warnText else { return }
+    warnText = line
+    warnPill.text = line
+    if !line.isEmpty {
+      // Re-centre: the pill resizes itself to the sentence, so the origin set at
+      // layout time belongs to whatever text was there before.
+      warnPill.setFrameOrigin(NSPoint(x: (frame.width - warnPill.frame.width) / 2,
+                                      y: frame.height - warnPill.frame.height - 14))
+      // A warning is worthless under a hidden bar. Showing the row also makes the
+      // mic and camera buttons reachable at the exact moment somebody wants them.
+      showBar()
+    }
+    fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
+  }
+  private(set) var warnText = ""
+
   func setQuality(m2eMs: Double?, concealPct: Double, lossPct: Double) {
     var parts: [String] = []
-    if let t = startedAt {
-      let s = Int(Date().timeIntervalSince(t))
-      // The clock lives on its own, chrome-less, where `#elapsed` puts it.
-      onMain { [weak self] in self?.elapsedLabel.stringValue = String(format: "%d:%02d", s / 60, s % 60) }
-    }
+    // The mm:ss call clock was updated from here. Removed on request. `startedAt`
+    // STAYS: it is also what tells `markConnected` this is the first connection,
+    // and what stops the control row from auto-hiding before the call has begun.
     var word = "", colour = Palette.fg
     if let ms = m2eMs, ms > 0 {
       parts.append("\(Int(ms.rounded())) ms")
@@ -1335,32 +1581,34 @@ final class CallControls: NSView {
     }
     if lossPct >= 0.5, colour == Palette.ok { word += " (repairing)" }
     if !word.isEmpty { parts.append(word) }
+    // Composed and kept, shown nowhere.
+    //
+    // ASSIGNED ON MAIN, and that is not cosmetic: `reportLoop` calls this from its
+    // own thread, and `describeTree` reads it from the main thread. A Swift String
+    // is refcounted, so a plain cross-thread store here would be a torn retain --
+    // the same class of bug as the path dictionaries in Net.swift. Every other
+    // write in this function already went through `onMain` for the same reason.
     let text = parts.joined(separator: "  ·  ")
-    onMain { [weak self] in
-      guard let self else { return }
-      self.qualityPill.textColor = colour
-      self.qualityPill.text = text
-      // `Pill.text` hides itself when empty and SHOWS itself otherwise, which would
-      // undo the opt-in a second after it was set. The switch decides.
-      self.qualityPill.isHidden = !self.numbersShown || text.isEmpty
-      self.needsLayout = true
-    }
+    onMain { [weak self] in self?.qualityText = text }
   }
 
-  // ── "YOUR ROOM IS LOUD" ───────────────────────────────────────────────────
+  // ── THE ECHO WARNING IS GONE FROM THE SCREEN ──────────────────────────────
   //
-  // The one call problem whose fix belongs entirely to the person: the microphone
-  // is hearing the speaker. The measurement already existed -- capture against
-  // playout, cross-correlated over a 0-200 ms search, printed every second and
-  // shown to nobody -- and 0.30 is the threshold the delay estimator already
-  // trusts.
-  func setEcho(_ correlation: Double) {
-    let text = correlation > 0.30 ? "your room is loud — try headphones" : ""
-    onMain { [weak self] in
-      self?.echoPill.text = text
-      self?.needsLayout = true
-    }
-  }
+  // There used to be a pill here reading "your room is loud -- try headphones"
+  // above 0.30 correlation. It was removed on request: it fired often enough to
+  // read as background noise rather than advice, it sat over the picture for the
+  // rest of the call, and the person it interrupted usually could not act on it.
+  // A warning that cannot be dismissed and cannot be acted on is a defect no
+  // matter how true it is.
+  //
+  // The MEASUREMENT stays -- capture against playout, cross-correlated over a
+  // 0-200 ms search -- because the delay estimator and the end-of-call summary
+  // both read `audio.echoCorr`, and it is the only evidence we have that a room
+  // is feeding the speaker back into the microphone. It goes to the log and the
+  // telemetry beat and nowhere a person has to look. This function is kept as a
+  // no-op so the one caller in the report loop stays where it is; if a future
+  // treatment for echo is automatic rather than advisory, it lands here.
+  func setEcho(_ correlation: Double) { _ = correlation }
 
   /// Shown only when there is more than one camera: a one-entry menu teaches
   /// nothing and takes the space of something that would.
@@ -1386,6 +1634,8 @@ final class CallControls: NSView {
   @objc private func camPicked() { onCamPick?(camPicker.indexOfSelectedItem) }
 
   @objc func toggleMic() {
+    let before = micMuted
+    defer { Metrics.tap("mic", ok: micMuted != before) }
     showBar(pin: true)
     micMuted.toggle()
     micButton.off = micMuted
@@ -1394,15 +1644,108 @@ final class CallControls: NSView {
   }
 
   @objc func toggleCam() {
+    let before = camOff
+    defer { Metrics.tap("cam", ok: camOff != before) }
     showBar(pin: true)
     camOff.toggle()
     camButton.off = camOff
     onCam?(camOff)
   }
 
+  // ── YOUR HANDLE, AND WHETHER ANYONE MAY RING IT ────────────────────────────
+  //
+  // Both are set from outside: this file draws and reports, and the network half
+  // lives in Identity.swift. `handle` stays empty until the server has actually
+  // agreed the name is ours, because a row inviting someone to share a name that
+  // might belong to a stranger is worse than no row.
+  private(set) var handle = ""
+  private(set) var silent = false
+  /// Someone pressed Silent. The app answers by calling `setSilent` back once the
+  /// server has agreed -- the switch is not allowed to move on its own.
+  var onSilent: ((Bool) -> Void)?
+  /// A handle was dialled. The app rings it and joins the room it sent.
+  var onCall: ((String) -> Void)?
+
+  /// Dial without a pointer -- `--call`, and anything later that wants to start a
+  /// call by name. Goes through exactly what the field goes through, so the two
+  /// cannot drift apart.
+  func dial(_ raw: String) {
+    guard let h = Identity.sanitize(raw.hasPrefix("@") ? String(raw.dropFirst()) : raw) else {
+      // Counted as a FAILED call, not skipped. A press that produced nothing is
+      // the single most valuable thing this can record, and a counter that only
+      // ever increments on success is decoration.
+      Metrics.tap("call", ok: false)
+      setStatus("that is not a name"); return
+    }
+    setStatus("calling @\(h)…")
+    onCall?(h)
+  }
+  var onAnswerRing: (() -> Void)?
+  var onDeclineRing: (() -> Void)?
+
+  /// Somebody is ringing this Mac. Ignored while a call is already up: joining a
+  /// second room would end the first one, and "call waiting" is not a thing this
+  /// app claims to do.
+  func showIncoming(from: String, room: String) {
+    onMain { [weak self] in
+      guard let self, self.waiting.isHidden == false || !self.sawPeer else { return }
+      guard self.waiting.incoming == nil else { return }
+      self.waiting.setIncoming(from: from, room: room)
+      self.setStatus("@\(from) is calling")
+      self.nudgeBar()
+    }
+  }
+
+  func hideIncoming() { onMain { [weak self] in self?.waiting.clearIncoming() } }
+
+  /// True once the far end has been seen, which is what makes a ring untimely.
+  private var sawPeer = false
+
+  func setHandle(_ h: String) {
+    onMain { [weak self] in
+      guard let self, self.handle != h else { return }
+      self.handle = h
+      if self.moreOpen { self.rebuildSheet() }
+    }
+  }
+
+  func setSilent(_ on: Bool) {
+    onMain { [weak self] in
+      guard let self, self.silent != on else { return }
+      self.silent = on
+      if self.moreOpen { self.rebuildSheet() }
+    }
+  }
+
+  @objc private func copyHandleRow(_ sender: SheetRow) {
+    guard !handle.isEmpty else { Metrics.tap("copy_handle", ok: false); return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString("@" + handle, forType: .string)
+    Metrics.tap("copy_handle",
+                ok: NSPasteboard.general.string(forType: .string) == "@" + handle)
+    let was = status
+    setStatus("@\(handle) copied")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in self?.setStatus(was) }
+    closeMore()
+  }
+
+  @objc private func toggleSilentRow(_ sender: SheetRow) {
+    Metrics.tap("silent")
+    let want = !silent
+    // Say what was asked for, not what is true yet. The switch itself only moves
+    // when `setSilent` comes back, so a refusal leaves it where it was rather
+    // than telling someone they are unreachable when they are not.
+    setStatus(want ? "going silent…" : "turning silence off…")
+    onSilent?(want)
+    closeMore()
+  }
+
   @objc func invite() {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(inviteText, forType: .string)
+    // Read it back. A copy button that reports success without checking is the
+    // one control whose failure is completely invisible to the person using it.
+    Metrics.tap("invite", ok: NSPasteboard.general.string(forType: .string) == inviteText)
     // Confirmed, briefly. A copy button that gives no feedback is a copy button
     // people press three times.
     let was = status
@@ -1422,6 +1765,7 @@ final class CallControls: NSView {
   /// `#flip`: the next camera in the list. Hidden while there is only one, exactly
   /// as `display: none` does, so the row is six buttons or five and never a dead one.
   @objc func nextCamera() {
+    Metrics.tap("flip")
     guard camNames.count > 1 else { return }
     // "a flip is a state change; the bar earns its 10 s again"
     showBar(pin: true)
@@ -1431,17 +1775,11 @@ final class CallControls: NSView {
     setStatus(camNames[next])
   }
 
-  /// `#xlate`: live translation. It exists in the web app and not yet here, so the
-  /// button is present and OFF -- pressing it says so rather than doing nothing,
-  /// because a control that swallows a click is worse than one that declines it.
-  // Live translation is not in the native app yet. The web app states the rule for
-  // exactly this case, about its own flip button: "The control only exists where it
-  // can do something... A flip button on a single-camera laptop is a lie about the
-  // hardware, and finding out by tapping it is worse than not having it." A globe
-  // that answers "web-only for now" is the same lie about the app, so it is hidden
-  // until it can translate, and `simulate("xlate")` still says so out loud.
+  /// Translation is parked. The globe is not in the row. simulate("xlate")
+  /// still names the decision rather than pretending the control exists.
   @objc func toggleXlate() {
-    setStatus("live translation is web-only for now")
+    Metrics.tap("xlate")
+    setStatus("translation is off")
   }
 
   /// `#more`: the sheet. Native's equivalents of its rows are the camera picker and
@@ -1496,7 +1834,7 @@ final class CallControls: NSView {
   private func setBar(visible: Bool) {
     guard visible != barShown else { return }
     barShown = visible
-    let row: [NSView] = [micButton, camButton, peekButton, flipButton, xlateButton, leaveButton, moreButton]
+    let row: [NSView] = [micButton, camButton, peekButton, flipButton, leaveButton, moreButton]
     NSAnimationContext.runAnimationGroup { ctx in
       ctx.duration = 0.22
       for v in row { v.animator().alphaValue = visible ? 1 : 0 }
@@ -1527,6 +1865,8 @@ final class CallControls: NSView {
   @objc func openMore() { if !moreOpen { toggleMore() } }
 
   @objc func toggleMore() {
+    let before = moreOpen
+    defer { Metrics.tap("more", ok: moreOpen != before) }
     moreOpen.toggle()
     moreButton.on = moreOpen
     if moreOpen { rebuildSheet() }
@@ -1548,13 +1888,24 @@ final class CallControls: NSView {
     super.mouseDown(with: event)
   }
 
-  /// The sheet's `.callOnly` rows, in native terms: the invite first because it is
-  /// the flow, then one row per camera with a tick on the live one.
+  /// The sheet's `.callOnly` rows, in native terms: one row per camera with a tick
+  /// on the live one, then the encryption code.
+  ///
+  /// ── NO "COPY INVITE LINK" ROW ───────────────────────────────────────────────
+  ///
+  /// There was one, first in the list. It is gone, and the reason is the shape of
+  /// the product: this is a call between two people. While one of them is waiting,
+  /// the link is already on screen with three ways to copy it -- the URL glass
+  /// itself, a `copy` button and a `share` button -- and once the other one arrives
+  /// there is nobody left to invite, so the row spent the entire call being dead
+  /// weight in the one menu the app has.
+  ///
+  /// This is only safe because the waiting card now COMES BACK when the other
+  /// person leaves (`setPeerPresent`). Before that, `waiting.isHidden = true` was a
+  /// one-way door, and removing this row would have left a departed call with no
+  /// route to the link at all.
   private func rebuildSheet() {
     var rows: [SheetRow] = []
-    let inv = SheetRow("Copy invite link", glyph: Glyph.link)
-    inv.target = self; inv.action = #selector(inviteFromSheet)
-    rows.append(inv)
     for (i, name) in camNames.enumerated() {
       let r = SheetRow(name, glyph: Glyph.cam)
       r.checked = i == camPicker.indexOfSelectedItem
@@ -1562,34 +1913,62 @@ final class CallControls: NSView {
       r.target = self; r.action = #selector(pickCameraRow(_:))
       rows.append(r)
     }
-    // `#c-hud`: "Connection numbers", a switch with a tick.
-    let hud = SheetRow("Connection numbers", glyph: Glyph.bars)
-    hud.checked = numbersShown
-    hud.target = self; hud.action = #selector(toggleNumbers)
-    rows.append(hud)
-    if let first = rows.dropFirst().first { first.ruled = true }
+    // ── NO "CONNECTION NUMBERS" ROW ───────────────────────────────────────────
+    //
+    // There was one here, a switch that put a latency readout over the other
+    // person's face. Removed on the user's ruling, twice given: this is a consumer
+    // app, and a switch offering somebody a millisecond figure is a test harness
+    // wearing the app's clothes. The numbers did not go away -- every one of them
+    // is still on stderr once a second and in the telemetry beat. Diagnostics in
+    // this project live hidden, they do not stop existing.
+    //
+    // ── AND NO DIVIDER RULE ───────────────────────────────────────────────────
+    //
+    // `if let first = rows.dropFirst().first { first.ruled = true }` was here. It
+    // meant one thing: rule off the first switch-like row so the ACTION above it --
+    // "Copy invite link" -- could not be mistaken for a switch. That action is gone,
+    // and the line does not degrade gracefully with it: `rows` is now cameras only,
+    // so `dropFirst().first` is the SECOND CAMERA, and a machine with two cameras
+    // would have drawn a divider through the middle of the camera list. A rule
+    // computed from positions rather than from meaning goes stale the moment the
+    // positions change, so it goes rather than gets re-pointed.
+    //
+    // `#c-safety` below is `inert`, which is how the sheet already says "this one is
+    // not a control" -- it does not need a line to say it a second time.
 
     // `#c-safety`: neither a switch nor an action -- a fact about this call, with
     // nothing to press, because there is no decision here for anyone to make.
     let safety = SheetRow("Encryption code", glyph: Glyph.lock)
     safety.inert = true
     safety.value = safetyCode.isEmpty ? "…" : safetyCode
-    var items: [NSView] = rows
+
+    var items: [NSView] = []
+    // The name first: it is the one thing in here somebody came looking for.
+    // Absent until claimed -- see `handle`.
+    if !handle.isEmpty {
+      let h = SheetRow("Your handle", glyph: Glyph.person)
+      h.value = "@" + handle
+      h.target = self; h.action = #selector(copyHandleRow(_:))
+      items.append(h)
+    }
+    items += rows as [NSView]
+    // Silent is a switch, so it carries a tick and never a value.
+    let q = SheetRow("Silent", glyph: Glyph.bell)
+    q.checked = silent
+    q.target = self; q.action = #selector(toggleSilentRow(_:))
+    items.append(q)
     items.append(safety)
-    items.append(SheetHint("Read it aloud. Same code on both screens means nobody is in the middle."))
+    items.append(SheetHint(silent
+      ? "Silent: nobody can ring you. To them you simply look away."
+      : "Read it aloud. Same code on both screens means nobody is in the middle."))
     sheet.setItems(items)
   }
 
-  private(set) var numbersShown = false
-  @objc private func toggleNumbers() {
-    numbersShown.toggle()
-    qualityPill.isHidden = !numbersShown || qualityPill.text.isEmpty
-    rebuildSheet()
-    needsLayout = true
-  }
-
-  @objc private func inviteFromSheet() { invite(); closeMore() }
+  // `inviteFromSheet` was here, the sheet row's action. The row is gone; `invite()`
+  // itself stays -- the Command-Shift-C menu item and the `--press invite` token
+  // both still use it, and so does the waiting card's own copy button.
   @objc private func pickCameraRow(_ sender: SheetRow) {
+    Metrics.tap("pick_camera", ok: camNames.indices.contains(sender.tag))
     camPicker.selectItem(at: sender.tag)
     onCamPick?(sender.tag)
     setStatus(camNames.indices.contains(sender.tag) ? camNames[sender.tag] : "camera changed")
@@ -1598,6 +1977,7 @@ final class CallControls: NSView {
 
   private var leaveTimer: Timer?
   @objc func leave() {
+    Metrics.tap(leaveArmed ? "leave_confirm" : "leave_arm")
     if leaveArmed {
       cancelLeaveConfirm()
       onLeave?()
@@ -1647,8 +2027,7 @@ final class CallControls: NSView {
     "controls \(Int(bounds.width))x\(Int(bounds.height))"
       + "  status=\(status.isEmpty ? "-" : status)"
       + "  room=\(roomPill.text)"
-      + "  quality=\(qualityPill.text.isEmpty ? "-" : qualityPill.text)"
-      + "  echo=\(echoPill.isHidden ? "-" : echoPill.text)"
+      + "  quality=\(qualityText.isEmpty ? "-" : qualityText)"
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"
@@ -1740,7 +2119,6 @@ final class CallControls: NSView {
     case "more": toggleMore()
     case "leave": leave()
     case "unleave": cancelLeaveConfirm()
-    case "echo": setEcho(0.9)
     case "quality": markConnected(); setQuality(m2eMs: 11, concealPct: 0, lossPct: 0)
     case let c where c.hasPrefix("cam#"):
       guard let n = Int(c.dropFirst(4)), n >= 1, n <= camPicker.numberOfItems else {
@@ -1788,7 +2166,7 @@ extension CallControls {
       out.append((n, v))
     }
     add("mic", micButton); add("cam", camButton); add("peek", peekButton)
-    add("flip", flipButton); add("xlate", xlateButton); add("leave", leaveButton)
+    add("flip", flipButton); add("leave", leaveButton)
     add("more", moreButton)
     if moreOpen { for (i, r) in sheet.rows.enumerated() where r.isEnabled { add("row#\(i)", r) } }
     if !waiting.isHidden { for (n, v) in waiting.clickTargets { add(n, v) } }
@@ -1827,6 +2205,31 @@ extension CallControls {
       lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)")
     }
     return lines
+  }
+
+  /// Real keystrokes, through THIS window. A text field filled by assigning
+  /// `stringValue` proves nothing about typing into it, and a system-wide event
+  /// tap proves it by aiming at whatever happens to be in front -- which, on a
+  /// Mac somebody is using, is not this app. Measured the hard way: a handle
+  /// typed at screen coordinates landed in the browser the user was watching.
+  /// These events carry this window's number, so nothing else can receive them.
+  @discardableResult
+  func typeText(_ s: String) -> Bool {
+    guard let win = window else { return false }
+    for ch in s {
+      let str = String(ch)
+      func ev(_ t: NSEvent.EventType) -> NSEvent? {
+        NSEvent.keyEvent(with: t, location: .zero, modifierFlags: [],
+                         timestamp: ProcessInfo.processInfo.systemUptime,
+                         windowNumber: win.windowNumber, context: nil,
+                         characters: str, charactersIgnoringModifiers: str,
+                         isARepeat: false, keyCode: 0)
+      }
+      guard let d = ev(.keyDown), let u = ev(.keyUp) else { return false }
+      win.sendEvent(d); win.sendEvent(u)
+    }
+    fputs("  typed \"\(s)\" -> first responder \(win.firstResponder.map { "\(type(of: $0))" } ?? "none")\n", stderr)
+    return true
   }
 
   /// A real click, through the window, at the control's own centre.

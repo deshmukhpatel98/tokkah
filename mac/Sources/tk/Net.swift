@@ -324,6 +324,10 @@ final class Wire {
   var tsync: TimeSync?
   var impair: Impair?
   var crypto: Crypto?
+  var turn: TurnClient?
+  /// Once the race picks the TURN path, media is ChannelData to the TURN server
+  /// instead of raw UDP to the peer.
+  var sendViaTurn = false
   /// Sent in the clear, necessarily: it is what establishes the key. Contains a
   /// public key and nothing else -- no identity, no room code, nothing that is
   /// worth anything to a listener on its own.
@@ -578,6 +582,11 @@ final class Wire {
   private(set) var redundantSent = 0
 
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
+    if sendViaTurn, let t = turn {
+      if t.sendChannel(fd: fd, p, n) { sent += 1; sentBytes += n + 28 + 4 }
+      else { sendErrs += 1 }
+      return
+    }
     let r = withUnsafePointer(to: &peer) { pp in
       pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
         sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -614,6 +623,15 @@ final class Wire {
   // the one it came from. Adopt it. This is the useful half of what ICE does, and
   // it needs no state machine: probe everything, lock onto whatever answers.
   private var candidates: [sockaddr_in] = []
+  // Two long-lived threads touch this array for the whole call: the 0.5 s
+  // rediscovery loop (main.swift:1151) appends, iterates and clears it, and the
+  // 20 s directory refresh (main.swift:1235) appends to it. An `append` that
+  // reallocates while the other thread is mid-iteration is the SIGSEGV that has
+  // already ended live calls from the render callback -- no Swift collection is
+  // shared across threads here without a lock. Same reason and same shape as
+  // `pathLock` below; the send loop copies out and releases before any syscall,
+  // because a lock held across `sendto` is a lock held across the network.
+  private let candLock = NSLock()
   private(set) var locked = false
   private(set) var lockedFrom = ""
 
@@ -622,26 +640,31 @@ final class Wire {
     a.sin_family = sa_family_t(AF_INET)
     a.sin_port = port.bigEndian
     a.sin_addr.s_addr = inet_addr(ip)
+    candLock.lock()
     if !candidates.contains(where: { $0.sin_addr.s_addr == a.sin_addr.s_addr && $0.sin_port == a.sin_port }) {
       candidates.append(a)
     }
+    candLock.unlock()
   }
 
-  func clearCandidates() { candidates.removeAll() }
+  func clearCandidates() { candLock.lock(); candidates.removeAll(); candLock.unlock() }
 
   /// Punch every candidate. Cheap: a 32-byte clock probe doubles as the probe
   /// that opens the NAT binding, so connectivity and offset are established by
   /// the same packet.
   func probeAllCandidates() {
     guard !locked else { return }
-    var out = [UInt8](repeating: 0, count: TPKTX)
+    var out = [UInt8](repeating: 0, count: TPKTY)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
       p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
       appendRxReport(p)
     }
-    for c in candidates {
+    candLock.lock()
+    let targets = candidates
+    candLock.unlock()
+    for c in targets {
       var a = c
       out.withUnsafeBufferPointer { b in
         _ = withUnsafePointer(to: &a) { pp in
@@ -651,16 +674,117 @@ final class Wire {
         }
       }
     }
+    // And through our TURN allocation, so the relayed path is in the same race.
+    if let t = turn {
+      out.withUnsafeBufferPointer { t.sendChannel(fd: fd, $0.baseAddress!, $0.count) }
+    }
   }
 
-  /// A packet arrived and parsed. Whatever address it came from is reachable, so
-  /// that is the peer from now on. Only the FIRST one wins: after that, changing
-  /// the peer on arriving traffic would let a stray packet steal the call.
+  /// A packet arrived and parsed. We do NOT lock onto the first address that
+  /// answers — that is the public-internet path as often as the short one.
+  /// Candidates are raced by measured RTT (time-sync replies) for ~150 ms, then
+  /// the lowest wins. First packet still starts media flowing (tentative).
   /// Host time of the last packet we accepted from the peer. This, not
   /// `locked`, is what "connected" means -- a remembered address is a claim about
   /// the past, and the only evidence a path still works is traffic on it.
   private(set) var lastRecvHost: UInt64 = 0
   private(set) var relocks = 0
+  private var pathRtt: [String: Double] = [:]
+  private var pathAddr: [String: sockaddr_in] = [:]
+  private var raceBegan: UInt64 = 0
+  private var raceSettled = false
+
+  // ── TWO THREADS, ONE DICTIONARY ─────────────────────────────────────────────
+  //
+  // `pathRtt` and `pathAddr` are written by the RECEIVE thread (a probe reply
+  // reaches `notePath`) and emptied by the REDISCOVERY thread
+  // (`unlockForRediscovery`, from main.swift's poll loop). Two threads mutating
+  // one Swift Dictionary is not a stale read, it is heap corruption: a resize
+  // moves the storage under the other thread's feet, and the app vanishes
+  // mid-call with no message. A SIGSEGV out of a real-time callback has already
+  // ended live calls in this project, which is why the rule here is that no
+  // Swift collection is shared across threads without a lock.
+  //
+  // AND THE TWO EVENTS ARE CORRELATED, NOT INDEPENDENT, which is what makes this
+  // likely rather than theoretical: the media gap that provokes rediscovery ends
+  // with the peer's probe reply arriving, so the `removeAll()` and the insert are
+  // provoked by the same instant. The race is not a coincidence waiting to
+  // happen, it is the reconnection path.
+  //
+  // A lock on the time-constraint receive thread is affordable HERE and would not
+  // be a few lines lower: `notePath` is reached only by a TMAGIC probe *reply*,
+  // which is about 1 Hz. Audio is 375 packets a second and never touches these.
+  // The critical section is a handful of dictionary operations and no I/O at all
+  // -- every `fputs` is deferred until after the unlock, so a blocked stderr
+  // cannot hold this lock while the receive thread waits behind it. Same pattern,
+  // and for the same reason, as `RelayBox` in Turn.swift.
+  private let pathLock = NSLock()
+
+  private func pathKey(_ a: sockaddr_in) -> String {
+    var ipb = [CChar](repeating: 0, count: 64)
+    var f = a
+    inet_ntop(AF_INET, &f.sin_addr, &ipb, 64)
+    let kind = turn?.isTurnServer(a) == true ? "relay" : "direct"
+    return "\(kind) \(String(cString: ipb)):\(UInt16(bigEndian: a.sin_port))"
+  }
+
+  func notePath(_ from: sockaddr_in, rttMs: Double) {
+    // Outside the lock on purpose: `pathKey` allocates (a [CChar], a String, an
+    // interpolation) and allocation is the one thing that must not happen while
+    // the receive thread holds a lock the rediscovery thread also wants.
+    let k = pathKey(from)
+    var firstSighting = false
+    var line: String?
+    pathLock.lock()
+    pathAddr[k] = from
+    if let prev = pathRtt[k] {
+      if rttMs < prev { pathRtt[k] = rttMs }
+    } else {
+      pathRtt[k] = rttMs
+      firstSighting = true
+    }
+    if raceBegan == 0 { raceBegan = Clock.now() }
+    line = pickBestPathLocked()
+    pathLock.unlock()
+    // Both of these used to be inside what is now the critical section. stderr can
+    // block for an unbounded time (a full pipe, a slow terminal), and a lock held
+    // across a blocking write is a lock held for as long as the reader is asleep.
+    if firstSighting {
+      fputs("path: \(k) rtt \(String(format: "%.2f", rttMs)) ms\n", stderr)
+    }
+    if let line { fputs(line, stderr) }
+  }
+
+  /// CALLER HOLDS `pathLock`. Returns the line to print, which the caller prints
+  /// after unlocking -- the naming says so because a second `pathLock.lock()` in
+  /// here would deadlock the receive thread against itself, and NSLock is not
+  /// recursive.
+  private func pickBestPathLocked() -> String? {
+    guard let best = pathRtt.min(by: { $0.value < $1.value }),
+          let addr = pathAddr[best.key] else { return nil }
+    let elapsed = raceBegan == 0 ? 0 : Clock.ms(Clock.now() - raceBegan)
+    // Tentative: first working path so the call starts. Settled after 150 ms
+    // of racing, or sooner if two paths have spoken and 60 ms have passed.
+    let settle = elapsed >= 150 || (pathRtt.count >= 2 && elapsed >= 60)
+    if !locked {
+      adopt(addr)
+      sendViaTurn = turn?.isTurnServer(addr) == true
+    }
+    guard settle, !raceSettled else { return nil }
+    raceSettled = true
+    if pathKey(peer) != best.key {
+      // Read BEFORE the reassignment below: the line says which path we are
+      // leaving, and `lockedFrom` is about to stop being that.
+      let was = lockedFrom
+      peer = addr
+      locked = true
+      lockedFrom = best.key
+      sendViaTurn = turn?.isTurnServer(addr) == true
+      return "path: picked \(best.key) at \(String(format: "%.2f", best.value)) ms rtt"
+           + " (was \(was))\n"
+    }
+    return "path: kept \(best.key) at \(String(format: "%.2f", best.value)) ms rtt\n"
+  }
 
   /// What the PEER has lost and recovered on the path FROM HERE. Cumulative, so
   /// a reader that samples at any cadence gets a true delta -- a windowed average
@@ -688,6 +812,37 @@ final class Wire {
   private let lpTmp = UnsafeMutablePointer<UInt8>.allocate(capacity: Lpc.MAXN * 2)
   private(set) var peerRxLost: Int = 0
   private(set) var peerRxRecovered: Int = 0
+  /// What the far end reports about ITSELF. `peerPlayed` is the one that
+  /// separates "they cannot hear me" from "they are fine and I am not sending".
+  private(set) var peerPlayed: Int = 0
+  private(set) var peerMuted = false
+  private(set) var peerQLevel = 0
+  private(set) var peerStatus = 0
+  private(set) var peerReportsState = false
+  /// Our own half of the same report, set once a second by the reporter.
+  var selfMuted = false
+  var selfQLevel = 0
+  // ── THE STATUS BYTE: WHY THE PICTURE STOPPED ───────────────────────────────
+  //
+  // This byte has been on the wire in every packet since the TPKTX arm was
+  // added, and nothing has ever written to it -- a channel with a reader and no
+  // sender. It now carries the two reasons video legitimately stops, because
+  // the far end cannot tell either of them from a crash: frames simply cease,
+  // the last one stays on screen, and a still face is the single most alarming
+  // thing a call can do.
+  //
+  // Two bits, not one, and that distinction is the whole point. "Their
+  // connection is weak" and "they turned their camera off" produce identical
+  // wire behaviour and demand opposite reactions from the person watching.
+  // Guessing between them from frame arrival alone would be a coin flip
+  // presented as a diagnosis.
+  static let ST_VPAUSED = 1        // video stopped because the link could not carry it
+  static let ST_CAMOFF  = 2        // video stopped because a human pressed the button
+  var selfStatus = 0
+  /// What the far end's status byte says. Both are false against a build that
+  /// predates the byte, which is correct: it never pauses and never reports.
+  var peerVideoPaused: Bool { peerStatus & Wire.ST_VPAUSED != 0 }
+  var peerCamOff: Bool { peerStatus & Wire.ST_CAMOFF != 0 }
   /// Whether the far end reports at all. False means an older build, and the
   /// controller must then fall back to the local numbers and SAY SO -- a silent
   /// fallback to the wrong signal is the bug this field exists to fix.
@@ -703,6 +858,17 @@ final class Wire {
     let rec = UInt32(truncatingIfNeeded: r?.recovered ?? 0)
     p.storeBytes(of: lost.littleEndian, toByteOffset: TPKT, as: UInt32.self)
     p.storeBytes(of: rec.littleEndian, toByteOffset: TPKT + 4, as: UInt32.self)
+    // The TPKTY arm. Guarded on the buffer actually being long enough, because
+    // this function is also handed the shorter probe on paths that have not been
+    // widened -- writing past the end there would be memory corruption, not a
+    // missing field.
+    guard p.count >= TPKTY else { return }
+    p.storeBytes(of: UInt32(truncatingIfNeeded: r?.played ?? 0).littleEndian,
+                 toByteOffset: TPKTX, as: UInt32.self)
+    p.storeBytes(of: UInt8(selfMuted ? 1 : 0), toByteOffset: TPKTX + 4, as: UInt8.self)
+    p.storeBytes(of: UInt8(truncatingIfNeeded: selfQLevel), toByteOffset: TPKTX + 5, as: UInt8.self)
+    p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus), toByteOffset: TPKTX + 6, as: UInt8.self)
+    p.storeBytes(of: UInt8(0), toByteOffset: TPKTX + 7, as: UInt8.self)
   }
 
   /// Nothing has arrived for a while, so the address we locked onto is no longer
@@ -718,7 +884,20 @@ final class Wire {
     guard locked else { return }
     locked = false
     lockedFrom = ""
+    // Not nested inside `pathLock` below: nothing takes both, and keeping them
+    // sequential means no future caller can invent a lock-order deadlock here.
+    candLock.lock()
     candidates.removeAll()
+    candLock.unlock()
+    // Under the lock: this runs on the rediscovery thread while the receive thread
+    // may be inserting the very probe reply that ends the gap which sent us here.
+    pathLock.lock()
+    pathRtt.removeAll()
+    pathAddr.removeAll()
+    raceBegan = 0
+    raceSettled = false
+    pathLock.unlock()
+    sendViaTurn = false
     relocks += 1
   }
 
@@ -752,7 +931,7 @@ final class Wire {
   /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
   /// media socket so it measures the path the media actually takes.
   func sendTimeProbe() {
-    var out = [UInt8](repeating: 0, count: TPKTX)
+    var out = [UInt8](repeating: 0, count: TPKTY)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -844,13 +1023,20 @@ final class Wire {
     while true {
       var src = sockaddr_in()
       var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-      let n = withUnsafeMutablePointer(to: &src) { sp in
+      var n = withUnsafeMutablePointer(to: &src) { sp in
         sp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
           recvfrom(fd, buf, cap, 0, $0, &srcLen)
         }
       }
       if n < 8 { if n < 0 { usleep(200) }; continue }
       recvBytes += Int(n) + 28
+      // ChannelData from our TURN server is the media, wrapped. Slide the
+      // payload to the front so the rest of this loop does not know about TURN.
+      if let t = turn, let inner = t.unwrap(buf, Int(n), from: src) {
+        if inner.1 < 8 { continue }
+        memmove(buf, inner.0, inner.1)
+        n = inner.1
+      }
       var magic = buf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
 
       // THE HANDSHAKE, and it is the one thing never encrypted -- it is what
@@ -912,6 +1098,36 @@ final class Wire {
       // decrypted, so it came from someone holding the key.
       if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
         lastRecvHost = Clock.now()
+        // The updater asks "is a call live?" before it restarts the app, and this
+        // is the only evidence that answers it. Stamped here rather than exposed
+        // as a callback: a hook assigned nowhere would answer "never in a call"
+        // and fail invisibly, in the direction that cuts someone off mid-sentence.
+        //
+        // ── AND IT IS THE SAME LINE AS `lastRecvHost`, DELIBERATELY ───────────
+        //
+        // This was narrowed to `magic == MAGIC || magic == VMAGIC` on the theory
+        // that a clock probe or a keyframe request proves a process is alive
+        // without proving a conversation exists, so a call sitting in silence
+        // behind a refused wire format would be held un-updateable by its own
+        // probes. BOTH HALVES OF THAT WERE WRONG, so the narrowing is reverted and
+        // the reasons are written down rather than left to be re-derived:
+        //
+        //  1. It fixed nothing. On a refused wire format the packet IS `MAGIC` and
+        //     it DOES decrypt -- the refusal is `frames != FPP`, read out of the
+        //     decrypted plaintext some sixty lines below. So audio was refreshing
+        //     this stamp 375 times a second throughout the silence, exactly as
+        //     before. The silent-call case is handled where it belongs, by the
+        //     wire-mismatch bypass in Update.startPolling.
+        //  2. It broke an invariant that `Update.callIsLive()` states in its own
+        //     comment: it reads the same evidence as the app's own peer-gone
+        //     detector, which watches `wire.lastRecvHost` (main.swift). Two
+        //     variables meant to agree cannot be assigned on different conditions.
+        //     The worst case is a SUPPORTED configuration: a peer with the mic
+        //     denied and the camera off sends neither MAGIC nor VMAGIC, so this
+        //     stamp would stay 0 for the whole call, `callIsLive()` would be false
+        //     from beginning to end, and the first poll tick would restart the app
+        //     out from under a working one-way call.
+        Update.lastMediaHost = lastRecvHost
         if !locked { adopt(src) }
       }
       if magic == VMAGIC {
@@ -948,12 +1164,20 @@ final class Wire {
           peerRxRecovered = Int(rv)
           peerReportsLoss = true
         }
+        if plainN >= TPKTY {
+          let pl = (plain + TPKTX).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          peerPlayed = Int(pl)
+          peerMuted = plain[TPKTX + 4] == 1
+          peerQLevel = Int(plain[TPKTX + 5])
+          peerStatus = Int(plain[TPKTX + 6])
+          peerReportsState = true
+        }
         if kind == 0 {
           // A request. Reply from THIS thread, immediately -- handing it to
           // another thread would put that thread's scheduling delay inside t3-t2,
           // where it is indistinguishable from network asymmetry and biases the
           // offset by half of it.
-          var out = [UInt8](repeating: 0, count: TPKTX)
+          var out = [UInt8](repeating: 0, count: TPKTY)
           out.withUnsafeMutableBytes { p in
             p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
             p.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -967,6 +1191,10 @@ final class Wire {
           let t2 = (plain + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           let t3 = (plain + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           tsync?.note(t1: t1, t2: t2, t3: t3, t4: t4)
+          // One-way is not observable. Round trip of THIS packet on THIS address
+          // is, and that is how we pick the path.
+          let rtt = Clock.msSigned(t4, t1) - Clock.msSigned(t3, t2)
+          if rtt > 0, rtt < 5000 { notePath(src, rttMs: rtt) }
         }
         continue
       }
@@ -1003,7 +1231,12 @@ final class Wire {
         // of us moves. Ask the updater to look now instead of at the end of its
         // minute -- a wire-format change otherwise costs up to 60 s of silence in
         // the middle of a real conversation.
-        if fmtMismatch == 1 { Update.urgent = true }
+        // `wireMismatch` FIRST: it is the reason, `urgent` is only the trigger, and
+        // the poll thread reads the reason the moment it sees the trigger. Set the
+        // other way round and a tick landing between the two stores would see an
+        // urgent check with no reason attached, and hold the fix behind the silent
+        // call it exists to end.
+        if fmtMismatch == 1 { Update.wireMismatch = true; Update.urgent = true }
         if fmtMismatch == 1 || fmtMismatch % 4000 == 0 {
           fputs("audio: peer sends \(frames)-sample packets, this build expects \(FPP)"
               + " -- the two ends are on different versions, one side needs the update"

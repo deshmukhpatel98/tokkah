@@ -44,9 +44,18 @@ final class VQuality {
   ///   0.4  37.5 dB  0.129 Mbps      0.7  45.5 dB  1.185 Mbps  <- lossless
   ///   unset 37.9 dB 0.122 Mbps      0.8  47.7 dB  3.059 Mbps
   ///
-  /// 0.4 is indistinguishable from unset, so 0.3 is a genuine retreat below the
+  /// 0.4 is indistinguishable from unset, so 0.3 was a genuine retreat below the
   /// old behaviour rather than a relabelling of it.
-  static let LEVELS: [Double] = [0.3, 0.5, 0.6, 0.7]
+  ///
+  /// AND THAT WAS THE PROBLEM. 0.3 is 35.6 dB at 0.089 Mbps on a 1280x720 frame,
+  /// and there is no resolution ladder under it -- the frame size is fixed, so the
+  /// whole retreat is spent on quantiser. 0.089 Mbps of 720p is the picture two
+  /// people described as "highly pixelated" while the other end looked perfect.
+  /// It is not a degraded picture, it is a broken one, and a floor nobody wants to
+  /// land on is not a floor. 0.5 is 40.1 dB at 0.221 Mbps: soft, watchable, and
+  /// still an eighth of the lossless rung's bandwidth, so it retreats just as far
+  /// in the direction that matters (queue, therefore latency) without the mush.
+  static let LEVELS: [Double] = [0.5, 0.6, 0.7]
 
   private(set) var level: Int
   private let ceiling: Int
@@ -55,6 +64,37 @@ final class VQuality {
   private var penalty = [Double](repeating: 60, count: LEVELS.count)
   private var quietFor = 0
   private(set) var stepDowns = 0, stepUps = 0, refusedUps = 0
+
+  // ── BELOW THE FLOOR THERE IS NO SMALLER PICTURE, SO STOP SENDING ONE ───────
+  //
+  // The ladder ends at 0.5 because everything under it was the "highly
+  // pixelated" bug report, and a floor nobody wants to land on is not a floor.
+  // But a link that keeps losing packets at the floor was then handed the one
+  // answer this controller had left: nothing. It held 0.5 and kept pushing
+  // 0.22 Mbps into a path that had already said no, and every one of those
+  // packets shares a queue with the audio.
+  //
+  // Audio is the call. Video is the nice part. So when the floor is not enough,
+  // the video stops entirely and the voice gets the whole link -- which is also
+  // what people do by hand on a bad call, and they do it because it works.
+  //
+  // Pausing is NOT another rung. A rung is a picture; this is the absence of
+  // one, it has to be visible to the person on the other end, and it has to be
+  // hard to flap: a picture that comes and goes every four seconds is worse
+  // than no picture at all. Hence a streak to enter, a longer quiet to leave,
+  // and a resume-wait that doubles every time the link fools us again.
+  private(set) var paused = false
+  private(set) var pauses = 0
+  private(set) var pausedTicks = 0
+  /// Consecutive harmed seconds while already at the floor.
+  private var harmedAtFloor = 0
+  /// Consecutive quiet seconds while paused.
+  private var quietPaused = 0
+  /// Harmed seconds at the floor before the video stops.
+  private let pauseAfter: Int
+  /// Quiet seconds before it comes back -- doubling per pause, capped.
+  private let resumeQuietBase: Int
+  private let canPause: Bool
 
   /// Seconds of no harm before trying the next level up.
   private let quietNeeded = 15
@@ -67,8 +107,12 @@ final class VQuality {
   /// neither arm and measured nothing. A control arm has to be holdable.
   private let held: Bool
 
-  init(ceiling: Double? = nil, hold: Bool = false) {
+  init(ceiling: Double? = nil, hold: Bool = false, pause: Bool = true,
+       pauseAfter: Int = 3, resumeQuiet: Int = 8) {
     held = hold
+    canPause = pause
+    self.pauseAfter = max(1, pauseAfter)
+    self.resumeQuietBase = max(1, resumeQuiet)
     // A `--vquality` value pins the ceiling; without one the ceiling is the top
     // rung, which is the point of the exercise.
     if let c = ceiling {
@@ -97,23 +141,82 @@ final class VQuality {
     // first half-minute of every call.
     guard now >= Double(warmup) else { return nil }
     let harmed = framesLost > 0 || concealed > 0 || jitGrew
+
+    // ── WHILE PAUSED, THE ONLY QUESTION IS WHEN TO COME BACK ──────────────────
+    //
+    // Handled before anything else because none of the rules below apply: there
+    // is no picture to step down, and stepping UP into a link that just refused
+    // the floor would be the 2->1->2->1 cycle wearing a different hat.
+    //
+    // The wait doubles per pause in the same call. One pause is bad luck; three
+    // is a link that is going to do it again, and each recovery costs the far
+    // end a black-to-blur-to-face flicker they did not ask for.
+    if paused {
+      pausedTicks += 1
+      if harmed { quietPaused = 0; return nil }
+      quietPaused += 1
+      let need = min(resumeQuietBase << min(pauses - 1, 3), 60)
+      guard quietPaused >= need else { return nil }
+      paused = false
+      // Back at the FLOOR, never at the level that was in effect when the link
+      // gave out -- the picture has to earn its way up through the same quiet
+      // seconds as everybody else. `level` is already 0 (pausing can only happen
+      // there), so the encoder needs no rebuild and this returns no change.
+      level = 0
+      quietFor = 0
+      harmedAtFloor = 0
+      return nil
+    }
+
     if harmed {
       quietFor = 0
-      guard level > 0 else { return nil }          // already at the floor
+      if level == 0 {
+        // Already at the floor and still being hurt. There is nothing smaller to
+        // send, so send nothing -- but only after a STREAK. A single harmed
+        // second at the floor is an ordinary internet hiccup, and stopping the
+        // video for it would make the feature the fault.
+        guard canPause else { return nil }
+        harmedAtFloor += 1
+        guard harmedAtFloor >= pauseAfter else { return nil }
+        paused = true
+        pauses += 1
+        quietPaused = 0
+        harmedAtFloor = 0
+        return nil
+      }
       // This level hurt. Do not come back to it soon, and double the wait each
       // time it hurts again -- a level that fails twice is not unlucky.
+      //
+      // The cap is 120 s, not 480. Doubling from a 60-second start reached eight
+      // minutes after three bad seconds, and eight minutes is longer than most
+      // calls: one bad minute on a link that then recovered pinned the picture at
+      // the bottom for the entire rest of the conversation, with nothing on screen
+      // saying why. Two minutes is long enough to stop the 2->1->2->1 cycle this
+      // backoff exists to break, and short enough that a link which got better is
+      // re-tested inside the same call.
       blockedUntil[level] = now + penalty[level]
-      penalty[level] = min(penalty[level] * 2, 480)
+      penalty[level] = min(penalty[level] * 2, 120)
       level -= 1
       stepDowns += 1
       return quality
     }
     quietFor += 1
+    // A quiet second at the floor breaks the streak. Without this the counter is
+    // a lifetime total of bad seconds rather than consecutive ones, and a link
+    // that hiccups once a minute would eventually stop the video for good.
+    harmedAtFloor = 0
     guard quietFor >= quietNeeded, level < ceiling else { return nil }
     let next = level + 1
     if now < blockedUntil[next] {
       refusedUps += 1
-      quietFor = 0                                  // wait out the block, quietly
+      // DO NOT reset `quietFor` here. It used to, and that made the up-path
+      // starvable: a refusal is not harm, it is this controller declining its own
+      // request, and zeroing the quiet counter on it meant the next attempt was
+      // another 15 s away -- so a level blocked for 120 s was retried at 15, 30,
+      // 45... and each retry pushed the clock out again. On a link that had gone
+      // quiet the picture could never climb back at all. Keep the credit: the
+      // quiet seconds were real, and the moment the block expires the step up
+      // happens on the very next tick.
       return nil
     }
     level = next
@@ -123,8 +226,10 @@ final class VQuality {
   }
 
   var describe: String {
-    (held ? "HELD q" : "q") + String(format: "%.1f", quality)
+    (paused ? "PAUSED (was q" : (held ? "HELD q" : "q")) + String(format: "%.1f", quality)
+      + (paused ? ")" : "")
       + " (level \(level)/\(ceiling), \(stepDowns) down \(stepUps) up"
-      + (refusedUps > 0 ? " \(refusedUps) up-refused" : "") + ")"
+      + (refusedUps > 0 ? " \(refusedUps) up-refused" : "")
+      + (pauses > 0 ? ", \(pauses) pause\(pauses == 1 ? "" : "s") \(pausedTicks)s" : "") + ")"
   }
 }

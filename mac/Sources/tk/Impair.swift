@@ -58,9 +58,23 @@ final class Impair {
   private(set) var delayed = 0
   private var burstUntil: UInt64 = 0
   private var seed: UInt64 = 0x2545_F491_4F6C_DD1D
+  // ── A LINK THAT GETS BETTER ────────────────────────────────────────────────
+  //
+  // Every impairment here is permanent for the life of the process, which can
+  // only ever prove the half of a controller that gives things up. The half that
+  // hands them back -- the one that turns a bad minute into a bad call when it is
+  // wrong -- had no way to be exercised on a live call at all.
+  //
+  // `--imp-until 20` heals the path at t=20 s. Not a shorter test of the same
+  // thing: it is the only test of the other thing.
+  private let untilS: Double
+  private var healed = false
+  private var startedAt: UInt64 = 0
 
   init(dropPct: Double, burstMs: Double, jitterMs: Double,
-       delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0) {
+       delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0,
+       untilS: Double = 0) {
+    self.untilS = untilS
     self.dropPct = dropPct
     self.burstMs = burstMs
     self.jitterMs = jitterMs
@@ -80,6 +94,17 @@ final class Impair {
   func shouldDrop() -> Bool {
     guard dropPct > 0 else { return false }
     let now = Clock.now()
+    if untilS > 0 {
+      // Measured from the first packet, not from process start: the socket, the
+      // room and the peer all happen first, and anchoring on launch would spend
+      // most of a short window on setup.
+      if startedAt == 0 { startedAt = now }
+      if !healed, Clock.msSigned(now, startedAt) > untilS * 1000 {
+        healed = true
+        fputs("IMPAIRED: path healed at \(Int(untilS)) s -- loss stops here\n", stderr)
+      }
+      if healed { return false }
+    }
     if burstMs > 0 {
       if now < burstUntil { dropped += 1; return true }
       // Scale the per-packet probability so a burst of B ms fires often enough to

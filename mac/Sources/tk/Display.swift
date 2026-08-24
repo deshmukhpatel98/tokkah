@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import AppKit
 import CoreMedia
 import Foundation
@@ -17,6 +18,10 @@ import QuartzCore
 // value. This is the same argument as no-B-frames, one stage later.
 final class Display {
   private var win: NSWindow?
+  /// The window itself, for the one caller that needs to act on the WINDOW
+  /// rather than on what is drawn inside it: an arriving call has to come
+  /// forward, and "forward" is not a property of any view.
+  var callWindow: NSWindow? { win }
   private let layer = AVSampleBufferDisplayLayer()
   // ── Yourself, in the corner ────────────────────────────────────────────────
   //
@@ -54,6 +59,29 @@ final class Display {
     let h = w * 9.0 / 16.0
     return NSRect(x: 12, y: 76, width: w, height: h)
   }
+
+  // ── WHAT A PAUSED PICTURE LOOKS LIKE ───────────────────────────────────────
+  //
+  // Not a frozen frame. A held face is the most dishonest thing this app can
+  // draw: it is indistinguishable from a crash, from a hang, and from someone
+  // sitting very still, and people talk to it for thirty seconds before
+  // realising. The blur says "this is not live" in the first tenth of a second,
+  // without a word being read, and it says it in the picture itself rather than
+  // in a caption somebody has to notice.
+  //
+  // It is the LAST frame, blurred once, not a blur applied per frame: there are
+  // no new frames during a pause, so a repeated blur would be the same
+  // computation over and over for an identical result. One CIGaussianBlur into
+  // one CGImage, held as layer contents until the picture comes back.
+  private let pauseLayer = CALayer()
+  /// The one decoded frame kept alive so there is something to blur when the
+  /// link gives out. Exactly one: a decoder pool can spare a buffer, and the
+  /// alternative is having nothing to show at the moment it matters most.
+  private var lastRemote: CVImageBuffer?
+  private let ciCtx = CIContext(options: [.useSoftwareRenderer: false])
+  private(set) var peerPaused = false
+  private(set) var selfPaused = false
+  private(set) var peerCamOff = false
 
   private(set) var shown = 0, enqueueFails = 0
   /// Screen refresh period, so the display term in the budget is stated rather
@@ -136,6 +164,16 @@ final class Display {
     // on a layer that is allowed to draw outside itself.
     selfLayer.masksToBounds = true
     selfLayer.frame = Display.selfFrame(in: rect)
+    // The blur covers the far end's picture and nothing else. It goes UNDER the
+    // corner tile on purpose: your own camera is still running during their
+    // pause, and blurring your own face for their bad link would be a lie about
+    // whose connection is at fault.
+    pauseLayer.frame = rect
+    pauseLayer.isHidden = true
+    pauseLayer.contentsGravity = .resizeAspect
+    pauseLayer.backgroundColor = Palette.bg.cgColor
+    pauseLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+    layer.addSublayer(pauseLayer)
     layer.addSublayer(selfLayer)
     videoView.autoresizingMask = [.width, .height]
     root.addSubview(videoView)
@@ -296,6 +334,7 @@ final class Display {
       win.setFrame(f, display: true)
       let r = NSRect(x: 0, y: 0, width: w, height: h)
       self.layer.frame = r
+      self.pauseLayer.frame = r
       self.selfLayer.frame = Display.selfFrame(in: r)
     }
   }
@@ -376,7 +415,115 @@ final class Display {
   /// The far end's picture: always the window. Peeking puts YOU in the corner tile
   /// on top, it does not displace the person talking.
   func show(_ img: CVImageBuffer) {
-    if enqueue(img, into: layer) { shown += 1 }
+    if enqueue(img, into: layer) {
+      shown += 1
+      noteFrameShown()
+    }
+    // Kept whether or not the enqueue succeeded: a layer that refused a frame is
+    // exactly when having a picture to fall back on matters.
+    lastRemote = img
+  }
+
+  // ── PAUSED: BLUR IT AND SAY SO ──────────────────────────────────────────────
+  //
+  // Called once a second from the reporter, off the main thread, so every touch
+  // of the view tree is hopped onto main. Idempotent by design -- it is called
+  // with the same values sixty times a minute and must do nothing on all but the
+  // transitions.
+  func setPaused(peer: Bool, selfSide: Bool, peerCamOff camOff: Bool) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      let hideBlur = !peer
+      let wasPeerPaused = self.peerPaused
+      if peer != self.peerPaused || camOff != self.peerCamOff {
+        self.peerPaused = peer
+        self.peerCamOff = camOff
+        if hideBlur {
+          self.pauseLayer.isHidden = true
+          self.pauseLayer.contents = nil
+        } else {
+          // No frame yet means the link failed before the first picture ever
+          // arrived. A flat panel is the honest answer; inventing one is not.
+          self.pauseLayer.contents = self.lastRemote.flatMap { self.blur($0) }
+          self.pauseLayer.isHidden = false
+        }
+      }
+      // ── A DELIBERATE PAUSE IS NOT A FREEZE ───────────────────────────────
+      //
+      // `noteFrameShown` measures the gap between frames, and a sixteen-second
+      // pause is a sixteen-second gap. Left alone it books the longest freeze of
+      // the call, trips the "their face stopped moving" verdict, and reports a
+      // feature working exactly as designed as the worst defect in the record.
+      //
+      // Zeroing the anchor on BOTH edges is what makes it correct: the entry
+      // stops the gap being measured from the last live frame, and the exit
+      // discards any stray in-flight frame that landed mid-pause and would
+      // otherwise become the anchor the first real frame is measured against.
+      if peer != wasPeerPaused { self.forgetFrameGap() }
+      self.selfPaused = selfSide
+      // PLAIN WORDS, NO NUMBERS. The readout that used to live over the picture
+      // was a diagnostics panel and it was removed for being one. This is a
+      // sentence a person acts on.
+      let line: String
+      if peer && camOff {
+        line = "their camera is off and their connection is weak"
+      } else if peer {
+        line = "their connection is weak \u{2014} video paused, audio is still on"
+      } else if camOff {
+        line = "their camera is off"
+      } else if selfSide {
+        line = "your connection is weak \u{2014} your video is paused, audio is still on"
+      } else {
+        line = ""
+      }
+      self.controls?.setWarning(line)
+    }
+  }
+
+  /// One frame, blurred hard enough that no detail survives. The radius scales
+  /// with the frame so a 1080p pause is not sharper than a 720p one -- a blur
+  /// specified in pixels means different things on different cameras, which is
+  /// the same units bug that has bitten this codebase in three other places.
+  private func blur(_ pb: CVImageBuffer) -> CGImage? {
+    let ci = CIImage(cvImageBuffer: pb)
+    let ext = ci.extent
+    guard ext.width > 1, ext.height > 1 else { return nil }
+    let radius = max(14.0, min(ext.width, ext.height) / 18.0)
+    // `clampedToExtent` before the blur and a crop after it: without the clamp a
+    // Gaussian samples past the edge, finds transparency, and draws a soft dark
+    // frame around the whole picture that reads as a vignette nobody asked for.
+    let out = ci.clampedToExtent()
+      .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+      .cropped(to: ext)
+    return ciCtx.createCGImage(out, from: ext)
+  }
+
+  // ── A FROZEN FACE IS THE FATIGUE, NOT THE LATENCY ───────────────────────────
+  //
+  // Every video number here was a RATE or an AVERAGE: 30 frames a second, 2 lost,
+  // 0.6 ms to decode. All of them stay healthy through the thing people actually
+  // find exhausting -- a face that holds still for a third of a second and then
+  // jumps. Thirty frames arrived; they just did not arrive evenly, and an average
+  // is exactly the wrong instrument for that.
+  //
+  // So: the longest a single frame stayed on screen, and how many times the gap
+  // was long enough to see. 150 ms is where a held frame stops reading as motion
+  // and starts reading as a stall; 400 ms is where people say "you froze".
+  private(set) var freezeMaxMs = 0
+  private(set) var freezes150 = 0
+  private(set) var freezes400 = 0
+  private var lastShownT: UInt64 = 0
+  /// Drop the anchor the next gap would be measured from, so the next frame
+  /// starts a fresh interval instead of closing one that spans a pause.
+  func forgetFrameGap() { lastShownT = 0 }
+  private func noteFrameShown() {
+    let now = Clock.now()
+    defer { lastShownT = now }
+    guard lastShownT != 0 else { return }
+    let gap = Int(Clock.msSigned(now, lastShownT))
+    if gap > freezeMaxMs { freezeMaxMs = gap }
+    if gap >= 150 { freezes150 += 1 }
+    if gap >= 400 { freezes400 += 1 }
   }
 
   @discardableResult
