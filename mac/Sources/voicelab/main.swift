@@ -96,9 +96,126 @@ enum Spatial {
            taps: [(0.0079, 0.20), (0.0148, 0.14)]),
   ]
 
-  static func render(_ x: [Float], _ p: Preset) -> ([Float], [Float]) {
+  // ── MOST CALLS HAPPEN ON THE LAPTOP'S OWN SPEAKERS ────────────────────────
+  //
+  // Everything above encodes the DIFFERENCE between the two ears, and that
+  // difference only survives if each ear hears one channel. Out of speakers
+  // both ears hear both channels, so the whole rendering is erased by acoustic
+  // crosstalk somewhere between the screen and the head. A listening test run
+  // through speakers therefore returns "they all sound the same" whether the
+  // rendering is good, bad, or absent -- the same verdict as a true negative.
+  //
+  // The fix is not to give up on speakers, it is to cancel the crosstalk. Two
+  // speakers this close together are the best case for it, not the worst:
+  // Kirkeby, Nelson and Hamada's stereo dipole is exactly a pair spanning
+  // 10-30 degrees, and a laptop lid is about 26 cm of span at arm's length,
+  // which is 15. Their result is that a span this narrow is unusually ROBUST to
+  // the listener moving, which is the usual reason this technique is a party
+  // trick rather than a feature.
+  //
+  // Two deliberate compromises, both from the literature and both about not
+  // sounding worse when the geometry is wrong:
+  //
+  //  * BANDLIMITED. Cancelling below ~300 Hz needs enormous boost, because down
+  //    there the two ears genuinely do hear the same thing and inverting that
+  //    is close to dividing by zero; above ~6 kHz the required precision is
+  //    finer than the listener holds their head. Both bands are passed straight
+  //    through, and only the band between them is cancelled.
+  //  * PARTIAL. Cancelling 100% of a crosstalk path you have estimated wrongly
+  //    is worse than cancelling 75% of it, so the loop is deliberately shy.
+  // Aimed WIDER than the speakers actually are: about 15 degrees off at arm's
+  // length, cancelled as though 20. Tuning at the nominal geometry gives the
+  // best number for a listener holding perfectly still and the worst one for
+  // everybody else. These three constants were swept, not chosen -- head
+  // positions from 8 to 30 degrees (a metre away down to a hunch over the
+  // keyboard), scored on BOTH ear cues, and only a narrow window of settings
+  // helps the level difference everywhere without pulling the arrival time away
+  // from the truth. 18-20 degrees at 0.7-0.85 depth is that window; everything
+  // outside it fails at one end of the range or the other.
+  //
+  // Caveat worth stating plainly: this simulation is symmetric, so it can model
+  // the listener sitting nearer or further, and cannot model them sitting off
+  // to one side, which is the case this technique handles worst.
+  static var dipoleDeg = 20.0
+  static var ctcDepth: Float = 0.85
+  /// Only the band between these is cancelled; see the note above.
+  static var ctcLo = 150.0
+  static var ctcHi = 6000.0
+
+  /// What the far ear hears of a speaker: later, quieter, duller.
+  private static func crossPath(_ halfAngleDeg: Double) -> (Int, Float, Float) {
+    let th = halfAngleDeg * Double.pi / 180
+    // The contralateral ear sits at th + 90 degrees from the speaker.
+    let itd = (headR / c) * (th + sin(th)) * SR
+    let alpha = Float(1.05 + 0.95 * cos(th + .pi / 2))
+    return (max(1, Int(itd.rounded())), alpha * 0.5, Float(pow(10, -1.6 / 20)))
+  }
+
+  static func crosstalkCancel(_ L: [Float], _ R: [Float]) -> ([Float], [Float]) {
+    let n = min(L.count, R.count)
+    guard n > 8 else { return (L, R) }
+    let (d, direct, lvl) = crossPath(dipoleDeg)
+    let g = lvl * ctcDepth
+    let a = Float(exp(-2 * Double.pi * 1600 / SR))
+
+    // Split each channel into low / mid / high. Only mid is cancelled.
+    let loL = onePole(L, ctcLo), loR = onePole(R, ctcLo)
+    let bandL = onePole(L, ctcHi), bandR = onePole(R, ctcHi)
+    var midL = [Float](repeating: 0, count: n), midR = midL
+    var restL = midL, restR = midL
+    for i in 0..<n {
+      midL[i] = bandL[i] - loL[i]; midR[i] = bandR[i] - loR[i]
+      restL[i] = L[i] - midL[i];   restR[i] = R[i] - midR[i]
+    }
+
+    // yL = midL - crosspath(yR), and the mirror. The delay is >= 1 sample so
+    // the recursion is causal; loop gain is g^2 < 1 so it settles.
+    var yL = [Float](repeating: 0, count: n), yR = yL
+    var lpL: Float = 0, lpR: Float = 0
+    for i in 0..<n {
+      let fL = i >= d ? yL[i - d] : 0
+      let fR = i >= d ? yR[i - d] : 0
+      lpL = (1 - a) * fL + a * lpL
+      lpR = (1 - a) * fR + a * lpR
+      let xR = direct * fR + (1 - direct) * lpR
+      let xL = direct * fL + (1 - direct) * lpL
+      yL[i] = midL[i] - g * xR
+      yR[i] = midR[i] - g * xL
+    }
+    for i in 0..<n { yL[i] += restL[i]; yR[i] += restR[i] }
+    return (yL, yR)
+  }
+
+  /// What the two ears actually receive when a stereo pair is played over the
+  /// speakers -- direct path plus the crosstalk from the opposite speaker. This
+  /// exists so the cancellation can be CHECKED rather than believed.
+  static func earsFromSpeakers(_ L: [Float], _ R: [Float],
+                               halfAngleDeg: Double = dipoleDeg) -> ([Float], [Float]) {
+    let n = min(L.count, R.count)
+    let (d, direct, lvl) = crossPath(halfAngleDeg)
+    let a = Float(exp(-2 * Double.pi * 1600 / SR))
+    var eL = [Float](repeating: 0, count: n), eR = eL
+    var lpL: Float = 0, lpR: Float = 0
+    for i in 0..<n {
+      let fL = i >= d ? L[i - d] : 0
+      let fR = i >= d ? R[i - d] : 0
+      lpL = (1 - a) * fL + a * lpL
+      lpR = (1 - a) * fR + a * lpR
+      eL[i] = L[i] + lvl * (direct * fR + (1 - direct) * lpR)
+      eR[i] = R[i] + lvl * (direct * fL + (1 - direct) * lpL)
+    }
+    return (eL, eR)
+  }
+
+  static func render(_ x: [Float], _ p: Preset, speakers: Bool = false) -> ([Float], [Float]) {
     if p.azimuth == 0 && p.taps.isEmpty { return (x, x) }
-    return render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
+    var (L, R) = render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
+    if speakers { (L, R) = crosstalkCancel(L, R) }
+    let n = min(L.count, R.count)
+    var peak: Float = 1e-9
+    for i in 0..<n { peak = max(peak, max(abs(L[i]), abs(R[i]))) }
+    if peak > 0.89 { let g = 0.89 / peak; for i in 0..<n { L[i] *= g; R[i] *= g } }
+    return (L, R)
   }
 
   static func render(_ x: [Float], azimuth: Double, farEarDb: Double,
@@ -170,6 +287,35 @@ enum Wav {
     d.append(pcm)
     try? d.write(to: url)
   }
+
+  /// Mono 16-bit read, for pulling old takes back off the disk at launch.
+  /// Deliberately minimal: it only ever has to read what write() produced.
+  static func readMono(_ url: URL) -> [Float]? {
+    guard let d = try? Data(contentsOf: url), d.count > 44 else { return nil }
+    func u32(_ o: Int) -> UInt32 {
+      UInt32(d[o]) | UInt32(d[o+1]) << 8 | UInt32(d[o+2]) << 16 | UInt32(d[o+3]) << 24
+    }
+    func u16(_ o: Int) -> UInt16 { UInt16(d[o]) | UInt16(d[o+1]) << 8 }
+    guard d[0] == 0x52, d[1] == 0x49 else { return nil }        // "RI"
+    var o = 12, ch = 1, bits = 16
+    var data: Range<Int>? = nil
+    while o + 8 <= d.count {
+      let id = String(bytes: d[o..<o+4], encoding: .ascii) ?? ""
+      let len = Int(u32(o + 4))
+      let body = o + 8
+      if id == "fmt " , body + 16 <= d.count { ch = Int(u16(body + 2)); bits = Int(u16(body + 14)) }
+      if id == "data" { data = body..<min(d.count, body + len); break }
+      o = body + len + (len & 1)
+    }
+    guard let r = data, bits == 16, ch >= 1 else { return nil }
+    let frames = r.count / (2 * ch)
+    var out = [Float](repeating: 0, count: frames)
+    for i in 0..<frames {
+      let o = r.lowerBound + i * 2 * ch
+      out[i] = Float(Int16(bitPattern: u16(o))) / 32767
+    }
+    return out
+  }
 }
 
 // ── Capture ──────────────────────────────────────────────────────────────────
@@ -198,6 +344,43 @@ final class Recorder {
     case .standard: return "Standard"
     @unknown default: return "unknown"
     }
+  }
+
+  // ── WHAT YOU ARE LISTENING ON DECIDES WHICH RENDERING IS CORRECT ──────────
+  //
+  // This is not a preference, it is a fact about the room, and it silently
+  // decides whether any of this works. There is no honest way to offer a
+  // headphone rendering to somebody on speakers and call the result a listening
+  // test -- so the app reads the output device and renders for it.
+  static func outputDevice() -> (name: String, speakers: Bool) {
+    var dev = AudioDeviceID(0); var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &dev) == noErr
+    else { return ("speakers", true) }
+
+    var name = "output"
+    var nameRef: CFString? = nil; sz = UInt32(MemoryLayout<CFString?>.size)
+    a.mSelector = kAudioObjectPropertyName
+    if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &nameRef) == noErr, let n = nameRef {
+      name = n as String
+    }
+
+    // Anything not wired into the machine -- USB, Bluetooth, an adapter -- is
+    // overwhelmingly a headset. Built-in could still be the headphone jack, and
+    // the data source says which: 'hdpn'.
+    var t = UInt32(0); sz = 4
+    a.mSelector = kAudioDevicePropertyTransportType
+    guard AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &t) == noErr else { return (name, true) }
+    if t != kAudioDeviceTransportTypeBuiltIn { return (name, false) }
+
+    var src = UInt32(0); sz = 4
+    a.mSelector = kAudioDevicePropertyDataSource
+    a.mScope = kAudioObjectPropertyScopeOutput
+    if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &src) == noErr {
+      if src == 0x6864706E { return (name + " (headphone jack)", false) }   // 'hdpn'
+    }
+    return (name, true)
   }
 
   static func raiseInputIfLow() -> String {
@@ -459,6 +642,9 @@ final class Lab: NSObject, NSApplicationDelegate {
   var takeNo = 0
   var lastFolder: URL?
   var openBtn = Btn()
+  var outLabel = NSTextField(labelWithString: "")
+  var lastOut = ""
+  var outTimer: Timer?
   var takes: [(String, [Float], [Float])] = []
   var recording = false
   var timer: Timer?
@@ -492,7 +678,9 @@ final class Lab: NSObject, NSApplicationDelegate {
       return f
     }
     _ = label("Record your voice, then hear it six ways.", 15, Ink.fg, top(16, 25), .semibold)
-    _ = label("Wear headphones. The whole effect is the difference between your two ears.", 12, Ink.warn, top(46, 22))
+    // WHAT YOU ARE LISTENING ON IS NOT A PREFERENCE, IT DECIDES WHICH RENDERING
+    // IS CORRECT -- so it is read from the system and shown, not asked for.
+    outLabel = label("", 12, Ink.warn, top(46, 22))
 
     // ── WHAT THE MICROPHONE IS ALLOWED TO DO TO YOU ──────────────────────────
     //
@@ -557,6 +745,12 @@ final class Lab: NSObject, NSApplicationDelegate {
     advice.alignment = .center
     advice.frame = NSRect(x: 20, y: top(552, 16), width: 520, height: 16)
     root.addSubview(advice)
+
+    refreshOut()
+    loadHistory()
+    outTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+      self?.refreshOut()
+    }
 
     w.contentView = root
     w.makeKeyAndOrderFront(nil)
@@ -637,19 +831,73 @@ final class Lab: NSObject, NSApplicationDelegate {
     advice.stringValue = "Play them in order. Ask where the voice is, not whether it is clean."
   }
 
-  /// Load one of the kept takes into the three play buttons. Re-rendering here
-  /// rather than storing three stereo copies per take: the passes are linear and
-  /// finish inside the click, and holding every version of every take would be
-  /// tens of megabytes to save a few milliseconds nobody can feel.
+  /// Reads the output device and, if it changed, re-renders the loaded take for
+  /// it. Plugging in headphones mid-session should change what you hear next
+  /// time you press play, without you having to know that it should.
+  func refreshOut() {
+    let (name, speakers) = Recorder.outputDevice()
+    let key = name + (speakers ? "|s" : "|h")
+    guard key != lastOut else { return }
+    let first = lastOut.isEmpty
+    lastOut = key
+    outLabel.stringValue = speakers
+      ? "Playing through \(name) — un-mixed so each ear gets its own voice."
+      : "Playing through \(name) — straight into each ear."
+    outLabel.textColor = speakers ? Ink.good : Ink.good
+    if !first && selected >= 0 { select(selected) }
+  }
+
+  /// Load one of the kept takes into the play buttons. Re-rendering here rather
+  /// than storing every version of every take: the passes are linear and finish
+  /// inside the click, and keeping them all would be tens of megabytes to save a
+  /// few milliseconds nobody can feel. It also means a take recorded on speakers
+  /// is re-rendered for headphones the moment you plug them in.
   func select(_ i: Int) {
     guard i < history.count else { return }
     selected = i
     let raw = history[i].raw
+    let speakers = Recorder.outputDevice().speakers
     takes = Spatial.presets.map { p in
-      let (L, R) = Spatial.render(raw, p)
+      let (L, R) = Spatial.render(raw, p, speakers: speakers)
       return (p.name, L, R)
     }
     plays.forEach { $0.enabled = true; $0.playing = false }
+    refreshRows()
+  }
+
+  // ── TAKES OUTLIVE THE PROCESS ────────────────────────────────────────────
+  //
+  // The history used to live only in memory, so quitting the app -- or me
+  // installing a new build -- silently threw away every recording the list
+  // could reach, while the files sat on the Desktop the whole time. "I'm not
+  // able to play the previous recordings" was exactly this. The raw mono take
+  // is the only thing worth keeping, because every rendering is derived from it.
+  func loadHistory() {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Desktop/Voice Lab")
+    let fm = FileManager.default
+    guard let kids = try? fm.contentsOfDirectory(at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return }
+    func when(_ u: URL) -> Date {
+      (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+    let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm"; f.timeZone = .current
+    for folder in kids.sorted(by: { when($0) > when($1) }) {
+      guard history.count < 4 else { break }
+      let raw = folder.appendingPathComponent("0 raw mono.wav")
+      guard let x = Wav.readMono(raw), x.count > Int(SR) else { continue }
+      let mode = folder.lastPathComponent.hasSuffix("like-a-call") ? "like a call" : "pure mic"
+      history.append(Take(label: String(format: "%@  ·  %@  ·  %.0f s",
+                                        f.string(from: when(folder)), mode, Double(x.count) / SR),
+                          raw: x))
+      if lastFolder == nil { lastFolder = folder }
+    }
+    if !history.isEmpty {
+      openBtn.enabled = true
+      select(0)
+      status.stringValue = "Loaded your last \(history.count) recording\(history.count == 1 ? "" : "s"). Press play, or record a new one."
+    }
     refreshRows()
   }
 
@@ -671,10 +919,12 @@ final class Lab: NSObject, NSApplicationDelegate {
   /// take that gets lost is always the one nobody thought to keep.
   func save(raw: [Float]) {
     takeNo += 1
-    let stamp = ISO8601DateFormatter().string(from: Date())
-      .replacingOccurrences(of: ":", with: "-")
-      .replacingOccurrences(of: "T", with: " ")
-      .prefix(19)
+    // ISO8601DateFormatter is UTC by default, so a take made at 2am was filed
+    // under the previous evening and looked like somebody else's.
+    let fmt = DateFormatter()
+    fmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
+    fmt.timeZone = .current
+    let stamp = fmt.string(from: Date())
     let mode = rec.pureMic ? "pure-mic" : "like-a-call"
     let dir = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Desktop/Voice Lab/\(stamp) \(mode)")
@@ -730,6 +980,138 @@ final class Lab: NSObject, NSApplicationDelegate {
 // about two thousand times a second and varies as it goes; broadband noise
 // crosses far more often and stays flat. It cannot tell a good voice from a bad
 // one, but it can tell a voice from garbage, which is the failure that happened.
+// ── Does the cancellation actually reach the ears? ───────────────────────────
+//
+// The whole speaker path rests on a claim about physics, so it gets measured
+// against a known answer instead of believed. A voice is rendered to the ear
+// difference it is supposed to have, then played through a simulated pair of
+// laptop speakers, and what arrives at each ear is measured -- with the
+// cancellation and without it.
+//
+// The important half is the LAST column. The canceller assumes the listener is
+// 15 degrees off each speaker; the simulation is also run at 11 and 19, which
+// is the head moving. Inverting a path you have estimated wrongly is the way
+// this technique earns its reputation for sounding worse than doing nothing,
+// so a pass requires it to still help when the geometry is wrong.
+func argVal(_ k: String) -> Double? {
+  let a = CommandLine.arguments
+  guard let i = a.firstIndex(of: k), i + 1 < a.count, let v = Double(a[i + 1]) else { return nil }
+  return v
+}
+if let v = argVal("--ctc-depth") { Spatial.ctcDepth = Float(v) }
+if let v = argVal("--ctc-deg")   { Spatial.dipoleDeg = v }
+if let v = argVal("--ctc-lo")    { Spatial.ctcLo = v }
+if let v = argVal("--ctc-hi")    { Spatial.ctcHi = v }
+if CommandLine.arguments.contains("--spatial-test") || CommandLine.arguments.contains("--selftest") {
+  func band(_ x: [Float]) -> [Float] {
+    let lo = Spatial.onePole(x, 300), hi = Spatial.onePole(x, 6000)
+    return (0..<x.count).map { hi[$0] - lo[$0] }
+  }
+  func rms(_ x: [Float]) -> Double {
+    guard !x.isEmpty else { return 0 }
+    var a = 0.0; for v in x { a += Double(v) * Double(v) }
+    return (a / Double(x.count)).squareRoot()
+  }
+  /// Level difference between the ears, in dB, in the band the cue lives in.
+  func ild(_ l: [Float], _ r: [Float]) -> Double {
+    let a = rms(band(l)), b = rms(band(r))
+    guard a > 1e-12, b > 1e-12 else { return 0 }
+    return 20 * log10(b / a)
+  }
+  /// Arrival-time difference between the ears, in samples.
+  ///
+  /// VALIDATE THE RULER FIRST. The obvious version -- cross-correlate the two
+  /// ears over the whole voice band -- reported the timing collapsing from 13
+  /// samples to 6 under cancellation, and 6 is exactly the delay of the
+  /// crosstalk path. The correlator was locking onto the reflection of the
+  /// opposite speaker rather than onto the voice. Timing is carried below about
+  /// 1.5 kHz anyway, and down there the crosstalk comb is far weaker, so the
+  /// estimate is made in that band with the peak interpolated between samples.
+  func itd(_ l: [Float], _ r: [Float]) -> Double {
+    func low(_ x: [Float]) -> [Float] {
+      let lo = Spatial.onePole(x, 150), hi = Spatial.onePole(x, 1500)
+      return (0..<x.count).map { hi[$0] - lo[$0] }
+    }
+    let a = low(l), b = low(r)
+    let n = min(a.count, b.count)
+    guard n > 4000 else { return 0 }
+    var c = [Double](repeating: 0, count: 51)
+    for (k, lag) in (-25...25).enumerated() {
+      var acc = 0.0
+      var i = max(0, -lag)
+      let end = min(n, n - lag)
+      while i < end { acc += Double(a[i]) * Double(b[i + lag]); i += 1 }
+      c[k] = acc
+    }
+    var k = 0; for i in 1..<c.count where c[i] > c[k] { k = i }
+    var frac = 0.0
+    if k > 0, k < c.count - 1 {
+      let d = c[k - 1] - 2 * c[k] + c[k + 1]
+      if abs(d) > 1e-12 { frac = 0.5 * (c[k - 1] - c[k + 1]) / d }
+      frac = max(-1, min(1, frac))
+    }
+    return Double(k - 25) + frac
+  }
+
+  // A deterministic voice-band signal: no microphone, no randomness, same
+  // numbers on every machine.
+  var seed: UInt64 = 0x5eed
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  var x = (0..<Int(SR * 4)).map { i -> Float in
+    // noise, amplitude-modulated at a syllable rate so it has speech-like structure
+    rnd() * 0.5 * Float(0.55 + 0.45 * sin(2 * Double.pi * 3.7 * Double(i) / SR))
+  }
+  x = Spatial.onePole(x, 7000)
+
+  let p = Spatial.presets[1]                       // "Beside you": direction only
+  let (iL, iR) = Spatial.render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
+  let (cL, cR) = Spatial.crosstalkCancel(iL, iR)
+
+  print("  intended at the ears (headphones): ILD \(String(format: "%+.1f", ild(iL, iR))) dB   ITD \(String(format: "%.1f", itd(iL, iR))) samples")
+  // THE COST SIDE. My simulation inverts my own model, so "cancel harder" can
+  // only ever look better in it. The price is real though: cancellation is a
+  // boost, and the lower it reaches the bigger that boost gets, until the voice
+  // is boomy and there is no headroom left. That is measurable even when the
+  // benefit is self-fulfilling.
+  func lowRms(_ x: [Float]) -> Double { rms(Spatial.onePole(x, 400)) }
+  let boost = 20 * log10(max(1e-12, lowRms(cL) + lowRms(cR)) / max(1e-12, lowRms(iL) + lowRms(iR)))
+  var pk: Float = 0; for i in 0..<min(cL.count, cR.count) { pk = max(pk, max(abs(cL[i]), abs(cR[i]))) }
+  var ipk: Float = 0; for i in 0..<min(iL.count, iR.count) { ipk = max(ipk, max(abs(iL[i]), abs(iR[i]))) }
+  print(String(format: "  cost: low-end boost %+.1f dB, peak %+.1f dB", boost, 20 * log10(Double(pk / max(1e-9, ipk)))))
+  // TWO CUES, AND A SETTING THAT HELPS ONE CAN WRECK THE OTHER. Tuning purely on
+  // the level difference produced a canceller that restored ILD everywhere and
+  // pulled the arrival-time difference from 13 samples down to 6 -- and below
+  // about 1.5 kHz, which is most of a voice, timing is the cue that decides
+  // where a sound is. So the timing is a pass condition, not a readout: the
+  // cancellation is not allowed to leave it further from the truth than plain
+  // stereo already did.
+  let want = itd(iL, iR)
+  var worst = Double.infinity, worstOff = 0.0
+  var okAll = true
+  for deg in [8.0, 12.0, 15.0, 20.0, 25.0, 30.0] {
+    let (aL, aR) = Spatial.earsFromSpeakers(iL, iR, halfAngleDeg: deg)
+    let (bL, bR) = Spatial.earsFromSpeakers(cL, cR, halfAngleDeg: deg)
+    let off = ild(aL, aR), on = ild(bL, bR)
+    let tOff = itd(aL, aR), tOn = itd(bL, bR)
+    let gain = on - off
+    if gain < worst { worst = gain; worstOff = off }
+    let ildOK = gain > 0.5
+    let itdOK = abs(tOn - want) <= abs(tOff - want) + 1
+    okAll = okAll && ildOK && itdOK
+    print(String(format: "  head at %2.0f deg: level %+.1f -> %+.1f dB (%+.1f restored)   timing %.1f -> %.1f of %.1f samples   %@",
+                 deg, off, on, gain, tOff, tOn, want,
+                 !ildOK ? "NO HELP (level)" : !itdOK ? "NO HELP (timing wrecked)" : "ok"))
+  }
+  print(okAll
+    ? String(format: "  SPATIAL TEST PASSED -- helps at every head position, worst case %+.1f dB over plain stereo's %+.1f dB", worst, worstOff)
+    : "  SPATIAL TEST FAILED -- cancellation does not survive the head moving")
+  if CommandLine.arguments.contains("--spatial-test") { exit(okAll ? 0 : 1) }
+  if !okAll { exit(1) }
+}
+
 if CommandLine.arguments.contains("--selftest") {
   func zcr(_ x: [Float]) -> Double {
     guard x.count > 1 else { return 0 }
