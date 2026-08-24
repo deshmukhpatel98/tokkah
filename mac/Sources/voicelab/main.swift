@@ -1131,6 +1131,80 @@ if let v = argVal("--ctc-deg")   { Spatial.dipoleDeg = v }
 if let v = argVal("--ctc-lo")    { Spatial.ctcLo = v }
 if let v = argVal("--ctc-hi")    { Spatial.ctcHi = v }
 if let v = argVal("--wide-gain") { Spatial.wideGain = Float(v) }
+if CommandLine.arguments.contains("--vs-call") { }
+// ── DOES THE CALL SOUND LIKE THE LAB? ────────────────────────────────────────
+//
+// A mode is chosen here, by listening, and delivered by a different piece of
+// code in the call: block filters over a whole recording on this side, one
+// sample at a time on the audio thread on that side. Nothing makes those agree
+// except checking, so this writes a signal, has `tk` run its own filter over it,
+// and compares the two answers. Overall level is normalised away first -- the
+// call allows static headroom for the reflections and the Lab peak-normalises,
+// so they legitimately differ by a constant, and a constant is not a difference
+// in sound.
+if CommandLine.arguments.contains("--vs-call") {
+  let tk = argVal("--tk").map { _ in "" } ?? {
+    let a = CommandLine.arguments
+    guard let i = a.firstIndex(of: "--tk"), i + 1 < a.count else { return "" }
+    return a[i + 1]
+  }()
+  guard !tk.isEmpty, FileManager.default.isExecutableFile(atPath: tk) else {
+    print("  --vs-call needs --tk <path to the tk binary>"); exit(2)
+  }
+  var seed: UInt64 = 0xC0FFEE
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  var x = (0..<Int(SR * 4)).map { i -> Float in
+    rnd() * 0.5 * Float(0.55 + 0.45 * sin(2 * Double.pi * 3.1 * Double(i) / SR))
+  }
+  x = Spatial.onePole(x, 7000)
+  let dir = FileManager.default.temporaryDirectory
+  let inURL = dir.appendingPathComponent("pres-in.f32")
+  let outURL = dir.appendingPathComponent("pres-out.f32")
+  try? x.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: inURL)
+
+  // The Lab's preset names, and what the call calls the same thing.
+  let pairs = [("Leaning in", "leaning-in"), ("Right next to you", "next-to-you"),
+               ("In the room with you", "in-the-room"),
+               ("Across the table", "across-the-table"), ("Warmer, no room", "warmer")]
+  var worst = 0.0
+  for (labName, callName) in pairs {
+    guard let p = Spatial.monoPresets.first(where: { $0.name == labName }) else { continue }
+    let pr = Process()
+    pr.executableURL = URL(fileURLWithPath: tk)
+    pr.arguments = ["--presence", callName,
+                    "--presence-run", "\(inURL.path),\(outURL.path)"]
+    pr.standardError = FileHandle.nullDevice
+    pr.standardOutput = FileHandle.nullDevice
+    try? pr.run(); pr.waitUntilExit()
+    guard let d = try? Data(contentsOf: outURL), d.count >= 4 else {
+      print("    \(labName): the call produced nothing"); worst = 99; continue
+    }
+    var got = [Float](repeating: 0, count: d.count / 4)
+    _ = got.withUnsafeMutableBytes { d.copyBytes(to: $0) }
+    let (want, _) = Spatial.render(x, p, speakers: true)
+    let n = min(want.count, got.count)
+    func r(_ v: ArraySlice<Float>) -> Double {
+      var a = 0.0; for s in v { a += Double(s) * Double(s) }
+      return (a / Double(v.count)).squareRoot()
+    }
+    let gw = r(want[0..<n]), gg = r(got[0..<n])
+    guard gw > 1e-9, gg > 1e-9 else { print("    \(labName): silence"); worst = 99; continue }
+    let k = Float(gw / gg)
+    var err = 0.0
+    for i in 0..<n { err = max(err, abs(Double(want[i] - got[i] * k))) }
+    let rel = err / gw
+    worst = max(worst, rel)
+    print(String(format: "    %@%@  worst sample differs by %.1f%% of the voice",
+                 labName.padding(toLength: 22, withPad: " ", startingAt: 0),
+                 rel < 0.02 ? "same sound " : "DIFFERENT  ", rel * 100))
+  }
+  print(worst < 0.02 ? "  CALL MATCHES THE LAB" : "  CALL DOES NOT MATCH THE LAB")
+  exit(worst < 0.02 ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--spatial-test") || CommandLine.arguments.contains("--selftest") {
   func band(_ x: [Float]) -> [Float] {
     let lo = Spatial.onePole(x, 300), hi = Spatial.onePole(x, 6000)

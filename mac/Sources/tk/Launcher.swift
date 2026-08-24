@@ -299,6 +299,20 @@ enum Launcher {
     return "\(a.randomElement()!)-\(b.randomElement()!)-\(c.randomElement()!)"
   }
 
+  // ── THE JOIN WINDOW, REBUILT ON THE SAME SURFACE AS THE CALL ───────────────
+  //
+  // What was here was stock AppKit: a grey `NSTextField`, two `.rounded` bezel
+  // buttons, `.inline` chips for the recents, and a camera preview bolted to the
+  // top half as a separate box with a label over it. It worked, and it looked like
+  // a preferences pane from a different decade of the platform -- while the call it
+  // opens is a full-bleed picture with glass floating on it. Two screens, two
+  // products, ten seconds apart.
+  //
+  // So it is the call window's own composition: your camera edge to edge, one
+  // pane of glass floating on it holding everything you can do. Nothing here is a
+  // new idea; it is the same three parts the waiting card already uses, which is
+  // the point -- the join window should look like the thing it is the front door
+  // to.
   static func askRoom() -> String? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
@@ -306,14 +320,22 @@ enum Launcher {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
-    let W: CGFloat = 520, PREVIEW: CGFloat = 268, H: CGFloat = PREVIEW + 214
+    let W: CGFloat = 560, H: CGFloat = 520
     let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
-                     styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                     styleMask: [.titled, .closable, .fullSizeContentView],
+                     backing: .buffered, defer: false)
     w.title = "Kin"
+    // Same treatment as the call window: the picture runs under the title bar and
+    // only the traffic lights remain. A chrome band above a face is just a
+    // smaller face, here as much as there.
+    w.titlebarAppearsTransparent = true
+    w.titleVisibility = .hidden
+    w.backgroundColor = Palette.bg
     w.center()
     w.isReleasedWhenClosed = false
 
     let v = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+    v.wantsLayer = true
 
     // ── THE CAMERA, BEFORE YOU COMMIT TO A CALL ───────────────────────────────
     //
@@ -327,19 +349,171 @@ enum Launcher {
     // encode anything, so the capture pipeline it needs is the one AVFoundation
     // already has. The session is torn down before the re-exec so the real call
     // opens the device cleanly.
-    let camBox = NSView(frame: NSRect(x: 0, y: H - PREVIEW, width: W, height: PREVIEW))
+    let camBox = NSView(frame: v.bounds)
+    camBox.autoresizingMask = [.width, .height]
     camBox.wantsLayer = true
     let host = CALayer()
-    host.backgroundColor = NSColor.black.cgColor
+    host.backgroundColor = Palette.bg.cgColor
     camBox.layer = host
     v.addSubview(camBox)
 
+    // A dim over the picture, for the same reason the call window has one: the
+    // glass below is clear-adjacent and the thing behind it is a face lit by
+    // whatever is in the room. 35%, the HIG's number.
+    let dim = CAGradientLayer()
+    dim.frame = NSRect(x: 0, y: 0, width: W, height: H * 0.62)
+    dim.startPoint = CGPoint(x: 0.5, y: 1)
+    dim.endPoint = CGPoint(x: 0.5, y: 0)
+    dim.colors = [NSColor.clear.cgColor, Palette.dim.cgColor]
+    dim.autoresizingMask = [.layerWidthSizable]
+    host.addSublayer(dim)
+
+    // ── WHAT THE CAMERA IS DOING, IN A PILL ───────────────────────────────────
+    //
+    // This was a bare `NSTextField` centred over a black box. It is a pill now, in
+    // the middle where the picture would be, so "Starting camera…" and "Camera
+    // access is off" arrive as a statement about the picture rather than as a
+    // caption floating in a void.
+    let hintPill = Glass(radius: Metric.capsule(Metric.pillHeight), variant: .regular)
     let hint = NSTextField(labelWithString: "")
-    hint.font = .systemFont(ofSize: 12)
-    hint.textColor = .secondaryLabelColor
+    hint.font = Type_.status
+    hint.textColor = Palette.fg
     hint.alignment = .center
-    hint.frame = NSRect(x: 20, y: H - PREVIEW / 2 - 9, width: W - 40, height: 18)
+    hint.backgroundColor = .clear
+    hint.isBordered = false
+    func setHint(_ s: String) {
+      hint.stringValue = s
+      hintPill.isHidden = s.isEmpty
+      hint.isHidden = s.isEmpty
+      guard !s.isEmpty else { return }
+      let tw = ceil((s as NSString).size(withAttributes: [.font: Type_.status]).width)
+      let pw = tw + Metric.s8
+      hintPill.frame = NSRect(x: (W - pw) / 2, y: H * 0.62, width: pw, height: Metric.pillHeight)
+      hint.frame = NSRect(x: (W - pw) / 2, y: H * 0.62 + (Metric.pillHeight - 16) / 2,
+                          width: pw, height: 16)
+    }
+    v.addSubview(hintPill)
     v.addSubview(hint)
+
+    let session = AVCaptureSession()
+    setHint("Starting camera…")
+
+    // ── ONE PANE OF GLASS, HOLDING EVERYTHING YOU CAN DO ──────────────────────
+    let recents = Array(recentRooms.prefix(4))
+    let pad = Metric.cardPad
+    // Every term is a thing on screen or the space above it, so the card is
+    // exactly as tall as its contents and no taller. The first version reserved a
+    // status line AND a recents gap with generous spacing on both, and the two
+    // empty bands together left sixty points of nothing in the middle of the card.
+    let statusH: CGFloat = 14
+    let cardH: CGFloat = pad + 24 + Metric.s1 + 32 + Metric.s5 + Metric.fieldHeight
+                       + Metric.s1 + statusH + (recents.isEmpty ? 0 : Metric.s2 + 24) + pad
+    let cardW = W - Metric.gutter * 2
+    let card = Glass(radius: Metric.cardRadius, variant: .regular)
+    card.tint = Palette.glassTint
+    card.frame = NSRect(x: Metric.gutter, y: Metric.gutter, width: cardW, height: cardH)
+    v.addSubview(card)
+
+    let title = NSTextField(labelWithString: "Join a call")
+    title.font = Type_.title
+    title.textColor = Palette.fg
+    title.backgroundColor = .clear
+    title.isBordered = false
+    var cy = card.frame.maxY - pad - 24
+    title.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: 24)
+    v.addSubview(title)
+
+    // Shorter than it was. The old copy ran to two dense lines about the name
+    // being the encryption key AND the rendezvous AND the setup; all true, and
+    // more than anyone reads standing in a doorway.
+    let sub = NSTextField(labelWithString: "Both of you type the same name. It is also the key, "
+                        + "so pick something only the two of you would say.")
+    sub.font = Type_.caption
+    sub.textColor = Palette.muted
+    sub.maximumNumberOfLines = 2
+    sub.lineBreakMode = .byWordWrapping
+    sub.backgroundColor = .clear
+    sub.isBordered = false
+    cy -= Metric.s1 + 32
+    sub.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: 32)
+    v.addSubview(sub)
+
+    // The row: name, Suggest, Join. Vibrant fills, not glass -- this is INSIDE a
+    // glass surface, and glass on glass is the one thing the guidance rules out.
+    cy -= Metric.s5 + Metric.fieldHeight
+    let joinW: CGFloat = 92, suggestW: CGFloat = 84
+    let fieldW = cardW - pad * 2 - Metric.s2 * 2 - joinW - suggestW
+    let fieldBack = Vibrant()
+    fieldBack.radius = Metric.cardFieldRadius
+    fieldBack.frame = NSRect(x: card.frame.minX + pad, y: cy,
+                             width: fieldW, height: Metric.fieldHeight)
+    v.addSubview(fieldBack)
+
+    let field = NSTextField(frame: NSRect(x: fieldBack.frame.minX + Metric.s4,
+                                          y: cy + (Metric.fieldHeight - 19) / 2,
+                                          width: fieldW - Metric.s4 * 2, height: 19))
+    field.placeholderString = "room name"
+    field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom()
+    field.font = Type_.field
+    field.textColor = Palette.fg
+    field.backgroundColor = .clear
+    field.drawsBackground = false
+    field.isBordered = false
+    field.focusRingType = .none
+    v.addSubview(field)
+
+    let newBtn = PillButton("Suggest")
+    let join = PillButton("Join")
+    join.prominent = true
+    newBtn.setFrameSize(NSSize(width: suggestW, height: Metric.fieldHeight))
+    join.setFrameSize(NSSize(width: joinW, height: Metric.fieldHeight))
+    newBtn.setFrameOrigin(NSPoint(x: fieldBack.frame.maxX + Metric.s2, y: cy))
+    join.setFrameOrigin(NSPoint(x: newBtn.frame.maxX + Metric.s2, y: cy))
+    v.addSubview(newBtn)
+    v.addSubview(join)
+
+    // Validation messages. A reserved line, so saying something does not shove
+    // the recents down and move a target under a finger already travelling.
+    cy -= Metric.s1 + statusH
+    let status = NSTextField(labelWithString: "")
+    status.font = Type_.caption
+    status.textColor = Palette.warn
+    status.backgroundColor = .clear
+    status.isBordered = false
+    status.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: statusH)
+    v.addSubview(status)
+
+    // Camera-denied recovery, in the same pill language as everything else.
+    let settingsButton = PillButton("Open Settings")
+    settingsButton.setFrameSize(NSSize(width: 132, height: Metric.pillHeight))
+    settingsButton.setFrameOrigin(NSPoint(x: (W - 132) / 2, y: H * 0.62 - Metric.s2 - Metric.pillHeight))
+    settingsButton.isHidden = true
+    settingsButton.onPress = {
+      // The exact pane, not the top of Settings: "go and find it" is how a person
+      // gives up on an app.
+      if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+        NSWorkspace.shared.open(u)
+      }
+    }
+    v.addSubview(settingsButton)
+
+    func startPreview() {
+      guard let dev = AVCaptureDevice.default(for: .video) ?? CameraSource.available().first,
+            let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) else {
+        setHint("No camera found — this call will be audio only.")
+        return
+      }
+      session.addInput(input)
+      let pl = AVCaptureVideoPreviewLayer(session: session)
+      pl.videoGravity = .resizeAspectFill
+      pl.frame = CGRect(x: 0, y: 0, width: W, height: H)
+      pl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+      // BELOW the dim, or the gradient that keeps the glass legible ends up behind
+      // the picture doing nothing.
+      host.insertSublayer(pl, below: dim)
+      setHint("")
+      DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
+    }
 
     // ── ASK FOR THE CAMERA, HERE, AND SAY WHAT HAPPENED ───────────────────────
     //
@@ -352,93 +526,22 @@ enum Launcher {
     //
     // So it is requested explicitly, at the moment the person is looking at the
     // window it is about, and each of the three outcomes says something different.
-    let session = AVCaptureSession()
-    hint.stringValue = "Starting camera…"
-    let settingsButton = NSButton(title: "Open Settings", target: nil, action: nil)
-    settingsButton.bezelStyle = .rounded
-    settingsButton.frame = NSRect(x: (W - 140) / 2, y: H - PREVIEW / 2 - 46, width: 140, height: 28)
-    settingsButton.isHidden = true
-    v.addSubview(settingsButton)
-
-    final class Opener: NSObject {
-      @objc func go() {
-        // The exact pane, not the top of Settings: "go and find it" is how a person
-        // gives up on an app.
-        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
-          NSWorkspace.shared.open(u)
-        }
-      }
-    }
-    let opener = Opener()
-    settingsButton.target = opener
-    settingsButton.action = #selector(Opener.go)
-
-    func startPreview() {
-      guard let dev = AVCaptureDevice.default(for: .video) ?? CameraSource.available().first,
-            let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) else {
-        hint.stringValue = "No camera found — this call will be audio only."
-        return
-      }
-      session.addInput(input)
-      let pl = AVCaptureVideoPreviewLayer(session: session)
-      pl.videoGravity = .resizeAspectFill
-      pl.frame = CGRect(x: 0, y: 0, width: W, height: PREVIEW)
-      host.addSublayer(pl)
-      hint.stringValue = ""
-      DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
-    }
-
     CameraSource.requestAccess { access in
       DispatchQueue.main.async {
         switch access {
         case .granted:
           startPreview()
         case .denied:
-          hint.stringValue = "Camera access is off, so they will not see you."
+          setHint("Camera access is off, so they will not see you.")
           settingsButton.isHidden = false
           fputs("camera: access DENIED -- the call will be audio only\n", stderr)
         case .restricted:
-          hint.stringValue = "Camera use is restricted on this Mac — audio only."
+          setHint("Camera use is restricted on this Mac — audio only.")
           fputs("camera: access restricted by policy\n", stderr)
         }
       }
     }
 
-    let title = NSTextField(labelWithString: "Join a call")
-    title.font = .systemFont(ofSize: 20, weight: .semibold)
-    title.frame = NSRect(x: 24, y: H - PREVIEW - 38, width: 300, height: 26)
-    v.addSubview(title)
-
-    let sub = NSTextField(labelWithString: "Both of you type the same room name — that is the whole setup. "
-                        + "It is also the encryption key, so pick something only the two of you would say.")
-    sub.font = .systemFont(ofSize: 11)
-    sub.textColor = .secondaryLabelColor
-    sub.maximumNumberOfLines = 2
-    sub.frame = NSRect(x: 24, y: H - PREVIEW - 74, width: W - 48, height: 32)
-    v.addSubview(sub)
-
-    let field = NSTextField(frame: NSRect(x: 24, y: H - PREVIEW - 112, width: W - 48 - 96, height: 30))
-    field.placeholderString = "room name"
-    field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom()
-    field.font = .systemFont(ofSize: 15)
-    v.addSubview(field)
-
-    let newBtn = NSButton(title: "Suggest", target: nil, action: nil)
-    newBtn.frame = NSRect(x: W - 24 - 88, y: H - PREVIEW - 112, width: 88, height: 30)
-    newBtn.bezelStyle = .rounded
-    v.addSubview(newBtn)
-
-    let status = NSTextField(labelWithString: "")
-    status.font = .systemFont(ofSize: 11)
-    status.textColor = .secondaryLabelColor
-    status.frame = NSRect(x: 24, y: 20, width: W - 150, height: 16)
-    v.addSubview(status)
-
-    let join = NSButton(title: "Join", target: nil, action: nil)
-    join.frame = NSRect(x: W - 24 - 104, y: 14, width: 104, height: 32)
-    join.bezelStyle = .rounded
-    join.keyEquivalent = "\r"                      // Return joins
-    v.addSubview(join)
     w.contentView = v
 
     // A tiny target rather than a delegate class: the whole interaction is "did
@@ -482,35 +585,40 @@ enum Launcher {
       @objc func cancel() { done = true }
     }
     let t = Target(field: field, status: status)
-    join.target = t
-    join.action = #selector(Target.go)
-    newBtn.target = t
-    newBtn.action = #selector(Target.suggest)
+    join.onPress = { t.go() }
+    newBtn.onPress = { t.suggest() }
+    // Return joins. `keyEquivalent` belonged to the NSButton this replaced, so the
+    // field's own action carries it now -- and the field is where the Return is
+    // actually pressed, which is one fewer thing to keep in agreement.
+    field.target = t
+    field.action = #selector(Target.go)
 
     // Rooms you have actually been in, one click each.
-    let recents = recentRooms
     if !recents.isEmpty {
-      let lbl = NSTextField(labelWithString: "Recent")
-      lbl.font = .systemFont(ofSize: 10, weight: .semibold)
-      lbl.textColor = .tertiaryLabelColor
-      lbl.frame = NSRect(x: 24, y: H - PREVIEW - 140, width: 60, height: 14)
-      v.addSubview(lbl)
-      var x: CGFloat = 24
-      for r in recents.prefix(4) {
-        let b = NSButton(title: r, target: t, action: #selector(Target.pickRecent(_:)))
-        b.bezelStyle = .inline
-        b.font = .systemFont(ofSize: 11)
-        let width = min(150, b.intrinsicContentSize.width + 18)
-        if x + width > W - 24 { break }
-        b.frame = NSRect(x: x, y: H - PREVIEW - 166, width: width, height: 22)
-        v.addSubview(b)
-        x += width + 8
+      cy -= Metric.s2 + 24
+      var x = card.frame.minX + pad
+      for r in recents {
+        let chip = PillButton(r)
+        chip.setFrameSize(NSSize(width: min(160, chip.frame.width), height: 24))
+        if x + chip.frame.width > card.frame.maxX - pad { break }
+        chip.setFrameOrigin(NSPoint(x: x, y: cy))
+        chip.onPress = { [weak t] in
+          guard let t else { return }
+          t.field.stringValue = r
+          if let name = t.validate(r) { t.picked = name; t.done = true }
+        }
+        v.addSubview(chip)
+        x += chip.frame.width + Metric.s2
       }
     }
 
     w.makeKeyAndOrderFront(nil)
     w.makeFirstResponder(field)
     app.activate(ignoringOtherApps: true)
+    // The same line the call window prints, and for the same reason: a material is
+    // composited by the window server, so the only capture that can see this
+    // screen is one aimed at this window.
+    fputs("window id \(w.windowNumber) -- screencapture -l \(w.windowNumber) -x out.png\n", stderr)
 
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.

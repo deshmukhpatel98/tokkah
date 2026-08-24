@@ -882,6 +882,119 @@ final class Audio {
   /// a peer sends anything, `onRender` zero-fills and returns early, so a healthy
   /// output unit ticks this and leaves `renderTicks` at zero -- see the watchdog.
   var renderCallbacks = 0
+  // ── PRESENCE: how far away the person sounds ─────────────────────────────
+  //
+  // Direction cannot be delivered on a laptop speaker. It lives entirely in the
+  // difference between the two ears, both speakers reach both ears, and
+  // cancelling that crosstalk was measured and abandoned -- it bought +0.3 dB of
+  // the cue for 1.9 dB of change to the tone of the voice, which sounds exactly
+  // as bad as it reads. Distance is a different matter: level, the
+  // direct-to-reverberant ratio and spectrum are all monaural cues, so they
+  // arrive intact on one speaker, on two, or on a phone held at arm's length.
+  //
+  // COSTS NO LATENCY, BY CONSTRUCTION. The direct sound is passed through
+  // untouched and the reflections are added behind it -- they are late by
+  // definition, so nothing waits for them. It costs no bandwidth either: this
+  // runs on the receiving end, on a stream that was already sent.
+  //
+  // The parameters are the ones from Voice Lab, so a mode chosen by listening
+  // there is the same mode here.
+  struct Presence {
+    var lowG: Float = 0, highG: Float = 0
+    var taps = 0
+    var tapD = (0, 0, 0, 0)
+    /// The fractional part of each delay. A reflection at 9.1 ms is 436.8
+    /// samples, and rounding that to 436 moves it by 4 microseconds -- which
+    /// sounds like nothing and is not: the Lab interpolates, so truncating here
+    /// made every mode with a room in it a measurably different sound from the
+    /// one that was chosen by listening.
+    var tapF: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    var tapG: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    var scale: Float = 1
+    var on: Bool { lowG != 0 || highG != 0 || taps > 0 }
+
+    static func named(_ n: String) -> Presence? {
+      func mk(_ low: Double, _ high: Double, _ t: [(Double, Float)]) -> Presence {
+        var p = Presence()
+        p.lowG = Float(pow(10, low / 20) - 1)
+        p.highG = Float(pow(10, high / 20) - 1)
+        p.taps = min(4, t.count)
+        var d = [0, 0, 0, 0]; var f: [Float] = [0, 0, 0, 0]; var g: [Float] = [0, 0, 0, 0]
+        var sum: Float = 0
+        for i in 0..<p.taps {
+          let samples = t[i].0 * SR
+          d[i] = Int(samples.rounded(.down)); f[i] = Float(samples - samples.rounded(.down))
+          g[i] = t[i].1; sum += abs(t[i].1)
+        }
+        p.tapD = (d[0], d[1], d[2], d[3]); p.tapF = (f[0], f[1], f[2], f[3])
+        p.tapG = (g[0], g[1], g[2], g[3])
+        // A static headroom allowance, not a limiter: reflections are delayed
+        // and dulled so they rarely peak together, and a shelf only lifts part
+        // of the band. Half of each is the room left for them.
+        let lift = Float(max(0, pow(10, max(low, high) / 20) - 1))
+        p.scale = 1 / (1 + 0.5 * sum + 0.5 * lift)
+        return p
+      }
+      switch n {
+      case "off", "today":     return Presence()
+      case "leaning-in":       return mk(5.5, 1.5, [])
+      case "next-to-you":      return mk(3.5, 1.0, [(0.0041, 0.10), (0.0079, 0.07)])
+      case "in-the-room":      return mk(0, 0, [(0.0091, 0.26), (0.0168, 0.19), (0.0277, 0.13)])
+      case "across-the-table": return mk(0, -2.5, [(0.0142, 0.42), (0.0238, 0.34),
+                                                   (0.0371, 0.27), (0.0503, 0.20)])
+      case "warmer":           return mk(3.0, -1.0, [])
+      default:                 return nil
+      }
+    }
+  }
+  /// Held separately from Audio so the filter can be run -- and checked against
+  /// the version people chose a mode with -- without opening a device.
+  final class PresenceFilter {
+    static let PRES = 4096                              // > the longest reflection
+    static let PMASK = PRES - 1
+    var p = Presence()
+    private let buf: UnsafeMutablePointer<Float>
+    private var w = 0
+    private var lo: Float = 0, hi: Float = 0, dull: Float = 0
+    init() {
+      buf = .allocate(capacity: PresenceFilter.PRES)
+      buf.initialize(repeating: 0, count: PresenceFilter.PRES)
+    }
+    /// One sample. No allocation, no locks, and a straight passthrough when off.
+    @inline(__always) func process(_ x: Float) -> Float {
+      guard p.on else { return x }
+      // The reflections are a duller copy of the voice: a surface absorbs the
+      // top end, and a bright echo reads as an effect rather than as a room.
+      dull = 0.493727 * x + 0.506273 * dull            // one pole, 5.2 kHz
+      buf[w & PresenceFilter.PMASK] = dull
+      @inline(__always) func tap(_ d: Int, _ f: Float, _ g: Float) -> Float {
+        let a = buf[(w - d) & PresenceFilter.PMASK]
+        let b = buf[(w - d - 1) & PresenceFilter.PMASK]
+        return g * (a * (1 - f) + b * f)
+      }
+      var y = x
+      if p.taps > 0 { y += tap(p.tapD.0, p.tapF.0, p.tapG.0) }
+      if p.taps > 1 { y += tap(p.tapD.1, p.tapF.1, p.tapG.1) }
+      if p.taps > 2 { y += tap(p.tapD.2, p.tapF.2, p.tapG.2) }
+      if p.taps > 3 { y += tap(p.tapD.3, p.tapF.3, p.tapG.3) }
+      w += 1
+      if p.lowG != 0 {
+        lo = 0.97416 * lo + 0.02584 * y                 // one pole, 200 Hz
+        y += p.lowG * lo
+      }
+      if p.highG != 0 {
+        hi = 0.592385 * hi + 0.407615 * y               // one pole, 4 kHz
+        y += p.highG * (y - hi)
+      }
+      return y * p.scale
+    }
+  }
+  static var presence = Presence() { didSet { sharedPresence.p = presence } }
+  nonisolated(unsafe) static let sharedPresence = PresenceFilter()
+  private let pres = Audio.sharedPresence
+
+  @inline(__always) private func presence(_ x: Float) -> Float { pres.process(x) }
+
   var lastRenderErr: OSStatus = 0
 
   init() {
@@ -1856,11 +1969,18 @@ final class Audio {
           xfade -= 1
           if xfade == 0 { plcPeriod = 0; plcSamples = 0 }
         }
-        out[i] = mute ? 0 : val
+        // Presence is applied to what LEAVES the machine, not to what the rest
+        // of this loop reasons about. The concealment history, the edge detector
+        // and the continuity metrics all want the clean stream; feeding a room
+        // back into them would have the synthesis chase its own reflections.
+        // The echo canceller is the exception and must see the treated signal,
+        // because that is what the speaker actually plays into the microphone.
+        let played = presence(val)
+        out[i] = mute ? 0 : played
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
-        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
+        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
         sigSumSq += Double(val) * Double(val); sigN += 1
         // History is what was actually PLAYED, and only the good path writes it:
         // feeding synthesis back in would make the cursor chase its own tail.
@@ -1941,11 +2061,12 @@ final class Audio {
         } else if !concealZeros {
           val = plcNext()
         }
-        out[i] = mute ? 0 : val
+        let played = presence(val)
+        out[i] = mute ? 0 : played
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
-        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = val; echoW += 1 }
+        if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
         if concealRun < 1_000_000_000 { concealRun += 1 }
         goodRun = 0
         ring.concealedS += 1

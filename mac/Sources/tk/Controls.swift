@@ -26,52 +26,11 @@ import AppKit
 // the bottom: information sits in pills at the top, actions float in a glass bar
 // at the bottom, and the video runs full-bleed underneath all of it -- which is
 // what FaceTime does, and what the web app does.
-enum Palette {
-  static func hex(_ v: UInt32, _ a: CGFloat = 1) -> NSColor {
-    NSColor(srgbRed: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
-            blue: CGFloat(v & 0xff) / 255, alpha: a)
-  }
-  static let fg = hex(0xe8eaed)
-  static let muted = hex(0x9aa4b2)
-  static let accent = hex(0x60a5fa)
-  static let ok = hex(0x4ade80)
-  static let warn = hex(0xfbbf24)
-  static let bad = hex(0xef4444)
-  static let bg = hex(0x06080d)
-  static let glass = NSColor(srgbRed: 10/255, green: 14/255, blue: 22/255, alpha: 0.72)
-  static let glassLine = NSColor(white: 1, alpha: 0.14)
-}
-
-/// A rounded, blurred surface. `NSVisualEffectView` is the real thing -- the web
-/// app's `backdrop-filter: blur(18px)` has an exact native counterpart and there is
-/// no reason to fake it with a flat fill.
-final class Glass: NSVisualEffectView {
-  // ── DECORATION IS NOT A TARGET ─────────────────────────────────────────────
-  //
-  // The blur is a subview of the button it sits inside, so `hitTest` handed every
-  // click to the glass and not to the button. Two consequences, both invisible in
-  // a handler test: `acceptsFirstMouse` was asked of the glass (which says no), so
-  // the first click on a background window was always eaten; and every audit that
-  // started at the content view happily reported the right control was reachable.
-  // A pane of glass has nothing to do with a click. It passes them through.
-  override func hitTest(_ point: NSPoint) -> NSView? { nil }
-  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-  init(radius: CGFloat, circle: Bool = false) {
-    super.init(frame: .zero)
-    material = .hudWindow
-    blendingMode = .withinWindow
-    state = .active
-    appearance = NSAppearance(named: .vibrantDark)
-    wantsLayer = true
-    layer?.cornerRadius = radius
-    layer?.masksToBounds = true
-    layer?.borderWidth = 1
-    layer?.borderColor = Palette.glassLine.cgColor
-    layer?.backgroundColor = Palette.glass.cgColor
-    _ = circle
-  }
-  required init?(coder: NSCoder) { fatalError() }
-}
+// `Palette`, `Glass`, `Metric`, `Type_`, `Motion` and `GlassGroup` all moved to
+// Glass.swift, which is now the design system: the material, the type ramp and the
+// geometry rule, in one place. They were here, and `Glass` was an
+// `NSVisualEffectView` with an opaque fill painted over the blur -- so it was not
+// glass, and nothing that photographed it could tell.
 
 // ── THE WEB APP'S OWN ICONS, AS PATHS ───────────────────────────────────────
 //
@@ -270,7 +229,12 @@ enum Glyph {
 // three circles red put two more of them next to the one irreversible button.
 final class IconButton: NSButton {
   private let shape: Glyph.Shape
-  private let glass = Glass(radius: 0)
+  // CLEAR, and interactive. A bar circle carries a glyph rather than a sentence
+  // and floats over a live face, which is precisely the case the HIG names for the
+  // clear variant: "components that float above media backgrounds -- such as
+  // photos and videos -- to create a more immersive content experience." The dim
+  // that keeps it legible is a gradient on the overlay, not a fill in here.
+  private let glass = Glass(radius: 0, variant: .clear, interactive: true)
   private var hovering = false
   /// Bar circles are 58; the corner `more` button is 48, like the web app.
   private let box: CGFloat
@@ -288,8 +252,29 @@ final class IconButton: NSButton {
   var off = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
   /// Active: `box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.35)`.
   var on = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
-  /// The one filled control.
-  var destructive = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
+  // ── THE ONE PROMINENT CONTROL ──────────────────────────────────────────────
+  //
+  // It used to be a flat red disc with the glass hidden underneath it -- `.icon-btn.leave
+  // { background: var(--bad) }`, straight from the web app's CSS. Next to four
+  // circles of real material it read as a sticker: the only thing on the screen
+  // that was paint rather than glass.
+  //
+  // It is tinted glass now, which is what the platform does with a prominent
+  // action -- "Assign a tint color to suggest prominence" -- and it keeps the rule
+  // this file already had. There is still exactly one dominant control, mic and
+  // camera still turn their GLYPH red rather than their whole circle, and the
+  // irreversible button is still the only one that looks irreversible. It is now
+  // made of the same stuff as its neighbours while doing it.
+  var destructive = false {
+    didSet {
+      guard destructive != oldValue else { return }
+      // A WARM tint, not the colour itself: the colour is the fill behind the
+      // glass (see `draw`). This only stops the material from cooling the red back
+      // toward the blue of whatever is on the other side of it.
+      glass.tint = destructive ? Palette.destructiveTint : nil
+      needsDisplay = true; ink.needsDisplay = true
+    }
+  }
   // ── PRESS AND HOLD ─────────────────────────────────────────────────────────
   //
   // `#peek` is `pointerdown` -> show, `pointerup` -> hide. Not a toggle: the web
@@ -322,7 +307,7 @@ final class IconButton: NSButton {
     setAccessibilityLabel(help)
     wantsLayer = true
     glass.frame = NSRect(x: 0, y: 0, width: size, height: size)
-    glass.layer?.cornerRadius = size / 2
+    glass.radius = Metric.capsule(size)
     addSubview(glass)
     // ── THE GLYPH HAS TO BE ABOVE THE BLUR ────────────────────────────────────
     //
@@ -333,7 +318,13 @@ final class IconButton: NSButton {
     // A convincing false negative: the drawing code was right the whole time.
     ink.frame = NSRect(x: 0, y: 0, width: size, height: size)
     ink.owner = self
-    addSubview(ink)
+    // HANDED TO THE GLASS, not stacked on it. See `Glass.content`: a sibling above
+    // the material gets caught in the material's own resampling, and every stroked
+    // glyph in the row came out soft and haloed while the one button with no glass
+    // behind it -- the red leave circle -- stayed razor sharp. Same drawing code,
+    // so the material was the only difference. On a Mac without Liquid Glass the
+    // setter falls back to adding it as a subview, which is what it always was.
+    glass.content = ink
   }
   required init?(coder: NSCoder) { fatalError() }
 
@@ -419,8 +410,12 @@ final class IconButton: NSButton {
   override func layout() {
     super.layout()
     glass.frame = bounds
-    glass.layer?.cornerRadius = min(bounds.width, bounds.height) / 2
-    glass.isHidden = destructive
+    // A capsule at every width. The confirm morph stretches this button from 58 to
+    // 150 points wide, and a fixed radius would have it pass through every shape
+    // between a circle and a rounded rectangle on the way. Half the HEIGHT keeps it
+    // a capsule throughout, so the circle grows into a pill and never looks like a
+    // box with soft corners.
+    glass.radius = Metric.capsule(bounds.height)
     ink.frame = bounds
   }
 
@@ -430,25 +425,45 @@ final class IconButton: NSButton {
       ? NSBezierPath(roundedRect: bounds, xRadius: 24, yRadius: 24)
       : NSBezierPath(ovalIn: NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2,
                                     width: d, height: d))
+    // ── THE RED GOES BEHIND THE GLASS, NOT INTO IT ────────────────────────────
+    //
+    // `tintColor` was the obvious way to make this button prominent and it is the
+    // wrong tool for a strong colour. The header says the tint is what the glass
+    // tints the background "toward", so it BLENDS with whatever is behind: at 0.96
+    // over a navy jacket, `#ef4444` photographed as a deep maroon. Correct hue,
+    // wrong brightness, on the one button that has to be unmistakable.
+    //
+    // So the colour is a fill in this view's own backing, and the glass -- which is
+    // a subview and therefore composites above it -- refracts a red field instead
+    // of a blue one. Bright red, and still glass: it keeps the specular rim and the
+    // interactive response, and the glyph stays crisp because it lives inside the
+    // material rather than under it.
+    //
+    // Everything else `draw` used to do is gone. The 1 pt `--glass-line` ring
+    // around every circle moved into the ink, where the material cannot resample it
+    // into a soft grey band.
     if destructive {
-      // `.icon-btn.leave { background: var(--bad) }`, and #f26464 on hover.
-      (hovering ? Palette.hex(0xf26464) : Palette.bad).setFill()
+      (hovering ? Palette.hex(0xf46b6b) : Palette.bad).setFill()
+      circle.fill()
+    } else if hovering {
+      Palette.fill(0.10).setFill()
       circle.fill()
     }
-    // `border: 1px solid var(--glass-line)`, brightening to .28 on hover.
-    (destructive ? (hovering ? Palette.hex(0xf26464) : Palette.bad)
-                 : NSColor(white: 1, alpha: hovering ? 0.28 : 0.14)).setStroke()
-    circle.lineWidth = 1
-    circle.stroke()
   }
 
-  /// Called by the overlay, so it lands on top of the blur.
+  /// Called by the glass, so it lands ON the material rather than under it.
   fileprivate func drawGlyph(in bounds: NSRect) {
     let d = min(bounds.width, bounds.height)
     if confirming, let text = confirmLabel {
+      let r = Metric.capsule(bounds.height)
+      let edge = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                              xRadius: r, yRadius: r)
+      Palette.fill(hovering ? 0.34 : 0.16).setStroke()
+      edge.lineWidth = 1
+      edge.stroke()
       // Glyph and word side by side, the pair centred: `gap: 8px`, 13px semibold.
       let gsize: CGFloat = 22
-      let f = NSFont.systemFont(ofSize: 13, weight: .semibold)
+      let f = Type_.confirm
       let a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
       let tw = (text as NSString).size(withAttributes: a)
       let total = gsize + 8 + tw.width
@@ -465,11 +480,28 @@ final class IconButton: NSButton {
       (text as NSString).draw(at: NSPoint(x: x, y: (bounds.height - tw.height) / 2), withAttributes: a)
       return
     }
+    // ── THE EDGE, DRAWN WHERE IT STAYS CRISP ──────────────────────────────────
+    //
+    // Liquid Glass draws a specular rim of its own, and over bright content it is
+    // plenty. Over a dark navy jacket it nearly vanishes, and four discs with no
+    // edge on a dark picture are four things you have to look for. So there is a
+    // hairline again -- but here, in the ink, INSIDE the glass, rather than in
+    // `draw` underneath it where the material resampled it into a soft grey band.
+    //
+    // Faint on purpose. It is helping the material find its edge on dark content,
+    // not replacing it; it brightens on hover, which is the one thing the glass
+    // itself has no opinion about.
+    let edge = NSBezierPath(ovalIn: NSRect(
+      x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
+      .insetBy(dx: 0.5, dy: 0.5))
+    Palette.fill(hovering ? 0.34 : 0.16).setStroke()
+    edge.lineWidth = 1
+    edge.stroke()
     if on {
       // `box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.35)`.
       let r = NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
         .insetBy(dx: 1.5, dy: 1.5)
-      NSColor(white: 1, alpha: 0.35).setStroke()
+      Palette.fill(0.35).setStroke()
       let ring = NSBezierPath(ovalIn: r); ring.lineWidth = 1.5; ring.stroke()
     }
     // 26 px of a 58 px circle, centred, stroke 1.8 scaled with it.
@@ -501,10 +533,13 @@ final class IconButton: NSButton {
 /// A 999px information pill: room name, call quality, a warning.
 final class Pill: NSView {
   private let label = NSTextField(labelWithString: "")
-  private let glass = Glass(radius: 13)
+  // REGULAR: it carries words, over a face, with nothing dimming it. The regular
+  // variant "blurs and adjusts the luminosity of background content to maintain
+  // legibility of text", which is the whole job of this view.
+  private let glass = Glass(radius: 0, variant: .regular)
   var textColor: NSColor = Palette.fg { didSet { label.textColor = textColor } }
 
-  init(font: NSFont = .systemFont(ofSize: 12, weight: .medium)) {
+  init(font: NSFont = Type_.status) {
     super.init(frame: .zero)
     addSubview(glass)
     label.font = font
@@ -524,13 +559,13 @@ final class Pill: NSView {
       // tails inside a pill that was otherwise correctly placed, which reads as a
       // broken layout rather than a measurement bug. The font and the text are
       // both right here, so ask them directly.
-      let font = label.font ?? .systemFont(ofSize: 12)
+      let font = label.font ?? Type_.status
       let size = (text as NSString).size(withAttributes: [.font: font])
       let w = ceil(size.width) + 26
       let h: CGFloat = 27
       setFrameSize(NSSize(width: w, height: h))
       glass.frame = NSRect(x: 0, y: 0, width: w, height: h)
-      glass.layer?.cornerRadius = h / 2
+      glass.radius = Metric.capsule(h)
       // AND GIVE IT SLACK, because `size(withAttributes:)` is still a point or two
       // short of what the field draws -- the right side bearing of the last glyph
       // lands outside it. Sizing the label to EXACTLY the measured width sheared
@@ -652,7 +687,7 @@ final class SheetRow: NSButton {
     isBordered = false
     title = ""
     setAccessibilityLabel(label)
-    text.font = .systemFont(ofSize: 14)
+    text.font = Type_.row
     text.textColor = NSColor(white: 232.0 / 255, alpha: 0.86)
     text.backgroundColor = .clear
     text.isBordered = false
@@ -677,17 +712,26 @@ final class SheetRow: NSButton {
 
   override func layout() {
     super.layout()
-    let x: CGFloat = glyph == nil ? 12 : 42
+    let x: CGFloat = glyph == nil ? Metric.s3 : 42
     text.frame = NSRect(x: x, y: (bounds.height - 18) / 2, width: bounds.width - x - 40, height: 18)
   }
 
   override func draw(_ dirty: NSRect) {
     if hovering || pressed {
-      NSColor(white: 1, alpha: pressed ? 0.12 : 0.06).setFill()
-      NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
+      // A VIBRANT FILL, NOT A SECOND PANE OF GLASS. "Avoid overcrowding or layering
+      // Liquid Glass elements on top of each other" -- and a row highlight inside a
+      // glass sheet is the most tempting place in the app to break that rule.
+      //
+      // The radius is CONCENTRIC with the sheet rather than picked: the row is
+      // inset by `sheetPad` inside a corner of `sheetRadius`, so sharing a centre of
+      // curvature means 26 - 10 = 16. It was 12, which is the kind of number that
+      // looks deliberate and is off by four.
+      Palette.fill(pressed ? 0.12 : 0.06).setFill()
+      let r = Metric.sheetRowRadius
+      NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
     }
     if ruled {
-      NSColor(white: 1, alpha: 0.09).setStroke()
+      Palette.fill(0.09).setStroke()
       let line = NSBezierPath()
       line.move(to: NSPoint(x: 0, y: bounds.maxY - 0.5))
       line.line(to: NSPoint(x: bounds.width, y: bounds.maxY - 0.5))
@@ -717,20 +761,20 @@ final class SheetRow: NSButton {
       // reads as "not yet", where the same treatment as a real code reads as a
       // code that failed to print.
       let pending = value == "…"
-      let f = NSFont.monospacedSystemFont(ofSize: 13, weight: pending ? .regular : .semibold)
+      let f = pending ? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) : Type_.code
       var a: [NSAttributedString.Key: Any] = [
         .font: f, .foregroundColor: pending ? Palette.muted : Palette.fg,
       ]
       if !pending { a[.kern] = 13.0 * 0.09 }
       let sz = (value as NSString).size(withAttributes: a)
-      (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - 12,
+      (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - Metric.s3,
                                           y: (bounds.height - sz.height) / 2),
                                withAttributes: a)
     }
     if checked {
       // `.tick`: stroke 2.2, var(--ok), right-aligned.
       let t = NSBezierPath()
-      let x = bounds.width - 30, y = bounds.height / 2
+      let x = bounds.width - 30, y = bounds.height / 2  // 18 pt tick, 12 pt from the edge
       t.move(to: NSPoint(x: x, y: y))
       t.line(to: NSPoint(x: x + 4.5, y: y - 4.5))
       t.line(to: NSPoint(x: x + 14, y: y + 6))
@@ -743,12 +787,25 @@ final class SheetRow: NSButton {
 /// `.sheet .hint { font-size: 11px; color: var(--muted); padding: 8px 12px 2px }`
 final class SheetHint: NSView {
   private let label = NSTextField(labelWithString: "")
+  /// What this actually needs, rather than the 34 points every hint used to get.
+  /// The one hint in the app wraps to two lines and was drawn into a box built for
+  /// something between one and two, so its second line sat on the sheet's bottom
+  /// edge with its descenders in the corner radius.
+  private(set) var wantedHeight: CGFloat = Metric.sheetHint
+  func measure(width: CGFloat) {
+    let inner = width - Metric.s3 * 2
+    let r = (label.stringValue as NSString).boundingRect(
+      with: NSSize(width: inner, height: .greatestFiniteMagnitude),
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      attributes: [.font: label.font ?? Type_.caption])
+    wantedHeight = ceil(r.height) + Metric.s3 + Metric.s1
+  }
   init(_ text: String) {
     super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 30))
     label.stringValue = text
-    label.font = .systemFont(ofSize: 11)
+    label.font = Type_.caption
     label.textColor = Palette.muted
-    label.maximumNumberOfLines = 2
+    label.maximumNumberOfLines = 3
     label.lineBreakMode = .byWordWrapping
     label.backgroundColor = .clear
     label.isBordered = false
@@ -757,24 +814,50 @@ final class SheetHint: NSView {
   required init?(coder: NSCoder) { fatalError() }
   override func layout() {
     super.layout()
-    label.frame = NSRect(x: 12, y: 2, width: bounds.width - 24, height: bounds.height - 4)
+    label.frame = NSRect(x: Metric.s3, y: Metric.s1, width: bounds.width - Metric.s3 * 2,
+                         height: bounds.height - Metric.s2)
   }
 }
 
-/// The panel itself: glass, rounded at the top only, with a grip.
+// ── AN INSET PANEL, NOT A TRAY ──────────────────────────────────────────────
+//
+// This was `border-radius: 20px 20px 0 0`, transcribed from the web app: a sheet
+// glued to the bottom edge of the window, square where it met it. That is the
+// phone idiom the web app was built for, and it is not what a Mac does any more --
+// "half sheets are inset from the edge of the display to allow content to peek
+// through from beneath them", and they took on a larger radius at the same time.
+//
+// It also fixes something that was simply wrong. Photographed with the sheet open,
+// the control row showed THROUGH the panel and the hint text ran straight across
+// the mute and camera buttons, because a tray pinned to the bottom edge occupies
+// exactly the space the bar lives in. Floating it clear of the bar means the two
+// no longer share any pixels.
 final class Sheet: NSView {
-  private let glass = Glass(radius: 0)
-  private let grip = NSView()
+  /// REGULAR: this is the one surface in the app made mostly of sentences, and the
+  /// guidance names exactly this case -- "components have a significant amount of
+  /// text, such as alerts, sidebars, or popovers".
+  private let glass = Glass(radius: Metric.sheetRadius, variant: .regular)
   private(set) var rows: [SheetRow] = []
 
   init() {
     super.init(frame: .zero)
     wantsLayer = true
+    // ── A TINT, BECAUSE THIS ONE HAS TO BE READ ───────────────────────────────
+    //
+    // Regular glass already "blurs and adjusts the luminosity of background content
+    // to maintain legibility", and over a dark room it is enough on its own. Over a
+    // brightly lit face it is not: photographed open on a real call, the hint line
+    // under the encryption code was grey text on a grey astronaut. Tinting is the
+    // sanctioned way to push a surface toward a value -- it is still a material,
+    // still refracting, just no longer at the mercy of what the camera is pointed
+    // at.
+    glass.tint = Palette.glassTint
     addSubview(glass)
-    grip.wantsLayer = true
-    grip.layer?.backgroundColor = NSColor(white: 1, alpha: 0.2).cgColor
-    grip.layer?.cornerRadius = 2
-    addSubview(grip)
+    // The grip -- a 36x4 pill at the top -- went with the bottom tray. It is a
+    // phone affordance for a sheet you drag off the bottom of a screen, and this is
+    // a popover hanging under the button that opened it. Nothing here is draggable,
+    // so a handle saying it is would be a lie. `onSwipeDown` still works for the
+    // harness and for anyone who tries it.
   }
   required init?(coder: NSCoder) { fatalError() }
 
@@ -800,28 +883,35 @@ final class Sheet: NSView {
     items.forEach { $0.removeFromSuperview() }
     items = v
     rows = v.compactMap { $0 as? SheetRow }
+    // Measured BEFORE `wantedHeight` is asked for, or the panel is sized from a
+    // hint's placeholder height and then draws a taller one inside it.
+    let inner = Metric.sheetWidth - Metric.sheetPad * 2
+    for h in v.compactMap({ $0 as? SheetHint }) { h.measure(width: inner) }
     v.forEach(addSubview)
     needsLayout = true
   }
 
-  private func height(of v: NSView) -> CGFloat { v is SheetHint ? 34 : 48 }
+  private func height(of v: NSView) -> CGFloat {
+    (v as? SheetHint)?.wantedHeight ?? Metric.sheetRow
+  }
 
-  /// 10 top padding + grip + the items + 26 bottom.
-  var wantedHeight: CGFloat { 10 + 14 + items.reduce(0) { $0 + height(of: $1) } + 26 }
+  /// Padding, the items, and the same padding again. Symmetrical now: the old
+  /// 10-top/26-bottom asymmetry was paying for a bottom edge that ran off the
+  /// window, and there is no such edge any more.
+  var wantedHeight: CGFloat {
+    Metric.sheetPad + items.reduce(0) { $0 + height(of: $1) } + Metric.sheetPad
+  }
 
   override func layout() {
     super.layout()
     glass.frame = bounds
-    // `border-radius: 20px 20px 0 0` -- rounded at the top, square where it meets
-    // the bottom of the window, because that edge is not there.
-    glass.layer?.cornerRadius = 20
-    glass.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
-    grip.frame = NSRect(x: (bounds.width - 36) / 2, y: bounds.height - 14, width: 36, height: 4)
-    var y = bounds.height - 24
+    glass.radius = Metric.sheetRadius
+    var y = bounds.height - Metric.sheetPad
     for v in items {
       let h = height(of: v)
       y -= h
-      v.frame = NSRect(x: 10, y: y, width: bounds.width - 20, height: h)
+      v.frame = NSRect(x: Metric.sheetPad, y: y,
+                       width: bounds.width - Metric.sheetPad * 2, height: h)
     }
   }
 }
@@ -841,11 +931,27 @@ final class Sheet: NSView {
 // button to press before anything happens. The call is already live behind this
 // card -- the card is only how you tell somebody else where it is.
 final class WaitingCard: NSView {
+  // ── ONE CARD, NOT FIVE THINGS FLOATING ────────────────────────────────────
+  //
+  // Title, hint, link, two buttons, a field and a third button, each drifting
+  // separately in the middle of somebody's picture, each carrying its own
+  // `text-shadow: 0 1px 8px rgba(0,0,0,.85)` to stay readable. Seven shadows is
+  // what a screen looks like when nothing on it has a surface to sit on.
+  //
+  // A panel gives them one, and it is what the material is FOR: this is the app's
+  // one text-heavy moment, so it is regular glass, tinted, with the picture
+  // refracting through it. The controls are still direct subviews of this card and
+  // the panel is only a sibling behind them -- the hit-testing here has been fixed
+  // three times and moving every frame into a new coordinate space to gain nothing
+  // visible would be asking for a fourth.
+  private let panel = Glass(radius: Metric.cardRadius, variant: .regular)
   private let wash = CAGradientLayer()
   private let title = NSTextField(labelWithString: "Waiting for the other person…")
   private let hint = NSTextField(labelWithString: "This link is the key — anyone who has it can join")
   private let urlField = NSTextField(labelWithString: "")
-  private let urlGlass = Glass(radius: 14)
+  // NOT glass. See `Vibrant`: these sit on the card's glass, and a pane of glass on
+  // a pane of glass is the one thing the guidance names outright.
+  private let urlGlass = Vibrant()
   private let shareButton = PillButton("share")
   private let copyButton = PillButton("copy")
   // ── CALLING A NAME INSTEAD OF SENDING A LINK ────────────────────────────────
@@ -853,7 +959,7 @@ final class WaitingCard: NSView {
   // The one editable thing in this app, and it lives here because this screen is
   // where somebody already is when they want to reach a person: the link is for
   // people you have never called, the field is for the ones you have.
-  private let dialGlass = Glass(radius: 14)
+  private let dialGlass = Vibrant()
   private let dialField = NSTextField()
   private let callButton = PillButton("call")
   private let answerButton = PillButton("answer")
@@ -934,25 +1040,49 @@ final class WaitingCard: NSView {
     wash.endPoint = CGPoint(x: 1.0, y: 1.0)
     layer?.addSublayer(wash)
 
-    for (t, size, colour) in [(title, 16.0, Palette.fg), (hint, 12.0, Palette.muted)] as [(NSTextField, Double, NSColor)] {
-      t.font = .systemFont(ofSize: size)
+    panel.tint = Palette.glassTint
+    addSubview(panel)
+
+    for (t, font, colour) in [(title, Type_.title, Palette.fg),
+                              (hint, Type_.caption, Palette.muted)]
+        as [(NSTextField, NSFont, NSColor)] {
+      t.font = font
       t.textColor = colour
       t.alignment = .center
       t.backgroundColor = .clear
       t.isBordered = false
-      // `text-shadow: 0 1px 8px rgba(0,0,0,.85)` -- a soft shadow is what keeps
-      // white text legible over an unknown frame without putting it on a slab.
-      t.shadow = { let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.85)
-                   sh.shadowBlurRadius = 8; sh.shadowOffset = NSSize(width: 0, height: -1); return sh }()
+      // A backstop for the same failure the width calculation fixes. The card is
+      // sized to the text, but the window can be narrower than the text; when it
+      // is, this ends the line with an ellipsis instead of cutting a word in half,
+      // which at least reads as "there is more" rather than as a broken layout.
+      t.lineBreakMode = .byTruncatingTail
+      // The `text-shadow: 0 1px 8px rgba(0,0,0,.85)` that used to be set here is
+      // gone. It existed to keep white text legible over an unknown camera frame,
+      // and there is a panel under the text now doing that job properly. A drop
+      // shadow on type sitting on a material reads as a printing fault.
       addSubview(t)
     }
-    urlField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    urlField.font = Type_.mono
     urlField.textColor = Palette.fg
     urlField.alignment = .center
     urlField.backgroundColor = .clear
     urlField.isBordered = false
     urlField.isSelectable = true
-    urlGlass.layer?.backgroundColor = NSColor(srgbRed: 8/255, green: 11/255, blue: 18/255, alpha: 0.9).cgColor
+    // ── A BLACK RECTANGLE BEHIND THE LINK ─────────────────────────────────────
+    //
+    // There were two lines here, one for each field:
+    //     urlGlass.layer?.backgroundColor = rgba(8,11,18,.9)
+    // Harmless when `Glass` WAS the blur -- it was the fill that made the old
+    // material readable. Now `Glass` is a wrapper and its own layer is the
+    // un-rounded outer box, so the same line painted a hard-edged opaque black
+    // rectangle across the material and out past its corners.
+    //
+    // Invisible for as long as this screen was photographed over black, which is
+    // every screenshot ever taken of it: the app's own snapshot cannot see a
+    // material, and the capture rig was running the near end with `--video off`.
+    // Over a real picture -- which is what a waiting user is actually looking at,
+    // because `showSelf` puts your own camera in the window until someone
+    // arrives -- it was the first thing you saw.
     addSubview(urlGlass)
     addSubview(urlField)
     shareButton.onPress = { [weak self] in self?.onShare?() }
@@ -960,9 +1090,7 @@ final class WaitingCard: NSView {
     addSubview(shareButton)
     addSubview(copyButton)
 
-    dialGlass.layer?.backgroundColor = NSColor(srgbRed: 8/255, green: 11/255,
-                                               blue: 18/255, alpha: 0.9).cgColor
-    dialField.font = .systemFont(ofSize: 13)
+    dialField.font = Type_.row
     dialField.textColor = Palette.fg
     dialField.alignment = .center
     dialField.backgroundColor = .clear
@@ -1066,41 +1194,89 @@ final class WaitingCard: NSView {
     super.layout()
     wash.frame = bounds
     let cx = bounds.midX, cy = bounds.midY
-    title.frame = NSRect(x: 0, y: cy + 22, width: bounds.width, height: 22)
-    hint.frame = NSRect(x: 0, y: cy + 2, width: bounds.width, height: 16)
-    // `#shareBox { margin-top: 14px }`, the three controls centred as one row.
-    let uw = min(320, bounds.width * 0.7), uh: CGFloat = 34
-    let gap: CGFloat = 10
-    let rowW = uw + gap + shareButton.frame.width + gap + copyButton.frame.width
-    var x = cx - rowW / 2
-    let y = cy - 16 - uh
-    urlGlass.frame = NSRect(x: x, y: y, width: uw, height: uh)
-    urlGlass.layer?.cornerRadius = uh / 2
-    urlField.frame = NSRect(x: x + 12, y: y + (uh - 15) / 2, width: uw - 24, height: 15)
-    x += uw + gap
+    let ringing = incoming != nil
+    let pad = Metric.cardPad
+    let gap = Metric.s2
+    let uh = Metric.fieldHeight
+
+    // ── THE CARD IS MEASURED, NOT PLACED ──────────────────────────────────────
+    //
+    // Everything below used to be positioned relative to the window's centre with
+    // its own margin, so the spacing between any two things was the difference of
+    // two numbers written in different places. Here the ROWS are measured first,
+    // the panel is sized to hold them, and every position falls out of that -- so a
+    // longer link or a hidden row moves the card instead of overflowing it.
+    //
+    // The link is as wide as the link, within reason. It was a flat 320, which is
+    // narrower than the URLs this app generates: the tail of a long room name went
+    // under the right edge and the one thing on this screen you might need to read
+    // character by character was the one thing clipped.
+    let linkW = min(max(300, ceil((urlField.stringValue as NSString)
+                   .size(withAttributes: [.font: urlField.font ?? Type_.mono]).width) + Metric.s8),
+                    bounds.width * 0.6)
+    let linkRowW = linkW + gap + shareButton.frame.width + gap + copyButton.frame.width
+    let dialW = min(260, bounds.width * 0.45)
+    let dialRowW = dialW + gap + callButton.frame.width
+    let ringRowW = answerButton.frame.width + gap + declineButton.frame.width
+
+    let titleH: CGFloat = 24, hintH: CGFloat = 16
+    let rowsW = ringing ? ringRowW : max(linkRowW, dialRowW)
+    let rowsH = ringing ? uh : uh * 2 + Metric.s3
+    // ── THE TEXT IS PART OF THE WIDTH ─────────────────────────────────────────
+    //
+    // The card was sized from `rowsW` alone. That is fine for the invite state,
+    // where a link 300 points wide is the widest thing in it -- and wrong for the
+    // ringing state, where the widest thing is a sentence and the row is two small
+    // pills. Photographed with `--incoming devesh`, the hint read
+    //
+    //     answer and you will both be in the sa
+    //
+    // clipped mid-word by a panel built around two buttons. A card has to be as
+    // wide as its widest CHILD, and the words are children.
+    func textW(_ f: NSTextField) -> CGFloat {
+      ceil((f.stringValue as NSString)
+        .size(withAttributes: [.font: f.font ?? Type_.caption]).width)
+    }
+    let contentW = max(rowsW, textW(title), textW(hint))
+    let panelW = min(bounds.width - Metric.gutter * 2, contentW + pad * 2)
+    let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + rowsH + pad
+    panel.frame = NSRect(x: cx - panelW / 2, y: cy - panelH / 2, width: panelW, height: panelH)
+    panel.radius = Metric.cardRadius
+
+    var y = panel.frame.maxY - pad - titleH
+    title.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: titleH)
+    y -= Metric.s1 + hintH
+    hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
+    y -= Metric.s5 + uh
+
+    // The link row: link, share, copy, centred as one.
+    var x = cx - linkRowW / 2
+    urlGlass.frame = NSRect(x: x, y: y, width: linkW, height: uh)
+    urlGlass.radius = Metric.cardFieldRadius
+    urlField.frame = NSRect(x: x + Metric.s3, y: y + (uh - 15) / 2,
+                            width: linkW - Metric.s6, height: 15)
+    x += linkW + gap
     shareButton.frame.origin = NSPoint(x: x, y: y + (uh - shareButton.frame.height) / 2)
     x += shareButton.frame.width + gap
     copyButton.frame.origin = NSPoint(x: x, y: y + (uh - copyButton.frame.height) / 2)
 
-    // The dial row, one row below the link row and built the same way, so the two
-    // read as alternatives rather than as two unrelated features.
-    let dw = min(260, bounds.width * 0.55)
-    let drowW = dw + gap + callButton.frame.width
-    var dx = cx - drowW / 2
-    let dy = y - 12 - uh
-    dialGlass.frame = NSRect(x: dx, y: dy, width: dw, height: uh)
-    dialGlass.layer?.cornerRadius = uh / 2
-    dialField.frame = NSRect(x: dx + 14, y: dy + (uh - 17) / 2, width: dw - 28, height: 17)
-    dx += dw + gap
-    callButton.frame.origin = NSPoint(x: dx, y: dy + (uh - callButton.frame.height) / 2)
-
     // Answering shares the link row's line: it is the same decision in the same
     // place, and `answer` sits on the left where `copy` is not.
-    let arowW = answerButton.frame.width + gap + declineButton.frame.width
-    var ax = cx - arowW / 2
+    var ax = cx - ringRowW / 2
     answerButton.frame.origin = NSPoint(x: ax, y: y + (uh - answerButton.frame.height) / 2)
     ax += answerButton.frame.width + gap
     declineButton.frame.origin = NSPoint(x: ax, y: y + (uh - declineButton.frame.height) / 2)
+
+    // The dial row, one row below the link row and built the same way, so the two
+    // read as alternatives rather than as two unrelated features.
+    y -= Metric.s3 + uh
+    var dx = cx - dialRowW / 2
+    dialGlass.frame = NSRect(x: dx, y: y, width: dialW, height: uh)
+    dialGlass.radius = Metric.cardFieldRadius
+    dialField.frame = NSRect(x: dx + Metric.s4, y: y + (uh - 17) / 2,
+                             width: dialW - Metric.s8, height: 17)
+    dx += dialW + gap
+    callButton.frame.origin = NSPoint(x: dx, y: y + (uh - callButton.frame.height) / 2)
   }
 }
 
@@ -1108,11 +1284,22 @@ final class WaitingCard: NSView {
 final class PillButton: NSView {
   /// See IconButton.acceptsFirstMouse.
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-  private let glass = Glass(radius: 14)
+  // Every one of these lives on the waiting card's glass panel, so it is a fill.
+  // It was a `Glass`, which made the card five panes deep in places.
+  private let glass = Vibrant()
   private let label = NSTextField(labelWithString: "")
   private var hovering = false
   var onPress: (() -> Void)?
   var tint: NSColor = Palette.fg { didSet { label.textColor = tint } }
+  /// The one button on a surface that people are meant to press. Brighter fill,
+  /// heavier word -- the difference between "Join" and "Suggest" next to it.
+  var prominent = false {
+    didSet {
+      glass.level = prominent ? 0.30 : 0.13
+      glass.edge = prominent ? 0.34 : 0.14
+      label.font = prominent ? Type_.buttonProminent : Type_.button
+    }
+  }
   private var title2Storage = ""
   var title2: String {
     get { title2Storage }
@@ -1121,8 +1308,10 @@ final class PillButton: NSView {
   init(_ text: String) {
     super.init(frame: .zero)
     wantsLayer = true
+    // A shade up from a field: a button asks to be pressed, a field asks to be read.
+    glass.level = 0.13
     addSubview(glass)
-    label.font = .systemFont(ofSize: 12, weight: .medium)
+    label.font = Type_.button
     label.alignment = .center
     label.backgroundColor = .clear
     label.isBordered = false
@@ -1138,29 +1327,55 @@ final class PillButton: NSView {
   private func setTitle(_ t: String) {
     title2Storage = t
     label.stringValue = t
-    let w = ceil((t as NSString).size(withAttributes: [.font: label.font!]).width) + 32
-    setFrameSize(NSSize(width: w, height: 30))
+    let w = ceil((t as NSString).size(withAttributes: [.font: label.font!]).width) + Metric.s8
+    setFrameSize(NSSize(width: w, height: Metric.pillHeight))
     needsLayout = true
   }
 
   override func layout() {
     super.layout()
     glass.frame = bounds
-    glass.layer?.cornerRadius = bounds.height / 2
+    glass.radius = Metric.capsule(bounds.height)
     label.frame = NSRect(x: 4, y: (bounds.height - 15) / 2, width: bounds.width - 8, height: 15)
   }
   override func mouseDown(with event: NSEvent) { onPress?() }
   override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+  // A word in a pill is a target, so it answers to the pointer. The old glass
+  // version could not: `NSGlassEffectView` has an interactive mode of its own and
+  // a fill has none, so the feedback is drawn here.
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    trackingAreas.forEach(removeTrackingArea)
+    addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                                   owner: self, userInfo: nil))
+  }
+  override func mouseEntered(with event: NSEvent) {
+    hovering = true; glass.level = prominent ? 0.42 : 0.20
+  }
+  override func mouseExited(with event: NSEvent) {
+    hovering = false; glass.level = prominent ? 0.30 : 0.13
+  }
 }
 
 final class CallControls: NSView {
   /// Space at the bottom the video should not put anything important in. Published
   /// so the self-view sits above the bar rather than a second file guessing.
-  /// `padding: 26px 12px 14px` around a 58 px circle.
-  static let barHeight: CGFloat = 98
+  /// Derived now, rather than the constant 98 it used to be, so moving the row off
+  /// the edge cannot leave the self-view overlapping it.
+  static let barHeight: CGFloat = Metric.barInset + Metric.control + Metric.s4
 
-  private let roomPill = Pill(font: .systemFont(ofSize: 12, weight: .semibold))
+  private let roomPill = Pill(font: Type_.status)
+  /// The dark layer the HIG asks for behind clear glass over bright content, at
+  /// the 35% it names. Two of them, because there are controls at both ends of the
+  /// window and a face in the middle that neither should touch.
   private let scrim = CAGradientLayer()
+  private let topScrim = CAGradientLayer()
+  /// The five bar circles, in a container that lets them notice each other. See
+  /// GlassGroup: at rest the spacing is below the gap so they stay five separate
+  /// targets, and it is animated up only while the row collapses into the leave
+  /// confirmation, where they flow into it instead of blinking out.
+  private let barGroup = GlassGroup(frame: .zero)
   /// ── THE READOUT IS A STRING NOW, NOT A VIEW ────────────────────────────────
   ///
   /// `qualityPill` used to draw this over the picture whenever the "Connection
@@ -1179,13 +1394,14 @@ final class CallControls: NSView {
   private let flipButton = IconButton(Glyph.flip, help: "switch camera")
   private let xlateButton = IconButton(Glyph.xlate, help: "live translation")
   private let leaveButton = IconButton(Glyph.leave, help: "leave call")
-  /// `#more`, top-right corner, out of the thumb row -- 48 px, not 58.
-  private let moreButton = IconButton(Glyph.more, size: 48, help: "more")
+  /// `#more`, top-right corner, out of the thumb row -- smaller than a bar circle,
+  /// because it is a secondary control and should not read as a sixth action.
+  private let moreButton = IconButton(Glyph.more, size: Metric.controlSmall, help: "more")
   private let sheet = Sheet()
   private let waiting = WaitingCard()
   /// `#status`: a pill, TOP-CENTRE, not a room name in the corner. The room's name
   /// is not something the web app ever shows -- the link is.
-  private let statusPill = Pill(font: .systemFont(ofSize: 11))
+  private let statusPill = Pill(font: Type_.status)
   /// ── THE ONE WARNING THAT EARNS ITS PLACE OVER A FACE ───────────────────────
   ///
   /// The readout this replaces was a diagnostics panel -- millisecond figures
@@ -1196,14 +1412,14 @@ final class CallControls: NSView {
   ///
   /// Amber, not red. Red is for a call that has failed; this one is still
   /// working, and the audio -- which is the call -- has not lost a sample.
-  private let warnPill = Pill(font: .systemFont(ofSize: 11, weight: .medium))
+  private let warnPill = Pill(font: Type_.status)
   // `#elapsed`, the mm:ss clock above the status pill, was here. Removed on
   // request; see the note in `init` for why that loses no signal.
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
   private let sheetScrim = ScrimView()
   private let camPicker = NSPopUpButton()
-  private let camGlass = Glass(radius: 13)
+  private let camGlass = Glass(radius: 0, variant: .regular)
   private var camNames: [String] = []
 
   private(set) var micMuted = false
@@ -1251,17 +1467,46 @@ final class CallControls: NSView {
     // against the thing it is meant to give contrast against.
     scrim.startPoint = CGPoint(x: 0.5, y: 1)   // top of the scrim, transparent
     scrim.endPoint = CGPoint(x: 0.5, y: 0)     // bottom of the window, darkest
-    scrim.colors = [NSColor.clear.cgColor,
-                    NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: 0.72).cgColor]
-    // 62% like the web app: full darkness is reached before the bottom and simply
-    // stays, so the fade is gentle where it meets the picture and solid where the
-    // buttons are.
+    // ── 35%, WHICH IS THE HIG'S NUMBER AND NOT THE WEB APP'S ─────────────────
+    //
+    // This was 0.72, transcribed from CSS where it had to be that dark because
+    // there was no material underneath it -- the whole job of legibility fell on
+    // the scrim. There is a material now, so the scrim only has to do the part the
+    // guidance describes: "If the underlying content is bright, consider adding a
+    // dark dimming layer of 35% opacity." At 0.72 it was a black band across the
+    // bottom of somebody's face; at 0.35 it is a shadow.
+    scrim.colors = [NSColor.clear.cgColor, Palette.dim.cgColor]
     scrim.locations = [0, 0.62]
     layer?.addSublayer(scrim)
 
-    for b in [micButton, camButton, peekButton, flipButton, leaveButton, moreButton] {
-      addSubview(b)
+    // ── AND ONE AT THE TOP, FOR THE SAME REASON ──────────────────────────────
+    //
+    // The bottom of the window had a dim and the top did not, so the status pill
+    // and the `more` button floated over an undimmed face -- and `more` is clear
+    // glass, which over a bright forehead is a smudge you cannot find. It also
+    // protects the traffic lights, which `.fullSizeContentView` put on top of the
+    // picture. Lighter than the bottom and shorter, because there is one small
+    // control up here and five big ones down there.
+    topScrim.startPoint = CGPoint(x: 0.5, y: 0)
+    topScrim.endPoint = CGPoint(x: 0.5, y: 1)
+    topScrim.colors = [NSColor.clear.cgColor,
+                       Palette.dim.withAlphaComponent(0.28).cgColor]
+    topScrim.locations = [0, 0.7]
+    layer?.addSublayer(topScrim)
+
+    // ── THE ROW GOES IN THE GROUP, NOT ON THE OVERLAY ────────────────────────
+    //
+    // A glass container only merges views that are descendants of its content
+    // view. Adding these five to `self` beside the container -- which is what every
+    // other control in this file does -- would leave them outside the effect,
+    // rendering identically and morphing not at all. `more` stays outside on
+    // purpose: it lives in the opposite corner and has nothing to flow into.
+    addSubview(barGroup)
+    barGroup.spacing = CallControls.restSpacing
+    for b in [micButton, camButton, peekButton, flipButton, leaveButton] {
+      barGroup.content.addSubview(b)
     }
+    addSubview(moreButton)
     micButton.target = self; micButton.action = #selector(toggleMic)
     camButton.target = self; camButton.action = #selector(toggleCam)
     peekButton.onHold = { [weak self] on in
@@ -1348,7 +1593,7 @@ final class CallControls: NSView {
     addSubview(camGlass)
     camPicker.isHidden = true
     camPicker.isBordered = false
-    camPicker.font = .systemFont(ofSize: 11, weight: .medium)
+    camPicker.font = Type_.caption
     camPicker.contentTintColor = Palette.fg
     camPicker.target = self
     camPicker.action = #selector(camPicked)
@@ -1361,6 +1606,7 @@ final class CallControls: NSView {
     super.layout()
     let w = bounds.width, h = bounds.height
     scrim.frame = CGRect(x: 0, y: 0, width: w, height: 190)
+    topScrim.frame = CGRect(x: 0, y: h - 130, width: w, height: 130)
 
     // ── `.bar`, TRANSCRIBED ───────────────────────────────────────────────────
     //
@@ -1377,7 +1623,15 @@ final class CallControls: NSView {
     // have the exact interface as we have in the web app" -- and the answer was
     // that this file was designed from the web app's colours instead of copied
     // from its layout.
-    let bw: CGFloat = 58, gap: CGFloat = 18, bottomPad: CGFloat = 14
+    //
+    // That is still true and the group does not change it. `NSGlassEffectContainerView`
+    // draws nothing itself; below its `spacing` the circles render exactly as five
+    // separate discs. What it adds is that they can now FLOW into each other when
+    // the row changes shape, which a set of unrelated views can never do.
+    let bw = Metric.control, gap = Metric.controlGap, bottomPad = Metric.barInset
+    // The group is the row's own coordinate space: a strip the height of a circle,
+    // sitting where the row sits. Every button frame below is relative to it.
+    barGroup.frame = NSRect(x: 0, y: bottomPad, width: w, height: bw)
     let row = [micButton, camButton, peekButton, flipButton, leaveButton]
       .filter { !$0.isHidden }
     if leaveArmed {
@@ -1386,27 +1640,46 @@ final class CallControls: NSView {
       // circles plus a 150 px pill overflowed a phone, and the overflow left a live
       // mute button under the finger already travelling toward "leave".
       for b in row where b !== leaveButton {
-        b.frame = NSRect(x: w / 2, y: bottomPad, width: 0, height: bw)
+        b.frame = NSRect(x: w / 2, y: 0, width: 0, height: bw)
         b.alphaValue = 0
       }
-      leaveButton.frame = NSRect(x: (w - 150) / 2, y: bottomPad, width: 150, height: bw)
+      leaveButton.frame = NSRect(x: (w - 150) / 2, y: 0, width: 150, height: bw)
     } else {
       let rowW = CGFloat(row.count) * bw + CGFloat(max(0, row.count - 1)) * gap
       var x = (w - rowW) / 2
       for b in row {
-        b.frame = NSRect(x: x, y: bottomPad, width: bw, height: bw)
+        b.frame = NSRect(x: x, y: 0, width: bw, height: bw)
         if barShown { b.alphaValue = 1 }
         x += bw + gap
       }
     }
-    // `#more`: top-right, 14 px in, riding the same row as the pills but in the
-    // corner the web app puts it in.
-    moreButton.frame = NSRect(x: w - 48 - 14, y: h - 48 - 14, width: 48, height: 48)
+    // `#more`: top-right. On the gutter, so it lines up with everything else that
+    // lives against an edge instead of keeping its own private 14.
+    let mb = Metric.controlSmall
+    moreButton.frame = NSRect(x: w - mb - Metric.gutter, y: h - mb - Metric.gutter,
+                              width: mb, height: mb)
 
-    // `.sheet { left:50%; bottom:0; width:min(92vw,420px) }`
-    let sw = min(w * 0.92, 420)
+    // ── IT COMES OUT OF THE BUTTON THAT OPENED IT ─────────────────────────────
+    //
+    // This was `bottom: 0; left: 50%` -- a tray glued to the bottom edge of the
+    // window, transcribed from the web app, where it is the right idiom because the
+    // web app is mostly used on a phone. Two things were wrong with it here.
+    //
+    // It sat exactly where the control row sits: photographed open on a real call,
+    // the mute and camera circles showed straight through the panel and a line of
+    // hint text ran across them.
+    //
+    // And it came from nowhere. The button that opens it is in the TOP-RIGHT
+    // corner, and the panel appeared at the bottom in the middle -- "an action
+    // sheet originates from the element that initiates the action, instead of from
+    // the bottom edge of the display", which is the rule on a Mac and the thing
+    // every popover on this machine already does. So it hangs under `#more`, its
+    // right edge on the same gutter, and the whole middle of the picture is free.
+    let sw = min(w - Metric.gutter * 2, Metric.sheetWidth)
     let sh = sheet.wantedHeight
-    sheet.frame = NSRect(x: (w - sw) / 2, y: 0, width: sw, height: sh)
+    sheet.frame = NSRect(x: w - Metric.gutter - sw,
+                         y: max(Metric.s3, moreButton.frame.minY - Metric.s2 - sh),
+                         width: sw, height: sh)
     sheetScrim.frame = bounds
     sheet.isHidden = !moreOpen
     sheetScrim.isHidden = !moreOpen
@@ -1431,28 +1704,31 @@ final class CallControls: NSView {
     // measured from the top of the window rather than from the clock, so removing
     // it moves nothing.
     statusPill.setFrameOrigin(NSPoint(x: (w - statusPill.frame.width) / 2,
-                                      y: h - statusPill.frame.height - 14))
+                                      y: h - statusPill.frame.height - Metric.s4))
     // THE SAME SLOT, and they cannot collide: `#status` hides itself once the
     // call connects, and the picture cannot pause before it connects. Giving the
     // warning its own row below would leave a permanent gap under a pill that is
     // almost never there.
     warnPill.setFrameOrigin(NSPoint(x: (w - warnPill.frame.width) / 2,
-                                    y: h - warnPill.frame.height - 14))
+                                    y: h - warnPill.frame.height - Metric.s4))
 
     // The pills stack down the LEFT, because `#more` owns the top-right corner in
     // the web app and two things cannot have it. 36 pt clears the traffic lights,
     // which now float over the picture -- `.fullSizeContentView` put them there,
     // and at 20 pt the room pill sliced straight through all three.
-    let topPad: CGFloat = 36
+    let topPad = Metric.topInset
     // Was a stack of two; the quality pill below it is gone, so there is one.
     let py = h - roomPill.frame.height - topPad
-    roomPill.setFrameOrigin(NSPoint(x: 20, y: py))
-    // Bottom-left, level with the action bar.
-    let cpW: CGFloat = 210, cpH: CGFloat = 28, cpY: CGFloat = 22 + (46 + 28 - cpH) / 2
-    camGlass.frame = NSRect(x: 20, y: cpY, width: cpW, height: cpH)
-    camGlass.layer?.cornerRadius = cpH / 2
+    roomPill.setFrameOrigin(NSPoint(x: Metric.gutter, y: py))
+    // Bottom-left, vertically centred on the action row rather than on a number
+    // that happened to line up when the row sat 14 points off the edge.
+    let cpW: CGFloat = 210, cpH = Metric.pillHeight
+    let cpY = Metric.barInset + (Metric.control - cpH) / 2
+    camGlass.frame = NSRect(x: Metric.gutter, y: cpY, width: cpW, height: cpH)
+    camGlass.radius = Metric.capsule(cpH)
     camGlass.isHidden = camPicker.isHidden
-    camPicker.frame = NSRect(x: 30, y: cpY + 4, width: cpW - 20, height: cpH - 8)
+    camPicker.frame = NSRect(x: Metric.gutter + Metric.s2, y: cpY + Metric.s1,
+                             width: cpW - Metric.s4, height: cpH - Metric.s2)
   }
 
   // ── APPLY NOW IF WE ARE ALREADY ON MAIN ───────────────────────────────────
@@ -1553,7 +1829,7 @@ final class CallControls: NSView {
       // Re-centre: the pill resizes itself to the sentence, so the origin set at
       // layout time belongs to whatever text was there before.
       warnPill.setFrameOrigin(NSPoint(x: (frame.width - warnPill.frame.width) / 2,
-                                      y: frame.height - warnPill.frame.height - 14))
+                                      y: frame.height - warnPill.frame.height - Metric.s4))
       // A warning is worthless under a hidden bar. Showing the row also makes the
       // mic and camera buttons reachable at the exact moment somebody wants them.
       showBar()
@@ -1639,6 +1915,10 @@ final class CallControls: NSView {
     showBar(pin: true)
     micMuted.toggle()
     micButton.off = micMuted
+    // The button says it happened. A mute is invisible by definition -- there is no
+    // change on screen to confirm it except the glyph turning red, and a colour
+    // change alone is the one confirmation a colourblind user does not get.
+    Motion.pop(micButton)
     onMic?(micMuted)
     setStatus(micMuted ? "you are muted" : status.contains("muted") ? "connected" : status)
   }
@@ -1649,6 +1929,7 @@ final class CallControls: NSView {
     showBar(pin: true)
     camOff.toggle()
     camButton.off = camOff
+    Motion.pop(camButton)
     onCam?(camOff)
   }
 
@@ -1835,10 +2116,11 @@ final class CallControls: NSView {
     guard visible != barShown else { return }
     barShown = visible
     let row: [NSView] = [micButton, camButton, peekButton, flipButton, leaveButton, moreButton]
-    NSAnimationContext.runAnimationGroup { ctx in
-      ctx.duration = 0.22
-      for v in row { v.animator().alphaValue = visible ? 1 : 0 }
-    }
+    // One curve for the whole app. This was a bare 0.22 linear fade, which next to
+    // a material that eases everything it does read as the one thing on screen
+    // that had not been told.
+    Motion.run({ for v in row { v.animator().alphaValue = visible ? 1 : 0 } },
+               duration: 0.24)
   }
   override func mouseMoved(with event: NSEvent) { showBar() }
   override func mouseEntered(with event: NSEvent) { showBar() }
@@ -1987,8 +2269,22 @@ final class CallControls: NSView {
     leaveButton.confirming = true
     leaveButton.confirmLabel = "tap to leave"
     showBar(pin: true)
-    needsLayout = true
-    layoutSubtreeIfNeeded()
+    // ── THE ROW FLOWS INTO THE DECISION ───────────────────────────────────────
+    //
+    // Four circles contract to zero width while a fifth stretches to a 150-point
+    // pill. Done as plain frame changes that is four things vanishing next to one
+    // thing growing, and it reads as a glitch.
+    //
+    // Raising the container's spacing past the gap between the circles is what
+    // makes them MERGE -- measured on this machine: at a gap of 18, spacing 40
+    // grows liquid bridges between them and spacing 80 makes them one shape. So
+    // the spacing is animated up as they close, and the four buttons pour into the
+    // one that is left instead of blinking out of existence.
+    //
+    // This is the whole reason the row is inside a glass container. Nothing else
+    // in the app needs one, and no arrangement of separate views can do it.
+    setRowMerge(CallControls.mergeSpacing)
+    animateRow()
     // Three seconds and it forgets, because an armed hang-up left on screen is a
     // trap for the next click that lands anywhere near it.
     leaveTimer?.invalidate()
@@ -1997,13 +2293,54 @@ final class CallControls: NSView {
     }
   }
 
+  /// Below the 18-point gap between circles, so they stay five distinct shapes
+  /// while nothing is happening.
+  static let restSpacing: CGFloat = 12
+  /// Well above it, so they merge. See GlassGroup for the measurements.
+  static let mergeSpacing: CGFloat = 64
+
+  /// Drive the container's proximity, which is what decides whether the circles
+  /// notice each other. Stepped rather than jumped: a spacing that snaps produces
+  /// a merge that snaps, and the whole point is that it flows.
+  private func setRowMerge(_ target: CGFloat) {
+    mergeTimer?.invalidate()
+    guard !Motion.reduceMotion else { barGroup.spacing = target; return }
+    let steps = 12
+    let from = barGroup.spacing
+    var i = 0
+    mergeTimer = Timer.scheduledTimer(withTimeInterval: Motion.duration / Double(steps),
+                                      repeats: true) { [weak self] t in
+      guard let self else { t.invalidate(); return }
+      i += 1
+      let k = min(1.0, Double(i) / Double(steps))
+      // Ease out, so most of the merging happens early and it settles rather than
+      // arriving. Matches the curve the frames are travelling on.
+      self.barGroup.spacing = from + (target - from) * CGFloat(1 - pow(1 - k, 3))
+      if i >= steps { t.invalidate() }
+    }
+    RunLoop.main.add(mergeTimer!, forMode: .common)
+  }
+  private var mergeTimer: Timer?
+
+  /// Re-lay the row inside an animation, so the circles travel to their new
+  /// positions instead of being redrawn there.
+  private func animateRow() {
+    Motion.run {
+      needsLayout = true
+      layoutSubtreeIfNeeded()
+    }
+  }
+
   func cancelLeaveConfirm() {
     guard leaveArmed else { return }
     leaveArmed = false
     leaveTimer?.invalidate()
     leaveButton.confirming = false
-    needsLayout = true
-    layoutSubtreeIfNeeded()
+    // Back to five separate targets. The merge is for the moment of change; at rest
+    // these are five different irreversible-to-varying-degrees actions and they
+    // must not look like one control.
+    setRowMerge(CallControls.restSpacing)
+    animateRow()
     scheduleBarHide()
   }
 

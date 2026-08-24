@@ -252,7 +252,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ring-only", "rings", "rings-for", "ring-gap", "call", "no-rings", "io", "no-agc",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
-  "no-auto-gain", "gain-debug",
+  "no-auto-gain", "gain-debug", "presence", "presence-run",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1696,6 +1696,48 @@ if let io = arg("io") {
 if flag("no-agc") { Audio.agcOn = false }
 if flag("no-auto-gain") { Audio.autoGain = false }
 if flag("gain-debug") { Audio.gainDebug = true }
+
+// HOW FAR AWAY THE OTHER PERSON SOUNDS. Distance is monaural -- level, the
+// direct-to-reverberant ratio and spectrum -- so unlike direction it arrives
+// intact on a laptop speaker, which is where most calls are actually heard.
+// Costs nothing to send (it runs on the receiving end of a stream already on the
+// wire) and nothing in latency (reflections are late by definition; the direct
+// sound is untouched).
+if let m = arg("presence") {
+  guard let p = Audio.Presence.named(m) else {
+    fputs("--presence takes off, leaning-in, next-to-you, in-the-room,"
+        + " across-the-table or warmer, not \(m)\n", stderr)
+    exit(2)
+  }
+  Audio.presence = p
+  Metrics.fact("presence", m)
+}
+
+// ── TWO IMPLEMENTATIONS OF THE SAME SOUND ────────────────────────────────
+//
+// The mode is chosen by listening in Voice Lab, which renders in blocks over a
+// whole recording; the call runs the same filter one sample at a time on the
+// audio thread. Those are different pieces of code and there is no reason to
+// believe they sound alike -- a mode picked by ear in one and delivered by the
+// other is a guess unless somebody checks. This runs the call's filter over a
+// file so the Lab can compare it against its own answer, sample by sample.
+if let io = arg("presence-run") {
+  let parts = io.split(separator: ",").map(String.init)
+  guard parts.count == 2, let inData = FileManager.default.contents(atPath: parts[0]) else {
+    fputs("--presence-run takes in.f32,out.f32\n", stderr); exit(2)
+  }
+  let n = inData.count / 4
+  var x = [Float](repeating: 0, count: n)
+  _ = x.withUnsafeMutableBytes { inData.copyBytes(to: $0) }
+  let f = Audio.PresenceFilter()
+  f.p = Audio.presence
+  var y = [Float](repeating: 0, count: n)
+  for i in 0..<n { y[i] = f.process(x[i]) }
+  let out = y.withUnsafeBufferPointer { Data(buffer: $0) }
+  try? out.write(to: URL(fileURLWithPath: parts[1]))
+  fputs("presence-run: \(n) samples\n", stderr)
+  exit(0)
+}
 
 // 16 frames is the HAL path's floor and it is measured, not guessed. Under
 // VoiceProcessingIO it is the WRONG floor: that unit does its own block

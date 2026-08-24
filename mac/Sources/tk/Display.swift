@@ -54,10 +54,24 @@ final class Display {
     //
     // Bottom-LEFT, not bottom-right, and the peeking width -- because peeking is
     // the only time it is ever on screen here.
+    //
+    // ── ON THE GUTTER, AND CLEAR OF THE ROW ───────────────────────────────────
+    //
+    // `x: 12, y: 76` were two numbers that belonged to nothing. 12 is not the
+    // margin anything else in this app uses, and 76 was chosen when the control
+    // row sat 14 points off the bottom edge -- it clears the row today by accident
+    // rather than by construction, and the next time the row moves it stops
+    // clearing it silently.
+    //
+    // `Metric.gutter` is the margin every other corner element uses, so the tile
+    // lines up with the `more` button in the opposite corner. `barHeight` is the
+    // row's own published height, so this cannot collide with it at any window
+    // width -- which `y: 76` could, once a narrow window pushed the row's left
+    // edge past the tile.
     let vmin = min(r.width, r.height)
     let w = max(140, min(vmin * 0.26, 240))
     let h = w * 9.0 / 16.0
-    return NSRect(x: 12, y: 76, width: w, height: h)
+    return NSRect(x: Metric.gutter, y: CallControls.barHeight, width: w, height: h)
   }
 
   // ── WHAT A PAUSED PICTURE LOOKS LIKE ───────────────────────────────────────
@@ -144,17 +158,27 @@ final class Display {
     // cost this file an invisible control bar. Sublayers are fine.
     selfLayer.videoGravity = .resizeAspectFill
     selfLayer.isHidden = true
-    selfLayer.cornerRadius = 12
+    // ── CONCENTRIC WITH THE WINDOW ────────────────────────────────────────────
+    //
+    // This was the literal 12, and 12 turns out to be right -- but for a reason
+    // nobody had written down, which is why it would not have survived the window
+    // corner changing. A shape inset from a rounded container shares its centre of
+    // curvature when its radius is the container's radius minus the inset, so a
+    // tile 20 points inside a 32-point window corner wants exactly 12. Derived now,
+    // so it tracks the window instead of agreeing with it by luck.
+    selfLayer.cornerRadius = Metric.selfRadius
     selfLayer.masksToBounds = true
-    selfLayer.borderWidth = 0
+    // The same hairline the bar circles draw, so the corner tile is edged like
+    // everything else floating on the picture rather than being the one thing with
+    // no edge at all.
+    selfLayer.borderWidth = 1
     // `transform: scaleX(-1)`. A self-view that is not mirrored is the one thing
     // everybody notices instantly and cannot name: you raise your left hand and the
     // wrong hand moves.
     selfLayer.transform = CATransform3DMakeScale(-1, 1, 1)
     // The web app's glass line, and a real shadow so the corner reads as floating
     // above the picture rather than punched into it.
-    selfLayer.cornerRadius = 12
-    selfLayer.borderColor = Palette.glassLine.cgColor
+    selfLayer.borderColor = Palette.fill(0.16).cgColor
     selfLayer.backgroundColor = Palette.bg.cgColor
     selfLayer.shadowColor = NSColor.black.cgColor
     selfLayer.shadowOpacity = 0.45
