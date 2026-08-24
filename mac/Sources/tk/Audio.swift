@@ -473,6 +473,112 @@ final class Audio {
   private(set) var micGainNow: Float = -1
   private var micFloor: Float = 1.0
   private var speechRun = 0
+  // ── WHAT A CALL HAS TO REPORT FOR THIS TO GET BETTER ──────────────────────
+  //
+  // Turn-taking is now the whole product, so it needs the same treatment
+  // mouth-to-ear got: a number per call, from real calls, that says whether it
+  // worked. Not "did the audio arrive" -- whether the two people managed to talk
+  // to each other without tripping over one another.
+  //
+  // THE HEADLINE IS TIME TO FLOOR. From the moment somebody wants to speak to the
+  // moment they are actually audible. It is the "does this feel automatic"
+  // number, and it is the one to drive down.
+  //
+  // THE FAILURE IS A COLLISION: both people vocalising at once. Counted, timed,
+  // and attributed -- who stopped first, and how long it took. A design that
+  // makes collisions rare and short is working; one that makes them long is
+  // making people fight for the floor, which is worse than doing nothing.
+  //
+  // NOTHING HERE CARRIES AUDIO OR WORDS. Counts and durations only.
+  struct Turns {
+    var claims = 0                 // times this end bid for the floor
+    var claimsGranted = 0          // ... and became audible
+    var timeToFloorMs: [Double] = []
+    var backchannels = 0           // listening noises, held back or not
+    var escalated = 0              // a listening noise that turned into a bid
+    var collisions = 0             // both ends vocalising at once
+    var collisionMs: Double = 0    // total time spent in one
+    // WHO STOPPED FIRST CANNOT BE DECIDED AT ONE END, and two attempts to do it
+    // anyway both failed the same way. This end sees its own state the instant
+    // it changes and the far end's a network delay later, so at the close of
+    // every overlap our own silence is always the fresher fact. Measured on a
+    // loopback: "you stopped 9, they stopped 0" -- printed by BOTH ends. Adding
+    // a 120 ms confirmation margin did not fix it; it is not a tuning problem,
+    // it is that the question needs two clocks.
+    //
+    // So these are published RAW and one-sided, for the server to join against
+    // the far end's own record of the same overlap. Nothing on screen claims to
+    // know who backed down, because this end cannot.
+    var yieldedToPeer = 0          // this end went quiet, far end demonstrably kept going
+    var peerYielded = 0            // the far end went quiet and this end kept going
+    var ambiguousYields = 0        // too close to call from one side
+    var gateFlaps = 0              // open/close inside 300 ms: choppy, and audible
+  }
+  /// Set on the receive path the moment a packet says so, because a cue that is
+  /// a video frame late appears after the moment it was meant to prevent.
+  nonisolated(unsafe) static var peerVocalNow = false
+  private(set) var turns = Turns()
+  private var claimStart: UInt64 = 0
+  private var claimPending = false
+  private var collisionStart: UInt64 = 0
+  private var pendingYield: UInt64 = 0
+  private var lastOpenAt: UInt64 = 0
+  private var wasOpen = true
+
+  /// Called once per capture block, which is the only place that sees this end's
+  /// state and the far end's in the same instant.
+  func accountTurn(peerVocal: Bool, audible: Bool) {
+    let now = Clock.now()
+    let mine = dgate.vocal
+
+    // A bid, and how long until it was actually heard.
+    turns.backchannels = dgate.backchannels
+    if mine == .claim, !claimPending {
+      claimPending = true; claimStart = now; turns.claims += 1
+      if dgate.backchannels > 0 && dgate.vocalWasBackchannel { turns.escalated += 1 }
+    }
+    if claimPending, audible {
+      turns.claimsGranted += 1
+      turns.timeToFloorMs.append(Clock.ms(now - claimStart))
+      claimPending = false
+    }
+    if mine == .quiet { claimPending = false }
+
+    // A collision, and who ended it.
+    let bothTalking = mine != .quiet && peerVocal
+    if bothTalking, collisionStart == 0 {
+      collisionStart = now; turns.collisions += 1
+    } else if !bothTalking, collisionStart != 0 {
+      turns.collisionMs += Clock.ms(now - collisionStart)
+      collisionStart = 0
+      // Both went quiet within a network delay of each other: unknowable here.
+      if mine == .quiet && peerVocal { pendingYield = now }
+      else if mine != .quiet && !peerVocal { turns.peerYielded += 1 }
+      else { turns.ambiguousYields += 1 }
+    }
+    // A yield is only confirmed if the far end was still going a clear margin
+    // later. 120 ms is longer than any plausible one-way delay on this product.
+    if pendingYield != 0, Clock.ms(now - pendingYield) > 120 {
+      if peerVocal { turns.yieldedToPeer += 1 } else { turns.ambiguousYields += 1 }
+      pendingYield = 0
+    }
+
+    // Choppiness. A gate that opens and shuts inside a third of a second is
+    // audible as chopping, and no amount of good intent excuses it.
+    if audible != wasOpen {
+      if audible {
+        if lastOpenAt != 0, Clock.ms(now - lastOpenAt) < 300 { turns.gateFlaps += 1 }
+        lastOpenAt = now
+      }
+      wasOpen = audible
+    }
+  }
+
+  var timeToFloorP50: Double {
+    let v = turns.timeToFloorMs.sorted()
+    return v.isEmpty ? -1 : v[v.count / 2]
+  }
+
   // ── HEADPHONES CHANGE WHAT IS POSSIBLE, NOT JUST WHAT IS PLEASANT ─────────
   //
   // On headphones there is no acoustic path from the speaker to the microphone
@@ -1067,6 +1173,10 @@ final class Audio {
     private(set) var openFrames = 0
     private(set) var backchannels = 0
     private(set) var claims = 0
+    /// Whether the current vocalisation started life as a listening noise. A bid
+    /// that escalated from one is a different event from a bid that began as
+    /// one, and only the first says the classifier hesitated.
+    private(set) var vocalWasBackchannel = false
 
     @inline(__always) func noteFar(_ v: Float) {
       let a = abs(v)
@@ -1193,9 +1303,10 @@ final class Audio {
       // be a sentence becomes a claim, and a claim never quietly downgrades to a
       // continuer under somebody mid-word.
       if v.rawValue < vocal.rawValue && v != .quiet { return }
-      vocal = v
-      if v == .backchannel { backchannels += 1 }
+      if v == .quiet { vocalWasBackchannel = false }
+      if v == .backchannel { backchannels += 1; vocalWasBackchannel = true }
       if v == .claim { claims += 1 }
+      vocal = v
     }
   }
   static var gate = Gate() { didSet { sharedGate.cfg = gate } }
@@ -1900,6 +2011,7 @@ final class Audio {
     // as it was captured, or turned down whole -- never filtered, never guessed
     // at. Whose turn it is is the only thing between the room and the far end.
     duplexGate(inScratch, Int(n))
+    accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5)
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.

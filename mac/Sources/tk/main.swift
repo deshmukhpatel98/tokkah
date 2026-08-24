@@ -3020,6 +3020,15 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
     "a_quality_s": audio.qualityTicks,
     "floor_held_pct": audio.floorHeldPct, "mic_access": gMicAccess,
+    // Turn-taking is the product now, so it reports like the product.
+    "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
+    "turn_to_floor_p50": audio.timeToFloorP50,
+    "turn_collisions": audio.turns.collisions,
+    "turn_collision_ms": audio.turns.collisionMs,
+    "turn_yielded": audio.turns.yieldedToPeer, "turn_peer_yielded": audio.turns.peerYielded,
+    "turn_yield_unclear": audio.turns.ambiguousYields,
+    "turn_backchannels": audio.turns.backchannels, "turn_escalated": audio.turns.escalated,
+    "turn_flaps": audio.turns.gateFlaps,
     "v_rx_w": gRxWidth, "v_rx_h": gRxHeight,
     "peer_rx_lost": wire.peerRxLost, "peer_rx_recovered": wire.peerRxRecovered,
     "peer_reports": wire.peerReportsLoss ? 1 : 0,
@@ -3295,9 +3304,17 @@ func reportLoop() {
     fputs("  room: \(corr) correlation at \(at) ms\(sim)\(verdict)\n", stderr)
   }
   if Audio.gate.on {
+    let t = audio.turns
     let held = String(format: "%.0f", audio.floorHeldPct)
-    fputs("  floor: yours \(held)% of the call"
-        + "  \(audio.backchannels) listening noises, \(audio.floorClaims) bids to speak\n", stderr)
+    let ttf = audio.timeToFloorP50 >= 0 ? String(format: "%.0f ms", audio.timeToFloorP50) : "-"
+    fputs("  floor: yours \(held)% of the call, \(t.backchannels) listening noises,"
+        + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)\n", stderr)
+    if t.collisions > 0 || t.gateFlaps > 0 {
+      let avg = t.collisions > 0 ? String(format: "%.0f ms", t.collisionMs / Double(t.collisions)) : "-"
+      fputs("  overlap: \(t.collisions) times both talking, \(avg) each"
+          + " (who stopped first is not decidable from one end -- see the beat)"
+          + (t.gateFlaps > 0 ? "  \(t.gateFlaps) CHOPPY OPENINGS" : "") + "\n", stderr)
+    }
   }
   if audio.acoustic {
     let heard = audio.acRound.p(0.50)

@@ -856,11 +856,21 @@ final class Wire {
   // presented as a diagnosis.
   static let ST_VPAUSED = 1        // video stopped because the link could not carry it
   static let ST_CAMOFF  = 2        // video stopped because a human pressed the button
+  // WHAT THIS END'S VOICE IS DOING, so the other end can DRAW it. These are cues
+  // and never commands: nothing at the far end is muted, opened or overridden by
+  // them. A person reads the cue and stops talking, and their stopping is what
+  // opens this microphone -- through a purely local rule, with nothing
+  // arbitrating and nothing to deadlock.
+  static let ST_BACKCHAN = 4       // a listening noise: "mm-hm", not a bid
+  static let ST_CLAIM    = 8       // this end wants to say something
   var selfStatus = 0
   /// What the far end's status byte says. Both are false against a build that
   /// predates the byte, which is correct: it never pauses and never reports.
   var peerVideoPaused: Bool { peerStatus & Wire.ST_VPAUSED != 0 }
   var peerCamOff: Bool { peerStatus & Wire.ST_CAMOFF != 0 }
+  var peerBackchannel: Bool { peerStatus & Wire.ST_BACKCHAN != 0 }
+  var peerClaim: Bool { peerStatus & Wire.ST_CLAIM != 0 }
+  var peerVocal: Bool { peerStatus & (Wire.ST_BACKCHAN | Wire.ST_CLAIM) != 0 }
   /// Whether the far end reports at all. False means an older build, and the
   /// controller must then fall back to the local numbers and SAY SO -- a silent
   /// fallback to the wrong signal is the bug this field exists to fix.
@@ -885,7 +895,16 @@ final class Wire {
                  toByteOffset: TPKTX, as: UInt32.self)
     p.storeBytes(of: UInt8(selfMuted ? 1 : 0), toByteOffset: TPKTX + 4, as: UInt8.self)
     p.storeBytes(of: UInt8(truncatingIfNeeded: selfQLevel), toByteOffset: TPKTX + 5, as: UInt8.self)
-    p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus), toByteOffset: TPKTX + 6, as: UInt8.self)
+    // Read at packet time, not once a video frame: a cue that arrives a frame
+    // late is a cue that appears after the moment it was about to prevent.
+    let vocalBits: Int
+    switch Audio.sharedGate.vocal {
+    case .quiet:       vocalBits = 0
+    case .backchannel: vocalBits = Wire.ST_BACKCHAN
+    case .claim:       vocalBits = Wire.ST_CLAIM
+    }
+    p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus | vocalBits),
+                 toByteOffset: TPKTX + 6, as: UInt8.self)
     p.storeBytes(of: UInt8(0), toByteOffset: TPKTX + 7, as: UInt8.self)
   }
 
@@ -1188,6 +1207,7 @@ final class Wire {
           peerMuted = plain[TPKTX + 4] == 1
           peerQLevel = Int(plain[TPKTX + 5])
           peerStatus = Int(plain[TPKTX + 6])
+          Audio.peerVocalNow = peerVocal
           peerReportsState = true
         }
         if kind == 0 {
