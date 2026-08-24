@@ -911,6 +911,12 @@ final class Audio {
     var tapF: (Float, Float, Float, Float) = (0, 0, 0, 0)
     var tapG: (Float, Float, Float, Float) = (0, 0, 0, 0)
     var scale: Float = 1
+    /// How far behind the direct sound the last reflection lands. This is the
+    /// number that matters to the echo canceller, because a room does not just
+    /// change the tone of what the speaker plays -- it makes the path from the
+    /// speaker back into the microphone LONGER, and a canceller can only cancel
+    /// what fits inside its own window.
+    var tailMs: Double = 0
     var on: Bool { lowG != 0 || highG != 0 || taps > 0 }
 
     static func named(_ n: String) -> Presence? {
@@ -933,6 +939,7 @@ final class Audio {
         // of the band. Half of each is the room left for them.
         let lift = Float(max(0, pow(10, max(low, high) / 20) - 1))
         p.scale = 1 / (1 + 0.5 * sum + 0.5 * lift)
+        p.tailMs = (t.prefix(p.taps).map { $0.0 }.max() ?? 0) * 1000
         return p
       }
       switch n {

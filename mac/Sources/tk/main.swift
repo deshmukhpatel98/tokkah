@@ -1711,6 +1711,17 @@ if let m = arg("presence") {
   }
   Audio.presence = p
   Metrics.fact("presence", m)
+  // A ROOM LENGTHENS THE ECHO PATH. The reflections this adds are played by the
+  // speaker like everything else, so they come back into the microphone that
+  // much later. A canceller cancels what fits inside its window and nothing
+  // past it, so a mode whose tail runs beyond it leaves echo the far end can
+  // hear -- and the two modes with no reflections at all cannot, by
+  // construction, cost anything here.
+  if p.tailMs > 0 {
+    fputs(String(format: "presence %@: reflections out to %.0f ms"
+                 + " -- this is added to the echo path\n", m, p.tailMs), stderr)
+    Metrics.fact("presence_tail_ms", String(format: "%.0f", p.tailMs))
+  }
 }
 
 // ── TWO IMPLEMENTATIONS OF THE SAME SOUND ────────────────────────────────
