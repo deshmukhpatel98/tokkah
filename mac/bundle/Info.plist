@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>                  <string>Tokkah</string>
-  <key>CFBundleDisplayName</key>           <string>Tokkah</string>
+  <key>CFBundleName</key>                  <string>Kin</string>
+  <key>CFBundleDisplayName</key>           <string>Kin</string>
   <key>CFBundleIdentifier</key>            <string>com.tokkah.tk</string>
   <!-- tokkah://join/<room>, so an invite is a link somebody clicks rather than a
        room name they have to retype correctly. Registered here because LaunchServices
@@ -11,10 +11,22 @@
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
-      <key>CFBundleURLName</key>    <string>Tokkah call</string>
-      <key>CFBundleURLSchemes</key> <array><string>tokkah</string></array>
+      <key>CFBundleURLName</key>    <string>Kin call</string>
+      <!-- kin:// is the name now; tokkah:// stays forever, because links
+           already sent to people do not get to stop working. -->
+      <key>CFBundleURLSchemes</key> <array><string>kin</string><string>tokkah</string></array>
     </dict>
   </array>
+  <!-- ── THE ONE KEY THE RENAME MUST NOT TOUCH (yet) ───────────────────────────
+       This plist is not only for new installs: `Update.installBundle` writes it
+       INTO an existing bundle on every update. The binary inside that bundle is
+       still called `Tokkah`, so changing this to `Kin` here would make macOS look
+       for `Contents/MacOS/Kin`, find nothing, and every installed copy would stop
+       launching — bricked by a rename. It flips one release later, once every
+       installed updater is the one that knows how to move the file too.
+       Same reason CFBundleIdentifier stays: it is invisible to people, and
+       changing it makes macOS treat this as a different app and re-ask for the
+       camera and the microphone. -->
   <key>CFBundleExecutable</key>            <string>Tokkah</string>
   <key>CFBundleIconFile</key>              <string>AppIcon</string>
   <key>CFBundlePackageType</key>           <string>APPL</string>
@@ -28,11 +40,11 @@
        A bundle owns its own permissions, and these strings are what the prompt
        actually says. -->
   <key>NSMicrophoneUsageDescription</key>
-  <string>Tokkah needs the microphone to carry your voice on a call.</string>
+  <string>Kin needs the microphone to carry your voice on a call.</string>
   <key>NSCameraUsageDescription</key>
-  <string>Tokkah needs the camera to send your picture on a call.</string>
+  <string>Kin needs the camera to send your picture on a call.</string>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Tokkah connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
+  <string>Kin connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
 </dict>
 </plist>

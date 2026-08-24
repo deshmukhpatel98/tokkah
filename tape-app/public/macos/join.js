@@ -8,7 +8,7 @@
   var el = document.getElementById('room');
   if (room && /^[A-Za-z0-9_-]{1,64}$/.test(room)) {
     el.textContent = room;
-    document.title = 'Join "' + room + '" on Tokkah';
+    document.title = 'Join "' + room + '" on Kin';
   } else {
     el.textContent = 'ask them for the room name';
     el.style.fontSize = '18px';

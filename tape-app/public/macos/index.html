@@ -1,7 +1,7 @@
 <!doctype html>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Tokkah for macOS</title>
+<title>Kin for macOS</title>
 <style>
   :root { --bg:#fff; --fg:#12151a; --dim:#5d6673; --line:#e3e7ec; --code:#f5f7f9; --accent:#0a58ca; }
   @media (prefers-color-scheme: dark) {
@@ -29,30 +29,36 @@
 </style>
 <main>
   <div class=tag>early build · apple silicon · audio + video</div>
-  <h1>Tokkah for macOS</h1>
+  <h1>Kin for macOS</h1>
   <p class=lede>A video call that should feel like the other person is in the room. This is the
      native half — built because a browser will not give you the clocks or the audio
      thread the goal requires.</p>
 
   <h2>Install</h2>
-  <pre><code>curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code></pre>
-  <p class=note>Installs to <code>~/.local/bin/tk</code>. No security dialog to click through:
-     files fetched by <code>curl</code> are not quarantined, so this path never meets Gatekeeper.
-     The download is checked against a SHA-256 in a signed manifest, and from then on
-     <code>tk</code> updates itself and verifies an Ed25519 signature on every update before
-     applying it. Read the script first if you like — it is
-     <a href="/macos/install.sh">right here</a>, 50 lines.</p>
-  <p>It installs <b>Tokkah.app</b> into /Applications &mdash; double-click it, type a
-     room name, press Join. Both people type the same name and you are connected
-     directly, with no server in between. It keeps itself up to date, so you never
-     install it again. There is a <a href="/macos/dl/Tokkah.dmg">.dmg</a> too, though
-     macOS will want a right-click &rarr; Open the first time because it is not
-     notarised by Apple.</p>
+  <p><a id=dl data-dl href="/macos/dl/Kin-0.56.0.dmg"><b>Download Kin-0.56.0.dmg</b></a></p>
+  <p class=note>Open the disk image and double-click <b>Kin</b>. macOS warns once, because
+     this is signed by us and not notarised by Apple: open <code>System Settings &rarr; Privacy
+     &amp; Security</code>, scroll down and click <b>Open Anyway</b> (or right-click the app
+     &rarr; <b>Open</b>). That is the whole of it &mdash; after that single click the app moves
+     itself into /Applications, clears its own quarantine, and keeps itself up to date, verifying
+     an Ed25519 signature on every update before applying it. Nothing else to do. Dragging it to
+     /Applications yourself still works, but it is not required.</p>
+  <p>Then double-click <b>Kin.app</b>, type a room name, press Join. Both people type
+     the same name and you are connected directly, with no server in between.</p>
+
   <p>Every call reports what it did to
      <a href="/macos/calls">the call dashboard</a> &mdash; latency, gaps in the sound,
      bandwidth, and anything that broke, live while the call is running and kept
      afterwards. No audio and no room names are ever sent; the room name is the
      encryption key and never leaves the two machines.</p>
+
+  <h2>Or from a terminal</h2>
+  <pre><code>curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code></pre>
+  <p class=note>For people comfortable with a terminal: no security prompt at all, because files
+     fetched by <code>curl</code> are not quarantined, so this path never meets Gatekeeper. It
+     installs the same app plus <code>~/.local/bin/tk</code>, checks the download against a
+     SHA-256 in a signed manifest, and self-updates from then on. Read the script first if you
+     like &mdash; it is <a href="/macos/install.sh">right here</a>, 50 lines.</p>
 
   <h2>Use it</h2>
   <pre><code>tk --room ripe-mango-jam --window</code></pre>
@@ -147,7 +153,9 @@
      repaired by asking for a new keyframe, which costs about one frame. Two machines behind
      ordinary routers find each other with <code>--room</code> and talk directly, with no relay
      in the middle; a symmetric NAT on either side will defeat that, and there is no fallback
-     yet when it does. It is signed by us, not notarised by Apple, which is exactly why the
-     install goes through <code>curl</code>. And it is an early build being changed several
+     yet when it does. It is signed by us, not notarised by Apple, so the .dmg costs you one
+     click through a macOS warning the first time; the <code>curl</code> install skips even
+     that. And it is an early build being changed several
      times a day &mdash; it updates itself, so it will not stay this one for long.</p>
 </main>
+<script src="/macos/dl.js" defer></script>

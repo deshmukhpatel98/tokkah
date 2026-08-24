@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install tk, the native macOS half of Tokkah.
+# Install tk, the native macOS half of Kin.
 #
 #   curl -fsSL https://room.tokkah.com/macos/install.sh | sh
 #
@@ -28,7 +28,7 @@ WANT=$(printf '%s' "$MAN" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-echo "downloading tk $VER"
+echo "downloading Kin $VER"
 curl -fsSL "$URL" -o "$TMP/tk.tar.gz"
 GOT=$(shasum -a 256 "$TMP/tk.tar.gz" | awk '{print $1}')
 [ "$GOT" = "$WANT" ] || { echo "checksum mismatch: expected $WANT, got $GOT" >&2; exit 1; }
@@ -40,7 +40,7 @@ chmod +x "$DEST/tk"
 
 echo "installed $DEST/tk ($("$DEST/tk" --version))"
 
-# ── Tokkah.app, so this is something you can hand to another person ──────────
+# ── Kin.app, so this is something you can hand to another person ─────────────
 #
 # The bundle is assembled HERE rather than downloaded, so there is still exactly
 # one archive in the world and it cannot fall out of step with the binary the
@@ -53,8 +53,32 @@ echo "installed $DEST/tk ($("$DEST/tk" --version))"
 APPS="/Applications"
 [ -w "$APPS" ] || APPS="$HOME/Applications"
 mkdir -p "$APPS"
-APP="$APPS/Tokkah.app"
+APP="$APPS/Kin.app"
 rm -rf "$APP"
+
+# ── PREFER THE SIGNED BUNDLE THE ARCHIVE ALREADY CARRIES ─────────────────────
+#
+# Assembling the bundle here and ad-hoc signing it is what made the permission
+# prompts come back. macOS pins a camera or microphone grant to the app's
+# designated requirement, and an ad-hoc signature's requirement is a hash of the
+# bundle's contents -- so it changed on every release, and every change looked
+# like a brand new application that had to ask again. It was worse than that:
+# the icon below is fetched with `|| true` BEFORE the signature is made, so two
+# machines that disagreed about whether that fetch succeeded ended up with two
+# different identities for the same version.
+#
+# Releases now ship the finished bundle signed with a stable certificate, so the
+# right thing to do is copy it and change nothing. `ditto` preserves the
+# extended attributes parts of a signature live in.
+if [ -d "$TMP/Kin.app" ]; then
+  ditto "$TMP/Kin.app" "$APP"
+  codesign --verify --deep --strict "$APP" 2>/dev/null \
+    || echo "warning: the downloaded bundle does not verify"
+else
+# Fallback for an archive built before the bundle shipped inside it. Still
+# ad-hoc, so permissions will be re-asked on each update until a release with
+# the signed bundle arrives -- which is the bug, not the design.
+echo "note: this release predates signed bundles; permissions may be re-asked"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$DEST/tk" "$APP/Contents/MacOS/Tokkah"
 chmod +x "$APP/Contents/MacOS/Tokkah"
@@ -64,36 +88,60 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Tokkah</string>
-  <key>CFBundleDisplayName</key><string>Tokkah</string>
+  <key>CFBundleName</key><string>Kin</string>
+  <key>CFBundleDisplayName</key><string>Kin</string>
   <key>CFBundleIdentifier</key><string>com.tokkah.tk</string>
+  <!-- Stays Tokkah, and MUST match bundle/Info.plist: that one is written into
+       existing installs by the self-updater, so if these two disagree about the
+       executable's name, whichever install receives the other one stops
+       launching. Both flip together, one release after the updater that can move
+       the file has shipped. -->
   <key>CFBundleExecutable</key><string>Tokkah</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <!-- This was absent, so a curl install could not open a deep link at all: the
+       scheme only ever existed in the .dmg's plist. Two hand-written copies of
+       the same metadata, and they had already drifted. release.sh now compares
+       them. -->
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>Kin call</string>
+    <key>CFBundleURLSchemes</key><array><string>kin</string><string>tokkah</string></array>
+  </dict></array>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VER</string>
   <key>CFBundleVersion</key><string>$VER</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Tokkah needs the microphone to carry your voice on a call.</string>
+  <string>Kin needs the microphone to carry your voice on a call.</string>
   <key>NSCameraUsageDescription</key>
-  <string>Tokkah needs the camera to send your picture on a call.</string>
+  <string>Kin needs the camera to send your picture on a call.</string>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Tokkah connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
+  <string>Kin connects directly to the other person, including over your local network, so audio and video do not travel through a server.</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>
 </plist>
 PLIST
 # Best-effort: a missing icon is a generic app tile, not a broken install.
 curl -fsSL "$BASE/AppIcon.icns" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null || true
-# Ad-hoc signature gives the bundle one stable identity, which is what the
-# permission grants attach to. The updater re-signs after it replaces the binary.
 codesign -s - -f --deep "$APP" >/dev/null 2>&1 || true
+fi
 # Tell the Finder to notice the new icon straight away.
 touch "$APP"
+# ── The Tokkah.app this one renames must not survive alongside it ────────────
+#
+# Kin.app IS the old Tokkah.app under its new name. Leaving both would give the
+# user two apps in /Applications, two copies updating themselves every minute,
+# and two separate code identities holding two separate microphone grants --
+# with no way to tell which one the invite link opens. Same bundle, new name, so
+# the old directory goes.
+if [ -d "$APPS/Tokkah.app" ]; then
+  rm -rf "$APPS/Tokkah.app"
+  echo "removed the older $APPS/Tokkah.app (this is the same app, renamed)"
+fi
 echo "installed $APP"
 echo ""
-echo "OPEN IT: double-click Tokkah in $APPS, type a room name, press Join."
+echo "OPEN IT: double-click Kin in $APPS, type a room name, press Join."
 echo "Both people type the SAME room name and you are connected -- directly, with"
 echo "no server in between. The room name is also the encryption key, so choose"
 echo "something only the two of you would say."
