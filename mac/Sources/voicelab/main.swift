@@ -316,9 +316,10 @@ final class Btn: NSView {
     p.stroke()
     let c = enabled ? Ink.fg : Ink.dim
     let t = NSMutableParagraphStyle(); t.alignment = .center
-    let y = sub.isEmpty ? (bounds.height - 20) / 2 : bounds.height / 2 - 21
+    let y = sub.isEmpty ? (bounds.height - (bounds.height < 34 ? 17 : 20)) / 2 : bounds.height / 2 - 21
     (title as NSString).draw(in: NSRect(x: 8, y: y, width: bounds.width - 16, height: 24),
-      withAttributes: [.font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+      withAttributes: [.font: NSFont.systemFont(ofSize: bounds.height < 34 ? 12 : 15,
+                                                weight: bounds.height < 34 ? .regular : .semibold),
                        .foregroundColor: c, .paragraphStyle: t])
     if !sub.isEmpty {
       (sub as NSString).draw(in: NSRect(x: 10, y: bounds.height / 2 + 2, width: bounds.width - 20, height: 34),
@@ -350,6 +351,17 @@ final class Lab: NSObject, NSApplicationDelegate {
   var advice = NSTextField(labelWithString: "")
   var plays: [Btn] = []
   var modeBtns: [Btn] = []
+  // ── EVERY TAKE STAYS PLAYABLE ─────────────────────────────────────────────
+  //
+  // Pressing Record used to disable the three play buttons, so starting a new
+  // recording destroyed your ability to hear the last one -- which is precisely
+  // when you want it, because the only useful comparison is against what came
+  // before. Takes are kept as their raw mono and re-rendered on selection; the
+  // rendering is a handful of linear passes and costs less than the click.
+  struct Take { let label: String; let raw: [Float] }
+  var history: [Take] = []
+  var selected = -1
+  var takeRows: [Btn] = []
   var takeNo = 0
   var lastFolder: URL?
   var openBtn = Btn()
@@ -359,13 +371,13 @@ final class Lab: NSObject, NSApplicationDelegate {
   var startedAt = Date()
 
   func applicationDidFinishLaunching(_ n: Notification) {
-    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
+    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 730),
                      styleMask: [.titled, .closable, .miniaturizable],
                      backing: .buffered, defer: false)
     w.title = "Voice Lab"
     w.backgroundColor = Ink.bg
     w.center()
-    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 560))
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 730))
     root.wantsLayer = true
     root.layer?.backgroundColor = Ink.bg.cgColor
 
@@ -373,7 +385,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     // below is "distance down from the top edge", converted once here. The
     // previous version nudged bottom-up constants one at a time and three
     // elements ended up drawn on top of each other.
-    let H: CGFloat = 560
+    let H: CGFloat = 730
     func top(_ down: CGFloat, _ h: CGFloat) -> CGFloat { H - down - h }
 
     func label(_ s: String, _ size: CGFloat, _ col: NSColor, _ y: CGFloat, _ weight: NSFont.Weight = .regular) -> NSTextField {
@@ -385,7 +397,7 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(f)
       return f
     }
-    _ = label("Record your voice, then hear it three ways.", 15, Ink.fg, top(18, 25), .semibold)
+    _ = label("Record your voice, then hear it three ways.", 15, Ink.fg, top(16, 25), .semibold)
     _ = label("Wear headphones. The whole effect is the difference between your two ears.", 12, Ink.warn, top(46, 22))
 
     // ── WHAT THE MICROPHONE IS ALLOWED TO DO TO YOU ──────────────────────────
@@ -432,7 +444,15 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(b)
       plays.append(b)
     }
-    openBtn.frame = NSRect(x: 190, y: top(494, 34), width: 180, height: 34)
+    _ = label("Your takes — click one to load it", 11, Ink.dim, top(490, 16))
+    for i in 0..<5 {
+      let b = Btn(frame: NSRect(x: 40, y: top(512 + CGFloat(i) * 34, 30), width: 480, height: 30))
+      b.enabled = false
+      b.onTap = { [weak self] in self?.select(i) }
+      root.addSubview(b)
+      takeRows.append(b)
+    }
+    openBtn.frame = NSRect(x: 190, y: top(686, 30), width: 180, height: 30)
     openBtn.title = "Show recordings"
     openBtn.enabled = false
     openBtn.onTap = { [weak self] in
@@ -443,7 +463,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     advice.font = .systemFont(ofSize: 11)
     advice.textColor = Ink.dim
     advice.alignment = .center
-    advice.frame = NSRect(x: 20, y: top(468, 18), width: 520, height: 18)
+    advice.frame = NSRect(x: 20, y: top(462, 16), width: 520, height: 16)
     root.addSubview(advice)
 
     w.contentView = root
@@ -474,7 +494,8 @@ final class Lab: NSObject, NSApplicationDelegate {
     recording = true
     startedAt = Date()
     recBtn.title = "Stop"
-    plays.forEach { $0.enabled = false }
+    // The previous take stays playable while this one records. Disabling it here
+    // was the whole complaint: Record erased the thing you were comparing to.
     rec.onLevel = { [weak self] l in self?.meter.level = l }
     timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
       guard let self, self.recording else { return }
@@ -512,14 +533,47 @@ final class Lab: NSObject, NSApplicationDelegate {
     var norm = x
     let g = 0.7 / max(pk, 1e-6)
     for i in 0..<norm.count { norm[i] *= g }
-    takes = [("As it is today", norm, norm)]
-    let a = Spatial.render(norm, azimuth: 32, room: false)
-    let b = Spatial.render(norm, azimuth: 32, room: true)
-    takes.append(("Beside you", a.0, a.1))
-    takes.append(("Beside you, in a room", b.0, b.1))
-    plays.forEach { $0.enabled = true }
+    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+    history.insert(Take(label: String(format: "%@  ·  %@  ·  %.0f s  ·  %.0f dB",
+                                      f.string(from: Date()),
+                                      rec.pureMic ? "pure mic" : "like a call",
+                                      Double(norm.count) / SR, snr),
+                        raw: norm), at: 0)
+    if history.count > 5 { history.removeLast() }
+    select(0)
     save(raw: norm)
     advice.stringValue = "Play them in order. Ask where the voice is, not whether it is clean."
+  }
+
+  /// Load one of the kept takes into the three play buttons. Re-rendering here
+  /// rather than storing three stereo copies per take: the passes are linear and
+  /// finish inside the click, and holding every version of every take would be
+  /// tens of megabytes to save a few milliseconds nobody can feel.
+  func select(_ i: Int) {
+    guard i < history.count else { return }
+    selected = i
+    let raw = history[i].raw
+    takes = [("As it is today", raw, raw)]
+    let a = Spatial.render(raw, azimuth: 32, room: false)
+    let b = Spatial.render(raw, azimuth: 32, room: true)
+    takes.append(("Beside you", a.0, a.1))
+    takes.append(("Beside you, in a room", b.0, b.1))
+    plays.forEach { $0.enabled = true; $0.playing = false }
+    refreshRows()
+  }
+
+  func refreshRows() {
+    for (i, row) in takeRows.enumerated() {
+      if i < history.count {
+        row.enabled = true
+        row.title = history[i].label
+        row.playing = (i == selected)
+      } else {
+        row.enabled = false
+        row.title = ""
+        row.playing = false
+      }
+    }
   }
 
   /// Written the moment a take is judged usable, not on a button, because the
