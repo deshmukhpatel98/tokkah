@@ -474,6 +474,50 @@ final class Audio {
   private(set) var micGainNow: Float = -1
   private var micFloor: Float = 1.0
   private var speechRun = 0
+  // ── HANDING THE RECOGNISER A CHUNK, OFF THE AUDIO THREAD ──────────────────
+  //
+  // Both signals it needs are already kept: `capHist` is the RAW microphone,
+  // written before the gate touches it, so the quiet side's words are there at
+  // full quality however far down the gate has turned them; `echoHist` is what
+  // the speaker played. Aligning them by the measured delay costs an index.
+  //
+  // Read from a background thread, well behind the write head. The histories are
+  // seconds long and this stays a few hundred milliseconds back, so the writer
+  // is never in the region being read -- which is what makes it safe without a
+  // lock on the audio thread, and a lock on the audio thread is the thing that
+  // must never exist.
+  private var subReadAt = 0
+
+  func subtitleChunk() -> (mic: [Float], ref: [Float])? {
+    guard let ch = capHist, let eh = echoHist else { return nil }
+    let w = capHistW
+    // Stay 100 ms behind the writer: the cost is a subtitle a tenth of a second
+    // later, and the alternative is reading a sample as it is being written.
+    let safe = w - Int(SR * 0.10)
+    if subReadAt == 0 { subReadAt = max(0, safe - Int(SR * 0.20)) }
+    let n = safe - subReadAt
+    guard n >= Int(SR * 0.06) else { return nil }
+    // If it has fallen a long way behind -- a stalled recogniser, a slept
+    // machine -- skip forward rather than transcribing history nobody wants.
+    if n > Int(SR * 1.5) { subReadAt = safe - Int(SR * 0.5) }
+    let take = safe - subReadAt
+    var mic = [Float](repeating: 0, count: take)
+    var ref = [Float](repeating: 0, count: take)
+    let d = Int((echoDelayMs > 0 ? echoDelayMs : 0) / 1000.0 * SR)
+    let ew = echoW
+    for i in 0..<take {
+      let idx = subReadAt + i
+      mic[i] = ch[((idx % Audio.CAPH) + Audio.CAPH) % Audio.CAPH]
+      // What the speaker was playing when that sample was captured: the same
+      // distance back from ITS write head, minus the flight time through the room.
+      let back = (w - idx) + d
+      let e = ew - back
+      ref[i] = e >= 0 ? eh[((e % Audio.ECHO_MAX) + Audio.ECHO_MAX) % Audio.ECHO_MAX] : 0
+    }
+    subReadAt = safe
+    return (mic, ref)
+  }
+
   // ── CLEANING THE MICROPHONE FOR THE RECOGNISER ONLY ───────────────────────
   //
   // On speakers, the muted person's microphone hears two people: themselves, and

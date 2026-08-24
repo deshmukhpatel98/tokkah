@@ -254,6 +254,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor",
+  "no-subtitles", "asr-port", "subtitle-debug",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -2413,6 +2414,69 @@ if videoArg != "off" {
 // because the condition that produces it produces it on every single frame.
 let kscratch = UnsafeMutablePointer<UInt8>.allocate(capacity: 32)
 wire.onKeyRequest = { keyAsksIn += 1; venc?.requestKeyframe() }
+
+// ── THE QUIET SIDE STILL GETS TO SAY SOMETHING ───────────────────────────────
+//
+// One person is audible at a time, and the entire design rests on the other one
+// not being LOST. Their microphone never stops recording -- the gate turns it
+// down on the way to the wire, it does not stop capturing -- so their own
+// machine recognises what they said and sends the words. Their audio never
+// travels, which is why this can keep up with somebody talking.
+nonisolated(unsafe) var peerSaid = ""
+nonisolated(unsafe) var peerSaidFinal = false
+nonisolated(unsafe) var peerSaidAt = Date.distantPast
+nonisolated(unsafe) var subSent = 0
+nonisolated(unsafe) var subGot = 0
+nonisolated(unsafe) var turnComplete = 0.0
+let subtitles = flag("no-subtitles") ? nil
+  : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789)
+
+// RECEIVING IS NOT SENDING, and this was inside the block that needs a
+// recogniser -- so a machine without one could not DISPLAY the far end's words
+// either, though displaying text requires nothing at all. The end-to-end test
+// caught it immediately: the speaker recognised itself perfectly and the
+// listener showed nothing.
+wire.onSubtitle = { text, final in
+  peerSaid = text; peerSaidFinal = final; peerSaidAt = Date()
+  subGot += 1
+  if flag("subtitle-debug") { fputs("  they said: \(text)\(final ? " ." : " ...")\n", stderr) }
+}
+
+if let subs = subtitles {
+  subs.onText = { text, final in
+    guard !text.isEmpty else { return }
+    subSent += 1
+    wire.sendSubtitle(text, final: final)
+    if flag("subtitle-debug") { fputs("  you said: \(text)\(final ? " ." : " ...")\n", stderr) }
+  }
+  // Smart-turn reads the WAVEFORM, so it is judging prosody: a sentence that
+  // landed against one that trailed off, which no transcript can recover. It is
+  // what lets a handover happen at the end of a thought rather than after a
+  // silence long enough to be uncomfortable.
+  subs.onComplete = { p in turnComplete = p }
+
+  // Off the audio thread entirely. It reads the two histories the audio thread
+  // has already written, a safe distance behind the write head.
+  Thread {
+    let cleaner = Audio.SubtitleCleaner()
+    var wasVocal = false
+    while !shuttingDown {
+      Thread.sleep(forTimeInterval: 0.12)
+      guard Audio.gate.on else { continue }
+      let vocal = Audio.sharedGate.vocal != .quiet
+      if let c = audio.subtitleChunk(), !c.mic.isEmpty {
+        // Cleaned before it is recognised, because on speakers this microphone
+        // also hears the far end and their words would otherwise land in this
+        // person's subtitles under this person's name.
+        let clean = cleaner.clean(mic: c.mic, ref: c.ref)
+        clean.withUnsafeBufferPointer { subs.feed($0.baseAddress!, $0.count) }
+      }
+      if vocal { subs.tick() }
+      else if wasVocal { subs.endUtterance() }
+      wasVocal = vocal
+    }
+  }.start()
+}
 Thread {
   var lastAsk = 0.0
   var lastDecodes = -1

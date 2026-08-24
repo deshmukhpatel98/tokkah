@@ -43,6 +43,17 @@ let MAGIC: UInt32 = 0x544B_0001
 /// packet that carried them, is otherwise blind for the entire call. Measured
 /// exactly that: a peer starting 2 s late logged noFmt 346 and decoded nothing.
 let KMAGIC: UInt32 = 0x544B_0003
+// ── WORDS, NOT AUDIO ─────────────────────────────────────────────────────────
+//
+// The muted person's microphone never leaves their machine. Their own device
+// recognises what they said and sends the TEXT, which is a few dozen bytes
+// against a few dozen kilobytes -- so a subtitle costs one recognition on the
+// speaker's own hardware and no network round trip at all, which is the only way
+// it can keep up with somebody talking.
+//
+// It rides the media socket, so it is sealed by the same key as everything else
+// and takes the same path the voice takes.
+let SMAGIC: UInt32 = 0x544B_0007
 
 // ── The receive ring ────────────────────────────────────────────────────────
 //
@@ -958,6 +969,27 @@ final class Wire {
   /// Called on the socket thread when the peer asks for a keyframe.
   var onKeyRequest: (() -> Void)?
 
+  /// What the far end is saying, as their own machine heard it. `final` marks
+  /// the end of an utterance; everything before it is a running guess that will
+  /// be revised, which is what makes it feel live rather than late.
+  var onSubtitle: ((String, Bool) -> Void)?
+
+  /// Capped so one long sentence cannot become a jumbo packet. 512 bytes is far
+  /// more than anybody says between two revisions.
+  func sendSubtitle(_ text: String, final: Bool) {
+    var bytes = Array(text.utf8)
+    if bytes.count > 512 { bytes = Array(bytes.suffix(512)) }
+    var out = [UInt8](repeating: 0, count: 7 + bytes.count)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: SMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+      p.storeBytes(of: UInt8(final ? 1 : 0), toByteOffset: 4, as: UInt8.self)
+      p.storeBytes(of: UInt8(bytes.count & 0xFF), toByteOffset: 5, as: UInt8.self)
+      p.storeBytes(of: UInt8(bytes.count >> 8), toByteOffset: 6, as: UInt8.self)
+    }
+    for (i, b) in bytes.enumerated() { out[7 + i] = b }
+    out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .ctl) }
+  }
+
   func requestKeyframe(scratch: UnsafeMutablePointer<UInt8>) {
     scratch.withMemoryRebound(to: UInt32.self, capacity: 2) {
       $0[0] = KMAGIC.littleEndian; $0[1] = 0
@@ -1118,7 +1150,7 @@ final class Wire {
       var plain: UnsafeMutablePointer<UInt8> = buf
       var plainN = Int(n)
       if let c = crypto, c.established {
-        if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
+        if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
           // A recognised magic in the clear while a key exists: an old build on
           // the far end, or someone probing. Counted, never used.
           c.notePlaintextRx()
@@ -1133,7 +1165,7 @@ final class Wire {
       // A recognised magic from a reachable address is enough to point media
       // there. Once encryption is up this is genuine authentication: the packet
       // decrypted, so it came from someone holding the key.
-      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC {
+      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
         lastRecvHost = Clock.now()
         // The updater asks "is a call live?" before it restarts the app, and this
         // is the only evidence that answers it. Stamped here rather than exposed
@@ -1184,6 +1216,16 @@ final class Wire {
         continue
       }
       if magic == KMAGIC { onKeyRequest?(); continue }
+      if magic == SMAGIC {
+        guard plainN >= 7 else { continue }
+        let final = plain[4] == 1
+        let n = Int(plain[5]) | Int(plain[6]) << 8
+        guard n >= 0, 7 + n <= plainN else { continue }
+        let txt = n == 0 ? "" : (String(bytes: UnsafeBufferPointer(start: plain + 7, count: n),
+                                        encoding: .utf8) ?? "")
+        onSubtitle?(txt, final)
+        continue
+      }
       if magic == TMAGIC {
         guard plainN >= TPKT else { continue }
         let t4 = Clock.now()   // stamp FIRST: everything after this is our own cost
