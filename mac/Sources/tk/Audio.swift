@@ -473,6 +473,78 @@ final class Audio {
   private(set) var micGainNow: Float = -1
   private var micFloor: Float = 1.0
   private var speechRun = 0
+  // ── WHOSE TURN IT IS WHEN BOTH WANT IT ────────────────────────────────────
+  //
+  // Two people start at the same moment. Somebody has to go second, and the
+  // question is who -- asked over and over across a whole conversation, where
+  // the same person going second every time is the actual failure. That is a
+  // person being talked over by a machine's tie-break.
+  //
+  // So it keeps a ledger of contested moments and who ended up with the floor.
+  // Not floor TIME: somebody with more to say should say more, and throttling
+  // that would be a worse product than any echo. Only the coin-flips.
+  //
+  // THE LEDGER BIASES THE CUE AND NEVER THE AUDIO. Nothing is muted by it,
+  // nothing is opened by it, and it cannot cut anybody off -- it makes the
+  // visual nudge to yield stronger for whoever has been winning the coin-flips
+  // and weaker for whoever keeps losing them. The humans still decide; they are
+  // just no longer deciding blind.
+  //
+  // Both ends compute it from the same rule, and can compute it independently:
+  // whoever is still going a beat after an overlap started is the one who took
+  // it. Where the two ends disagree, the cost is a slightly wrong nudge, which
+  // is the cheapest kind of disagreement there is.
+  struct Ledger {
+    /// Contested starts this end took, and the far end took.
+    var mine = 0, theirs = 0
+    /// Recency-weighted, so a conversation is judged on the last few minutes
+    /// rather than on who talked most an hour ago.
+    var bias: Double = 0
+
+    /// −1 the far end has been yielding and is owed one; +1 this end has.
+    var owed: Double { max(-1, min(1, bias)) }
+
+    /// Same number as `Audio.yieldNudge`, on the struct so it can be tested
+    /// without a call in progress.
+    var yieldNudgeFor: Double { max(0, owed) }
+
+    mutating func won(byMe: Bool) {
+      if byMe { mine += 1 } else { theirs += 1 }
+      // Swept, not chosen. The requirement is three-sided: eight contested
+      // starts in a row must register clearly (+0.70), four yields afterwards
+      // must settle NEAR ZERO rather than swing to owing the other person just
+      // as much (-0.07), and twenty alternating turns must leave the nudge off
+      // entirely (-0.07). A faster memory satisfies the first and fails the
+      // second, which is a nudge that oscillates instead of correcting.
+      bias = bias * 0.86 + (byMe ? 0.14 : -0.14)
+    }
+  }
+  private(set) var ledger = Ledger()
+  private var contestAt: UInt64 = 0
+  private var contestMineAtStart = false
+
+  /// Called once per capture block while an overlap is in progress. Decides the
+  /// contest exactly once, a beat after it began, on whoever is still speaking.
+  private func judgeContest(now: UInt64, mineVocal: Bool, peerVocal: Bool) {
+    if mineVocal && peerVocal {
+      if contestAt == 0 { contestAt = now; contestMineAtStart = true }
+      return
+    }
+    guard contestAt != 0 else { return }
+    // 400 ms: longer than a stumble, shorter than a sentence. Below this the
+    // "winner" is whoever happened to draw breath second.
+    if Clock.ms(now - contestAt) >= 400 {
+      if mineVocal != peerVocal { ledger.won(byMe: mineVocal) }
+      contestAt = 0
+    } else if !mineVocal && !peerVocal {
+      contestAt = 0            // both stopped: nobody took it, nothing is owed
+    }
+  }
+
+  /// How hard to nudge this end to yield, 0...1. Read by the interface; it has
+  /// no effect on any sample of audio.
+  var yieldNudge: Double { max(0, ledger.owed) }
+
   // ── WHAT A CALL HAS TO REPORT FOR THIS TO GET BETTER ──────────────────────
   //
   // Turn-taking is now the whole product, so it needs the same treatment
@@ -545,6 +617,7 @@ final class Audio {
     if mine == .quiet { claimPending = false }
 
     // A collision, and who ended it.
+    judgeContest(now: now, mineVocal: mine != .quiet, peerVocal: peerVocal)
     let bothTalking = mine != .quiet && peerVocal
     if bothTalking, collisionStart == 0 {
       collisionStart = now; turns.collisions += 1

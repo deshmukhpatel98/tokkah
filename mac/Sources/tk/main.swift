@@ -253,6 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
+  "ledger-test",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1706,6 +1707,52 @@ if flag("gain-debug") { Audio.gainDebug = true }
 // Both of these pin what the route would otherwise decide, which is what makes
 // an A/B possible: --no-gate is full duplex on speakers, --force-gate is one at
 // a time on headphones.
+// ── DOES THE LEDGER ACTUALLY EVEN THINGS OUT? ─────────────────────────────
+//
+// The failure it exists to prevent is one person going second every single time,
+// so the test is not "does the number move" -- it is whether somebody who keeps
+// losing coin-flips ends up owed a turn, and whether an even conversation stays
+// neutral instead of drifting. Both matter: a ledger that nudges during a
+// balanced conversation is worse than none at all.
+if flag("ledger-test") {
+  var l = Audio.Ledger()
+  var bad = false
+  func show(_ what: String, _ v: Double, _ want: String, _ ok: Bool) {
+    print(String(format: "  %@ nudge %+.2f  (want %@)  %@",
+                 what.padding(toLength: 34, withPad: " ", startingAt: 0), v, want, ok ? "ok" : "WRONG"))
+    if !ok { bad = true }
+  }
+  // An even conversation must not nudge anybody.
+  for i in 0..<20 { l.won(byMe: i % 2 == 0) }
+  show("taking turns fairly", l.owed, "near 0", abs(l.owed) < 0.35)
+
+  // One side taking every contested start must end up clearly owing.
+  l = Audio.Ledger()
+  for _ in 0..<8 { l.won(byMe: true) }
+  show("you took eight in a row", l.owed, "strongly +", l.owed > 0.7)
+  // 0.6, not 0.7: the swept value lands at 0.70 and a bar sitting exactly on it
+  // passes by a rounding digit, which is not a test.
+  show("... so you are nudged to yield", l.owed, "> 0.6", l.yieldNudgeFor > 0.6)
+
+  // And it must forgive: yielding a few times clears the debt, or the nudge
+  // becomes a permanent handicap rather than a correction.
+  for _ in 0..<4 { l.won(byMe: false) }
+  // ABSOLUTE VALUE, NOT LESS-THAN. The first version of this line asked only
+  // that the number came DOWN, and +0.93 swinging to -0.48 passed it -- a
+  // correction that overshoots into owing the other person just as much, which
+  // in a real conversation is a nudge that oscillates instead of settling.
+  show("then yielded four", l.owed, "back near 0 EITHER WAY", abs(l.owed) < 0.3)
+
+  // The far end's ledger is the mirror of ours, or the two ends nudge the same
+  // person and the conversation locks up.
+  var a = Audio.Ledger(), b = Audio.Ledger()
+  for i in 0..<10 { let mine = i % 3 == 0; a.won(byMe: mine); b.won(byMe: !mine) }
+  show("two ends see the mirror image", a.owed + b.owed, "sums to 0", abs(a.owed + b.owed) < 0.001)
+
+  print(bad ? "  LEDGER TEST FAILED" : "  LEDGER TEST PASSED -- it corrects a lopsided conversation and leaves an even one alone")
+  exit(bad ? 1 : 0)
+}
+
 if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false }
 if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
