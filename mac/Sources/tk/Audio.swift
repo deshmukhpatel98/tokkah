@@ -1002,6 +1002,103 @@ final class Audio {
 
   @inline(__always) private func presence(_ x: Float) -> Float { pres.process(x) }
 
+  // ── THE DUPLEX GATE ───────────────────────────────────────────────────────
+  //
+  // The goal is that the far end hears the pure microphone -- nothing between the
+  // room and the wire. The only thing that ever justified putting something there
+  // is echo, and Apple's voice processing pays for it with the sound this whole
+  // project is trying to get away from: the noise suppression and the automatic
+  // gain, not the cancellation.
+  //
+  // So: DO NOTHING TO THE VOICE, AND DO IT ONLY WHEN THERE IS NO VOICE. While the
+  // far end is talking and this end is not, there is nothing in the microphone
+  // worth sending -- it is their own voice coming back at them. Turn it down. The
+  // moment this end speaks, the microphone is wide open and completely untouched:
+  // no spectral processing, no gain riding, no suppression. Every sample of
+  // anybody's actual speech goes out exactly as captured.
+  //
+  // WHAT MAKES IT SAFE IS KNOWING THE ECHO'S SIZE, NOT ITS SOUND. A microphone
+  // hearing echo looks loud, and gating on loudness alone would hold the gate
+  // open for the echo and closed on a quiet talker. The coupling -- how loud the
+  // microphone gets per unit of playout -- is learned as a running minimum over
+  // moments when only the far end is speaking, because near-end speech can only
+  // ever push that ratio up. Speech is then "more than the echo can explain".
+  struct Gate {
+    var on = true
+    /// How far down to turn the microphone when only the far end is talking.
+    var floorDb: Double = -22
+    /// How much louder than the expected echo counts as somebody really talking.
+    var margin: Float = 2.2
+  }
+  /// Standalone, like the presence filter, so the claim that a talking near end
+  /// passes through untouched can be checked without opening a device.
+  final class DuplexGate {
+    var cfg = Gate()
+    private var farEnv: Float = 0
+    private var nearEnv: Float = 0
+    private var coupling: Float = 0.5
+    private var farRun = 0
+    private(set) var gain: Float = 1
+    private(set) var closedFrames = 0
+    private(set) var openFrames = 0
+
+    @inline(__always) func noteFar(_ v: Float) {
+      let a = abs(v)
+      farEnv = a > farEnv ? a : farEnv * 0.9994        // ~35 ms release at 48 kHz
+    }
+
+    func process(_ x: UnsafeMutablePointer<Float>, _ n: Int) {
+      guard cfg.on else { return }
+      var peak: Float = 0
+      for k in 0..<n { let a = abs(x[k]); if a > peak { peak = a } }
+      // THE TWO ENVELOPES MUST FALL AT THE SAME RATE. This one is updated once
+      // per block and the far one once per sample, and giving them the same
+      // literal decay made this one hold its value for over a second while the
+      // other tracked in thirty-five milliseconds. The ratio between them was
+      // then meaningless for a second after every sentence, and the gate stayed
+      // open through it. 0.93 per block is the same 35 ms as 0.9994 per sample.
+      nearEnv = peak > nearEnv ? peak : nearEnv * 0.93
+
+      let far = farEnv
+      let farTalking = far > 0.004
+      farRun = farTalking ? farRun + n : 0
+      // NOT AT THE ONSET. When the far end starts, the echo has not arrived yet
+      // -- it is a room away and a buffer or two behind -- so for the first few
+      // milliseconds the microphone is honestly silent while the playout is
+      // loud. A minimum tracker fed that moment learns "there is no echo here",
+      // and from then on every sound in the room clears a threshold of zero and
+      // the gate never closes again. One transient, latched forever.
+      if farTalking, farRun > Int(SR * 0.08), nearEnv > 0.0008 {
+        // Learn the coupling from the quietest the microphone gets while the far
+        // end is loud. It may creep up slowly, so a change of volume or posture
+        // is followed; it may never jump, because a jump is somebody talking.
+        let r = min(max(nearEnv / max(far, 1e-6), 0.002), 4)
+        coupling = r < coupling ? r : min(coupling * 1.00002, 4)
+      }
+      let expected = coupling * far
+      let nearTalking = !farTalking || nearEnv > expected * cfg.margin
+      let want: Float = (farTalking && !nearTalking)
+        ? Float(pow(10, cfg.floorDb / 20)) : 1
+
+      // OPEN FAST, CLOSE SLOW. Backwards, this clips the first syllable of every
+      // interruption, which is the one thing a person notices immediately.
+      let step: Float = want > gain ? 0.02 : 0.0006
+      for k in 0..<n {
+        gain += (want - gain) * step
+        x[k] *= gain
+      }
+      if want < 1 { closedFrames += n } else { openFrames += n }
+    }
+  }
+  static var gate = Gate() { didSet { sharedGate.cfg = gate } }
+  nonisolated(unsafe) static let sharedGate = DuplexGate()
+  private let dgate = Audio.sharedGate
+  var gateClosedFrames: Int { dgate.closedFrames }
+  var gateOpenFrames: Int { dgate.openFrames }
+
+  @inline(__always) private func noteFar(_ v: Float) { dgate.noteFar(v) }
+  private func duplexGate(_ x: UnsafeMutablePointer<Float>, _ n: Int) { dgate.process(x, n) }
+
   var lastRenderErr: OSStatus = 0
 
   init() {
@@ -1139,7 +1236,18 @@ final class Audio {
   /// What the hardware is actually running at, which under VPIO need not be `SR`.
   var hwInRate: Double = 0
   var hwOutRate: Double = 0
-  static var ioKind = "vp"
+  // ── PURE BY DEFAULT ───────────────────────────────────────────────────────
+  //
+  // "vp" is Apple's VoiceProcessingIO: a good echo canceller wrapped in noise
+  // suppression and automatic gain, and that wrapper is the sound of being on a
+  // call rather than in a room. It is the thing this is trying not to be. "hal"
+  // is the plain device -- nothing between the microphone and the wire.
+  //
+  // What replaces the echo control is the duplex gate, which is transparent by
+  // construction: it only ever acts while the near end is NOT speaking, and a
+  // test asserts that a talking near end comes out bit-for-bit as captured.
+  // Echo during double talk is not solved by this and is the honest gap.
+  static var ioKind = "hal"
   static var agcOn = true
   /// Device-level input gain staging. On by default because the failure it fixes
   /// is silent, common, and unfixable anywhere else; `--no-auto-gain` is the
@@ -1684,6 +1792,9 @@ final class Audio {
     // signal, which is what a real microphone path would have delivered.
     if aecOn { cancelEcho(Int(n)) }
 
+    // And then the gate, on whatever cancellation left behind.
+    duplexGate(inScratch, Int(n))
+
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.
     if acoustic, acWaiting {
@@ -1983,6 +2094,7 @@ final class Audio {
         // The echo canceller is the exception and must see the treated signal,
         // because that is what the speaker actually plays into the microphone.
         let played = presence(val)
+        noteFar(played)
         out[i] = mute ? 0 : played
         noteEdge(val)
         prevOut = val
@@ -2069,6 +2181,7 @@ final class Audio {
           val = plcNext()
         }
         let played = presence(val)
+        noteFar(played)
         out[i] = mute ? 0 : played
         noteEdge(val)
         prevOut = val

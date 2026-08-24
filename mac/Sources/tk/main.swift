@@ -253,6 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
+  "no-gate", "gate-floor", "gate-margin", "gate-test",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1703,6 +1704,81 @@ if flag("gain-debug") { Audio.gainDebug = true }
 // Costs nothing to send (it runs on the receiving end of a stream already on the
 // wire) and nothing in latency (reflections are late by definition; the direct
 // sound is untouched).
+if flag("no-gate") { Audio.gate.on = false }
+if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
+if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
+
+// ── DOES A TALKING NEAR END GET THROUGH UNTOUCHED? ────────────────────────
+//
+// That is the whole promise, and it is the half that a listening test is worst
+// at confirming -- gentle damage to a voice sounds like a slightly worse
+// microphone, not like a bug. So it is checked as an identity: build a far end
+// talking, a near end talking over the top of it, and a microphone that hears
+// both, then require the samples where the near end is speaking to come out
+// EXACTLY as they went in, and the stretches where only the far end is speaking
+// to come out quiet.
+if flag("gate-test") {
+  let n = Int(SR * 12)
+  var seed: UInt64 = 0x51ED
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  // Far end talks 1-5 s and 6-11 s. Near end talks 3-5 s (interrupting) and 8-9 s.
+  func active(_ i: Int, _ spans: [(Double, Double)]) -> Bool {
+    let t = Double(i) / SR
+    return spans.contains { t >= $0.0 && t < $0.1 }
+  }
+  let farSpans = [(1.0, 5.0), (6.0, 11.0)]
+  let nearSpans = [(3.0, 5.0), (8.0, 9.0)]
+  var far = [Float](repeating: 0, count: n)
+  var near = [Float](repeating: 0, count: n)
+  for i in 0..<n {
+    let env = Float(0.55 + 0.45 * sin(2 * Double.pi * 4.3 * Double(i) / SR))
+    if active(i, farSpans) { far[i] = rnd() * 0.5 * env }
+    if active(i, nearSpans) { near[i] = rnd() * 0.35 * env }
+  }
+  let couple: Float = 0.25                       // the room's echo, 12 dB down
+  var mic = [Float](repeating: 0, count: n)
+  for i in 0..<n { mic[i] = near[i] + couple * (i >= 400 ? far[i - 400] : 0) }
+
+  let g = Audio.DuplexGate()
+  g.cfg = Audio.gate
+  var out = mic
+  let blk = 128
+  out.withUnsafeMutableBufferPointer { op in
+    var i = 0
+    while i + blk <= n {
+      for k in i..<(i + blk) { g.noteFar(far[k]) }
+      g.process(op.baseAddress! + i, blk)
+      i += blk
+    }
+  }
+  // Score the near-end stretches after the gate has had 200 ms to open.
+  var worstNear = 0.0, farOnlyE = 0.0, farOnlyRef = 0.0, nearN = 0
+  for i in 0..<n {
+    let t = Double(i) / SR
+    let nearOn = nearSpans.contains { t >= $0.0 + 0.2 && t < $0.1 }
+    let farOnly = active(i, farSpans) && !active(i, nearSpans)
+    if nearOn, abs(mic[i]) > 1e-4 {
+      worstNear = max(worstNear, Double(abs(out[i] - mic[i]) / abs(mic[i]))); nearN += 1
+    }
+    if farOnly {
+      farOnlyE += Double(out[i]) * Double(out[i])
+      farOnlyRef += Double(mic[i]) * Double(mic[i])
+    }
+  }
+  let suppressed = (farOnlyE > 0 && farOnlyRef > 0) ? 10 * log10(farOnlyRef / farOnlyE) : 99
+  let untouched = worstNear < 0.001 && nearN > 1000
+  print(String(format: "  while only they are talking, the microphone is %.1f dB quieter", suppressed))
+  print(String(format: "  while you are talking, the worst sample differs by %.4f%% -- %@",
+               worstNear * 100, untouched ? "untouched" : "CHANGED"))
+  let ok = untouched && suppressed > 15
+  print(ok ? "  GATE TEST PASSED -- your voice is bit-for-bit what the microphone heard"
+           : "  GATE TEST FAILED" + (untouched ? " (it does not suppress enough)" : " (it altered the near voice)"))
+  exit(ok ? 0 : 1)
+}
+
 if let m = arg("presence") {
   guard let p = Audio.Presence.named(m) else {
     fputs("--presence takes off, leaning-in, next-to-you, in-the-room,"
