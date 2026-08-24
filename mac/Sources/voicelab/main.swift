@@ -665,6 +665,206 @@ final class Player {
   func stop() { node.stop() }
 }
 
+// ── CAN THIS ROOM CARRY A PURE MICROPHONE? ───────────────────────────────────
+//
+// The goal is a call that sounds like the pure mic recording, not like a call.
+// The thing standing between those is echo: with nothing processing the input,
+// whatever the speaker plays goes straight back down the microphone and out to
+// the far end. Apple's voice processing solves that and is exactly the sound
+// being rejected -- most of what makes it sound like a call is the noise
+// suppression and the automatic gain, not the cancellation.
+//
+// A purely linear canceller has no such cost. It subtracts a signal it already
+// has a copy of, so when the far end is silent it does nothing at all to the
+// voice. The only question is whether it can be made long enough for a real
+// room, and that is not a question to answer by guessing: 1024 taps is 21 ms,
+// and whether 21 ms is most of the echo or a tenth of it depends on the room.
+//
+// So: play a known sound, record what comes back, and learn the path. The
+// filter that results IS the room -- where the echo starts, how long it rings,
+// and therefore how long a canceller has to be to catch it.
+enum Echo {
+  static let AR = 12000.0                       // analysis rate; sizing needs no more
+
+  /// A ONE-POLE IS NOT AN ANTI-ALIAS FILTER. It falls off at 6 dB per octave, so
+  /// at the Nyquist of the analysis rate it is barely 2 dB down and everything
+  /// above folds back into the band. Aliasing is not a linear function of the
+  /// reference, so no linear filter can cancel it: it put a floor under every
+  /// measurement here and made a 170 ms canceller look no better than a 21 ms
+  /// one. Four poles, and the floor goes away.
+  static func lowpassSteep(_ x: [Float], _ fc: Double) -> [Float] {
+    var y = x
+    for _ in 0..<4 { y = Spatial.onePole(y, fc) }
+    return y
+  }
+
+  /// Speech-shaped noise. A probe should look like the thing whose echo is the
+  /// problem: measuring with a click flatters the estimate, because a click has
+  /// energy everywhere and a voice does not.
+  static func probe(seconds: Double) -> [Float] {
+    var seed: UInt64 = 0x9E3779B97F4A7C15
+    func rnd() -> Float {
+      seed = seed &* 6364136223846793005 &+ 1442695040888963407
+      return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+    }
+    var x = (0..<Int(SR * seconds)).map { _ in rnd() }
+    let lo = Spatial.onePole(x, 150), hi = lowpassSteep(x, 3800)
+    for i in 0..<x.count { x[i] = (hi[i] - lo[i]) * 0.55 }
+    // Ease both ends so the probe starts and stops without a thump.
+    let ramp = Int(SR * 0.05)
+    for i in 0..<ramp {
+      let g = Float(i) / Float(ramp)
+      x[i] *= g; x[x.count - 1 - i] *= g
+    }
+    return x
+  }
+
+  static func decimate(_ x: [Float]) -> [Float] {
+    let step = Int((SR / AR).rounded())
+    let lp = lowpassSteep(x, AR / 3.2)
+    return stride(from: 0, to: lp.count, by: step).map { lp[$0] }
+  }
+
+  /// Normalised least-mean-squares, run offline over the whole recording. The
+  /// output is the room's impulse response as a canceller would learn it, which
+  /// is the honest thing to size a canceller against.
+  ///
+  /// RUN TO CONVERGENCE, NOT ONCE. A long filter needs more data to learn than a
+  /// short one -- roughly in proportion to its length -- so a single pass over a
+  /// few seconds scores a 170 ms filter on how FAST it adapts and calls that the
+  /// room. Measured that way the curve went flat at 7 dB and said filter length
+  /// does not matter, which is the opposite of true. Passing over the same
+  /// recording several times and scoring the last one asks the question actually
+  /// being asked: how much of this room is cancellable at all.
+  static func learn(ref: [Float], mic: [Float], taps: Int, passes: Int = 6)
+      -> (ir: [Float], erleDb: Double) {
+    var w = [Float](repeating: 0, count: taps)       // stored reversed: w[last] is lag 0
+    let n = min(ref.count, mic.count)
+    guard n > taps + 100 else { return (w, 0) }
+    var micE = 0.0, errE = 0.0
+    // THE STEP SIZE SETS A CEILING ON HOW QUIET IT CAN GET. A gradient step
+    // large enough to converge quickly keeps overshooting once it is there, and
+    // that residual jitter -- misadjustment -- is roughly mu/(2-mu) of the echo
+    // power no matter how good the filter is. At mu = 0.4 that is a hard 6 dB
+    // ceiling, which is precisely where every measurement here was pinned, and
+    // it looked exactly like "filter length does not matter". Anneal it: big
+    // steps to find the answer, small steps to sit still on it.
+    for pass in 0..<passes {
+    let mu: Float = 0.5 * pow(0.45, Float(pass))
+    let scoring = (pass == passes - 1)
+    if scoring { micE = 0; errE = 0 }
+    ref.withUnsafeBufferPointer { xp in
+      let x = xp.baseAddress!
+      for i in taps..<n {
+        let seg = x + (i - taps + 1)
+        var y: Float = 0
+        vDSP_dotpr(w, 1, seg, 1, &y, vDSP_Length(taps))
+        let e = mic[i] - y
+        var norm: Float = 0
+        vDSP_svesq(seg, 1, &norm, vDSP_Length(taps))
+        var a = mu * e / (norm + 1e-6)
+        vDSP_vsma(seg, 1, &a, w, 1, &w, 1, vDSP_Length(taps))
+        if scoring {
+          micE += Double(mic[i]) * Double(mic[i]); errE += Double(e) * Double(e)
+        }
+      }
+    }
+    }
+    let erle = (micE > 1e-12 && errE > 1e-12) ? 10 * log10(micE / errE) : 0
+    return (w, erle)
+  }
+
+  struct Room {
+    var delayMs = 0.0, tail60Ms = 0.0, erlDb = 0.0
+    var within: [(ms: Double, pct: Double)] = []
+    var erleByTaps: [(taps: Int, ms: Double, db: Double)] = []
+  }
+
+  /// The microphone is opened before the probe starts, so the recording begins
+  /// with an unknown amount of silence. Nothing downstream can tell that apart
+  /// from a very long echo delay, so it is cut off here: the probe fades in over
+  /// 50 ms and is far louder than a quiet room, so its arrival is unambiguous.
+  static func trimToOnset(_ mic: [Float]) -> [Float] {
+    let win = Int(SR * 0.01)
+    guard mic.count > win * 20 else { return mic }
+    var floorE: Double = 0
+    for i in 0..<win { floorE += Double(mic[i]) * Double(mic[i]) }
+    floorE = max(floorE / Double(win), 1e-10)
+    var i = win
+    while i + win < mic.count {
+      var e = 0.0
+      for k in i..<(i + win) { e += Double(mic[k]) * Double(mic[k]) }
+      if e / Double(win) > floorE * 25 {
+        return Array(mic[max(0, i - Int(SR * 0.02))...])
+      }
+      i += win
+    }
+    return mic
+  }
+
+  static func analyse(played: [Float], mic: [Float]) -> Room {
+    var r = Room()
+    let ref = decimate(played), rec = decimate(trimToOnset(mic))
+    // How much quieter the room already makes it. This is the head start a
+    // canceller gets for free, and on a laptop it is usually small.
+    let pe = rms(ref), me = rms(rec)
+    r.erlDb = (pe > 1e-9 && me > 1e-9) ? 20 * log10(pe / me) : 0
+
+    let taps = Int(AR * 0.34)                        // 340 ms: longer than any laptop room
+    let (wRev, _) = learn(ref: ref, mic: rec, taps: taps)
+    // Stored reversed, so index j is lag (taps-1-j).
+    var ir = [Float](repeating: 0, count: taps)
+    for j in 0..<taps { ir[taps - 1 - j] = wRev[j] }
+
+    var peak = 0, pv: Float = 0
+    for (i, v) in ir.enumerated() where abs(v) > pv { pv = abs(v); peak = i }
+    r.delayMs = Double(peak) / AR * 1000
+
+    var total = 0.0
+    for i in peak..<taps { total += Double(ir[i]) * Double(ir[i]) }
+    guard total > 1e-18 else { return r }
+    var acc = 0.0
+    for ms in [21.3, 42.7, 85.3, 170.7, 341.0] {
+      let end = min(taps, peak + Int(ms / 1000 * AR))
+      var e = 0.0
+      for i in peak..<end { e += Double(ir[i]) * Double(ir[i]) }
+      r.within.append((ms, e / total * 100))
+    }
+    // How long until the ring has dropped 60 dB: the room's own decay time.
+    acc = 0
+    for i in peak..<taps {
+      acc += Double(ir[i]) * Double(ir[i])
+      if acc >= total * 0.999999 { r.tail60Ms = Double(i - peak) / AR * 1000; break }
+    }
+
+    // And the number that actually decides the design: what a canceller of each
+    // length would achieve in THIS room. Aimed at the measured delay first,
+    // because that is what the real one does -- a filter that has to spend its
+    // first 12 ms covering the gap before the echo arrives is being scored on a
+    // handicap it does not have.
+    // Short of the measured delay ON PURPOSE. A filter only sees the past, so
+    // aligning exactly -- or a hair past, which is what the peak estimate does
+    // -- puts the echo's arrival before the earliest tap and leaves it
+    // uncancellable. That alone pinned every reading at 6 dB and read as
+    // "filter length makes no difference".
+    let skip = max(0, Int(r.delayMs / 1000 * AR) - 24)
+    let aimed = skip > 0 && skip < rec.count / 2 ? Array(rec[skip...]) : rec
+    for t48 in [1024, 2048, 4096, 8192] {
+      let ms = Double(t48) / SR * 1000
+      let t = max(16, Int(ms / 1000 * AR))
+      let (_, db) = learn(ref: ref, mic: aimed, taps: t)
+      r.erleByTaps.append((t48, ms, db))
+    }
+    return r
+  }
+
+  static func rms(_ x: [Float]) -> Double {
+    guard !x.isEmpty else { return 0 }
+    var a = 0.0; for v in x { a += Double(v) * Double(v) }
+    return (a / Double(x.count)).squareRoot()
+  }
+}
+
 // ── The window ───────────────────────────────────────────────────────────────
 //
 // One decision per screen. Record, then hear three versions. No numbers on the
@@ -766,6 +966,7 @@ final class Lab: NSObject, NSApplicationDelegate {
   var takeNo = 0
   var lastFolder: URL?
   var openBtn = Btn()
+  var echoBtn = Btn()
   var outLabel = NSTextField(labelWithString: "")
   var lastOut = ""
   var outTimer: Timer?
@@ -822,10 +1023,20 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(b)
       modeBtns.append(b)
     }
-    recBtn.frame = NSRect(x: 180, y: top(138, 48), width: 200, height: 48)
+    recBtn.frame = NSRect(x: 55, y: top(138, 48), width: 235, height: 48)
     recBtn.title = "Record"
     recBtn.onTap = { [weak self] in self?.toggle() }
     root.addSubview(recBtn)
+
+    // The other half of the goal. Sounding like the pure microphone rather than
+    // like a call means capturing with nothing in the way, and the only thing
+    // stopping that is echo. Whether echo can be cancelled cleanly enough is a
+    // property of the room, not an opinion, so it gets a button.
+    echoBtn.frame = NSRect(x: 305, y: top(138, 48), width: 200, height: 48)
+    echoBtn.title = "Check my echo"
+    echoBtn.sub = "plays a sound, listens for it"
+    echoBtn.onTap = { [weak self] in self?.checkEcho() }
+    root.addSubview(echoBtn)
 
     meter.frame = NSRect(x: 100, y: top(194, 8), width: 360, height: 8)
     root.addSubview(meter)
@@ -1029,6 +1240,67 @@ final class Lab: NSObject, NSApplicationDelegate {
     refreshRows()
   }
 
+  // ── MEASURE THE ROOM ─────────────────────────────────────────────────────
+  func checkEcho() {
+    guard !recording else { return }
+    let dev = Recorder.outputDevice()
+    echoBtn.enabled = false
+    recBtn.enabled = false
+    status.textColor = Ink.warn
+    status.stringValue = "Listening to your room — keep quiet for five seconds."
+    let probe = Echo.probe(seconds: 4)
+    let r = Recorder()
+    r.pureMic = true                       // measuring the path, not Apple's idea of it
+    do { try r.start() } catch {
+      status.textColor = Ink.hot
+      status.stringValue = "Could not open the microphone."
+      echoBtn.enabled = true; recBtn.enabled = true
+      return
+    }
+    // A beat of silence first, so the noise floor has something to be measured
+    // against and the probe's arrival is unmistakable.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.player.play(probe, probe)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+      guard let self else { return }
+      r.stop()
+      self.player.stop()
+      let mic = r.samples
+      self.status.stringValue = "Working out how long your room rings…"
+      DispatchQueue.global(qos: .userInitiated).async {
+        let room = Echo.analyse(played: probe, mic: mic)
+        DispatchQueue.main.async { self.showEcho(room, on: dev.name, micPeak: r.peak) }
+      }
+    }
+  }
+
+  func showEcho(_ room: Echo.Room, on device: String, micPeak: Float) {
+    echoBtn.enabled = true
+    recBtn.enabled = true
+    // Every number here goes to the log; the screen gets a sentence.
+    fputs("echo: device \(device)  micPeak \(micPeak)  startsAt \(room.delayMs) ms"
+        + "  ERL \(room.erlDb) dB\n", stderr)
+    for w in room.within { fputs(String(format: "echo:   %.0f%% within %.0f ms\n", w.pct, w.ms), stderr) }
+    for e in room.erleByTaps {
+      fputs(String(format: "echo:   %d taps (%.0f ms) -> %.1f dB\n", e.taps, e.ms, e.db), stderr)
+    }
+    guard micPeak > 0.005, let short = room.erleByTaps.first,
+          let best = room.erleByTaps.max(by: { $0.db < $1.db }) else {
+      status.textColor = Ink.hot
+      status.stringValue = "The microphone barely heard the speaker — turn the volume up and try again."
+      return
+    }
+    let gain = best.db - short.db
+    status.textColor = gain > 3 ? Ink.good : Ink.warn
+    status.stringValue = String(format: "Your room's echo lasts about %.0f ms.", room.tail60Ms)
+    advice.stringValue = gain > 3
+      ? String(format: "Today's canceller catches %.0f dB of it. A longer one would catch %.0f dB — worth building.",
+               short.db, best.db)
+      : String(format: "Today's canceller already catches %.0f dB; a longer one only gets %.0f dB. Length is not the problem here.",
+               short.db, best.db)
+  }
+
   func refreshRows() {
     for (i, row) in takeRows.enumerated() {
       if i < history.count {
@@ -1131,6 +1403,52 @@ if let v = argVal("--ctc-deg")   { Spatial.dipoleDeg = v }
 if let v = argVal("--ctc-lo")    { Spatial.ctcLo = v }
 if let v = argVal("--ctc-hi")    { Spatial.ctcHi = v }
 if let v = argVal("--wide-gain") { Spatial.wideGain = Float(v) }
+// ── THE ECHO ANALYSER, CHECKED AGAINST A ROOM WITH A KNOWN ANSWER ────────────
+//
+// It is about to be pointed at a real room, where nobody knows the right answer
+// and every number it prints will be believed. So first it gets a room that was
+// built on purpose: a known delay, a known decay, and a known amount of energy
+// past the window a 1024-tap canceller can see.
+if CommandLine.arguments.contains("--echo-selftest") {
+  let delayMs = 12.0, rt60Ms = 150.0
+  let probe = Echo.probe(seconds: 3)
+  var ir = [Float](repeating: 0, count: Int(SR * 0.4))
+  var seed: UInt64 = 0xABCDEF
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  let d0 = Int(delayMs / 1000 * SR)
+  ir[d0] = 0.30                                       // the direct arrival
+  for i in (d0 + 1)..<ir.count {                      // a decaying scatter after it
+    let t = Double(i - d0) / SR
+    ir[i] = rnd() * 0.16 * Float(pow(10, -3 * t / (rt60Ms / 1000)))
+  }
+  var mic = [Float](repeating: 0, count: probe.count)
+  for k in 0..<ir.count where abs(ir[k]) > 1e-6 {
+    let g = ir[k]
+    for i in k..<probe.count { mic[i] += g * probe[i - k] }
+  }
+  let r = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  built a room: echo starts at %.0f ms, rings for %.0f ms", delayMs, rt60Ms))
+  print(String(format: "  measured:     echo starts at %.1f ms", r.delayMs))
+  for w in r.within { print(String(format: "                %.0f%% of it lands within %.0f ms", w.pct, w.ms)) }
+  for e in r.erleByTaps {
+    print(String(format: "                a %d-tap canceller (%.0f ms) would get %.1f dB", e.taps, e.ms, e.db))
+  }
+  let delayOK = abs(r.delayMs - delayMs) < 2
+  let risesOK = (r.erleByTaps.last?.db ?? 0) > (r.erleByTaps.first?.db ?? 0) + 3
+  let shortSees = r.within.first?.pct ?? 100
+  let partialOK = shortSees < 95 && shortSees > 20
+  print(delayOK && risesOK && partialOK
+    ? "  ECHO SELFTEST PASSED -- finds the delay, and a longer filter measurably does better"
+    : "  ECHO SELFTEST FAILED"
+      + (delayOK ? "" : " (delay wrong)")
+      + (risesOK ? "" : " (length makes no difference -- it cannot tell filters apart)")
+      + (partialOK ? "" : " (a 21 ms window scores \(Int(shortSees))%, which is not a room)"))
+  exit(delayOK && risesOK && partialOK ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--vs-call") { }
 // ── DOES THE CALL SOUND LIKE THE LAB? ────────────────────────────────────────
 //
@@ -1142,6 +1460,52 @@ if CommandLine.arguments.contains("--vs-call") { }
 // call allows static headroom for the reflections and the Lab peak-normalises,
 // so they legitimately differ by a constant, and a constant is not a difference
 // in sound.
+// ── THE ECHO ANALYSER, CHECKED AGAINST A ROOM WITH A KNOWN ANSWER ────────────
+//
+// It is about to be pointed at a real room, where nobody knows the right answer
+// and every number it prints will be believed. So first it gets a room that was
+// built on purpose: a known delay, a known decay, and a known amount of energy
+// past the window a 1024-tap canceller can see.
+if CommandLine.arguments.contains("--echo-selftest") {
+  let delayMs = 12.0, rt60Ms = 150.0
+  let probe = Echo.probe(seconds: 3)
+  var ir = [Float](repeating: 0, count: Int(SR * 0.4))
+  var seed: UInt64 = 0xABCDEF
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  let d0 = Int(delayMs / 1000 * SR)
+  ir[d0] = 0.30                                       // the direct arrival
+  for i in (d0 + 1)..<ir.count {                      // a decaying scatter after it
+    let t = Double(i - d0) / SR
+    ir[i] = rnd() * 0.16 * Float(pow(10, -3 * t / (rt60Ms / 1000)))
+  }
+  var mic = [Float](repeating: 0, count: probe.count)
+  for k in 0..<ir.count where abs(ir[k]) > 1e-6 {
+    let g = ir[k]
+    for i in k..<probe.count { mic[i] += g * probe[i - k] }
+  }
+  let r = Echo.analyse(played: probe, mic: mic)
+  print(String(format: "  built a room: echo starts at %.0f ms, rings for %.0f ms", delayMs, rt60Ms))
+  print(String(format: "  measured:     echo starts at %.1f ms", r.delayMs))
+  for w in r.within { print(String(format: "                %.0f%% of it lands within %.0f ms", w.pct, w.ms)) }
+  for e in r.erleByTaps {
+    print(String(format: "                a %d-tap canceller (%.0f ms) would get %.1f dB", e.taps, e.ms, e.db))
+  }
+  let delayOK = abs(r.delayMs - delayMs) < 2
+  let risesOK = (r.erleByTaps.last?.db ?? 0) > (r.erleByTaps.first?.db ?? 0) + 3
+  let shortSees = r.within.first?.pct ?? 100
+  let partialOK = shortSees < 95 && shortSees > 20
+  print(delayOK && risesOK && partialOK
+    ? "  ECHO SELFTEST PASSED -- finds the delay, and a longer filter measurably does better"
+    : "  ECHO SELFTEST FAILED"
+      + (delayOK ? "" : " (delay wrong)")
+      + (risesOK ? "" : " (length makes no difference -- it cannot tell filters apart)")
+      + (partialOK ? "" : " (a 21 ms window scores \(Int(shortSees))%, which is not a room)"))
+  exit(delayOK && risesOK && partialOK ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--vs-call") {
   let tk = argVal("--tk").map { _ in "" } ?? {
     let a = CommandLine.arguments
