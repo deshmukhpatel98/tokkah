@@ -55,12 +55,60 @@ enum Spatial {
     return y
   }
 
-  static func render(_ x: [Float], azimuth: Double, room: Bool) -> ([Float], [Float]) {
+  // ── DISTANCE IS A SEPARATE KNOB FROM DIRECTION ────────────────────────────
+  //
+  // "Beside you" and "beside you in a room" differ only in whether a room is
+  // there at all, and that turned out to be a hard thing to have an opinion
+  // about. The literature says why: the two cues that carry DISTANCE
+  // independently of loudness are the direct-to-reverberant ratio and, for a
+  // nearby source off the midline, the interaural level difference -- which
+  // grows sharply inside a metre or so. Neither was on a control here.
+  //
+  // So the presets move along that axis on purpose. Same voice, same direction,
+  // three distances, and the differences are large enough to have an opinion
+  // about instead of a shrug.
+  struct Preset {
+    let name: String, sub: String
+    let azimuth: Double
+    /// Extra level drop at the far ear, in dB. Bigger = closer (near-field ILD).
+    let farEarDb: Double
+    /// Reflections as (delay seconds, gain). Fewer, earlier and quieter = a
+    /// higher direct-to-reverberant ratio = closer.
+    let taps: [(Double, Float)]
+  }
+
+  static let presets: [Preset] = [
+    Preset(name: "As it is today", sub: "one voice, both ears — inside your head",
+           azimuth: 0, farEarDb: 0, taps: []),
+    Preset(name: "Beside you", sub: "direction only, no room",
+           azimuth: 32, farEarDb: 3, taps: []),
+    Preset(name: "Beside you, in a room", sub: "direction plus early reflections",
+           azimuth: 32, farEarDb: 3,
+           taps: [(0.0068, 0.34), (0.0131, 0.24), (0.0204, 0.17), (0.0296, 0.12)]),
+    Preset(name: "Right next to you", sub: "close: big ear difference, almost no room",
+           azimuth: 34, farEarDb: 7.5,
+           taps: [(0.0037, 0.13), (0.0071, 0.09)]),
+    Preset(name: "Across the table", sub: "further: small ear difference, more room",
+           azimuth: 26, farEarDb: 2,
+           taps: [(0.0124, 0.40), (0.0203, 0.33), (0.0311, 0.26), (0.0442, 0.20)]),
+    Preset(name: "Just in front of you", sub: "nearly centred, a little room",
+           azimuth: 12, farEarDb: 1.2,
+           taps: [(0.0079, 0.20), (0.0148, 0.14)]),
+  ]
+
+  static func render(_ x: [Float], _ p: Preset) -> ([Float], [Float]) {
+    if p.azimuth == 0 && p.taps.isEmpty { return (x, x) }
+    return render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
+  }
+
+  static func render(_ x: [Float], azimuth: Double, farEarDb: Double,
+                     taps: [(Double, Float)]) -> ([Float], [Float]) {
+    let room = !taps.isEmpty
     let th = azimuth * Double.pi / 180
     let itd = (headR / c) * (th + sin(th)) * SR
     var R = shadow(x, cosToEar: cos(th - .pi / 2))
     var L = shadow(delay(x, itd), cosToEar: cos(th + .pi / 2))
-    let farGain = Float(pow(10, -3.0 / 20))
+    let farGain = Float(pow(10, -farEarDb / 20))
     for i in 0..<L.count { L[i] *= farGain }
     if room {
       // A small room seen from a seat beside you. The first reflection lands
@@ -68,8 +116,11 @@ enum Spatial {
       // enough not to read as an echo. DIFFERENT per ear on purpose -- it is the
       // difference between the ears that sounds spacious; the same reverb in
       // both is just a mono voice in a bucket.
-      let tapsL: [(Double, Float)] = [(0.0068, 0.34), (0.0131, 0.24), (0.0204, 0.17), (0.0296, 0.12)]
-      let tapsR: [(Double, Float)] = [(0.0081, 0.30), (0.0157, 0.22), (0.0229, 0.15), (0.0331, 0.11)]
+      // The two ears get DIFFERENT reflection patterns. Identical reverb in both
+      // is just a mono voice in a bucket; it is the mismatch between the ears
+      // that reads as space rather than as effect.
+      let tapsL = taps
+      let tapsR = taps.map { (t, g) in (t * 1.19 + 0.0013, g * 0.88) }
       let dull = onePole(x, 5200)
       func add(_ dst: inout [Float], _ taps: [(Double, Float)]) {
         for (t, g) in taps {
@@ -181,15 +232,54 @@ final class Recorder {
   func start() throws {
     samples.removeAll(); samples.reserveCapacity(48000 * 30); peak = 0
     let input = engine.inputNode
-    // Must be set BEFORE the format is read: turning voice processing on changes
-    // the node's format, and a converter built from the old one produces silence.
+    // ── VOICE PROCESSING IS A DUPLEX UNIT, AND IT NEEDS BOTH HALVES ──────────
+    //
+    // "Like a call" came out as noise with no voice in it. The unit behind it is
+    // the same VoiceProcessingIO the call uses, and it is duplex by nature: it
+    // cancels the echo of what is being PLAYED out of what is coming IN, so it
+    // expects a render side. With only an input tap attached there is no render
+    // side, the engine ran the input at a format nobody had agreed on, and the
+    // capture was garbage.
+    //
+    // So both ends get it, and the graph is completed with a silent path to the
+    // mixer -- silent because this is a recorder, not a call, and nothing should
+    // come out of the speaker while it runs.
     try? input.setVoiceProcessingEnabled(!pureMic)
+    // Read the format AFTER all of that: enabling voice processing changes it,
+    // and a converter built from the old one is the silence this started as.
     let inFmt = input.outputFormat(forBus: 0)
+    fputs("capture: \(pureMic ? "pure" : "voice-processed") \(inFmt.sampleRate) Hz "
+        + "\(inFmt.channelCount) ch\n", stderr)
+    // ── VOICE PROCESSING HANDS BACK FIVE CHANNELS ────────────────────────────
+    //
+    // Measured: pure capture is 48000 Hz 1 ch, and the same node with voice
+    // processing enabled reports 48000 Hz 5 ch. Connecting that to the mixer
+    // failed outright (-10875) and building a mono converter from it produced
+    // the noise that was actually shipped -- a five-channel buffer read as
+    // though it were one is every channel interleaved into nonsense, which is
+    // exactly what noise sounds like.
+    //
+    // The rate already matches, so there is nothing to convert: take channel 0
+    // and leave the converter out of the path entirely. Fewer moving parts, and
+    // the one that was moving was the one that broke.
+    let direct = (inFmt.sampleRate == SR)
+    if direct { conv = nil }
     let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SR,
                                channels: 1, interleaved: false)!
     conv = AVAudioConverter(from: inFmt, to: outFmt)
     input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in
-      guard let self, let conv = self.conv else { return }
+      guard let self else { return }
+      if direct {
+        guard let ch = buf.floatChannelData?[0] else { return }
+        let n = Int(buf.frameLength)
+        var pk: Float = 0
+        for i in 0..<n { let v = ch[i]; self.samples.append(v); pk = max(pk, abs(v)) }
+        self.peak = max(self.peak, pk)
+        self.level = self.level * 0.7 + pk * 0.3
+        DispatchQueue.main.async { self.onLevel?(self.level) }
+        return
+      }
+      guard let conv = self.conv else { return }
       let cap = AVAudioFrameCount(Double(buf.frameLength) * SR / inFmt.sampleRate) + 64
       guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
       var err: NSError?
@@ -213,6 +303,10 @@ final class Recorder {
   func stop() {
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
+    // Leave no connection behind: the next take may be in the other mode, and a
+    // graph built for voice processing does not survive being reused without it.
+    engine.disconnectNodeOutput(engine.inputNode)
+    engine.mainMixerNode.outputVolume = 1
   }
 
   /// How far the voice stands above the room. Below about 25 dB nothing else
@@ -371,13 +465,13 @@ final class Lab: NSObject, NSApplicationDelegate {
   var startedAt = Date()
 
   func applicationDidFinishLaunching(_ n: Notification) {
-    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 730),
+    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 790),
                      styleMask: [.titled, .closable, .miniaturizable],
                      backing: .buffered, defer: false)
     w.title = "Voice Lab"
     w.backgroundColor = Ink.bg
     w.center()
-    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 730))
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 790))
     root.wantsLayer = true
     root.layer?.backgroundColor = Ink.bg.cgColor
 
@@ -385,7 +479,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     // below is "distance down from the top edge", converted once here. The
     // previous version nudged bottom-up constants one at a time and three
     // elements ended up drawn on top of each other.
-    let H: CGFloat = 730
+    let H: CGFloat = 790
     func top(_ down: CGFloat, _ h: CGFloat) -> CGFloat { H - down - h }
 
     func label(_ s: String, _ size: CGFloat, _ col: NSColor, _ y: CGFloat, _ weight: NSFont.Weight = .regular) -> NSTextField {
@@ -397,7 +491,7 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(f)
       return f
     }
-    _ = label("Record your voice, then hear it three ways.", 15, Ink.fg, top(16, 25), .semibold)
+    _ = label("Record your voice, then hear it six ways.", 15, Ink.fg, top(16, 25), .semibold)
     _ = label("Wear headphones. The whole effect is the difference between your two ears.", 12, Ink.warn, top(46, 22))
 
     // ── WHAT THE MICROPHONE IS ALLOWED TO DO TO YOU ──────────────────────────
@@ -416,43 +510,41 @@ final class Lab: NSObject, NSApplicationDelegate {
       root.addSubview(b)
       modeBtns.append(b)
     }
-    recBtn.frame = NSRect(x: 180, y: top(146, 54), width: 200, height: 54)
+    recBtn.frame = NSRect(x: 180, y: top(138, 48), width: 200, height: 48)
     recBtn.title = "Record"
     recBtn.onTap = { [weak self] in self?.toggle() }
     root.addSubview(recBtn)
 
-    meter.frame = NSRect(x: 100, y: top(212, 10), width: 360, height: 10)
+    meter.frame = NSRect(x: 100, y: top(194, 8), width: 360, height: 8)
     root.addSubview(meter)
 
     status.font = .systemFont(ofSize: 12)
     status.textColor = Ink.dim
     status.alignment = .center
-    status.frame = NSRect(x: 20, y: top(232, 18), width: 520, height: 18)
+    status.frame = NSRect(x: 20, y: top(208, 18), width: 520, height: 18)
     status.stringValue = "Press Record and talk for about ten seconds."
     root.addSubview(status)
 
-    let titles = [("As it is today", "one voice, both ears — inside your head"),
-                  ("Beside you", "head model only, no room"),
-                  ("Beside you, in a room", "head model plus early reflections")]
-    for (i, t) in titles.enumerated() {
-      // TOP TO BOTTOM in the order they should be heard. AppKit lays subviews out
-      // from the bottom, so index 0 at y=60 put "as it is today" -- the thing you
-      // compare everything against -- underneath its own comparisons.
-      let b = Btn(frame: NSRect(x: 40, y: top(266 + CGFloat(i) * 66, 56), width: 480, height: 56))
-      b.title = t.0; b.sub = t.1; b.enabled = false
+    // TOP TO BOTTOM in the order they should be heard: nearest-to-today first,
+    // then direction, then distance. AppKit lays subviews out from the bottom,
+    // so this once put "as it is today" -- the thing everything is compared
+    // against -- underneath its own comparisons.
+    for (i, p) in Spatial.presets.enumerated() {
+      let b = Btn(frame: NSRect(x: 40, y: top(236 + CGFloat(i) * 52, 46), width: 480, height: 46))
+      b.title = p.name; b.sub = p.sub; b.enabled = false
       b.onTap = { [weak self] in self?.playTake(i) }
       root.addSubview(b)
       plays.append(b)
     }
-    _ = label("Your takes — click one to load it", 11, Ink.dim, top(490, 16))
-    for i in 0..<5 {
-      let b = Btn(frame: NSRect(x: 40, y: top(512 + CGFloat(i) * 34, 30), width: 480, height: 30))
+    _ = label("Your takes — click one to load it", 11, Ink.dim, top(578, 16))
+    for i in 0..<4 {
+      let b = Btn(frame: NSRect(x: 40, y: top(600 + CGFloat(i) * 32, 28), width: 480, height: 28))
       b.enabled = false
       b.onTap = { [weak self] in self?.select(i) }
       root.addSubview(b)
       takeRows.append(b)
     }
-    openBtn.frame = NSRect(x: 190, y: top(686, 30), width: 180, height: 30)
+    openBtn.frame = NSRect(x: 190, y: top(736, 30), width: 180, height: 30)
     openBtn.title = "Show recordings"
     openBtn.enabled = false
     openBtn.onTap = { [weak self] in
@@ -463,7 +555,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     advice.font = .systemFont(ofSize: 11)
     advice.textColor = Ink.dim
     advice.alignment = .center
-    advice.frame = NSRect(x: 20, y: top(462, 16), width: 520, height: 16)
+    advice.frame = NSRect(x: 20, y: top(552, 16), width: 520, height: 16)
     root.addSubview(advice)
 
     w.contentView = root
@@ -539,7 +631,7 @@ final class Lab: NSObject, NSApplicationDelegate {
                                       rec.pureMic ? "pure mic" : "like a call",
                                       Double(norm.count) / SR, snr),
                         raw: norm), at: 0)
-    if history.count > 5 { history.removeLast() }
+    if history.count > 4 { history.removeLast() }
     select(0)
     save(raw: norm)
     advice.stringValue = "Play them in order. Ask where the voice is, not whether it is clean."
@@ -553,11 +645,10 @@ final class Lab: NSObject, NSApplicationDelegate {
     guard i < history.count else { return }
     selected = i
     let raw = history[i].raw
-    takes = [("As it is today", raw, raw)]
-    let a = Spatial.render(raw, azimuth: 32, room: false)
-    let b = Spatial.render(raw, azimuth: 32, room: true)
-    takes.append(("Beside you", a.0, a.1))
-    takes.append(("Beside you, in a room", b.0, b.1))
+    takes = Spatial.presets.map { p in
+      let (L, R) = Spatial.render(raw, p)
+      return (p.name, L, R)
+    }
     plays.forEach { $0.enabled = true; $0.playing = false }
     refreshRows()
   }
@@ -589,9 +680,8 @@ final class Lab: NSObject, NSApplicationDelegate {
       .appendingPathComponent("Desktop/Voice Lab/\(stamp) \(mode)")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     Wav.write(raw, nil, to: dir.appendingPathComponent("0 raw mono.wav"))
-    let names = ["1 as it is today.wav", "2 beside you.wav", "3 beside you in a room.wav"]
-    for (i, t) in takes.enumerated() where i < names.count {
-      Wav.write(t.1, t.2, to: dir.appendingPathComponent(names[i]))
+    for (i, t) in takes.enumerated() {
+      Wav.write(t.1, t.2, to: dir.appendingPathComponent("\(i + 1) \(t.0).wav"))
     }
     // A note in the folder, because in a week the folder name will not be enough
     // to say what was different about this take.
@@ -627,6 +717,53 @@ final class Lab: NSObject, NSApplicationDelegate {
   }
 
   func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { true }
+}
+
+// ── The app testing its own capture ──────────────────────────────────────────
+//
+// "Like a call" produced noise with no voice in it, and there was no way to find
+// that out except by asking a person to press a button and listen. A GUI that
+// can only be checked by a human is a GUI whose bugs ship. `--selftest` records
+// in both modes and says what it got.
+//
+// Zero-crossing rate is the discriminator: speech crosses zero a few hundred to
+// about two thousand times a second and varies as it goes; broadband noise
+// crosses far more often and stays flat. It cannot tell a good voice from a bad
+// one, but it can tell a voice from garbage, which is the failure that happened.
+if CommandLine.arguments.contains("--selftest") {
+  func zcr(_ x: [Float]) -> Double {
+    guard x.count > 1 else { return 0 }
+    var c = 0
+    for i in 1..<x.count where (x[i - 1] < 0) != (x[i] < 0) { c += 1 }
+    return Double(c) * SR / Double(x.count)
+  }
+  var bad = false
+  for pure in [true, false] {
+    let r = Recorder()
+    r.pureMic = pure
+    let name = pure ? "pure mic   " : "like a call"
+    do { try r.start() } catch {
+      print("  \(name): FAILED to start -- \(error.localizedDescription)"); bad = true; continue
+    }
+    // Something to hear. The echo canceller will fight this in the processed
+    // arm, which is correct behaviour and not the thing under test.
+    let say = Process()
+    say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+    say.arguments = ["-v", "Samantha", "Testing one two three, the quick brown fox jumps over the lazy dog."]
+    try? say.run()
+    Thread.sleep(forTimeInterval: 6)
+    say.terminate()
+    r.stop()
+    let x = r.samples
+    let z = zcr(x)
+    let ok = x.count > Int(SR * 3) && r.peak > 0.002 && z > 80 && z < 6000
+    print(String(format: "  %@: %6d samples (%.1f s)  peak %.4f  zero-crossings %.0f/s  %@",
+                 name, x.count, Double(x.count) / SR, r.peak, z,
+                 ok ? "looks like audio" : (z >= 6000 ? "NOISE, not a voice" : "nothing captured")))
+    if !ok { bad = true }
+  }
+  print(bad ? "  SELFTEST FAILED" : "  SELFTEST PASSED")
+  exit(bad ? 1 : 0)
 }
 
 let app = NSApplication.shared
