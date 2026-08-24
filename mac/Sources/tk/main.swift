@@ -253,7 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
-  "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate",
+  "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1742,7 +1742,7 @@ if flag("gate-test") {
     if active(i, farSpans) { far[i] = rnd() * 0.5 * env }
     if active(i, nearSpans) { near[i] = rnd() * 0.35 * env }
   }
-  let couple: Float = 0.25                       // the room's echo, 12 dB down
+  let couple = Float(Double(arg("gate-coupling") ?? "0.25") ?? 0.25)
   var mic = [Float](repeating: 0, count: n)
   for i in 0..<n { mic[i] = near[i] + couple * (i >= 400 ? far[i - 400] : 0) }
 
@@ -1777,9 +1777,20 @@ if flag("gate-test") {
   print(String(format: "  while only they are talking, the microphone is %.1f dB quieter", suppressed))
   print(String(format: "  while you are talking, the worst sample differs by %.4f%% -- %@",
                worstNear * 100, untouched ? "untouched" : "CHANGED"))
-  let ok = untouched && suppressed > 15
-  print(ok ? "  GATE TEST PASSED -- your voice is bit-for-bit what the microphone heard"
-           : "  GATE TEST FAILED" + (untouched ? " (it does not suppress enough)" : " (it altered the near voice)"))
+  // ONE OF THESE IS ABSOLUTE AND THE OTHER IS NOT, AND SAYING SO IS THE POINT.
+  // Never altering a talking near end is required in every room. How much echo
+  // can be suppressed is a property of the room: when the microphone hears the
+  // speaker at nearly the level it was played, no comparison of levels can
+  // separate the two, and the right behaviour is to suppress less rather than
+  // to gate somebody mid-sentence. So the suppression bar applies to rooms
+  // where suppression is possible, and above that the number is reported.
+  let hard = couple > 0.55
+  let ok = untouched && (hard || suppressed > 15)
+  print(String(format: "  (room: microphone hears the speaker at %.0f%% of playout)", couple * 100))
+  print(ok ? (hard
+        ? "  GATE TEST PASSED -- a hard room: less echo held back, and still not one sample of your voice touched"
+        : "  GATE TEST PASSED -- your voice is bit-for-bit what the microphone heard")
+     : "  GATE TEST FAILED" + (untouched ? " (it does not suppress enough)" : " (it altered the near voice)"))
   exit(ok ? 0 : 1)
 }
 

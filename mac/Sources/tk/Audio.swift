@@ -1087,19 +1087,67 @@ final class Audio {
     /// How far down to turn the microphone when only the far end is talking.
     var floorDb: Double = -22
     /// How much louder than the expected echo counts as somebody really talking.
-    var margin: Float = 2.2
+    /// The base, at light coupling; it relaxes as the room couples harder --
+    /// see the note at the comparison. Swept across simulated rooms: 2.8 holds
+    /// 19 dB up to a microphone hearing the speaker at 80% of playout, decays
+    /// safely to nothing past that, and never alters the near voice.
+    var margin: Float = 2.8
+    /// Voiced time past which a listening noise is instead a bid for the floor.
+    /// Continuers are short by definition; saying something takes longer.
+    var claimMs: Double = 700
   }
   /// Standalone, like the presence filter, so the claim that a talking near end
   /// passes through untouched can be checked without opening a device.
+  ///
+  /// ── WHAT THIS IS AND IS NOT ───────────────────────────────────────────────
+  ///
+  /// It is PURELY LOCAL. It turns this microphone down for one reason: it can
+  /// hear the far end's voice coming out of this machine's own speaker right
+  /// now. There is no protocol, nothing negotiated, and nothing to race -- which
+  /// matters, because two ends see each other through a hundred milliseconds of
+  /// network and a design where they must agree can deadlock with both people
+  /// muted. If the far end goes quiet, this opens. Always.
+  ///
+  /// What it publishes is a CUE, never a command: this end is making a listening
+  /// noise, or this end wants to say something. The far end draws that, a person
+  /// reads it and stops talking, and their stopping is what opens this
+  /// microphone -- through the same local rule, with nothing arbitrating.
   final class DuplexGate {
     var cfg = Gate()
-    private var farEnv: Float = 0
+
+    /// What the near end is doing with their voice.
+    enum Vocal: Int {
+      case quiet = 0
+      /// Short, level, over the top of the far end: "mm-hm", "yeah", a laugh.
+      /// The literature is unambiguous that these are produced WITHOUT intent to
+      /// take a turn -- short duration, no turn-competitiveness -- which is
+      /// exactly why their audio is the least costly thing to hold back and
+      /// their meaning still has to arrive somehow.
+      case backchannel = 1
+      /// Sustained, or loud enough to be unmistakable. Somebody wants the floor.
+      case claim = 2
+    }
+    private(set) var vocal = Vocal.quiet
+
+    // The voice detector is the one from the user's own voice-mode app, where it
+    // has been run against real conversation: the floor falls fast and rises
+    // slowly, so it settles into a quiet room in a moment but a cough cannot drag
+    // it up over speech; two consecutive loud frames are required, which is what
+    // keeps key clicks and lip noise out.
+    private var level: Float = 0
     private var nearEnv: Float = 0
+    private var floor: Float = 0.004
+    private var run = 0
+    private var farEnv: Float = 0
     private var coupling: Float = 0.5
     private var farRun = 0
+    private var voicedBlocks = 0
+    private var quietBlocks = 0
     private(set) var gain: Float = 1
     private(set) var closedFrames = 0
     private(set) var openFrames = 0
+    private(set) var backchannels = 0
+    private(set) var claims = 0
 
     @inline(__always) func noteFar(_ v: Float) {
       let a = abs(v)
@@ -1107,35 +1155,106 @@ final class Audio {
     }
 
     func process(_ x: UnsafeMutablePointer<Float>, _ n: Int) {
-      guard cfg.on else { return }
+      guard cfg.on else { vocal = .quiet; return }
+      // TWO MEASURES, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. The peak envelope
+      // is what the echo comparison uses, and it must be the same KIND of number
+      // as the far-end envelope it is divided by -- pairing an RMS with a peak
+      // made the learned coupling drift low, the expected echo come out
+      // under-estimated, and the gate read its own echo as somebody talking.
+      // Suppression fell from 19.2 dB to 0.2. The smoothed RMS and its floor
+      // stay, as the absolute-silence guard for a room with no echo in it.
+      var sum: Float = 0
       var peak: Float = 0
-      for k in 0..<n { let a = abs(x[k]); if a > peak { peak = a } }
-      // THE TWO ENVELOPES MUST FALL AT THE SAME RATE. This one is updated once
-      // per block and the far one once per sample, and giving them the same
-      // literal decay made this one hold its value for over a second while the
-      // other tracked in thirty-five milliseconds. The ratio between them was
-      // then meaningless for a second after every sentence, and the gate stayed
-      // open through it. 0.93 per block is the same 35 ms as 0.9994 per sample.
-      nearEnv = peak > nearEnv ? peak : nearEnv * 0.93
-
+      for k in 0..<n {
+        sum += x[k] * x[k]
+        let a = abs(x[k]); if a > peak { peak = a }
+      }
+      let rms = (sum / Float(n)).squareRoot()
+      level += (rms - level) * 0.35
+      nearEnv = peak > nearEnv ? peak : nearEnv * 0.93   // 35 ms, matching the far side
+      // The floor tracks the SAME measure it will be compared against. Tracking
+      // it on the RMS and testing the peak against it is a factor of two or
+      // three of pure unit error, and it read as the room being loud enough to
+      // be somebody talking -- 0.4 dB of suppression instead of 19.
+      if nearEnv < floor { floor += (nearEnv - floor) * 0.25 }
+      else               { floor += (nearEnv - floor) * 0.002 }
       let far = farEnv
       let farTalking = far > 0.004
       farRun = farTalking ? farRun + n : 0
       // NOT AT THE ONSET. When the far end starts, the echo has not arrived yet
-      // -- it is a room away and a buffer or two behind -- so for the first few
-      // milliseconds the microphone is honestly silent while the playout is
-      // loud. A minimum tracker fed that moment learns "there is no echo here",
-      // and from then on every sound in the room clears a threshold of zero and
-      // the gate never closes again. One transient, latched forever.
+      // -- it is a room away and a buffer behind -- so for a few milliseconds
+      // the microphone is honestly silent while the playout is loud. A minimum
+      // tracker fed that moment learns "there is no echo here" and never closes
+      // again. One transient, latched forever.
       if farTalking, farRun > Int(SR * 0.08), nearEnv > 0.0008 {
-        // Learn the coupling from the quietest the microphone gets while the far
-        // end is loud. It may creep up slowly, so a change of volume or posture
-        // is followed; it may never jump, because a jump is somebody talking.
         let r = min(max(nearEnv / max(far, 1e-6), 0.002), 4)
         coupling = r < coupling ? r : min(coupling * 1.00002, 4)
       }
+
+      // THE BAR MOVES WITH WHAT THE SPEAKER IS EMITTING. A fixed one is deaf
+      // when the far end is loud and trigger-happy when it is quiet; the second
+      // is worse, and in the app this detector came from it cut six replies out
+      // of nine short. Three terms, whichever is highest: a multiple of the room
+      // floor, an absolute minimum for a silent room where any multiple of
+      // nothing is still nothing, and a multiple of the echo we expect.
+      // TWO SEPARATE TESTS, BECAUSE THEY GUARD AGAINST DIFFERENT MISTAKES.
+      // "Louder than the echo can explain" is what keeps the far end's own voice
+      // from reading as this end talking, and it is the only thing the GATE
+      // needs. "Louder than this room's own floor" is what keeps a fan or a
+      // keyboard from reading as a voice, and it only matters to the classifier.
+      // Rolled into one bar they interfere: the floor sits far below the echo
+      // during far-end speech, so the floor term alone declares the echo voiced.
       let expected = coupling * far
-      let nearTalking = !farTalking || nearEnv > expected * cfg.margin
+      // THE MARGIN CANNOT BE A CONSTANT, BECAUSE THE MISTAKE IT GUARDS IS NOT
+      // SYMMETRIC. A generous margin suppresses echo well and, in a room where
+      // the microphone sits inches from the speaker, sits ABOVE an ordinary
+      // speaking voice -- so the person is gated while they talk. Leaking some
+      // echo is a worse call; being cut off is an unusable one. Measured across
+      // simulated rooms, a fixed 2.2 gives 19 dB at light coupling and alters
+      // the near voice once the microphone hears the speaker at 80% of playout,
+      // which a laptop does. So it relaxes as the coupling rises: there is less
+      // room to be clever exactly where being clever is dangerous.
+      let effMargin = max(1.35, cfg.margin - 1.5 * coupling)
+      let aboveEcho = nearEnv > expected * effMargin
+      let aboveRoom = nearEnv > max(floor * 4.0, 0.006)
+      if aboveEcho && aboveRoom {
+        run += 1
+        if run >= 2 { voicedBlocks += 1; quietBlocks = 0 }
+      } else {
+        run = 0
+        if voicedBlocks > 0 { quietBlocks += 1 }
+      }
+
+      // ── BACKCHANNEL OR A BID FOR THE FLOOR ───────────────────────────────
+      //
+      // The difference is duration and nothing cleverer. A continuer is over
+      // before a word would be; wanting the floor takes longer than that,
+      // because you have to start saying something. The threshold is generous
+      // on purpose: mistaking a bid for a continuer costs a person their turn,
+      // and mistaking a continuer for a bid costs a cue that was going to
+      // disappear anyway.
+      let voicedMs = Double(voicedBlocks) * Double(n) / SR * 1000
+      let quietMs = Double(quietBlocks) * Double(n) / SR * 1000
+      if voicedBlocks > 0, voicedMs >= cfg.claimMs { promote(.claim) }
+      else if voicedBlocks > 0 { promote(.backchannel) }
+      // A gap longer than an ordinary mid-sentence pause ends it. 200-400 ms is
+      // a pause inside a sentence; past that the person has stopped.
+      if quietMs > 450 { voicedBlocks = 0; quietBlocks = 0; promote(.quiet) }
+
+      // THE GATE OPENS ON VOICE, NOT ON THE VERDICT. Waiting for the classifier
+      // to decide between a continuer and a bid means holding the microphone
+      // down through the first seven hundred milliseconds of somebody's
+      // sentence, and a test that asserts the near voice is untouched catches
+      // that immediately: 92% of the worst sample, gone. So the audio path
+      // opens the moment there is voice at all, and the classification is an
+      // OBSERVER -- it decides what cue the far end draws, never whether this
+      // person is allowed to be heard.
+      //
+      // Withholding a continuer's audio is a separate change and needs the
+      // retroactive buffer to be safe: hold the samples, and release them into
+      // the gap if it turns out to be a bid. Until that exists, a continuer is
+      // audible, which is exactly what happens today.
+      let nearTalking = !farTalking || aboveEcho
       let want: Float = (farTalking && !nearTalking)
         ? Float(pow(10, cfg.floorDb / 20)) : 1
 
@@ -1147,6 +1266,17 @@ final class Audio {
         x[k] *= gain
       }
       if want < 1 { closedFrames += n } else { openFrames += n }
+    }
+
+    private func promote(_ v: Vocal) {
+      guard v != vocal else { return }
+      // Only ever forward within one vocalisation: a continuer that turns out to
+      // be a sentence becomes a claim, and a claim never quietly downgrades to a
+      // continuer under somebody mid-word.
+      if v.rawValue < vocal.rawValue && v != .quiet { return }
+      vocal = v
+      if v == .backchannel { backchannels += 1 }
+      if v == .claim { claims += 1 }
     }
   }
   static var gate = Gate() { didSet { sharedGate.cfg = gate } }
