@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Accelerate
 
 // ── Voice Lab ────────────────────────────────────────────────────────────────
 //
@@ -75,7 +76,64 @@ enum Spatial {
     /// Reflections as (delay seconds, gain). Fewer, earlier and quieter = a
     /// higher direct-to-reverberant ratio = closer.
     let taps: [(Double, Float)]
+    /// Below ~200 Hz. The proximity effect: get close to any directional
+    /// microphone and the low end rises. It is the reason a radio voice sounds
+    /// like it is in the room with you, and it needs only one ear.
+    var lowShelfDb: Double = 0
+    /// Above ~4 kHz. Air absorbs the top end over distance, so less of it reads
+    /// as further away.
+    var highShelfDb: Double = 0
   }
+
+  /// Which set of renderings is honest for what the listener is on.
+  static func list(speakers: Bool) -> [Preset] { speakers ? monoPresets : presets }
+
+  static func shelf(_ x: [Float], lowDb: Double, highDb: Double) -> [Float] {
+    var y = x
+    if lowDb != 0 {
+      let g = Float(pow(10, lowDb / 20) - 1)
+      let lp = onePole(x, 200)
+      for i in 0..<y.count { y[i] += g * lp[i] }
+    }
+    if highDb != 0 {
+      let g = Float(pow(10, highDb / 20) - 1)
+      let lp = onePole(y, 4000)
+      for i in 0..<y.count { y[i] += g * (y[i] - lp[i]) }
+    }
+    return y
+  }
+
+  // ── WHAT SURVIVES ON A LAPTOP SPEAKER ─────────────────────────────────────
+  //
+  // Direction does not. It is carried entirely by the difference between the two
+  // ears, and speakers hand both channels to both ears; cancelling that crosstalk
+  // was measured and abandoned, because buying +0.3 dB of the cue cost 1.9 dB of
+  // change to the tone of the voice, and that trade sounds exactly as bad as it
+  // reads.
+  //
+  // DISTANCE survives, because it does not need two ears. The far-field distance
+  // cues are level, the direct-to-reverberant ratio, and spectrum -- all of them
+  // monaural. So on speakers the axis is how FAR away the person is and how
+  // close to your ear they feel, not where they are sitting. Every preset here
+  // is identical in both channels, which is what makes it immune to the problem
+  // that killed the other approach.
+  static let monoPresets: [Preset] = [
+    Preset(name: "As it is today", sub: "untouched", azimuth: 0, farEarDb: 0, taps: []),
+    Preset(name: "Leaning in", sub: "very close, nothing between you",
+           azimuth: 0, farEarDb: 0, taps: [], lowShelfDb: 5.5, highShelfDb: 1.5),
+    Preset(name: "Right next to you", sub: "close, barely any room",
+           azimuth: 0, farEarDb: 0,
+           taps: [(0.0041, 0.10), (0.0079, 0.07)], lowShelfDb: 3.5, highShelfDb: 1),
+    Preset(name: "In the room with you", sub: "a room, but a small one",
+           azimuth: 0, farEarDb: 0,
+           taps: [(0.0091, 0.26), (0.0168, 0.19), (0.0277, 0.13)]),
+    Preset(name: "Across the table", sub: "further off, more room",
+           azimuth: 0, farEarDb: 0,
+           taps: [(0.0142, 0.42), (0.0238, 0.34), (0.0371, 0.27), (0.0503, 0.20)],
+           highShelfDb: -2.5),
+    Preset(name: "Warmer, no room", sub: "tone only — is it the room or the voice?",
+           azimuth: 0, farEarDb: 0, taps: [], lowShelfDb: 3, highShelfDb: -1),
+  ]
 
   static let presets: [Preset] = [
     Preset(name: "As it is today", sub: "one voice, both ears — inside your head",
@@ -137,7 +195,26 @@ enum Spatial {
   // the listener sitting nearer or further, and cannot model them sitting off
   // to one side, which is the case this technique handles worst.
   static var dipoleDeg = 20.0
+  /// 0 = off. DEFAULTED BACK TO OFF after listening: see the note on
+  /// `speakerMode`. The sweep below optimised cue accuracy and was blind to what
+  /// the cancellation does to the sound of the voice.
   static var ctcDepth: Float = 0.85
+  enum SpeakerMode: String { case off, ctc, wide }
+  /// ── THE MEASUREMENT SAID BETTER AND THE EARS SAID WORSE ──────────────────
+  ///
+  /// Crosstalk cancellation measurably restored the ear cues -- level difference
+  /// from +2.2 to +4.3 dB, arrival time to within a tenth of a sample -- and the
+  /// verdict on hearing it was "the speaker ones are really, really bad", with
+  /// the plain headphone renderings preferred even when played on speakers.
+  ///
+  /// Both are true. Cancellation works by subtracting a delayed copy of the
+  /// opposite channel, which is a comb filter; it moves the cue into place and
+  /// puts notches through the voice on the way. The cue metrics cannot see a
+  /// notch, so they reported a clean win. The ear is the ground truth and it
+  /// says the timbre damage costs more than the cue is worth.
+  ///
+  /// Off by default until something scores well on BOTH.
+  static var speakerMode = SpeakerMode.off
   /// Only the band between these is cancelled; see the note above.
   static var ctcLo = 150.0
   static var ctcHi = 6000.0
@@ -149,6 +226,35 @@ enum Spatial {
     let itd = (headR / c) * (th + sin(th)) * SR
     let alpha = Float(1.05 + 0.95 * cos(th + .pi / 2))
     return (max(1, Int(itd.rounded())), alpha * 0.5, Float(pow(10, -1.6 / 20)))
+  }
+
+  static func forSpeakers(_ L: [Float], _ R: [Float]) -> ([Float], [Float]) {
+    switch speakerMode {
+    case .off:  return (L, R)
+    case .ctc:  return crosstalkCancel(L, R)
+    case .wide: return widen(L, R)
+    }
+  }
+
+  // ── THE GENTLE ALTERNATIVE ────────────────────────────────────────────────
+  //
+  // Crosstalk does two things to a stereo pair: it leaves the part both channels
+  // share alone and it shrinks the part where they differ. Cancellation attacks
+  // that by inverse-filtering the path, which is where the combing comes from.
+  // The other way round is Blumlein's shuffler: split into what the channels
+  // share and how they differ, and simply turn the difference up. There is no
+  // delay, no subtraction of a delayed copy, and no notch -- and when the two
+  // channels are identical the difference is zero, so a mono voice comes out
+  // bit-for-bit unchanged. It cannot restore arrival time, only level.
+  static var wideGain: Float = 2.0
+  static func widen(_ L: [Float], _ R: [Float]) -> ([Float], [Float]) {
+    let n = min(L.count, R.count)
+    var oL = [Float](repeating: 0, count: n), oR = oL
+    for i in 0..<n {
+      let m = (L[i] + R[i]) * 0.5, s = (L[i] - R[i]) * 0.5 * wideGain
+      oL[i] = m + s; oR[i] = m - s
+    }
+    return (oL, oR)
   }
 
   static func crosstalkCancel(_ L: [Float], _ R: [Float]) -> ([Float], [Float]) {
@@ -208,9 +314,27 @@ enum Spatial {
   }
 
   static func render(_ x: [Float], _ p: Preset, speakers: Bool = false) -> ([Float], [Float]) {
-    if p.azimuth == 0 && p.taps.isEmpty { return (x, x) }
+    // A preset with no direction is a MONO treatment: identical in both
+    // channels, so nothing about it can be erased by crosstalk.
+    if p.azimuth == 0 {
+      var y = x
+      if !p.taps.isEmpty {
+        let dull = onePole(x, 5200)
+        for (t, g) in p.taps {
+          var tap = dull; for i in 0..<tap.count { tap[i] *= g }
+          let d = delay(tap, t * SR)
+          if d.count > y.count { y += [Float](repeating: 0, count: d.count - y.count) }
+          for i in 0..<d.count { y[i] += d[i] }
+        }
+      }
+      y = shelf(y, lowDb: p.lowShelfDb, highDb: p.highShelfDb)
+      var peak: Float = 1e-9
+      for v in y { peak = max(peak, abs(v)) }
+      if peak > 0.89 { let g = 0.89 / peak; for i in 0..<y.count { y[i] *= g } }
+      return (y, y)
+    }
     var (L, R) = render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
-    if speakers { (L, R) = crosstalkCancel(L, R) }
+    if speakers { (L, R) = forSpeakers(L, R) }
     let n = min(L.count, R.count)
     var peak: Float = 1e-9
     for i in 0..<n { peak = max(peak, max(abs(L[i]), abs(R[i]))) }
@@ -717,7 +841,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     // then direction, then distance. AppKit lays subviews out from the bottom,
     // so this once put "as it is today" -- the thing everything is compared
     // against -- underneath its own comparisons.
-    for (i, p) in Spatial.presets.enumerated() {
+    for (i, p) in Spatial.list(speakers: Recorder.outputDevice().speakers).enumerated() {
       let b = Btn(frame: NSRect(x: 40, y: top(236 + CGFloat(i) * 52, 46), width: 480, height: 46))
       b.title = p.name; b.sub = p.sub; b.enabled = false
       b.onTap = { [weak self] in self?.playTake(i) }
@@ -841,9 +965,13 @@ final class Lab: NSObject, NSApplicationDelegate {
     let first = lastOut.isEmpty
     lastOut = key
     outLabel.stringValue = speakers
-      ? "Playing through \(name) — un-mixed so each ear gets its own voice."
-      : "Playing through \(name) — straight into each ear."
-    outLabel.textColor = speakers ? Ink.good : Ink.good
+      ? "Playing through \(name) — these are distances, not directions."
+      : "Playing through \(name) — direction works here."
+    outLabel.textColor = Ink.good
+    for (i, p) in Spatial.list(speakers: speakers).enumerated() where i < plays.count {
+      plays[i].title = p.name
+      plays[i].sub = p.sub
+    }
     if !first && selected >= 0 { select(selected) }
   }
 
@@ -857,7 +985,7 @@ final class Lab: NSObject, NSApplicationDelegate {
     selected = i
     let raw = history[i].raw
     let speakers = Recorder.outputDevice().speakers
-    takes = Spatial.presets.map { p in
+    takes = Spatial.list(speakers: speakers).map { p in
       let (L, R) = Spatial.render(raw, p, speakers: speakers)
       return (p.name, L, R)
     }
@@ -1002,6 +1130,7 @@ if let v = argVal("--ctc-depth") { Spatial.ctcDepth = Float(v) }
 if let v = argVal("--ctc-deg")   { Spatial.dipoleDeg = v }
 if let v = argVal("--ctc-lo")    { Spatial.ctcLo = v }
 if let v = argVal("--ctc-hi")    { Spatial.ctcHi = v }
+if let v = argVal("--wide-gain") { Spatial.wideGain = Float(v) }
 if CommandLine.arguments.contains("--spatial-test") || CommandLine.arguments.contains("--selftest") {
   func band(_ x: [Float]) -> [Float] {
     let lo = Spatial.onePole(x, 300), hi = Spatial.onePole(x, 6000)
@@ -1053,6 +1182,103 @@ if CommandLine.arguments.contains("--spatial-test") || CommandLine.arguments.con
     return Double(k - 25) + frac
   }
 
+  // ── THE METRIC THAT WAS MISSING ──────────────────────────────────────────
+  //
+  // Cue accuracy went up and the sound got worse, which means the instrument
+  // could not see the damage. Cancellation subtracts a delayed copy of the
+  // opposite channel; that is a comb filter, and a comb puts a row of notches
+  // through the voice. Notches are invisible to a level difference and to a
+  // cross-correlation, so both reported a clean win.
+  //
+  // RIPPLE is what they were missing: the magnitude spectrum at the ear,
+  // measured against a smoothed version of itself. A smooth spectrum with a
+  // tilt is a tone colour. A spectrum with regular deep notches in it is the
+  // hollow, phasey sound of comb filtering, and it shows up here as a big
+  // number no matter where the notches happen to land.
+  /// Average magnitude spectrum in dB, Welch-averaged over Hann windows.
+  func spectrum(_ x: [Float]) -> [Double] {
+    let log2n = vDSP_Length(12), n = 1 << 12
+    guard x.count >= n * 2, let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+    else { return [] }
+    defer { vDSP_destroy_fftsetup(setup) }
+    var win = [Float](repeating: 0, count: n)
+    vDSP_hann_window(&win, vDSP_Length(n), Int32(vDSP_HANN_NORM))
+    var mag = [Float](repeating: 0, count: n / 2)
+    var frames = 0, off = 0
+    while off + n <= x.count {
+      var re = [Float](repeating: 0, count: n / 2), im = re
+      var chunk = [Float](repeating: 0, count: n)
+      vDSP_vmul(Array(x[off..<off + n]), 1, win, 1, &chunk, 1, vDSP_Length(n))
+      chunk.withUnsafeBufferPointer { p in
+        p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { c in
+          var split = DSPSplitComplex(realp: &re, imagp: &im)
+          vDSP_ctoz(c, 2, &split, 1, vDSP_Length(n / 2))
+          vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+          var m = [Float](repeating: 0, count: n / 2)
+          vDSP_zvabs(&split, 1, &m, 1, vDSP_Length(n / 2))
+          for i in 0..<n / 2 { mag[i] += m[i] }
+        }
+      }
+      frames += 1; off += n / 2
+    }
+    guard frames > 0 else { return [] }
+    return (0..<n / 2).map { 20 * log10(Double(mag[$0]) / Double(frames) + 1e-9) }
+  }
+
+  // ── THE METRIC THAT WAS MISSING ──────────────────────────────────────────
+  //
+  // Cue accuracy went up and the sound got worse, which means the instrument
+  // could not see the damage. Cancellation works by subtracting a delayed copy
+  // of the opposite channel, and anything of that shape rearranges the spectrum
+  // -- a broad hollowing, a row of notches, or both. A level difference and a
+  // cross-correlation are blind to every bit of it, which is why they reported
+  // a clean win on something that sounds wrong.
+  //
+  // This compares the tone of the voice at the ear before and after the
+  // treatment. The average difference is subtracted first, so turning the
+  // volume up scores zero and only a change in SHAPE counts -- which is what
+  // "it sounds hollow" actually means.
+  func colourChange(_ a: [Float], _ b: [Float]) -> Double {
+    let sa = spectrum(a), sb = spectrum(b)
+    guard !sa.isEmpty, sa.count == sb.count else { return 0 }
+    let hz = SR / 4096.0
+    // 80 Hz to 10 kHz. The first version started at 200 and was therefore blind
+    // to the proximity effect, which lives below it -- it scored a 5.5 dB low
+    // shelf as 0.4 dB of change and called two clearly different modes
+    // indistinguishable. A metric's band has to contain the thing it is judging.
+    let lo = Int(80 / hz), hi = min(sa.count - 1, Int(10000 / hz))
+    var mean = 0.0
+    for i in lo...hi { mean += sb[i] - sa[i] }
+    mean /= Double(hi - lo + 1)
+    var acc = 0.0
+    for i in lo...hi { let d = (sb[i] - sa[i]) - mean; acc += d * d }
+    return (acc / Double(hi - lo + 1)).squareRoot()
+  }
+
+  /// The biggest change in any third-octave band, in dB. RMS across the whole
+  /// spectrum answers "how much was rearranged"; this answers "would anyone
+  /// notice", which is a different question -- a strong lift confined to one
+  /// region is plainly audible and barely moves an average taken over ten
+  /// kilohertz. Roughly 1.5 dB in a band is where a tone change stops being
+  /// something you have to go looking for.
+  func bandChange(_ a: [Float], _ b: [Float]) -> Double {
+    let sa = spectrum(a), sb = spectrum(b)
+    guard !sa.isEmpty, sa.count == sb.count else { return 0 }
+    let hz = SR / 4096.0
+    var worst = 0.0
+    var f = 80.0
+    while f < 10000 {
+      let lo = Int(f / hz), hi = min(sa.count - 1, Int(f * 1.26 / hz))
+      if hi > lo {
+        var d = 0.0
+        for i in lo...hi { d += sb[i] - sa[i] }
+        worst = max(worst, abs(d / Double(hi - lo + 1)))
+      }
+      f *= 1.26
+    }
+    return worst
+  }
+
   // A deterministic voice-band signal: no microphone, no randomness, same
   // numbers on every machine.
   var seed: UInt64 = 0x5eed
@@ -1066,48 +1292,85 @@ if CommandLine.arguments.contains("--spatial-test") || CommandLine.arguments.con
   }
   x = Spatial.onePole(x, 7000)
 
+  // CALIBRATE THE RULER BEFORE TRUSTING IT. A metric for comb filtering has to
+  // rank two known inputs the right way round: a plain signal, and the same
+  // signal with a delayed copy added, which is a comb by construction.
+  // Three known answers it must get right: the same signal is no change, the
+  // same signal twice as loud is no change of TONE, and a deliberate comb is.
+  let comb = (0..<x.count).map { i -> Float in i >= 9 ? x[i] - 0.8 * x[i - 9] : x[i] }
+  let louder = x.map { $0 * 2 }
+  let same = colourChange(x, x), vol = colourChange(x, louder), cmb = colourChange(x, comb)
+  let ruled = same < 0.1 && vol < 0.1 && cmb > 1.5
+  print(String(format: "  ruler check: identical %.2f dB, twice as loud %.2f dB, deliberate comb %.2f dB -- %@",
+               same, vol, cmb, ruled ? "ok" : "RULER IS BLIND"))
+  guard ruled else { print("  SPATIAL TEST FAILED -- the tone metric cannot be trusted"); exit(1) }
+
   let p = Spatial.presets[1]                       // "Beside you": direction only
   let (iL, iR) = Spatial.render(x, azimuth: p.azimuth, farEarDb: p.farEarDb, taps: p.taps)
-  let (cL, cR) = Spatial.crosstalkCancel(iL, iR)
-
-  print("  intended at the ears (headphones): ILD \(String(format: "%+.1f", ild(iL, iR))) dB   ITD \(String(format: "%.1f", itd(iL, iR))) samples")
-  // THE COST SIDE. My simulation inverts my own model, so "cancel harder" can
-  // only ever look better in it. The price is real though: cancellation is a
-  // boost, and the lower it reaches the bigger that boost gets, until the voice
-  // is boomy and there is no headroom left. That is measurable even when the
-  // benefit is self-fulfilling.
-  func lowRms(_ x: [Float]) -> Double { rms(Spatial.onePole(x, 400)) }
-  let boost = 20 * log10(max(1e-12, lowRms(cL) + lowRms(cR)) / max(1e-12, lowRms(iL) + lowRms(iR)))
-  var pk: Float = 0; for i in 0..<min(cL.count, cR.count) { pk = max(pk, max(abs(cL[i]), abs(cR[i]))) }
-  var ipk: Float = 0; for i in 0..<min(iL.count, iR.count) { ipk = max(ipk, max(abs(iL[i]), abs(iR[i]))) }
-  print(String(format: "  cost: low-end boost %+.1f dB, peak %+.1f dB", boost, 20 * log10(Double(pk / max(1e-9, ipk)))))
-  // TWO CUES, AND A SETTING THAT HELPS ONE CAN WRECK THE OTHER. Tuning purely on
-  // the level difference produced a canceller that restored ILD everywhere and
-  // pulled the arrival-time difference from 13 samples down to 6 -- and below
-  // about 1.5 kHz, which is most of a voice, timing is the cue that decides
-  // where a sound is. So the timing is a pass condition, not a readout: the
-  // cancellation is not allowed to leave it further from the truth than plain
-  // stereo already did.
   let want = itd(iL, iR)
-  var worst = Double.infinity, worstOff = 0.0
+  print(String(format: "  intended at the ears (headphones): level %+.1f dB, timing %.1f samples",
+               ild(iL, iR), want))
+  print("")
+
+  // Every candidate scored on all three at once: does the cue survive, does the
+  // timing survive, and what does it do to the sound of the voice.
   var okAll = true
-  for deg in [8.0, 12.0, 15.0, 20.0, 25.0, 30.0] {
-    let (aL, aR) = Spatial.earsFromSpeakers(iL, iR, halfAngleDeg: deg)
-    let (bL, bR) = Spatial.earsFromSpeakers(cL, cR, halfAngleDeg: deg)
-    let off = ild(aL, aR), on = ild(bL, bR)
-    let tOff = itd(aL, aR), tOn = itd(bL, bR)
-    let gain = on - off
-    if gain < worst { worst = gain; worstOff = off }
-    let ildOK = gain > 0.5
-    let itdOK = abs(tOn - want) <= abs(tOff - want) + 1
-    okAll = okAll && ildOK && itdOK
-    print(String(format: "  head at %2.0f deg: level %+.1f -> %+.1f dB (%+.1f restored)   timing %.1f -> %.1f of %.1f samples   %@",
-                 deg, off, on, gain, tOff, tOn, want,
-                 !ildOK ? "NO HELP (level)" : !itdOK ? "NO HELP (timing wrecked)" : "ok"))
+  var best = ("", -99.0)
+  for mode in [Spatial.SpeakerMode.off, .ctc, .wide] {
+    Spatial.speakerMode = mode
+    let (cL, cR) = Spatial.forSpeakers(iL, iR)
+    var worstGain = Double.infinity, added = 0.0, timingOK = true
+    for deg in [8.0, 12.0, 15.0, 20.0, 25.0, 30.0] {
+      let (aL, aR) = Spatial.earsFromSpeakers(iL, iR, halfAngleDeg: deg)
+      let (bL, bR) = Spatial.earsFromSpeakers(cL, cR, halfAngleDeg: deg)
+      worstGain = min(worstGain, ild(bL, bR) - ild(aL, aR))
+      // What the treatment does to the tone of the voice at that ear, against
+      // plain stereo heard from the same seat.
+      added = max(added, (colourChange(aL, bL) + colourChange(aR, bR)) / 2)
+      if abs(itd(bL, bR) - want) > abs(itd(aL, aR) - want) + 1 { timingOK = false }
+    }
+    let clean = added < 1.5
+    print(String(format: "  %-5@ : worst cue %+.1f dB   timing %@   tone change %.1f dB vs plain stereo   %@",
+                 mode.rawValue as NSString, worstGain, timingOK ? "kept" : "WRECKED", added,
+                 clean ? "clean" : "COMBED -- this is the hollow sound"))
+    if clean && timingOK && worstGain > best.1 { best = (mode.rawValue, worstGain) }
   }
-  print(okAll
-    ? String(format: "  SPATIAL TEST PASSED -- helps at every head position, worst case %+.1f dB over plain stereo's %+.1f dB", worst, worstOff)
-    : "  SPATIAL TEST FAILED -- cancellation does not survive the head moving")
+  Spatial.speakerMode = .off
+  print("")
+
+  // ── THE SPEAKER SET ───────────────────────────────────────────────────────
+  //
+  // Two things have to be true of these. MONO-SAFE: identical in both channels,
+  // so crosstalk has nothing to erase and the rendering that arrives is the
+  // rendering that was made. TELLABLE APART: a set of modes a listener shrugs at
+  // is not a choice, it is a menu, and the last round produced exactly that.
+  print("  on speakers (mono — distance, not direction):")
+  var monoOK = true
+  var prev: [Float]? = nil
+  let (base, _) = Spatial.render(x, Spatial.monoPresets[0], speakers: true)
+  for p in Spatial.monoPresets {
+    let (L, R) = Spatial.render(x, p, speakers: true)
+    let safe = L == R
+    let vsBase = bandChange(base, L)
+    let vsPrev = prev.map { bandChange($0, L) } ?? 0
+    prev = L
+    let distinct = p.name == "As it is today" || (vsBase > 1.5 && vsPrev > 1.5)
+    if !safe || !distinct { monoOK = false }
+    let pad = p.name.padding(toLength: 22, withPad: " ", startingAt: 0)
+    print(String(format: "    %@%@   %.1f dB from today, %.1f dB from the one above  %@",
+                 pad, safe ? "mono-safe" : "NOT MONO-SAFE",
+                 vsBase, vsPrev,
+                 distinct ? "" : "<- too close to tell apart"))
+  }
+  print(monoOK ? "  speaker set ok -- every mode is mono-safe and audibly its own thing"
+               : "  SPEAKER SET FAILED")
+  print("")
+  if best.0.isEmpty {
+    print("  no speaker treatment earns its keep -- plain stereo it is")
+  } else {
+    print("  best speaker treatment: \(best.0)  (\(String(format: "%+.1f", best.1)) dB of cue, tone left alone)")
+  }
+  okAll = monoOK
   if CommandLine.arguments.contains("--spatial-test") { exit(okAll ? 0 : 1) }
   if !okAll { exit(1) }
 }
