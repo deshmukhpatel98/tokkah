@@ -253,7 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
-  "ledger-test",
+  "ledger-test", "subtitle-test", "sub-over", "sub-floor",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1714,6 +1714,77 @@ if flag("gain-debug") { Audio.gainDebug = true }
 // losing coin-flips ends up owed a turn, and whether an even conversation stays
 // neutral instead of drifting. Both matter: a ledger that nudges during a
 // balanced conversation is worse than none at all.
+// ── HOW MUCH OF THE OTHER PERSON IS LEFT FOR THE RECOGNISER TO READ? ──────
+//
+// The muted person's microphone hears both of them, and the whole point is that
+// their subtitles must contain their words and not the other person's. So the
+// measure is the near-to-far ratio the recogniser is handed, against the one it
+// would have been handed raw.
+//
+// Both halves are measured through the SAME per-band gains the mixture produced.
+// Cleaning the near voice alone and the echo alone would let the filter adapt to
+// a different signal in each run and score itself on two passes that never
+// happened -- flattering by construction.
+if flag("subtitle-test") {
+  let sr = 16000.0
+  var seed: UInt64 = 0xBEEF
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  func voiceLike(_ n: Int, _ rate: Double, _ amp: Float) -> [Float] {
+    // Amplitude-modulated, band-limited noise: syllable structure, formant-ish
+    // tilt, and no two of them alike.
+    var x = (0..<n).map { i -> Float in
+      rnd() * amp * Float(0.5 + 0.5 * sin(2 * Double.pi * rate * Double(i) / sr))
+    }
+    var lp: Float = 0
+    for i in 0..<n { lp = 0.72 * lp + 0.28 * x[i]; x[i] = x[i] - lp * 0.6 }
+    return x
+  }
+  let n = Int(sr * 6)
+  let near = voiceLike(n, 3.9, 0.30)
+  let far  = voiceLike(n, 2.7, 0.55)
+  // The echo: delayed, and coloured, because a laptop speaker and its microphone
+  // are not flat. A test with a flat echo path is a test of the easy case.
+  let d = Int(sr * 0.012)
+  var echo = [Float](repeating: 0, count: n)
+  var lp: Float = 0
+  for i in d..<n { lp = 0.55 * lp + 0.45 * far[i - d]; echo[i] = lp * 0.45 + far[i - d] * 0.12 }
+  let mic = (0..<n).map { near[$0] + echo[$0] }
+
+  func rms(_ x: [Float]) -> Double {
+    var a = 0.0; for v in x { a += Double(v) * Double(v) }
+    return (a / Double(max(1, x.count))).squareRoot()
+  }
+  let inRatio = 20 * log10(rms(near) / max(rms(echo), 1e-12))
+
+  let c = Audio.SubtitleCleaner()
+  if let v = arg("sub-over"), let f = Float(v) { c.over = f }
+  if let v = arg("sub-floor"), let f = Float(v) { c.floorFrac = f }
+  _ = c.clean(mic: mic, ref: far)                       // let it learn the path
+  let c2 = Audio.SubtitleCleaner()
+  if let v = arg("sub-over"), let f = Float(v) { c2.over = f }
+  if let v = arg("sub-floor"), let f = Float(v) { c2.floorFrac = f }
+  let keptNear = c2.clean(mic: mic, ref: far, probe: near)
+  let c3 = Audio.SubtitleCleaner()
+  if let v = arg("sub-over"), let f = Float(v) { c3.over = f }
+  if let v = arg("sub-floor"), let f = Float(v) { c3.floorFrac = f }
+  let keptEcho = c3.clean(mic: mic, ref: far, probe: echo)
+  let outRatio = 20 * log10(rms(keptNear) / max(rms(keptEcho), 1e-12))
+  let nearLoss = 20 * log10(rms(keptNear) / max(rms(near), 1e-12))
+
+  print(String(format: "  the microphone hands over the near voice %+.1f dB above the other person", inRatio))
+  print(String(format: "  after cleaning, %+.1f dB above -- %+.1f dB better for the recogniser",
+               outRatio, outRatio - inRatio))
+  print(String(format: "  the near voice itself lost %.1f dB (it may sound bad; nobody hears it)", -nearLoss))
+  let ok = outRatio - inRatio > 12 && nearLoss > -8
+  print(ok ? "  SUBTITLE TEST PASSED -- the other person's voice is pushed down far enough to read past"
+           : "  SUBTITLE TEST FAILED"
+             + (outRatio - inRatio > 12 ? " (it ate the near voice too)" : " (not enough separation)"))
+  exit(ok ? 0 : 1)
+}
+
 if flag("ledger-test") {
   var l = Audio.Ledger()
   var bad = false

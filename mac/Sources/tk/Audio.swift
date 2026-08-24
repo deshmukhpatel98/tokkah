@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Accelerate
 
 // ── The mute flag outlives the audio engine, and has to ─────────────────────
 //
@@ -473,6 +474,132 @@ final class Audio {
   private(set) var micGainNow: Float = -1
   private var micFloor: Float = 1.0
   private var speechRun = 0
+  // ── CLEANING THE MICROPHONE FOR THE RECOGNISER ONLY ───────────────────────
+  //
+  // On speakers, the muted person's microphone hears two people: themselves, and
+  // the far end coming out of their own laptop. Transcribe that and their
+  // subtitles fill up with the other person's words, attributed to them. It is a
+  // real bug and a very visible one.
+  //
+  // This is NOT the echo canceller coming back, and the difference is the whole
+  // reason it is allowed to exist. Cancellation was unacceptable because it
+  // damaged the voice people HEAR. Nothing here is ever heard. The output of
+  // this path is text, so it may distort, over-subtract, smear the phase and
+  // hollow out the voice as much as it likes -- a recogniser does not care, and
+  // no listener is downstream of it. It is also allowed to run late, which the
+  // audio path never is.
+  //
+  // So it uses the method a listener could never tolerate: SPECTRAL
+  // OVER-SUBTRACTION. Take the magnitude spectrum of the microphone and of what
+  // was played, aligned by the measured delay, and subtract several times more
+  // of the second than is actually there. A linear filter has to get the phase
+  // right and can therefore only remove what it can predict exactly; this
+  // ignores phase entirely, which is why it removes so much more, and why the
+  // result would be unlistenable.
+  //
+  // The coupling is learned PER BAND, because a laptop's speaker and its
+  // microphone are not flat: one figure for the whole spectrum under-subtracts
+  // where the path is loud and eats the near voice where it is quiet.
+  final class SubtitleCleaner {
+    static let N = 512                      // 32 ms at 16 kHz
+    static let HOP = N / 2
+    static let BINS = N / 2
+    /// How many times the estimated echo to remove. Far above 1 on purpose.
+    ///
+    /// Swept: 2.6 gives +7 dB of separation, 9 gives +14, 14 gives +17, and the
+    /// near voice loses 0.2, 3.1 and 4.2 dB respectively -- which does not
+    /// matter, because nobody hears it. What DOES matter is the thing this
+    /// measurement cannot see: past some depth, over-subtraction leaves musical
+    /// noise, and a recogniser reads that as words. So this stops at a strong
+    /// setting rather than the best-scoring one, and the real tuning happens
+    /// with the recogniser in the loop, against transcripts.
+    var over: Float = 9
+    /// Never take a band below this fraction of what arrived, or consonants
+    /// vanish along with the echo and the recogniser starts inventing words.
+    var floorFrac: Float = 0.03
+
+    private var coupling = [Float](repeating: 0.35, count: BINS)
+    private var win = [Float](repeating: 0, count: N)
+    private var overlap = [Float](repeating: 0, count: HOP)
+    private var setup: FFTSetup?
+
+    init() {
+      for i in 0..<SubtitleCleaner.N {
+        win[i] = 0.5 - 0.5 * cos(2 * Float.pi * Float(i) / Float(SubtitleCleaner.N))
+      }
+      setup = vDSP_create_fftsetup(vDSP_Length(9), FFTRadix(kFFTRadix2))
+    }
+    deinit { if let s = setup { vDSP_destroy_fftsetup(s) } }
+
+    private func spectrum(_ x: [Float], _ off: Int) -> (re: [Float], im: [Float]) {
+      let n = SubtitleCleaner.N
+      var buf = [Float](repeating: 0, count: n)
+      for i in 0..<n where off + i < x.count { buf[i] = x[off + i] * win[i] }
+      var re = [Float](repeating: 0, count: n / 2), im = re
+      guard let setup else { return (re, im) }
+      buf.withUnsafeBufferPointer { p in
+        p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { c in
+          var sp = DSPSplitComplex(realp: &re, imagp: &im)
+          vDSP_ctoz(c, 2, &sp, 1, vDSP_Length(n / 2))
+          vDSP_fft_zrip(setup, &sp, 1, vDSP_Length(9), FFTDirection(FFT_FORWARD))
+        }
+      }
+      return (re, im)
+    }
+
+    /// `mic` and `ref` must already be aligned: ref[i] is what the speaker was
+    /// playing when mic[i] was captured. Returns audio fit for a recogniser and
+    /// for nothing else.
+    /// `probe`, when given, is passed through the SAME per-band gains the mixture
+    /// produced. It is the only honest way to ask how much of the near voice
+    /// survived and how much of the echo did: measuring them by cleaning each
+    /// alone would let the filter adapt to a different signal each time and
+    /// score itself on two runs that never happened.
+    func clean(mic: [Float], ref: [Float], probe: [Float]? = nil) -> [Float] {
+      let n = SubtitleCleaner.N, hop = SubtitleCleaner.HOP, bins = SubtitleCleaner.BINS
+      guard mic.count >= n, let setup else { return mic }
+      var out = [Float](repeating: 0, count: mic.count)
+      var off = 0
+      while off + n <= mic.count {
+        let m = spectrum(mic, off)
+        let r = spectrum(ref, off)
+        let pr = probe.map { spectrum($0, off) }
+        var re = pr?.re ?? m.re, im = pr?.im ?? m.im
+        for b in 0..<bins {
+          let mMag = (m.re[b] * m.re[b] + m.im[b] * m.im[b]).squareRoot()
+          let rMag = (r.re[b] * r.re[b] + r.im[b] * r.im[b]).squareRoot()
+          if rMag > 1e-6 {
+            // Learn the path per band as a slow minimum, for the same reason the
+            // time-domain gate does: near speech can only push the ratio up.
+            let obs = min(mMag / rMag, 4)
+            coupling[b] = obs < coupling[b] ? coupling[b] * 0.9 + obs * 0.1
+                                            : min(coupling[b] * 1.0002, 4)
+          }
+          let est = coupling[b] * rMag * over
+          let keep = max(mMag - est, mMag * floorFrac)
+          let g = mMag > 1e-9 ? keep / mMag : 1
+          re[b] *= g; im[b] *= g
+        }
+        var buf = [Float](repeating: 0, count: n)
+        re.withUnsafeMutableBufferPointer { rp in
+          im.withUnsafeMutableBufferPointer { ip in
+            var sp = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+            vDSP_fft_zrip(setup, &sp, 1, vDSP_Length(9), FFTDirection(FFT_INVERSE))
+            buf.withUnsafeMutableBufferPointer { bp in
+              bp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { c in
+                vDSP_ztoc(&sp, 1, c, 2, vDSP_Length(n / 2))
+              }
+            }
+          }
+        }
+        let scale = 1 / Float(n)
+        for i in 0..<n where off + i < out.count { out[off + i] += buf[i] * scale * win[i] }
+        off += hop
+      }
+      return out
+    }
+  }
+
   // ── WHOSE TURN IT IS WHEN BOTH WANT IT ────────────────────────────────────
   //
   // Two people start at the same moment. Somebody has to go second, and the
