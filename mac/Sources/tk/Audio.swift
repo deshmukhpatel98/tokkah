@@ -486,6 +486,65 @@ final class Audio {
   private(set) var micGainNow: Float = -1
   private var micFloor: Float = 1.0
   private var speechRun = 0
+  // ── HEADPHONES CHANGE WHAT IS POSSIBLE, NOT JUST WHAT IS PLEASANT ─────────
+  //
+  // On headphones there is no acoustic path from the speaker to the microphone
+  // at all, so there is no echo, so there is nothing for the gate to protect
+  // against -- and both people can talk over each other exactly as they would in
+  // a room. On speakers that path exists and cannot be wished away.
+  //
+  // This is therefore not a setting. It is read from the system, it is re-read
+  // while the call runs, and plugging in a pair of headphones mid-sentence opens
+  // the call up within a second without anybody being told about it.
+  private(set) var outputName = ""
+  private(set) var onSpeakers = true
+  static var gateAuto = true
+
+  func checkOutputRoute() {
+    let (name, speakers) = Audio.outputDevice()
+    guard name != outputName || speakers != onSpeakers else { return }
+    let firstLook = outputName.isEmpty
+    outputName = name
+    onSpeakers = speakers
+    if Audio.gateAuto {
+      Audio.gate.on = speakers
+      Audio.sharedGate.cfg = Audio.gate
+    }
+    Metrics.fact("output_route", speakers ? "speakers" : "headphones")
+    let how = speakers ? "one at a time, so nobody hears themselves"
+                       : "both at once, nothing in the way"
+    fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\n", stderr)
+  }
+
+  /// The default output device, and whether sound leaves it into the room.
+  /// Anything not wired into the machine -- USB, Bluetooth, an adapter -- is
+  /// overwhelmingly a headset; built-in could still be the headphone jack, and
+  /// the data source says which.
+  static func outputDevice() -> (name: String, speakers: Bool) {
+    var dev = AudioDeviceID(0); var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &dev) == noErr
+    else { return ("speakers", true) }
+    var name = "output"
+    var nameRef: CFString? = nil; sz = UInt32(MemoryLayout<CFString?>.size)
+    a.mSelector = kAudioObjectPropertyName
+    if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &nameRef) == noErr, let n = nameRef {
+      name = n as String
+    }
+    var t = UInt32(0); sz = 4
+    a.mSelector = kAudioDevicePropertyTransportType
+    guard AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &t) == noErr else { return (name, true) }
+    if t != kAudioDeviceTransportTypeBuiltIn { return (name, false) }
+    var src = UInt32(0); sz = 4
+    a.mSelector = kAudioDevicePropertyDataSource
+    a.mScope = kAudioObjectPropertyScopeOutput
+    if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &src) == noErr, src == 0x6864706E {
+      return (name + " (headphone jack)", false)      // 'hdpn'
+    }
+    return (name, true)
+  }
+
   func tuneInputGain() {
     guard Audio.autoGain else { return }
     let peak = micPeakWin

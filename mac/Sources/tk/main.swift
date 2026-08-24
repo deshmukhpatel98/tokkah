@@ -253,7 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
-  "no-gate", "gate-floor", "gate-margin", "gate-test",
+  "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1704,7 +1704,11 @@ if flag("gain-debug") { Audio.gainDebug = true }
 // Costs nothing to send (it runs on the receiving end of a stream already on the
 // wire) and nothing in latency (reflections are late by definition; the direct
 // sound is untouched).
-if flag("no-gate") { Audio.gate.on = false }
+// Both of these pin what the route would otherwise decide, which is what makes
+// an A/B possible: --no-gate is full duplex on speakers, --force-gate is one at
+// a time on headphones.
+if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false }
+if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
 if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
 
@@ -3701,6 +3705,8 @@ func reportLoop() {
   audio.sampleQuality()
   // Same cadence, same thread, same reason: never from a callback.
   audio.tuneInputGain()
+  // Same cadence: headphones appearing mid-call open it to full duplex.
+  audio.checkOutputRoute()
   if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
     Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
                              played: d.played, concealed: d.concealed, cap: d.cap,
