@@ -1005,9 +1005,29 @@ final class Audio {
     rsz = UInt32(MemoryLayout<Float64>.size)
     AudioObjectGetPropertyData(outDev, &ra, 0, nil, &rsz, &outRate)
     hwInRate = inRate; hwOutRate = outRate
+    // ── READ THE SETTING BACK, BECAUSE ACCEPTED IS NOT IN EFFECT ─────────────
+    //
+    // `noErr` from AudioUnitSetProperty means the unit took the call, not that
+    // anything changed. Four VideoToolbox properties in this project accepted a
+    // value, echoed it back, and did nothing, and one of them was believed for a
+    // whole release. AGC is the one setting here that audibly alters a voice --
+    // it flattens the loud-and-soft that carries how close someone is -- so an
+    // A/B of it that was really comparing an arm against itself would be worse
+    // than not running one.
+    var agcGot: UInt32 = 99
+    var agcSz = UInt32(4)
+    let ar = AudioUnitGetProperty(u, kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                                  kAudioUnitScope_Global, 0, &agcGot, &agcSz)
+    let agcReal = ar == noErr ? (agcGot == 1) : Audio.agcOn
+    if ar == noErr, agcReal != Audio.agcOn {
+      fputs("*** AGC: asked for \(Audio.agcOn ? "on" : "off") and the unit reports"
+          + " \(agcReal ? "on" : "off") -- the flag is not in effect\n", stderr)
+    }
+    Metrics.fact("agc", ar == noErr ? (agcReal ? "on" : "off") : "unreadable")
     fputs("[io] VoiceProcessingIO -- echo cancellation on"
         + (b == noErr ? "" : " (bypass property refused: \(b))")
         + ", gain control \(Audio.agcOn ? "on" : "off")"
+        + (ar == noErr ? " (readback \(agcGot))" : " (readback refused: \(ar))")
         + (a == noErr ? "" : " (AGC property refused: \(a))") + "\n", stderr)
     fputs("[in]  \"\(deviceName(inDev))\" \(Int(inRate)) Hz  bufferFrames=\(gotIn)"
         + " (asked \(Audio.devBuf))  deviceLatency=\(String(format: "%.2f", inLatencyMs)) ms\n", stderr)
