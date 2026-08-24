@@ -113,10 +113,30 @@ final class FileSource: FrameSource {
 final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
   var onFrame: ((CVPixelBuffer, UInt64) -> Void)?
   private let session = AVCaptureSession()
+  /// Written only by the capture queue, read only by it. One-shot.
+  private var firstFrameLogged = false
   private let out = AVCaptureVideoDataOutput()
   private let q = DispatchQueue(label: "tk.cam")
+  // ── ONE QUEUE OWNS THE SESSION ──────────────────────────────────────────────
+  //
+  // Every touch of `session` -- discovery, opening the device, configuration,
+  // startRunning, and a later camera swap -- happens here and nowhere else.
+  // AVCaptureSession is not thread-safe, and the moment the bring-up moved off
+  // main "the picker also configures it" stopped being a comment and became a
+  // second thread. One serial queue makes single ownership a property of the
+  // code rather than a thing to remember.
+  private let sessionQ = DispatchQueue(label: "tk.cam.session")
+  /// True once a bring-up has succeeded. `sessionQ` only.
+  private var started = false
   private var name = "?"
-  var describe: String { "camera \(name)" }
+  /// `name` and `current` are written on `sessionQ` and read from wherever a log
+  /// line or the picker asks. A `String` and an `AVCaptureDevice?` are both
+  /// refcounted, so an unsynchronised read racing a write is a retain/release
+  /// race -- the shape that has already SIGSEGV'd this process once. Recursive
+  /// because `describe` is legitimately read from INSIDE `sessionQ` (the
+  /// bring-up's own log line), where a plain lock would deadlock on itself.
+  private let meta = NSRecursiveLock()
+  var describe: String { meta.lock(); defer { meta.unlock() }; return "camera \(name)" }
 
   // ── EVERY CAMERA, NOT JUST THE DEFAULT ────────────────────────────────────
   //
@@ -158,47 +178,104 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   }
   /// Remembered across launches: choosing a camera every call is not a feature.
   private static let pickKey = "tk.cameraId"
-  static var preferred: AVCaptureDevice? {
+  static var preferred: AVCaptureDevice? { preferred(in: available()) }
+  /// The same choice, made against a list the caller has already built. `bringUp`
+  /// is on the launch critical path and was building the discovery session twice
+  /// -- once for `devs`, once inside `preferred` -- for the same answer.
+  static func preferred(in devs: [AVCaptureDevice]) -> AVCaptureDevice? {
     guard let id = UserDefaults.standard.string(forKey: pickKey) else { return nil }
-    return available().first { $0.uniqueID == id }
+    return devs.first { $0.uniqueID == id }
   }
   static func remember(_ d: AVCaptureDevice) {
     UserDefaults.standard.set(d.uniqueID, forKey: pickKey)
   }
-  private(set) var current: AVCaptureDevice?
+  private var _current: AVCaptureDevice?
+  var current: AVCaptureDevice? { meta.lock(); defer { meta.unlock() }; return _current }
+  private func setCurrent(_ d: AVCaptureDevice?) { meta.lock(); _current = d; meta.unlock() }
 
   /// Swap the camera on a live session. Configuration is atomic between begin and
   /// commit, so frames stop for the swap and resume -- no teardown of the session,
   /// which would drop the output delegate and the encoder's frame supply with it.
+  ///
+  /// Called from the picker, on main, and does its work on `sessionQ` -- because
+  /// the bring-up now runs there too, and two threads inside
+  /// beginConfiguration/commitConfiguration on one session is undefined. Opening
+  /// the replacement device is also the expensive part, and doing it here means a
+  /// camera swap no longer freezes the window either.
   func switchTo(_ dev: AVCaptureDevice) {
-    session.beginConfiguration()
-    for i in session.inputs { session.removeInput(i) }
-    if let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) {
-      session.addInput(input)
-      current = dev
-      name = dev.localizedName
-      CameraSource.remember(dev)
-      fputs("camera: switched to \(dev.localizedName)\n", stderr)
-    } else {
-      fputs("camera: could not switch to \(dev.localizedName) -- keeping the old one\n", stderr)
+    sessionQ.async { [weak self] in
+      guard let self else { return }
+      self.session.beginConfiguration()
+      for i in self.session.inputs { self.session.removeInput(i) }
+      if let input = try? AVCaptureDeviceInput(device: dev), self.session.canAddInput(input) {
+        self.session.addInput(input)
+        self.setCurrent(dev)
+        self.meta.lock(); self.name = dev.localizedName; self.meta.unlock()
+        CameraSource.remember(dev)
+        fputs("camera: switched to \(dev.localizedName)\n", stderr)
+      } else {
+        fputs("camera: could not switch to \(dev.localizedName) -- keeping the old one\n", stderr)
+      }
+      // Inside the transaction, for the same reason as the bring-up: committing
+      // first makes the swap configure the graph twice and freezes the picture for
+      // both passes instead of one.
+      self.configure(self.current)
+      self.session.commitConfiguration()
     }
-    session.commitConfiguration()
-    configure(current)
   }
 
-  func start() throws {
+  // ── THE HARDWARE DOES NOT OPEN ON THE THREAD THAT DRAWS ─────────────────────
+  //
+  // All of this used to run on main, between the window appearing and the runloop
+  // being turned for the first time: device discovery, `AVCaptureDevice.default`,
+  // `AVCaptureDeviceInput(device:)` -- which opens the sensor -- format and
+  // frame-rate negotiation, and `startRunning`. Main is the thread that composites
+  // the window and services the copy button, so every millisecond of that is a
+  // millisecond the invite link is on screen and cannot be clicked. Measured at
+  // 130-160 ms on this Mac, and it is hardware, so it is not bounded by anything
+  // this program controls: a Continuity Camera or a cold USB webcam is far worse.
+  //
+  // `start()` stays synchronous for the callers that need it that way (the file
+  // source's path, and the post-rendezvous fallback), and is now just this on the
+  // session queue.
+  func start() throws { try sessionQ.sync { try bringUp() } }
+
+  /// Bring the camera up without blocking the caller. `done` is called on
+  /// `sessionQ` -- hop to main yourself for anything AppKit.
+  func startOffMain(_ done: @escaping (Error?) -> Void) {
+    sessionQ.async {
+      do { try self.bringUp(); done(nil) } catch { done(error) }
+    }
+  }
+
+  /// `sessionQ` only.
+  private func bringUp() throws {
+    // A second call after a successful bring-up is a no-op, and a call after a
+    // FAILED one starts from a clean session rather than adding a second input to
+    // a half-built one. Both are reachable now that the early path and the
+    // post-rendezvous path can no longer see each other's outcome synchronously.
+    if started { return }
+    if !session.inputs.isEmpty || !session.outputs.isEmpty {
+      session.beginConfiguration()
+      for i in session.inputs { session.removeInput(i) }
+      for o in session.outputs { session.removeOutput(o) }
+      session.commitConfiguration()
+    }
+    let tFind = Clock.now()
     let devs = CameraSource.available()
     // The remembered one if it is still plugged in, else whatever macOS prefers,
     // else the first thing we can find.
-    guard let dev = CameraSource.preferred ?? AVCaptureDevice.default(for: .video) ?? devs.first
+    guard let dev = CameraSource.preferred(in: devs) ?? AVCaptureDevice.default(for: .video) ?? devs.first
     else { throw Err.e("no camera") }
-    current = dev
-    name = dev.localizedName
+    setCurrent(dev)
+    meta.lock(); name = dev.localizedName; meta.unlock()
     if devs.count > 1 {
       fputs("cameras: \(devs.map { $0.localizedName }.joined(separator: ", "))"
           + " -- using \(dev.localizedName)\n", stderr)
     }
+    let tOpen = Clock.now()
     let input = try AVCaptureDeviceInput(device: dev)
+    let tCfg = Clock.now()
     session.beginConfiguration()
     guard session.canAddInput(input) else { throw Err.e("cannot add camera input") }
     session.addInput(input)
@@ -209,32 +286,139 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     out.setSampleBufferDelegate(self, queue: q)
     guard session.canAddOutput(out) else { throw Err.e("cannot add video output") }
     session.addOutput(out)
-    session.commitConfiguration()
-    configure(dev)
+    // INSIDE the transaction, and that is the whole point. A fresh session's
+    // `sessionPreset` is `.high`, which on this camera is its largest sensor mode.
+    // Committing first and calling `configure` afterwards therefore built the
+    // graph twice: once at full sensor resolution, then again at 720p when
+    // assigning `activeFormat` implicitly flipped the preset to `.inputPriority`.
+    // The first pass was thrown away and its cost landed on `startRunning`, which
+    // is why `configure` itself measures 2 ms while the first frame is ~700 ms out.
+    // Device-level configuration between begin and commit is the documented way to
+    // avoid exactly this.
+    // ── RIG ARM, and why it is a flag rather than a second bundle ────────────
+    //
+    // Measuring this needed two builds that differ in one line. Two BUNDLES cannot
+    // do it: both carry `com.tokkah.tk`, so LaunchServices resolves by identifier
+    // and `open -n -a <path>` launched the wrong one -- caught only because the log
+    // prints which bundle it is running. Giving them different identifiers is worse,
+    // because the camera grant is pinned to the designated requirement and the arm
+    // would measure the DENIED path. One bundle, one signature, arm chosen in argv.
+    if flag("cam-twopass") {
+      session.commitConfiguration()
+      configure(dev)
+    } else {
+      configure(dev)
+      session.commitConfiguration()
+    }
+    let tRun = Clock.now()
     session.startRunning()
+    let end = Clock.now()
+    started = true
+    // Broken out because "the camera took 150 ms" is not actionable and
+    // "AVCaptureDeviceInput took 96 ms of it" is. Discovery, opening the sensor,
+    // negotiating the format, and starting the graph fail and stall for entirely
+    // different reasons.
+    fputs("camera: startRunning took \(Int(Clock.msSigned(end, tRun))) ms\n", stderr)
+    fputs("camera: bring-up \(Int(Clock.msSigned(end, tFind))) ms off-main"
+        + " (find \(Int(Clock.msSigned(tOpen, tFind)))"
+        + ", open \(Int(Clock.msSigned(tCfg, tOpen)))"
+        + ", configure \(Int(Clock.msSigned(tRun, tCfg)))"
+        + ", run \(Int(Clock.msSigned(end, tRun)))) -- done at \(sinceLaunch()) ms\n", stderr)
   }
 
   /// 720p at the highest frame rate the device offers. Factored out so a switched
   /// camera gets the same treatment as the first one -- otherwise the second camera
   /// runs at whatever default it likes and the frame rate silently halves.
+  /// `'420v'` rather than `875704438`, because the whole reason to print a pixel
+  /// format is so a person can compare it with the one `out.videoSettings` asks for.
+  static func fourCC(_ c: FourCharCode) -> String {
+    let b = [UInt8((c >> 24) & 0xff), UInt8((c >> 16) & 0xff), UInt8((c >> 8) & 0xff), UInt8(c & 0xff)]
+    return String(bytes: b, encoding: .ascii) ?? "????"
+  }
+
+  private static func describe(_ f: AVCaptureDevice.Format) -> String {
+    let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+    let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+    let fps = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+    return "\(d.width)x\(d.height) \(fourCC(sub)) \(Int(fps))fps"
+  }
+
   private func configure(_ dev: AVCaptureDevice?) {
     guard let dev else { return }
     // Highest frame rate the format allows: fewer, older frames is the one thing
     // that cannot be fixed downstream.
-    if let f = dev.formats.last(where: {
+    let cands = dev.formats.filter {
       let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
       return d.width == 1280 && d.height == 720
-    }) {
-      try? dev.lockForConfiguration()
-      dev.activeFormat = f
-      let best = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 30
-      dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(best))
-      dev.unlockForConfiguration()
+    }
+    // The encoder is hardcoded to 1280x720 (main.swift), so a camera with no 720p
+    // mode is fed mismatched buffers. That used to be a silent no-op; say it.
+    guard let f = cands.last else {
+      fputs("camera: no 1280x720 mode on \(dev.localizedName) -- staying in "
+          + "\(CameraSource.describe(dev.activeFormat)) while the encoder expects 1280x720\n", stderr)
+      return
+    }
+    // `try?` and then assign anyway made a failed lock look like a handled case:
+    // `activeFormat =` on an unlocked device is undefined and can raise. If the
+    // lock is refused, keep the format the system chose and say so.
+    do {
+      try dev.lockForConfiguration()
+    } catch {
+      fputs("camera: could not lock \(dev.localizedName) for configuration -- staying in "
+          + "\(CameraSource.describe(dev.activeFormat))\n", stderr)
+      return
+    }
+    dev.activeFormat = f
+    let best = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 30
+    dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(best))
+    dev.unlockForConfiguration()
+    // Which mode the sensor is actually in, and how many others matched. `.last`
+    // is list order, not a preference -- if this ever prints more than one
+    // candidate, the choice between them needs to be made deliberately.
+    fputs("camera: mode \(CameraSource.describe(f))"
+        + (cands.count > 1 ? " (\(cands.count) 720p modes matched: "
+            + cands.map { CameraSource.describe($0) }.joined(separator: ", ") + ")" : "")
+        + "\n", stderr)
+    // ── AND ON THE WIRE, NOT ONLY IN A LOG NOBODY WILL EVER SEE ──────────────
+    //
+    // This is the half that turns "his picture goes blocky when he moves" from a
+    // guess into a lookup. A Mac mini has no built-in camera, so it is running
+    // somebody's USB webcam -- and a webcam that hands us 'dmb1' is handing us
+    // MOTION JPEG: frames already thrown away once, which we then re-encode. The
+    // blockiness is baked in before our encoder ever sees it, and no amount of
+    // bitrate on our side can put it back.
+    let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+    let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+    Metrics.fact("cam", dev.localizedName)
+    Metrics.fact("cam_kind", CameraSource.kindOf(dev))
+    Metrics.fact("cam_mode", "\(dims.width)x\(dims.height)@\(Int(best))")
+    Metrics.fact("cam_pixfmt", CameraSource.fourCC(sub))
+  }
+
+  /// Built in, plugged in, or an iPhone across the room. Three very different
+  /// pictures, and the name alone does not tell them apart.
+  static func kindOf(_ d: AVCaptureDevice) -> String {
+    switch d.deviceType {
+    case .builtInWideAngleCamera: return "built-in"
+    case .continuityCamera:       return "iPhone (Continuity)"
+    case .deskViewCamera:         return "desk view"
+    default:
+      let raw = d.deviceType.rawValue
+      return raw.contains("External") ? "external" : raw
     }
   }
 
   func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
     guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+    // The number that matches what a person sees. `startRunning()` returning is
+    // not a picture: the session is live but the sensor has delivered nothing, so
+    // timing the call that starts it reports a ready camera while the window is
+    // still black. One line, once, on the capture queue -- its only writer.
+    if !firstFrameLogged {
+      firstFrameLogged = true
+      Metrics.mark("cam_first_frame_ms", sinceLaunch())
+      fputs("camera: FIRST FRAME at \(sinceLaunch()) ms\n", stderr)
+    }
     // The sensor's own timestamp, converted to the host clock -- the same clock
     // the audio path stamps with. This is the whole reason for being native.
     let pts = CMSampleBufferGetPresentationTimeStamp(sb)
@@ -410,6 +594,13 @@ final class VEncoder {
         + "  Quality readback \(q.map { "\($0 as NSNumber)" } ?? "nil")\n", stderr)
     let gotBps = (got as? NSNumber)?.intValue ?? -1
     fputs("encoder: H.264 \(cfgW)x\(cfgH) bitrate asked \(cfgBitrate) got \(gotBps), B-frames off\n", stderr)
+    // An encoder that quietly gave us a different bitrate than we asked for is a
+    // fact about the call, not a line in a log. Same for the codec: the day this
+    // is ever anything but H.264, every picture number moves and nothing else
+    // would say why.
+    Metrics.fact("venc", "h264 \(cfgW)x\(cfgH)")
+    Metrics.fact("venc_bps", gotBps == cfgBitrate ? "\(gotBps)"
+                                                 : "asked \(cfgBitrate) got \(gotBps)")
     VTCompressionSessionPrepareToEncodeFrames(sess)
   }
 

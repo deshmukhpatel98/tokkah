@@ -76,13 +76,19 @@ struct Quantiles {
 
   var count: Int { n }
 
-  mutating func p(_ q: Double) -> Double? {
-    let m = wrapped ? cap : n
-    if m == 0 { return nil }
-    let buf = UnsafeMutableBufferPointer(start: v, count: m)
-    let s = buf.sorted()
+  // Copy-out, then sort the copy. The audio thread writes this buffer; the
+  // reporter and leaveCall used to sort it in place, and hang-up was a
+  // SIGSEGV at 0xe8 in Quantiles.p — 20+ crash reports on 0.41.0. A torn
+  // snapshot is a slightly wrong percentile. A shared sort is a dead app.
+  func p(_ q: Double) -> Double? {
+    if Int(bitPattern: v) < 4096 { return nil }
+    let m = min(cap, wrapped ? cap : n)
+    guard m > 0 else { return nil }
+    var tmp = [Double](repeating: 0, count: m)
+    for i in 0..<m { tmp[i] = v[i] }
+    tmp.sort()
     let i = min(m - 1, max(0, Int((Double(m) * q).rounded(.down))))
-    return s[i]
+    return tmp[i]
   }
 
   mutating func reset() { n = 0; wrapped = false }

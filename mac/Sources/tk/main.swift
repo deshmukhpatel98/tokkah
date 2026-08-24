@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.54.0"
+let VERSION = "0.55.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -2382,6 +2382,7 @@ if audio.jitAuto {
     var calm = 0
     var lastConcealed = 0
     var lastSnaps = 0
+    var lastSnapsBehind = 0, lastSnapsPast = 0
     var lastLate = 0
     var lastNearLate = 0
     var lastStarved = 0
@@ -2496,6 +2497,11 @@ if audio.jitAuto {
       }
       let snapped = r.snaps - lastSnaps
       lastSnaps = r.snaps
+      // Attribution, not just a count. Only a BACKLOG snap is evidence that a
+      // bigger buffer would not have helped; a starvation snap is the opposite.
+      let snappedBehind = r.snapsBehind - lastSnapsBehind
+      let snappedPast = r.snapsPast - lastSnapsPast
+      lastSnapsBehind = r.snapsBehind; lastSnapsPast = r.snapsPast
       // ── What growing is FOR, and when it has finished ──────────────────────
       //
       // A buffer exists to stop starvation. So the question "should it grow?" has
@@ -2594,9 +2600,39 @@ if audio.jitAuto {
       r.ipiCapWinMax = 0
       let excusedDip = p01 < GROW_BELOW_MS && senderHiccup && conc == 0 && late == 0
       if excusedDip { marginExcused += 1 }
-      if snapped > 0 {
+      // ── I TRIED TO NARROW THIS VETO AND THE MEASUREMENT SAID NO ──────────────
+      //
+      // The veto reads a backlog snap as "this machine stalled, so a bigger buffer
+      // would have prevented nothing". That justification is genuinely wrong for a
+      // bursty path -- a link that holds packets 120 ms and releases them in a
+      // clump leaves the same over-full ring as a callback that did not run -- and
+      // the two are separable here: a render stall makes the CURSOR late and the
+      // packets punctual, a burst makes the PACKETS late and starves first.
+      //
+      // So the veto was narrowed to `snappedBehind > 0 && snappedPast == 0 &&
+      // late == 0`. Against known inputs it bought almost nothing and cost real
+      // audio on a clean path:
+      //
+      //   --imp-spike 120 --imp-spike-hz 1   10.00% -> 9.59% concealed (buffer 8 -> 13)
+      //   clean, 3 runs each                 0.00 / 0.00 / 0.54%  ->  0.22 / 0.83 / 4.98%
+      //
+      // The spike case barely moved because a 120 ms hold once a second IS 12% of
+      // dead air unless the buffer swallows the whole 120 ms, which is a latency
+      // price the rest of this file exists to refuse. And the clean path got worse
+      // because growing more readily moves the cursor, the move starves, the
+      // starvation argues for growing again -- the self-feeding transient the
+      // comments above already warn about twice.
+      //
+      // Kept as a comment rather than deleted because the reasoning is sound and
+      // the conclusion is still no: the flaw is real, and fixing it is not worth
+      // what it costs. What DID survive is the attribution itself -- snapsBehind
+      // and snapsPast are now separate counters and ride in every beat, so the
+      // question "was the buffer too small, or did this machine stall" is
+      // answerable from a call record instead of from a guess.
+      if snappedBehind > 0 {
         calm = 0
-        fputs("jit: \(snapped) snap(s), \(conc) concealed -- stall, not jitter; holding at \(audio.jitTarget)\n", stderr)
+        fputs("jit: \(snappedBehind) backlog snap(s), \(conc) concealed -- stall, not jitter;"
+            + " holding at \(audio.jitTarget)\n", stderr)
       } else if excusedDip {
         // Held, not grown, and said out loud -- a controller that silently declines
         // to act looks identical to one that never saw anything.
@@ -2853,10 +2889,16 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "agc_on": Audio.agcOn ? 1 : 0, "devbuf": Audio.devBuf,
     "in_rate": Int(audio.hwInRate), "out_rate": Int(audio.hwOutRate),
     "in_lat_ms": audio.inLatencyMs, "out_lat_ms": audio.outLatencyMs,
+    // THE DENOMINATOR. Concealment was recorded as a bare count for the whole of
+    // this project's life, and a count cannot answer the only question anybody
+    // asks of it -- 4657 concealed samples is either a rounding error or a fifth
+    // of the call, and nothing in the record said which. `played` is the other
+    // half of the ratio: every sample the speaker produced was one or the other.
+    "played": r.played,
     "conceal_total": r.concealed, "conceal_lost": r.concealLost,
     "conceal_starved": r.concealStarved,
     "late": r.lateArrivals, "near_late": r.nearLate,
-    "snaps": r.snaps, "dup": r.dup, "too_old": r.tooOld, "jumps": r.jumps,
+    "snaps": r.snaps, "snaps_behind": r.snapsBehind, "snaps_past": r.snapsPast, "dup": r.dup, "too_old": r.tooOld, "jumps": r.jumps,
     "recv": r.recv, "accepted": r.accepted,
     // Health flags. These are the ones that mean "something is wrong that the
     // person on the call cannot see".
@@ -2933,7 +2975,7 @@ func reportLoop() {
       + "  \(String(format: "%.2f", upMbps))/\(String(format: "%.2f", downMbps)) Mbps up/down"
       + "   m2e p50 \(f(p50)) p95 \(f(p95)) p99 \(f(p99)) ms"
       + "  slack p50 \(f(r.slack.p(0.50))) p01 \(f(r.slack.p(0.01))) min \(f(r.slackMin == 1e9 ? nil : r.slackMin)) ms"
-      + "  jit \(audio.jitTarget) snap \(r.snaps)"
+      + "  jit \(audio.jitTarget) snap \(r.snaps)(\(r.snapsBehind)b/\(r.snapsPast)p)"
       + (wire.fmtMismatch > 0 ? "  VERSION-MISMATCH \(wire.fmtMismatch)" : "")
       + "  net rtt \(tsync.bestRttMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " jit \(tsync.rttSpreadMs.map { String(format: "%.2f", $0) } ?? "-")"

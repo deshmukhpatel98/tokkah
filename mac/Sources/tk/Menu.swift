@@ -20,7 +20,7 @@ enum Menu {
   static weak var controls: CallControls?
   static var onQuit: (() -> Void)?
 
-  static func install(appName: String = "Tokkah") {
+  static func install(appName: String = "Kin") {
     let main = NSMenu()
 
     // ── Tokkah ────────────────────────────────────────────────────────────────
@@ -29,8 +29,27 @@ enum Menu {
     app.addItem(withTitle: "About \(appName)", action: #selector(Target.about), keyEquivalent: "")
       .target = Target.shared
     app.addItem(.separator())
-    app.addItem(withTitle: "Check for Updates…", action: #selector(Target.update), keyEquivalent: "")
-      .target = Target.shared
+    // ── ITS OWN STATEMENT, AND THE TARGET IS THE WHOLE POINT ──────────────────
+    //
+    // This item was inserted between the `addItem` above and its trailing
+    // `.target = Target.shared` continuation, so the target landed on the NEXT
+    // item and this one had none. It compiled -- an imported ObjC method is
+    // implicitly @discardableResult -- and it did not read as broken either:
+    // a nil-target item resolves its action through the RESPONDER CHAIN, `NSWindow`
+    // has a public `-update`, so the item validated, drew ENABLED, posted a window
+    // notification and never once reached `Target.update()`. Not even its own
+    // "checking for updates…" feedback appeared. Third instance in this codebase of
+    // a control that looks live and is not, so the target gets its own line and
+    // cannot be orphaned by the next insertion.
+    let check = app.addItem(withTitle: "Check for Updates…", action: #selector(Target.update),
+                            keyEquivalent: "")
+    check.target = Target.shared
+    // Only meaningful while something is actually held. `Target` returns false from
+    // validateMenuItem for it otherwise, so it greys out rather than being a
+    // control that looks live and does nothing.
+    let restart = app.addItem(withTitle: "Restart to Update", action: #selector(Target.restart),
+                              keyEquivalent: "")
+    restart.target = Target.shared
     app.addItem(.separator())
     let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
     let servicesMenu = NSMenu()
@@ -87,9 +106,46 @@ enum Menu {
     NSApp.mainMenu = main
   }
 
+  // ── A MENU ITEM THE HARNESS CAN ACTUALLY CLICK ──────────────────────────────
+  //
+  // `--press` reaches the in-window bar and nothing else, so every menu item in
+  // this file has only ever been tested by calling its handler -- which is the one
+  // test that cannot see the defect these items actually had. The target was
+  // missing; the handler was fine. So the harness gets a way in, by TITLE, and
+  // uses the two AppKit calls a real click uses: `NSMenu.update()` (what opening
+  // the menu does, and what decides whether the item is enabled) and
+  // `performActionForItem` (what clicking it does, including resolving a nil
+  // target through the responder chain).
+  static func find(_ title: String) -> (NSMenu, Int)? {
+    func walk(_ m: NSMenu) -> (NSMenu, Int)? {
+      for (i, it) in m.items.enumerated() {
+        if it.title == title { return (m, i) }
+        if let sub = it.submenu, let hit = walk(sub) { return hit }
+      }
+      return nil
+    }
+    guard let root = NSApp.mainMenu else { return nil }
+    return walk(root)
+  }
+
+  /// Clicks a menu item by title and describes what the click found, so a missing
+  /// target is a line in the log rather than an absence in it.
+  static func click(_ title: String) -> String {
+    guard let (menu, idx) = find(title) else { return "NOT IN THE MENU" }
+    let item = menu.items[idx]
+    menu.update()                       // exactly what opening the menu does
+    let owner = item.target.map { String(describing: type(of: $0)) } ?? "nil (responder chain)"
+    let desc = "in \"\(menu.title)\" target=\(owner)"
+             + " action=\(item.action.map { NSStringFromSelector($0) } ?? "-")"
+             + " \(item.isEnabled ? "enabled" : "greyed")"
+    guard item.isEnabled else { return desc + " -- not clicked, it is greyed" }
+    menu.performActionForItem(at: idx)  // exactly what clicking it does
+    return desc + " -- clicked"
+  }
+
   /// One object to own the actions. `NSApp.mainMenu` items need a target that is
   /// alive for the life of the app, and the controls come and go with the window.
-  final class Target: NSObject {
+  final class Target: NSObject, NSMenuItemValidation {
     static let shared = Target()
     @objc func mic() { Menu.controls?.toggleMic(); Menu.controls?.nudgeBar() }
     @objc func cam() { Menu.controls?.toggleCam(); Menu.controls?.nudgeBar() }
@@ -97,11 +153,32 @@ enum Menu {
     @objc func more() { Menu.controls?.nudgeBar(); Menu.controls?.openMore() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }
     @objc func quit() { Menu.onQuit?(); NSApp.terminate(nil) }
-    /// The background poller already checks every minute; this just makes it
-    /// check now, using the same "the peer is on a different build" fast path.
+    /// The background poller already checks every minute; this just makes it check
+    /// now.
+    ///
+    /// `urgent` and NOT the wire-mismatch flag, and the difference matters: this
+    /// item used to share the one flag that also authorises committing an update
+    /// THROUGH a live call, so somebody idly asking "is there an update?" in the
+    /// middle of a conversation got the conversation restarted. Asking is not
+    /// consenting. `urgent` now means only "check now instead of waiting out the
+    /// poll interval"; the menu already has a separate, correctly-gated "Restart to
+    /// Update" for a person who does want it to land immediately.
     @objc func update() {
       Update.urgent = true
       Menu.controls?.setStatus("checking for updates…")
+    }
+    /// The poller restarts on its own as soon as the call ends. This is for
+    /// somebody who does not want to wait for that.
+    @objc func restart() {
+      guard Update.pending != nil else { return }
+      Update.restartNow = true
+      Menu.controls?.setStatus("restarting…")
+    }
+    /// A menu item that fires into a guard and does nothing is a dead control.
+    /// Grey it out instead, so the menu tells the truth about whether an update
+    /// is actually waiting.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+      item.action == #selector(Target.restart) ? Update.pending != nil : true
     }
     @objc func about() {
       let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? VERSION
@@ -109,7 +186,7 @@ enum Menu {
         .applicationVersion: v,
         .credits: NSAttributedString(
           string: "A video call that tries to be as fast as light allows.\n"
-                + "room.tokkah.com",
+                + "kin.tokkah.com",
           attributes: [.font: NSFont.systemFont(ofSize: 11)]),
       ])
     }

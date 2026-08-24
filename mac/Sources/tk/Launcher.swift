@@ -2,7 +2,7 @@ import AVFoundation
 import AppKit
 import Security
 
-// ── The join screen, for a Tokkah.app that was double-clicked ────────────────
+// ── The join screen, for a Kin.app that was double-clicked ────────────────
 //
 // `tk` grew up as a command with flags, which is right for measuring things and
 // useless for handing to someone on another Mac. An app bundle needs to do
@@ -80,9 +80,17 @@ enum Launcher {
     static let shared = Handler()
     @objc func handle(event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
       guard let s = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-            let u = URL(string: s), u.scheme == "tokkah" else { return }
+            let u = URL(string: s),
+            u.scheme == "tokkah" || u.scheme == "kin" else { return }
       // tokkah://join/<room> and tokkah://<room> both work: people will write
       // either, and refusing one of them would be pedantry with a cost.
+      //
+      // `kin` was registered in Info.plist and then refused right here, so
+      // LaunchServices launched the app, handed over the scheme it had been told
+      // to route, and this dropped it on the floor. The new invite funnel
+      // (tape-app/public/join.js) emits tokkah:// today, but every registered
+      // scheme has to land in a room: a registered scheme that does nothing
+      // looks exactly like a working one, right up to the silence.
       var name = u.path.hasPrefix("/") ? String(u.path.dropFirst()) : u.path
       if name.isEmpty { name = u.host ?? "" }
       if u.host == "join", name.isEmpty { name = "" }
@@ -92,9 +100,111 @@ enum Launcher {
         fputs("url: refusing \(s) -- a room is letters, numbers, - and _ only\n", stderr)
         return
       }
-      Launcher.urlRoom = name
+      // A link that arrives while a call is already up has nobody waiting on the
+      // mailbox: the only reader is the launch path, and the re-exec'd call
+      // process is past it forever. So a live process installs a handler instead,
+      // and the mailbox is the fallback for the launch that has not read it yet.
+      if let f = Launcher.onURLRoom { f(name) } else { Launcher.urlRoom = name }
       fputs("url: joining \(name)\n", stderr)
     }
+
+    /// kAEOpenApplication / kAEReopenApplication. Nothing to read out of it: the
+    /// fact that it ARRIVED is the whole message -- it means this launch is a
+    /// plain one and no `tokkah://` is on its way.
+    @objc func launched(event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+      Launcher.sawLaunchEvent = true
+    }
+  }
+
+  /// Set when a launch Apple Event arrives, which is the proof that this launch
+  /// carries no URL. See awaitURLRoom.
+  nonisolated(unsafe) private static var sawLaunchEvent = false
+
+  // REGISTRATION ORDER IS LOAD-BEARING AND BACKWARDS FROM WHAT IT LOOKS LIKE:
+  // finishLaunching() installs AppKit's OWN kCoreEventClass handlers, so this has
+  // to run AFTER it or AppKit quietly replaces ours and the flag never sets.
+  private static func installLaunchEventHandlers() {
+    let m = NSAppleEventManager.shared()
+    for id in [kAEOpenApplication, kAEReopenApplication] {
+      m.setEventHandler(Handler.shared,
+                        andSelector: #selector(Handler.launched(event:reply:)),
+                        forEventClass: AEEventClass(kCoreEventClass),
+                        andEventID: AEEventID(id))
+    }
+  }
+
+  // ── ONE HAND-DRIVEN APPKIT PUMP ─────────────────────────────────────────────
+  //
+  // There were three copies of this loop -- here, in askRoom, and in the
+  // rendezvous wait in main -- each with slightly different slice and exit
+  // handling, which is exactly how the fourth one drifts. A main thread that does
+  // not come back to the runloop is a window that exists, is key, and shows
+  // nothing: the 2878 ms of blank glass this program used to open with.
+  //
+  // `nextEvent`/`sendEvent` and not CFRunLoopRunInMode: the AppKit queue is not
+  // the runloop, and a bare CFRunLoopRunInMode after finishLaunching was measured
+  // returning nil where the same wait in nextEvent had the event in 27 ms.
+  static func pumpAppKit(until deadline: Date, slice: Double = 0.02,
+                         while keepGoing: () -> Bool = { true }) {
+    let app = NSApplication.shared
+    while keepGoing(), Date() < deadline {
+      let step = min(slice, max(0, deadline.timeIntervalSinceNow))
+      guard let e = app.nextEvent(matching: .any, until: Date(timeIntervalSinceNow: step),
+                                  inMode: .default, dequeue: true) else { continue }
+      app.sendEvent(e)
+    }
+  }
+
+  /// The one slot `runPumping` writes its answer into. A class, so the closure
+  /// that runs off-thread and the caller that reads it afterwards are looking at
+  /// the same storage; a local type cannot be nested in a generic function.
+  final class PumpBox<V> { var v: V? }
+
+  // ── A BLOCKING CALL ON MAIN IS A CONTROL THAT DOES NOTHING ──────────────────
+  //
+  // `pumpAppKit` fixed main walking into the network and not coming back for
+  // 2878 ms. It did not fix main going back IN every hundred milliseconds. The
+  // rendezvous poll is a synchronous HTTPS round trip -- `URLSession` plus a
+  // `DispatchSemaphore.wait`, roughly 300-400 ms to the worker -- and the loop
+  // that owns the whole waiting screen ran it on main. So for about four fifths
+  // of every second the invite link was drawn, hit-testable and pressable, and
+  // the press went into the queue and stayed there. Measured, from a real
+  // synthetic click: due at 605 ms, executed at 1546 ms.
+  //
+  // That is the user's complaint exactly -- "the person should be able to copy
+  // the link and share it as fast as possible" -- and it is not the camera.
+  //
+  // The result still comes back HERE, to the caller, on the caller's thread, so
+  // nothing about the program's order or its thread ownership changes: the peer
+  // list is still processed on main and `wire` is still touched from one thread.
+  // Only the WAITING moves. `pump: false` is the headless path, where there is no
+  // window to keep alive and a thread hop would be pure cost.
+  ///
+  /// Run `work` off this thread and keep AppKit turning until it finishes.
+  /// Returns nil if `timeout` expired -- in which case the value is deliberately
+  /// NOT read, because another thread is still writing it.
+  static func runPumping<T>(pump: Bool, timeout: TimeInterval = 12,
+                            _ work: @escaping () -> T) -> T? {
+    guard pump else { return work() }
+    // A class box, and a semaphore between the write and the read. The signal/wait
+    // pair is the memory barrier, so there is never a moment where one thread is
+    // reading this while the other writes it -- which for anything refcounted is
+    // the difference between a value and a crash.
+    let box = PumpBox<T>()
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+      let r = work()
+      box.v = r
+      done.signal()
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    // 8 ms slices: half a frame at 60 Hz, so a click is serviced within one
+    // refresh of arriving rather than at the end of a network round trip.
+    while Date() < deadline {
+      pumpAppKit(until: min(Date().addingTimeInterval(0.008), deadline), slice: 0.008)
+      if done.wait(timeout: .now()) == .success { return box.v }
+    }
+    return nil
   }
 
   /// A room handed over by a `tokkah://` link, if one arrived. Consumed once.
@@ -102,6 +212,64 @@ enum Launcher {
     let r = urlRoom
     urlRoom = nil
     return r
+  }
+
+  /// Where a link should go once a call is already running. Set by the call
+  /// process; when it is set the mailbox is bypassed entirely.
+  nonisolated(unsafe) static var onURLRoom: ((String) -> Void)?
+
+  // ── THE MAIL HAS NOT ARRIVED WHEN YOU OPEN THE MAILBOX ─────────────────────
+  //
+  // `tokkah://` does not come in on argv. LaunchServices starts the app and then
+  // DELIVERS the URL as an Apple Event, a moment later -- so installing the
+  // handler and reading `urlRoom` in the same straight line always reads nil,
+  // because nothing has pumped events yet. That is exactly how every single link
+  // click minted a stranger's room: the invite was sitting in the queue, unread,
+  // and the re-exec that followed destroyed the queue along with it.
+  //
+  // Two things are load-bearing here and both were measured, not assumed:
+  //
+  //   `finishLaunching()` -- NSApplication HOLDS the launch Apple Events until it
+  //   is called. Without it the event never arrives at all: a 3 s wait that turned
+  //   the runloop the whole time still returned nil.
+  //
+  //   `nextEvent`/`sendEvent` -- and not `CFRunLoopRunInMode`. The AppKit queue is
+  //   not the runloop; a bare 3 s of `CFRunLoopRunInMode(.defaultMode)` after
+  //   finishLaunching ALSO returned nil, while the same wait spent in `nextEvent`
+  //   had the room in 27 ms. Same loop askRoom() drives by hand, for the same
+  //   reason.
+  //
+  // It returns the INSTANT the room arrives, so the only launch that pays the
+  // timeout is a plain double-click -- the one with nothing to wait for.
+  //
+  // ── AND THAT LAUNCH WAS PAYING ALL OF IT ────────────────────────────────────
+  //
+  // "the only launch that pays the timeout is a plain double-click" was written as
+  // if that launch were rare. It is the common one, and it paid the full 700 ms
+  // every single time: first stderr at 818 ms plain against 44 ms with --room.
+  // The wait was right and the unconditional budget was not.
+  //
+  // A plain launch is not silent -- it gets kAEOpenApplication (or
+  // kAEReopenApplication), delivered on the same queue as the URL. So there are
+  // two mailboxes now and the wait ends on whichever fills: a link, or the proof
+  // that no link is coming. The fallback timeout is for the launch that delivers
+  // neither, and it is 250 ms rather than 700 because it is now a backstop and no
+  // longer the normal path.
+  //
+  // NAMED RISK: we replace AppKit's own oapp handler to do this. There is no app
+  // delegate and no NSDocument here, so the default is close to a no-op -- but
+  // "close to" is not provable by reading, which is why acceptance checks that a
+  // plain launch still comes forward and still builds its menu.
+  static func awaitURLRoom(within budget: Double) -> String? {
+    // NSApplication FIRST, for the same reason askRoom() does it: Apple Event
+    // dispatch runs through the application object, and without touching it the
+    // handler installed above is never given anything to handle.
+    let app = NSApplication.shared
+    app.finishLaunching()
+    installLaunchEventHandlers()          // AFTER finishLaunching. See above.
+    let deadline = Date().addingTimeInterval(budget)
+    pumpAppKit(until: deadline, while: { urlRoom == nil && !sawLaunchEvent })
+    return takeURLRoom()
   }
 
   // ── Recent rooms, remembered ────────────────────────────────────────────────
@@ -141,7 +309,7 @@ enum Launcher {
     let W: CGFloat = 520, PREVIEW: CGFloat = 268, H: CGFloat = PREVIEW + 214
     let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                      styleMask: [.titled, .closable], backing: .buffered, defer: false)
-    w.title = "Tokkah"
+    w.title = "Kin"
     w.center()
     w.isReleasedWhenClosed = false
 
@@ -346,12 +514,9 @@ enum Launcher {
 
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.
-    while !t.done {
-      guard let e = app.nextEvent(matching: .any, until: .distantFuture,
-                                 inMode: .default, dequeue: true) else { continue }
-      app.sendEvent(e)
-      if !w.isVisible { t.done = true }             // they closed it
-    }
+    // Same pump as everywhere else now; the exit condition is the only difference.
+    pumpAppKit(until: .distantFuture, while: { !t.done && w.isVisible })
+    t.done = true                                  // they joined, or they closed it
     w.orderOut(nil)
     // Release the device before the re-exec, so the call opens it cleanly rather
     // than racing a session this process is about to stop existing to own.
@@ -363,12 +528,65 @@ enum Launcher {
   /// Replace this process with the same binary, plus the arguments a joined call
   /// needs. execv rather than spawning: one process, so the dock icon, the
   /// permission grants and the self-updater all keep referring to the same thing.
-  static func reexec(room: String, extra: [String]) -> Never {
+  /// `why` is not decoration. This replaces the running image, so everything the
+  /// process knew about how it got here is gone one line later -- and a re-exec
+  /// LOOP (five of them in nine seconds, each rebuilding the camera) looked in
+  /// the log exactly like the app being launched five times by something else.
+  /// Called immediately before the image is replaced, and whatever it returns is
+  /// prepended to the new argv. `execv` is an ending as final as a hang-up -- the
+  /// process stops existing on the next line -- and everything it had not yet
+  /// reported dies with it. Measured: a ring answered inside five seconds
+  /// reported NOTHING; not the ring, not the answer, not the button press.
+  nonisolated(unsafe) static var beforeReexec: (() -> [String])?
+
+  static func reexec(room: String, extra: [String], why: String = "unnamed") -> Never {
+    let handoff = beforeReexec?() ?? []
     let me = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])).path
-    var args = [me, "--room", room] + extra
+    fputs("launch: pid \(getpid()) re-exec into \(room) -- \(why)"
+        + " (argv was: \(CommandLine.arguments.dropFirst().joined(separator: " ")))\n", stderr)
+    var args = [me, "--room", room] + handoff + extra
     // Carry through anything already on the command line, so `--gui` plus a flag
-     // under test still behaves.
-    args += CommandLine.arguments.dropFirst().filter { $0 != "--gui" }
+    // under test still behaves. But not a flag the line above already put there:
+    // after the DMG self-install hands off with our own flags attached, the
+    // original argv repeats what `extra` adds (seen: `--video camera --window
+    // --window`). `arg()` takes the first occurrence, so a duplicate is harmless
+    // today -- and a flag for which twice differs from once would break in
+    // silence. Values are separate words in this CLI, so a dropped duplicate
+    // takes its value token with it.
+    var seen = Set(args.filter { $0.hasPrefix("--") })
+    let carried = Array(CommandLine.arguments.dropFirst())
+    var i = 0
+    while i < carried.count {
+      let t = carried[i]; i += 1
+      guard t.hasPrefix("--") else { args.append(t); continue }
+      let value: String? = (i < carried.count && !carried[i].hasPrefix("--")) ? carried[i] : nil
+      if value != nil { i += 1 }
+      // ── FLAGS THAT MUST NOT SURVIVE A RE-EXEC ────────────────────────────
+      //
+      // `--gui` because the room has already been chosen. `--call` because the
+      // ring has already been SENT: carrying it forward makes the new image dial
+      // the same person again, re-exec again, and ring forever -- observed as two
+      // rings a few seconds apart before this line existed, which would also have
+      // burned the callee's rate limit and shown them a stack of missed calls
+      // from somebody who pressed call once.
+      //
+      // `--incoming` for exactly the same reason one flag later: it is what tells
+      // a fresh image "somebody is ringing you", and answering re-execs. Carried
+      // forward, the new image re-arms the same ring, answers it again, and
+      // re-execs again -- observed as five camera bring-ups in nine seconds, one
+      // process changing its mind every second, with a window that flickered.
+      // A ring is an event, not a state, and events do not survive their handler.
+      // `--press`/`--press-after` because a press sequence belongs to the image
+      // that was asked to run it. Carried forward, the successor replays the
+      // whole sequence -- so a test that pressed `call` once placed a second
+      // call from the new image, and a rig that double-fires is a rig that
+      // cannot tell you whether the thing under test fired once.
+      if t == "--gui" || t == "--call" || t == "--incoming"
+        || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
+      seen.insert(t)
+      args.append(t)
+      if let v = value { args.append(v) }
+    }
     var c = args.map { strdup($0) }
     c.append(nil)
     execv(me, &c)

@@ -53,6 +53,23 @@ let TPKT = 4 + 4 + 8 + 8 + 8      // magic, kind, t1, t2, t3
 // TPKT rather than inserted, so a build that predates this reads its 32 bytes
 // exactly as before and simply never reports.
 let TPKTX = TPKT + 8              // + rxLost, rxRecovered (cumulative, UInt32)
+// ── THE FAR END'S OWN STATE ─────────────────────────────────────────────────
+//
+// rxLost and rxRecovered say what the peer FAILED to get. They cannot say
+// whether it played anything at all, and "I can hear nothing" is the single most
+// common thing a person reports. A peer that is playing 1500 packets a second is
+// having a different problem to one playing zero, and until this arm existed
+// both looked identical from here.
+//
+// Appended, never re-ordered: a receiver checks `n >= TPKT`, then `n >= TPKTX`,
+// then `n >= TPKTY`, so an older build's shorter packet still parses exactly as
+// far as it understands. Same idiom as HPKTX.
+//   +0  played   UInt32   packets rendered, cumulative
+//   +4  muted    UInt8    1 if their microphone is muted
+//   +5  qLevel   UInt8    their video quality rung
+//   +6  status   UInt8    0 running, 1 held/paused
+//   +7  pad      UInt8
+let TPKTY = TPKTX + 8
 
 final class TimeSync {
   private struct S { let delayNs: Int64; let thetaNs: Int64 }

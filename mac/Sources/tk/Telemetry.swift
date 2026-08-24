@@ -53,16 +53,28 @@ enum Telemetry {
   /// Fire and forget, on a background queue. A beat must never delay a call:
   /// nothing here runs on the audio path, and a failure is counted and dropped
   /// rather than retried, because a stale beat is worth less than a fresh one.
-  static func post(_ fields: [String: Any], final: Bool = false) {
-    guard enabled else { return }
+  /// `done` fires when the request has finished, however it finished. It exists
+  /// for the two paths that post and then immediately `exit(0)`: without it the
+  /// FINAL beat of every call was handed to URLSession and then killed with the
+  /// process a microsecond later, so the record the dashboard cares about most
+  /// was the one least likely to arrive. Measured against a local sink: not one
+  /// final beat from the Leave button was delivered. It is called on every exit
+  /// from this function, including the two `guard`s, so a waiter can never be
+  /// left holding a semaphore that nothing will signal.
+  static func post(_ fields: [String: Any], final: Bool = false,
+                   done: (@Sendable () -> Void)? = nil) {
+    guard enabled else { done?(); return }
     var f = fields
     f["install"] = install
     f["call"] = call
+    // The row this one continues, when an answered ring or a followed link
+    // replaced the image mid-call. Absent on a call that began at launch.
+    if let prev = arg("prev-call") { f["prev_call"] = prev }
     f["version"] = VERSION
     f["model"] = model
     f["phase"] = final ? "final" : "live"
-    guard let body = try? JSONSerialization.data(withJSONObject: f) else { return }
-    guard let url = URL(string: endpoint) else { return }
+    guard let body = try? JSONSerialization.data(withJSONObject: f) else { done?(); return }
+    guard let url = URL(string: endpoint) else { done?(); return }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -80,6 +92,7 @@ enum Telemetry {
       } else {
         sent += 1
       }
+      done?()
     }.resume()
   }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 
 // ── The mute flag outlives the audio engine, and has to ─────────────────────
 //
@@ -210,6 +211,13 @@ final class Audio {
   nonisolated(unsafe) var cursorAheadMs = 0.0
   nonisolated(unsafe) var cursorAheadDone = false
   nonisolated(unsafe) var aheadRun = 0
+  /// `--stall-out <s>` stops the output unit outright, once, that many seconds in.
+  /// Same reasoning as cursor-ahead: the dead-callback watchdog and its rebuild
+  /// only ever run during a failure, and a recovery no test has ever triggered is
+  /// a guess. This is not a simulation of the fault -- it IS the fault, a real
+  /// output unit that stops calling back, produced on demand.
+  nonisolated(unsafe) var stallOutAfterS = 0.0
+  nonisolated(unsafe) var stallOutDone = false
   private static let HIST = 2048           // 42.7 ms, power of two for masking
   private static let HMASK = HIST - 1
   private static let PMIN = 96             // 500 Hz
@@ -248,6 +256,13 @@ final class Audio {
   private var sigSumSq: Double = 0
   private var sigN: Int = 0
   var sigRms: Double { sigN > 0 ? (sigSumSq / Double(sigN)).squareRoot() : 0 }
+  // ── THE LONGEST HOLE, NOT THE AVERAGE NUMBER OF HOLES ──────────────────────
+  //
+  // Concealment as a RATE says how often the fill ran. It cannot say whether a
+  // word was lost, and that is the only thing a person notices: 200 gaps of one
+  // packet each is a texture; one gap of 300 ms is a missing syllable and "sorry,
+  // say that again". Same samples, same rate, opposite experience.
+  private(set) var concealMaxRun = 0
   private var prevOut: Float = 0
   private var wasConcealing = false
   // ── Real speech instead of a quiet room ────────────────────────────────────
@@ -396,6 +411,22 @@ final class Audio {
   private var aecFrozen = 0
   private(set) var aecUpdates = 0
   private(set) var aecFreezes = 0
+  // ── WAS THE MICROPHONE BEING OVERLOADED ──────────────────────────────────────
+  //
+  // "It felt like the mic was hit hard from both sides" is a description of
+  // CLIPPING, and there was no number for it anywhere. A sample pinned at full
+  // scale is information that has already been destroyed -- no echo canceller,
+  // codec or jitter buffer downstream can undo it, and every one of them will be
+  // blamed for it. One pass over 128 samples per callback, scalars only, nothing
+  // allocated: the same shape as the level meter that has run here for months.
+  private(set) var micClipped = 0
+  private(set) var micSamples = 0
+  private(set) var micPeak: Float = 0
+  private var micSumSq: Double = 0
+  var micRms: Double { micSamples > 0 ? (micSumSq / Double(micSamples)).squareRoot() : 0 }
+  /// Seconds the report thread has been ticking. Kept because it is the
+  /// denominator for anything expressed as "for how long".
+  private(set) var qualityTicks = 0
   private(set) var aecReaims = 0
   private var aimDisagree = 0
   private var micE: Double = 0
@@ -411,6 +442,25 @@ final class Audio {
   /// figure is a leaky average over about a second and is the honest "what is it
   /// doing now". Quoting only the first understates a converged filter; quoting
   /// only the second hides how long it took to get there.
+  /// Called once a second from the report thread. Turns two instantaneous
+  /// signals into a DURATION, which is the form a person's complaint takes:
+  /// "there was echo for a while", not "correlation was 0.62".
+  /// ── AN ECHO-LEAK TIMER WAS TRIED HERE AND REMOVED ──────────────────────────
+  ///
+  /// It counted seconds where `echoCorr` was high while our speaker was live, on
+  /// the assumption that high correlation means echo is getting through. The
+  /// calibration said otherwise, and backwards: with the canceller OFF the
+  /// correlation was 0.10 and with it ON the correlation was 0.76. `echoCorr` is
+  /// the delay estimator's CONFIDENCE that it has found the echo path -- which
+  /// goes up precisely when the canceller is working, because that is when the
+  /// estimator is running and locked.
+  ///
+  /// Echo has to be judged the way the existing rule judges it: correlation high
+  /// AND the achieved ERLE low. Both are already on the wire.
+  func sampleQuality() {
+    qualityTicks += 1
+  }
+
   var erleDb: Double {
     guard erleMicE > 1e-12, erleOutE > 1e-12 else { return 0 }
     return 10 * log10(erleMicE / erleOutE)
@@ -734,6 +784,11 @@ final class Audio {
     return Double(capFrames) - elapsedS * SR
   }
   var capCallbacks = 0
+  /// Times the render callback ARRIVED, which is not the same fact as
+  /// `renderTicks` (renders that reached the mixing loop and fed the DAC). Before
+  /// a peer sends anything, `onRender` zero-fills and returns early, so a healthy
+  /// output unit ticks this and leaves `renderTicks` at zero -- see the watchdog.
+  var renderCallbacks = 0
   var lastRenderErr: OSStatus = 0
 
   init() {
@@ -845,6 +900,167 @@ final class Audio {
     return Double(frames) / SR * 1000.0
   }
 
+  // ── THE ECHO CANCELLER THIS APP NEVER HAD ──────────────────────────────────
+  //
+  // Until now both ends of every call ran `kAudioUnitSubType_HALOutput`: raw
+  // hardware in and out, with NO acoustic echo cancellation, no gain control and
+  // no noise suppression. The software canceller beside this file measured
+  // 11-13 dB against a LINEAR simulation and was `aecOn = false` by default, so
+  // in the field there was nothing at all -- two people on speakers each fed the
+  // other's voice straight back, which is what "the mic was hit hard from both
+  // sides" sounds like.
+  //
+  // `VoiceProcessingIO` is the unit FaceTime uses. It cancels against the render
+  // stream the OS actually played, which is why it must be ONE duplex unit rather
+  // than the two this file used to build -- an input-only instance has no
+  // reference signal and would cancel nothing.
+  //
+  // Two things it fixes for free, both of which have their own scars here:
+  //   * it converts sample rates, so a device that will not move to 48 kHz stops
+  //     being a hard stop ("device at 44100 Hz, need 48000 Hz")
+  //   * it owns the mic gain, so a hot input stops clipping into the encoder
+  //
+  // What it costs is latency, and this project's whole point is latency -- so HAL
+  // stays reachable as `--io hal`, unchanged, and the two are measurable against
+  // each other rather than argued about.
+  /// What the hardware is actually running at, which under VPIO need not be `SR`.
+  var hwInRate: Double = 0
+  var hwOutRate: Double = 0
+  static var ioKind = "vp"
+  static var agcOn = true
+  var duplex: Bool { Audio.ioKind == "vp" }
+
+  private func makeDuplexUnit() throws -> AudioUnit {
+    var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
+      componentSubType: kAudioUnitSubType_VoiceProcessingIO,
+      componentManufacturer: kAudioUnitManufacturer_Apple,
+      componentFlags: 0, componentFlagsMask: 0)
+    guard let comp = AudioComponentFindNext(nil, &desc) else {
+      throw Err.e("no VoiceProcessingIO component")
+    }
+    var unit: AudioUnit?
+    try ck(AudioComponentInstanceNew(comp, &unit), "InstanceNew(vp)")
+    guard let u = unit else { throw Err.e("null vp unit") }
+
+    // BOTH scopes on one instance. This is the whole reason for the duplex unit.
+    var enable: UInt32 = 1
+    try ck(AudioUnitSetProperty(u, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1,
+                                &enable, 4), "vp enable in")
+    try ck(AudioUnitSetProperty(u, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0,
+                                &enable, 4), "vp enable out")
+
+    // Same wire format as the HAL path: float32, mono, 48 kHz. VPIO converts to
+    // and from whatever the hardware is actually running, which is the point.
+    var asbd = AudioStreamBasicDescription(mSampleRate: SR, mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
+      mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1,
+      mBitsPerChannel: 32, mReserved: 0)
+    let sz = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    // What we RECEIVE from the mic: output scope of the input element.
+    try ck(AudioUnitSetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1,
+                                &asbd, sz), "vp in format")
+    // What we HAND to the speaker: input scope of the output element.
+    try ck(AudioUnitSetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
+                                &asbd, sz), "vp out format")
+
+    // Processing ON. `Bypass` defaults to 0 already; set it anyway, because a
+    // default that changes under us is a silent regression in the one feature
+    // this unit exists for. Not fatal if refused -- an older OS that has no such
+    // property still cancels.
+    var bypass: UInt32 = 0
+    let b = AudioUnitSetProperty(u, kAUVoiceIOProperty_BypassVoiceProcessing,
+                                 kAudioUnitScope_Global, 0, &bypass, 4)
+    var agc: UInt32 = Audio.agcOn ? 1 : 0
+    let a = AudioUnitSetProperty(u, kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                                 kAudioUnitScope_Global, 0, &agc, 4)
+    // ── KEEP THE INSTRUMENTS ALIVE ──────────────────────────────────────────
+    //
+    // `makeUnit` is where `inDev`/`outDev` and the two device latencies are
+    // normally captured, and the duplex path does not go through it. Left unset
+    // they are ZERO, which does not read as "unknown" anywhere downstream -- it
+    // reads as "no device latency", and mouth-to-ear would quietly lose the
+    // largest fixed term it has. Captured here, from the same devices, with the
+    // one difference that the rate is NOT forced: converting is VPIO's job and
+    // the 48 kHz hard stop is exactly what it removes.
+    inDev = defaultDevice(input: true)
+    outDev = defaultDevice(input: false)
+    // ── ASK FOR THE SAME SMALL BUFFER THE HAL PATH GETS ─────────────────────
+    //
+    // The HAL path forces `devBuf` (16 frames) on both devices and measures ~2 ms
+    // of device latency. The duplex path did not, took VPIO's default, and
+    // measured ~12 ms each way with 10,754 late arrivals in twenty seconds --
+    // concealment caused by the buffer, not by the network. VPIO is entitled to
+    // refuse (it does its own block processing), so the ACCEPTED size is read
+    // back and printed rather than assumed: a request that silently did nothing
+    // would look identical to one that worked.
+    let gotIn = setBufferFrames(inDev, UInt32(Audio.devBuf), input: true)
+    let gotOut = setBufferFrames(outDev, UInt32(Audio.devBuf), input: false)
+    inLatencyMs = deviceLatencyMs(inDev, input: true)
+    outLatencyMs = deviceLatencyMs(outDev, input: false)
+    var inRate: Float64 = 0, outRate: Float64 = 0
+    var ra = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var rsz = UInt32(MemoryLayout<Float64>.size)
+    AudioObjectGetPropertyData(inDev, &ra, 0, nil, &rsz, &inRate)
+    rsz = UInt32(MemoryLayout<Float64>.size)
+    AudioObjectGetPropertyData(outDev, &ra, 0, nil, &rsz, &outRate)
+    hwInRate = inRate; hwOutRate = outRate
+    fputs("[io] VoiceProcessingIO -- echo cancellation on"
+        + (b == noErr ? "" : " (bypass property refused: \(b))")
+        + ", gain control \(Audio.agcOn ? "on" : "off")"
+        + (a == noErr ? "" : " (AGC property refused: \(a))") + "\n", stderr)
+    fputs("[in]  \"\(deviceName(inDev))\" \(Int(inRate)) Hz  bufferFrames=\(gotIn)"
+        + " (asked \(Audio.devBuf))  deviceLatency=\(String(format: "%.2f", inLatencyMs)) ms\n", stderr)
+    fputs("[out] \"\(deviceName(outDev))\" \(Int(outRate)) Hz  bufferFrames=\(gotOut)"
+        + " (asked \(Audio.devBuf))  deviceLatency=\(String(format: "%.2f", outLatencyMs)) ms\n", stderr)
+    // The devices themselves, on the wire. "The audio was terrible" is a different
+    // problem on AirPods (a Bluetooth path that adds its own delay and its own
+    // codec) than on the built-in speakers, and the beat could not tell them
+    // apart -- it carried the sample rates and never the names.
+    Metrics.fact("mic_dev", deviceName(inDev))
+    Metrics.fact("spk_dev", deviceName(outDev))
+    // ── APPLE'S ON-DEVICE VOICE MODEL, WHICH THIS APP MAY NOT SWITCH ON ───────
+    //
+    // Voice Isolation is the good one: a real on-device ML model, running on
+    // Apple silicon, that strips a room out of a voice far better than the
+    // classic canceller in VoiceProcessingIO underneath it. It is already on
+    // every Mac this app runs on.
+    //
+    // And `preferredMicrophoneMode` is `class, readonly` -- the header says it
+    // "has been selected by the user in Control Center". Apple made this the
+    // person's choice, not the app's, so there is no call to make here that turns
+    // it on. What an app CAN do is know, which is worth more than it sounds: two
+    // calls on the same Mac with the same network can sound completely different
+    // because of a menu-bar toggle, and without this field every echo number in
+    // the record is missing the variable that explains it.
+    //
+    // `activeMicrophoneMode`, not `preferred`: the header is explicit that the
+    // active one differs when the audio route cannot honour the preference, and
+    // the one that was actually applied is the one the audio was recorded under.
+    let micMode: String
+    switch AVCaptureDevice.activeMicrophoneMode {
+    case .voiceIsolation: micMode = "voice-isolation"
+    case .wideSpectrum:   micMode = "wide-spectrum"
+    case .standard:       micMode = "standard"
+    @unknown default:     micMode = "unknown"
+    }
+    Metrics.fact("mic_mode", micMode)
+    if AVCaptureDevice.preferredMicrophoneMode != AVCaptureDevice.activeMicrophoneMode {
+      Metrics.fact("mic_mode_wanted", "\(AVCaptureDevice.preferredMicrophoneMode.rawValue)")
+    }
+    fputs("[io] microphone mode: \(micMode)"
+        + (micMode == "voice-isolation" ? "" :
+           "  -- Voice Isolation is OFF; it is Apple's on-device voice model and"
+           + " it is a Control Center toggle (menu bar > Mic Mode), not something"
+           + " this app is allowed to set")
+        + "\n", stderr)
+    if abs(inRate - SR) > 1 || abs(outRate - SR) > 1 {
+      fputs("[io] hardware is not at \(Int(SR)) Hz -- VoiceProcessingIO is converting."
+          + " Under --io hal this would have been a hard stop.\n", stderr)
+    }
+    return u
+  }
+
   private func makeUnit(input: Bool) throws -> AudioUnit {
     var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
       componentSubType: kAudioUnitSubType_HALOutput, componentManufacturer: kAudioUnitManufacturer_Apple,
@@ -892,8 +1108,19 @@ final class Audio {
   }
 
   func start() throws {
-    let iu = try makeUnit(input: true)
-    let ou = try makeUnit(input: false)
+    // ONE unit in `vp`, two in `hal`. `inUnit` and `outUnit` point at the same
+    // instance in duplex, so every existing stop/start/property path keeps
+    // working -- but init and start must then happen ONCE, which is what the
+    // `duplex` guards below are for. Initialising the same unit twice is not
+    // harmless: it tears down and rebuilds the graph under a running callback.
+    let iu: AudioUnit, ou: AudioUnit
+    if duplex {
+      let u = try makeDuplexUnit()
+      iu = u; ou = u
+    } else {
+      iu = try makeUnit(input: true)
+      ou = try makeUnit(input: false)
+    }
     inUnit = iu; outUnit = ou
     let me = Unmanaged.passUnretained(self).toOpaque()
 
@@ -905,12 +1132,21 @@ final class Audio {
       &outCb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set render cb")
 
     try ck(AudioUnitInitialize(iu), "init in")
-    try ck(AudioUnitInitialize(ou), "init out")
+    if !duplex { try ck(AudioUnitInitialize(ou), "init out") }
     try ck(AudioOutputUnitStart(iu), "start in")
-    try ck(AudioOutputUnitStart(ou), "start out")
+    if !duplex { try ck(AudioOutputUnitStart(ou), "start out") }
     started = true
     watchRate()
     watchStalls()
+    if stallOutAfterS > 0, !stallOutDone {
+      stallOutDone = true
+      let at = stallOutAfterS
+      DispatchQueue.global().asyncAfter(deadline: .now() + at) { [weak self] in
+        guard let self, let u = self.outUnit else { return }
+        fputs("*** injected: output unit stopped at \(at) s -- the callback is now dead.\n", stderr)
+        AudioOutputUnitStop(u)
+      }
+    }
     Thread { [weak self] in self?.echoEstimator() }.start()
   }
 
@@ -927,6 +1163,15 @@ final class Audio {
         AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &r)
         guard abs(r - SR) > 1 else { return }
         self.rateEvents += 1
+        // Under VPIO the hardware rate is allowed to be anything: the unit
+        // converts. Forcing it back here would be this program overruling the
+        // very component it delegated the problem to, and re-priming the ring
+        // for a disturbance that did not happen.
+        if self.duplex {
+          fputs("*** the \(label) device moved to \(Int(r)) Hz -- VoiceProcessingIO"
+              + " is converting, leaving it alone.\n", stderr)
+          return
+        }
         fputs("\n*** the \(label) device just moved to \(Int(r)) Hz mid-call. Every render fails at\n"
             + "*** that rate and the call would go silent with no error, so putting it back.\n", stderr)
         let got = self.forceSampleRate(dev, SR)
@@ -968,10 +1213,22 @@ final class Audio {
       while true {
         Thread.sleep(forTimeInterval: 0.25)
         guard let self, self.started else { continue }
-        let c = self.capCallbacks, r2 = self.renderTicks
+        // LIVENESS IS THE CALLBACK, not the audio it carried. This watched
+        // `renderTicks` -- renders that actually fed media -- and `onRender`
+        // zero-fills and returns before that line whenever no peer has sent
+        // anything yet. So every launch that started before its peer read as a
+        // dead output unit at exactly 750 ms, 12 out of 12 peerless launches, with
+        // "last render status 0" printed right there in the message: the callback
+        // was alive and succeeding. It rebuilt a healthy graph and stamped a
+        // permanent false "[1 capture stall(s) recovered]" onto every later stats
+        // line. `renderCallbacks` counts invocations, which is what the message
+        // already claims to be measuring, so pre-media zero-fill stays alive and a
+        // genuinely dead output unit is still caught before media arrives.
+        // `renderTicks` is still read, and still printed under its own name below.
+        let c = self.capCallbacks, rc = self.renderCallbacks, r2 = self.renderTicks
         stillCap = (c == lastCap) ? stillCap + 1 : 0
-        stillRender = (r2 == lastRender) ? stillRender + 1 : 0
-        lastCap = c; lastRender = r2
+        stillRender = (rc == lastRender) ? stillRender + 1 : 0
+        lastCap = c; lastRender = rc
         // A THIRD WAY TO BE SILENT, and the one that got past the first two: both
         // callbacks running, packets arriving, and nothing played -- because the
         // read cursor sat ahead of the stream and concealed every packet. Watching
@@ -980,7 +1237,7 @@ final class Audio {
         stuck = (played == lastPlayed && got > lastGot) ? stuck + 1 : 0
         if ProcessInfo.processInfo.environment["TK_TRACE_STUCK"] != nil {
           fputs("tick dPlayed \(played - lastPlayed) dGot \(got - lastGot)"
-              + " stuck \(stuck) render \(r2) cap \(c) stillR \(stillRender)"
+              + " stuck \(stuck) render \(r2) cb \(rc) cap \(c) stillR \(stillRender)"
               + " pos \(Int(self.ring.pos)) played \(played)\n", stderr)
         }
         lastPlayed = played; lastGot = got
@@ -1103,6 +1360,19 @@ final class Audio {
       }
     }
 
+    // What the microphone actually delivered. Placed HERE deliberately: after the
+    // file substitution so a rig measures its own input, and before the simulated
+    // echo below, so a rig's echo injection cannot be mistaken for a room's.
+    for k in 0..<Int(n) {
+      let a = abs(inScratch[k])
+      micSumSq += Double(a) * Double(a)
+      if a > micPeak { micPeak = a }
+      // 0.997 and not 1.0: a converter that clips rarely returns exactly full
+      // scale, and a threshold that only catches the exact value catches nothing.
+      if a >= 0.997 { micClipped += 1 }
+    }
+    micSamples += Int(n)
+
     // Add the simulated echo to what the microphone "heard". After the file
     // substitution, because the echo is added to whatever the near end is saying,
     // which is exactly the relationship a room has.
@@ -1201,6 +1471,11 @@ final class Audio {
   // ── Playout: ring -> speaker, and the m2e measurement ───────────────────
   fileprivate func onRender(_ ts: UnsafePointer<AudioTimeStamp>, _ n: UInt32,
                             _ io: UnsafeMutablePointer<AudioBufferList>) {
+    // First line, before every early return below: the fact being recorded is
+    // "the callback arrived", and that is true of a render that zero-fills, a
+    // render with no buffer to write into, and a render that feeds the DAC. The
+    // stall watchdog is the customer, and it must not mistake silence for death.
+    renderCallbacks += 1
     let ab = UnsafeMutableAudioBufferListPointer(io)
     guard let raw = ab[0].mData else { return }
     let out = raw.assumingMemoryBound(to: Float.self)
@@ -1317,9 +1592,16 @@ final class Audio {
     let unplayedBehind = hi - Int64(jitTarget) > ring.maxPlayedSeq
     aheadRun = (past > 1) ? aheadRun + 1 : 0
     let AHEAD_HOLD = Int(0.010 * SR / Double(Audio.devBuf))   // 10 ms of callbacks
-    if behind > SNAP_PKTS || (past > 1 && aheadRun >= AHEAD_HOLD && unplayedBehind) {
+    let snapBehind = behind > SNAP_PKTS
+    let snapPast = past > 1 && aheadRun >= AHEAD_HOLD && unplayedBehind
+    if snapBehind || snapPast {
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
       ring.snaps += 1
+      // WHICH WAY the cursor was wrong, recorded separately. See the note on
+      // these fields: the two causes ask for opposite things from the buffer
+      // controller, and it can only tell them apart if the ring says which one
+      // happened.
+      if snapBehind { ring.snapsBehind += 1 } else { ring.snapsPast += 1 }
       cur = Int64(ring.pos) / Int64(FPP)
     }
 
@@ -1439,6 +1721,7 @@ final class Audio {
         // FPP good samples proves every slot was written, and cannot be skipped.
         goodRun += 1
         if goodRun >= FPP { haveLastGood = true }
+        if concealRun > concealMaxRun { concealMaxRun = concealRun }
         concealRun = 0
         ring.playedS += 1
         if Int64(seq) > ring.maxPlayedSeq { ring.maxPlayedSeq = Int64(seq) }

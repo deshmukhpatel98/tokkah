@@ -255,7 +255,8 @@ function ledgerOf(c) {
   }
   if (fx.venc) rows.push(['encoder', fx.venc + (fx.venc_bps ? ' · ' + fx.venc_bps + ' bps' : '')]);
   if (fx.mic_dev || fx.spk_dev) {
-    rows.push(['audio devices', (fx.mic_dev || '?') + ' → ' + (fx.spk_dev || '?')]);
+    rows.push(['audio devices', (fx.mic_dev || '?') + ' → ' + (fx.spk_dev || '?')
+      + (fx.mic_mode ? ' · mic mode ' + fx.mic_mode : '')]);
   }
   const taps = c.taps || {}, fails = c.tap_fails || {};
   const pressed = Object.keys(taps).sort();
@@ -277,6 +278,12 @@ function ledgerOf(c) {
     rows.push(['video paused', bits.join(' · ') + ' (audio kept running)']);
   }
   if (num(c.v_peer_cam_off) === 1) rows.push(['their camera', 'off at the end']);
+  const sb = num(c.snaps_behind), sp = num(c.snaps_past);
+  if (sb || sp) {
+    rows.push(['audio cursor repairs',
+      (sb || 0) + ' backlog (this Mac fell behind) · ' + (sp || 0)
+        + ' starved (ran off the end of the stream)']);
+  }
   const ev = c.events || {};
   const evs = Object.keys(ev).sort().map((k) =>
     (EVENT_WORDS[k] || k) + (ev[k] > 1 ? ' ×' + ev[k] : ''));
@@ -309,6 +316,44 @@ function verdicts(c) {
   const n = (k) => num(c[k]);
 
   // ── Audio ────────────────────────────────────────────────────────────────
+  //
+  // THE HEADLINE AUDIO NUMBER, because "lossless" is the whole promise and this
+  // is the only field that says whether it was kept. Everything the receiver
+  // played was either a real sample from the far end's microphone or something
+  // this app invented to cover a hole, and this is the ratio between them.
+  const cTot = n('conceal_total'), cPlay = n('played');
+  if (cTot !== null && cPlay !== null && cPlay + cTot > 0) {
+    const pct = (100 * cTot) / (cPlay + cTot);
+    // Attribution in the same breath, because the two causes have different fixes
+    // and are indistinguishable to the ear. LOST means packets never arrived --
+    // loss recovery's problem. STARVED means they arrived too late to be played,
+    // which is the jitter buffer being smaller than the path is bumpy.
+    const lost = n('conceal_lost') || 0, starv = n('conceal_starved') || 0;
+    const why = starv > lost ? 'they arrived too late to play (starvation)'
+                             : 'they never arrived (loss)';
+    const fixWhere = starv > lost
+      ? 'the jitter buffer -- and note it deliberately refuses to grow on some'
+        + ' evidence; snaps_behind vs snaps_past says whether the ring was'
+        + ' starving or backlogged'
+      : 'loss recovery and FEC -- packets are actually going missing';
+    if (pct >= 1) {
+      add(pct >= 8 ? 3 : pct >= 3 ? 2 : 1, 'the audio was not lossless',
+          pct.toFixed(2) + '% of everything played was invented to cover a hole ('
+            + lost + ' lost, ' + starv + ' starved) -- ' + why,
+          fixWhere);
+    }
+  }
+  // Apple's on-device voice model, and whether this call got it. It is a Control
+  // Center toggle the app is not allowed to set, so this is the one finding here
+  // whose fix is a person flipping a switch rather than a change to the code.
+  if (f.mic_mode && f.mic_mode !== 'voice-isolation') {
+    add(1, 'Apple\u2019s Voice Isolation was off',
+        'the microphone ran in ' + f.mic_mode + ' mode',
+        'menu bar \u2192 Mic Mode \u2192 Voice Isolation. It is an on-device model that'
+          + ' strips the room out of a voice, and it is strictly better than the'
+          + ' canceller underneath it. Compare echo_corr and erle_db across calls'
+          + ' with it on and off before deciding it matters.');
+  }
   const hole = n('a_conceal_ms_max');
   if (hole !== null && hole >= 120) {
     add(hole >= 250 ? 3 : 2, 'a word could have been lost',

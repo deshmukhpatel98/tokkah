@@ -167,13 +167,15 @@ func localIPv4() -> String? {
 // inbound holes -- which is why BOTH sides must send even before either has
 // received anything.
 enum Rendezvous {
-  struct Peer { let id: String; let ip: String; let port: UInt16; let ageMs: Int; let localIP: String?; let localPort: UInt16? }
+  struct Peer { let id: String; let ip: String; let port: UInt16; let ageMs: Int; let localIP: String?; let localPort: UInt16?; let relayIP: String?; let relayPort: UInt16? }
 
   /// Publish our address and return whoever else is in the room.
-  static func exchange(room: String, me: String, addr: String?, local: String? = nil, base: String = "https://room.tokkah.com") -> [Peer] {
+  static func exchange(room: String, me: String, addr: String?, local: String? = nil,
+                       relay: String? = nil, base: String = "https://room.tokkah.com") -> [Peer] {
     var u = "\(base)/api/room/\(room)/rv?me=\(me)"
     if let a = addr { u += "&addr=\(a)" }
     if let l = local { u += "&local=\(l)" }
+    if let r = relay { u += "&relay=\(r)" }
     guard let url = URL(string: u) else { return [] }
     var out: [Peer] = []
     let sem = DispatchSemaphore(value: 0)
@@ -194,8 +196,14 @@ enum Rendezvous {
           let lb = l.split(separator: ":")
           if lb.count == 2, let lp = UInt16(lb[1]) { lip = String(lb[0]); lport = lp }
         }
+        var rip: String?; var rport: UInt16?
+        if let r = p["relay"] as? String {
+          let rb = r.split(separator: ":")
+          if rb.count == 2, let rp = UInt16(rb[1]) { rip = String(rb[0]); rport = rp }
+        }
         out.append(Peer(id: id, ip: String(bits[0]), port: port,
-                        ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport))
+                        ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport,
+                        relayIP: rip, relayPort: rport))
       }
     }.resume()
     _ = sem.wait(timeout: .now() + 10)

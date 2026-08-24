@@ -91,6 +91,24 @@ final class RecvRing {
   // Plain vars rather than atomics: they are diagnostics, a torn read costs a
   // wrong log line, and an atomic on the audio path costs a real-time budget.
   var recv = 0, dup = 0, jumps = 0, tooOld = 0, snaps = 0
+  // ── TWO OPPOSITE FAULTS WERE SHARING ONE COUNTER ────────────────────────────
+  //
+  // `snaps` counts both directions of cursor repair, and they mean opposite
+  // things about the jitter buffer:
+  //
+  //   snapsBehind -- the cursor was left with a BACKLOG: this machine stalled and
+  //                  then had to catch up. A bigger buffer would not have
+  //                  prevented it and would make every recovery longer.
+  //   snapsPast   -- the cursor ran off the END of the stream and was reading
+  //                  packets that had not arrived. That IS the buffer being too
+  //                  small for the path, and growing is the whole remedy.
+  //
+  // The grow-veto downstream reads the union and calls all of it "stall, not
+  // jitter", so starvation -- the one piece of evidence that the buffer is too
+  // small -- was the reason given for refusing to enlarge it. Chronic starvation
+  // therefore pinned the buffer at its opening size for the whole call.
+  var snapsBehind = 0
+  var snapsPast = 0
   // ── Count SAMPLES, not packet boundaries ───────────────────────────────────
   //
   // These were counted once per packet, at the sample where the read cursor
