@@ -1415,6 +1415,12 @@ final class CallControls: NSView {
   private let warnPill = Pill(font: Type_.status)
   // `#elapsed`, the mm:ss clock above the status pill, was here. Removed on
   // request; see the note in `init` for why that loses no signal.
+  /// ── THE TURN-TAKING LAYER ──────────────────────────────────────────────────
+  ///
+  /// The floor cue, the listening-noise bloom and the caption band. See Cues.swift
+  /// for why there are three of them and why none of them says a word about what
+  /// you should do. It sits UNDER the button row and passes every click through.
+  private let cues = TurnCues(frame: .zero)
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
   private let sheetScrim = ScrimView()
@@ -1501,6 +1507,9 @@ final class CallControls: NSView {
     // other control in this file does -- would leave them outside the effect,
     // rendering identically and morphing not at all. `more` stays outside on
     // purpose: it lives in the opposite corner and has nothing to flow into.
+    // Under the row, so a caption can never draw over a button, and above the
+    // scrim, so it gets the dimming the scrim is there to give it.
+    addSubview(cues)
     addSubview(barGroup)
     barGroup.spacing = CallControls.restSpacing
     for b in [micButton, camButton, peekButton, flipButton, leaveButton] {
@@ -1699,6 +1708,13 @@ final class CallControls: NSView {
     // the window and not on a box.
     waiting.frame = bounds
 
+    // The turn layer is the whole window too; it places its own three pieces. The
+    // one thing it cannot know is how tall the button row is, so it is told --
+    // rather than repeating the arithmetic and drifting the next time the row
+    // moves.
+    cues.frame = bounds
+    cues.bottomInset = CallControls.barHeight + Metric.s3
+
     // `#status { top:14px; left:50%; translateX(-50%) }`. `#elapsed` used to sit
     // 18 pt below this; nothing takes its place, and the pill's own position is
     // measured from the top of the window rather than from the clock, so removing
@@ -1837,6 +1853,40 @@ final class CallControls: NSView {
     fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
   }
   private(set) var warnText = ""
+
+  // ── THE TURN LAYER, FORWARDED ──────────────────────────────────────────────
+  //
+  // Four setters, all of them called from the call loop on main, all of them
+  // cheap enough to call at the loop's rate and idempotent enough that calling
+  // them with the same value costs nothing. The views decide when to animate; the
+  // caller only ever states what is true.
+
+  /// What the other person is saying, as their recogniser revises it. Called from
+  /// the receive thread, so it hops -- and `onMain` runs it inline when it is
+  /// already there, which is what lets `--press said` be photographed in the same
+  /// pass that set it.
+  func setTheirWords(_ text: String, final: Bool) {
+    onMain { [weak self] in self?.cues.setTheirs(text, final: final) }
+  }
+
+  /// What YOU are saying, shown only while you are the quiet side. `showing`
+  /// false clears it, which is what having the floor back looks like.
+  func setMyWords(_ text: String, showing: Bool) {
+    onMain { [weak self] in self?.cues.setMine(text, showing: showing) }
+  }
+
+  /// A listening noise, as the word it was.
+  func setListeningNoise(_ word: String) {
+    onMain { [weak self] in self?.cues.setListeningNoise(word) }
+  }
+
+  /// 0 quiet, 1 listening, 2 bidding for the floor -- plus how much the ledger
+  /// says this person is owed.
+  func setFloor(peerVocal: Int, nudge: Double) {
+    onMain { [weak self] in self?.cues.setFloor(peerVocal: peerVocal, nudge: nudge) }
+  }
+
+  var cueState: String { cues.describe }
 
   func setQuality(m2eMs: Double?, concealPct: Double, lossPct: Double) {
     var parts: [String] = []
@@ -2371,6 +2421,7 @@ final class CallControls: NSView {
       + "  more=\(moreOpen ? "open" : "closed") peek=\(peeking)\(peekButton.holding ? "/held" : "")"
       + "  leave=\(leaveArmed ? "ARMED" : "idle") bar=\(barShown ? "shown" : "hidden")"
       + "  clip=\(NSPasteboard.general.string(forType: .string) ?? "-")"
+      + "  \(cues.describe)"
       + (moreOpen ? "\n  sheet=[" + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]" : "")
   }
 
@@ -2457,6 +2508,24 @@ final class CallControls: NSView {
     case "leave": leave()
     case "unleave": cancelLeaveConfirm()
     case "quality": markConnected(); setQuality(m2eMs: 11, concealPct: 0, lossPct: 0)
+    // ── THE TURN LAYER, EXERCISED ─────────────────────────────────────────────
+    //
+    // Every one of these draws something over a face and none of them can be
+    // reached by clicking, so a harness that only presses buttons would never see
+    // them at all. `--press cue-claim` then `--press tree` is how the shape and
+    // the words get checked without two people and two microphones.
+    case "cue-quiet": setFloor(peerVocal: 0, nudge: 0)
+    case "cue-listen": setFloor(peerVocal: 1, nudge: 0)
+    case "cue-claim": setFloor(peerVocal: 2, nudge: 0)
+    case "cue-claim-owed": setFloor(peerVocal: 2, nudge: 1)
+    case "bloom": setListeningNoise("mm-hmm")
+    case "said": setTheirWords("So the thing about a call is that you never really "
+                             + "know whose turn it is, and that is the whole problem.",
+                               final: false)
+    case "said-final": setTheirWords("That is the whole problem.", final: true)
+    case "said-clear": setTheirWords("", final: true)
+    case "mine": setMyWords("Right, but what if we just decided", showing: true)
+    case "mine-clear": setMyWords("", showing: false)
     case let c where c.hasPrefix("cam#"):
       guard let n = Int(c.dropFirst(4)), n >= 1, n <= camPicker.numberOfItems else {
         fputs("press: no camera \(c)\n", stderr); return

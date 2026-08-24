@@ -253,7 +253,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
-  "ledger-test", "subtitle-test", "sub-over", "sub-floor",
+  "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-subtitles", "asr-port", "subtitle-debug",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
@@ -1825,6 +1825,133 @@ if flag("ledger-test") {
   exit(bad ? 1 : 0)
 }
 
+// ── THE CUES, WHICH ONLY EVER EXIST WHILE MOVING ────────────────────────────
+//
+// A photograph proves a cue was drawn. It cannot prove that it ARRIVES in time,
+// that it goes away, that the ledger changes anything, or that a caption's last
+// line is not being clipped off the bottom of its own field -- and that last one
+// shipped, looked exactly like a bug in the string fitting, and was found by
+// reading a debug line rather than by looking at the screen.
+//
+// So the parts that move are asserted here, at a fixed frame time, and the parts
+// that are drawn are photographed by the shoot rig. Neither one covers the other.
+if flag("cue-test") {
+  var bad = false
+  func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
+    print("  \(what.padding(toLength: 40, withPad: " ", startingAt: 0)) \(got.padding(toLength: 22, withPad: " ", startingAt: 0)) (want \(want))  \(ok ? "ok" : "WRONG")")
+    if !ok { bad = true }
+  }
+  func ms(_ v: CGFloat?) -> String { v.map { String(format: "%.0f ms", $0) } ?? "never" }
+
+  // ── 1. A BID HAS TO LAND BEFORE THE FIRST SYLLABLE IS OVER ─────────────────
+  //
+  // A vowel is about 120 ms. A cue that takes longer than that to become
+  // unmistakable arrives after you have already started talking over somebody,
+  // which is the one thing it exists to prevent.
+  let c = FloorCue(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
+  c.vocal = 2
+  let bid = c.timeTo(0.75)
+  show("a bid becomes unmistakable", ms(bid), "<= 120 ms", (bid ?? 1e9) <= 120)
+
+  // ── 2. A LISTENING NOISE MUST NOT ─────────────────────────────────────────
+  //
+  // Same organ, and it must stop well short of the bid's brightness or the two
+  // are one signal with two names.
+  let c2 = FloorCue(frame: c.frame)
+  c2.vocal = 1
+  _ = c2.timeTo(0.41)
+  for _ in 0..<60 { c2.step(1.0 / 30) }
+  show("a listening noise settles low", String(format: "%.2f", c2.level), "0.40-0.45",
+       c2.level > 0.40 && c2.level < 0.45)
+
+  // ── 3. THE LEDGER HAS TO DO SOMETHING ─────────────────────────────────────
+  //
+  // Somebody who is owed a turn gets a cue that arrives sooner and goes further.
+  // If these two numbers are equal, the whole record-keeping is decoration.
+  let c3 = FloorCue(frame: c.frame)
+  c3.vocal = 2; c3.nudge = 1
+  let owedT = c3.timeTo(0.75)
+  show("owed a turn: the bid arrives sooner", ms(owedT), "< the \(ms(bid)) above",
+       (owedT ?? 1e9) < (bid ?? 0))
+  for _ in 0..<60 { c3.step(1.0 / 30) }
+  show("... and goes further", String(format: "%.2f vs %.2f", c3.level, c.level),
+       "higher", c3.level > c.level + 0.05)
+
+  // ── 4. AND IT HAS TO LEAVE ────────────────────────────────────────────────
+  //
+  // Slower than it came, because a cue that snaps off reads as a glitch -- but
+  // gone, because a cue that lingers stops meaning anything.
+  //
+  // Measured to "visibly gone" rather than to zero: the tail of an exponential
+  // takes another second to reach nothing and nobody can see the difference. The
+  // slow fall is deliberate -- a cue that snapped off at the first gap between
+  // two words would flicker through every sentence.
+  c.vocal = 0
+  let gone = c.timeTo(0.05)
+  show("and then it goes away", ms(gone), "300-1200 ms",
+       (gone ?? 1e9) > 300 && (gone ?? 1e9) < 1200)
+
+  // ── 5. THE LAST LINE OF A CAPTION IS NOT CLIPPED ──────────────────────────
+  //
+  // The regression: the two-line well was sized from `ascender - descender +
+  // leading`, the text system lays out one point taller than that, and the
+  // second line was cut off entirely. It read as truncation in the fitting code,
+  // which was correct all along.
+  let band = CaptionBand(frame: NSRect(x: 0, y: 0, width: 720, height: 200))
+  band.theirText = "So the thing about a call is that you never really know whose "
+                 + "turn it is, and that is the whole problem."
+  band.refit(force: true)
+  band.layoutSubtreeIfNeeded()
+  show("a two-line caption is not clipped", String(format: "%+.0f pt", band.clippedBy),
+       "<= 0", band.clippedBy <= 0)
+  show("... and both lines are there", band.theirDrawn.hasSuffix("problem.") ? "ends correctly" : "TRUNCATED",
+       "the whole sentence", band.theirDrawn.hasSuffix("problem."))
+
+  // ── 6. A LONG ONE KEEPS ITS TAIL, NOT ITS HEAD ────────────────────────────
+  //
+  // The newest words are the ones somebody is trying to read. What falls off is
+  // what fell off the front.
+  let long = (1...40).map { "word\($0)" }.joined(separator: " ")
+  band.theirText = long
+  band.refit(force: true)
+  band.layoutSubtreeIfNeeded()
+  show("a long caption keeps its tail", band.theirDrawn.hasSuffix("word40") ? "ends at word40" : "lost the end",
+       "the newest words", band.theirDrawn.hasSuffix("word40"))
+  show("... and says it cut the front", band.theirDrawn.hasPrefix("…") ? "leading …" : "silently cut",
+       "a leading …", band.theirDrawn.hasPrefix("…"))
+  show("... and still fits two lines", String(format: "%+.0f pt", band.clippedBy), "<= 0",
+       band.clippedBy <= 0)
+
+  // ── 7. THE WHOLE LAYER STOPS ──────────────────────────────────────────────
+  //
+  // Thirty frames a second for the length of a call, drawing nothing, is the kind
+  // of thing that shows up later as "the app makes my laptop hot".
+  let cues = TurnCues(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
+  cues.setFloor(peerVocal: 2, nudge: 0)
+  cues.setTheirs("hello", final: true)
+  cues.setListeningNoise("mm-hmm")
+  show("it is running while there is something", cues.testTicking ? "ticking" : "stopped",
+       "ticking", cues.testTicking)
+  cues.setFloor(peerVocal: 0, nudge: 0)
+  // ── THE HARNESS HAS TO LET REAL TIME PASS ─────────────────────────────────
+  //
+  // The eased values run on the `dt` this loop hands them, but the bloom's life
+  // and the caption's expiry are wall-clock -- correctly, because they are about
+  // how long a person has had to read something. Spinning two thousand fake
+  // frames in a fifth of a second left the bloom still alive and reported a layer
+  // that never stops. That was the instrument, not the code.
+  Thread.sleep(forTimeInterval: 1.9)
+  var spins = 0
+  while cues.testTicking, spins < 2000 { cues.testTick(1.0 / 30); spins += 1 }
+  show("and stops when there is not", cues.testTicking ? "STILL TICKING" : "stopped after \(spins) frames",
+       "stopped", !cues.testTicking)
+
+  print(bad ? "  CUE TEST FAILED"
+            : "  CUE TEST PASSED -- the bid lands inside a syllable, the ledger moves it,"
+              + " nothing is clipped, and the whole layer stops when the call goes quiet")
+  exit(bad ? 1 : 0)
+}
+
 if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false }
 if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
@@ -2428,6 +2555,11 @@ nonisolated(unsafe) var peerSaidAt = Date.distantPast
 nonisolated(unsafe) var subSent = 0
 nonisolated(unsafe) var subGot = 0
 nonisolated(unsafe) var turnComplete = 0.0
+/// Whether the utterance currently being recognised has stayed a listening noise
+/// the whole way through. Written by the chunk thread, read by the recogniser's
+/// callback; a bool either side of a 120 ms tick, which is why it needs nothing
+/// around it.
+nonisolated(unsafe) var utteranceWasListening = true
 let subtitles = flag("no-subtitles") ? nil
   : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789)
 
@@ -2436,18 +2568,56 @@ let subtitles = flag("no-subtitles") ? nil
 // either, though displaying text requires nothing at all. The end-to-end test
 // caught it immediately: the speaker recognised itself perfectly and the
 // listener showed nothing.
-wire.onSubtitle = { text, final in
-  peerSaid = text; peerSaidFinal = final; peerSaidAt = Date()
+nonisolated(unsafe) var peerSaidListening = false
+wire.onSubtitle = { text, final, listening in
+  peerSaid = text; peerSaidFinal = final; peerSaidAt = Date(); peerSaidListening = listening
   subGot += 1
-  if flag("subtitle-debug") { fputs("  they said: \(text)\(final ? " ." : " ...")\n", stderr) }
+  // ── TWO KINDS OF WORDS, TWO PLACES ────────────────────────────────────────
+  //
+  // A listening noise blooms over the picture for a second and a half and is
+  // gone; a real utterance runs in the caption band. Which one it is was decided
+  // by the machine that HEARD it, from how long it lasted and how hard it pushed
+  // -- "yeah" is both of these things depending on nothing you can see in the
+  // text.
+  if let c = display?.controls {
+    if listening { c.setListeningNoise(text) } else { c.setTheirWords(text, final: final) }
+  }
+  if flag("subtitle-debug") {
+    fputs("  they said: \(text)\(final ? " ." : " ...")\(listening ? "  (listening)" : "")\n", stderr)
+  }
+}
+
+// The wordless half, and the fast one. Fired from the receive thread the moment
+// the far end's status byte changes, so it lands one hop after they open their
+// mouth instead of waiting for a recogniser. The ledger rides along: somebody who
+// is owed a turn gets a cue that arrives quicker and pushes harder.
+wire.onPeerVocal = { v in
+  display?.controls?.setFloor(peerVocal: v, nudge: audio.yieldNudge)
 }
 
 if let subs = subtitles {
   subs.onText = { text, final in
     guard !text.isEmpty else { return }
     subSent += 1
-    wire.sendSubtitle(text, final: final)
-    if flag("subtitle-debug") { fputs("  you said: \(text)\(final ? " ." : " ...")\n", stderr) }
+    // What KIND of sound these words came from is this machine's to say -- it is
+    // the only one that heard the waveform. The flag is latched for the whole
+    // utterance rather than read at the moment the text lands: recognition
+    // finishes after the sound does, and by then the gate has usually moved on.
+    let listening = utteranceWasListening
+    wire.sendSubtitle(text, final: final, listening: listening)
+    // ── AND YOU SEE YOUR OWN, WHEN YOU ARE THE QUIET ONE ─────────────────────
+    //
+    // One person is audible at a time, so the other one is talking into a room
+    // that gives nothing back. That is the single most uncomfortable thing this
+    // design could do to somebody, and it is fixed by showing them the words
+    // their microphone is producing: not a level meter, not a "you are muted"
+    // badge -- the actual sentence, going out. When you have the floor it stays
+    // empty, because then you can simply hear yourself.
+    let audible = Audio.sharedGate.gain > 0.5
+    display?.controls?.setMyWords(text, showing: !audible && !listening)
+    if flag("subtitle-debug") {
+      fputs("  you said: \(text)\(final ? " ." : " ...")\(listening ? "  (listening)" : "")\n", stderr)
+    }
   }
   // Smart-turn reads the WAVEFORM, so it is judging prosody: a sentence that
   // landed against one that trailed off, which no transcript can recover. It is
@@ -2464,6 +2634,13 @@ if let subs = subtitles {
       Thread.sleep(forTimeInterval: 0.12)
       guard Audio.gate.on else { continue }
       let vocal = Audio.sharedGate.vocal != .quiet
+      // Latched across the utterance: it starts as a listening noise and stops
+      // being one the instant the classifier calls it a bid. Reading the gate at
+      // publish time instead would have labelled every escalation "listening",
+      // because a bid that grew out of a "mm-" is still a bid when the words
+      // arrive 300 ms later.
+      if !wasVocal, vocal { utteranceWasListening = true }
+      if Audio.sharedGate.vocal == .claim { utteranceWasListening = false }
       if let c = audio.subtitleChunk(), !c.mic.isEmpty {
         // Cleaned before it is recognised, because on speakers this microphone
         // also hears the far end and their words would otherwise land in this

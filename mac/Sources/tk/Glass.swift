@@ -114,6 +114,12 @@ enum Metric {
   /// answer both rules agree on.
   static var cardFieldRadius: CGFloat { concentric(cardRadius, inset: cardPad) }
 
+  /// The caption band. Not concentric with anything -- it floats in the middle of
+  /// the window rather than nesting into a corner -- so it gets its own number,
+  /// one step softer than the sheet because it holds nothing but a sentence and
+  /// has no edge to define.
+  static let captionRadius: CGFloat = 22
+
   /// Height of an information pill and of a text button. Both are capsules, so
   /// their radius is half of this and is never written down.
   static let pillHeight: CGFloat = 30
@@ -168,6 +174,23 @@ enum Type_ {
   /// "tap to leave" inside the confirm capsule -- the one place a control says a
   /// sentence instead of drawing a shape.
   static let confirm = NSFont.systemFont(ofSize: 13, weight: .semibold)
+
+  // ── THE OTHER PERSON'S VOICE, AS TEXT ──────────────────────────────────────
+  //
+  // Bigger than every other size in this file, and deliberately. A caption is
+  // read from wherever you happen to be sitting, at a glance, WHILE you are
+  // listening to somebody else -- so it gets the size a subtitle gets and not the
+  // size a label gets. 16 is what Apple's own Live Captions uses; 13 (`row`) was
+  // legible at a desk and unreadable from a sofa.
+  static let said = NSFont.systemFont(ofSize: 16, weight: .medium)
+  /// The same words, but yours, on the side that is currently not audible. Second
+  /// voice, second size: it is confirmation that you are landing, not something to
+  /// read.
+  static let saidMine = NSFont.systemFont(ofSize: 13, weight: .regular)
+  /// "mm-hmm". One word, appears, fades. It is not a caption -- it is the sound
+  /// somebody makes to tell you they are still with you, and it should feel like
+  /// that: large, brief, and gone before you finish the sentence you were on.
+  static let bloom = NSFont.systemFont(ofSize: 30, weight: .semibold)
 }
 
 enum Palette {

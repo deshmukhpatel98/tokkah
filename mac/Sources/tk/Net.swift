@@ -882,6 +882,9 @@ final class Wire {
   var peerBackchannel: Bool { peerStatus & Wire.ST_BACKCHAN != 0 }
   var peerClaim: Bool { peerStatus & Wire.ST_CLAIM != 0 }
   var peerVocal: Bool { peerStatus & (Wire.ST_BACKCHAN | Wire.ST_CLAIM) != 0 }
+  /// 0 quiet, 1 listening noise, 2 bid for the floor. Fires only when it changes.
+  var onPeerVocal: ((Int) -> Void)?
+  private var lastVocalSent = -1
   /// Whether the far end reports at all. False means an older build, and the
   /// controller must then fall back to the local numbers and SAY SO -- a silent
   /// fallback to the wrong signal is the bug this field exists to fix.
@@ -972,17 +975,29 @@ final class Wire {
   /// What the far end is saying, as their own machine heard it. `final` marks
   /// the end of an utterance; everything before it is a running guess that will
   /// be revised, which is what makes it feel live rather than late.
-  var onSubtitle: ((String, Bool) -> Void)?
+  /// `(text, final, wasAListeningNoise)`. The third flag is the sender's own
+  /// classification of the sound the words came from, not a guess made from the
+  /// words: "yeah" is a listening noise when it lasted 300 ms under somebody
+  /// else's sentence and a full turn when it did not, and only the machine that
+  /// heard it knows which. It decides whether these words bloom for a second over
+  /// the picture or run in the caption band.
+  var onSubtitle: ((String, Bool, Bool) -> Void)?
 
   /// Capped so one long sentence cannot become a jumbo packet. 512 bytes is far
   /// more than anybody says between two revisions.
-  func sendSubtitle(_ text: String, final: Bool) {
+  /// Byte 4 is a FLAG BYTE, not a boolean, and it was one from the first version
+  /// -- bit 0 committed, bit 1 "this was a listening noise". Reusing the spare
+  /// bits of a byte that was already there keeps the frame the same size and the
+  /// same shape, which matters because the two ends of a call update
+  /// independently and an older build has to keep working: it reads bit 0 the way
+  /// it always did and ignores the rest.
+  func sendSubtitle(_ text: String, final: Bool, listening: Bool = false) {
     var bytes = Array(text.utf8)
     if bytes.count > 512 { bytes = Array(bytes.suffix(512)) }
     var out = [UInt8](repeating: 0, count: 7 + bytes.count)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: SMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
-      p.storeBytes(of: UInt8(final ? 1 : 0), toByteOffset: 4, as: UInt8.self)
+      p.storeBytes(of: UInt8((final ? 1 : 0) | (listening ? 2 : 0)), toByteOffset: 4, as: UInt8.self)
       p.storeBytes(of: UInt8(bytes.count & 0xFF), toByteOffset: 5, as: UInt8.self)
       p.storeBytes(of: UInt8(bytes.count >> 8), toByteOffset: 6, as: UInt8.self)
     }
@@ -1218,12 +1233,16 @@ final class Wire {
       if magic == KMAGIC { onKeyRequest?(); continue }
       if magic == SMAGIC {
         guard plainN >= 7 else { continue }
-        let final = plain[4] == 1
+        // `& 1`, not `== 1`: byte 4 carries flags now, and an equality test would
+        // have quietly stopped seeing "committed" the moment anything else was
+        // set alongside it.
+        let final = plain[4] & 1 != 0
+        let listening = plain[4] & 2 != 0
         let n = Int(plain[5]) | Int(plain[6]) << 8
         guard n >= 0, 7 + n <= plainN else { continue }
         let txt = n == 0 ? "" : (String(bytes: UnsafeBufferPointer(start: plain + 7, count: n),
                                         encoding: .utf8) ?? "")
-        onSubtitle?(txt, final)
+        onSubtitle?(txt, final, listening)
         continue
       }
       if magic == TMAGIC {
@@ -1250,6 +1269,16 @@ final class Wire {
           peerQLevel = Int(plain[TPKTX + 5])
           peerStatus = Int(plain[TPKTX + 6])
           Audio.peerVocalNow = peerVocal
+          // ── THE FAST HALF OF THE TURN LAYER ─────────────────────────────────
+          //
+          // Fired on CHANGE, from the receive thread, rather than polled by the
+          // window. The whole claim of the floor cue is that it lands one hop
+          // after somebody opens their mouth; a 12 Hz poll in the UI would have
+          // put up to 83 ms of the thing back, which is most of an ocean, and
+          // there is nothing to poll for anyway -- this byte only ever changes a
+          // few times a second.
+          let v = peerClaim ? 2 : (peerBackchannel ? 1 : 0)
+          if v != lastVocalSent { lastVocalSent = v; onPeerVocal?(v) }
           peerReportsState = true
         }
         if kind == 0 {
