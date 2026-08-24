@@ -422,6 +422,10 @@ final class Audio {
   private(set) var micClipped = 0
   private(set) var micSamples = 0
   private(set) var micPeak: Float = 0
+  /// Peak since the gain tuner last looked. The lifetime peak above answers
+  /// "did this call ever clip"; the tuner needs "how loud is it RIGHT NOW", and
+  /// a lifetime maximum can never come back down.
+  private(set) var micPeakWin: Float = 0
   private var micSumSq: Double = 0
   var micRms: Double { micSamples > 0 ? (micSumSq / Double(micSamples)).squareRoot() : 0 }
   /// Seconds the report thread has been ticking. Kept because it is the
@@ -457,6 +461,95 @@ final class Audio {
   ///
   /// Echo has to be judged the way the existing rule judges it: correlation high
   /// AND the achieved ERLE low. Both are already on the wire.
+  // ── GAIN STAGING, AT THE DEVICE, NOT IN SOFTWARE ──────────────────────────
+  //
+  // Found on this machine: macOS input volume at 14 of 100. Speech reached the
+  // far end 16 dB above the hiss -- barely above the noise floor -- and every
+  // downstream fix made it worse, because digital makeup gain amplifies the hiss
+  // by exactly as much as the voice. Turning the software gain control off gave
+  // an inaudible voice; leaving it on gave a voice clipped flat at 1.01. Two
+  // opposite-looking faults, one cause, and no model or codec can undo either:
+  // once the ADC has quantised a whisper into the bottom few bits, the
+  // information is gone.
+  //
+  // The fix is the one every recording engineer knows: set the gain BEFORE the
+  // converter, so the signal arrives at a healthy level and nothing downstream
+  // has to rescue it. macOS exposes exactly that as the input device's volume,
+  // and this app has never touched it.
+  //
+  // Deliberately slow and bounded. It runs once a second, moves in small steps,
+  // and stops well short of the ends of the range -- a gain control that hunts
+  // is worse than one that is slightly wrong, and this one is changing a setting
+  // the person can see in System Settings.
+  private var gainTicks = 0
+  private var gainMoves = 0
+  private(set) var micGainNow: Float = -1
+  private var micFloor: Float = 1.0
+  private var speechRun = 0
+  func tuneInputGain() {
+    guard Audio.autoGain else { return }
+    let peak = micPeakWin
+    micPeakWin = 0
+    gainTicks += 1
+    // ── ONLY TUNE ON A VOICE, NEVER ON A ROOM ────────────────────────────────
+    //
+    // First version gated on `peak > 0.005`, which an empty room clears easily:
+    // it read 0.01-0.03 of ambient hiss, called it "too quiet", and walked the
+    // input from 27% to 95% with nobody speaking. Then the first real word
+    // arrives into a gain set for silence and clips. A control loop that acts on
+    // the noise floor will always drive itself to the top of its range, because
+    // the noise floor rises with it and never satisfies the target.
+    //
+    // So: track the floor, and require the peak to stand clearly above it before
+    // believing anything is being said. The floor follows downward fast and
+    // upward slowly, so it settles on the quiet background rather than on speech.
+    micFloor = peak < micFloor ? peak : micFloor * 0.995 + peak * 0.005
+    let speaking = peak > max(0.02, micFloor * 5)
+    // A STREAK, NOT A TICK. One second above the floor is a keyboard, a chair, a
+    // door. Measured: the single-tick version still walked 40% -> 60% across
+    // twenty seconds of an empty room, because a quiet room is not silent and
+    // every transient in it looked like a voice. Somebody actually talking
+    // clears the floor for several seconds together.
+    speechRun = speaking ? speechRun + 1 : 0
+    if Audio.gainDebug {
+      fputs("  gain: peak \(String(format: "%.4f", peak)) floor \(String(format: "%.4f", micFloor))"
+          + " speaking \(speaking) run \(speechRun) ticks \(gainTicks)\n", stderr)
+    }
+    guard gainTicks > 3, speechRun >= 3 else { return }
+    guard let dev = inDev as AudioDeviceID?, dev != 0 else { return }
+    var cur: Float32 = 0
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+      mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    var sz = UInt32(MemoryLayout<Float32>.size)
+    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &sz, &cur) == noErr else { return }
+    var settable: DarwinBoolean = false
+    guard AudioObjectIsPropertySettable(dev, &addr, &settable) == noErr,
+          settable.boolValue else { return }
+    micGainNow = cur
+    // Aim for speech peaking around -8 dBFS: loud enough to sit far above the
+    // noise floor, with headroom left for a laugh or a raised voice. The band is
+    // wide on purpose so ordinary variation in how loudly somebody talks does
+    // not move the knob at all.
+    var want = cur
+    if peak < 0.18 { want = min(cur + 0.06, 0.95) }        // too quiet, climb
+    else if peak > 0.92 { want = max(cur - 0.08, 0.15) }   // clipping, back off
+    guard abs(want - cur) > 0.001 else { return }
+    var v = want
+    guard AudioObjectSetPropertyData(dev, &addr, 0, nil,
+            UInt32(MemoryLayout<Float32>.size), &v) == noErr else { return }
+    // READ IT BACK. A settable property that accepts a write and does nothing is
+    // this project's most repeated trap.
+    var got: Float32 = -1
+    sz = UInt32(MemoryLayout<Float32>.size)
+    _ = AudioObjectGetPropertyData(dev, &addr, 0, nil, &sz, &got)
+    gainMoves += 1
+    micGainNow = got
+    Metrics.count("mic_gain_moved")
+    Metrics.fact("mic_gain_end", String(format: "%.2f", got))
+    fputs("mic gain: peak was \(String(format: "%.2f", peak)) -- input \(Int(cur * 100))%"
+        + " -> \(Int(got * 100))% (move \(gainMoves))\n", stderr)
+  }
+
   func sampleQuality() {
     qualityTicks += 1
   }
@@ -928,6 +1021,11 @@ final class Audio {
   var hwOutRate: Double = 0
   static var ioKind = "vp"
   static var agcOn = true
+  /// Device-level input gain staging. On by default because the failure it fixes
+  /// is silent, common, and unfixable anywhere else; `--no-auto-gain` is the
+  /// control arm.
+  static var autoGain = true
+  static var gainDebug = false
   var duplex: Bool { Audio.ioKind == "vp" }
 
   private func makeDuplexUnit() throws -> AudioUnit {
@@ -1037,6 +1135,41 @@ final class Audio {
     // problem on AirPods (a Bluetooth path that adds its own delay and its own
     // codec) than on the built-in speakers, and the beat could not tell them
     // apart -- it carried the sample rates and never the names.
+    // ── THE MICROPHONE SLIDER IS PART OF THE AUDIO PATH ──────────────────────
+    //
+    // Found the hard way on this machine: macOS input volume sat at 14 of 100.
+    // Every symptom followed from it and none of them pointed at it. With AGC off
+    // the far end got a voice peaking at 0.05 -- inaudible. With AGC on, the
+    // canceller made up the ~18x shortfall and overshot, so the same voice
+    // arrived peaking at 1.01: CLIPPED, which is the harshest, most artificial
+    // sound a call can produce. "Too quiet" and "distorted" look like opposite
+    // faults and were the same fault, and no amount of work on codecs, jitter or
+    // echo could have touched either.
+    //
+    // A person cannot be expected to find this. The slider is in System Settings,
+    // it is not where anyone looks when a call sounds bad, and nothing in the app
+    // has ever mentioned it. So the app reads it and says so.
+    var vol: Float32 = -1
+    var va = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+      mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    var vsz = UInt32(MemoryLayout<Float32>.size)
+    if AudioObjectGetPropertyData(inDev, &va, 0, nil, &vsz, &vol) != noErr {
+      // Some devices expose per-channel volume and nothing on the main element.
+      va.mElement = 1
+      vsz = UInt32(MemoryLayout<Float32>.size)
+      if AudioObjectGetPropertyData(inDev, &va, 0, nil, &vsz, &vol) != noErr { vol = -1 }
+    }
+    if vol >= 0 {
+      Metrics.fact("mic_gain", String(format: "%.2f", vol))
+      if vol < 0.35 {
+        Metrics.count("mic_gain_low")
+        fputs("*** MICROPHONE INPUT IS AT \(Int(vol * 100))% -- this is the single most\n"
+            + "    likely reason a call sounds quiet OR distorted. Below about a third,\n"
+            + "    the gain control has to make up the difference and overshoots into\n"
+            + "    clipping. System Settings > Sound > Input, or:\n"
+            + "      osascript -e 'set volume input volume 75'\n", stderr)
+      }
+    }
     Metrics.fact("mic_dev", deviceName(inDev))
     Metrics.fact("spk_dev", deviceName(outDev))
     // ── APPLE'S ON-DEVICE VOICE MODEL, WHICH THIS APP MAY NOT SWITCH ON ───────
@@ -1387,6 +1520,7 @@ final class Audio {
       let a = abs(inScratch[k])
       micSumSq += Double(a) * Double(a)
       if a > micPeak { micPeak = a }
+      if a > micPeakWin { micPeakWin = a }
       // 0.997 and not 1.0: a converter that clips rarely returns exactly full
       // scale, and a threshold that only catches the exact value catches nothing.
       if a >= 0.997 { micClipped += 1 }

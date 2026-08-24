@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                  <string>Voice Lab</string>
+  <key>CFBundleDisplayName</key>           <string>Voice Lab</string>
+  <!-- Its OWN identifier, not Kin's. A shared one would mean testing the lab
+       could revoke or re-prompt the microphone grant on the actual product. -->
+  <key>CFBundleIdentifier</key>            <string>com.tokkah.voicelab</string>
+  <key>CFBundleExecutable</key>            <string>VoiceLab</string>
+  <key>CFBundlePackageType</key>           <string>APPL</string>
+  <key>CFBundleShortVersionString</key>    <string>1.0</string>
+  <key>CFBundleVersion</key>               <string>1</string>
+  <key>LSMinimumSystemVersion</key>        <string>14.0</string>
+  <key>NSHighResolutionCapable</key>       <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Voice Lab records your voice so you can hear how it sounds on a call.</string>
+</dict>
+</plist>

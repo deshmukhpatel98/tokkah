@@ -26,6 +26,19 @@ let package = Package(
         .linkedFramework("AudioToolbox"),
         .linkedFramework("AVFoundation"),
       ]
+    ),
+    // A separate binary on purpose: it opens the microphone and a window, and it
+    // must never be linkable into a call. Its own bundle id gives it its own
+    // microphone grant, so testing it cannot disturb Kin's.
+    .executableTarget(
+      name: "voicelab",
+      path: "Sources/voicelab",
+      swiftSettings: [.swiftLanguageMode(.v5)],
+      linkerSettings: [
+        .linkedFramework("AppKit"),
+        .linkedFramework("CoreAudio"),
+        .linkedFramework("AVFoundation"),
+      ]
     )
   ]
 )

@@ -252,6 +252,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ring-only", "rings", "rings-for", "ring-gap", "call", "no-rings", "io", "no-agc",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
+  "no-auto-gain", "gain-debug",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1693,6 +1694,8 @@ if let io = arg("io") {
   Audio.ioKind = io
 }
 if flag("no-agc") { Audio.agcOn = false }
+if flag("no-auto-gain") { Audio.autoGain = false }
+if flag("gain-debug") { Audio.gainDebug = true }
 
 // 16 frames is the HAL path's floor and it is measured, not guessed. Under
 // VoiceProcessingIO it is the WRONG floor: that unit does its own block
@@ -3567,6 +3570,8 @@ func reportLoop() {
   // Once a second, on the report thread: turns two instantaneous signals into a
   // duration. Never from a callback -- see the note in Audio.sampleQuality.
   audio.sampleQuality()
+  // Same cadence, same thread, same reason: never from a callback.
+  audio.tuneInputGain()
   if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
     Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
                              played: d.played, concealed: d.concealed, cap: d.cap,
