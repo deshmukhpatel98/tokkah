@@ -254,6 +254,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
+  "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "subtitle-debug",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
@@ -1952,7 +1953,97 @@ if flag("cue-test") {
   exit(bad ? 1 : 0)
 }
 
+// ── DOES THE DEADLOCK RULE PICK ONE, AND ONLY WHEN IT SHOULD? ───────────────
+//
+// The rule is the one place in this app that acts on a person's audio because of
+// a judgement about a conversation, so it is asserted clause by clause -- and the
+// clause that matters most is the REFUSAL: an even conversation with two
+// simultaneous starts must leave both people alone.
+if flag("yield-test") {
+  var bad = false
+  func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
+    print("  \(what.padding(toLength: 46, withPad: " ", startingAt: 0)) \(got.padding(toLength: 14, withPad: " ", startingAt: 0)) (want \(want))  \(ok ? "ok" : "WRONG")")
+    if !bad { bad = !ok }
+  }
+  func y(_ ms: Double, _ gap: Double?, _ owed: Double) -> Bool {
+    Audio.Yield.shouldYield(collisionMs: ms, gapMs: gap, owed: owed, afterMs: 450)
+  }
+  func yn(_ b: Bool) -> String { b ? "ducks" : "left alone" }
+
+  // Brief overlap is what conversation sounds like.
+  show("200 ms of overlap, they were first", yn(y(200, -400, 0)), "left alone", !y(200, -400, 0))
+  show("449 ms, one millisecond short", yn(y(449, -400, 0)), "left alone", !y(449, -400, 0))
+  // Past the deadlock threshold, whoever started second gives.
+  show("600 ms, they started 400 ms earlier", yn(y(600, -400, 0)), "ducks", y(600, -400, 0))
+  show("600 ms, this end started first", yn(y(600, 400, 0)), "left alone", !y(600, 400, 0))
+  // The refusal.
+  show("both started together, even ledger", yn(y(600, 20, 0)), "left alone", !y(600, 20, 0))
+  show("both started together, no start known", yn(y(600, nil, 0)), "left alone", !y(600, nil, 0))
+  // The ledger, which is the point of keeping one.
+  show("together, but this end owes a turn", yn(y(600, 20, 0.5)), "ducks", y(600, 20, 0.5))
+  show("together, and the far end owes one", yn(y(600, 20, -0.5)), "left alone", !y(600, 20, -0.5))
+  show("this end has taken every start", yn(y(600, 400, 0.8)), "ducks even so", y(600, 400, 0.8))
+  // Both ends run the same rule off mirrored ledgers, so exactly one gives.
+  var mirrored = 0
+  for owed in stride(from: -1.0, through: 1.0, by: 0.1) {
+    let a = y(600, 20, owed), b = y(600, -20, -owed)
+    if a != b { mirrored += 1 }
+  }
+  show("mirrored ledgers pick different sides", "\(mirrored)/21", ">= 12", mirrored >= 12)
+
+  // ── AND THE DUCK ITSELF: BOUNDED, AND IT LETS GO ──────────────────────────
+  //
+  // Nine decibels, never a mute, and back within a breath of the deadlock
+  // ending. A rule that decides correctly and then leaves somebody quiet is
+  // worse than no rule at all.
+  let g = Audio.DuplexGate()
+  g.cfg = Audio.gate
+  var seed: UInt64 = 0x9E11
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  let secs = 3.0, n = Int(SR * secs), blk = 16
+  var x = (0..<n).map { _ in rnd() * 0.3 }
+  let ref = x
+  var minGain: Float = 1, releasedAt = -1.0
+  x.withUnsafeMutableBufferPointer { op in
+    var i = 0
+    while i + blk <= n {
+      let t = Double(i) / SR
+      g.yielding = t >= 0.5 && t < 2.0            // a deadlock, then it ends
+      g.process(op.baseAddress! + i, blk)
+      if t > 1.9, t < 2.0 { minGain = min(minGain, g.yieldGainNow) }
+      if t >= 2.0, releasedAt < 0, g.yieldGainNow > 0.98 { releasedAt = (t - 2.0) * 1000 }
+      i += blk
+    }
+  }
+  let duckDb = 20 * log10(Double(minGain))
+  show("the duck settles at", String(format: "%.1f dB", duckDb), "-9 +/- 1",
+       abs(duckDb + 9) < 1)
+  show("... and it is never a mute", String(format: "%.3f gain", Double(minGain)),
+       "> 0.2", minGain > 0.2)
+  show("it lets go after the deadlock", releasedAt < 0 ? "never" : String(format: "%.0f ms", releasedAt),
+       "< 300 ms", releasedAt >= 0 && releasedAt < 300)
+  // Untouched while nobody is yielding: the first half second is the control.
+  var worst = 0.0
+  for i in 0..<Int(SR * 0.45) where abs(ref[i]) > 1e-4 {
+    worst = max(worst, Double(abs(x[i] - ref[i]) / abs(ref[i])))
+  }
+  show("before the deadlock, nothing is touched", String(format: "%.4f%%", worst * 100),
+       "0", worst < 0.001)
+
+  print(bad ? "  YIELD TEST FAILED"
+            : "  YIELD TEST PASSED -- brief overlap is left alone, a deadlock is decided by who"
+              + " started second unless the ledger says otherwise, an even one is refused,"
+              + " and the duck is 9 dB and lets go")
+  exit(bad ? 1 : 0)
+}
+
 if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false }
+if flag("no-yield") { Audio.gate.yieldOn = false }
+if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
+if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
 if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
 if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
@@ -2647,7 +2738,11 @@ if let subs = subtitles {
     // their microphone is producing: not a level meter, not a "you are muted"
     // badge -- the actual sentence, going out. When you have the floor it stays
     // empty, because then you can simply hear yourself.
-    let audible = Audio.sharedGate.gain > 0.5
+    // THE DUCK COUNTS. `gain` is the echo gate and it is wide open during a
+    // deadlock -- you are talking, loudly, over somebody. What has actually
+    // happened to your voice is the two factors multiplied, and it is the
+    // moment you most need to see that you are still getting through.
+    let audible = Audio.sharedGate.gain * Audio.sharedGate.yieldGainNow > 0.5
     display?.controls?.setMyWords(text, showing: !audible && !listening)
     if flag("subtitle-debug") {
       fputs("  you said: \(text)\(final ? " ." : " ...")\(listening ? "  (listening)" : "")\n", stderr)
@@ -3475,6 +3570,9 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "turn_yielded": audio.turns.yieldedToPeer, "turn_peer_yielded": audio.turns.peerYielded,
     "turn_yield_unclear": audio.turns.ambiguousYields,
     "turn_backchannels": audio.turns.backchannels, "turn_escalated": audio.turns.escalated,
+    // The deadlock rule, published from BOTH ends so the server can see whether
+    // it is splitting them evenly or picking on the same person every call.
+    "turn_yields": audio.turns.yields, "turn_yielded_pct": audio.yieldedPct,
     "turn_flaps": audio.turns.gateFlaps,
     "v_rx_w": gRxWidth, "v_rx_h": gRxHeight,
     "peer_rx_lost": wire.peerRxLost, "peer_rx_recovered": wire.peerRxRecovered,
@@ -3757,6 +3855,9 @@ func reportLoop() {
     fputs("  floor: yours \(held)% of the call, \(t.backchannels) listening noises,"
         + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)"
         + "  now \(["quiet", "listening", "bidding"][Audio.sharedGate.vocal.rawValue])"
+        + (t.yields > 0 ? String(format: "  gave way %d time(s), %.1f%% of the call%@",
+                                 t.yields, audio.yieldedPct,
+                                 audio.yieldingNow ? " (NOW)" : "") : "")
         + (subtitles.map { "  words: \($0.requests) asked, \($0.failures) failed,"
                          + " \(String(format: "%.0f", $0.lastMs)) ms, \(subSent) sent \(subGot) got" } ?? "")
         + "\n", stderr)

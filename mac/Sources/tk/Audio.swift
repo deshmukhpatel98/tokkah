@@ -716,6 +716,30 @@ final class Audio {
   /// no effect on any sample of audio.
   var yieldNudge: Double { max(0, ledger.owed) }
 
+  /// The deadlock rule, pulled out whole so it can be tested without a call and
+  /// so there is exactly one place that states it. See the long note at its one
+  /// call site in `accountTurn` for why each clause is there.
+  enum Yield {
+    /// Inside this, the ordering of two starts is the network's opinion and not a
+    /// fact -- this end sees its own the instant it happens and the far end's a
+    /// hop later. The same undecidability that stopped yield attribution being
+    /// reported from one end.
+    static let unknowableMs: Double = 150
+
+    /// `gapMs`: when the far end started minus when this end started, positive if
+    /// they started later. nil when either start is unknown.
+    /// `owed`: +1 this end has been taking the contested starts, -1 the far end has.
+    static func shouldYield(collisionMs: Double, gapMs: Double?, owed: Double,
+                            afterMs: Double) -> Bool {
+      guard collisionMs >= afterMs else { return false }   // brief overlap is conversation
+      if owed > 0.6 { return true }                        // taken too many; give this one up
+      guard let g = gapMs else { return false }
+      if g < -unknowableMs { return true }                 // they were clearly first
+      if g > unknowableMs { return false }                 // this end was clearly first
+      return owed > 0.35                                   // too close to call: ask the record
+    }
+  }
+
   // ── WHAT A CALL HAS TO REPORT FOR THIS TO GET BETTER ──────────────────────
   //
   // Turn-taking is now the whole product, so it needs the same treatment
@@ -756,6 +780,10 @@ final class Audio {
     var peerYielded = 0            // the far end went quiet and this end kept going
     var ambiguousYields = 0        // too close to call from one side
     var gateFlaps = 0              // open/close inside 300 ms: choppy, and audible
+    /// Deadlocks this end gave up. Published rather than shown: the far end
+    /// publishes the same number for its own side, and the two together say
+    /// whether the rule is splitting them evenly or picking on somebody.
+    var yields = 0
   }
   /// Set on the receive path the moment a packet says so, because a cue that is
   /// a video frame late appears after the moment it was meant to prevent.
@@ -764,6 +792,8 @@ final class Audio {
   private var claimStart: UInt64 = 0
   private var claimPending = false
   private var lastVocal = DuplexGate.Vocal.quiet
+  private var myVocalStart: UInt64 = 0
+  private var peerVocalStart: UInt64 = 0
   private var collisionStart: UInt64 = 0
   private var pendingYield: UInt64 = 0
   private var lastOpenAt: UInt64 = 0
@@ -813,6 +843,13 @@ final class Audio {
     // A collision, and who ended it.
     judgeContest(now: now, mineVocal: mine != .quiet, peerVocal: peerVocal)
     let bothTalking = mine != .quiet && peerVocal
+    // When each side STARTED, which is the only evidence about who interrupted
+    // whom. Recorded on the edge; the far end's is a network delay stale and the
+    // decision below refuses to use it when the two are close together.
+    if mine != .quiet, myVocalStart == 0 { myVocalStart = now }
+    if mine == .quiet { myVocalStart = 0 }
+    if peerVocal, peerVocalStart == 0 { peerVocalStart = now }
+    if !peerVocal { peerVocalStart = 0 }
     if bothTalking, collisionStart == 0 {
       collisionStart = now; turns.collisions += 1
     } else if !bothTalking, collisionStart != 0 {
@@ -828,6 +865,42 @@ final class Audio {
     if pendingYield != 0, Clock.ms(now - pendingYield) > 120 {
       if peerVocal { turns.yieldedToPeer += 1 } else { turns.ambiguousYields += 1 }
       pendingYield = 0
+    }
+
+    // ── THE DEADLOCK, AND WHO GIVES ───────────────────────────────────────────
+    //
+    // Only past `yieldAfterMs`, because everything shorter than that is what
+    // conversation sounds like. Two rules, in order, and a refusal:
+    //
+    //   1. WHOEVER STARTED SECOND INTERRUPTED. That is the rule people already
+    //      use, so an app that follows it needs no explaining. It is only usable
+    //      when the two starts are clearly apart: this end sees its own the
+    //      instant it happens and the far end's a hop later, so inside about a
+    //      hundred milliseconds the ordering is not a fact, it is the network.
+    //      This is the same thing that made yield attribution undecidable from
+    //      one end, and the answer is the same -- do not pretend to know.
+    //
+    //   2. UNLESS THE LEDGER SAYS OTHERWISE. Somebody who has taken the last
+    //      several contested starts gives this one up even though they started
+    //      first. That is the whole reason the record exists, and it is where it
+    //      stops being a readout and starts being a decision.
+    //
+    //   3. OTHERWISE NOBODY YIELDS. An even conversation with two simultaneous
+    //      starts is genuinely undecided, and inventing a winner there would be
+    //      the app talking over somebody on a coin toss.
+    //
+    // Both ends run this with mirrored ledgers -- `--ledger-test` asserts they
+    // sum to zero -- so it resolves without either side asking the other. When
+    // the network makes them briefly disagree the failure is symmetric and
+    // self-clearing: both duck for a moment, or neither does.
+    let gap: Double? = (myVocalStart != 0 && peerVocalStart != 0)
+      ? Clock.ms(peerVocalStart) - Clock.ms(myVocalStart) : nil
+    let wantYield = bothTalking && collisionStart != 0 && Yield.shouldYield(
+      collisionMs: Clock.ms(now - collisionStart), gapMs: gap, owed: ledger.owed,
+      afterMs: Audio.gate.yieldAfterMs)
+    if wantYield != dgate.yielding {
+      dgate.yielding = wantYield
+      if wantYield { turns.yields += 1 }
     }
 
     // Choppiness. A gate that opens and shuts inside a third of a second is
@@ -983,6 +1056,13 @@ final class Audio {
   }
   var backchannels: Int { dgate.backchannels }
   var floorClaims: Int { dgate.claims }
+  /// How much of the call this end spent ducked out of a deadlock. A number that
+  /// climbs is the rule picking on somebody, which is the failure to watch for.
+  var yieldedPct: Double {
+    let total = Double(dgate.openFrames + dgate.closedFrames)
+    return total > 0 ? Double(dgate.yieldSamples) / total * 100 : 0
+  }
+  var yieldingNow: Bool { dgate.yielding }
 
   // ── NO ECHO CANCELLATION. THE ECHO IS NOT CREATED. ────────────────────────
   //
@@ -1387,6 +1467,24 @@ final class Audio {
     /// Voiced time past which a listening noise is instead a bid for the floor.
     /// Continuers are short by definition; saying something takes longer.
     var claimMs: Double = 700
+    /// ── WHEN NEITHER OF YOU BACKS OFF ─────────────────────────────────────────
+    ///
+    /// Brief overlap is what conversation SOUNDS like and nothing here touches
+    /// it. What this handles is the deadlock: past `yieldAfterMs` of both people
+    /// still going, one of them has to give, and if the app will not decide then
+    /// the two of you spend the next second doing it manually -- which is the
+    /// fatigue the whole product exists to remove.
+    ///
+    /// It is a duck and not a mute, and the difference is the whole safety
+    /// argument. Nine decibels is unmistakable to the person listening and still
+    /// leaves you audible if you carry on; a mute costs somebody their sentence
+    /// when the decision is wrong, and it will sometimes be wrong. It also cuts
+    /// the echo the winner gets back -- during a real collision this end's
+    /// microphone is carrying the far end's own voice off the speaker, which is
+    /// the one thing this design exists to never send.
+    var yieldDb: Double = -9
+    var yieldAfterMs: Double = 450
+    var yieldOn = true
   }
   /// Standalone, like the presence filter, so the claim that a talking near end
   /// passes through untouched can be checked without opening a device.
@@ -1438,6 +1536,15 @@ final class Audio {
     private var vocalSamples = 0
     private var quietSamples = 0
     private(set) var gain: Float = 1
+    /// Set once per block by the turn accounting, which is the only place that
+    /// sees this end's state and the far end's at the same instant. The gate does
+    /// not decide this -- it applies it.
+    var yielding = false
+    private var yieldGain: Float = 1
+    private(set) var yieldSamples = 0
+    /// Where the duck has actually got to, so a test can assert the bound rather
+    /// than the intent.
+    var yieldGainNow: Float { yieldGain }
     private(set) var closedFrames = 0
     private(set) var openFrames = 0
     private(set) var backchannels = 0
@@ -1621,10 +1728,21 @@ final class Audio {
       // OPEN FAST, CLOSE SLOW. Backwards, this clips the first syllable of every
       // interruption, which is the one thing a person notices immediately.
       let step: Float = want > gain ? 0.02 : 0.0006
+      // ── AND THE DUCK, WHICH IS A SEPARATE DECISION ─────────────────────────
+      //
+      // Its own smoothed factor rather than folded into `want`, because the two
+      // move for different reasons and at different speeds: the gate is an
+      // echo judgement made every block, and this is a turn judgement made once
+      // per collision. 80 ms down so it is a duck and not a cut, 50 ms back up so
+      // the moment the deadlock ends you are simply talking again.
+      let yWant: Float = (cfg.yieldOn && yielding) ? Float(pow(10, cfg.yieldDb / 20)) : 1
+      let yStep: Float = yWant > yieldGain ? 0.00042 : 0.00026
       for k in 0..<n {
         gain += (want - gain) * step
-        x[k] *= gain
+        yieldGain += (yWant - yieldGain) * yStep
+        x[k] *= gain * yieldGain
       }
+      if yWant < 1 { yieldSamples += n }
       if want < 1 { closedFrames += n } else { openFrames += n }
     }
 
