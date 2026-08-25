@@ -194,9 +194,48 @@ enum Update {
     }
     // Staged beside the app so the exchange below is a rename within one volume
     // rather than a copy that could be interrupted half way through.
-    let next = appDir.deletingLastPathComponent()
-      .appendingPathComponent(".\(appDir.lastPathComponent).new")
+    //
+    // ── AND UNDER THIS PROCESS'S OWN NAME ─────────────────────────────────────
+    //
+    // This was one fixed path, `.Kin.app.new`, and the moment the watcher grew an
+    // update poller of its own there were two processes on one Mac that could be
+    // inside this function at the same time. What that does is not a failed
+    // update -- it is a SUCCESSFUL one that installs an incomplete bundle:
+    // each `removeItem` below deletes files out of the other's in-flight `ditto`,
+    // ditto returns 0 having copied what was left, and RENAME_SWAP puts the short
+    // tree in place atomically and silently. Measured on this machine with a
+    // 6000-file payload: four runs in six installed a bundle missing 3-9% of its
+    // files, with no error printed by either process.
+    //
+    // The missing files are not random. `ditto` walks Contents in directory
+    // order -- Info.plist, MacOS, PkgInfo, Resources, _CodeSignature -- so what
+    // gets dropped is the tail, and the tail is the signature. A bundle missing
+    // `_CodeSignature/` still launches and still reports the right version, and
+    // `codesign --verify` says "invalid resource directory". The designated
+    // requirement is what macOS pins a camera or microphone grant to, so the
+    // visible symptom is the app asking for the camera again for no reason
+    // anybody could ever trace -- which is the exact bug the certificate signing
+    // in mkapp.sh exists to prevent.
+    //
+    // Two updaters now stage into two directories, each copies a complete tree,
+    // and the two RENAME_SWAPs simply happen one after the other. There is no
+    // moment at which the live path holds a partial bundle.
+    let parent = appDir.deletingLastPathComponent()
+    let stem = ".\(appDir.lastPathComponent).new."
+    let next = parent.appendingPathComponent("\(stem)\(getpid())")
     try? fm.removeItem(at: next)
+    // A per-process name leaks a full copy of the app if an updater is killed
+    // mid-ditto, where the single fixed path used to be reused by the next one.
+    // So sweep -- but only copies whose process is GONE. Deleting a live
+    // updater's staging tree is precisely the defect above, and a cleanup that
+    // reintroduced it would be worse than the leak.
+    if let sibs = try? fm.contentsOfDirectory(atPath: parent.path) {
+      for s in sibs where s.hasPrefix(stem) {
+        guard let pid = Int32(s.dropFirst(stem.count)), pid != getpid() else { continue }
+        if kill(pid, 0) == 0 || errno == EPERM { continue }   // still running
+        try? fm.removeItem(at: parent.appendingPathComponent(s))
+      }
+    }
     // `ditto`, not copyItem: it carries the extended attributes parts of a
     // signature live in. A bundle that arrives without them stops verifying, and
     // on a machine with no signing key that damage is permanent.
@@ -405,7 +444,17 @@ enum Update {
       fputs("update: sha256 mismatch (want \(m.sha256), got \(got)) -- refusing\n", stderr); return nil
     }
     let fm = FileManager.default
-    let tmp = fm.temporaryDirectory.appendingPathComponent("tk-upd-\(m.version)")
+    // Per process, for the same reason `swapBundle` stages under its own name:
+    // `temporaryDirectory` is the one per-user directory, and since the watcher
+    // grew a poller two processes can be staging the same version at the same
+    // moment. They shared this path, and the first thing each one does is delete
+    // it -- so one untarred into a directory the other had just removed and got
+    // "archive has neither tk nor a bundle", observed. The dangerous version of
+    // that is quieter: a HALF-extracted tree that still has an executable in it,
+    // which passes the launch probe below and is then copied faithfully into the
+    // install.
+    let tmp = fm.temporaryDirectory
+      .appendingPathComponent("tk-upd-\(m.version)-\(getpid())")
     try? fm.removeItem(at: tmp)
     guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else { return nil }
     let tgzPath = tmp.appendingPathComponent("tk.tar.gz")
