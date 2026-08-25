@@ -157,6 +157,31 @@ final class VideoAssembler {
   private(set) var lastDone: Int32 = -1
   var onFrame: ((Data, UInt64) -> Void)?
 
+  // ── TOLD, RATHER THAN LEFT TO WORK IT OUT ──────────────────────────────────
+  //
+  // The restart detector below infers a restarted sender from thirty consecutive
+  // frames whose numbers are not newer than the last one delivered -- a full
+  // SECOND at 30 fps. The audio ring reaches the same conclusion from sixty-four
+  // packets, which is forty-three milliseconds, because audio arrives forty times
+  // faster.
+  //
+  // Measured on the rejoin rig: audio was back to `conceal 2/s` in the same
+  // report second that media returned, and video sat at `dec 0/s` for one more.
+  // A second of a frozen face after the voice is back is exactly the thing this
+  // app has a whole document about, and it was being spent re-deriving a fact the
+  // process next door already had.
+  //
+  // So the audio path hands it over. The inference below stays: it is the only
+  // thing that works when the peer sends video and no audio at all, which is a
+  // supported configuration (a microphone the person has denied).
+  func peerRestarted() {
+    guard lastDone >= 0 else { return }
+    restarts += 1
+    staleRun = 0
+    lastDone = -1
+    for i in 0..<VRING { slots[i].seq = -1 }
+  }
+
   func take(seq: Int32, frag: Int, nfrag: Int, capHost: UInt64, bytes: UnsafePointer<UInt8>, n: Int,
             parity: Bool = false, parLastLen: Int = 0) {
     fragsIn += 1

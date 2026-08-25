@@ -1234,6 +1234,10 @@ final class Wire {
 
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
     reportRing = ring
+    /// The value of `ring.restarts` this loop has already acted on. A counter and
+    /// not a flag, so a second restart later in the same call is a second event
+    /// rather than one that has already been consumed.
+    var seenRingRestarts = ring.restarts
     if !Wire.noRealtime { fputs(goRealtime() + "\n", stderr) }
     // One buffer big enough for either kind. Audio and video share the socket, so
     // the loop dispatches on the magic rather than owning two sockets: two ports
@@ -1617,6 +1621,15 @@ final class Wire {
         ring.write(seq: seq, cap: cap, src: fbuf, n: frames)
       } else {
         (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
+      }
+      // The audio ring works out that the sender restarted forty times faster than
+      // the video assembler can, because audio arrives forty times more often. Tell
+      // it, rather than making it wait out its own thirty stale frames -- that is a
+      // second of frozen face after the voice is already back. See
+      // `VideoAssembler.peerRestarted`.
+      if ring.restarts != seenRingRestarts {
+        seenRingRestarts = ring.restarts
+        video?.peerRestarted()
       }
       // A trailing block means this packet is also carrying an earlier one. Fill
       // the hole only if it IS a hole -- ring.write already refuses a duplicate,
