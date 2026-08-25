@@ -174,11 +174,18 @@ function analyse(c) {
   // card still appears and both buttons still work, so a black rectangle where
   // a face should be is a fault nobody on either end would ever report.
   if (ev.ring_preview_off) faults.push('the ring card could NOT show who was calling');
-  if (ev.ring_preview_picture && num(c.v_frags) > 0 && !num(c.v_decoded)) {
+  if (ev.ring_preview_open && num(c.v_frags) > 0 && !num(c.v_decoded)) {
     faults.push('their video reached the ring card and NOT ONE frame was decoded');
   }
-  if (ev.ring_preview_picture && num(c.v_decoded) > 0 && num(c.v_shown) === 0) {
+  if (ev.ring_preview_open && num(c.v_decoded) > 0 && num(c.v_shown) === 0) {
     faults.push('the caller\u2019s picture was decoded and NEVER DRAWN on the ring card');
+  }
+  // The whole feature in one line: a preview that opened, their video arriving,
+  // and the app never once announcing a picture. The two rules above name the
+  // stage that failed; this one fires even when both of them are satisfied and
+  // the face still never appeared.
+  if (ev.ring_preview_open && num(c.v_frags) > 0 && !ev.ring_preview_picture) {
+    faults.push('the ring card never showed the caller\u2019s face');
   }
   if (ev.ring_preview && (num(c.cap_callbacks) || num((c.marks || {}).cam_first_frame_ms) !== null)) {
     faults.push('a RING NOBODY ANSWERED opened the microphone or the camera');
@@ -232,6 +239,7 @@ const EVENT_WORDS = {
   ring_preview: 'the card could show who was calling',
   ring_preview_off: 'the card could NOT show who was calling -- a name and nothing else',
   ring_preview_picture: 'the caller\u2019s video reached the ring card',
+  ring_preview_open: 'the ring card joined the call to fetch their picture',
   peer_ringing_seen: 'the far end said it was still RINGING, not answered',
   ring_tone_apple: 'rang with Apple\u2019s own ringtone',
   ring_tone_fallback: 'no ringtone on this Mac -- a system alert instead',
@@ -302,7 +310,8 @@ const MARK_WORDS = {
   ring_front_ms: 'ring reached the front',
   ring_recv_ms: 'ring arrived',
   ring_sent_ms: 'ring sent',
-  ring_preview_ms: 'the caller\u2019s picture reached the ring card',
+  ring_preview_ms: 'the ring card reached the caller',
+  ring_preview_picture_ms: 'the caller\u2019s face appeared',
   answered_ms: 'answered',
   bye_recv_ms: 'heard they had hung up',
   cancelled_ms: 'cancelled',
@@ -502,7 +511,7 @@ function verdicts(c) {
   // still appears, both buttons still work, and nobody who missed the face ever
   // thinks to report it -- so it has to be found here or not at all.
   const frags = n('v_frags'), decoded = n('v_decoded'), shown = n('v_shown');
-  if (e('ring_preview_picture') && frags !== null && frags > 0) {
+  if (e('ring_preview_open') && frags !== null && frags > 0) {
     if ((decoded ?? 0) === 0) {
       add(3, 'the ring never showed who was calling',
           frags + ' pieces of their video arrived while this Mac was ringing and'
@@ -515,6 +524,16 @@ function verdicts(c) {
           decoded + ' frames were decoded and none of them reached the screen',
           'Display -- the ring card is drawn OVER the picture, and a decode with'
             + ' no draw is the card covering the one thing it exists to show.');
+    } else if (!e('ring_preview_picture')) {
+      // Every counter above is healthy and the app still never said a picture
+      // arrived. Kept as its own branch because it is the case where the parts
+      // all report success and the person saw nothing.
+      add(3, 'the ring card never announced a picture',
+          'their video arrived, decoded and drew, and the app never reached the'
+            + ' line that says a frame is on screen',
+          'the first-frame block in vdec.onDecoded -- the counters are collected'
+            + ' by the video path, this is stamped by the ring itself, and only'
+            + ' one of them has ever been wrong.');
     }
   }
   if (e('ring_preview_off')) {

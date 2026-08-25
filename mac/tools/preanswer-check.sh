@@ -166,9 +166,13 @@ RECVNZ=$(grep -oE "recv [0-9]+/s" "$SP/b.log" | grep -vc "recv 0/s")
 [ "${RECVNZ:-0}" != "0" ] \
   && say "OK" "while RECEIVING them -- $RECVNZ reports with their stream arriving" \
   || say "FAIL" "it received nothing, so there is no picture of who is calling"
-grep -q "their picture is on the ring card" "$SP/b.log" \
-  && say "OK" "and it put their picture behind the card" \
-  || say "FAIL" "their stream arrived and never reached the screen"
+# NOT the picture assertion -- this line is printed at the transport LOCK, and
+# for a while it claimed a picture there. A `--video off` caller reaches it
+# identically, so asserting a face on it passed a ring with nothing to look at.
+# The face is proven in part 3a, on the line that only a decoded frame prints.
+grep -q "the ring card reached them" "$SP/b.log" \
+  && say "OK" "and the card is JOINED to their call, not merely named after it" \
+  || say "FAIL" "the ring card never reached them, so it has nothing to show"
 # The caller must not read any of that as an answer.
 grep -q "they are being asked -- not connected yet" "$SP/a.log" \
   && say "OK" "and the caller knows it is a ring, not an answer" \

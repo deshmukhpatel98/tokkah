@@ -280,13 +280,13 @@ grep -q "camera: bring-up" "$SP/b.log" \
 grep -q "the other side's picture is on screen" "$SP/b.log" \
   && say "OK" "the app says so itself: the other side's picture is on screen" \
   || say "FAIL" "the display never announced a remote frame"
-# NOT PICTURE EVIDENCE, and it is listed here so nobody reads it as such. This
-# line is printed at the TRANSPORT LOCK, before any frame has been decoded, so it
-# is a claim about the branch taken and not about anything being visible. Part
-# three prints it too, with no picture at all. preanswer-check does treat it as
-# "their stream arrived and reached the screen"; that is the same class of mistake
-# this whole rig exists to avoid.
-grep -q "their picture is on the ring card" "$SP/b.log" \
+# NOT PICTURE EVIDENCE, and it is worded so that nobody can read it as such. It
+# is printed at the TRANSPORT LOCK, before a single frame has been decoded, so it
+# says which branch was taken and nothing about anything being visible. It used
+# to read "their picture is on the ring card" -- which part three below printed
+# with no picture in existence, and which preanswer-check asserted on as proof of
+# the entire feature. Both were corrected; part three now guards the correction.
+grep -q "the ring card reached them" "$SP/b.log" \
   && say "OK" "and the lock took the ring branch rather than the connected one" \
   || say "FAIL" "the lock did not take the ring branch"
 
@@ -368,10 +368,18 @@ grep -q "the other side's picture is on screen" "$SP/f.log" \
 echo "$(grep '^audit state' "$SP/f.log" | tail -1)" | grep -q 'card=ringing' \
   && say "OK" "CAMERA-OFF CALLER: with the ring card up, so it is still a ring" \
   || say "FAIL" "CAMERA-OFF CALLER: the card went away without any picture to take it"
-grep -q "their picture is on the ring card" "$SP/f.log" \
-  && note "the app printed \"their picture is on the ring card\" in THIS arm too, where" \
-  && note "there is no picture at all -- it fires at the lock, not on a frame. Anything" \
-  && note "reading it as picture evidence (preanswer-check does) is blind. APP DEFECT."
+# ── THE REGRESSION GUARD FOR THE DEFECT THIS RIG FOUND ──────────────────────
+#
+# This arm is the one place in the repo where a ring locks and no picture can
+# possibly exist, which makes it the only arm that can tell a claim about the
+# TRANSPORT from a claim about a FACE. The app used to fail it: the lock printed
+# "their picture is on the ring card" and counted `ring_preview_picture` right
+# here, so the log line, the counter and the dashboard word all reported a face
+# that nothing had drawn. If any of that language ever comes back to the lock,
+# every instrument downstream goes blind again -- so it fails here, loudly.
+grep -qE "picture is on the ring card|their picture is on" "$SP/f.log" \
+  && say "FAIL" "CAMERA-OFF CALLER: the lock claimed a picture again -- the log line has regressed" \
+  || say "OK" "CAMERA-OFF CALLER: and the lock claims a connection, never a face"
 
 echo
 if [ "$fail" = 0 ]; then

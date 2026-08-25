@@ -2131,14 +2131,22 @@ if let room = arg("room") {
           sinceLock = 0
           if ringPreview {
             setWindowTitle("Kin — \(Identity.display(arg("incoming") ?? "someone")) is calling")
-            Metrics.count("ring_preview_picture")
+            // What just happened is a LOCK, not a frame. This counted
+            // `ring_preview_picture` right here and printed that their picture
+            // was on the card -- at a point a caller running `--video off`
+            // reaches identically. So the counter meant "a ring found its
+            // socket", the dashboard rendered it as "the caller's video reached
+            // the ring card", and a rig asserting on that log line passed on a
+            // ring with no picture in it whatsoever. A picture is counted where
+            // a picture exists: `vdec.onDecoded`, further down this file.
+            Metrics.count("ring_preview_open")
             Metrics.mark("ring_preview_ms", sinceLaunch())
             // NOT `continue`. The sleep that paces this whole loop is at the
             // bottom of it, and skipping to the top would turn a half-second poll
             // into a spin -- on the one image whose entire promise is that it
             // costs a Mac nothing while it waits to be answered.
-            fputs("room \(room): their picture is on the ring card"
-                + " -- still nobody's decision\n", stderr)
+            fputs("room \(room): the ring card reached them"
+                + " -- their picture will follow, still nobody's decision\n", stderr)
           } else {
           display?.controls?.markConnected()
           setWindowTitle("Kin — connected")
@@ -3547,6 +3555,13 @@ vdec.onDecoded = { img, capHost in
       display?.controls?.markConnected()
       setWindowTitle("Kin — connected")
       display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
+    }
+    if ringPreview {
+      // The only line in this program that knows a picture EXISTS. Everything
+      // above runs on the transport being up, which is a different question and
+      // was answering this one wrongly -- see the lock path for what that cost.
+      Metrics.count("ring_preview_picture")
+      Metrics.mark("ring_preview_picture_ms", sinceLaunch())
     }
     fputs("the other side's picture is on screen"
         + (ringPreview ? " -- behind the ring card, still nobody's decision" : "") + "\n",
