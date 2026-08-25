@@ -929,6 +929,167 @@ enum Identity {
     return true
   }
 
+  // ── THE HANG-UP THE WATCHER CANNOT DELIVER ──────────────────────────────────
+  //
+  // The stand-down above has a seam in it, and a cancelled call rang at somebody
+  // through the seam for the whole 45 s.
+  //
+  // The watcher does not become the call, it LAUNCHES one: a new copy of Kin with
+  // `--incoming` on it. That copy takes about half a second to reach its own
+  // first poll (measured here: 479 ms with a warm binary; a cold signed bundle is
+  // longer), and for the whole of that half-second the watcher is still the only
+  // process polling this mailbox. A `bye` that lands in it is drained by the
+  // WATCHER -- destructively, so it is then gone for everybody -- and the watcher
+  // has no card to take down, so it dropped the message and said so in the log.
+  // The copy it had just launched went on ringing at a person for a call that no
+  // longer existed. The first second or two after a misdial is exactly when
+  // people cancel, so the seam is not an edge case; it is the common case.
+  //
+  // The message cannot be put back. The caller signs every ring and every bye,
+  // the callee verifies it, and that is the property that makes the doorbell
+  // worth having -- so the watcher, which holds no key of the caller's, can
+  // neither forge nor re-post one. The handoff has to be local.
+  //
+  // So the watcher leaves the news in a file and the ringing copy reads it. What
+  // makes that safe is not the file, it is who is allowed to act on it:
+  //
+  //   WHO CAN WRITE IT -- anything running as this user. That is not a new
+  //   authority: the file sits beside `identity.json`, in a 0700 directory, and
+  //   `identity.json` holds the Ed25519 SEED. Anyone who can drop a note here can
+  //   already read the seed and be this install outright -- ring, cancel,
+  //   register, anything. A signature over this file would be checked with a key
+  //   stored next to it, which proves nothing at all.
+  //
+  //   WHAT IT MUST MATCH -- the reader accepts a note only for the call it is
+  //   ACTUALLY RINGING: same caller, same room. The room is the half that carries
+  //   the weight, exactly as it does for a bye off the wire -- it was minted for
+  //   this one call minutes ago and the only machines that have ever seen it are
+  //   the two ends. It is checked in `handleBye`, the same one place a network
+  //   bye is checked, so there is one rule and not two.
+  //
+  //   HOW IT EXPIRES -- it carries the wall clock it was WRITTEN at, not the `t`
+  //   the caller signed, because the question the reader is asking is "did this
+  //   land during my ring", and it refuses anything older than 60 s. That is the
+  //   ring's own lease, the same number `ringLoop` and the watcher use to decide
+  //   a message is a record rather than a call, so a note cannot outlive the
+  //   thing it is about. A note stamped in the future is refused too, or a clock
+  //   that jumped would leave one that never expires.
+  //
+  //   AND IT IS CONSUMED -- read once and deleted, applied or not. A note that
+  //   does not fit this ring will never fit a later one, and leaving it would put
+  //   it in front of every future ring for that room.
+  private static var cancelDir: URL { dir.appendingPathComponent("cancelled", isDirectory: true) }
+
+  /// One file per call, named by a HASH of the room and never by the room itself.
+  /// A room name is chosen by the CALLER and the signature proves only that they
+  /// said it, not that it is a sane filename -- `../../../../etc/anything` is a
+  /// perfectly valid signed room, and a watcher that named a file after one would
+  /// be writing wherever a stranger pointed it. The hash also means the ringing
+  /// copy opens exactly one path instead of reading a directory of other people's
+  /// filenames.
+  private static func cancelNote(room: String) -> URL {
+    let hex = SHA256.hash(data: Data(room.utf8)).map { String(format: "%02x", $0) }.joined()
+    return cancelDir.appendingPathComponent(String(hex.prefix(32)) + ".json")
+  }
+
+  /// The ring's own lease. Deliberately the same 60 s the age guards use.
+  private static let cancelNoteLifeMs = 60_000
+
+  /// Leave the news for the copy this process just launched. Called by the
+  /// watcher, on the one branch that used to drop a bye on the floor.
+  ///
+  /// EVERY verified bye it drops, not only the room it last opened a window for.
+  /// A stranger who has learnt this handle can therefore cause a file to be
+  /// written -- which is worth saying out loud and is not worth defending
+  /// against here: the note is bounded (the server caps rings per handle per
+  /// minute and per hour), it is swept two lease periods later, and it can only
+  /// ever end a ring whose caller and room it already matches. The alternative --
+  /// writing only for `lastRoom` -- would silently lose the second of two rings,
+  /// which is the case the sorted-by-time delivery in `ringLoop` exists for.
+  static func noteCancelled(_ r: Ring) {
+    guard r.kind == "bye" else { return }
+    // A hang-up that is already past the lease is a record of a call, not the end
+    // of one -- the same rule the receiver applies -- and writing it would only
+    // create rubbish for the sweep.
+    guard r.ageMs < cancelNoteLifeMs else {
+      fputs("watch: that hang-up is \(r.ageMs) ms old -- too old to be about a ring"
+          + " that is still going, so nothing was left for Kin\n", stderr)
+      return
+    }
+    let now = Int(Date().timeIntervalSince1970 * 1000)
+    let note: [String: Any] = ["from": r.from, "room": r.room, "t": now]
+    guard let d = try? JSONSerialization.data(withJSONObject: note, options: [.sortedKeys])
+    else { return }
+    try? FileManager.default.createDirectory(at: cancelDir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let f = cancelNote(room: r.room)
+    do {
+      try d.write(to: f, options: .atomic)
+      try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: f.path)
+      Metrics.count("bye_note_written")
+    } catch {
+      fputs("watch: could not leave the hang-up for Kin: \(error)\n", stderr)
+      Metrics.count("bye_note_write_fail")
+    }
+    sweepCancelNotes()
+  }
+
+  /// Is there a note for the call this copy is ringing? Consumes it either way.
+  ///
+  /// Returns true ONLY for a note that names this caller and this room and is
+  /// younger than a ring's lease. Everything else is deleted and refused -- and
+  /// the deletion is what makes "it kept ringing" mean something, because a
+  /// reader that never ran leaves the file exactly where it was.
+  static func takeCancelNote(from: String, room: String) -> Bool {
+    let f = cancelNote(room: room)
+    guard let d = try? Data(contentsOf: f) else { return false }
+    try? FileManager.default.removeItem(at: f)
+    guard let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let noteFrom = o["from"] as? String, let noteRoom = o["room"] as? String,
+          let t = o["t"] as? Int
+    else {
+      Metrics.count("bye_note_malformed")
+      fputs("cancel: there was a note here and it was not readable -- ignored\n", stderr)
+      return false
+    }
+    let ageMs = Int(Date().timeIntervalSince1970 * 1000) - t
+    // Named, all three ways, because a ring that should have stopped and did not
+    // is the failure this whole path exists to prevent, and "it was ignored" with
+    // no reason is how that becomes unfindable.
+    guard noteRoom == room, noteFrom == from else {
+      Metrics.count("bye_note_wrong_call")
+      fputs("cancel: a note about @\(noteFrom) in \(noteRoom) is not about"
+          + " @\(from) in \(room) -- ignored\n", stderr)
+      return false
+    }
+    guard ageMs < cancelNoteLifeMs, ageMs > -5_000 else {
+      Metrics.count("bye_note_stale")
+      fputs("cancel: the note from @\(noteFrom) is \(ageMs) ms old"
+          + (ageMs < 0 ? " -- it is stamped in the future, which no honest writer"
+                       + " does, so it is ignored\n"
+                       : ", past a ring's own lease -- ignored\n"), stderr)
+      return false
+    }
+    Metrics.count("bye_note_taken")
+    return true
+  }
+
+  /// Notes nobody came for. The reader deletes what it reads, so anything left
+  /// here belongs to a copy that never started, or that was already gone -- and
+  /// two lease periods is long past the last moment it could have meant anything.
+  /// Swept by the writer because the writer is the process that is always alive.
+  private static func sweepCancelNotes() {
+    let fm = FileManager.default
+    guard let names = try? fm.contentsOfDirectory(atPath: cancelDir.path) else { return }
+    let cutoff = Date().addingTimeInterval(-2 * Double(cancelNoteLifeMs) / 1000)
+    for n in names {
+      let p = cancelDir.appendingPathComponent(n)
+      guard let a = try? fm.attributesOfItem(atPath: p.path),
+            let m = a[.modificationDate] as? Date, m < cutoff else { continue }
+      try? fm.removeItem(at: p)
+    }
+  }
+
   /// The listening loop itself, on whatever thread calls it. `until` is a
   /// deadline for the measurement flags; nil means the life of the process.
   ///
@@ -1116,8 +1277,32 @@ enum Identity {
 
   /// Listen for rings for as long as the app is open, on a thread of its own,
   /// and hand every one to main -- the caller draws a window with it.
+  ///
+  /// ── HOLDING THE LAUNCH WINDOW OPEN, BECAUSE IT IS TOO SHORT TO AIM AT ──────
+  ///
+  /// `TK_RING_START_MS` delays the moment this app starts listening, and it is
+  /// the only way a rig can stand inside the seam the note above is about. That
+  /// seam is the gap between the watcher launching Kin and Kin taking the line,
+  /// and it measured 479 ms on this Mac -- a warm binary, a tiny bundle, no
+  /// camera. A cancel sent by another process cannot be aimed into 479 ms: the
+  /// `tk --bye-only` that sends it spends about that long starting up, so which
+  /// of the two wins is a coin flip, and a rig whose arm is a coin flip proves
+  /// nothing in either direction.
+  ///
+  /// So the window is held open at a fixed size instead of raced for. Same idea
+  /// as `TK_AIM_MS`, which widens the ring card's "nobody could have aimed this
+  /// yet" window so that refusal is reachable without a person at the trackpad:
+  /// the state is real, it is just held still. Production never sets it, and it
+  /// is announced out loud when it is set, because a switch that turns the
+  /// doorbell off for six seconds must never be silent.
   static func startRinging(gapMs: Int = 5000, onRing: @escaping (Ring) -> Void) {
+    let holdMs = Int(ProcessInfo.processInfo.environment["TK_RING_START_MS"] ?? "") ?? 0
+    if holdMs > 0 {
+      fputs("ring: TK_RING_START_MS -- not listening for the first \(holdMs) ms"
+          + " of this launch (rig only)\n", stderr)
+    }
     Thread {
+      if holdMs > 0 { Thread.sleep(forTimeInterval: Double(holdMs) / 1000) }
       ringLoop(gapMs: gapMs) { r in DispatchQueue.main.async { onRing(r) } }
     }.start()
   }

@@ -1468,6 +1468,56 @@ if let from = arg("incoming"), let r = arg("room") {
                            known: !ik.isEmpty && Identity.contacts()[from] == ik,
                            keyChanged: false, kind: nil)
   Metrics.count("ring_recv_watch")
+  // ── THEY MAY ALREADY HAVE CANCELLED, AND ONLY THE WATCHER KNOWS ───────────
+  //
+  // The doorbell drain is destructive and this copy did not do it: for the first
+  // half-second of this launch the WATCHER is still the only process polling, so
+  // a `bye` sent one beat after the ring is taken by the watcher and can never be
+  // polled for here. It leaves the news on disk instead (`Identity.noteCancelled`
+  // in Watch.swift), and this is the first of the two places that reads it.
+  //
+  // BEFORE the card and the ringtone, deliberately. Both are dispatched to main
+  // just below, so checking after them would ring at somebody for a quarter of a
+  // second before taking it back -- a cancelled call should make no noise at all.
+  //
+  // Through `handleBye` and not by hand, because a note only means something if
+  // it is about THIS caller and THIS room, and that rule already exists in one
+  // place for byes off the wire. Two copies of it is two things to get wrong.
+  if Identity.takeCancelNote(from: from, room: r) {
+    fputs("cancel: @\(from) called it off while Kin was still starting"
+        + " -- the watcher took the message and left it here\n", stderr)
+    Metrics.count("bye_note_prering")
+    handleBye(Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
+                            known: false, keyChanged: false, kind: "bye"))
+  }
+  // ── AND IT CAN ALSO LAND A MOMENT AFTER THAT LINE ─────────────────────────
+  //
+  // The read above is one sample of a file another process writes, so it answers
+  // only for the instant it ran. A cancel that lands between it and this copy's
+  // own first poll would be taken by the watcher, written after we looked, and
+  // waited out in full -- the original bug moved a few hundred milliseconds to
+  // the right. `once-fired-probes-record-transients`: a state read once at
+  // startup is a birth certificate, not a subscription.
+  //
+  // Four times a second, for as long as this copy has something to ask about. It
+  // is one open() of a path that is usually not there, against a window that has
+  // a person looking at it, and it stops mattering the moment `gOffered` is
+  // cleared -- by an answer, a decline, or by the note itself. `.common` mode so
+  // it keeps firing while a menu or a drag is tracking.
+  //
+  // Handed straight to the run loop and not kept in a `let` of its own: a
+  // top-level variable in this file is initialised in file order, and this file
+  // has twice had one silently undone by its own initialiser after a thread had
+  // already written to it. There is nothing here that needs a name.
+  RunLoop.main.add(Timer(timeInterval: 0.25, repeats: true) { _ in
+    guard let o = gOffered, o.kind == nil,
+          Identity.takeCancelNote(from: o.from, room: o.room) else { return }
+    fputs("cancel: @\(o.from) called it off -- the watcher took the message"
+        + " while this copy was still starting up\n", stderr)
+    Metrics.count("bye_note_ringing")
+    handleBye(Identity.Ring(from: o.from, room: o.room, t: 0, k: o.k, ageMs: 0,
+                            known: o.known, keyChanged: false, kind: "bye"))
+  }, forMode: .common)
   DispatchQueue.main.async {
     display?.controls?.showIncoming(from: from, room: r)
     Ringer.start(raising: display?.callWindow)

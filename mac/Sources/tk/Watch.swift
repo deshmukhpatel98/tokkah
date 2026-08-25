@@ -396,18 +396,36 @@ enum Watch {
       }
       Resident.refresh()
     }) { r in
-      // ── A HANG-UP IS NOT A DOORBELL ────────────────────────────────────
+      // ── A HANG-UP IS NOT A DOORBELL, AND IT IS NOT RUBBISH EITHER ──────
       //
       // `ringLoop` hands every verified message to this closure, byes included --
       // only the app's own listener filtered on kind. So a cancelled call could
       // open a window, ring, and connect to a room the caller had already left:
-      // rung by somebody who had just hung up. There is nothing for a watcher to
-      // DO with a bye (the copy it launched does its own polling and will hear
-      // its own), so it is dropped here, named, and deliberately does NOT touch
-      // `lastRoom` -- a bye is not a ring this Mac has been shown.
+      // rung by somebody who had just hung up. A watcher must therefore never
+      // open a window for one, and this branch is where that is decided. It also
+      // deliberately does NOT touch `lastRoom` -- a bye is not a ring this Mac
+      // has been shown.
+      //
+      // ── AND THE SENTENCE THAT USED TO BE HERE WAS FALSE ────────────────
+      //
+      // "there is nothing for a watcher to DO with a bye (the copy it launched
+      // does its own polling and will hear its own)". It does its own polling
+      // about half a second AFTER it is launched, and until then this process is
+      // the only one draining this mailbox. Every hang-up that landed in that
+      // half-second was taken here, dropped here, and never reached the copy that
+      // was ringing at somebody -- which then rang for the full 45 s for a call
+      // that had been called off. A cancel one beat after a misdial is the
+      // ordinary case, not an edge one, so that window was most of them.
+      //
+      // The message cannot be handed back to the server: the caller signs it and
+      // this process holds none of their keys. So it is left on disk for the copy
+      // to find. See `Identity.noteCancelled` for who may write one, what it has
+      // to match before anything acts on it, and how it expires -- the rules live
+      // there because the ringing copy is the half that has to apply them.
       if r.kind != nil {
         fputs("watch: @\(r.from) sent \(r.kind!) for room \(r.room) -- not a call to open\n",
               stderr)
+        if r.kind == "bye" { Identity.noteCancelled(r) }
         return
       }
       guard r.ageMs < 60_000, r.room != lastRoom else { return }
