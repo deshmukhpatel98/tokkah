@@ -182,6 +182,44 @@ if flag("rings") || arg("rings-for") != nil {
 }
 // The headless watcher, and the three commands that manage it.
 if flag("watch") {
+  // ── THE ONE PROCESS THAT IS ALWAYS RUNNING NEVER LOOKED FOR AN UPDATE ──────
+  //
+  // `Update.startPolling` is called ~350 lines below this. `Watch.run` returns
+  // `Never`. So on every Mac with the login item installed, the process that
+  // lives from login to logout has never once asked whether there is a newer
+  // Kin -- it only ever REACTED, via `imageStamp()`, to a swap some other copy
+  // had already performed. Guard by unreachability again: nothing disabled the
+  // updater here, it was simply below a function that does not come back.
+  //
+  // What that cost, exactly: the foreground app's first check is ten seconds
+  // after launch, and closing the window is `exit(0)`. Nothing about a staged
+  // update survives the process -- `pending` is memory and `stage()` deletes and
+  // re-downloads its temp directory every time. So ten consecutive eight-second
+  // sessions make no progress whatsoever, and somebody who is rung, answers,
+  // talks and closes the window can stay on an old build for ever. "Open and
+  // close it and it updates itself" was not true, and the half of the product
+  // that could have made it true was this one.
+  //
+  // Half an hour, not the foreground app's minute: this process is measured in
+  // days, and the thing it is racing is a release, not a call. Sixty seconds
+  // before the first ask, because launchd starts it at login alongside
+  // everything else a Mac does at login and there is no hurry at all. Both take
+  // the same rig overrides as the foreground poller, so a test can prove this in
+  // seconds rather than sitting through the production cadence.
+  //
+  // `callIsLive()` is false in here for ever -- a doorbell holds no media -- so
+  // this commits as soon as it has something, which is exactly right for a
+  // process with nobody looking at it. Its own `imageStamp()` check then sees
+  // the binary move underneath it and exits 3, and launchd starts the new one.
+  // That half is already proven in the field; it just never had anything to
+  // react to unless the person happened to open the app for long enough.
+  if !flag("no-update") {
+    let every = max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_POLL"] ?? "") ?? 1800)
+    let first = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "") ?? 60)
+    fputs("watch: checking for a newer Kin every \(Int(every)) seconds"
+        + " -- this Mac stays current whether or not anybody opens the app\n", stderr)
+    Update.startPolling(current: VERSION, every: every, firstAfter: first)
+  }
   Watch.run(gapMs: Int(arg("ring-gap") ?? "4000") ?? 4000)
 }
 if flag("watch-install") { fputs(Watch.install() + "\n", stderr); exit(0) }

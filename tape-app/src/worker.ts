@@ -4753,6 +4753,30 @@ export default {
       h.set('content-type', rel[1].endsWith('.dmg')
         ? 'application/x-apple-diskimage'
         : 'application/gzip');
+      // ── HOW BIG IS IT: THE ONE HEADER NOBODY WAS SENDING ─────────────────────
+      //
+      // `writeHttpMetadata` copies what R2 stored ABOUT the object -- type,
+      // encoding, disposition -- and never its length. So every release has gone
+      // out chunked, with no `content-length` at all, and two things that quietly
+      // depended on it have been dead the whole time:
+      //
+      //   · the size on the front door. kin.js asks this route for a HEAD and
+      //     prints `content-length / 1e6`, guarded by `bytes > 500e3` so that a
+      //     404 body can never be read as a download. With no header at all the
+      //     guard is never passed, the line never runs, and the hand-typed
+      //     fallback in the page stands forever -- it says "1.1 MB", and the disk
+      //     image is 1,514,539 bytes. The number that exists so the page cannot
+      //     go stale was itself the stale one, and nothing said so.
+      //   · every progress bar. A browser, `curl`, and the updater's URLSession
+      //     all size a download from this header; without it a 1.5 MB fetch is an
+      //     indeterminate spinner, and a truncated one is caught only later, by
+      //     the SHA-256 in the signed manifest.
+      //
+      // Taken from `obj.size`, which is R2's own count of the bytes about to be
+      // streamed, so the promise cannot disagree with the body. Guarded rather
+      // than assumed: a length we are not certain of is worse than none, because
+      // a client would then treat a whole file as a short one.
+      if (Number.isFinite(obj.size) && obj.size > 0) h.set('content-length', String(obj.size));
       return new Response(obj.body, { headers: h });
     }
     // Short invite links: room.tokkah.com/etm-bkmb-iev (Meet-shaped, minted by
