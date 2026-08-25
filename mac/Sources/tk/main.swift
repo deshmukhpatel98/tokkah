@@ -329,6 +329,8 @@ let KNOWN_FLAGS: Set<String> = [
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "headphone-test", "route", "contacts-fake",
+  // Reading what macOS has decided, and opening the exact pane that decides it.
+  "permissions", "permissions-open",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -383,6 +385,36 @@ for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
       + "a misspelled flag would otherwise be ignored in silence, and an arm running"
       + " without the thing it is named after is worse than no arm at all.\n", stderr)
   exit(2)
+}
+
+// ── WHAT MACOS HAS DECIDED, AND THE ONE CLICK THAT CHANGES IT ──────────────
+//
+// Below the unknown-flag guard so a misspelling is refused rather than ignored,
+// and above everything that opens a device, a socket, a window or the identity:
+// asking what the permissions are must not itself be a call. Same reason the
+// `--*-test` flags had to be excused from the app's side effects -- a diagnostic
+// that starts the product cannot be used to diagnose the product.
+//
+// `tk --permissions` prints and exits. `tk --permissions-open camera` is the
+// second token, and it is here because of this codebase's own law about controls
+// that are declared and never wired: an API with no caller reads as finished and
+// does nothing, and `reveal` is exactly the shape of thing that rots unnoticed.
+// This makes it runnable by hand on any machine in one line.
+if flag("permissions") || arg("permissions-open") != nil {
+  if let which = arg("permissions-open") {
+    guard let need = Permissions.Need(rawValue: which) else {
+      fputs("--permissions-open takes one of: "
+          + Permissions.Need.allCases.map(\.rawValue).joined(separator: ", ") + "\n", stderr)
+      exit(2)
+    }
+    // The only path in this program that throws a System Settings window at
+    // whoever is sitting here, which is why the automated rig never takes it.
+    let opened = Permissions.reveal(need)
+    fputs(Permissions.report() + "\n", stderr)
+    exit(opened ? 0 : 1)
+  }
+  fputs(Permissions.report() + "\n", stderr)
+  exit(0)
 }
 
 // ── WHAT `--video` ACCEPTS, SAID OUT LOUD ──────────────────────────────────
@@ -2388,9 +2420,19 @@ case .notDetermined:
   fputs("microphone: still waiting on the permission dialog -- answer it and this\n"
       + "  end starts sending. Nothing here blocks on it.\n", stderr)
 case .denied, .restricted:
+  // ── AND NAME THE RIGHT APP ────────────────────────────────────────────────
+  //
+  // This used to say "enable the app you launched this from (Terminal, iTerm, VS
+  // Code...)". True of the bare CLI binary, whose grant TCC attributes to the
+  // terminal above it -- and reached from inside Kin.app too, where it is advice
+  // that sends somebody to switch on a text editor to fix their microphone. The
+  // bundle has owned its own grant since it became a bundle; the message had not
+  // noticed. It now names whichever is actually true, and carries the URL that
+  // opens the pane rather than a path through three menus.
   fputs("microphone: DENIED. You will hear the other person and they will hear silence.\n"
-      + "  Enable the app you launched this from (Terminal, iTerm, VS Code...) in\n"
-      + "  System Settings > Privacy & Security > Microphone, then run tk again.\n", stderr)
+      + "  Switch on \(Bundle.main.bundleIdentifier == nil ? "the app you launched this from (Terminal, iTerm, VS Code...)" : "Kin")"
+      + " under System Settings > Privacy & Security > Microphone.\n"
+      + "  One click: tk --permissions-open microphone\n", stderr)
 @unknown default:
   break
 }
