@@ -30,9 +30,9 @@
 <main>
   <div class=tag>early build · apple silicon · audio + video</div>
   <h1>Kin for macOS</h1>
-  <p class=lede>A video call that should feel like the other person is in the room. This is the
-     native half — built because a browser will not give you the clocks or the audio
-     thread the goal requires.</p>
+  <p class=lede>A video call that should feel like the other person is in the room. It is a
+     native app and nothing else — built that way because a browser will not give you the
+     clocks or the audio thread the goal requires.</p>
 
   <h2>Install</h2>
   <p><a id=dl data-dl href="/macos/dl/Kin-0.64.0.dmg"><b>Download Kin-0.64.0.dmg</b></a></p>
@@ -43,8 +43,17 @@
      itself into /Applications, clears its own quarantine, and keeps itself up to date, verifying
      an Ed25519 signature on every update before applying it. Nothing else to do. Dragging it to
      /Applications yourself still works, but it is not required.</p>
-  <p>Then double-click <b>Kin.app</b>, type a room name, press Join. Both people type
-     the same name and you are connected directly, with no server in between.</p>
+  <p>Then double-click <b>Kin.app</b>. There is nothing to fill in: it opens with your
+     camera on and a call already running, and the link to it in the middle of the window.
+     Click the link to copy it, send it to the other person, and they are in.</p>
+  <p class=note>Or press the handset beside the link, type a name, and that Mac rings.
+     Answer someone&rsquo;s call once and they become a face on the panel, so calling them
+     back is one tap. Kin rings when it is closed, too: it keeps a small thing in the menu
+     bar from login onwards, so a call reaches this Mac without the app being open, and the
+     card that appears shows the caller&rsquo;s picture <em>before</em> you answer. Only
+     theirs, and only if you have answered them before &mdash; a stranger rings as a name
+     and nothing else, because drawing their picture would mean opening a connection to
+     them before you had agreed to anything.</p>
 
   <p>Every call reports what it did to
      <a href="/macos/calls">the call dashboard</a> &mdash; latency, gaps in the sound,
@@ -58,15 +67,17 @@
      fetched by <code>curl</code> are not quarantined, so this path never meets Gatekeeper. It
      installs the same app plus <code>~/.local/bin/tk</code>, checks the download against a
      SHA-256 in a signed manifest, and self-updates from then on. Read the script first if you
-     like &mdash; it is <a href="/macos/install.sh">right here</a>, 50 lines.</p>
+     like &mdash; it is <a href="/macos/install.sh">right here</a>, just under 160 lines, most
+     of them saying why.</p>
 
   <h2>Use it</h2>
   <pre><code>tk --room ripe-mango-jam --window</code></pre>
   <p class=note>Pick any room name and run the same command on both Macs &mdash; that is the
      whole setup. They find each other through a rendezvous at room.tokkah.com, then talk
-     <strong>directly</strong>, peer to peer, with no relay carrying your call. Two Macs on one
-     wifi take the LAN path automatically; two Macs in different houses punch through both
-     routers. The room name is also the encryption salt, so choose something only the two of
+     <strong>directly</strong>, peer to peer. Every route the two Macs have is raced against
+     the others by measured round trip and the quickest one wins: two Macs on one wifi take the
+     LAN path automatically, two Macs in different houses punch through both routers.
+     The room name is also the encryption salt, so choose something only the two of
      you would say, and say it to each other rather than typing it anywhere.</p>
   <p class=note><code>--window</code> opens the picture; without it you get audio and a
      latency read-out. Add <code>--video camera</code> to send your camera, or
@@ -78,8 +89,10 @@
      <code>tk</code> is a command-line tool it has no identity of its own, so macOS grants that
      to the <em>terminal</em> you launched it from &mdash; if it says the microphone was denied,
      enable Terminal (or iTerm, or VS Code) under System&nbsp;Settings &rarr;
-     Privacy&nbsp;&amp;&nbsp;Security &rarr; Microphone. It prints its latency budget on start
-     and then one line a second.</p>
+     Privacy&nbsp;&amp;&nbsp;Security &rarr; Microphone. That is a property of the bare binary
+     and not of the app: <b>Kin.app</b> is a signed bundle, so it owns its own permissions,
+     asks in its own name, and can be reviewed and revoked like anything else on the Mac.
+     <code>tk</code> prints its latency budget on start and then one line a second.</p>
 
   <h2>Where it is</h2>
   <table>
@@ -140,22 +153,32 @@
      recovers in about 300 ms.</p>
 
   <h2>Honest limits</h2>
-  <p class=note>Apple silicon only. It is a command-line tool that can open a window, not yet
-     an app with buttons. Audio and video are encrypted with AES-256-GCM,
-     keys agreed per call over X25519 and salted with the room code &mdash; so a listener on any
-     hop gets nothing, and neither does anyone who was not told the code. What it does
-     <em>not</em> stop is someone who knows the code and can sit in the middle of the path:
-     that needs an identity that outlives a call, which does not exist here yet. It is <strong>uncompressed</strong> audio &mdash; 32-bit float, never
-     re-encoded &mdash; which is why it sounds like the room rather than like a phone, and also
-     why it wants about 2.4&nbsp;Mbps in each direction, rising to 3.7 while it is repairing
-     packet loss. On a thin uplink that is the first thing to notice. There is limited
-     forward error correction: a lost packet is a concealed millisecond of audio, and a lost video frame is
-     repaired by asking for a new keyframe, which costs about one frame. Two machines behind
-     ordinary routers find each other with <code>--room</code> and talk directly, with no relay
-     in the middle; a symmetric NAT on either side will defeat that, and there is no fallback
-     yet when it does. It is signed by us, not notarised by Apple, so the .dmg costs you one
-     click through a macOS warning the first time; the <code>curl</code> install skips even
-     that. And it is an early build being changed several
+  <p class=note>Apple silicon only, and a Mac only &mdash; there is no Windows, Linux, iPhone
+     or Android build, and no browser call any more. Audio and video are encrypted with
+     AES-256-GCM, keys agreed per call over X25519 and salted with the room code &mdash; so a
+     listener on any hop gets nothing, and neither does anyone who was not told the code. What
+     it does <em>not</em> stop is someone who knows the code and can sit in the middle of the
+     path. There is an identity that outlives a call now &mdash; your Mac keeps a key, and a
+     call from a name you have answered before is checked against the key it used last time
+     &mdash; but that key is not yet tied to the one the call is encrypted with, so it does not
+     close this. There is <strong>no lossy codec</strong> anywhere in the audio, nothing that
+     throws away the parts of a voice a model decided you would not miss, which is why it
+     sounds like the room rather than like a phone. What it does do is cut the 32-bit float
+     macOS hands over down to 16 bits, and then compress <em>that</em> losslessly &mdash;
+     2.6&times;, bit for bit, no packet ever falling back to a raw copy. The compression costs
+     nothing at all. The 16-bit step is the one real loss and it measures 73&nbsp;dB
+     signal-to-noise end to end, which is below the self-noise of any microphone this will run
+     on. Together that is 1.16&nbsp;Mbps in each direction, and it climbs while the path is
+     losing, because every packet then carries a copy of the one before it. On a thin uplink
+     that is still the first thing to notice. Beyond that copy there is no forward error
+     correction: a lost packet on a clean path is a concealed millisecond of audio, and a lost
+     video frame is repaired by asking for a new keyframe, which costs about one frame. Two
+     machines behind ordinary routers find each other and talk directly, with nothing in the
+     middle; when the routers will not allow that, or when a relay is measurably the shorter
+     wire, the call goes through Cloudflare&rsquo;s relay instead &mdash; sealed with the same
+     key, which the relay does not have. It is signed by us, not notarised by Apple, so the
+     .dmg costs you one click through a macOS warning the first time; the <code>curl</code>
+     install skips even that. And it is an early build being changed several
      times a day &mdash; it updates itself, so it will not stay this one for long.</p>
 </main>
 <script src="/macos/dl.js" defer></script>

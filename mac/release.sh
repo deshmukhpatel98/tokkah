@@ -90,15 +90,59 @@ def sh_key(k):
     m = re.search(r"<key>" + k + r"</key>\s*<string>([^<]*)</string>", sh)
     return m.group(1) if m else None
 bad = 0
-for k in ("CFBundleExecutable", "CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName"):
+# ── THE KEYS WHOSE ABSENCE IS A CRASH, NOT A DIFF ────────────────────────────
+#
+# This compared the four identity keys and stopped. The three usage strings are
+# duplicated in both files too, and macOS treats a MISSING one as a fatal error
+# the first time the app touches that device -- not a warning, not a silent
+# denial: the process dies. `install.sh` ad-hoc signs in its fallback branch, so
+# a drift here does not show up as a cosmetic difference between two plists, it
+# shows up as Kin dying on somebody's first call with nothing to read.
+#
+# LSMinimumSystemVersion is here for the opposite reason: it was 13.0 in both
+# files while Package.swift builds for 14 and the binary's own LC_BUILD_VERSION
+# says minos 14.0. Agreeing with each other was never the property that mattered
+# -- they agreed perfectly, and both were wrong. So it is checked against the
+# BINARY below rather than only across the pair.
+for k in ("CFBundleExecutable", "CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName",
+          "LSMinimumSystemVersion",
+          "NSCameraUsageDescription", "NSMicrophoneUsageDescription",
+          "NSLocalNetworkUsageDescription"):
     a, b = bundle.get(k), sh_key(k)
     if a != b:
         print(f"  MISMATCH {k}: bundle={a!r} install.sh={b!r}")
         bad = 1
     else:
         print(f"  {k} = {a}")
+for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription"):
+    if not bundle.get(k):
+        print(f"  MISSING {k} in the bundle -- the app will DIE on first use of that device")
+        bad = 1
 sys.exit(bad)
 PYCHK
+
+# ── AND THE FLOOR MUST BE ONE THE BINARY CAN ACTUALLY MEET ───────────────────
+#
+# Both plists said macOS 13 while the binary is built for 14. That combination
+# is worse than either mistake alone: macOS reads the plist, decides the app is
+# allowed to run, launches it, and dyld then refuses the binary -- so a Mac on
+# 13 gets a launch failure rather than the honest "requires macOS 14" it would
+# have got from a truthful plist. Nothing in the repo could notice, because the
+# two files agreed with each other.
+echo "== os floor =="
+python3 - "$REPO/mac/bundle/Info.plist" "$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')" <<'PYMIN'
+import plistlib, sys
+said = plistlib.load(open(sys.argv[1], "rb")).get("LSMinimumSystemVersion")
+real = sys.argv[2]
+def v(x): return tuple(int(n) for n in (x or "0").split(".")[:2])
+if not real:
+    print("  COULD NOT READ minos from the binary -- not proven"); sys.exit(1)
+if v(said) < v(real):
+    print(f"  MISMATCH: the plist admits {said} and the binary needs {real} --"
+          f" a Mac on {said} would be allowed to launch something dyld refuses")
+    sys.exit(1)
+print(f"  plist says {said}, binary needs {real}")
+PYMIN
 
 echo "== icon =="
 # Regenerated every release from the Material Symbols path, so the icon in the

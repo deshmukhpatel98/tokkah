@@ -177,7 +177,7 @@
           Get Kin for Mac
         </a>
       </div>
-      <p class=meta><span id=ver>v0.64.0</span> · <span id=size>1.1 MB</span> · <span>macOS 13+</span> · <span>Apple silicon</span> · <span>free</span></p>
+      <p class=meta><span id=ver>v0.64.0</span> · <span id=size>1.5 MB</span> · <span>macOS 13+</span> · <span>Apple silicon</span> · <span>free</span></p>
       <p class=steps>Open the <code>.dmg</code>, double-click <b>Kin</b>. macOS warns once,
          because we sign it ourselves and Apple has not notarised it: open
          <code>System Settings → Privacy &amp; Security</code>, scroll down, click
@@ -188,8 +188,9 @@
          A download by <code>curl</code> is never quarantined, so it never meets Gatekeeper.
          <code class=curl id=curl>curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code>
          </p>
-      <p class=steps id=byhand><b>Already have Kin?</b> Open it and type the room name
-         above — that is all the link was carrying.</p>
+      <p class=steps id=byhand><b>Already have Kin?</b> The link is the part that carries the
+         room, so press <b>Try the link again</b> below, or paste it into a browser on the Mac
+         that has Kin. Opening Kin on its own starts a new call rather than joining this one.</p>
       <p class=again><button type=button id=retry>Try the link again</button></p>
     </div>
 
@@ -203,8 +204,10 @@
   </div>
 
   <footer class=up>
-    <p class=foot>Both people have to be in the call at the same moment — there is no
-       ringing and nothing is stored. <b>The room name is also the encryption key</b>, so
+    <p class=foot>A link does not ring anybody, so both people have to be in this room at the
+       same moment; once you know someone's name in Kin you can ring them directly instead,
+       and their Mac rings whether or not the app is open. Nothing is stored either way.
+       <b>The room name is also the encryption key</b>, so
        for anything you would not say in public use a fresh one; it never leaves the two
        machines.</p>
     <nav class=links>
