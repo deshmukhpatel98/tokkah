@@ -1164,7 +1164,14 @@ final class SheetHint: NSView {
       attributes: [.font: label.font ?? Type_.caption])
     wantedHeight = ceil(r.height) + Metric.s3 + Metric.s1
   }
+  /// Kept, because `describeTree` reports it. A hint is a SENTENCE THE PERSON
+  /// READS and hints are not `SheetRow`s, so every one of them was invisible to
+  /// every rig here -- the same argument that put `warn=` in the state dump. The
+  /// one that says why this Mac has no name is the whole of what a person gets
+  /// told about being uncallable, and nothing could see it.
+  private(set) var text: String
   init(_ text: String) {
+    self.text = text
     super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 30))
     label.stringValue = text
     label.font = Type_.caption
@@ -1207,6 +1214,8 @@ final class Sheet: NSView {
   /// The one field a page can carry, so `clickTargets` can name it without every
   /// caller having to hold on to the view it just handed over.
   private(set) var field: SheetField?
+  /// The page's sentences, in order. Read by `describeTree`.
+  var hints: [String] { items.compactMap { ($0 as? SheetHint)?.text } }
 
   // ── ONE SHEET, THREE PAYLOADS ──────────────────────────────────────────────
   //
@@ -3846,7 +3855,17 @@ final class CallControls: NSView {
     // nothing, reports success, and teaches the person the feature is broken. So an
     // unclaimed handle gets a sentence instead of a control.
     if handle.isEmpty {
-      items.append(SheetHint("Your name on Kin isn't set up yet."))
+      // ── AND IT HAS TO SAY WHY, NOT JUST THAT ─────────────────────────────
+      //
+      // This was one fixed sentence. A fresh install on this Mac was refused its
+      // handle with a 429, retried nothing, and the only report of that anywhere
+      // was a line in stderr -- so the person was uncallable, for the whole
+      // launch, under a hint that read like a step still in progress. Which of
+      // the three reasons it is (no network, the server is busy, every name is
+      // taken) is the whole of what someone would do differently, and only the
+      // last one is theirs to fix. Read live, so opening the panel again after
+      // the network comes back shows the sentence that is true now.
+      items.append(SheetHint(Identity.nameTroubleLine))
     } else {
       let mine = ContactRow(handle: handle)
       mine.value = "copy"
@@ -4316,6 +4335,9 @@ final class CallControls: NSView {
       + "  \(cues.describe)"
       + (moreOpen ? "\n  sheet=\(sheetPage.rawValue)["
                   + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]"
+                  // The sentences, not only the controls. See `SheetHint.text`.
+                  + " hints=[" + sheet.hints.map { Self.oneLine($0) }
+                                      .joined(separator: " | ") + "]"
                   + (sheet.field.map { " field=\"\($0.text)\"" } ?? "") : "")
   }
 

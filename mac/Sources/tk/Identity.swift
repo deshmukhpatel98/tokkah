@@ -36,6 +36,73 @@ enum Identity {
   static let base = ProcessInfo.processInfo.environment["TK_KIN_BASE"]
     ?? "https://room.tokkah.com"
 
+  // ── FORCING THE ANSWER THE SERVER ONLY GIVES WHEN IT FEELS LIKE IT ─────────
+  //
+  // A first install on this Mac asked for @kinrig74230, got `429 {"error":"rate"}`
+  // and then gave up for the rest of the launch. Reproducing that on demand means
+  // hammering the real register endpoint until it refuses -- which is rude, slow,
+  // and is the exact behaviour the 429 exists to stop, so a rig built that way
+  // would be testing the retry by committing the offence.
+  //
+  // So the first N attempts can be TOLD what they got, before the request is ever
+  // sent. That keeps the test deterministic and off the wire, and the attempt
+  // AFTER the forced ones is a real one against whatever `base` points at -- so
+  // an arm still ends in a genuine 200 or a genuine 403 rather than in a
+  // simulation all the way down.
+  //
+  // Announced out loud, once, for the reason `TK_RING_START_MS` is: a switch that
+  // makes the app fail to claim its own name must never be silent, and a switch
+  // that a build does not understand must not read as a switch that worked. The
+  // rig greps for this line precisely so a `silent-no-op-flag` cannot pass it --
+  // run these arms against a build from before this change and the override does
+  // nothing, quietly, and every arm passes for the wrong reason.
+  private struct Forced {
+    var status: Int          // 0 means "the request never completed"
+    var times: Int
+    var retryMs: Int
+  }
+  /// `nil` until the override has been read once. Deliberately NOT seeded from
+  /// inside `forced`'s own initialiser: a static that writes another static from
+  /// its initialiser is the shape of `top-level-code-runs-in-order`, and the cost
+  /// of getting it wrong here is an override that silently forces nothing.
+  nonisolated(unsafe) private static var forcedLeft: Int?
+  private static let forced: Forced? = {
+    let e = ProcessInfo.processInfo.environment
+    guard let raw = e["TK_CLAIM_FORCE_STATUS"] else { return nil }
+    guard let st = Int(raw) else {
+      // Loud, not ignored. A misspelt value that silently means "no override" is
+      // how three A/Bs here ended up comparing an arm against itself.
+      fputs("identity: TK_CLAIM_FORCE_STATUS=\(raw) is not a status\n", stderr)
+      return nil
+    }
+    let f = Forced(status: st,
+                   times: Int(e["TK_CLAIM_FORCE_TIMES"] ?? "") ?? 1,
+                   retryMs: Int(e["TK_CLAIM_FORCE_RETRY_MS"] ?? "") ?? 2000)
+    fputs("identity: TK_CLAIM_FORCE_STATUS -- the next \(f.times) register attempt(s)"
+        + " will be treated as \(st == 0 ? "no answer" : "\(st)")"
+        + (st == 429 ? ", retry in \(f.retryMs) ms" : "") + " (rig only)\n", stderr)
+    return f
+  }()
+
+  /// How long the duty loop waits before asking again for a name it could not
+  /// get. Rig override for the same reason every other cadence here has one: a
+  /// test that has to wait a minute to watch a retry will not be run.
+  private static let retryFloorMs =
+    Int(ProcessInfo.processInfo.environment["TK_CLAIM_RETRY_MS"] ?? "") ?? 5_000
+  /// Ceiling on one pass of `claim()`. A BUDGET and not a count, because
+  /// `claim()` is called from the resident's `onTick` -- the same thread that
+  /// polls the doorbell -- and a count says nothing about how long a pass takes.
+  ///
+  /// It does NOT cost missed calls, and that is worth stating because it looks
+  /// like it should: `onTick` only calls `claim()` while `claimed` is false, and
+  /// `pollOnce` refuses outright without a claim ("no mailbox to read"). The
+  /// thread it blocks has nothing to do until this succeeds. It is still bounded,
+  /// because a pass that never returns is a resident that never checks whether a
+  /// newer Kin has been installed underneath it. The old code's worst case was 12
+  /// names x a 10 s request = two minutes; this is a ceiling on the whole walk.
+  private static let passBudget =
+    Double(Int(ProcessInfo.processInfo.environment["TK_CLAIM_BUDGET_MS"] ?? "") ?? 20_000) / 1000
+
   // ── The stored identity ────────────────────────────────────────────────────
 
   struct Stored {
@@ -230,25 +297,70 @@ enum Identity {
     return sig.base64EncodedString()
   }
 
-  /// One registration attempt. Returns the HTTP status, or nil if the request
-  /// never completed. Synchronous on purpose: the caller is already off-main and
-  /// the ladder is a sequence of decisions, not a fan-out.
-  private static func attempt(_ handle: String, _ s: Stored) -> Int? {
+  /// ── WHAT ONE REGISTRATION TURNED OUT TO BE ────────────────────────────────
+  ///
+  /// Five facts, not one status code, for the same reason `PollOutcome` has four:
+  /// the caller has to make TWO decisions out of this -- "may I take a different
+  /// name" and "should I ask again" -- and an `Int?` let one condition answer
+  /// both. `one-condition-two-concerns`, the fifth instance in this codebase.
+  ///
+  ///   won        -- the name is ours
+  ///   taken      -- somebody else's key holds it. The ONLY one that advances the
+  ///                 ladder, because it is the only one that is about the NAME
+  ///   busy       -- 429, carrying the server's own retryMs. About US
+  ///   refused    -- any other status. Also about us
+  ///   unreachable-- the request never completed. A laptop opened before Wi-Fi
+  ///                 associates is the ordinary case, not an exotic one
+  enum ClaimOutcome {
+    case won
+    case taken
+    case busy(Int)
+    case refused(Int)
+    case unreachable
+  }
+
+  /// The rig override, spent one attempt at a time, BEFORE the request is built.
+  /// Returns nil when there is nothing to force and the real request should go.
+  private static func forcedAnswer(_ handle: String) -> ClaimOutcome? {
+    guard let f = forced else { return nil }
+    if forcedLeft == nil { forcedLeft = f.times }
+    guard let left = forcedLeft, left > 0 else { return nil }
+    forcedLeft = left - 1
+    let what: ClaimOutcome
+    switch f.status {
+    case 200: what = .won
+    case 403: what = .taken
+    case 429: what = .busy(f.retryMs)
+    case 0:   what = .unreachable
+    default:  what = .refused(f.status)
+    }
+    // Printed in the same shape a real refusal prints, so the rig's greps do not
+    // need to know which arm produced the line.
+    fputs("identity: @\(handle) -> \(f.status == 0 ? "no answer" : "\(f.status)")"
+        + " (forced, \(left - 1) left)\n", stderr)
+    return what
+  }
+
+  /// One registration attempt. Synchronous on purpose: the caller is already
+  /// off-main and the ladder is a sequence of decisions, not a fan-out.
+  private static func attempt(_ handle: String, _ s: Stored) -> ClaimOutcome {
+    if let f = forcedAnswer(handle) { return f }
     guard let url = URL(string: "\(base)/api/kin/\(handle)/register"),
           let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: s.seed)
-    else { return nil }
+    else { return .unreachable }
     // INTEGER seconds. The timestamp is stringified into the signed message, so
     // its spelling is part of the contract -- a Double would render "1.8e+09" or
     // "1800000000.0" here and produce a signature that verifies on this device
     // and never on the server, forever, with a 401 that blames the key.
     let t = Int(Date().timeIntervalSince1970)
-    guard let sig = sign("kin-reg-v1|\(handle)|\(s.tok)|\(t)", seed: s.seed) else { return nil }
+    guard let sig = sign("kin-reg-v1|\(handle)|\(s.tok)|\(t)", seed: s.seed)
+    else { return .unreachable }
     let body: [String: Any] = [
       "to": handle, "tok": s.tok,
       "k": k.publicKey.rawRepresentation.base64EncodedString(),
       "t": t, "sig": sig,
     ]
-    guard let d = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+    guard let d = try? JSONSerialization.data(withJSONObject: body) else { return .unreachable }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -257,26 +369,94 @@ enum Identity {
     req.cachePolicy = .reloadIgnoringLocalCacheData
     var status: Int?
     var payload = ""
+    // The server's own hint, read the same way `pollOnce` reads it -- one idiom
+    // for "how long did the far end ask us to wait", so a 429 on the doorbell and
+    // a 429 on a registration are backed off with the same rule.
+    var hintMs: Int?
     let sem = DispatchSemaphore(value: 0)
     URLSession.shared.dataTask(with: req) { data, resp, _ in
       status = (resp as? HTTPURLResponse)?.statusCode
       if let data, let s = String(data: data, encoding: .utf8) { payload = s }
+      if let data,
+         let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        hintMs = o["retryMs"] as? Int
+      }
       sem.signal()
     }.resume()
     _ = sem.wait(timeout: .now() + 10)
-    if let st = status, st != 200 {
-      fputs("identity: @\(handle) -> \(st) \(payload)\n", stderr)
+    guard let st = status else {
+      // Not a status we can act on -- the request never completed at all. Said
+      // out loud, because the old code returned nil here and the only trace of a
+      // laptop opened before Wi-Fi came up was the ABSENCE of a line.
+      fputs("identity: @\(handle) -> no answer\n", stderr)
+      return .unreachable
     }
-    return status
+    if st != 200 { fputs("identity: @\(handle) -> \(st) \(payload)\n", stderr) }
+    switch st {
+    case 200: return .won
+    case 403: return .taken
+    case 429: return .busy(hintMs ?? 2000)
+    default:  return .refused(st)
+    }
+  }
+
+  // ── WHY THIS MAC STILL HAS NO NAME, IN WORDS ────────────────────────────────
+  //
+  // A fresh install here asked for a handle, got `429 {"error":"rate"}`, and for
+  // the rest of that launch nobody could call this person and THE APP NEVER SAID
+  // SO. The People panel showed "Your name on Kin isn't set up yet." -- no reason,
+  // no promise, and no difference between "the Wi-Fi is off", "the server is
+  // busy" and "every name you could have is taken", which are three different
+  // things for a person to do about it.
+  //
+  // Plain words only, and no numbers: this is a consumer surface, and a status
+  // code on it is a diagnostic, not a sentence. The detail stays in stderr where
+  // whoever is debugging can read the whole exchange.
+  private static let troubleLock = NSLock()
+  nonisolated(unsafe) private static var troubleWord: String?
+  /// Why there is no handle, or nil when there is nothing to report -- which is
+  /// both "we have one" and "we have not tried yet".
+  static var nameTrouble: String? {
+    troubleLock.lock(); defer { troubleLock.unlock() }
+    return troubleWord
+  }
+  /// The whole line for a panel with no name to show. The fallback is the
+  /// sentence that was there before, so a screen built from this is never blank
+  /// while the first claim is still in the air.
+  static var nameTroubleLine: String {
+    nameTrouble ?? "Your name on Kin isn’t set up yet."
+  }
+  private static func trouble(_ s: String?) {
+    troubleLock.lock(); troubleWord = s; troubleLock.unlock()
   }
 
   /// Walk the ladder until the server says yes. Called on its own thread.
+  ///
+  /// ── ONE CONDITION WAS ANSWERING TWO QUESTIONS ──────────────────────────────
   ///
   /// 403 `taken` is the only status that advances the ladder: it means the name
   /// belongs to a different key, which is exactly first-come-first-served
   /// working. Everything else -- a 429, a timeout, a 500 -- is about US, and
   /// moving to the next name because the network hiccuped would silently rename
   /// someone who already owns `devesh`.
+  ///
+  /// All of that is right, and the code that implemented it was still wrong,
+  /// because it read:
+  ///
+  ///     guard let st = attempt(cand, s) else { return }
+  ///     if st == 200 { ...settle...; return }
+  ///     if st != 403 { return }
+  ///
+  /// "Do not take a DIFFERENT name" and "stop asking for THIS one" are two
+  /// decisions, and both of those `return`s made the second one as a side effect
+  /// of the first. Observed on this Mac: `identity: @kinrig74230 -> 429` and then
+  /// nothing at all, for the whole launch. The nil case is worse, not better -- a
+  /// laptop opened before Wi-Fi associates is the ordinary way this app starts,
+  /// and it meant hours of running with no handle and no second attempt.
+  ///
+  /// So: a non-403 retries the SAME candidate, honouring the server's own hint,
+  /// and only a 403 moves down the ladder. Bounded by `passBudget` because this
+  /// runs on the resident's polling thread.
   /// True while `claim()` is walking the ladder. Read by `awaitClaim`, which is
   /// how `ring()` stops failing during the several seconds a first install spends
   /// asking the server for a name.
@@ -320,27 +500,119 @@ enum Identity {
       // the name disappear from the sheet on a bad network.
       let named = s.handle
       DispatchQueue.main.async { onClaimed?(named) }
-      if attempt(s.handle, s) == 200 { return }
+      trouble(nil)
+      if case .won = attempt(s.handle, s) { return }
       // A refresh that fails is not a reason to take a new name either.
       return
     }
+    let names = candidates()
+    guard !names.isEmpty else {
+      // `candidates()` already said which name it refused and why. Only reachable
+      // via `--handle`, so the sentence names the one thing that fixes it.
+      trouble("That name can’t be used. Choose another one.")
+      return
+    }
+    let deadline = Date().addingTimeInterval(passBudget)
     var tried = 0
-    for cand in candidates() where tried < 12 {
+    for cand in names where tried < 12 {
       tried += 1
-      guard let st = attempt(cand, s) else { return }   // no network: try next launch
-      if st == 200 {
-        s.handle = cand
-        s.claimed = true
-        lock.lock(); cached = s; lock.unlock()
-        save(s)
-        fputs("identity: you are @\(cand)\n", stderr)
-        let named = cand
-        DispatchQueue.main.async { onClaimed?(named) }
+      // ── ASK AGAIN FOR THE SAME NAME, NOT FOR THE NEXT ONE ──────────────────
+      //
+      // 0.5, 1, 2, 4 s, jittered and capped, and never below what the server
+      // itself asked for. Same rule and the same numbers as the doorbell's own
+      // 429 back-off (`case .rate` in `ringLoop`) -- there is one way this app
+      // reacts to being told it is asking too often, not two.
+      var ask = 0
+      var isTaken = false
+      while Date() < deadline {
+        ask += 1
+        switch attempt(cand, s) {
+        case .won:
+          s.handle = cand
+          s.claimed = true
+          lock.lock(); cached = s; lock.unlock()
+          save(s)
+          trouble(nil)
+          fputs("identity: you are @\(cand)\n", stderr)
+          let named = cand
+          DispatchQueue.main.async { onClaimed?(named) }
+          return
+        case .taken:
+          // The ONE answer that is about the name rather than about us, and so
+          // the only one that falls out of the `while` below and takes the next
+          // rung. Recorded in a flag rather than left to the loop's exit, because
+          // the loop has a second way out -- see the guard under it.
+          isTaken = true
+        case .busy(let hintMs):
+          trouble("Kin is waiting its turn to set up your name. It will keep trying.")
+          waitToAsk(cand, again: ask, hintMs: hintMs, before: deadline)
+          continue
+        case .refused:
+          trouble("Kin couldn’t set up your name just now. It will keep trying.")
+          waitToAsk(cand, again: ask, hintMs: 0, before: deadline)
+          continue
+        case .unreachable:
+          trouble("Kin can’t reach the internet, so your name isn’t set up yet."
+                + " It will keep trying.")
+          waitToAsk(cand, again: ask, hintMs: 0, before: deadline)
+          continue
+        }
+        break                                    // taken: down the ladder
+      }
+      // ── WHICH WAY THE INNER LOOP ENDED, AND WHY IT HAS TO BE ASKED ─────────
+      //
+      // Out of budget is not out of names, and only one of the two means the
+      // person has to pick a different name. Without this flag a single-candidate
+      // ladder -- which is every `--handle` run and every rig -- fell out of the
+      // `while` on the deadline and straight into "every name this Mac suggests
+      // is taken", telling somebody whose Wi-Fi was off to go and choose a new
+      // name. The trouble sentence set inside the loop is the right one; leave it
+      // standing and let the duty loop come back.
+      guard isTaken else {
+        fputs("identity: out of time on @\(cand) after \(ask) ask(s)"
+            + " -- asking again shortly\n", stderr)
         return
       }
-      if st != 403 { return }
     }
     fputs("identity: every name this Mac suggests is taken -- staying unclaimed\n", stderr)
+    trouble("Every name this Mac suggested is already taken. Choose your own name.")
+  }
+
+  /// Sleep between two asks for the SAME name, never past the pass deadline.
+  private static func waitToAsk(_ cand: String, again: Int, hintMs: Int, before: Date) {
+    let mine = min(0.25 * pow(2, Double(again)), 4) * Double.random(in: 0.75...1.25)
+    let wait = min(max(Double(hintMs) / 1000, mine),
+                   max(0, before.timeIntervalSinceNow))
+    guard wait > 0 else { return }
+    // The number the rig reads. It is the only place the honoured hint is
+    // observable, and without it "we backed off correctly" and "we slept for our
+    // own reasons" are the same silence.
+    fputs("identity: @\(cand) not settled -- asking again in \(Int(wait * 1000)) ms\n", stderr)
+    Thread.sleep(forTimeInterval: wait)
+  }
+
+  // ── AND IT HAS TO KEEP TRYING FOR THE LIFE OF THE PROCESS ───────────────────
+  //
+  // `start()` used to spawn exactly one `claim()`. A Mac whose first claim failed
+  // -- 429, a captive portal, Wi-Fi that associated a second later -- then had no
+  // handle until the person quit and reopened Kin, and was never told to. The
+  // resident already had this duty (`Watch`'s `onTick` retries every 60 s while
+  // unclaimed); the app, which is the half a person is actually looking at, did
+  // not.
+  //
+  // 5 s, then doubling to a minute: the failure this exists for is a laptop lid
+  // opened before the network is up, which resolves in seconds, and the ceiling
+  // is what makes "could not get a name at 9:00, has one by 9:05" true whatever
+  // went wrong. It ends the moment a name is won -- `claimed` only ever goes
+  // false to true -- so this thread is not a permanent resident on a healthy Mac.
+  private static func keepClaiming() {
+    var wait = Double(retryFloorMs) / 1000
+    while !claimed {
+      claim()
+      if claimed { return }
+      Thread.sleep(forTimeInterval: wait * Double.random(in: 0.85...1.15))
+      wait = min(wait * 2, 60)
+    }
   }
 
   // ── SILENT MODE ────────────────────────────────────────────────────────────
@@ -1419,9 +1691,13 @@ enum Identity {
   nonisolated(unsafe) static var onClaimed: ((String) -> Void)?
 
   /// Registration, off the launch path entirely. Nothing waits on this.
+  ///
+  /// `keepClaiming`, not a single `claim()`: one attempt at launch is a
+  /// once-fired probe, and this app is routinely launched by someone opening a
+  /// lid before the Wi-Fi has associated.
   static func start() {
     ensure()
-    Thread { claim() }.start()
+    Thread { keepClaiming() }.start()
   }
 
   // ── The ruler ──────────────────────────────────────────────────────────────
@@ -1543,13 +1819,17 @@ enum Identity {
     var s = ensure()
     guard want != s.handle || !s.claimed else { return .ok }
     switch attempt(want, s) {
-    case 200: break
-    case 403: return .taken
-    default: return .noAnswer
+    case .won: break
+    case .taken: return .taken
+    // A rename is a person waiting at a text field, not a background duty: the
+    // right answer to a 429 here is to say so and let them press again, not to
+    // sit on the main thread's callback for four seconds retrying.
+    case .busy, .refused, .unreachable: return .noAnswer
     }
     s.handle = want; s.claimed = true
     lock.lock(); cached = s; lock.unlock()
     save(s)
+    trouble(nil)
     fputs("identity: you are now @\(want)\n", stderr)
     return .ok
   }
