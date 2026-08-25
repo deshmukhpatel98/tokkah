@@ -123,7 +123,14 @@ enum Watch {
     // real launchd, at a real label, with a real plist -- without a copy in
     // /Applications. A test that has to skip the mechanism it is testing is not
     // a test of it. Production never sets this, so the guard is unchanged there.
-    guard exe.hasPrefix("/Applications/") || env["TK_WATCH_ANYWHERE"] == "1" else {
+    // `~/Applications` counts, and leaving it out was a hole: `Install` treats a
+    // copy there as installed and never relocates it, so on a Mac where
+    // /Applications was not writable Kin settled into the home folder and then
+    // silently never got a login item. Both are stable targets at login; the one
+    // thing that is not is a copy somebody double-clicked in Downloads.
+    guard exe.hasPrefix("/Applications/")
+       || exe.hasPrefix(NSHomeDirectory() + "/Applications/")
+       || env["TK_WATCH_ANYWHERE"] == "1" else {
       return "watch: not installing a login item for \(exe) -- only an installed"
            + " copy in /Applications is a stable target at login"
     }
@@ -203,6 +210,46 @@ enum Watch {
     _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
     try? FileManager.default.removeItem(at: plistURL)
     return "watch: login item removed -- this Mac can only be rung while Kin is open"
+  }
+
+  // -- CAN THIS MAC BE RUNG WITH KIN CLOSED, AND IF NOT, WHY -----------------
+  //
+  // `status()` below is for a terminal and says "plist present, launchd running".
+  // Nobody who owns this problem is ever going to type that. This is the same
+  // question answered in the words the person actually has -- and, crucially,
+  // with the ONE thing that would fix it, because a setting that reports itself
+  // broken and leaves you to work out the rest is a diagnostic, not a feature.
+  enum Fix { case none, install, moveToApplications, openLoginItems }
+  struct Reach {
+    let on: Bool
+    /// One sentence, plain, no paths and no launchd.
+    let says: String
+    let fix: Fix
+  }
+
+  static func reach() -> Reach {
+    let exe = exePath()
+    let placed = exe.hasPrefix("/Applications/")
+              || exe.hasPrefix(NSHomeDirectory() + "/Applications/")
+              || ProcessInfo.processInfo.environment["TK_WATCH_ANYWHERE"] == "1"
+    guard placed else {
+      return Reach(on: false,
+                   says: "Kin has to be in your Applications folder to answer while it\u{2019}s closed.",
+                   fix: .moveToApplications)
+    }
+    let loaded = run("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"]).ok
+    if installed, loaded, staleReason() == nil {
+      return Reach(on: true, says: "", fix: .none)
+    }
+    // The plist is on disk and launchd is not running it. On macOS 13 and later
+    // that is nearly always the person having switched Kin off under Login Items,
+    // and nothing this app writes will turn it back on -- only they can.
+    if installed, !loaded {
+      return Reach(on: false,
+                   says: "macOS has Kin switched off in Login Items, so calls stop when you quit.",
+                   fix: .openLoginItems)
+    }
+    return Reach(on: false, says: "Right now Kin only rings while it\u{2019}s open.", fix: .install)
   }
 
   static func status() -> String {

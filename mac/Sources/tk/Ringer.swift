@@ -65,6 +65,19 @@ enum Ringer {
     //                    a Space switch.
     // orderFrontRegardless  orders front even though this app is not active --
     //                    makeKeyAndOrderFront alone does nothing from the back.
+    // ── A RIG DOES NOT NEED THE WHOLE MAC ────────────────────────────────────
+    //
+    // Everything below exists to put this window in front of whatever somebody is
+    // doing, which is right for a ringing phone and wrong for a test: four ring
+    // windows fighting for the front while a person uses their Mac means their
+    // taps land on cards they cannot see, which is a real bug (the card refuses
+    // them now) and also makes every windowed rig depend on whether anybody
+    // happened to touch the trackpad. `firstrun-ring-check` is where the raising
+    // itself is proved; every other rig sets this and is left alone.
+    if ProcessInfo.processInfo.environment["TK_NO_RAISE"] == "1" {
+      fputs("ring: not raising the window -- TK_NO_RAISE\n", stderr)
+      return
+    }
     w.level = .floating
     w.collectionBehavior = [priorBehavior, .canJoinAllSpaces, .fullScreenAuxiliary]
     w.orderFrontRegardless()

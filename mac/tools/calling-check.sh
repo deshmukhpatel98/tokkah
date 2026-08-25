@@ -19,6 +19,12 @@
 # Real processes, real UDP. `TK_RING_TIMEOUT` compresses the product's 45 s so
 # claim 3 can be proven in seconds.
 set -u
+# Ring windows do not throw themselves in front of whatever the person at this
+# Mac is doing. That behaviour is right for a phone and is proved in
+# firstrun-ring-check; here it only means their taps land on cards they cannot
+# see, which made this rig's verdict depend on whether anybody touched the
+# trackpad while it ran.
+export TK_NO_RAISE=1
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.62.0"
+let VERSION = "0.63.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -1187,9 +1187,16 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
         if let colon = n.lastIndex(of: ":"), let d = Double(n[n.index(after: colon)...]) {
           hold = d; n = String(n[..<colon])
         }
+        // `@!answer` -- a click that looks like it came from a device rather than
+        // from here. The waiting card refuses those when nothing suggests anybody
+        // aimed them, and that refusal is the only defence against a ring window
+        // stealing somebody's next tap. Without a way to send one, the defence
+        // could only ever be observed in production, by accident, once.
+        let stray = n.hasPrefix("!")
+        if stray { n = String(n.dropFirst()) }
         display?.controls?.nudgeBar()
-        let sent = display?.controls?.click(n, holdFor: hold) ?? false
-        fputs("click \(n): \(sent ? "sent" : "NOT ON SCREEN") -> \(display?.controls?.describeTree ?? "-")\n", stderr)
+        let sent = display?.controls?.click(n, holdFor: hold, stray: stray) ?? false
+        fputs("click \(stray ? "!" : "")\(n): \(sent ? "sent" : "NOT ON SCREEN") -> \(display?.controls?.describeTree ?? "-")\n", stderr)
       } else {
         pressControl(token)
       }
@@ -1516,7 +1523,11 @@ display?.controls?.onDeclineRing = {
 if ringPending {
   fputs("ring: waiting to be answered -- no room, no microphone, no camera\n", stderr)
   Metrics.count("ring_offered")
-  NSApplication.shared.activate(ignoringOtherApps: true)
+  // Same switch, same reason: a rig must not take the screen away from whoever
+  // is using this Mac. See Display's window placement and Ringer.start.
+  if ProcessInfo.processInfo.environment["TK_NO_RAISE"] != "1" {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+  }
   NSApplication.shared.run()
   exit(0)
 }

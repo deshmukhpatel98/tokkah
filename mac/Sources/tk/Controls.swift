@@ -1956,9 +1956,34 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
       // of what that person was doing. Their click was aimed at another app and
       // answered a call instead. A second is longer than any accident and shorter
       // than anybody who has to see a name before deciding.
-      if event.eventNumber != 0, since < 1.0 || !moved {
+      // THE THIRD ONE, and it is the one that caught the real taps. A tap landed
+      // 1.6 seconds after the card appeared with the pointer having moved, so
+      // neither test above saw it -- and it was still nobody's decision, because
+      // the pointer had been sitting where that pill appeared the whole time.
+      // A person answering MOVES ONTO the button; if the hover began at the same
+      // instant the card did, the card came to the pointer. `hoverSince` is nil
+      // when there is no tracking at all (the window never became key), and that
+      // falls back to the two tests above rather than refusing -- a guard that can
+      // make the control dead is worse than the accident it prevents.
+      // Two ways to know, because the first one is not always available: the
+      // tracking areas that maintain `hoverSince` only run in a key window, and a
+      // window that never became key would report nil for a pointer sitting right
+      // on the pill. The geometric test needs nothing -- was the pointer inside
+      // this pill's rectangle at the instant the card took the screen?
+      let hovered = (v as? PillButton)?.hoverSince
+        .map { $0.timeIntervalSince(modeAt) < 0.15 } ?? false
+      let wasOverIt = window
+        .map { $0.convertToScreen(convert(v.frame, to: nil)).contains(pointerAtMode) } ?? false
+      let arrivedWithCard = hovered || wasOverIt
+      // The one second has a rig override, like every other cadence here: a rig
+      // that has to wait out a production timer either waits or tests something
+      // else, and this one is otherwise only reachable by having a person tap the
+      // trackpad at the right moment.
+      let aim = (Double(ProcessInfo.processInfo.environment["TK_AIM_MS"] ?? "") ?? 1000) / 1000
+      if event.eventNumber != 0, since < aim || !moved || arrivedWithCard {
         fputs("card: ignored a click nobody aimed -- \(Int(since * 1000)) ms after the"
-            + " \(mode.rawValue) card appeared, pointer moved=\(moved)\n", stderr)
+            + " \(mode.rawValue) card appeared, pointer moved=\(moved)"
+            + " arrivedWithCard=\(arrivedWithCard)\n", stderr)
         Metrics.count("card_click_unaimed")
         return
       }
@@ -2276,10 +2301,16 @@ final class PillButton: NSView {
     addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow],
                                    owner: self, userInfo: nil))
   }
+  /// When the pointer arrived on this pill, or nil if it is not on it. Read by
+  /// the waiting card: a pointer that arrived AT THE SAME MOMENT as the card did
+  /// not travel here, the card travelled to it.
+  private(set) var hoverSince: Date?
   override func mouseEntered(with event: NSEvent) {
+    hoverSince = Date()
     hovering = true; glass.level = prominent ? 0.42 : 0.20
   }
   override func mouseExited(with event: NSEvent) {
+    hoverSince = nil
     hovering = false; glass.level = prominent ? 0.30 : 0.13
   }
 }
@@ -3116,7 +3147,56 @@ final class CallControls: NSView {
     closeMore()
   }
 
-  @objc private func toggleSilentRow(_ sender: SheetRow) {
+    // Tapping it does the whole job, or explains the one thing it cannot do. Three
+  // outcomes and none of them is a dead end: turn it on, move Kin where it can be
+  // turned on, or open the exact panel where macOS is refusing.
+  @objc private func toggleWatchRow(_ sender: Any?) {
+    Metrics.tap("watch_row")
+    let w = Watch.reach()
+    if w.on {
+      Metrics.count("watch_turned_off")
+      Thread {
+        _ = Watch.uninstall()
+        DispatchQueue.main.async { [weak self] in
+          self?.setStatus("Kin will only ring while it\u{2019}s open")
+          self?.refreshSheet()
+        }
+      }.start()
+      return
+    }
+    switch w.fix {
+    case .moveToApplications:
+      Metrics.count("watch_fix_move")
+      setStatus("moving Kin to Applications\u{2026}")
+      // Relaunches from the new place and never returns. If it DOES return there
+      // is nothing left to try automatically, and saying so beats a spinner.
+      Install.relocateIfHomeless()
+      setStatus("drag Kin into Applications and open it again")
+    case .openLoginItems:
+      Metrics.count("watch_fix_loginitems")
+      // The exact panel, not the top of System Settings. macOS is the thing
+      // saying no here, and this is where it says it.
+      if let u = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+        NSWorkspace.shared.open(u)
+      }
+      setStatus("switch Kin on under Login Items")
+    case .install, .none:
+      setStatus("setting up\u{2026}")
+      Thread {
+        let said = Watch.install()
+        let ok = said.contains("installed")
+        Metrics.count(ok ? "watch_turned_on" : "watch_turn_on_fail")
+        fputs("watch: asked from the panel -- \(said)\n", stderr)
+        DispatchQueue.main.async { [weak self] in
+          self?.setStatus(ok ? "people can reach you even when Kin is closed"
+                             : "couldn\u{2019}t set that up \u{2014} try Login Items in System Settings")
+          self?.refreshSheet()
+        }
+      }.start()
+    }
+  }
+
+@objc private func toggleSilentRow(_ sender: SheetRow) {
     Metrics.tap("silent")
     let want = !silent
     // Say what was asked for, not what is true yet. The switch itself only moves
@@ -3418,6 +3498,21 @@ final class CallControls: NSView {
     rename.target = self; rename.action = #selector(renameRow(_:))
     items.append(rename)
     items += rows as [NSView]
+    // -- THE SETTING THAT DECIDES WHETHER YOU CAN BE CALLED AT ALL ------------
+    //
+    // It was already automatic: an installed copy writes its own login item on
+    // every launch. Then it did not work on somebody's second Mac and there was
+    // no way to find that out from inside the app -- the only report was
+    // `--watch-status`, in a terminal, saying "plist present, launchd running".
+    // A feature whose whole promise is "people can reach you" has to say, on the
+    // screen, whether people can reach you.
+    let w = Watch.reach()
+    let reach = SheetRow("Calls when Kin is closed", glyph: Glyph.phone)
+    reach.checked = w.on
+    reach.target = self; reach.action = #selector(toggleWatchRow(_:))
+    items.append(reach)
+    // Only when it is off, and it always names the one thing that fixes it.
+    if !w.on, !w.says.isEmpty { items.append(SheetHint(w.says)) }
     // Silent is a switch, so it carries a tick and never a value.
     let q = SheetRow("Silent", glyph: Glyph.bell)
     q.checked = silent
@@ -4247,7 +4342,11 @@ extension CallControls {
 
   /// A real click, through the window, at the control's own centre.
   /// `holdFor` keeps the button down that long, for press-and-hold controls.
-  func click(_ name: String, holdFor: TimeInterval = 0) -> Bool {
+  /// `stray: true` builds the event with a non-zero `eventNumber`, which is how
+  /// the waiting card tells a finger from this harness. It exists so the guard
+  /// against clicks nobody aimed can be PROVED to fire -- a defence that only
+  /// ever runs in production is a defence nobody has seen work.
+  func click(_ name: String, holdFor: TimeInterval = 0, stray: Bool = false) -> Bool {
     guard let win = window else { return false }
     guard let (_, v) = clickTargets.first(where: { $0.0 == name }) else {
       fputs("click: \(name) is not on screen\n", stderr); return false
@@ -4282,7 +4381,8 @@ extension CallControls {
       NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
                          timestamp: ProcessInfo.processInfo.systemUptime,
                          windowNumber: win.windowNumber, context: nil,
-                         eventNumber: 0, clickCount: 1, pressure: t == .leftMouseUp ? 0 : 1)
+                         eventNumber: stray ? 7777 : 0, clickCount: 1,
+                         pressure: t == .leftMouseUp ? 0 : 1)
     }
     guard let down = ev(.leftMouseDown), let up = ev(.leftMouseUp) else { return false }
     let hitNow = win.contentView?.hitTest(p)

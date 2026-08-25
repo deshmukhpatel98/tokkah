@@ -134,7 +134,30 @@ final class Display {
     window.titleVisibility = .hidden
     window.isMovableByWindowBackground = true
     window.backgroundColor = Palette.bg
-    window.center()
+    // ── A TEST WINDOW DOES NOT SIT WHERE SOMEBODY IS WORKING ─────────────────
+    //
+    // Centred is right for the product and wrong for a rig: measured repeatedly,
+    // a person's trackpad taps landed on ring cards parked in the middle of their
+    // screen -- real events, non-zero event numbers, subtype 3 -- and both the
+    // rig's verdict and that person's afternoon suffered for it. Same switch that
+    // stops the ringer taking the front.
+    if ProcessInfo.processInfo.environment["TK_NO_RAISE"] == "1" {
+      if let vis = NSScreen.main?.visibleFrame {
+        window.setFrameOrigin(NSPoint(x: vis.minX + 4, y: vis.minY + 4))
+      }
+      // ── AND THE POINTER GOES STRAIGHT THROUGH IT ───────────────────────────
+      //
+      // Moving it into a corner was not enough: a 1280x720 window covers a good
+      // deal of a laptop screen wherever it sits, and the taps kept landing. This
+      // makes the window server route every real click to whatever is behind --
+      // while `--press` is unaffected, because it delivers through `sendEvent`
+      // and straight to the view, neither of which the window server sees. So the
+      // harness can still click every control and the person at the keyboard
+      // cannot click any of them by accident.
+      window.ignoresMouseEvents = true
+    } else {
+      window.center()
+    }
     // ── LAYER-HOSTING VIEWS MUST NOT HAVE SUBVIEWS ────────────────────────────
     //
     // This was one view with `wantsLayer = true` AND a manually assigned layer,

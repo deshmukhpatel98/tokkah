@@ -18,6 +18,12 @@
 #   2. the caller still says it is calling, and the callee can still be asked
 #   3. answering still works -- a fix that made the ring inert would pass 1 and 2
 set -u
+# Ring windows do not throw themselves in front of whatever the person at this
+# Mac is doing. That behaviour is right for a phone and is proved in
+# firstrun-ring-check; here it only means their taps land on cards they cannot
+# see, which made this rig's verdict depend on whether anybody touched the
+# trackpad while it ran.
+export TK_NO_RAISE=1
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
@@ -60,9 +66,25 @@ spawn "$TK" --window --room "$R2" --listen 8024 --peer 127.0.0.1:8023 --video of
 perl -e 'select undef,undef,undef,14'
 reap
 
+# ── PART THREE: a click nobody aimed, and the same click from a finger ──────
+#
+# Three times in one afternoon a ring answered itself -- real trackpad taps, with
+# device-shaped event numbers, landing on a window that had put itself in front
+# of what somebody was doing. `@!answer` sends exactly that: the same gesture as
+# `@answer` above, differing only in whether it claims to have come from a
+# device. TK_AIM_MS widens the card's own "nobody could have aimed this yet"
+# window so the refusal is reachable without a person at the trackpad.
+R3="preans$$c"
+spawn env TK_AIM_MS=60000 "$TK" --window --room "$R3" --listen 8025 --peer 127.0.0.1:8026 \
+      --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --no-subtitles --incoming somebody --press-after 3 --press "@!answer,?" \
+      > "$SP/e.log" 2>&1
+perl -e 'select undef,undef,undef,10'
+reap
+
 fail=0
 say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
-for f in a b c d; do
+for f in a b c d e; do
   grep -q "^tk " "$SP/$f.log" || { echo "PRE-ANSWER CHECK COULD NOT RUN -- tk never started in $f:"; sed -n '1,5p' "$SP/$f.log" | sed 's/^/  /'; exit 2; }
 done
 
@@ -113,7 +135,18 @@ grep -q "ring: sounding" "$SP/b.log" \
   || say "FAIL" "no ringtone was chosen; $(grep -o 'ring: no ringtone.*' "$SP/b.log" | head -1)"
 
 echo
-if [ "$fail" = 0 ]; then
+if # ── 4. A CLICK NOBODY AIMED IS NOT AN ANSWER ────────────────────────────────
+grep -q "ignored a click nobody aimed" "$SP/e.log" \
+  && say "OK" "a click nobody aimed was refused, and the log says so" \
+  || say "FAIL" "a device-shaped click was taken at face value -- the guard never fired"
+grep -q "^cap " "$SP/e.log" \
+  && say "FAIL" "and it started a call anyway" \
+  || say "OK" "and it started nothing"
+grep -q "ignored a click nobody aimed" "$SP/d.log" \
+  && say "FAIL" "CONTROL: the real answer press was refused too -- the guard is a wall" \
+  || say "OK" "CONTROL: the real answer press went through, so it discriminates"
+
+[ "$fail" = 0 ]; then
   echo "PRE-ANSWER CHECK PASSED -- a ring asks, and only an answer starts a call"
 else
   echo "PRE-ANSWER CHECK FAILED -- see above; logs in $SP"

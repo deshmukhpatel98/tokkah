@@ -15,6 +15,12 @@
 # clears is worse than no banner: it tells you somebody is muted for the rest of
 # a call they are talking on.
 set -u
+# Ring windows do not throw themselves in front of whatever the person at this
+# Mac is doing. That behaviour is right for a phone and is proved in
+# firstrun-ring-check; here it only means their taps land on cards they cannot
+# see, which made this rig's verdict depend on whether anybody touched the
+# trackpad while it ran.
+export TK_NO_RAISE=1
 # ── KILLS ONLY WHAT THIS SCRIPT STARTED ─────────────────────────────────────
 #
 # This used to `pkill -f "$TK"`, and `pkill -f` takes a REGEX: in a path like
