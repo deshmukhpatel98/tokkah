@@ -4937,12 +4937,10 @@ if audio.jitAuto {
           }
         }
       }
-      let snapped = r.snaps - lastSnaps
       lastSnaps = r.snaps
       // Attribution, not just a count. Only a BACKLOG snap is evidence that a
       // bigger buffer would not have helped; a starvation snap is the opposite.
       let snappedBehind = r.snapsBehind - lastSnapsBehind
-      let snappedPast = r.snapsPast - lastSnapsPast
       lastSnapsBehind = r.snapsBehind; lastSnapsPast = r.snapsPast
       // ── What growing is FOR, and when it has finished ──────────────────────
       //
