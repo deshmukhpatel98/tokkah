@@ -366,7 +366,9 @@ abstract class PeerBase implements DurableObject {
         // unreachable — including, fatally for a WEBRTC peer, the internet.
         enableInternet: true,
         env: {
-          JOIN_URL: `${q('self')}/join.js`,
+          // `join` overrides the browser script so a native UDP far-peer can
+          // run in the same container without a new image.
+          JOIN_URL: q('join') || `${q('self')}/join.js`,
           // The report target is a SINGLE Durable Object, addressed by name and
           // nothing else. The previous design keyed it by region+generation and
           // a far peer that ran perfectly in Seattle posted into the wrong
@@ -527,7 +529,7 @@ async function occupants(env: Env, room: string): Promise<{ peers: string[]; err
 }
 
 async function summon(env: Env, origin: string, o: {
-  region: RegionKey; room: string; side?: string; hold?: string; qs?: string; gen?: string; tick?: string;
+  region: RegionKey; room: string; side?: string; hold?: string; qs?: string; gen?: string; tick?: string; join?: string;
 }): Promise<unknown> {
   const gen = o.gen ?? '1';
   const run = `${o.region}-${Date.now()}`;
@@ -541,6 +543,7 @@ async function summon(env: Env, origin: string, o: {
   u.searchParams.set('tick', o.tick ?? '15000');
   u.searchParams.set('run', run);
   u.searchParams.set('slot', slot(o.region, o.room));
+  if (o.join) u.searchParams.set('join', o.join);
   const res = await peerStub(env, o.region, o.room, gen).fetch(u.toString());
   const body = await res.json().catch(() => ({}));
   await labDO(env).fetch(`https://do/keeper`, {
@@ -713,6 +716,7 @@ export default {
         qs: url.searchParams.get('qs') ?? '',
         gen: url.searchParams.get('gen') ?? '1',
         tick: url.searchParams.get('tick') ?? '15000',
+        join: url.searchParams.get('join') ?? '',
       }));
     }
     // THE FURTHEST CALL ON EARTH THAT THIS NETWORK CAN PLACE: two containers,
