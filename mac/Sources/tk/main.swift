@@ -1872,8 +1872,6 @@ nonisolated(unsafe) var gDecCur = [UInt8](repeating: 0, count: 4096)
 var gDecPrevN = 0
 var gThetaMs: Double = 0
 var gThetaValid = false
-let audio = Audio()
-audio.wire = wire
 // TK_MUTE=1 in the environment silences playout as surely as --mute does.
 // This exists because a flag you have to remember on every one of forty test
 // commands is a flag you will forget on the forty-first, and here the cost of
@@ -2664,6 +2662,22 @@ if flag("gate-test") {
                               : " (it does not suppress enough)"))
   exit(ok ? 0 : 1)
 }
+
+// ── BUILT AFTER THE TESTS, BECAUSE IT OPENS THE MICROPHONE ─────────────────
+//
+// This sat above every `--*-test` block, so `tk --gate-test` -- a pure
+// computation over a synthetic buffer -- started CoreAudio and took the mic
+// before running. gate-test has failed twice in about forty runs and could not
+// be reproduced in twelve consecutive standalone runs, four runs straight after
+// a rig script, or three passes of the whole suite; the cause is still unknown.
+// This does not claim to fix it. It removes the one piece of ambient, shared,
+// machine-owned state a test of arithmetic had no business touching, which is
+// worth doing whether or not it is the culprit.
+//
+// Safe to move: nothing between the old position and here refers to `audio`,
+// and no test reads `Audio.sharedGate`.
+let audio = Audio()
+audio.wire = wire
 
 if let m = arg("presence") {
   guard let p = Audio.Presence.named(m) else {
