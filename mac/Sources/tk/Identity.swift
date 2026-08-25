@@ -442,6 +442,37 @@ enum Identity {
     return o
   }
 
+  // ── EVERYONE THIS MAC COULD TAP ────────────────────────────────────────────
+  //
+  // `contacts()` is the truth and it is keyed by handle, so the panel is that
+  // keyset sorted. Sorted rather than "most recent first" because nothing here
+  // records when a call happened -- and an ordering derived from a field that does
+  // not exist is a list that reshuffles itself for reasons nobody can explain.
+  //
+  // ── AND THE RIG OVERRIDE, WHICH IS NOT OPTIONAL ────────────────────────────
+  //
+  // Without `--contacts-fake` the panel can only ever be audited EMPTY, and the
+  // day a real contact finally lands is the first day a row is ever clicked. That
+  // is an instrument blind to the populated state reporting the same green as one
+  // where it works. It proves the view and the clicks and nothing about identity,
+  // pairing or ringing -- those are still two Macs on a live call.
+  //
+  // Echoed once, because a flag that does nothing quietly has cost this project
+  // three A/Bs that compared an arm against itself.
+  nonisolated(unsafe) private static var announcedFake = false
+  static func contactHandles() -> [String] {
+    if let fake = arg("contacts-fake") {
+      let list = fake.split(separator: ",").compactMap { sanitize(String($0)) }
+      if !announcedFake {
+        announcedFake = true
+        fputs("contacts: --contacts-fake is on -- \(list.count) pretend"
+            + " (\(list.joined(separator: ", "))), the real list is not read\n", stderr)
+      }
+      return list
+    }
+    return contacts().keys.sorted()
+  }
+
   /// Bind a handle to the key that actually rang. Called when a call is accepted,
   /// not when a ring arrives -- otherwise anyone who rings once owns the name.
   static func remember(handle: String, key: String) {
@@ -643,18 +674,45 @@ enum Identity {
   /// than making the test lie about what it checks.
   static func stripPossessiveT(_ s: String) -> String { stripPossessive(s) }
 
+  // ── A REFUSAL HAS TO SAY WHICH REFUSAL IT WAS ──────────────────────────────
+  //
+  // `rename` returned `false` for three completely different situations: a name
+  // that is not a name, a name that belongs to somebody else, and a server that
+  // never answered. A person can act on all three, and they act differently -- pick
+  // another name, pick another name, or try again in a minute -- so collapsing them
+  // into one boolean means the screen can only ever say the vaguest of the three.
+  //
+  // This is the same shape as the poll that reported a 429, a 403 and a dead
+  // network as an empty mailbox. Silence is a legitimate answer to "is this name
+  // free"; it is never a legitimate answer to "did the question get through".
+  enum Renamed {
+    case ok
+    /// Not `^[a-z][a-z0-9]{1,31}$`, so it was never sent.
+    case notAName
+    /// The server has this name bound to a different key. First come, first served.
+    case taken
+    /// No answer, or an answer nobody planned for. Nothing was changed.
+    case noAnswer
+  }
+
   /// Someone changed their handle in the UI. Only a successful claim moves the
   /// stored name, so a rejected rename leaves them as who they were.
-  @discardableResult
-  static func rename(to raw: String) -> Bool {
-    guard let want = sanitize(raw) else { return false }
+  static func renamed(to raw: String) -> Renamed {
+    guard let want = sanitize(raw) else { return .notAName }
     var s = ensure()
-    guard want != s.handle else { return true }
-    guard attempt(want, s) == 200 else { return false }
+    guard want != s.handle || !s.claimed else { return .ok }
+    switch attempt(want, s) {
+    case 200: break
+    case 403: return .taken
+    default: return .noAnswer
+    }
     s.handle = want; s.claimed = true
     lock.lock(); cached = s; lock.unlock()
     save(s)
     fputs("identity: you are now @\(want)\n", stderr)
-    return true
+    return .ok
   }
+
+  @discardableResult
+  static func rename(to raw: String) -> Bool { renamed(to: raw) == .ok }
 }

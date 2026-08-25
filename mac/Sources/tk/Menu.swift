@@ -80,6 +80,15 @@ enum Menu {
     let cam = call.addItem(withTitle: "Turn Camera Off", action: #selector(Target.cam), keyEquivalent: "v")
     cam.keyEquivalentModifierMask = [.command, .shift]; cam.target = Target.shared
     call.addItem(.separator())
+    // ── THE THIRD DOOR TO THE PEOPLE PANEL ────────────────────────────────────
+    //
+    // The fast route is a tap on the peek button, and it has two problems a menu
+    // item does not: it is undiscoverable, and it does not exist on an audio-only
+    // call, where peek refuses to open a tile with no camera frames behind it. The
+    // sheet's own People row is the second door. This is the one a person finds by
+    // looking, and it is the only one that works with no pointer at all.
+    let people = call.addItem(withTitle: "People…", action: #selector(Target.people), keyEquivalent: "p")
+    people.keyEquivalentModifierMask = [.command, .shift]; people.target = Target.shared
     let copy = call.addItem(withTitle: "Copy Invite Link", action: #selector(Target.invite), keyEquivalent: "c")
     copy.keyEquivalentModifierMask = [.command, .shift]; copy.target = Target.shared
     let code = call.addItem(withTitle: "Show Encryption Code", action: #selector(Target.more), keyEquivalent: "")
@@ -151,6 +160,7 @@ enum Menu {
     @objc func cam() { Menu.controls?.toggleCam(); Menu.controls?.nudgeBar() }
     @objc func invite() { Menu.controls?.invite(); Menu.controls?.nudgeBar() }
     @objc func more() { Menu.controls?.nudgeBar(); Menu.controls?.openMore() }
+    @objc func people() { Menu.controls?.nudgeBar(); Menu.controls?.openPeople() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }
     @objc func quit() { Menu.onQuit?(); NSApp.terminate(nil) }
     /// The background poller already checks every minute; this just makes it check

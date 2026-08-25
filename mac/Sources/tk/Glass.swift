@@ -104,6 +104,21 @@ enum Metric {
   static let sheetRow: CGFloat = 48
   static let sheetHint: CGFloat = 34
   static let sheetWidth: CGFloat = 420
+  /// Where a row's words start when a 18 pt glyph sits in front of them. It was a
+  /// bare 42 inside `SheetRow.layout`, and the day a row wanted a WIDER mark than a
+  /// glyph there was no name to move.
+  static let rowGlyphInset: CGFloat = 42
+  /// The same, for a row whose mark is a 34 pt face rather than an 18 pt glyph.
+  /// Not `rowGlyphInset + something`: it is the glyph inset's own arithmetic --
+  /// 12 pt of edge, the mark, 10 pt of air -- run again at the larger size.
+  static let rowAvatarInset: CGFloat = 56
+
+  /// A person, as a circle. 34 in a 48 pt row leaves 7 pt above and below, which
+  /// is what stops a column of faces from reading as a solid bar of colour.
+  static let avatar: CGFloat = 34
+  /// The ring that carries the hue. Thin, because the colour is an identifier and
+  /// not a status light -- see the note over `Palette.avatarInk`.
+  static let avatarRing: CGFloat = 1.5
 
   /// The waiting card: one panel holding the whole invite, rather than four
   /// controls floating separately over a face.
@@ -174,6 +189,10 @@ enum Type_ {
   /// "tap to leave" inside the confirm capsule -- the one place a control says a
   /// sentence instead of drawing a shape.
   static let confirm = NSFont.systemFont(ofSize: 13, weight: .semibold)
+  /// The one letter inside a contact's circle. Semibold because it is carrying a
+  /// person's identity at 34 points and a regular weight at this size reads as a
+  /// label that happened to land in a ring.
+  static let avatar = NSFont.systemFont(ofSize: 15, weight: .semibold)
 
   // ── THE OTHER PERSON'S VOICE, AS TEXT ──────────────────────────────────────
   //
@@ -244,6 +263,56 @@ enum Palette {
   /// of glass: "avoid overcrowding or layering Liquid Glass elements on top of
   /// each other."
   static func fill(_ alpha: CGFloat) -> NSColor { NSColor(white: 1, alpha: alpha) }
+
+  // ── A PERSON'S COLOUR, DERIVED FROM THEIR NAME ─────────────────────────────
+  //
+  // A contact has no photograph and never will -- nothing in this app has ever
+  // sent one -- so the circle has to be recognisable from the handle alone. That
+  // means the colour must be the SAME colour on every launch, on both Macs, for
+  // ever.
+  //
+  // FNV-1a, and not `String.hashValue`: Swift's `Hasher` is seeded per process, so
+  // the same person would be a different colour every time the app started -- and,
+  // worse, stable WITHIN a session, so it would test green on this machine and
+  // only ever be reported from the field. Not SHA-256 either: correct, and it
+  // drags CryptoKit into a drawing path for a value that needs nine bits.
+  //
+  // 22 buckets at 15 degrees rather than 360 free hues, because two contacts should
+  // either share a colour or be visibly different. Four degrees apart reads as a
+  // rendering fault, not as two people.
+  //
+  // Steps 0 and 23 are dropped, which removes 345-15 degrees. `Palette.bad` is hue
+  // ~0 and `leave` is the only filled control on the screen; a red circle beside
+  // the hang-up is exactly the mistake this file already refused once. Dropping two
+  // buckets is cheaper than a rotate-if-inside-the-band special case.
+  //
+  // From the HANDLE, never from a local nickname. Renaming somebody must not
+  // change their colour or the recognition the circle exists for is destroyed.
+  static func avatarHue(_ handle: String) -> CGFloat {
+    var h: UInt32 = 2166136261
+    for b in handle.lowercased().utf8 { h = (h ^ UInt32(b)) &* 16777619 }
+    return CGFloat(((h % 22) + 1) * 15)
+  }
+
+  // ── THE HUE LANDS ON THE RING AND THE LETTER, NOT ON A FILLED DISC ─────────
+  //
+  // A filled coloured disc with white text does not work, and it is arithmetic
+  // rather than taste. At S 0.62 / B 0.80, white on the blue end measures 6.4:1 and
+  // white on hue 60 (yellow) measures 1.71:1 -- illegible. One fixed
+  // saturation/brightness cannot carry white text across the wheel, and solving for
+  // constant luminance per hue is a numerical search inside a `draw` call.
+  //
+  // So the colour is the ring and the initial, and the disc stays a fill. That is
+  // also this app's own rule one row up: OFF does not fill a circle red, it turns
+  // the GLYPH red and leaves the surface alone.
+  //
+  // `NSColor(hue:saturation:brightness:)` is in the CALIBRATED space and every
+  // other colour in this file is `srgbRed:`. Without the conversion the avatars
+  // drift away from the palette on a wide-gamut display, and this Mac has one.
+  static func avatarInk(_ handle: String) -> NSColor {
+    let c = NSColor(hue: avatarHue(handle) / 360, saturation: 0.55, brightness: 0.98, alpha: 1)
+    return c.usingColorSpace(.sRGB) ?? accent
+  }
 }
 
 // ── THE MATERIAL ─────────────────────────────────────────────────────────────

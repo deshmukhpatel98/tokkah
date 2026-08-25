@@ -256,7 +256,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
-  "headphone-test", "route",
+  "headphone-test", "route", "contacts-fake",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1045,6 +1045,17 @@ if Identity.claimed {
   // And the switch, from disk, so a restart does not show "you can be reached"
   // to somebody who is still silenced.
   display?.controls?.setSilent(Identity.quietOn)
+}
+// Same shape, same thread, same rule: the name in the sheet does not move until
+// the server has agreed to it. `renamed` reports WHICH refusal it was, because a
+// name that is taken and a network that is down are two different things to do
+// about, and a boolean can only ever produce the vaguer of the two.
+display?.controls?.onRenameHandle = { want in
+  Thread {
+    let outcome = Identity.renamed(to: want)
+    if outcome == .ok { display?.controls?.setHandle(Identity.handle) }
+    display?.controls?.renameAnswered(outcome, name: want)
+  }.start()
 }
 display?.controls?.onSilent = { want in
   // Off main: this is an HTTPS round trip, and it is on the thread that draws.

@@ -205,6 +205,19 @@ enum Glyph {
             controlPoint2: NSPoint(x: 16 * k, y: 13 * k))
   } }, filled: false)
 
+  /// <path d="M4 20l1-4L16.5 4.5l3 3L8 19z"/><path d="M14.5 6.5l3 3"/>
+  /// A pencil, for the one row in the app that changes something you own. `person`
+  /// is next door and already means "this is you"; a second `person` on the row
+  /// under it would say "you" twice and "editable" not at all.
+  static let pencil = Shape(build: { box in path(box) { p, k in
+    m(p, k, 4, 20); l(p, k, 5, 16); l(p, k, 16.5, 4.5); l(p, k, 19.5, 7.5); l(p, k, 8, 19)
+    p.close()
+    // The ferrule. Without it the body is a bare quadrilateral and reads as a
+    // slanted banner rather than as a pencil at 18 pt, which is the only size this
+    // is ever drawn at.
+    m(p, k, 14.5, 6.5); l(p, k, 17.5, 9.5)
+  } }, filled: false)
+
   /// <path d="M6.5 17V10a5.5 5.5 0 0 1 11 0v7"/><path d="M4.5 17h15"/><path d="M10 20a2 2 0 0 0 4 0"/>
   static let bell = Shape(build: { box in path(box) { p, k in
     m(p, k, 6.5, 17); l(p, k, 6.5, 10)
@@ -285,6 +298,65 @@ final class IconButton: NSButton {
   var onHold: ((Bool) -> Void)?
   private(set) var holding = false
 
+  // ── TWO GESTURES ON ONE CIRCLE ─────────────────────────────────────────────
+  //
+  // A quick click on a hold button used to be an unclaimed gesture: `mouseDown`
+  // returns before `super.mouseDown` whenever `onHold` is set, so `peek` never sent
+  // an action and a tap was a self-view flash lasting one click. Claiming it costs
+  // no existing behaviour, which is why it is the cheapest of the three gestures.
+  //
+  // ── THE HOLD STAYS INSTANT: REVEAL AT DOWN, DECIDE AT UP ───────────────────
+  //
+  // The naive build waits out the boundary before doing anything, which makes peek
+  // slower by exactly the boundary -- on the one control whose entire value is a
+  // fast answer to "is my camera working". So `onHold(true)` still fires at
+  // `mouseDown`, byte-identical to the shipped version for every press past the
+  // boundary, and the classification happens at `mouseUp` where the duration is
+  // already known. The whole cost is that a tap flashes the tile for up to the
+  // boundary before the panel opens, which is feedback that the press registered.
+  var onTap: (() -> Void)?
+  /// Released before this many seconds is a tap; at or after it, the hold already
+  /// did its job and the release only ends it. ONE boundary, two outcomes, always
+  /// exactly one of them -- a control that sometimes does nothing is worse than
+  /// either wrong answer.
+  ///
+  /// 220 ms for peek: the hold watchdog polls at 150 ms so anything at or under
+  /// that races it, deliberate click durations sit well under 200 ms, and 220 ms is
+  /// below anything a person experiences as lag. `leave` raises it to its own hold
+  /// boundary -- see `CallControls.leaveHoldSeconds` for why the two cannot share a
+  /// number and why leave's tap window has to run all the way to its hold.
+  var tapWithin: TimeInterval = 0.22
+  private var downAt: Date?
+  /// A tap is cancelled by sliding off the circle, the same rule `SheetRow`
+  /// already implements. A HOLD is not -- `mouseDragged` below is explicit that a
+  /// hold survives the pointer leaving, and that is the behaviour peek needs.
+  private var slidOff = false
+  /// Cumulative, because a boolean sampled after the fact is a birth certificate
+  /// and not a health record. Only a count can show that one press did not
+  /// classify as both a tap and a hold.
+  private(set) var taps = 0
+
+  // ── THE FIRST CLICK ON A BACKGROUND WINDOW MUST NOT HANG UP ────────────────
+  //
+  // `acceptsFirstMouse` is true so a click that arrives while the app is behind
+  // something still counts -- right for mute, and "the whole point of a hang-up is
+  // that it works the first time". But a hold that FIRES turns a click-and-hold
+  // that only meant to bring the app forward into an ended call. So the state of
+  // the window at `mouseDown` is recorded here and the leave hold refuses to start
+  // without it. The press still activates and still arms, so nothing looks dead;
+  // the hold is available from the second press on.
+  private(set) var keyAtDown = false
+
+  /// 0…1 while a hold is filling. Drawn as a sweep across the confirm capsule --
+  /// the pill this widens into already exists, so the progress re-uses it instead
+  /// of adding a second shape over the picture.
+  var holdProgress: CGFloat = 0 {
+    didSet {
+      guard abs(holdProgress - oldValue) > 0.001 else { return }
+      needsDisplay = true; ink.needsDisplay = true
+    }
+  }
+
   // ── THE CIRCLE MORPHS IN PLACE ─────────────────────────────────────────────
   //
   //   .icon-btn.leave.confirming { width: 150px; border-radius: 24px; gap: 8px;
@@ -338,7 +410,10 @@ final class IconButton: NSButton {
   override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true; ink.needsDisplay = true }
 
   override func mouseDown(with event: NSEvent) {
+    keyAtDown = window?.isKeyWindow ?? false
     guard onHold != nil else { super.mouseDown(with: event); return }
+    downAt = Date()
+    slidOff = false
     setHolding(true)
     startHoldWatchdog()
   }
@@ -387,14 +462,45 @@ final class IconButton: NSButton {
   // get, for free and without holding the thread hostage.
   override func mouseUp(with event: NSEvent) {
     guard onHold != nil else { super.mouseUp(with: event); return }
+    // Duration off the WALL CLOCK, not off `pressedMouseButtons`. The harness's
+    // button is not a finger and is invisible to the window server -- which is the
+    // whole reason `syntheticHold` exists below -- so a classifier reading the
+    // physical button would file every synthetic press as a hold and the tap half
+    // of this control would be untestable.
+    let held = downAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+    let wasHolding = holding
     setHolding(false)
+    downAt = nil
+    // `wasHolding` and not `true`: the watchdog's job is "nothing is being held",
+    // and a lost `mouseUp` -- hold peek, then Command-Tab away -- is not a click.
+    // A tap fired from that path would open a panel nobody was looking at, and on
+    // `leave` the same shape would end a call.
+    guard wasHolding, !slidOff, held < tapWithin, let tap = onTap else { return }
+    taps += 1
+    tap()
   }
   override func mouseDragged(with event: NSEvent) {
-    guard onHold == nil else { return }   // a hold survives the pointer leaving
+    guard onHold == nil else {
+      // A hold survives the pointer leaving; a tap does not. Same cancelled-press
+      // rule every Mac button has: you can slide off a control you did not mean to
+      // hit, and the slide is the cancellation.
+      if !bounds.contains(convert(event.locationInWindow, from: nil)) { slidOff = true }
+      return
+    }
     super.mouseDragged(with: event)
   }
 
-  func simulateHold(_ on: Bool) { setHolding(on) }
+  func simulateHold(_ on: Bool) {
+    if on { downAt = Date(); slidOff = false; keyAtDown = window?.isKeyWindow ?? false }
+    setHolding(on)
+  }
+  /// The tap half, without a pointer. `--press peek-tap` and the menu route both
+  /// come through here so they cannot drift from what a finger does.
+  func simulateTap() {
+    guard let tap = onTap else { return }
+    taps += 1
+    tap()
+  }
 
 
   // ── THE FIRST CLICK COUNTS ─────────────────────────────────────────────────
@@ -448,6 +554,25 @@ final class IconButton: NSButton {
     } else if hovering {
       Palette.fill(0.10).setFill()
       circle.fill()
+    }
+    // ── THE HOLD, AS A RISING TIDE ACROSS THE PILL ────────────────────────────
+    //
+    // A veil rather than a second colour: over the red fill above, a lighter red
+    // is a shade nobody can name, and over the glass paths there is no fill to
+    // lighten at all. A white wash reads as "filling up" on either ground and
+    // costs no new token.
+    //
+    // Clipped to the capsule so the sweep cannot square off the corners the morph
+    // just rounded, and it is drawn HERE rather than in the ink because it belongs
+    // behind the material with the colour it is washing -- the glyph and the word
+    // have to stay crisp on top of it.
+    if holdProgress > 0 {
+      NSGraphicsContext.saveGraphicsState()
+      circle.addClip()
+      Palette.fill(0.28).setFill()
+      NSRect(x: bounds.minX, y: bounds.minY,
+             width: bounds.width * min(1, holdProgress), height: bounds.height).fill()
+      NSGraphicsContext.restoreGraphicsState()
     }
   }
 
@@ -599,7 +724,11 @@ final class Pill: NSView {
 // and copying an invite is not a thing anyone does twice in a call -- but it is the
 // whole flow ("the call just starts, you copy the link and share it"), so it is the
 // first row of the sheet rather than something removed.
-final class SheetRow: NSButton {
+// NOT `final`: `ContactRow` below is this row with a face drawn in the glyph slot,
+// and subclassing is what makes the four scars in here -- the hit test, the first
+// mouse, the hand-rolled tracking, the spoken string -- inherited instead of
+// re-derived by a second row class that would get one of them wrong.
+class SheetRow: NSButton {
   private let glyph: Glyph.Shape?
   private let text: NSTextField
   private var hovering = false
@@ -612,6 +741,16 @@ final class SheetRow: NSButton {
   var inert = false
   /// `.sheet .row .code` -- a monospaced value pinned right, for the encryption code.
   var value: String = "" { didSet { needsDisplay = true } }
+  /// This value is a WORD, not a code. The code treatment is monospace at 0.09em of
+  /// letter-spacing, which exists so two people can read a safety code aloud
+  /// character by character -- and applied to "copy" it drew `c o p y` in a
+  /// typewriter face, which reads as a serial number rather than as something to
+  /// press. Same slot, different job, so it has to be told which.
+  var valueIsWord = false { didSet { needsDisplay = true } }
+  /// Where the words start. A stored property rather than the `glyph == nil`
+  /// expression it replaces, so a subclass drawing a WIDER mark than a glyph can
+  /// move the text without overriding `layout` and re-deriving the rest of it.
+  var textInset: CGFloat = Metric.s3 { didSet { needsLayout = true } }
 
   /// What this row actually says, for a test that has to read the screen.
   var spoken: String {
@@ -683,6 +822,7 @@ final class SheetRow: NSButton {
   init(_ label: String, glyph: Glyph.Shape? = nil) {
     self.glyph = glyph
     text = NSTextField(labelWithString: label)
+    textInset = glyph == nil ? Metric.s3 : Metric.rowGlyphInset
     super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 48))
     isBordered = false
     title = ""
@@ -712,7 +852,7 @@ final class SheetRow: NSButton {
 
   override func layout() {
     super.layout()
-    let x: CGFloat = glyph == nil ? Metric.s3 : 42
+    let x = textInset
     text.frame = NSRect(x: x, y: (bounds.height - 18) / 2, width: bounds.width - x - 40, height: 18)
   }
 
@@ -761,11 +901,12 @@ final class SheetRow: NSButton {
       // reads as "not yet", where the same treatment as a real code reads as a
       // code that failed to print.
       let pending = value == "…"
-      let f = pending ? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) : Type_.code
+      let f = valueIsWord ? Type_.button
+            : (pending ? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) : Type_.code)
       var a: [NSAttributedString.Key: Any] = [
-        .font: f, .foregroundColor: pending ? Palette.muted : Palette.fg,
+        .font: f, .foregroundColor: (pending || valueIsWord) ? Palette.muted : Palette.fg,
       ]
-      if !pending { a[.kern] = 13.0 * 0.09 }
+      if !pending, !valueIsWord { a[.kern] = 13.0 * 0.09 }
       let sz = (value as NSString).size(withAttributes: a)
       (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - Metric.s3,
                                           y: (bounds.height - sz.height) / 2),
@@ -781,6 +922,138 @@ final class SheetRow: NSButton {
       t.lineWidth = 2.2; t.lineCapStyle = .round; t.lineJoinStyle = .round
       Palette.ok.setStroke(); t.stroke()
     }
+  }
+}
+
+// ── A PERSON, IN THE GLYPH SLOT ──────────────────────────────────────────────
+//
+// A SUBCLASS, so every scar `SheetRow` already paid for is inherited rather than
+// re-derived. There are four of them and each one cost a live defect: a `hitTest`
+// that takes SUPERVIEW coordinates and tests `frame`; `acceptsFirstMouse`, without
+// which every row is dead while the app is behind something; the hand-rolled
+// `mouseDown` tracking that exists because overriding `isFlipped` silently stops
+// `NSButtonCell` from ever firing; and a `spoken` string, which exists because the
+// harness has to click the list and read it back.
+//
+// Do not "simplify" the manual tracking away and do not touch `isFlipped`. That is
+// the same bug with the diff reversed.
+//
+// The other return on subclassing is that `clickTargets` needed no line at all --
+// it already collects `sheet.rows`, and a `ContactRow` IS a `SheetRow`.
+final class ContactRow: SheetRow {
+  private let handle: String
+  /// Who this row is, for the action that has to ring them. `tag` is taken -- the
+  /// camera rows use it as an index -- and a handle is not an integer.
+  var handleName: String { handle }
+
+  /// The handle is the row: the colour, the letter and the words all come from it.
+  /// A separate display name would be a local nickname, and names are deliberately
+  /// not a thing this version has -- see CONTACTS.md on why a name over the wire is
+  /// a claim and needs a trust model this app does not yet have.
+  init(handle: String) {
+    self.handle = handle
+    super.init("@" + handle, glyph: nil)
+    textInset = Metric.rowAvatarInset
+    setAccessibilityLabel("call @" + handle)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  // ── DRAWN, NOT LAYERED ─────────────────────────────────────────────────────
+  //
+  // `Display.snapshot` is `cacheDisplay`-based and cannot see a layer-only
+  // background: that blindness ran a scrim gradient backwards through every
+  // screenshot ever taken of this app. A sublayer here would photograph as an
+  // empty row in the app's own capture and as a circle through the window server,
+  // which is two instruments disagreeing about the same screen.
+  override func draw(_ dirty: NSRect) {
+    super.draw(dirty)
+    let d = Metric.avatar
+    let box = NSRect(x: Metric.s3, y: (bounds.height - d) / 2, width: d, height: d)
+    let ink = Palette.avatarInk(handle)
+    // A fill and a hairline, the same idiom as every other thing that lives INSIDE
+    // a glass surface. A second pane of glass here would be the one place in the
+    // app that breaks "avoid layering Liquid Glass elements on top of each other",
+    // and it would be a pane per contact.
+    Palette.fill(0.08).setFill()
+    NSBezierPath(ovalIn: box).fill()
+    let ring = NSBezierPath(ovalIn: box.insetBy(dx: Metric.avatarRing / 2, dy: Metric.avatarRing / 2))
+    ink.setStroke()
+    ring.lineWidth = Metric.avatarRing
+    ring.stroke()
+    // `handle.first` uppercased, and it is always a letter: the server's rule is
+    // `^[a-z][a-z0-9]{1,31}$` and `Identity.sanitize` applies it before anything
+    // reaches here. No empty initial, no emoji, no combining marks to measure.
+    let letter = String(handle.prefix(1)).uppercased()
+    let attrs: [NSAttributedString.Key: Any] = [.font: Type_.avatar, .foregroundColor: ink]
+    let sz = (letter as NSString).size(withAttributes: attrs)
+    (letter as NSString).draw(at: NSPoint(x: box.midX - sz.width / 2,
+                                          y: box.midY - sz.height / 2),
+                              withAttributes: attrs)
+  }
+}
+
+// ── THE ONE THING IN THE SHEET YOU TYPE INTO ─────────────────────────────────
+//
+// Built from the waiting card's dial field rather than invented: a `Vibrant` well
+// with a plain `NSTextField` in it, Enter commits, and the whole row routes clicks
+// to the FIELD rather than to itself.
+//
+// That last part is the one rule this cannot copy from `SheetRow`. Every row here
+// answers `self` because a row handles its own presses; a text field cannot work
+// that way, because typing needs it to become first responder and that only
+// happens if the click actually reaches it. Routing this to `self` like the rest
+// gives a field that draws, highlights on hover, and can never be typed into.
+final class SheetField: NSView {
+  private let well = Vibrant()
+  let field = NSTextField()
+  var onCommit: (() -> Void)?
+
+  var text: String {
+    get { field.stringValue }
+    set { field.stringValue = newValue }
+  }
+
+  init(placeholder: String, text: String) {
+    super.init(frame: NSRect(x: 0, y: 0, width: 400, height: Metric.sheetRow))
+    addSubview(well)
+    field.font = Type_.field
+    field.textColor = Palette.fg
+    field.backgroundColor = .clear
+    field.drawsBackground = false
+    field.isBordered = false
+    field.isEditable = true
+    field.isSelectable = true
+    field.focusRingType = .none
+    field.placeholderString = placeholder
+    field.stringValue = text
+    field.target = self
+    field.action = #selector(committed)
+    addSubview(field)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  @objc private func committed() { onCommit?() }
+
+  /// See IconButton.acceptsFirstMouse.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    guard !isHidden, frame.contains(point) else { return nil }
+    return field
+  }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .iBeam) }
+
+  override func layout() {
+    super.layout()
+    let h = Metric.fieldHeight
+    let r = NSRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+    well.frame = r
+    // Concentric with the sheet across the padding the sheet already puts around
+    // its rows, exactly as `sheetRowRadius` is. A literal here would be the tenth
+    // magic radius this design system exists to have removed.
+    well.radius = Metric.sheetRowRadius
+    field.frame = NSRect(x: r.minX + Metric.s3, y: r.midY - 9,
+                         width: r.width - Metric.s6, height: 18)
   }
 }
 
@@ -838,6 +1111,23 @@ final class Sheet: NSView {
   /// text, such as alerts, sidebars, or popovers".
   private let glass = Glass(radius: Metric.sheetRadius, variant: .regular)
   private(set) var rows: [SheetRow] = []
+  /// The one field a page can carry, so `clickTargets` can name it without every
+  /// caller having to hold on to the view it just handed over.
+  private(set) var field: SheetField?
+
+  // ── ONE SHEET, THREE PAYLOADS ──────────────────────────────────────────────
+  //
+  // People and rename are PAGES of this panel and not new surfaces, and the reason
+  // is that a new panel re-earns every hard part: a `hitTest` that takes superview
+  // coordinates, `acceptsFirstMouse`, hover and press states, hand-rolled click
+  // tracking, a spoken string -- and the three ways out that need no aiming (a
+  // click on the scrim, a swipe down, Escape). Each of those was paid for once
+  // already, in this class or the one above it.
+  //
+  // It is also the only surface that exists on both sides of the join: the sheet
+  // is there behind the waiting card and it is there mid-call, so `People` is
+  // reachable at the moment somebody actually wants to ring a person.
+  enum Page: String { case settings, people, rename }
 
   init() {
     super.init(frame: .zero)
@@ -883,6 +1173,7 @@ final class Sheet: NSView {
     items.forEach { $0.removeFromSuperview() }
     items = v
     rows = v.compactMap { $0 as? SheetRow }
+    field = v.compactMap { $0 as? SheetField }.first
     // Measured BEFORE `wantedHeight` is asked for, or the panel is sized from a
     // hint's placeholder height and then draws a taller one inside it.
     let inner = Metric.sheetWidth - Metric.sheetPad * 2
@@ -1015,6 +1306,16 @@ final class WaitingCard: NSView {
     Metrics.tap("call")
     dialField.stringValue = ""
     onCall?(h)
+  }
+
+  /// Put the caret in the name field. The people panel's "Call someone new" row
+  /// hands over to this rather than growing a second field: there is exactly one
+  /// place in this app you type a name into, and two of them would be two places
+  /// that can disagree about what a name is.
+  @discardableResult
+  func focusDial() -> Bool {
+    guard !dialField.isHidden, let w = window else { return false }
+    return w.makeFirstResponder(dialField)
   }
 
   /// `#copy:disabled { opacity: 1; color: var(--ok) }` -- "copied ✓" is a
@@ -1390,7 +1691,13 @@ final class CallControls: NSView {
   // release. Flip hides itself with one camera exactly as `#flip` does.
   private let micButton = IconButton(Glyph.mic, help: "microphone")
   private let camButton = IconButton(Glyph.cam, help: "camera")
-  private let peekButton = IconButton(Glyph.peek, help: "hold to see yourself")
+  // ── ONE CONTROL SAYING BOTH OF ITS GESTURES ────────────────────────────────
+  //
+  // `help` feeds the tooltip AND the accessibility label, and two gestures on one
+  // circle is genuinely worse for VoiceOver than two controls. The mitigation is
+  // that the gesture is never the only way in: the sheet carries a People row, the
+  // Call menu carries People… with its own shortcut, and both reach the same panel.
+  private let peekButton = IconButton(Glyph.peek, help: "tap for people · hold to see yourself")
   private let flipButton = IconButton(Glyph.flip, help: "switch camera")
   private let xlateButton = IconButton(Glyph.xlate, help: "live translation")
   private let leaveButton = IconButton(Glyph.leave, help: "leave call")
@@ -1441,7 +1748,7 @@ final class CallControls: NSView {
   func setSafetyCode(_ c: String) {
     guard c != safetyCode else { return }
     safetyCode = c
-    onMain { [weak self] in if self?.moreOpen == true { self?.rebuildSheet() } }
+    onMain { [weak self] in self?.refreshSheet() }
   }
   private let room: String
   private var startedAt: Date?
@@ -1525,8 +1832,32 @@ final class CallControls: NSView {
       // was the last control on the bar that left no trace of having been used.
       if on { Metrics.tap("peek", ok: self?.peeking == true) }
     }
+    // The second gesture on the same circle. A tap is not a hold that ended early:
+    // it is the route to the people panel, and it is claimed here because until now
+    // a quick click on peek did nothing at all except flash the tile for the length
+    // of the click.
+    peekButton.onTap = { [weak self] in
+      Metrics.tap("peek_tap")
+      self?.openPeople()
+    }
     flipButton.target = self; flipButton.action = #selector(nextCamera)
-    leaveButton.target = self; leaveButton.action = #selector(leave)
+    // ── LEAVE HAS NO target/action ANY MORE, AND THAT IS DELIBERATE ────────────
+    //
+    // `IconButton.mouseDown` returns before `super.mouseDown` whenever `onHold` is
+    // set, so an `NSButton` action on a hold button never fires. Assigning one here
+    // and expecting it to work is precisely the dead control this file keeps
+    // finding: it would compile, validate, draw, highlight on hover and never send.
+    // Both gestures come through the two closures instead.
+    leaveButton.onHold = { [weak self] on in self?.leaveHold(on) }
+    leaveButton.onTap = { [weak self] in self?.leaveTap() }
+    // ── LEAVE'S TAP WINDOW RUNS ALL THE WAY TO ITS HOLD ───────────────────────
+    //
+    // peek's 220 ms boundary would leave a dead band here: a SECOND press released
+    // between 220 and 600 ms is neither a tap that hangs up nor a hold that
+    // completes, so the app would do nothing at the one moment somebody is trying
+    // to end a call. One boundary, two outcomes -- under 600 ms it was a tap,
+    // at or over it the hold has already gone.
+    leaveButton.tapWithin = CallControls.leaveHoldSeconds
     moreButton.target = self; moreButton.action = #selector(toggleMore)
     sheetScrim.isHidden = true
     // It was added, framed, and wired to nothing: `moreScrim` in the web app is
@@ -1534,9 +1865,7 @@ final class CallControls: NSView {
     // only way to shut the sheet was to find the same 48 px disc again.
     sheetScrim.onClick = { [weak self] in self?.closeMore() }
     sheet.onSwipeDown = { [weak self] in self?.closeMore() }
-    addSubview(sheetScrim)
     sheet.isHidden = true
-    addSubview(sheet)
     rebuildSheet()
     // `#flip { display: none }` until there is more than one camera.
     // Translation is parked (not this release) — the globe is not in the row.
@@ -1583,10 +1912,10 @@ final class CallControls: NSView {
                   ok: NSPasteboard.general.string(forType: .string) == self.inviteText)
     }
     waiting.onShare = { [weak self] in self?.share() }
-    waiting.onCall = { [weak self] h in
-      self?.setStatus("calling @\(h)…")
-      self?.onCall?(h)
-    }
+    // Through `dial`, not straight at `onCall`. The field and a tapped face are the
+    // same act and they now travel the same line -- including the fallback for a
+    // doorbell that is not wired, which the field used to be missing.
+    waiting.onCall = { [weak self] h in self?.dial(h) }
     waiting.onAnswer = { [weak self] in self?.onAnswerRing?() }
     waiting.onDecline = { [weak self] in
       self?.waiting.clearIncoming()
@@ -1594,6 +1923,21 @@ final class CallControls: NSView {
       self?.onDeclineRing?()
     }
     addSubview(waiting)
+    // ── THE PANEL GOES ABOVE THE CARD, AND IT DID NOT ─────────────────────────
+    //
+    // These two were added before the waiting card, so the card drew OVER them --
+    // and the two overlap the moment the sheet is more than a few rows tall,
+    // because the card is centred and the panel hangs off the right gutter. With
+    // two rows in it nothing touched, which is why every screenshot of the sheet
+    // ever taken looked correct; the people page is the first one long enough to
+    // reach the card's corner.
+    //
+    // It also makes the scrim's contract uniform. `sheetScrim` fills the window and
+    // its whole job is to take one click and close what is in front of it -- but
+    // the card sat above it and answered first, so the copy button was the one
+    // place on the screen where clicking outside the panel did not close it.
+    addSubview(sheetScrim)
+    addSubview(sheet)
 
     // The one stock control left, so it gets a glass backing rather than the grey
     // AppKit bezel that made the whole bottom-left corner look like a preferences
@@ -1952,7 +2296,7 @@ final class CallControls: NSView {
       self.camPicker.isHidden = true
       // `#flip { display: none }` -> shown only when there IS a next camera.
       self.flipButton.isHidden = names.count < 2
-      self.rebuildSheet()
+      self.refreshSheet()
       self.needsLayout = true
     }
   }
@@ -1996,6 +2340,11 @@ final class CallControls: NSView {
   var onSilent: ((Bool) -> Void)?
   /// A handle was dialled. The app rings it and joins the room it sent.
   var onCall: ((String) -> Void)?
+  /// Somebody typed a new name. Registering it is a signature and an HTTPS round
+  /// trip, which is not this thread's work; the answer comes back through
+  /// `renameAnswered`. Same shape as `onSilent`, and for the same reason -- the
+  /// name on screen is not allowed to move until the server has agreed to it.
+  var onRenameHandle: ((String) -> Void)?
 
   /// Dial without a pointer -- `--call`, and anything later that wants to start a
   /// call by name. Goes through exactly what the field goes through, so the two
@@ -2008,8 +2357,27 @@ final class CallControls: NSView {
       Metrics.tap("call", ok: false)
       setStatus("that is not a name"); return
     }
+    // ── WITH NO DOORBELL WIRED, STILL DO SOMETHING COMPLETE ───────────────────
+    //
+    // `onCall` is assigned in one place. If that assignment is ever lost, every
+    // face in the panel becomes a circle that highlights, presses and does nothing
+    // -- and it would audit green, because a hit test cannot tell a handler that
+    // did nothing from one that is not there.
+    //
+    // So the fallback is the true state of the world: you can still reach this
+    // person, just not by ringing them. Copying the invite and saying so is a
+    // COMPLETE action, and it tells somebody the doorbell is the missing part
+    // rather than that the app is broken.
+    guard let ring = onCall else {
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(inviteText, forType: .string)
+      Metrics.tap("call", ok: false)
+      fputs("call: nothing is wired to onCall -- copied the link instead\n", stderr)
+      setStatus("link copied — send it to @\(h)")
+      return
+    }
     setStatus("calling @\(h)…")
-    onCall?(h)
+    ring(h)
   }
   var onAnswerRing: (() -> Void)?
   var onDeclineRing: (() -> Void)?
@@ -2036,7 +2404,7 @@ final class CallControls: NSView {
     onMain { [weak self] in
       guard let self, self.handle != h else { return }
       self.handle = h
-      if self.moreOpen { self.rebuildSheet() }
+      self.refreshSheet()
     }
   }
 
@@ -2044,11 +2412,15 @@ final class CallControls: NSView {
     onMain { [weak self] in
       guard let self, self.silent != on else { return }
       self.silent = on
-      if self.moreOpen { self.rebuildSheet() }
+      self.refreshSheet()
     }
   }
 
-  @objc private func copyHandleRow(_ sender: SheetRow) {
+  @objc private func copyHandleRow(_ sender: SheetRow) { copyHandle() }
+
+  /// Split from its `@objc` wrapper so `--press handle-copy` does not have to
+  /// invent a throwaway row to pass to an argument nobody reads.
+  func copyHandle() {
     guard !handle.isEmpty else { Metrics.tap("copy_handle", ok: false); return }
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString("@" + handle, forType: .string)
@@ -2192,16 +2564,47 @@ final class CallControls: NSView {
   private(set) var leaveArmed = false
 
   private(set) var moreOpen = false
+  /// Which payload the panel is showing. Reported in `describeTree`, because
+  /// without it every `row#N` assertion is ambiguous about which list it read.
+  private(set) var sheetPage: Sheet.Page = .settings
+
   /// Open it if it is closed. The menu item says "Show Encryption Code", and a
   /// menu item that sometimes closes the thing it offers to show is a trick.
-  @objc func openMore() { if !moreOpen { toggleMore() } }
+  @objc func openMore() { showPage(.settings, opening: true) }
+
+  /// Tap on peek, the People row, and the Call menu all land here. Opening the
+  /// panel when it is already open is not a toggle: somebody who taps peek twice
+  /// wants the people, not a panel that blinks.
+  @objc func openPeople() { showPage(.people, opening: true) }
+
+  /// One place changes the page, so a route that forgets to rebuild or forgets to
+  /// re-lay the panel cannot exist. `opening: false` is a move BETWEEN pages of an
+  /// already-open sheet -- a back row -- and must not reopen a panel somebody just
+  /// closed underneath it.
+  private func showPage(_ p: Sheet.Page, opening: Bool) {
+    guard opening || moreOpen else { return }
+    sheetPage = p
+    if !moreOpen {
+      moreOpen = true
+      moreButton.on = true
+    }
+    rebuildSheet()
+    // The panel is sized from its content, so a page swap has to re-lay it in the
+    // same turn. Deferring to the next pass photographs the OLD page's height with
+    // the new page's rows inside it.
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    nudgeBar()
+  }
 
   @objc func toggleMore() {
     let before = moreOpen
     defer { Metrics.tap("more", ok: moreOpen != before) }
     moreOpen.toggle()
     moreButton.on = moreOpen
-    if moreOpen { rebuildSheet() }
+    // The dots always open the settings page. A button that opens whichever page
+    // you happened to leave behind is a button whose effect depends on history.
+    if moreOpen { sheetPage = .settings; rebuildSheet() }
     needsLayout = true
     layoutSubtreeIfNeeded()
   }
@@ -2209,6 +2612,7 @@ final class CallControls: NSView {
     guard moreOpen else { return }
     moreOpen = false
     moreButton.on = false
+    sheetPage = .settings
     needsLayout = true
     layoutSubtreeIfNeeded()
   }
@@ -2237,6 +2641,28 @@ final class CallControls: NSView {
   /// one-way door, and removing this row would have left a departed call with no
   /// route to the link at all.
   private func rebuildSheet() {
+    switch sheetPage {
+    case .settings: buildSettingsPage()
+    case .people: buildPeoplePage()
+    case .rename: buildRenamePage()
+    }
+  }
+
+  // ── A REBUILD IS DESTRUCTIVE, AND ONE PAGE HOLDS TYPING ────────────────────
+  //
+  // `setSafetyCode`, `setCameras`, `setHandle` and `setSilent` all refresh the
+  // panel when it is open, and all four arrive from the call loop at moments
+  // nobody chose -- the key exchange landing, a camera being plugged in. On the
+  // rename page that would throw away a half-typed name mid-keystroke, which is
+  // the kind of defect that only ever happens to somebody else and can never be
+  // reproduced. So incidental refreshes go through here and the rename page is
+  // rebuilt only when something deliberately asks for it.
+  private func refreshSheet() {
+    guard moreOpen, sheetPage != .rename else { return }
+    rebuildSheet()
+  }
+
+  private func buildSettingsPage() {
     var rows: [SheetRow] = []
     for (i, name) in camNames.enumerated() {
       let r = SheetRow(name, glyph: Glyph.cam)
@@ -2283,6 +2709,27 @@ final class CallControls: NSView {
       h.target = self; h.action = #selector(copyHandleRow(_:))
       items.append(h)
     }
+    // ── THE PEOPLE ROW, AND WHY IT IS NOT ONLY A GESTURE ──────────────────────
+    //
+    // A tap on peek opens the same panel, and it is the fastest route. It is also
+    // unavailable on an audio-only call -- peek refuses to open an empty tile when
+    // no camera frame has ever arrived -- and undiscoverable to anyone who has not
+    // been told. So the panel has three doors: this row, the gesture, and the Call
+    // menu. A feature reachable only by a gesture nobody mentions is a feature
+    // behind a flag nobody runs.
+    let peopleEntry = SheetRow("People", glyph: Glyph.person)
+    peopleEntry.target = self; peopleEntry.action = #selector(peopleRow(_:))
+    items.append(peopleEntry)
+    // ── CHANGING YOUR NAME, WHETHER OR NOT YOU HAVE ONE ──────────────────────
+    //
+    // Present even when `handle` is empty, and that is the case it matters most in:
+    // an unclaimed handle means every name this Mac suggested was already taken,
+    // and the person it happened to is exactly the one who needs to pick another.
+    // Hiding the row until the name works would hide it from everybody it is for.
+    let rename = SheetRow(handle.isEmpty ? "Choose your name" : "Change your name",
+                          glyph: Glyph.pencil)
+    rename.target = self; rename.action = #selector(renameRow(_:))
+    items.append(rename)
     items += rows as [NSView]
     // Silent is a switch, so it carries a tick and never a value.
     let q = SheetRow("Silent", glyph: Glyph.bell)
@@ -2294,6 +2741,195 @@ final class CallControls: NSView {
       ? "Silent: nobody can ring you. To them you simply look away."
       : "Read it aloud. Same code on both screens means nobody is in the middle."))
     sheet.setItems(items)
+  }
+
+  // ── THE PEOPLE PAGE ────────────────────────────────────────────────────────
+  //
+  // Circles with names on them, and tapping one calls that person. Capped at six,
+  // and the cap is stated rather than left as a surprise: `Sheet` has no scroll
+  // view, and adding one is a new container with its own hit-testing -- exactly
+  // what putting this in the sheet avoids. At five contacts the panel is already
+  // most of a 720 pt window.
+  private static let peopleShown = 6
+  private(set) var people: [String] = []
+
+  private func buildPeoplePage() {
+    people = Array(Identity.contactHandles().prefix(CallControls.peopleShown))
+    var items: [NSView] = []
+    if people.isEmpty {
+      // NOT an empty panel, and not a greyed row. The truthful thing to say is how
+      // somebody gets one, and this is the whole of it.
+      items.append(SheetHint("Call someone once and they'll show up here."))
+    }
+    for h in people {
+      let r = ContactRow(handle: h)
+      r.target = self; r.action = #selector(callContactRow(_:))
+      items.append(r)
+    }
+    // ── YOUR OWN CIRCLE, AND THE ONE STATE THAT HAS NO ROW ───────────────────
+    //
+    // A copy button over an empty value is worse than no copy button: it copies
+    // nothing, reports success, and teaches the person the feature is broken. So an
+    // unclaimed handle gets a sentence instead of a control.
+    if handle.isEmpty {
+      items.append(SheetHint("Your name on Kin isn't set up yet."))
+    } else {
+      let mine = ContactRow(handle: handle)
+      mine.value = "copy"
+      mine.valueIsWord = true
+      mine.ruled = !people.isEmpty
+      mine.target = self; mine.action = #selector(copyHandleRow(_:))
+      items.append(mine)
+      items.append(SheetHint("Give this to someone and they can call you."))
+    }
+    // Only where it can work. Mid-call there is no name field on screen to hand
+    // over to, and a row that opens nothing is the defect this file keeps finding.
+    if !waiting.isHidden {
+      let new = SheetRow("Call someone new")
+      items.append(new)
+      new.target = self; new.action = #selector(callSomeoneNewRow(_:))
+    }
+    let back = SheetRow("Back")
+    back.target = self; back.action = #selector(backToSettingsRow(_:))
+    items.append(back)
+    // ── ONE LEFT EDGE FOR THE WHOLE PAGE ──────────────────────────────────────
+    //
+    // A page of faces has a 34 pt mark column and the sheet's ordinary rows have an
+    // 18 pt one, so the two kinds of row start their words 14 points apart.
+    // Photographed, the list had a ragged left edge and read as two lists that
+    // happened to be adjacent. These two carry no glyph at all rather than a small
+    // one floating in a column built for a face -- the words are what they are, and
+    // the words line up with the names above them.
+    for r in items.compactMap({ $0 as? SheetRow }) where !(r is ContactRow) {
+      r.textInset = Metric.rowAvatarInset
+    }
+    sheet.setItems(items)
+  }
+
+  // ── THE RENAME PAGE ────────────────────────────────────────────────────────
+  //
+  // The field is pre-filled with the name this Mac answers to, claimed or not,
+  // because that is the string a person came here to edit. `Identity.handle` always
+  // has one -- a name derived from the Mac exists whether or not the server has
+  // ever heard of it -- so this page is never an empty box with no context.
+  private func buildRenamePage() {
+    var items: [NSView] = []
+    items.append(SheetHint("This is the name people type to call you."))
+    let f = SheetField(placeholder: "a name", text: Identity.handle)
+    // Enter commits. A field you have to go looking for a button after is a field
+    // people type into and then wonder why nothing happened.
+    f.onCommit = { [weak self] in self?.commitRename() }
+    items.append(f)
+    let save = SheetRow("Save this name")
+    save.target = self; save.action = #selector(saveNameRow(_:))
+    items.append(save)
+    let back = SheetRow("Not now")
+    back.target = self; back.action = #selector(backToSettingsRow(_:))
+    items.append(back)
+    items.append(SheetHint("Letters and numbers, starting with a letter."))
+    sheet.setItems(items)
+    // The caret goes in without anybody having to aim at a 36 pt well. Deferred
+    // one turn: the field is not in a window until this layout pass completes, and
+    // `makeFirstResponder` on a view with no window silently does nothing.
+    DispatchQueue.main.async { [weak self] in
+      guard let self, let field = self.sheet.field else { return }
+      self.window?.makeFirstResponder(field.field)
+      // ── AND THE OLD NAME IS SELECTED, NOT SITTING THERE WAITING ──────────────
+      //
+      // `makeFirstResponder` alone leaves the caret at the end, so the first thing
+      // typed is APPENDED: somebody who came here to become `meera` got
+      // `deveshmeera`, and the harness proved it before a person could. Every
+      // rename field on this platform behaves the other way -- the value is
+      // selected, and typing replaces it -- because the reason you opened it is
+      // that the current value is not the one you want.
+      field.field.currentEditor()?.selectAll(nil)
+    }
+  }
+
+  @objc private func peopleRow(_ sender: SheetRow) {
+    Metrics.tap("people")
+    openPeople()
+  }
+
+  @objc private func backToSettingsRow(_ sender: SheetRow) {
+    Metrics.tap("people_back")
+    showPage(.settings, opening: false)
+  }
+
+  @objc private func renameRow(_ sender: SheetRow) {
+    Metrics.tap("rename_open")
+    showPage(.rename, opening: true)
+  }
+
+  @objc private func saveNameRow(_ sender: SheetRow) { commitRename() }
+
+  @objc private func callSomeoneNewRow(_ sender: SheetRow) { callSomeoneNew() }
+
+  func callSomeoneNew() {
+    closeMore()
+    // Reported, because "the row fired" and "there is a caret in the field" are two
+    // different claims and only the second one is the feature.
+    Metrics.tap("call_new", ok: waiting.focusDial())
+  }
+
+  /// A face was tapped. Everything after this is `dial`'s -- the same path the
+  /// name field takes, so a contact call and a typed call cannot drift into
+  /// meaning different things.
+  @objc private func callContactRow(_ sender: SheetRow) {
+    guard let row = sender as? ContactRow else { return }
+    Metrics.tap("call_contact")
+    closeMore()
+    dial(row.handleName)
+  }
+
+  // ── CHANGING YOUR NAME ─────────────────────────────────────────────────────
+  //
+  // The server is the authority and it answers on its own schedule, so this says
+  // what was ASKED FOR and then what came back. The name in the sheet does not move
+  // until `setHandle` arrives -- the same rule the Silent switch follows, and for
+  // the same reason: telling somebody they are `@meera` when the server still has
+  // that name bound to a stranger's key is the one error here that matters.
+  private func commitRename() {
+    guard let want = sheet.field?.text else { return }
+    guard let name = Identity.sanitize(want.hasPrefix("@") ? String(want.dropFirst()) : want) else {
+      Metrics.tap("rename", ok: false)
+      setStatus("that is not a name")
+      return
+    }
+    guard let ask = onRenameHandle else {
+      // A callback declared and invoked but assigned NOWHERE reads as finished and
+      // does nothing -- three instances in this file's history, one of them the
+      // whole of "the selfie feature is not working". If this ever fires it is a
+      // wiring bug, so it is loud on stderr and honest on screen rather than a row
+      // that silently swallows a press.
+      Metrics.tap("rename", ok: false)
+      fputs("rename: nothing is wired to onRenameHandle -- the row cannot work\n", stderr)
+      setStatus("cannot change your name right now")
+      return
+    }
+    Metrics.tap("rename")
+    setStatus("asking for @\(name)…")
+    ask(name)
+  }
+
+  /// The answer, in plain words. Three refusals and three different things to do
+  /// about them, which is why `Identity.renamed` reports which one it was instead
+  /// of a boolean that can only ever produce the vaguest of the three.
+  func renameAnswered(_ outcome: Identity.Renamed, name: String) {
+    onMain { [weak self] in
+      guard let self else { return }
+      switch outcome {
+      case .ok:
+        self.setStatus("you are @\(name)")
+        self.closeMore()
+      case .taken:
+        self.setStatus("@\(name) belongs to someone else")
+      case .notAName:
+        self.setStatus("that is not a name")
+      case .noAnswer:
+        self.setStatus("could not reach the internet — try again")
+      }
+    }
   }
 
   // `inviteFromSheet` was here, the sheet row's action. The row is gone; `invite()`
@@ -2308,16 +2944,137 @@ final class CallControls: NSView {
   }
 
   private var leaveTimer: Timer?
+
+  // ── HOLDING THE RED BUTTON ENDS THE CALL ───────────────────────────────────
+  //
+  // Asked for as "a long press on the red thing should disconnect instead of you
+  // having to click twice". It is built as an ADDITION rather than a replacement,
+  // and that is the one judgement call in this gesture.
+  //
+  // Consider the person who does not know it: they tap the red button, get a pill,
+  // and tap again. Today that hangs up. If the hold REPLACED the confirm, that
+  // second tap would do nothing, and the app would look broken at the one moment it
+  // must not. Somebody who learns the hold never sees the fallback, so it costs
+  // them nothing; somebody who does not is never stranded. It also keeps
+  // `--press leave,leave` and Command-Delete working, and a rig that silently
+  // stopped hanging up would take a long time to notice.
+  //
+  /// 600 ms. Far enough from peek's 220 ms that muscle memory trained on one
+  /// cannot end a call with the other -- 2.7x -- and above the 500 ms long-press
+  /// convention people already know from the phone in their pocket, so it reads as
+  /// a gesture rather than as a slow click. Well under the 3 s disarm below, so the
+  /// pill can never expire under a finger mid-hold.
+  /// ── AND ITS RIG OVERRIDE, WHICH IS NOT CONVENIENCE ────────────────────────
+  ///
+  /// A 600 ms fill cannot be photographed. `screencapture` takes about a second to
+  /// arm, and `--press` steps are 700 ms apart, so every instrument this project
+  /// has arrives after the hold has either completed or been let go -- and the one
+  /// thing worth looking at, a pill half full under a finger, is invisible to all
+  /// of them. Stretching the cadence is the same move `TK_REDUCE_TRANSPARENCY` and
+  /// `TK_KIN_DIR` make, for the same reason: the state exists, and without an
+  /// override no honest capture can reach it.
+  ///
+  ///     TK_LEAVE_HOLD_MS=30000 tk --window --press "@leave:25,?"
+  ///
+  /// Nothing in the app sets it, and the shipped number is the one above.
+  static let leaveHoldSeconds: TimeInterval =
+    (ProcessInfo.processInfo.environment["TK_LEAVE_HOLD_MS"].flatMap { Double($0) }
+       .map { $0 / 1000 }) ?? 0.6
+  /// Three seconds, because an armed hang-up left on screen is a trap for the next
+  /// click that lands anywhere near it -- but never less than the hold plus room to
+  /// spare, or the disarm fires under a finger that is still pressing.
+  static var leaveForgetSeconds: TimeInterval { max(3.0, leaveHoldSeconds * 5) }
+  /// ~30 Hz, and in `.common` modes because it has to keep firing during event
+  /// tracking -- which is the mode a `mouseDown` puts the runloop into. A timer
+  /// rather than a nested `nextEvent` loop because a hold must not own the main
+  /// thread: six seconds of holding peek once enqueued 169 frames into a visible
+  /// layer and drew a black rectangle, because Core Animation never got a turn.
+  private static let leaveFillTick: TimeInterval = 1.0 / 30
+  private var fillTimer: Timer?
+  private var holdStart: Date?
+  /// Was the pill already armed when this press went down? The answer decides
+  /// whether the release hangs up, and it has to be sampled at `mouseDown` --
+  /// `mouseDown` itself arms the pill, so reading `leaveArmed` at release time
+  /// would say "armed" for the very first press and end a call on one click.
+  private var leaveArmedAtDown = false
+
+  private func leaveHold(_ down: Bool) {
+    guard down else { stopLeaveFill(); return }
+    leaveArmedAtDown = leaveArmed
+    if !leaveArmed { arm(label: "hold to leave") }
+    // ── A HOLD MAY NOT FIRE ON A WINDOW NOBODY WAS LOOKING AT ─────────────────
+    //
+    // `acceptsFirstMouse` is true on every button here so a click that arrives
+    // while the app is behind something still counts, and that is right: "mute me
+    // now" is pressed precisely when this window is not the one you were typing in.
+    // But it turns a click-and-hold that only meant to bring the app forward into
+    // an ended call. The press still activates and still arms -- the pill draws, so
+    // nothing looks dead -- and the hold is available from the second press on.
+    guard leaveButton.keyAtDown else { return }
+    startLeaveFill()
+  }
+
+  /// A release inside the tap window. The FIRST press only arms, because arming is
+  /// what `mouseDown` already did; the second one is the confirmation.
+  private func leaveTap() {
+    guard leaveArmedAtDown else { return }
+    Metrics.tap("leave_confirm")
+    leaveNow()
+  }
+
+  private func startLeaveFill() {
+    fillTimer?.invalidate()
+    holdStart = Date()
+    let t = Timer(timeInterval: CallControls.leaveFillTick, repeats: true) { [weak self] timer in
+      guard let self, let start = self.holdStart else { timer.invalidate(); return }
+      let k = Date().timeIntervalSince(start) / CallControls.leaveHoldSeconds
+      self.leaveButton.holdProgress = CGFloat(min(1, k))
+      guard k >= 1 else { return }
+      timer.invalidate()
+      Metrics.tap("leave_hold")
+      self.leaveNow()
+    }
+    fillTimer = t
+    RunLoop.main.add(t, forMode: .common)
+  }
+
+  /// Released early, or Escape, or the disarm. The fill resets and the pill STAYS
+  /// armed for the rest of its three seconds, so somebody who under-held sees the
+  /// target still sitting there and simply presses again.
+  private func stopLeaveFill() {
+    fillTimer?.invalidate()
+    fillTimer = nil
+    holdStart = nil
+    leaveButton.holdProgress = 0
+  }
+
+  /// End the call on the first invocation, with no pill in the way. For anything
+  /// that is already an explicit, deliberate, named act.
+  func leaveNow() {
+    cancelLeaveConfirm()
+    onLeave?()
+  }
+
   @objc func leave() {
-    Metrics.tap(leaveArmed ? "leave_confirm" : "leave_arm")
     if leaveArmed {
-      cancelLeaveConfirm()
-      onLeave?()
+      Metrics.tap("leave_confirm")
+      leaveNow()
       return
     }
+    // "tap", not "hold": this path is the menu item, the keyboard and the rig,
+    // none of which can hold anything. A pill teaching a gesture the thing that
+    // armed it cannot perform is a control lying about its own way out.
+    arm(label: "tap to leave")
+  }
+
+  private func arm(label: String) {
+    // Counted HERE and not in `leave()`, because a press on the button arms
+    // through `mouseDown` and never goes near `leave()` at all -- the one route a
+    // person actually takes was the one route the counter could not see.
+    Metrics.tap("leave_arm")
     leaveArmed = true
     leaveButton.confirming = true
-    leaveButton.confirmLabel = "tap to leave"
+    leaveButton.confirmLabel = label
     showBar(pin: true)
     // ── THE ROW FLOWS INTO THE DECISION ───────────────────────────────────────
     //
@@ -2338,7 +3095,18 @@ final class CallControls: NSView {
     // Three seconds and it forgets, because an armed hang-up left on screen is a
     // trap for the next click that lands anywhere near it.
     leaveTimer?.invalidate()
-    leaveTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+    // ── AND IT MUST OUTLAST THE GESTURE IT IS WAITING FOR ─────────────────────
+    //
+    // This was a bare 3.0, which is right by a comfortable margin at a 600 ms hold
+    // and is a gesture that can NEVER COMPLETE the moment the hold goes past it:
+    // the disarm cancels the pill, `cancelLeaveConfirm` stops the fill, and the
+    // finger is still down on a button that has quietly given up. Found by
+    // stretching the hold to photograph it -- the rig override made the impossible
+    // condition real, and the pill vanished mid-hold in the first shot taken of it.
+    //
+    // Derived rather than documented, so the two numbers cannot be edited apart.
+    leaveTimer = Timer.scheduledTimer(withTimeInterval: CallControls.leaveForgetSeconds,
+                                      repeats: false) { [weak self] _ in
       self?.cancelLeaveConfirm()
     }
   }
@@ -2382,8 +3150,13 @@ final class CallControls: NSView {
   }
 
   func cancelLeaveConfirm() {
+    // Unconditional, and BEFORE the guard. Escape clears the pill by calling this,
+    // and a fill left running behind a cleared pill would travel on toward a
+    // hang-up with nothing on screen saying so.
+    stopLeaveFill()
     guard leaveArmed else { return }
     leaveArmed = false
+    leaveArmedAtDown = false
     leaveTimer?.invalidate()
     leaveButton.confirming = false
     // Back to five separate targets. The merge is for the moment of change; at rest
@@ -2419,10 +3192,26 @@ final class CallControls: NSView {
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"
       + "  more=\(moreOpen ? "open" : "closed") peek=\(peeking)\(peekButton.holding ? "/held" : "")"
-      + "  leave=\(leaveArmed ? "ARMED" : "idle") bar=\(barShown ? "shown" : "hidden")"
+      // A CUMULATIVE count, not a flag. A boolean sampled after the fact is a birth
+      // certificate rather than a health record, and only a count can show that one
+      // press did not classify as both a tap and a hold.
+      + " peektap=\(peekButton.taps)"
+      // The existing field EXTENDED rather than a second one beside it, because two
+      // fields describing one control are two fields that can disagree. A
+      // percentage is the only way a fill can be asserted without a screenshot.
+      + "  leave=\(leaveState) bar=\(barShown ? "shown" : "hidden")"
+      + "  handle=\(handle.isEmpty ? "-" : handle) people=\(people.count)"
       + "  clip=\(NSPasteboard.general.string(forType: .string) ?? "-")"
       + "  \(cues.describe)"
-      + (moreOpen ? "\n  sheet=[" + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]" : "")
+      + (moreOpen ? "\n  sheet=\(sheetPage.rawValue)["
+                  + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]"
+                  + (sheet.field.map { " field=\"\($0.text)\"" } ?? "") : "")
+  }
+
+  private var leaveState: String {
+    guard leaveArmed else { return "idle" }
+    guard leaveButton.holdProgress > 0 else { return "ARMED" }
+    return "HOLDING:\(Int((leaveButton.holdProgress * 100).rounded()))"
   }
 
   /// --press mic,cam,invite,leave,echo,cam#2 -- exercise the wiring before
@@ -2507,6 +3296,41 @@ final class CallControls: NSView {
     case "more": toggleMore()
     case "leave": leave()
     case "unleave": cancelLeaveConfirm()
+    // ── THE THREE GESTURES, WITHOUT A POINTER ─────────────────────────────────
+    //
+    // These exist beside the `@` clicks rather than instead of them. A `@` click is
+    // the only thing that can catch a control a finger cannot reach; a token is the
+    // only thing that can drive a control which is not on screen at all -- the
+    // people panel on an audio-only call, or the rename page's Save row before
+    // anybody has opened the panel.
+    case "peek-tap": peekButton.simulateTap()
+    case "leave-hold":
+      leaveButton.simulateHold(true)
+      leaveHold(true)
+    case "leave-hold-cancel":
+      leaveHold(false)
+      leaveButton.simulateHold(false)
+    case "people": openPeople()
+    case "people-back": showPage(.settings, opening: false)
+    case "rename": showPage(.rename, opening: true)
+    case "rename-save": commitRename()
+    case "handle-copy": copyHandle()
+    case "call-new": callSomeoneNew()
+    // Mirrors `cam#N`, INCLUDING its loud refusal. A token that quietly does
+    // nothing for an out-of-range index is a test that passes by not running.
+    //
+    // Reads the SOURCE rather than `people`, which is only filled once the panel
+    // has been built: a token that silently needed a previous token would be a
+    // dependency nobody wrote down.
+    case let c where c.hasPrefix("contact#"):
+      let list = Array(Identity.contactHandles().prefix(CallControls.peopleShown))
+      guard let n = Int(c.dropFirst(8)), n >= 1, n <= list.count else {
+        fputs("press: no contact \(what) -- this Mac knows \(list.count)"
+            + " (use --contacts-fake to give it some)\n", stderr)
+        return
+      }
+      closeMore()
+      dial(list[n - 1])
     case "quality": markConnected(); setQuality(m2eMs: 11, concealPct: 0, lossPct: 0)
     // ── THE TURN LAYER, EXERCISED ─────────────────────────────────────────────
     //
@@ -2571,11 +3395,31 @@ extension CallControls {
             !v.frame.isEmpty else { return }
       out.append((n, v))
     }
-    add("mic", micButton); add("cam", camButton); add("peek", peekButton)
-    add("flip", flipButton); add("leave", leaveButton)
-    add("more", moreButton)
-    if moreOpen { for (i, r) in sheet.rows.enumerated() where r.isEnabled { add("row#\(i)", r) } }
-    if !waiting.isHidden { for (n, v) in waiting.clickTargets { add(n, v) } }
+    // ── AN OPEN SHEET REALLY DOES TAKE THE BAR AWAY ───────────────────────────
+    //
+    // `sheetScrim` fills the window and sits ABOVE the row, so while the panel is
+    // open a click at mic's centre closes the sheet instead of muting. That is
+    // correct -- a click anywhere outside the panel is how it closes, and that exit
+    // needs no aiming -- but listing the bar buttons anyway made the audit print
+    // five FAILs for a screen behaving exactly as designed.
+    //
+    // The defect was in the INSTRUMENT, not the product: `clickTargets` is
+    // documented as what is on screen right now, and a button under a scrim is not
+    // something a person can press. An audit that cries wolf about a working screen
+    // is an audit nobody reads the day it is right.
+    if !moreOpen {
+      add("mic", micButton); add("cam", camButton); add("peek", peekButton)
+      add("flip", flipButton); add("leave", leaveButton)
+      add("more", moreButton)
+    } else {
+      for (i, r) in sheet.rows.enumerated() where r.isEnabled { add("row#\(i)", r) }
+      // The one thing in a sheet that is typed into rather than pressed. Named, so
+      // `@name` focuses it and `+meera` has somewhere to land.
+      if let f = sheet.field { add("name", f) }
+    }
+    // Under the scrim too, for the same reason and with the same consequence: while
+    // the panel is open, a click on `copy` closes the panel rather than copying.
+    if !waiting.isHidden, !moreOpen { for (n, v) in waiting.clickTargets { add(n, v) } }
     return out
   }
 
