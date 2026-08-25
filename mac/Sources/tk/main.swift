@@ -1991,33 +1991,62 @@ if flag("gate-test") {
   var mic = [Float](repeating: 0, count: n)
   for i in 0..<n { mic[i] = near[i] + couple * (i >= 400 ? far[i - 400] : 0) }
 
-  let g = Audio.DuplexGate()
-  g.cfg = Audio.gate
-  var out = mic
-  let blk = 128
-  out.withUnsafeMutableBufferPointer { op in
-    var i = 0
-    while i + blk <= n {
-      for k in i..<(i + blk) { g.noteFar(far[k]) }
-      g.process(op.baseAddress! + i, blk)
-      i += blk
+  // ── THE RIG PICKED ITS OWN BLOCK SIZE, WHICH IS HOW IT MISSED EVERYTHING ──
+  //
+  // This ran at 128 samples. The machine hands the gate SIXTEEN, and every
+  // smoothing constant in the classifier was written per block -- so the rig was
+  // testing a detector eight times slower than the one that ships, and passed it
+  // while the shipped one could not produce a single bid in a fourteen-second
+  // call. A rig that chooses a parameter the product does not choose is not
+  // testing the product.
+  //
+  // So it sweeps: 16 is what CoreAudio actually delivers here, 128 is what this
+  // test used to assume, 512 is a machine under load. All three have to pass,
+  // and the classifier has to reach the same verdict in all three.
+  var suppressed = 99.0, worstNear = 0.0, nearN = 0
+  var perBlock: [String] = []
+  var allOk = true
+  for blk in [16, 128, 512] {
+    let g = Audio.DuplexGate()
+    g.cfg = Audio.gate
+    var out = mic
+    out.withUnsafeMutableBufferPointer { op in
+      var i = 0
+      while i + blk <= n {
+        for k in i..<(i + blk) { g.noteFar(far[k]) }
+        g.process(op.baseAddress! + i, blk)
+        i += blk
+      }
     }
+    // Score the near-end stretches after the gate has had 200 ms to open.
+    var wn = 0.0, farOnlyE = 0.0, farOnlyRef = 0.0, nn = 0
+    for i in 0..<n {
+      let t = Double(i) / SR
+      let nearOn = nearSpans.contains { t >= $0.0 + 0.2 && t < $0.1 }
+      let farOnly = active(i, farSpans) && !active(i, nearSpans)
+      if nearOn, abs(mic[i]) > 1e-4 {
+        wn = max(wn, Double(abs(out[i] - mic[i]) / abs(mic[i]))); nn += 1
+      }
+      if farOnly {
+        farOnlyE += Double(out[i]) * Double(out[i])
+        farOnlyRef += Double(mic[i]) * Double(mic[i])
+      }
+    }
+    let sup = (farOnlyE > 0 && farOnlyRef > 0) ? 10 * log10(farOnlyRef / farOnlyE) : 99
+    // ── AND THE CLASSIFIER HAS TO CLASSIFY ───────────────────────────────────
+    //
+    // The near end talks for two full seconds here. Anything that calls that a
+    // listening noise is the defect this sweep exists to catch, and it is
+    // invisible to the suppression and identity numbers above -- both of which
+    // were green through the whole time the classifier was dead.
+    let sawBid = g.claims > 0
+    perBlock.append(String(format: "    %4d samples (%.2f ms): %.1f dB quieter, near voice %+.4f%%, %@",
+                           blk, Double(blk) / SR * 1000, sup, wn * 100,
+                           sawBid ? "\(g.claims) bid(s) seen" : "NO BID SEEN"))
+    if !sawBid { allOk = false }
+    if blk == 128 { suppressed = sup; worstNear = wn; nearN = nn }
   }
-  // Score the near-end stretches after the gate has had 200 ms to open.
-  var worstNear = 0.0, farOnlyE = 0.0, farOnlyRef = 0.0, nearN = 0
-  for i in 0..<n {
-    let t = Double(i) / SR
-    let nearOn = nearSpans.contains { t >= $0.0 + 0.2 && t < $0.1 }
-    let farOnly = active(i, farSpans) && !active(i, nearSpans)
-    if nearOn, abs(mic[i]) > 1e-4 {
-      worstNear = max(worstNear, Double(abs(out[i] - mic[i]) / abs(mic[i]))); nearN += 1
-    }
-    if farOnly {
-      farOnlyE += Double(out[i]) * Double(out[i])
-      farOnlyRef += Double(mic[i]) * Double(mic[i])
-    }
-  }
-  let suppressed = (farOnlyE > 0 && farOnlyRef > 0) ? 10 * log10(farOnlyRef / farOnlyE) : 99
+  for l in perBlock { print(l) }
   let untouched = worstNear < 0.001 && nearN > 1000
   print(String(format: "  while only they are talking, the microphone is %.1f dB quieter", suppressed))
   print(String(format: "  while you are talking, the worst sample differs by %.4f%% -- %@",
@@ -2030,12 +2059,14 @@ if flag("gate-test") {
   // to gate somebody mid-sentence. So the suppression bar applies to rooms
   // where suppression is possible, and above that the number is reported.
   let hard = couple > 0.55
-  let ok = untouched && (hard || suppressed > 15)
+  let ok = untouched && allOk && (hard || suppressed > 15)
   print(String(format: "  (room: microphone hears the speaker at %.0f%% of playout)", couple * 100))
   print(ok ? (hard
         ? "  GATE TEST PASSED -- a hard room: less echo held back, and still not one sample of your voice touched"
         : "  GATE TEST PASSED -- your voice is bit-for-bit what the microphone heard")
-     : "  GATE TEST FAILED" + (untouched ? " (it does not suppress enough)" : " (it altered the near voice)"))
+     : "  GATE TEST FAILED" + (!untouched ? " (it altered the near voice)"
+                              : !allOk ? " (the classifier never saw a bid at some block size)"
+                              : " (it does not suppress enough)"))
   exit(ok ? 0 : 1)
 }
 
@@ -2593,6 +2624,9 @@ wire.onSubtitle = { text, final, listening in
 // is owed a turn gets a cue that arrives quicker and pushes harder.
 wire.onPeerVocal = { v in
   display?.controls?.setFloor(peerVocal: v, nudge: audio.yieldNudge)
+  if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
+    fputs(String(format: "cue in  %.3f  peer -> %d\n", Date().timeIntervalSince1970, v), stderr)
+  }
 }
 
 if let subs = subtitles {
@@ -2630,17 +2664,24 @@ if let subs = subtitles {
   Thread {
     let cleaner = Audio.SubtitleCleaner()
     var wasVocal = false
+    var spokeFor = 0.0
     while !shuttingDown {
       Thread.sleep(forTimeInterval: 0.12)
       guard Audio.gate.on else { continue }
       let vocal = Audio.sharedGate.vocal != .quiet
-      // Latched across the utterance: it starts as a listening noise and stops
-      // being one the instant the classifier calls it a bid. Reading the gate at
-      // publish time instead would have labelled every escalation "listening",
-      // because a bid that grew out of a "mm-" is still a bid when the words
-      // arrive 300 ms later.
-      if !wasVocal, vocal { utteranceWasListening = true }
-      if Audio.sharedGate.vocal == .claim { utteranceWasListening = false }
+      // The gate latches this across the whole vocalisation, so this thread only
+      // reads it. It used to be derived HERE, from two samples 120 ms apart, and
+      // that is how six seconds of speech got labelled a listening noise and
+      // rendered as a bloom across the whole window: the poll saw `backchannel`
+      // at the start of the sentence and nothing later moved it.
+      //
+      // ONLY WHILE VOCAL. The gate clears the latch the moment somebody stops,
+      // and the FINAL revision of a sentence is published after that -- so
+      // reading it unconditionally re-labelled the last line of every turn a
+      // listening noise, which is the same bug wearing a different hat. Holding
+      // the last in-flight value is correct: it belongs to the utterance being
+      // transcribed, not to the silence after it.
+      if vocal { utteranceWasListening = !Audio.sharedGate.everClaimed }
       if let c = audio.subtitleChunk(), !c.mic.isEmpty {
         // Cleaned before it is recognised, because on speakers this microphone
         // also hears the far end and their words would otherwise land in this
@@ -2648,8 +2689,32 @@ if let subs = subtitles {
         let clean = cleaner.clean(mic: c.mic, ref: c.ref)
         clean.withUnsafeBufferPointer { subs.feed($0.baseAddress!, $0.count) }
       }
-      if vocal { subs.tick() }
-      else if wasVocal { subs.endUtterance() }
+      if vocal { subs.tick() } else if wasVocal { subs.endUtterance() }
+
+      // ── A SENTENCE ENDS WHEN IT LANDS, NOT WHEN THE ROOM GOES QUIET ─────────
+      //
+      // Waiting for silence is what made a long turn grow into a paragraph: the
+      // recogniser kept being handed a longer and longer window, the caption
+      // never committed, and the request cost climbed with it. Somebody talking
+      // steadily for a minute never produces the gap this was waiting for.
+      //
+      // Smart-turn already answers the right question and its answer was being
+      // stored and never used. It reads the WAVEFORM, so it hears the difference
+      // between a sentence that landed and one that trailed off -- which is
+      // exactly a sentence boundary, and is the thing no transcript can recover.
+      //
+      // The floor on `spokeFor` is there because a high probability on 300 ms of
+      // audio is a confident opinion about almost nothing.
+      spokeFor = vocal ? spokeFor + 0.12 : 0
+      if vocal, spokeFor > 1.2, turnComplete > 0.75 {
+        subs.endUtterance()
+        spokeFor = 0
+        // Consumed. The probability belongs to the response that produced it, and
+        // leaving it high would end the next sentence 1.2 s in whether or not it
+        // had landed -- chopping a steady talker into fixed-length pieces, which
+        // is the failure this was fixing.
+        turnComplete = 0
+      }
       wasVocal = vocal
     }
   }.start()
@@ -2743,11 +2808,34 @@ Thread {
   // the first honest number arrives within a second or two of the call starting;
   // after that a probe a second is plenty to track drift between two crystals,
   // which is parts per million.
-  var n = 0
+  // Time-based rather than counted, because the wait below can now end early and
+  // a counter would shorten the warm-up by however often somebody spoke.
+  let fastUntil = Date().addingTimeInterval(3.6)
   while true {
     wire.sendTimeProbe()
-    n += 1
-    Thread.sleep(forTimeInterval: n < 24 ? 0.15 : 1.0)
+    // ── THE CUE CANNOT WAIT FOR THE NEXT SECOND ──────────────────────────────
+    //
+    // The far end's floor state rides this packet, and this packet settles to one
+    // a second. A cue whose entire claim is that it lands inside a syllable was
+    // therefore arriving up to a second after the syllable, and on a live call it
+    // showed a listening noise through six seconds of somebody talking.
+    //
+    // So the wait is broken into 20 ms slices and ends the moment the
+    // classification moves -- the next line of the loop is the probe. 20 ms is a
+    // twentieth of the shortest listening noise and a fiftieth of a bid, under
+    // the resolution of the thing being reported, and this thread is asleep for
+    // every one of those slices.
+    let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 1.0)
+    while Date() < until {
+      Thread.sleep(forTimeInterval: 0.02)
+      if wire.vocalChanged() {
+        if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
+          fputs(String(format: "cue out %.3f  me -> %d\n", Date().timeIntervalSince1970,
+                       Audio.sharedGate.vocal.rawValue), stderr)
+        }
+        break
+      }
+    }
     if let th = tsync.thetaNs {
       audio.thetaMs = Double(th) / 1e6
       audio.thetaValid = true
@@ -3667,7 +3755,14 @@ func reportLoop() {
     let held = String(format: "%.0f", audio.floorHeldPct)
     let ttf = audio.timeToFloorP50 >= 0 ? String(format: "%.0f ms", audio.timeToFloorP50) : "-"
     fputs("  floor: yours \(held)% of the call, \(t.backchannels) listening noises,"
-        + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)\n", stderr)
+        + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)"
+        + "  now \(["quiet", "listening", "bidding"][Audio.sharedGate.vocal.rawValue])"
+        + (subtitles.map { "  words: \($0.requests) asked, \($0.failures) failed,"
+                         + " \(String(format: "%.0f", $0.lastMs)) ms, \(subSent) sent \(subGot) got" } ?? "")
+        + "\n", stderr)
+    if ProcessInfo.processInfo.environment["KIN_GATE_DEBUG"] != nil {
+      fputs("  gate: \(Audio.sharedGate.innards)\n", stderr)
+    }
     if t.collisions > 0 || t.gateFlaps > 0 {
       let avg = t.collisions > 0 ? String(format: "%.0f ms", t.collisionMs / Double(t.collisions)) : "-"
       fputs("  overlap: \(t.collisions) times both talking, \(avg) each"

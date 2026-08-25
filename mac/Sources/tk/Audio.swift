@@ -763,6 +763,7 @@ final class Audio {
   private(set) var turns = Turns()
   private var claimStart: UInt64 = 0
   private var claimPending = false
+  private var lastVocal = DuplexGate.Vocal.quiet
   private var collisionStart: UInt64 = 0
   private var pendingYield: UInt64 = 0
   private var lastOpenAt: UInt64 = 0
@@ -774,18 +775,40 @@ final class Audio {
     let now = Clock.now()
     let mine = dgate.vocal
 
-    // A bid, and how long until it was actually heard.
+    // ── A BID IS AN EDGE, NOT A STATE ───────────────────────────────────────
+    //
+    // This tested `mine == .claim, !claimPending`, and `claimPending` is cleared
+    // by the very next line as soon as the microphone is audible -- which, when
+    // nobody else is talking, is the SAME block. So every block of a sentence
+    // opened a fresh bid and closed it: one six-second sentence was recorded as
+    // 2,935 bids, all granted in a median of 0 ms.
+    //
+    // Two things were wrong and only one of them was cosmetic. The count was
+    // nonsense, and `timeToFloorMs` grew by one entry per capture block -- three
+    // thousand a second, sorted once a second by the report line. An hour-long
+    // call would have been ten million Doubles and a quadratic-looking report
+    // thread.
+    //
+    // So it latches on the CHANGE. A bid begins when the classifier says so and
+    // ends when the vocalisation does.
     turns.backchannels = dgate.backchannels
-    if mine == .claim, !claimPending {
-      claimPending = true; claimStart = now; turns.claims += 1
-      if dgate.backchannels > 0 && dgate.vocalWasBackchannel { turns.escalated += 1 }
+    if mine != lastVocal {
+      if mine == .claim {
+        claimPending = true; claimStart = now; turns.claims += 1
+        if dgate.vocalWasBackchannel { turns.escalated += 1 }
+      }
+      if mine == .quiet { claimPending = false }
+      lastVocal = mine
     }
     if claimPending, audible {
       turns.claimsGranted += 1
-      turns.timeToFloorMs.append(Clock.ms(now - claimStart))
+      // Bounded. This is a distribution, not a log: a few thousand samples
+      // describe it as well as a million and cannot become a leak.
+      if turns.timeToFloorMs.count < 4096 {
+        turns.timeToFloorMs.append(Clock.ms(now - claimStart))
+      }
       claimPending = false
     }
-    if mine == .quiet { claimPending = false }
 
     // A collision, and who ended it.
     judgeContest(now: now, mineVocal: mine != .quiet, peerVocal: peerVocal)
@@ -1403,15 +1426,17 @@ final class Audio {
     // slowly, so it settles into a quiet room in a moment but a cough cannot drag
     // it up over speech; two consecutive loud frames are required, which is what
     // keeps key clicks and lip noise out.
-    private var level: Float = 0
     private var nearEnv: Float = 0
     private var floor: Float = 0.004
     private var run = 0
     private var farEnv: Float = 0
     private var coupling: Float = 0.5
     private var farRun = 0
-    private var voicedBlocks = 0
-    private var quietBlocks = 0
+    /// Samples since this vocalisation began, and CONSECUTIVE quiet samples since
+    /// the last confirmed voice inside it. Both in samples, so no block size can
+    /// change what they mean.
+    private var vocalSamples = 0
+    private var quietSamples = 0
     private(set) var gain: Float = 1
     private(set) var closedFrames = 0
     private(set) var openFrames = 0
@@ -1421,6 +1446,29 @@ final class Audio {
     /// that escalated from one is a different event from a bid that began as
     /// one, and only the first says the classifier hesitated.
     private(set) var vocalWasBackchannel = false
+    /// ── DID THIS VOCALISATION EVER BECOME A BID ───────────────────────────────
+    ///
+    /// Latched here rather than sampled by whoever needs it. Recognition finishes
+    /// after the sound does, so the thing that publishes the words is asking a
+    /// question about a moment that has already passed -- and the subtitle thread,
+    /// which polls every 120 ms, could look twice at the start of a sentence,
+    /// see `backchannel` both times, and label an entire paragraph a listening
+    /// noise. Photographed on a live call: six seconds of speech blooming across
+    /// the window in 30 pt.
+    ///
+    /// The gate sees every block. It knows.
+    private(set) var everClaimed = false
+
+    /// What the classifier is actually looking at. Read once a second by the
+    /// report line under KIN_GATE_DEBUG; nothing on the call path reads them.
+    /// A detector that will not fire is not debuggable from its output.
+    var innards: String {
+      String(format: "n=%d going=%.0fms quiet=%.0fms near=%.4f floor=%.4f "
+                   + "far=%.4f coup=%.2f run=%d vocal=%d",
+             lastN, Double(vocalSamples) / SR * 1000, Double(quietSamples) / SR * 1000,
+             nearEnv, floor, farEnv, coupling, run, vocal.rawValue)
+    }
+    private var lastN = 0
 
     @inline(__always) func noteFar(_ v: Float) {
       let a = abs(v)
@@ -1429,28 +1477,42 @@ final class Audio {
 
     func process(_ x: UnsafeMutablePointer<Float>, _ n: Int) {
       guard cfg.on else { vocal = .quiet; return }
-      // TWO MEASURES, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. The peak envelope
-      // is what the echo comparison uses, and it must be the same KIND of number
-      // as the far-end envelope it is divided by -- pairing an RMS with a peak
-      // made the learned coupling drift low, the expected echo come out
-      // under-estimated, and the gate read its own echo as somebody talking.
-      // Suppression fell from 19.2 dB to 0.2. The smoothed RMS and its floor
-      // stay, as the absolute-silence guard for a room with no echo in it.
-      var sum: Float = 0
+      // ── EVERY CONSTANT HERE IS A TIME, NOT A PER-BLOCK NUMBER ────────────────
+      //
+      // This is the third instance of the bug class in this project and the most
+      // expensive: a smoothing coefficient written per BLOCK is only correct at
+      // the block size it was tuned at. These were tuned against a 128-sample rig
+      // block (2.67 ms) and the machine delivers SIXTEEN samples (0.33 ms), so
+      // every one of them ran eight times too fast.
+      //
+      // What that did, measured on a live call: the "noise floor" reached the
+      // level of the speech in 170 ms, so `aboveRoom` went false in the middle of
+      // a sentence; the classifier could then never accumulate its 700 ms and the
+      // far end saw a LISTENING NOISE through six seconds of somebody talking.
+      // Zero bids in a fourteen-second call, on a detector whose whole job is to
+      // notice bids.
+      //
+      // The rig could not see it because the rig chose its own block size. It
+      // sweeps the real one now.
+      let dt = Double(n) / SR
+      lastN = n
       var peak: Float = 0
-      for k in 0..<n {
-        sum += x[k] * x[k]
-        let a = abs(x[k]); if a > peak { peak = a }
-      }
-      let rms = (sum / Float(n)).squareRoot()
-      level += (rms - level) * 0.35
-      nearEnv = peak > nearEnv ? peak : nearEnv * 0.93   // 35 ms, matching the far side
-      // The floor tracks the SAME measure it will be compared against. Tracking
-      // it on the RMS and testing the peak against it is a factor of two or
-      // three of pure unit error, and it read as the room being loud enough to
-      // be somebody talking -- 0.4 dB of suppression instead of 19.
-      if nearEnv < floor { floor += (nearEnv - floor) * 0.25 }
-      else               { floor += (nearEnv - floor) * 0.002 }
+      for k in 0..<n { let a = abs(x[k]); if a > peak { peak = a } }
+      // 35 ms, matching the far side -- and now actually 35 ms rather than
+      // "0.93 per block", which was 4.6 ms on this machine.
+      let envA = Float(exp(-dt / 0.035))
+      nearEnv = peak > nearEnv ? peak : nearEnv * envA
+      // ── A FLOOR THAT RISES DURING SPEECH IS NOT A FLOOR ─────────────────────
+      //
+      // It falls fast, so it settles into a quiet room in a moment, and it rises
+      // slowly, so a cough cannot drag it up over a voice. The second half only
+      // works if it also refuses to rise WHILE somebody is talking: this is a
+      // noise tracker, and speech is not noise. Bootstrapping is fine -- the
+      // floor starts low, so the first voice is detected, so the floor holds --
+      // and there is a very slow rise even during voice so a genuinely loud room
+      // can still lift it rather than latching the detector on forever.
+      let fallK = Float(1 - exp(-dt / 0.15))
+      if nearEnv < floor { floor += (nearEnv - floor) * fallK }
       let far = farEnv
       let farTalking = far > 0.004
       farRun = farTalking ? farRun + n : 0
@@ -1461,7 +1523,10 @@ final class Audio {
       // again. One transient, latched forever.
       if farTalking, farRun > Int(SR * 0.08), nearEnv > 0.0008 {
         let r = min(max(nearEnv / max(far, 1e-6), 0.002), 4)
-        coupling = r < coupling ? r : min(coupling * 1.00002, 4)
+        // 3% a second of upward creep, so a room that gets more reflective is
+        // followed, expressed as a rate rather than as "1.00002 per block" --
+        // which was 6% a second on this machine and 0.75% on the rig.
+        coupling = r < coupling ? r : min(coupling * Float(exp(0.03 * dt)), 4)
       }
 
       // THE BAR MOVES WITH WHAT THE SPEAKER IS EMITTING. A fixed one is deaf
@@ -1490,12 +1555,19 @@ final class Audio {
       let effMargin = max(1.35, cfg.margin - 1.5 * coupling)
       let aboveEcho = nearEnv > expected * effMargin
       let aboveRoom = nearEnv > max(floor * 4.0, 0.006)
-      if aboveEcho && aboveRoom {
-        run += 1
-        if run >= 2 { voicedBlocks += 1; quietBlocks = 0 }
-      } else {
-        run = 0
-        if voicedBlocks > 0 { quietBlocks += 1 }
+      // TWO CONSECUTIVE BLOCKS was the rule, and two blocks is 5.3 ms on the rig
+      // and 0.67 ms on the machine -- less than a single glottal period, so it
+      // meant nothing there. It is 4 ms of continuous voice now, at any block
+      // size, which is what it was always trying to say.
+      let needed = max(2, Int((0.004 / dt).rounded(.up)))
+      let voiced = aboveEcho && aboveRoom
+      if voiced { run += 1 } else { run = 0 }
+      let confirmed = run >= needed
+      // The floor rises only when this is NOT somebody talking -- 2 s to settle
+      // into a room, and a 60 s creep even during speech so a detector that has
+      // latched on to a loud room can still climb out of it.
+      if nearEnv > floor {
+        floor += (nearEnv - floor) * Float(1 - exp(-dt / (confirmed ? 60 : 2)))
       }
 
       // ── BACKCHANNEL OR A BID FOR THE FLOOR ───────────────────────────────
@@ -1506,13 +1578,28 @@ final class Audio {
       // on purpose: mistaking a bid for a continuer costs a person their turn,
       // and mistaking a continuer for a bid costs a cue that was going to
       // disappear anyway.
-      let voicedMs = Double(voicedBlocks) * Double(n) / SR * 1000
-      let quietMs = Double(quietBlocks) * Double(n) / SR * 1000
-      if voicedBlocks > 0, voicedMs >= cfg.claimMs { promote(.claim) }
-      else if voicedBlocks > 0 { promote(.backchannel) }
+      // ── HOW LONG THEY HAVE BEEN GOING, AND HOW LONG THEY HAVE STOPPED ──────
+      //
+      // Both were counts of blocks, and both were wrong in the same way. A bid is
+      // "you have been talking for 700 ms" -- WALL CLOCK -- not "700 ms worth of
+      // blocks were above the bar", because ordinary speech is only voiced maybe
+      // half the time at a third of a millisecond's resolution and the other half
+      // was being counted as silence. On the machine that made `quietMs` reach
+      // 450 before `voicedMs` reached 700, every single time, so the classifier
+      // could not physically produce a bid.
+      //
+      // And silence has to be CONSECUTIVE. Accumulating every quiet block since
+      // the vocalisation began adds up the gaps between syllables and ends a turn
+      // in the middle of a sentence.
+      if confirmed, vocalSamples == 0 { vocalSamples = 1 }
+      if vocalSamples > 0 { vocalSamples += n }
+      if confirmed { quietSamples = 0 } else if vocalSamples > 0 { quietSamples += n }
+      let vocalMs = Double(vocalSamples) / SR * 1000
+      let quietMs = Double(quietSamples) / SR * 1000
+      if vocalSamples > 0 { promote(vocalMs >= cfg.claimMs ? .claim : .backchannel) }
       // A gap longer than an ordinary mid-sentence pause ends it. 200-400 ms is
       // a pause inside a sentence; past that the person has stopped.
-      if quietMs > 450 { voicedBlocks = 0; quietBlocks = 0; promote(.quiet) }
+      if quietMs > 450 { vocalSamples = 0; quietSamples = 0; promote(.quiet) }
 
       // THE GATE OPENS ON VOICE, NOT ON THE VERDICT. Waiting for the classifier
       // to decide between a continuer and a bid means holding the microphone
@@ -1547,9 +1634,19 @@ final class Audio {
       // be a sentence becomes a claim, and a claim never quietly downgrades to a
       // continuer under somebody mid-word.
       if v.rawValue < vocal.rawValue && v != .quiet { return }
-      if v == .quiet { vocalWasBackchannel = false }
-      if v == .backchannel { backchannels += 1; vocalWasBackchannel = true }
-      if v == .claim { claims += 1 }
+      // ── A LISTENING NOISE IS ONE THAT STAYED ONE ────────────────────────────
+      //
+      // Counted on the way OUT, not on the way in. Every vocalisation begins as a
+      // continuer -- it has to, the classifier cannot know in the first
+      // millisecond -- so counting at `promote(.backchannel)` scored one
+      // "listening noise" for every sentence anybody ever said. The number that
+      // means something is how many of them never became a bid.
+      if v == .quiet {
+        if vocalWasBackchannel && !everClaimed { backchannels += 1 }
+        vocalWasBackchannel = false; everClaimed = false
+      }
+      if v == .backchannel { vocalWasBackchannel = true }
+      if v == .claim { claims += 1; everClaimed = true }
       vocal = v
     }
   }

@@ -885,6 +885,38 @@ final class Wire {
   /// 0 quiet, 1 listening noise, 2 bid for the floor. Fires only when it changes.
   var onPeerVocal: ((Int) -> Void)?
   private var lastVocalSent = -1
+
+  // ── THE STATE THE CUE RIDES ON, SENT WHEN IT CHANGES ──────────────────────
+  //
+  // Polled rather than pushed, because the thing that knows -- the duplex gate --
+  // runs inside the capture callback, and a socket write from a real-time audio
+  // thread is how this project has killed live calls before. So a plain thread
+  // watches the classification and sends a probe the moment it moves.
+  //
+  // A probe, not a new packet type: it already carries the whole state block, the
+  // far end already parses it, and an extra 32 bytes a few times a second is
+  // nothing next to a 3 Mbps call. It also buys a free clock sample.
+  private var lastVocalOut = -1
+  private var lastStateFlush: UInt64 = 0
+  /// Returns true if the classification has moved since the last flush and enough
+  /// time has passed to send another. Called from the watcher thread only.
+  func vocalChanged() -> Bool {
+    let v: Int
+    switch Audio.sharedGate.vocal {
+    case .quiet: v = 0
+    case .backchannel: v = 1
+    case .claim: v = 2
+    }
+    guard v != lastVocalOut else { return false }
+    // A floor under the rate, so a classifier chattering on a noisy microphone
+    // cannot turn into a packet storm. 15 ms is far below anything a person can
+    // see and far above anything a gate does in normal speech.
+    let now = Clock.now()
+    guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
+    lastVocalOut = v
+    lastStateFlush = now
+    return true
+  }
   /// Whether the far end reports at all. False means an older build, and the
   /// controller must then fall back to the local numbers and SAY SO -- a silent
   /// fallback to the wrong signal is the bug this field exists to fix.
@@ -909,8 +941,21 @@ final class Wire {
                  toByteOffset: TPKTX, as: UInt32.self)
     p.storeBytes(of: UInt8(selfMuted ? 1 : 0), toByteOffset: TPKTX + 4, as: UInt8.self)
     p.storeBytes(of: UInt8(truncatingIfNeeded: selfQLevel), toByteOffset: TPKTX + 5, as: UInt8.self)
-    // Read at packet time, not once a video frame: a cue that arrives a frame
-    // late is a cue that appears after the moment it was about to prevent.
+    // ── READ HERE, BUT SENT WHEN? ─────────────────────────────────────────────
+    //
+    // This used to say "read at packet time, not once a video frame", which was
+    // true about the READ and silent about the delivery -- and the delivery is the
+    // whole number. The only packet with a TPKTY payload is the time probe, and
+    // the probe settles to ONE A SECOND after the first few. So the cue that this
+    // design promises lands "one hop after they open their mouth" was arriving up
+    // to a second late, and on a live call it showed a listening noise through six
+    // seconds of somebody talking.
+    //
+    // Fixed by `wantsStateFlush` below: the state is still carried here, unchanged,
+    // and a watcher sends an EXTRA probe the moment the classification changes.
+    // Edge-triggered for speed, level-triggered once a second for repair -- so a
+    // dropped edge costs a second of staleness rather than a cue that is wrong for
+    // the rest of the call.
     let vocalBits: Int
     switch Audio.sharedGate.vocal {
     case .quiet:       vocalBits = 0

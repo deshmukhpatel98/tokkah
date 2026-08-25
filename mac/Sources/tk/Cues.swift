@@ -260,13 +260,32 @@ final class BloomLabel: NSView {
 
   private(set) var word = ""
 
+  /// ── WHAT COUNTS AS A NOISE RATHER THAN A SENTENCE ──────────────────────────
+  ///
+  /// A hard ceiling, checked HERE and not only where the routing decision is
+  /// made. On a live call the classifier mislabelled six seconds of speech as a
+  /// listening noise and this view rendered the whole paragraph at 30 pt, running
+  /// off both edges of the window. The classifier is now fixed; this guard is
+  /// what makes the drawing safe whatever the classifier decides next, because a
+  /// view that can be told to draw a paragraph in display type eventually will
+  /// be. Real continuers -- "mm-hmm", "yeah", "right", "okay", "sure", "oh wow"
+  /// -- are all comfortably inside this.
+  static let maxWords = 3
+  static let maxChars = 24
+
   /// Repeating the same noise does not restart the animation -- somebody saying
   /// "mm-hmm, mm-hmm" is one continuous act of listening, and a word that flashes
   /// twice reads as a bug. A DIFFERENT word does restart it.
-  func show(_ w: String) {
+  ///
+  /// Returns false if the text is too long to be a listening noise, so the caller
+  /// can put it where a sentence belongs instead of dropping it.
+  @discardableResult
+  func show(_ w: String) -> Bool {
     let clean = w.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !clean.isEmpty else { return }
-    if clean.caseInsensitiveCompare(word) == .orderedSame, alive { return }
+    guard !clean.isEmpty else { return false }
+    guard clean.count <= BloomLabel.maxChars,
+          clean.split(separator: " ").count <= BloomLabel.maxWords else { return false }
+    if clean.caseInsensitiveCompare(word) == .orderedSame, alive { return true }
     word = clean
     // ── A WORD WITH NO BOX HAS TO CARRY ITS OWN CONTRAST ──────────────────────
     //
@@ -293,9 +312,20 @@ final class BloomLabel: NSView {
     label.frame = NSRect(x: (bounds.width - w) / 2, y: 0, width: w, height: h)
     setFrameSize(NSSize(width: bounds.width, height: h))
     needsLayout = true
+    return true
   }
 
   var alive: Bool { born > 0 && CACurrentMediaTime() - born < BloomLabel.life }
+
+  /// Cut it short, leaving only the fade. Used when the caption band picks up the
+  /// same words: the first 700 ms of every turn is genuinely unclassifiable, so
+  /// the opening word blooms and then the sentence resolves underneath it -- and
+  /// seeing "Hey." twice, once large and once in the caption, reads as a glitch
+  /// rather than as the two things it is.
+  func retire() {
+    guard alive else { return }
+    born = CACurrentMediaTime() - (BloomLabel.life - 0.45)
+  }
 
   /// Returns the vertical offset it wants, so the owner can place it. Keeping the
   /// rise OUT of this view means the animation cannot fight the layout pass.
@@ -606,6 +636,14 @@ final class TurnCues: NSView {
   /// committed; it only changes how long the words linger.
   func setTheirs(_ text: String, final: Bool) {
     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    // The caption has taken over these words; the bloom was the first guess at
+    // them. Compared case- and punctuation-insensitively, because "Hey." blooms
+    // and "Hey, I'm sitting" is what the caption says next.
+    if bloom.alive, !t.isEmpty {
+      let head = bloom.word.lowercased().filter { $0.isLetter || $0.isNumber }
+      let body = t.lowercased().filter { $0.isLetter || $0.isNumber }
+      if !head.isEmpty, body.hasPrefix(head) { bloom.retire() }
+    }
     if t != band.theirText { theirsAt = CACurrentMediaTime() }
     band.theirText = t
     theirsFinal = final
@@ -624,8 +662,14 @@ final class TurnCues: NSView {
   }
 
   /// A listening noise, as a word. Nothing happens if it did not come with one --
-  /// the cue has already carried the fact of it.
-  func setListeningNoise(_ word: String) { bloom.show(word); wake() }
+  /// the cue has already carried the fact of it. Anything too long to BE a
+  /// listening noise falls through to the caption band rather than being dropped:
+  /// whatever the classifier believed, those are words somebody said and the
+  /// quiet side is not allowed to lose them.
+  func setListeningNoise(_ word: String) {
+    if bloom.show(word) { wake(); return }
+    setTheirs(word, final: false)
+  }
 
   func setFloor(peerVocal: Int, nudge: Double) {
     cue.vocal = peerVocal
