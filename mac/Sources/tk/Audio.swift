@@ -1578,7 +1578,6 @@ final class Audio {
     roomLagMs = hit.lagMs
     roomRefRms = hit.refRms
     roomMicRms = hit.micRms
-    guard sameRoomEnabled else { roomVerdict = .unknown; return }
     guard hit.scored else {
       // The far end is quiet. That confirms nothing and denies nothing, so
       // neither counter moves and the state is HELD. A pause in a conversation
@@ -1630,6 +1629,19 @@ final class Audio {
     roomWin = ((roomWin << 1) | (same ? 1 : 0)) & mask
     roomWinN = min(roomWinN + 1, Audio.ROOM_WINDOW)
     guard roomWinN >= Audio.ROOM_WINDOW else { return }
+    // ── THE OFF SWITCH TAKES THE ACTION AWAY, NOT THE INSTRUMENT ─────────────
+    //
+    // `--no-sameroom` used to sit at the top of this function, and the control
+    // arm of tools/sameroom-check.sh caught what that meant: the arm reported no
+    // correlation at all, so "it never silenced anything" was true for the wrong
+    // reason and would have been true of a detector that had simply stopped
+    // working. One flag answering two questions -- the fourth instance of that
+    // in this codebase, and the first one caught by a rig rather than by a
+    // person wondering why a feature was missing.
+    //
+    // Below every counter and every published number, so the disabled arm still
+    // measures, still reports, and still refuses to act.
+    guard sameRoomEnabled else { return }
     let hits = roomWin.nonzeroBitCount
     if !roomConfirmed, hits >= Audio.ROOM_ENTER {
       roomConfirmed = true

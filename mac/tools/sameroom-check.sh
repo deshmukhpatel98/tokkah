@@ -105,9 +105,9 @@ sed 's/^/  /' "$SP/calib.log" | grep -vE "^  room:"
 # actually measure. It is also what the complaint describes: two machines far
 # enough apart in time to hear yourself, close enough in space to be one room.
 #
-# TK_ROOM_SUSTAIN shortens three seconds of consecutive evidence to one. It is a
-# CADENCE override, the kind every timed thing in this project has; it changes
-# nothing about what counts as evidence.
+# TK_ROOM_WINDOW shortens the ten seconds the decision is taken over. It is a
+# CADENCE override, the kind every timed thing in this project has; the enter and
+# leave counts scale with it, so the RATE being demanded is unchanged.
 #
 # TK_SRC_WALLCLOCK phase-locks the `--audio` substitute to the host clock. Two
 # microphones in one room receive the same sound at the same instant; two
@@ -136,7 +136,7 @@ lag_at()    { grep -oE "backward [0-9.]+ at [0-9.]+ ms" "$1" | sort -g -k2 | tai
 
 echo
 echo "── one person, two machines: THE SAME voice reaches both microphones ────"
-export TK_ROOM_SUSTAIN=2
+export TK_ROOM_WINDOW=8
 export TK_SRC_WALLCLOCK=1
 run_arm same one.aiff one.aiff
 SAME_A="$(best_corr "$SP/same-a.log")"; SAME_B="$(best_corr "$SP/same-b.log")"
@@ -203,6 +203,30 @@ fi
 [ "${AFTER:-0}" -ge 5 ] \
   && say_ok "and it kept agreeing with itself for $AFTER estimates afterwards" \
   || say_wrong "it stopped seeing the room right after acting on it ($AFTER estimates)"
+
+# ── AND THE ARM THAT PROVES THIS SCRIPT CAN FAIL ────────────────────────────
+#
+# Identical to the first arm in every way except `--no-sameroom`, which leaves
+# the detector measuring and reporting and takes away its ability to act. That is
+# behaviourally the build from before this feature existed, so if the checks
+# above pass here too, they were never testing the feature. Every rig should be
+# able to answer "what would you have said about the code without the change",
+# and this one can answer it in twenty-six seconds instead of a rebuild.
+echo
+echo "── the control arm: the same call, with the behaviour switched off ──────"
+run_arm off one.aiff one.aiff "--no-sameroom"
+OFF_CORR="$(best_corr "$SP/off-a.log")"
+echo "  it still measured ${OFF_CORR:-nothing}, and:"
+if grep -q "you are both in the same room" "$SP/off-a.log"; then
+  say_wrong "it silenced the speaker anyway -- --no-sameroom does nothing"
+else
+  say_ok "never silenced anything, so the checks above were testing the feature"
+fi
+if [ -n "${OFF_CORR:-}" ]; then
+  say_ok "and kept reporting the correlation, so the control arm is not just a dead build"
+else
+  say_wrong "it stopped measuring too -- one flag answering two questions"
+fi
 
 # ── THE PERSON CAN SAY NO, AND IT HAS TO STICK ──────────────────────────────
 #

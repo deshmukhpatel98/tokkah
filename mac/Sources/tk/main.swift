@@ -5545,13 +5545,12 @@ func reportLoop() {
     // measured with playout muted is not echo. Keep it here, next to the mute
     // flag it depends on, for whatever reads the correlation next.
     c.setEcho(audio.mute ? 0 : audio.echoCorr)
-    // ── AND THE ONE SENTENCE ABOUT THE ROOM ──────────────────────────────────
+    // ── AND THE ONE SENTENCE ABOUT THE ROOM, ON MAIN ─────────────────────────
     //
     // Plain words, no numbers: the person cannot act on a correlation and should
     // not have to read one (`consumer-app-not-a-lab`). It clears itself the
     // moment the detector stops agreeing, which is the half a banner usually
     // gets wrong.
-    // ── AND ON MAIN, BECAUSE `setWarning` TOUCHES A VIEW ─────────────────────
     //
     // `setWarning` assigns `Pill.text`, whose didSet calls `-[NSView
     // _setHidden:]`. From this thread that is an NSException and the process
