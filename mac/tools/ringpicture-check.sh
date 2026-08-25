@@ -96,7 +96,19 @@ mkdir -p "$SP"
 # whole comment about the afternoon an unquoted expansion cut this path off at
 # "video" and three runs labelled the video arm ran with no video at all.
 MEDIA="${MEDIA:-$HERE/../../testbed/media/real/talkingheadA.mov}"
-[ -f "$MEDIA" ] || { echo "no media at $MEDIA -- this rig needs a real moving picture"; exit 2; }
+# ── `-f` ANSWERS A QUESTION THE APP DOES NOT ASK ─────────────────────────────
+#
+# This was `[ -f "$MEDIA" ]`, which stats. On 2026-08-26 the whole repo went
+# EPERM for a while -- the harness lost its file-access permission -- and stat
+# kept working while open() did not. So the guard passed, the rig ran, the app
+# could not read a single byte of the picture, and the run reported 10 failing
+# assertions that all read as product regressions.
+#
+# The guard has to do the thing the app does. One byte is enough.
+if ! head -c 1 "$MEDIA" > /dev/null 2>&1; then
+  echo "cannot READ $MEDIA -- this rig needs a real moving picture, and stat is not proof that one can be opened"
+  exit 2
+fi
 # No handle claimed on the real server, and nothing read from or written to the
 # user's real install: these are rig processes, not somebody's copy of Kin.
 export TK_NO_IDENTITY=1

@@ -86,7 +86,12 @@ else echo "  WRONG $N doorbell threads -- they will steal rings from each other"
 # exactly like the doorbell above it.
 export TK_KIN_DIR="$SP/kin-caller"
 rm -rf "$TK_KIN_DIR"
-if "$TK" --handle "kinrigcall$$" --ring-only "kinrig-nobody-$$" > "$SP/c.log" 2>&1; then
+# `--mute` here too, and not because this line plays call audio. A ring is a
+# SOUND, and it is the one sound `--mute` was found not to be covering: rigs
+# rang out loud at the person sitting in front of this Mac. Every launch in
+# this file carries it through $ARGS; this one was assembled by hand and did
+# not, which is exactly how the gap gets back in.
+if "$TK" --mute --handle "kinrigcall$$" --ring-only "kinrig-nobody-$$" > "$SP/c.log" 2>&1; then
   : # a ring to a handle nobody owns should NOT succeed
 fi
 if grep -q "this Mac has no handle yet" "$SP/c.log"; then

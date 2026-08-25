@@ -57,7 +57,19 @@ trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 # head, never a synthetic pattern: a decoder and a display behave differently on
 # real texture, and this project has a rule about it.
 MEDIA="${MEDIA:-$HERE/../../testbed/media/real/talkingheadA.mov}"
-[ -f "$MEDIA" ] || { echo "no test media at $MEDIA -- see testbed/media/real/fetch.sh"; exit 2; }
+# ── `-f` ANSWERS A QUESTION THE APP DOES NOT ASK ─────────────────────────────
+#
+# This was `[ -f "$MEDIA" ]`, which stats. On 2026-08-26 the whole repo went
+# EPERM for a while -- the harness lost its file-access permission -- and stat
+# kept working while open() did not. So the guard passed, the rig ran, the app
+# could not read a single byte of the picture, and the run reported 7 failing
+# assertions that all read as product regressions.
+#
+# The guard has to do the thing the app does. One byte is enough.
+if ! head -c 1 "$MEDIA" > /dev/null 2>&1; then
+  echo "cannot READ $MEDIA -- it exists but will not open; see testbed/media/real/fetch.sh, and check this Mac has not revoked file access"
+  exit 2
+fi
 R1="preans$$a"
 spawn "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video "$MEDIA" \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
