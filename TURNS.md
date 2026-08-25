@@ -132,26 +132,63 @@ wire, it does not stop capturing — so recognition happens there and only the T
 crosses. A few dozen bytes against a few dozen kilobytes, and no round trip inside
 the loop that has to keep up with a person talking.
 
-Local Qwen3-ASR at `127.0.0.1:8789`, which also returns smart-turn's completion
-probability in the same response: ~85 ms for the words and ~13 for the prosody.
-Measured end to end on a live call, **97–290 ms per revision, 0 failures.**
+Two engines behind one surface. **The system recogniser is the default**, because
+it is on every Mac running macOS 26, needs no daemon, no 2 GB download and — this
+was the surprise — no permission prompt: `SpeechAnalyzer` with
+`.volatileResults + .fastResults` runs on-device and never moves
+`SFSpeechRecognizer.authorizationStatus()` off `notDetermined`. `--asr qwen`
+selects local Qwen3-ASR at `127.0.0.1:8789`, which also returns smart-turn's
+completion probability in the same response: ~85 ms for the words, ~13 for the
+prosody.
 
-**A sentence ends when it lands, not when the room goes quiet.** Waiting for
-silence made a long turn grow into a paragraph — the recogniser handed a longer
-window every time and the caption never committed. Smart-turn reads the WAVEFORM,
-so it hears the difference between a sentence that landed and one that trailed
-off, which is exactly a sentence boundary and is the thing no transcript can
-recover.
+### The models were never the problem
+
+Measured against LibriSpeech ground truth, same audio, same machine, two runs:
+
+| | word error |
+|---|---|
+| Apple, on-device | **3.0%   3.0%** |
+| Qwen3-ASR, as Kin was streaming it | 50.9%  46.2% |
+| Qwen3-ASR, handed whole utterances | **3.0%** |
+
+**The two models are identical and the whole 47-point gap was this app's
+streaming of the daemon.** Which is worth saying plainly, because for weeks the
+transcript was bad and the model was the obvious suspect. Three defects were
+hiding in the plumbing:
+
+- **The resampler was eating the consonants.** Four cascaded one-poles is
+  24 dB/octave from 3.5 kHz — −8.7 dB at 6 kHz, and only −15 dB at 9 kHz, so what
+  it failed to remove folded back on top of the speech. `s`, `sh`, `f` and `t` are
+  told apart in exactly that band. Now a 95-tap windowed sinc, and
+  `--decimator-test` measures the filter against a swept tone instead of trusting
+  the transcript. ([[validate-the-ruler-against-known-inputs]] — the old filter was
+  run through the new ruler first, to prove the ruler could see the difference.)
+- **Smart-turn was thresholded against a continuous stream**, so it chopped read
+  speech into fragments every 1.2 s: *"Mr. Quilter is the." / "Cool." / "Matter."*
+  — 85.8% word error out of a recogniser that scores 3.0%.
+- **`/health` returns 200 while the daemon is still importing.** `ready` decides
+  now, and an engine that answers six times with nothing is deserted mid-call
+  whatever it claimed at startup.
+
+**A sentence ends when it lands, and only at a pause.** Waiting for the 450 ms of
+silence that ends a vocalisation made a long turn grow into a paragraph — the
+recogniser handed a longer window every time and the caption never committed.
+Smart-turn hears the difference between a sentence that landed and one that
+trailed off, which no transcript can recover — but it has to be ASKED AT A PAUSE:
+a 220 ms breath, shorter than the 450 that ends a turn and longer than a plosive,
+with 1.5 s of material behind it, and a 12 s cap so a monologue still commits.
 
 The microphone on the quiet side also hears the far end off the speaker, so the
 chunk is cleaned before recognition (`Audio.SubtitleCleaner`, spectral
 over-subtraction). That is acceptable HERE and nowhere else in this app: the
 output is text, and nobody listens to it.
 
-**Not yet shipped to anyone but this machine.** The daemon is a LaunchAgent on the
-developer's Mac. Without it the app says so once and everything else works
-unchanged — the gate, the cues, the rim, the deadlock rule. Packaging the
-recogniser is the open item ([[a-feature-behind-a-flag-nobody-runs]]).
+**This now works on any Mac that installs Kin**, which was not true a day ago and
+was the single largest gap in the feature ([[feature-behind-a-flag-nobody-runs]]).
+The Qwen daemon stays a LaunchAgent on the developer's Mac, opt-in, and is still
+the only way to get smart-turn; on a Mac older than 26 with no daemon the app says
+so once and everything else works unchanged — the gate, the cues, the rim, the
+deadlock rule.
 
 ---
 
@@ -240,6 +277,8 @@ down cannot be decided at one end, and nothing on screen claims to know.
 | `--yield-test` | every clause and both refusals, −9.0 dB, 172 ms release, untouched before | the decision on real speech |
 | `--cue-test` | bid unmistakable in 100 ms, ledger moves it, 900 ms fade, no clipped caption line, the 30 Hz layer stops | how any of it looks |
 | `--subtitle-test` | the far end pushed far enough down to read past | the recogniser |
+| `--decimator-test` | ±1.5 dB from 300 Hz to 6 kHz, <−40 dB above 9 kHz, a chunk boundary is not a discontinuity | whether the recogniser agrees |
+| WER vs LibriSpeech | which engine, and what the plumbing costs | anything conversational — it is read speech |
 | `shoot.sh` | how it looks over a real face | anything that moves |
 | two live processes | all of it | nothing — this is the one that found every defect above |
 
@@ -256,8 +295,11 @@ not fire is not debuggable from its output.
 
 ## 8. Open
 
-- **Packaging the recogniser.** §4. The single thing standing between this and
-  somebody other than the author having subtitles.
+- **Smart-turn on a stock Mac.** §4. The system recogniser gives words to everyone
+  but no completion probability, so on a Mac without the daemon a sentence commits
+  on the 12 s cap or on the 450 ms that ends a vocalisation, never on prosody.
+- **Non-English.** The system recogniser is locked to `en-US` here. It supports
+  more; nothing has asked it to.
 - **The retroactive buffer.** A continuer is audible today. Withholding one needs
   the samples held and released into the gap if it turns out to be a bid, or an
   interruption loses its first syllable.
