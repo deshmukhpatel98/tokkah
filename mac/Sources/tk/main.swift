@@ -1274,18 +1274,18 @@ display?.controls?.onCall = { who in
       // Honest, and vague on purpose. A 200 means the ring is in their mailbox;
       // anything else means we could not put it there. Neither says whether they
       // are awake, and silence is indistinguishable from away by design.
-      display?.controls?.setStatus("could not reach @\(who)")
+      display?.controls?.setStatus("couldn\u{2019}t reach \(Identity.display(who))")
       // On the card too. The status pill is four words in a corner; the card is
       // where the person is looking, and it is currently showing them a ring that
       // is not happening.
-      display?.controls?.showCallFailed("Couldn't reach @\(who)",
-                                        because: "check the name, or try again in a moment")
+      display?.controls?.showCallFailed("Couldn\u{2019}t reach \(Identity.display(who))",
+                                        because: "check the name, and try again")
       return
     }
     Metrics.count("ring_sent_ok")
     Metrics.mark("ring_sent_ms", sinceLaunch())
     DispatchQueue.main.async {
-      display?.controls?.setStatus("ringing @\(who)…")
+      display?.controls?.setStatus("ringing \(Identity.display(who))…")
       Launcher.reexec(room: got, extra: ["--video", "camera", "--window", "--calling", who],
                       why: "call placed")
     }
@@ -1324,7 +1324,7 @@ display?.controls?.onAnswerRing = {
   // Only when we actually hold the key. The watcher route carries none, and
   // binding a name to an empty string would poison the contact list.
   if !o.k.isEmpty { Identity.remember(handle: o.from, key: o.k) }
-  display?.controls?.setStatus("joining @\(o.from)…")
+  display?.controls?.setStatus("answering \(Identity.display(o.from))…")
   Launcher.reexec(room: o.room, extra: ["--video", "camera", "--window"], why: "ring answered")
 }
 display?.controls?.onDeclineRing = {
@@ -1546,7 +1546,7 @@ if let room = arg("room") {
     } else {
       fputs("room: STUN found no mapping -- advertising \(myLocal!) only,"
           + " so a call on this network still works\n", stderr)
-      display?.controls?.setStatus("same-network only")
+      display?.controls?.setStatus("this network only")
     }
   }
   fputs("room \(room): I am \(me), public \(mine ?? "unknown")"

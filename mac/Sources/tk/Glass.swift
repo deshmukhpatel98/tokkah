@@ -119,6 +119,14 @@ enum Metric {
   /// The ring that carries the hue. Thin, because the colour is an identifier and
   /// not a status light -- see the note over `Palette.avatarInk`.
   static let avatarRing: CGFloat = 1.5
+  // ── THE SAME FACE, THE SIZE THE MOMENT DESERVES ────────────────────────────
+  //
+  // 34 is a face in a list. On the card that names who is calling, the person IS
+  // the content of the screen -- there is one name on it and nothing else -- so it
+  // is drawn at the size a portrait would be. Everything about it is otherwise the
+  // 34 pt one, scaled: same fill, same ring, same colour, same letter.
+  static let faceBig: CGFloat = 64
+  static let faceBigRing: CGFloat = 2
 
   /// The waiting card: one panel holding the whole invite, rather than four
   /// controls floating separately over a face.
@@ -193,6 +201,16 @@ enum Type_ {
   /// person's identity at 34 points and a regular weight at this size reads as a
   /// label that happened to land in a ring.
   static let avatar = NSFont.systemFont(ofSize: 15, weight: .semibold)
+  /// The initial inside `Metric.faceBig`, in proportion with the 15 pt one.
+  static let avatarBig = NSFont.systemFont(ofSize: 28, weight: .semibold)
+  // ── ONE STEP ABOVE `title`, AND ONLY FOR A PERSON'S NAME ──────────────────
+  //
+  // 17 was the largest thing in this app because nothing in it was ever the whole
+  // point of a screen. A name on the calling card is: strip the explanatory
+  // sentence away and the card is a face, a name, and what you can do about it.
+  // At 17 the name read as a caption for the buttons underneath rather than as the
+  // subject of the card.
+  static let name = NSFont.systemFont(ofSize: 22, weight: .semibold)
 
   // ── THE OTHER PERSON'S VOICE, AS TEXT ──────────────────────────────────────
   //

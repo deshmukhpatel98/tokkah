@@ -74,13 +74,18 @@ first=$(grep '^audit state' "$SP/a.log" | head -1)
 echo "$first" | grep -q 'card=calling' \
   && say "OK" "the caller's card is the calling card, not the invite link" \
   || say "FAIL" "caller's card was [$(echo "$first" | grep -o 'card=[a-z]*')]"
-echo "$first" | grep -q 'says="Calling @meera"' \
-  && say "OK" 'and it says who: "Calling @meera"' \
+echo "$first" | grep -q 'says="Calling Meera"' \
+  && say "OK" 'and it says who, as a person and not a username: "Calling Meera"' \
   || say "FAIL" "it did not name the callee: [$(echo "$first" | grep -o 'says="[^"]*"')]"
 # A caption alone cannot answer "or did it crash". The dots must be ANIMATING.
 echo "$first" | grep -q 'dots=alive' \
   && say "OK" "and it is visibly alive -- the dots are animating" \
   || say "FAIL" "the waiting dots are not running: [$(echo "$first" | grep -o 'dots=[A-Za-z]*')]"
+# The circle is the only picture of a person this app has. A card naming Meera
+# over somebody else's initial and colour would pass every assertion above.
+echo "$first" | grep -q 'face=meera' \
+  && say "OK" "and it is their circle -- their initial, their colour" \
+  || say "FAIL" "the face on the card was [$(echo "$first" | grep -o 'face=[a-z0-9]*')]"
 # Exactly one thing to press, and it is the way out.
 one=$(awk '/^audit state/{exit} /^audit (OK|SELF|FAIL)/{print $3}' "$SP/a.log" \
       | grep -E '^(cancel|again|link|call|dial|answer|decline)$' | paste -sd, -)
@@ -106,8 +111,8 @@ c=$(grep '^audit state' "$SP/c.log" | tail -1)
 echo "$c" | grep -q 'card=noAnswer' \
   && say "OK" "an unanswered call ends in the no-answer card" \
   || say "FAIL" "an unanswered call ended as [$(echo "$c" | grep -o 'card=[a-z]*')]"
-echo "$c" | grep -q 'says="@ravi didn' \
-  && say "OK" 'and it names them: "@ravi didn’t answer"' \
+echo "$c" | grep -q 'says="Ravi didn' \
+  && say "OK" 'and it names them: "Ravi didn’t answer"' \
   || say "FAIL" "it did not say who: [$(echo "$c" | grep -o 'says="[^"]*"')]"
 two=$(awk '/^audit state/{exit} /^audit (OK|SELF|FAIL)/{print $3}' "$SP/c.log" \
       | grep -E '^(cancel|again|link|call|dial)$' | paste -sd, -)

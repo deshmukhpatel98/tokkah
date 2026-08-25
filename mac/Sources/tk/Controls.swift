@@ -1006,27 +1006,54 @@ final class ContactRow: SheetRow {
   override func draw(_ dirty: NSRect) {
     super.draw(dirty)
     let d = Metric.avatar
-    let box = NSRect(x: Metric.s3, y: (bounds.height - d) / 2, width: d, height: d)
+    Avatar.draw(handle,
+                in: NSRect(x: Metric.s3, y: (bounds.height - d) / 2, width: d, height: d),
+                ring: Metric.avatarRing, font: Type_.avatar)
+  }
+}
+
+// ── ONE FACE, DRAWN IN ONE PLACE ─────────────────────────────────────────────
+//
+// A contact row has one and the calling card has one four times the size, and two
+// copies of this drawing would be two faces for the same person that drift apart
+// the first time either is nudged -- different ring weight, different letter
+// inset, and nobody able to say which is the real one. It is a free function
+// rather than a view because one caller draws it inside a row's own `draw` and the
+// other needs a view of its own.
+enum Avatar {
+  static func draw(_ handle: String, in box: NSRect, ring rw: CGFloat, font: NSFont) {
     let ink = Palette.avatarInk(handle)
     // A fill and a hairline, the same idiom as every other thing that lives INSIDE
     // a glass surface. A second pane of glass here would be the one place in the
-    // app that breaks "avoid layering Liquid Glass elements on top of each other",
-    // and it would be a pane per contact.
+    // app that breaks "avoid layering Liquid Glass elements on top of each other".
     Palette.fill(0.08).setFill()
     NSBezierPath(ovalIn: box).fill()
-    let ring = NSBezierPath(ovalIn: box.insetBy(dx: Metric.avatarRing / 2, dy: Metric.avatarRing / 2))
+    let r = NSBezierPath(ovalIn: box.insetBy(dx: rw / 2, dy: rw / 2))
     ink.setStroke()
-    ring.lineWidth = Metric.avatarRing
-    ring.stroke()
+    r.lineWidth = rw
+    r.stroke()
     // `handle.first` uppercased, and it is always a letter: the server's rule is
     // `^[a-z][a-z0-9]{1,31}$` and `Identity.sanitize` applies it before anything
     // reaches here. No empty initial, no emoji, no combining marks to measure.
     let letter = String(handle.prefix(1)).uppercased()
-    let attrs: [NSAttributedString.Key: Any] = [.font: Type_.avatar, .foregroundColor: ink]
+    let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
     let sz = (letter as NSString).size(withAttributes: attrs)
     (letter as NSString).draw(at: NSPoint(x: box.midX - sz.width / 2,
                                           y: box.midY - sz.height / 2),
                               withAttributes: attrs)
+  }
+}
+
+/// The big one, as a view, for the card that is about a person.
+final class Face: NSView {
+  var handle = "" { didSet { needsDisplay = true } }
+  /// Decoration on a card that routes its own clicks by frame. It must never be
+  /// the answer to a hit test -- see `decoration-inside-a-control-eats-clicks`.
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+  override func draw(_ dirty: NSRect) {
+    guard !handle.isEmpty else { return }
+    Avatar.draw(handle, in: bounds.insetBy(dx: 0.5, dy: 0.5),
+                ring: Metric.faceBigRing, font: Type_.avatarBig)
   }
 }
 
@@ -1301,6 +1328,10 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // panel, the title and the hint are alive, and they belong to `.ringing` alone.
   private let panel = Glass(radius: Metric.cardRadius, variant: .regular)
   private let wash = CAGradientLayer()
+  /// Who the card is about. There is no photograph in this app and never will be
+  /// (see CONTACTS.md), so the circle IS the person: their own colour, derived
+  /// from their handle and the same on both Macs for ever.
+  private let face = Face()
   private let title = NSTextField(labelWithString: "")
   private let hint = NSTextField(labelWithString: "")
 
@@ -1346,7 +1377,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   private let answerButton = PillButton("answer")
   private let declineButton = PillButton("decline")
   private let cancelButton = PillButton("cancel")
-  private let againButton = PillButton("try again")
+  private let againButton = PillButton("call again")
   // ── SOMETHING THAT IS OBVIOUSLY ALIVE ─────────────────────────────────────
   //
   // The complaint this whole state answers is "you don't know if you're calling or
@@ -1402,8 +1433,18 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
 
   func setIncoming(from: String, room: String) {
     incoming = (from, room)
-    title.stringValue = "@\(from) is calling"
-    hint.stringValue = "answer and you will both be in the same room"
+    face.handle = from
+    // ── THE SENTENCE UNDER IT IS GONE, ON BOTH SIDES ─────────────────────────
+    //
+    // It read "answer and you will both be in the same room". Two problems, and
+    // the second is the one that mattered. It explained something nobody needs
+    // explaining -- a person looking at a face, a name and a button marked
+    // `answer` knows what answering does. And "room" is this app's OWN word: an
+    // implementation detail from the version where you joined a URL, kept in the
+    // sentence people read at the one moment they are least interested in how it
+    // works. You call a person. There is no room.
+    title.stringValue = "\(Identity.display(from)) is calling"
+    hint.stringValue = ""
     mode = .ringing
     applyMode()
   }
@@ -1411,8 +1452,9 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// This app is ringing somebody. The mirror of `setIncoming`.
   func setOutgoing(to who: String) {
     calleeName = who
-    title.stringValue = "Calling @\(who)"
-    hint.stringValue = "you will both be in the same room when they answer"
+    face.handle = who
+    title.stringValue = "Calling \(Identity.display(who))"
+    hint.stringValue = ""
     mode = .calling
     applyMode()
     startRingTimeout()
@@ -1434,8 +1476,11 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// Nobody picked up. Not an error -- a person who was not at their Mac.
   private func ringTimedOut() {
     guard mode == .calling else { return }
-    setCallFailed("@\(calleeName) didn\u{2019}t answer",
-                  because: "their Mac may be closed — you can try again")
+    // "their Mac may be closed" asked the reader to think about a machine. What
+    // they want to know is about a person, and the honest answer is short: we put
+    // the call through and nobody picked it up.
+    setCallFailed("\(Identity.display(calleeName)) didn\u{2019}t answer",
+                  because: "they might be away")
   }
 
   /// The two ways a call can fail to start, in one state. A ring that could not be
@@ -1489,6 +1534,11 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     declineButton.isHidden = m != .ringing
     cancelButton.isHidden = m != .calling && m != .noAnswer
     againButton.isHidden = m != .noAnswer
+    // While it is ringing, this stops the call: `cancel`. Once the call is over
+    // there is nothing left to cancel and the button only puts the card away, so
+    // it says `close`. One control, and it says what it does at the time.
+    cancelButton.title2 = m == .noAnswer ? "close" : "cancel"
+    face.isHidden = !worded
     dotsView.isHidden = m != .calling
     if m == .calling { startDots() } else { stopDots() }
     if m != .calling { ringTimer?.invalidate(); ringTimer = nil }
@@ -1617,8 +1667,9 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
 
     panel.tint = Palette.glassTint
     addSubview(panel)
+    addSubview(face)
 
-    for (t, font, colour) in [(title, Type_.title, Palette.fg),
+    for (t, font, colour) in [(title, Type_.name, Palette.fg),
                               (hint, Type_.caption, Palette.muted)]
         as [(NSTextField, NSFont, NSColor)] {
       t.font = font
@@ -1694,6 +1745,12 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
       d.cornerRadius = 3
       dotsView.layer?.addSublayer(d)
     }
+    // The one thing on the screen a person is meant to press. It was green TEXT on
+    // an ordinary pill while `call again` on the next card over was a prominent
+    // one, so the app's primary action looked less primary than its consolation
+    // prize. `prominent` is the file's own word for this: brighter fill, heavier
+    // type, exactly one per surface.
+    answerButton.prominent = true
     answerButton.tint = Palette.ok
     // Deliberately NO `onPress` on these two: the card routes them through
     // mouseDown/mouseUp below so they commit on release. Wiring `onPress` as well
@@ -1752,6 +1809,9 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// What the card is saying, when it is saying anything. Empty in the two states
   /// that are controls rather than sentences.
   var cardWords: String { title.isHidden ? "" : title.stringValue }
+
+  /// Whose circle is on the card, or empty when there is no card.
+  var faceOf: String { face.isHidden ? "" : face.handle }
 
   @objc private func callIconPressed() {
     if mode == .dial { dialConfirmed() } else { enterDial() }
@@ -1915,7 +1975,8 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     // call they are on. Only the words and the buttons differ.
     if worded {
       let pad = Metric.cardPad
-      let titleH: CGFloat = 24, hintH: CGFloat = 16
+      let titleH: CGFloat = 28, hintH: CGFloat = 16
+      let faceD = Metric.faceBig
       let row: [PillButton]
       switch mode {
       case .ringing: row = [answerButton, declineButton]
@@ -1925,37 +1986,61 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
       }
       let rowW = row.reduce(0) { $0 + $1.frame.width } + gap * CGFloat(max(0, row.count - 1))
       // A card has to be as wide as its widest CHILD, and the words are children:
-      // sized from the row alone, the hint read "answer and you will both be in
-      // the sa", clipped mid-word by a panel built around two small pills.
+      // sized from the row alone, the hint once read "answer and you will both be
+      // in the sa", clipped mid-word by a panel built around two small pills.
       let contentW = max(rowW, textW(title), textW(hint))
-      let panelW = min(bounds.width - Metric.gutter * 2, contentW + pad * 2)
-      let dotsH: CGFloat = mode == .calling ? Metric.s6 : 0
-      let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + dotsH + uh + pad
+      // Every band is present only if it has something in it. Reserving space for
+      // an empty hint is how a card ends up with a considerate gap in the middle
+      // of it, which is exactly what the waiting dots were hiding behind.
+      let hasHint = !hint.stringValue.isEmpty
+      let dotD: CGFloat = 6
+      // ── ONE CURSOR, TOP TO BOTTOM, NO BAND WITHOUT CONTENT ──────────────────
+      //
+      // The first version of this reserved a band for the dots and then placed
+      // them relative to a cursor that had already moved past it, so they came out
+      // six points above the button and read as part of it. Written as a single
+      // downward cursor -- subtract the gap, subtract the height, place -- the
+      // arithmetic is the same shape as the layout and cannot disagree with the
+      // panel height computed from the same terms.
+      let bandsH = faceD + Metric.s4 + titleH
+                 + (hasHint ? Metric.s1 + hintH : 0)
+                 + (mode == .calling ? Metric.s5 + dotD : 0)
+                 + Metric.s5 + uh
+      // A floor on the width. Sized to its content alone, a card holding one short
+      // name came out narrower than it was tall -- a column, not a card. The words
+      // still win when they are longer than this.
+      let panelW = min(bounds.width - Metric.gutter * 2, max(contentW + pad * 2, 300))
+      let panelH = pad + bandsH + pad
       panel.frame = NSRect(x: cx - panelW / 2, y: cy - panelH / 2,
                            width: panelW, height: panelH)
       panel.radius = Metric.cardRadius
-      var y = panel.frame.maxY - pad - titleH
+
+      var y = panel.frame.maxY - pad
+      y -= faceD
+      face.frame = NSRect(x: cx - faceD / 2, y: y, width: faceD, height: faceD)
+      y -= Metric.s4 + titleH
       title.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: titleH)
-      y -= Metric.s1 + hintH
-      hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
-      y -= Metric.s5
+      if hasHint {
+        y -= Metric.s1 + hintH
+        hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
+      }
       if mode == .calling {
+        y -= Metric.s5 + dotD
         // No implicit animation on the placement. A CALayer animates its own frame
         // by default, so every layout pass would slide the dots across the card --
         // on top of the pulse they are running, which is the one motion here that
         // is supposed to mean something.
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        let d: CGFloat = 6, dg: CGFloat = 7
-        let w = d * 3 + dg * 2
-        dotsView.frame = NSRect(x: cx - w / 2, y: y - dotsH / 2 - d / 2, width: w, height: d)
+        let w = dotD * 3 + 7 * 2
+        dotsView.frame = NSRect(x: cx - w / 2, y: y, width: w, height: dotD)
         var dx: CGFloat = 0
         for dot in dots {
-          dot.frame = CGRect(x: dx, y: 0, width: d, height: d)
-          dx += d + dg
+          dot.frame = CGRect(x: dx, y: 0, width: dotD, height: dotD)
+          dx += dotD + 7
         }
         CATransaction.commit()
       }
-      y -= dotsH + uh
+      y -= Metric.s5 + uh
       var ax = cx - rowW / 2
       for b in row {
         b.frame.origin = NSPoint(x: ax, y: y + (uh - b.frame.height) / 2)
@@ -2345,7 +2430,7 @@ final class CallControls: NSView {
     // Through the leave that is already wired, rather than a second path out of a
     // call. There is no un-ring to send -- the ring is in their mailbox and they
     // may still answer -- so cancelling is hanging up on a phone still ringing.
-    waiting.onCallGaveUp = { [weak self] line in self?.setStatus(line.lowercased()) }
+    waiting.onCallGaveUp = { [weak self] line in self?.setStatus(line) }
     waiting.onCancelCall = { [weak self] in
       Metrics.tap("cancel_call")
       self?.setStatus("call cancelled")
@@ -2837,7 +2922,7 @@ final class CallControls: NSView {
     // The successor process re-enters the same state from `--calling`, so the card
     // is continuous across the re-exec rather than blinking back to the link.
     waiting.setOutgoing(to: h)
-    setStatus("calling @\(h)…")
+    setStatus("calling \(Identity.display(h))…")
     ring(h)
   }
   var onAnswerRing: (() -> Void)?
@@ -2851,7 +2936,7 @@ final class CallControls: NSView {
       guard let self, self.waiting.isHidden == false || !self.sawPeer else { return }
       guard self.waiting.incoming == nil else { return }
       self.waiting.setIncoming(from: from, room: room)
-      self.setStatus("@\(from) is calling")
+      self.setStatus("\(Identity.display(from)) is calling")
       self.nudgeBar()
     }
   }
@@ -2864,7 +2949,7 @@ final class CallControls: NSView {
     onMain { [weak self] in
       guard let self, !self.sawPeer else { return }
       self.waiting.setOutgoing(to: who)
-      self.setStatus("calling @\(who)…")
+      self.setStatus("calling \(Identity.display(who))…")
       self.nudgeBar()
     }
   }
@@ -3183,7 +3268,10 @@ final class CallControls: NSView {
     // The name first: it is the one thing in here somebody came looking for.
     // Absent until claimed -- see `handle`.
     if !handle.isEmpty {
-      let h = SheetRow("Your handle", glyph: Glyph.person)
+      // Not "Your handle". The hint under this row already explains it in plain
+      // words -- "This is the name people type to call you" -- and then the row
+      // above it used a word from the other register. A person has a name.
+      let h = SheetRow("Your name", glyph: Glyph.person)
       h.value = "@" + handle
       h.target = self; h.action = #selector(copyHandleRow(_:))
       items.append(h)
@@ -3685,6 +3773,10 @@ final class CallControls: NSView {
       // entirely for the second one.
       + (waiting.cardWords.isEmpty ? "" : "  says=\"\(waiting.cardWords)\"")
       + (waiting.mode == .calling ? "  dots=\(waiting.dotsAlive ? "alive" : "STILL")" : "")
+      // WHOSE face. The circle is the only picture of a person this app has, and a
+      // card showing the right name over the wrong initial and colour is a defect
+      // no assertion about the words could ever see.
+      + (waiting.faceOf.isEmpty ? "" : "  face=\(waiting.faceOf)")
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"

@@ -426,8 +426,11 @@ enum Launcher {
     // Shorter than it was. The old copy ran to two dense lines about the name
     // being the encryption key AND the rendezvous AND the setup; all true, and
     // more than anyone reads standing in a doorway.
-    let sub = NSTextField(labelWithString: "Both of you type the same name. It is also the key, "
-                        + "so pick something only the two of you would say.")
+    // Plainer again. "the key" is the right idea in the wrong register for the
+    // one screen a first-time user meets before anything else works; "password" is
+    // the word everybody already has for a secret you both know.
+    let sub = NSTextField(labelWithString: "Type the same word on both Macs. It is also the "
+                        + "password, so pick something only you two would say.")
     sub.font = Type_.caption
     sub.textColor = Palette.muted
     sub.maximumNumberOfLines = 2
@@ -452,7 +455,9 @@ enum Launcher {
     let field = NSTextField(frame: NSRect(x: fieldBack.frame.minX + Metric.s4,
                                           y: cy + (Metric.fieldHeight - 19) / 2,
                                           width: fieldW - Metric.s4 * 2, height: 19))
-    field.placeholderString = "room name"
+    // Not "room name". A room is this app's own plumbing, and this box is the
+    // first thing a new person is asked to fill in.
+    field.placeholderString = "a word you both know"
     field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom()
     field.font = Type_.field
     field.textColor = Palette.fg

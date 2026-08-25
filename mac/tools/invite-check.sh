@@ -122,7 +122,7 @@ second=$(awk '/^audit state/{n++} n==1 && /^audit (OK|SELF|FAIL)/{print $3}' "$L
   || say "FAIL" "while asking, the card offered [$second], wanted [dial,call]"
 
 # ── 4. THE SECOND PRESS RINGS THE NAME ──────────────────────────────────────
-grep -q 'status=calling @meera…' "$L" \
+grep -q 'status=calling Meera…' "$L" \
   && say "OK" "pressing it again called @meera" \
   || say "FAIL" "the second press did not start a call"
 

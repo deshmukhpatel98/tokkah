@@ -1115,6 +1115,23 @@ enum Identity {
   // This is the same shape as the poll that reported a 429, a 403 and a dead
   // network as an empty mailbox. Silence is a legitimate answer to "is this name
   // free"; it is never a legitimate answer to "did the question get through".
+  // ── A HANDLE IS A NAME, AND ON A CARD IT SHOULD LOOK LIKE ONE ──────────────
+  //
+  // Handles are `^[a-z][a-z0-9]{1,31}$`, so the stored form of a person is
+  // `meera`, and the app has always shown that form with an `@` in front of it.
+  // That is right where the handle is the SUBJECT -- the row you copy, the name
+  // you type, the thing you give somebody so they can reach you.
+  //
+  // It is wrong on the card that says who is calling. `@meera` is a username
+  // convention; a screen reader says "at meera", and the one word on the screen at
+  // the moment somebody's Mac is ringing should be a person, not an address. So
+  // the card capitalises it and drops the sigil, and every place that is teaching
+  // the handle keeps it.
+  static func display(_ handle: String) -> String {
+    guard let f = handle.first else { return handle }
+    return f.uppercased() + handle.dropFirst()
+  }
+
   enum Renamed {
     case ok
     /// Not `^[a-z][a-z0-9]{1,31}$`, so it was never sent.
