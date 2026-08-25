@@ -445,29 +445,6 @@ if !flag("no-update") {
   // rarer. Not the poller's thread: the poller's half-second cadence is what lands
   // a pending update the moment a call ends, and a tarball download would stall it.
   Thread { Update.repairBundleIfStale(current: VERSION) }.start()
-  // A handle nobody asked for, claimed on a thread nobody waits for. If this
-  // never completes the app is exactly as usable as it was before handles
-  // existed, which is the only acceptable cost for a convenience.
-  Identity.start()
-  // Being callable is the point of having a handle, so an installed copy makes
-  // itself reachable rather than waiting to be told. Only from /Applications
-  // (Watch.install refuses anything else), only when absent or stale, and never
-  // on a rig build -- --no-relocate marks a copy that is not somebody's install.
-  if !flag("no-relocate") {
-    Thread {
-      guard !Watch.healthy() else { Metrics.count("watch_present"); return }
-      // Say WHY it is being rewritten. "installed" on a Mac that already had a
-      // login item reads as a bug until you know the old one pointed at a copy
-      // that a self-update had replaced.
-      // "absent" and "unreadable" are different findings, and staleReason cannot
-      // tell them apart -- a file that is not there does not read either.
-      let was = !Watch.installed ? "absent"
-              : (Watch.staleReason().map { "stale: \($0)" } ?? "present but not loaded")
-      let said = Watch.install()
-      Metrics.count(said.contains("installed") ? "watch_installed" : "watch_install_fail")
-      fputs("watch: was \(was) -- \(said)\n", stderr)
-    }.start()
-  }
   // Rig override, sibling of TK_UPDATE_BASE: a test that proves the poller in
   // seconds must not sit through the production minute. Floor at 1 s so a typo
   // cannot turn the poller into a busy loop against the real server.
@@ -477,6 +454,45 @@ if !flag("no-update") {
   let firstAfter = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "")
                             ?? UPDATE_FIRST_CHECK_GRACE)
   Update.startPolling(current: VERSION, every: pollEvery, firstAfter: firstAfter)
+}
+
+// ── THESE ARE NOT PART OF UPDATING, AND THEY USED TO BE ───────────────────────
+//
+// `Identity.start()` and the login-item install sat INSIDE `if !flag("no-update")`
+// above. Nothing about claiming a handle or being reachable at login has anything
+// to do with checking for a new build -- they were in there because that is where
+// the `Thread { }` block already existed.
+//
+// The cost was silent and total: `--no-update` is documented one line above as
+// "for bisecting a regression, nothing else", every rig script in this project
+// passes it, and so EVERY test run had no handle at all. `handle=-` in the
+// control audit, for months, while the ringing and contacts work was being
+// written against it. `silent-no-op-flags`, and the same shape as the gate flag
+// that put the whole turn-taking layer behind a pair of headphones: one condition
+// answering two unrelated questions.
+//
+// A handle nobody asked for, claimed on a thread nobody waits for. If this never
+// completes the app is exactly as usable as it was before handles existed, which
+// is the only acceptable cost for a convenience.
+Identity.start()
+// Being callable is the point of having a handle, so an installed copy makes
+// itself reachable rather than waiting to be told. Only from /Applications
+// (Watch.install refuses anything else), only when absent or stale, and never on
+// a rig build -- --no-relocate marks a copy that is not somebody's install.
+if !flag("no-relocate") {
+  Thread {
+    guard !Watch.healthy() else { Metrics.count("watch_present"); return }
+    // Say WHY it is being rewritten. "installed" on a Mac that already had a
+    // login item reads as a bug until you know the old one pointed at a copy
+    // that a self-update had replaced.
+    // "absent" and "unreadable" are different findings, and staleReason cannot
+    // tell them apart -- a file that is not there does not read either.
+    let was = !Watch.installed ? "absent"
+            : (Watch.staleReason().map { "stale: \($0)" } ?? "present but not loaded")
+    let said = Watch.install()
+    Metrics.count(said.contains("installed") ? "watch_installed" : "watch_install_fail")
+    fputs("watch: was \(was) -- \(said)\n", stderr)
+  }.start()
 }
 
 guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) else {
