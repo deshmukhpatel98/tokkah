@@ -38,7 +38,15 @@ echo "== flags =="
 python3 - <<'EOF'
 import re, io, glob, sys
 src = "".join(io.open(f, encoding="utf-8").read() for f in glob.glob("Sources/tk/*.swift"))
-names = re.findall(r'"([^"]+)"', re.search(r"let KNOWN_FLAGS: Set<String> = \[(.*?)\]", src, re.S).group(1))
+block = re.search(r"let KNOWN_FLAGS: Set<String> = \[(.*?)\]", src, re.S).group(1)
+# ── A COMMENT IS NOT A FLAG ──────────────────────────────────────────────────
+# The comments INSIDE this literal quote things -- they are where the reason a
+# flag exists gets written down, and reasons contain sentences. One of them
+# quotes a rig's negative arm, `"the same crash, and it does NOT come back"`,
+# and this check read that sentence as two flag names nobody reads and failed
+# the release. Strip line comments before looking for names.
+block = re.sub(r"//[^\n]*", "", block)
+names = re.findall(r'"([^"]+)"', block)
 seen = set(re.findall(r'(?:arg|flag)\("([^"]+)"\)', src)) | set(re.findall(r'arguments\.contains\("--([^"]+)"\)', src))
 dead = [n for n in names if n not in seen]
 print("  %d flags registered, all read" % len(names) if not dead

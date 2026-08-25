@@ -6,62 +6,6 @@ This project measures its claims; where a change has a number, the number is her
 
 ## Unreleased
 
-### Added — Kin 0.64.0: a ring you can see
-- **A Mac that is being rung shows you the caller's picture before you answer.**
-  It joins the room and receives, so the card that asks the question also shows
-  the face behind it. Receive-only, and that is three separate guarantees: no
-  microphone is opened, so there is nothing to send and no green
-  light; no camera is opened, so there is no picture of this room; and the audio
-  engine is never started, so the caller's voice arrives and is never played.
-  [mac/tools/preanswer-check.sh](mac/tools/preanswer-check.sh) asserts all three
-  on real processes — `cap 0/s` and `played 0/s` in *every* report the ringing
-  copy makes, and no `camera: bring-up` line at all — alongside the new
-  assertion that their stream did arrive and did reach the screen.
-  `TK_RING_PREVIEW=0` turns it off.
-- **The caller is told that packets arriving are not an answer.** New status bit
-  `Wire.ST_RINGING`, set before the first probe goes out rather than on the
-  first tick of the report loop. Arrival from an address has always meant "they
-  are here" in this app, and that reading is what let a ring answer itself in
-  0.61.0; the caller's card now stays on `Calling`, its window says *"they are
-  being asked — not connected yet"*, and its microphone is zeroed rather than
-  sent into a room nobody has agreed to open. A build older than the bit never
-  sends one — and those never joined before answering — so an unheard status
-  byte is treated as answered after about two seconds.
-- Known trade-off, and it is not closed here: the Mac being rung joins the
-  rendezvous before its owner has agreed to anything, so the caller learns its
-  address before anybody answers. [RINGING.md](RINGING.md) names that leak and
-  the mitigation it wants — connect early only for rings whose key is already a
-  contact — which this change does not implement.
-
-### Fixed — Kin 0.64.0
-- **`--mute` silenced the call and left the ringtone playing.** Reported by the
-  person whose Mac the rigs run on, while they were watching something. Every rig
-  passes `--mute`, and `--mute` only ever silenced playout, because the ringtone
-  is a separate `AVAudioPlayer` that was never asked. `--mute`, `TK_MUTE=1` and
-  `TK_NO_RAISE=1` now silence the ring and stop it asking for attention.
-- **The third camera bring-up had no gate.** Two of them have been gated on
-  `ringPending` since 0.61.0. This one never needed a gate, because the ring
-  parked above it and the line was unreachable — so the moment a ring was
-  allowed to fall through and receive, the camera light came on next to somebody
-  who had agreed to nothing. Caught on the first rig run: `camera: bring-up
-  95 ms` inside an unanswered ring.
-
-### Changed — Kin 0.64.0
-- **The analytics can now name why a call never happened**, not just how one
-  sounded. Every ending writes one `outcome` — *talked*, *no answer*,
-  *cancelled*, *declined*, *being asked*, *could not ring them* — and beside it:
-  the route taken (straight to them, or through a relay), whether this Mac can
-  be rung while Kin is closed **and why not**, microphone and camera permission,
-  the doorbell's own answers broken out by class (ok / refused / rate-limited /
-  unreachable / error), rings dropped as malformed or unverified, and clicks the
-  ring card refused. `/macos/calls` reads them as plain-word verdicts — *"this
-  Mac cannot be rung when Kin is closed"*, *"the doorbell refused this Mac"*,
-  *"the microphone was never allowed"* — rather than leaving the reader to
-  notice a missing counter.
-- Rig windows now sit on the desktop layer and are `.stationary`. Corner
-  placement and click-through, added in 0.63.0, still left a 1280×720 window
-  appearing over whatever the person at this Mac was watching, once per launch.
-
 ### Licensing and openness
 - **Relicensed to GNU AGPL v3** with a commercial license alongside it
   ([LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)). Versions published before
@@ -106,6 +50,148 @@ This project measures its claims; where a change has a number, the number is her
   (WebAssembly only; the binaries still must come from `'self'`).
 - Vendored MediaPipe binaries (26 MB) are no longer in the repository;
   `tape-app/public/vendor/fetch.sh` reproduces them.
+
+## Kin 0.67.0 — 2026-08-26
+
+### Added
+- **A call ends when somebody hangs up, and at no other time.** Quit Kin
+  mid-call, let it crash, let the updater restart it — reopen and you are back
+  in the same call, with the same person, without either of you doing anything.
+  The call is a fact on disk (`call.json`), and the only thing that deletes it is
+  a hang-up at one of the two ends. The far side sees *"they'll be right back"*
+  rather than a departure, holds the room, and keeps its lease alive.
+  [mac/tools/leave-check.sh](mac/tools/leave-check.sh) now has two endings — a
+  kill and a real hang-up — because held and *"the departure detector is dead"*
+  draw the identical screen, and one rig ending could be satisfied by either.
+- **Crashes report themselves.** If Kin dies on somebody else's Mac we hear
+  about it without them filing anything: the next launch finds the report,
+  summarises it, and sends it with the call record. 29 assertions in
+  [mac/tools/crash-check.sh](mac/tools/crash-check.sh).
+
+### Fixed
+- **Two updaters could install an app with 3–9% of its files missing.** Measured
+  in 4 of 6 runs, and the dropped tail was `_CodeSignature/` — which is what
+  macOS pins camera and microphone grants to, so the visible symptom would have
+  been an app that suddenly asks for permissions again and cannot be given them.
+  The updater now has a rig of its own: 44 assertions in
+  [mac/tools/update-check.sh](mac/tools/update-check.sh).
+- **Subtitles are for a voice that cannot be heard, and appear once.** They went
+  on the wire whether or not the microphone was muted, the far end drew them, and
+  the near end drew them again — so two captions could share one screen, and the
+  person shown their own words was the only one in the call who already knew what
+  they had said. The decision is the sender's now, because the sender is the only
+  end that knows whether its microphone is off, and a voice ducked by the echo or
+  turn-taking gate counts as unheard too. Nothing new on the wire, and nothing
+  sent at all in the ordinary case.
+- **Nothing describes somebody who is not there.** Three things had not moved
+  with the change above. A held peer was still being measured, so *"they'll be
+  right back"* appeared beside a frozen *"23 ms — breaking up"*. The controls
+  stayed faded through a hold, leaving a frozen frame, a pill, and no hang-up
+  button anywhere. And `describeTree` pasted the clipboard in raw, so a copied
+  URL containing a newline split the diagnostic line and made three healthy runs
+  report broken subtitles.
+- **The picture comes back with the voice, not a second after it.**
+
+### Changed
+- A rig that could only `stat` the picture it needs now reads a byte of it.
+  During a machine-level permission outage, `stat` kept working while `open()`
+  did not, so two picture rigs ran against a file the app could not read and
+  produced 17 failing assertions that all read as product regressions.
+- The release's dead-flag gate stopped reading its own comments as flag names.
+
+## Kin 0.66.0 — 2026-08-26
+
+### Changed
+- **Transparent glass, and nothing painted on the person.** Every surface is
+  `NSGlassEffectView` in its clear style rather than a frosted material, and the
+  vignette and every other effect over the video are gone. 32 assertions in
+  [mac/tools/glass-check.sh](mac/tools/glass-check.sh), including calibration of
+  the instruments themselves against known-blurred and known-opaque references.
+
+### Added
+- **Calling someone writes them down.** A person you called appears in your
+  people list, not only a person who answered you — and only their name is
+  stored. 26 assertions in
+  [mac/tools/contacts-check.sh](mac/tools/contacts-check.sh).
+
+## Kin 0.65.0 — 2026-08-25
+
+### Added
+- **During a call the window becomes the other person.** Every control fades
+  away, subtitles stay, and any input brings the controls back for a few seconds.
+  32 assertions in [mac/tools/immersive-check.sh](mac/tools/immersive-check.sh).
+- **One click that lands on the pane, not on System Settings.** Each permission
+  Kin needs opens the exact panel that grants it. 28 assertions in
+  [mac/tools/permissions-check.sh](mac/tools/permissions-check.sh).
+- **A Mac that is always on keeps itself current.** The background watcher checks
+  for a newer Kin on its own, so a machine nobody opens still updates. The call
+  to start that polling sat about 350 lines below a function that returns
+  `Never`, so it had never once run.
+
+### Fixed
+- **A cancel that arrives while the app is still starting** no longer leaves a
+  ring on screen with nobody behind it.
+- **The ring card stopped claiming a face it had not seen.** The counter said a
+  picture had arrived when what had actually happened was that the card opened.
+- The download pages describe the app that exists.
+
+## Kin 0.64.0 — 2026-08-25
+
+### Added — a ring you can see
+- **A Mac that is being rung shows you the caller's picture before you answer.**
+  It joins the room and receives, so the card that asks the question also shows
+  the face behind it. Receive-only, and that is three separate guarantees: no
+  microphone is opened, so there is nothing to send and no green
+  light; no camera is opened, so there is no picture of this room; and the audio
+  engine is never started, so the caller's voice arrives and is never played.
+  [mac/tools/preanswer-check.sh](mac/tools/preanswer-check.sh) asserts all three
+  on real processes — `cap 0/s` and `played 0/s` in *every* report the ringing
+  copy makes, and no `camera: bring-up` line at all — alongside the new
+  assertion that their stream did arrive and did reach the screen.
+  `TK_RING_PREVIEW=0` turns it off.
+- **The caller is told that packets arriving are not an answer.** New status bit
+  `Wire.ST_RINGING`, set before the first probe goes out rather than on the
+  first tick of the report loop. Arrival from an address has always meant "they
+  are here" in this app, and that reading is what let a ring answer itself in
+  0.61.0; the caller's card now stays on `Calling`, its window says *"they are
+  being asked — not connected yet"*, and its microphone is zeroed rather than
+  sent into a room nobody has agreed to open. A build older than the bit never
+  sends one — and those never joined before answering — so an unheard status
+  byte is treated as answered after about two seconds.
+- Known trade-off, and it is not closed here: the Mac being rung joins the
+  rendezvous before its owner has agreed to anything, so the caller learns its
+  address before anybody answers. [RINGING.md](RINGING.md) names that leak and
+  the mitigation it wants — connect early only for rings whose key is already a
+  contact — which this change does not implement.
+
+### Fixed
+- **`--mute` silenced the call and left the ringtone playing.** Reported by the
+  person whose Mac the rigs run on, while they were watching something. Every rig
+  passes `--mute`, and `--mute` only ever silenced playout, because the ringtone
+  is a separate `AVAudioPlayer` that was never asked. `--mute`, `TK_MUTE=1` and
+  `TK_NO_RAISE=1` now silence the ring and stop it asking for attention.
+- **The third camera bring-up had no gate.** Two of them have been gated on
+  `ringPending` since 0.61.0. This one never needed a gate, because the ring
+  parked above it and the line was unreachable — so the moment a ring was
+  allowed to fall through and receive, the camera light came on next to somebody
+  who had agreed to nothing. Caught on the first rig run: `camera: bring-up
+  95 ms` inside an unanswered ring.
+
+### Changed
+- **The analytics can now name why a call never happened**, not just how one
+  sounded. Every ending writes one `outcome` — *talked*, *no answer*,
+  *cancelled*, *declined*, *being asked*, *could not ring them* — and beside it:
+  the route taken (straight to them, or through a relay), whether this Mac can
+  be rung while Kin is closed **and why not**, microphone and camera permission,
+  the doorbell's own answers broken out by class (ok / refused / rate-limited /
+  unreachable / error), rings dropped as malformed or unverified, and clicks the
+  ring card refused. `/macos/calls` reads them as plain-word verdicts — *"this
+  Mac cannot be rung when Kin is closed"*, *"the doorbell refused this Mac"*,
+  *"the microphone was never allowed"* — rather than leaving the reader to
+  notice a missing counter.
+- Rig windows now sit on the desktop layer and are `.stationary`. Corner
+  placement and click-through, added in 0.63.0, still left a 1280×720 window
+  appearing over whatever the person at this Mac was watching, once per launch.
 
 ## Kin 0.63.0 — 2026-08-25
 
