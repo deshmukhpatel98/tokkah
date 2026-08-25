@@ -1508,6 +1508,17 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
         // now, and `tools/glass-check.sh` holds them to it.
         for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
         fputs("audit state \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else if token.hasPrefix("utter:") {
+        // The words a rig puts in this Mac's mouth. Straight into the recogniser's
+        // own callback, so the send gate below decides its fate exactly as it
+        // would for a real sentence.
+        let words = String(token.dropFirst(6)).replacingOccurrences(of: "_", with: " ")
+        if let u = gUtter {
+          fputs("utter: \"\(words)\"\n", stderr)
+          u(words, true)
+        } else {
+          fputs("utter: no recogniser on this run -- nothing said\n", stderr)
+        }
       } else if token.hasPrefix("%") {
         // `%Check for Updates…` -- a MENU item, through AppKit's own dispatch.
         // Separate from `@` because the menu is not in `controls` and a handler
@@ -4310,6 +4321,21 @@ let subtitles = flag("no-subtitles") ? nil
 // caught it immediately: the speaker recognised itself perfectly and the
 // listener showed nothing.
 nonisolated(unsafe) var peerSaidListening = false
+/// ── SPEAKING, WITHOUT A MICROPHONE ───────────────────────────────────────────
+///
+/// The rule for subtitles lives in `subs.onText` -- who sends, when, and who is
+/// allowed to draw them. None of that can be reached from a rig, because reaching
+/// it needs a real voice and a real recogniser, and this repo has a law about
+/// what a test that cannot see the thing under test is worth. The `said` and
+/// `mine` press tokens write straight into the caption layer, so they prove the
+/// BAND and can say nothing at all about the rule.
+///
+/// So the recogniser's own callback is published here and `--press utter:<words>`
+/// calls it. Everything downstream of that point is the shipping path: the gate
+/// that decides whether it goes on the wire, the packet, the far end's decode and
+/// the far end's caption. Only the microphone is simulated, which is the one part
+/// a headless Mac cannot supply.
+nonisolated(unsafe) var gUtter: ((String, Bool) -> Void)?
 wire.onSubtitle = { text, final, listening in
   peerSaid = text; peerSaidFinal = final; peerSaidAt = Date(); peerSaidListening = listening
   subGot += 1
@@ -4340,6 +4366,9 @@ wire.onPeerVocal = { v in
 }
 
 if let subs = subtitles {
+  // Published for `--press utter:`. Assigned to the same closure the recogniser
+  // gets, not a copy of its body, so a rig can never drift from the real path.
+  defer { gUtter = subs.onText }
   subs.onText = { text, final in
     guard !text.isEmpty else { return }
     subSent += 1
@@ -4348,21 +4377,41 @@ if let subs = subtitles {
     // utterance rather than read at the moment the text lands: recognition
     // finishes after the sound does, and by then the gate has usually moved on.
     let listening = utteranceWasListening
-    wire.sendSubtitle(text, final: final, listening: listening)
-    // ── AND YOU SEE YOUR OWN, WHEN YOU ARE THE QUIET ONE ─────────────────────
+    // ── SUBTITLES ARE FOR A VOICE THAT CANNOT BE HEARD ───────────────────────
     //
-    // One person is audible at a time, so the other one is talking into a room
-    // that gives nothing back. That is the single most uncomfortable thing this
-    // design could do to somebody, and it is fixed by showing them the words
-    // their microphone is producing: not a level meter, not a "you are muted"
-    // badge -- the actual sentence, going out. When you have the floor it stays
-    // empty, because then you can simply hear yourself.
-    // THE DUCK COUNTS. `gain` is the echo gate and it is wide open during a
-    // deadlock -- you are talking, loudly, over somebody. What has actually
-    // happened to your voice is the two factors multiplied, and it is the
-    // moment you most need to see that you are still getting through.
-    let audible = Audio.sharedGate.gain * Audio.sharedGate.yieldGainNow > 0.5
-    display?.controls?.setMyWords(text, showing: !audible && !listening)
+    // They went out on every utterance, and both ends drew them: the far end as
+    // "theirs", and this end as "mine" whenever your own voice was not the
+    // audible one. So two captions could be on one screen at once, and the
+    // person reading their OWN words was the one person in the call who already
+    // knew what they had just said.
+    //
+    // The rule now is the one the feature was always for: if somebody's voice is
+    // not reaching the other person, the other person reads it instead. That
+    // makes the decision the SENDER's, because the sender is the only end that
+    // knows whether its microphone is off -- and it means nothing new on the
+    // wire, no status bit for the far end to interpret and no older build to
+    // keep in step. Nothing is sent while you can be heard, which also stops
+    // paying for recognition traffic on the ordinary case, and the receiver
+    // simply draws whatever arrives.
+    //
+    // The duck counts, not just the switch. `gain` is the echo gate and
+    // `yieldGainNow` is the turn-taking one; a voice held down by either is a
+    // voice the other person is not getting, which is the same problem the mute
+    // switch causes deliberately.
+    let audible = !gMicMuted
+      && Audio.sharedGate.gain * Audio.sharedGate.yieldGainNow > 0.5
+    if !audible { wire.sendSubtitle(text, final: final, listening: listening) }
+    // ── AND NEVER ON YOUR OWN SCREEN ─────────────────────────────────────────
+    //
+    // This used to show you your own sentence while you were the quiet one. The
+    // reasoning was that talking into a room which gives nothing back is
+    // uncomfortable, and that is true -- but the answer to it is the mute pill
+    // and the level the row already shows, not a second caption competing with
+    // the one carrying the other person's words. Reading your own speech back is
+    // the one caption nobody needs, and it was the reason two of them could be
+    // on screen at once. Cleared rather than merely not set, so a caption from
+    // before this rule cannot linger.
+    display?.controls?.setMyWords("", showing: false)
     if flag("subtitle-debug") {
       fputs("  \(sinceLaunch()) ms you said: \(text)\(final ? " ." : " ...")"
           + "\(listening ? "  (listening)" : "")\n", stderr)
