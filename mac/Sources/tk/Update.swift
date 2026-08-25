@@ -463,6 +463,47 @@ enum Update {
     return Staged(manifest: m, dir: tmp)
   }
 
+  // ── AN IMAGE THAT IS ABOUT TO BE REPLACED FILES ITS REPORT FIRST ───────────
+  //
+  // `Launcher.reexec` has had `beforeReexec` since answering a ring became a
+  // re-exec, and its comment says why: "execv is an ending as final as a hang-up
+  // -- the process stops existing on the next line -- and everything it had not
+  // yet reported dies with it. Measured: a ring answered inside five seconds
+  // reported NOTHING." The updater re-execs too, through its own `execv` down
+  // there, and it never had the hook -- so every update was an unreported ending
+  // and the row for that call simply stopped, which on the dashboard is
+  // indistinguishable from a laptop lid closing.
+  //
+  // Now that a call SURVIVES the restart, that matters more than it did: without
+  // this the dashboard sees a call vanish and an unrelated one start, when what
+  // happened was one call that took an update. Whatever this returns is prepended
+  // to the new argv, so the successor carries `--prev-call` and the two rows
+  // join.
+  nonisolated(unsafe) static var beforeRestart: (() -> [String])?
+
+  /// argv for the successor: the handoff first, then this process's own argv with
+  /// anything the handoff already supplied dropped. Same dedup rule and the same
+  /// reason as `Launcher.reexec` -- a flag repeated across three updates would
+  /// otherwise grow the command line forever.
+  private static func restartArgv(_ me: String) -> [String] {
+    let handoff = beforeRestart?() ?? []
+    var seen = Set(handoff.filter { $0.hasPrefix("--") })
+    var out = [me] + handoff
+    let carried = Array(CommandLine.arguments.dropFirst())
+    var i = 0
+    while i < carried.count {
+      let t = carried[i]; i += 1
+      guard t.hasPrefix("--") else { out.append(t); continue }
+      let value: String? = (i < carried.count && !carried[i].hasPrefix("--")) ? carried[i] : nil
+      if value != nil { i += 1 }
+      if seen.contains(t) { continue }
+      seen.insert(t)
+      out.append(t)
+      if let v = value { out.append(v) }
+    }
+    return out
+  }
+
   /// Swaps in a staged update and re-execs. Returns only on failure.
   static func commit(_ s: Staged) {
     let m = s.manifest, tmp = s.dir
@@ -489,7 +530,7 @@ enum Update {
     if swapBundle(from: tmp, at: me) {
       pending = nil
       fputs("update: installed \(m.version) -- restarting\n", stderr)
-      var argv = CommandLine.arguments.map { strdup($0) }
+      var argv = restartArgv(me.path).map { strdup($0) }
       argv.append(nil)
       execv(me.path, &argv)
       fputs("update: execv failed (errno \(errno)) -- exiting so a supervisor can restart\n", stderr)
@@ -536,7 +577,7 @@ enum Update {
              : nil)
     pending = nil
     fputs("update: installed \(m.version) -- restarting\n", stderr)
-    var argv = CommandLine.arguments.map { strdup($0) }
+    var argv = restartArgv(restart.path).map { strdup($0) }
     argv.append(nil)
     execv(restart.path, &argv)
     fputs("update: execv failed (errno \(errno)) -- exiting so a supervisor can restart\n", stderr)
@@ -656,6 +697,20 @@ enum Update {
   /// Set from the menu: the user asked for it, so land it even mid-call.
   nonisolated(unsafe) static var restartNow = false
 
+  /// ── LANDING AN UPDATE DURING A LIVE CALL, ON PURPOSE ───────────────────────
+  ///
+  /// Rig override, sibling of `TK_UPDATE_POLL` and `TK_UPDATE_BASE`. Production
+  /// never sets it and the default is unchanged: an update waits for the call to
+  /// end, because a second of silence chosen by nobody in the middle of a
+  /// sentence is worse than a restart at the end of a call that nobody notices.
+  ///
+  /// It exists because that sentence is a CLAIM about a cost, and the only way to
+  /// know the cost is to make the path reachable and measure it. Without this the
+  /// mid-call branch could only be reached by shipping a release and waiting for
+  /// somebody to be on a call, which is not a measurement.
+  nonisolated(unsafe) static let midCallAllowed =
+    ProcessInfo.processInfo.environment["TK_UPDATE_MIDCALL"] == "1"
+
   /// Called when a staged update starts waiting, so the window can say so. Wired
   /// in main.swift; unset for the headless CLI, which has no window to tell.
   nonisolated(unsafe) static var onPending: ((String) -> Void)?
@@ -707,7 +762,7 @@ enum Update {
             commit(s)          // returns only on failure; keep waiting if so
             continue
           }
-          if !callIsLive() { commit(s); continue }
+          if !callIsLive() || midCallAllowed { commit(s); continue }
           if !announced {
             announced = true
             fputs("update: \(s.manifest.version) is ready, holding until the call ends\n", stderr)
@@ -748,7 +803,7 @@ enum Update {
         // hang-up. Every other reason to check early -- the menu item, above all --
         // still waits, because a person asking whether an update exists has not
         // asked to be cut off.
-        if callIsLive() && !mayInterruptCall {
+        if callIsLive() && !mayInterruptCall && !midCallAllowed {
           pending = s
           announced = false
         } else {

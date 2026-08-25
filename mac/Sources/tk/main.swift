@@ -322,6 +322,11 @@ let KNOWN_FLAGS: Set<String> = [
   // to kill the app. Same family as silent-no-op-flags, one worse.
   "no-ring-preview", "incoming-key",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
+  // A call that outlives its process is on by default and has to be switchable
+  // off, because the negative arm of its own rig is "the same crash, and it does
+  // NOT come back" -- a rig that cannot run the control is measuring nothing.
+  // TK_NO_REJOIN=1 does the same, for a launch with no argv at all.
+  "no-rejoin", "resumed",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
@@ -505,6 +510,53 @@ Install.relocateIfHomeless()
 
 Launcher.installURLHandler()
 
+// ── WERE WE IN A CALL WHEN THIS MAC LAST SAW US? ────────────────────────────
+//
+// Before the mint below, because the answer changes what "opening Kin" means. If
+// there is a call nobody hung up on, opening the app is not starting a call, it
+// is WALKING BACK INTO one -- no room to type, no link to click, no ring, no
+// decision. That is the whole of what was asked for: "even if one side closes the
+// app, they should hop into the call as soon as they start the app again".
+//
+// Below the URL handler and above the mint, so the precedence reads in the order
+// a person would expect it: a link they just clicked wins over a call they were
+// already in, and both win over a fresh room.
+//
+// Placed here, at the same point in the file as the mint, because both end in
+// `Launcher.reexec` -- the room has to be in argv before the twenty places that
+// read `arg("room")`, and re-execing is the move this file already makes for
+// exactly that reason. It costs one `execv` (~15 ms, measured on this path
+// already for the gui prompt) and it reuses a path that is proven rather than
+// inventing a second way for a room to arrive.
+//
+// NOT for `--incoming` or `--calling`: both of those arrive WITH a room in argv,
+// so the guard below already excludes them. A ring is about a different call than
+// the one that was held, and answering it should not be ambiguous.
+//
+// ── AND NOT WHEN THE COMMAND LINE NAMES A DIFFERENT JOB ─────────────────────
+//
+// The guard above is "no room and no peer", which is true of `tk --stun`, `tk
+// --gate-test` and `tk --call meera` as well as of a double-click. Without this
+// list, a held call would turn a unit test into a re-exec INTO somebody's
+// conversation, and pressing "call Meera" would rejoin the old call instead of
+// placing the new one. Every entry is a mode that reaches its own behaviour below
+// this line; the ones that exit above it (`--version`, `--rings`, `--watch`,
+// every `--selftest-*`) need no mention. The list fails towards NOT rejoining,
+// which is the cheap direction: the worst case is a person opening Kin and
+// pressing nothing.
+let namesAnotherJob = isTestRun || flag("stun") || flag("acoustic")
+  || arg("call") != nil || arg("shot") != nil
+  || flag("cam-picker-test") || flag("vpause-test") || flag("presence-run")
+if arg("room") == nil, arg("peer") == nil, !flag("gui"), !flag("no-rejoin"),
+   !namesAnotherJob,
+   ProcessInfo.processInfo.environment["TK_NO_REJOIN"] != "1",
+   let live = Resume.pending() {
+  let bundled = (Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
+    .contains("/Contents/MacOS/")
+  Launcher.remember(live.room)
+  Launcher.reexec(room: live.room, extra: Resume.argv(live, bundled: bundled), why: "rejoin")
+}
+
 // ── A DOUBLE-CLICK STARTS A CALL ────────────────────────────────────────────
 //
 // No prompt, no lobby, no decision: the app opens, the camera comes on, and a
@@ -682,6 +734,32 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
   fputs("socket/bind failed on port \(listenPort)\n", stderr); exit(1)
 }
 
+// ── A REJOIN ALREADY KNOWS WHERE THEY WERE ──────────────────────────────────
+//
+// The socket itself cannot survive what this feature has to survive -- a crash
+// takes the file descriptor with the process, and no amount of care about
+// FD_CLOEXEC changes that. The ADDRESS survives, and the address is most of what
+// the socket was worth: the far end has been sending to us the whole time, so its
+// NAT binding is still open and one datagram to that address is a working path
+// with no discovery in it at all.
+//
+// So a resumed image starts aimed at where the call was, and races that address
+// alongside whatever the rendezvous turns up. On a healthy network the directory
+// answers first and this changes nothing; when the directory is slow, or still
+// serving a stale entry, this is the only thing that works -- and it costs one
+// file read and two assignments.
+//
+// AIMED, NOT TRUSTED. It goes in as a candidate like every other, so if the peer
+// really has moved, the race settles on wherever they answer from and this
+// address is simply one that never replied. The one thing it must not do is
+// pre-empt the race, which is why `setPeer` here is the same provisional
+// destination the rendezvous sets a moment later and not a lock.
+if flag("resumed"), let p = Resume.rememberedPath() {
+  wire.setPeer(ip: p.ip, port: p.port)
+  wire.addCandidate(ip: p.ip, port: p.port)
+  fputs("rejoin: aiming at \(p.ip):\(p.port), where the call was\n", stderr)
+}
+
 // TELEMETRY SETTINGS BEFORE ANYTHING CAN POST. These two lines used to sit next
 // to the audio engine, several hundred lines and one rendezvous later -- so a
 // person who ran with --no-telemetry and then left while still waiting for the
@@ -700,6 +778,27 @@ if let e = arg("tel-endpoint") { Telemetry.endpoint = e }
 Launcher.beforeReexec = {
   postFinalBeat(why: "re-exec")
   return ["--prev-call", Telemetry.call]
+}
+// ── AND THE UPDATER'S OWN RE-EXEC, WHICH NEVER HAD ONE ───────────────────────
+//
+// `Update.commit` calls execv directly and so filed nothing on the way out: an
+// update looked, on the dashboard, exactly like a call that stopped. Now that a
+// call SURVIVES the restart, the record has to say so or it reads as a call that
+// ended and a different one that began -- which this project has been fooled by
+// before, in the other direction, with a `final` beat followed by later `live`
+// ones.
+//
+// So the shape is: the outgoing image files a FINAL beat whose `ended` names the
+// restart rather than an ending anybody chose, and the successor carries
+// `--prev-call`, which the beat sends as `prev_call`. A row that says
+// `ended: update-restart` and is named by the next row's `prev_call` is one call
+// across an update; nothing else in the schema had to change.
+//
+// `--resumed` rides along too, so the new image aims at the address the call was
+// on before its rendezvous has said anything -- see the block below `wire`.
+Update.beforeRestart = {
+  postFinalBeat(why: "update-restart")
+  return ["--prev-call", Telemetry.call, "--resumed"]
 }
 
 // ── ASK FOR THE MICROPHONE HERE, WHERE THE PROCESS IS STILL ALIVE ────────────
@@ -829,10 +928,54 @@ func postFinalBeat(why: String) -> Bool {
   return ok
 }
 
+// ── HANGING UP IS THE ONLY THING THAT ENDS A CALL ────────────────────────────
+//
+// Everything else -- a crash, a force-quit, an update's `execv`, a lid closing --
+// leaves the call open and the record on disk, and the next launch walks straight
+// back in (Resume.swift). This is the one path that says it is over, so it has
+// two jobs beyond exiting: tell the other end, and delete the record.
+//
+// The goodbye goes out FIRST and synchronously. It is four UDP datagrams on a
+// socket that is already open and already pointed at them -- microseconds -- and
+// it has to leave before `exit(0)`, because after that there is no process to
+// send it. `execv-discards-unsent-analytics` is the same lesson with a different
+// payload: an ending has to finish its business while it still exists.
 func leaveCall() -> Never {
   shuttingDown = true
+  // Guarded the same way `hangUpAndExit` is, and for the same reason: leaving
+  // while still waiting for somebody has nobody to tell, and a goodbye sent to a
+  // ring that has not been answered would quit the caller's app instead of
+  // showing them a card.
+  if Resume.holding { wire.sendGoodbye() }
+  Resume.end(why: "left")
   postFinalBeat(why: "leave")
   fputs("left the call\n", stderr)
+  exit(0)
+}
+
+/// ── CLOSING THE WINDOW IS NOT HANGING UP ──────────────────────────────────
+///
+/// The red button used to be wired straight to `leaveCall`, which was right when
+/// a call could not survive its process. It is not right now, and the user said
+/// so in as many words: "even if one side closes the app, they should hop into
+/// the call as soon as they start the app again, unless they have disconnected
+/// the call."
+///
+/// So closing the window puts the app away and leaves the call open: no goodbye,
+/// the record stays, the far end holds, and opening Kin again walks back in. The
+/// hang-up control in the bar is what ends a call, and it is the only thing that
+/// does. This still stops the camera and the microphone with the process, which
+/// is the privacy property `WindowCloser` was written for.
+///
+/// The final beat says `closed`, not `leave`, so the two are separable on the
+/// dashboard -- a call that was put away and resumed must not read as a call that
+/// ended, and a row whose successor names it as `prev_call` is how that reads.
+func closeWindowKeepingCall() -> Never {
+  shuttingDown = true
+  let held = Resume.holding
+  postFinalBeat(why: held ? "closed-holding" : "closed")
+  fputs(held ? "window closed -- the call stays open; reopening Kin rejoins it\n"
+             : "window closed\n", stderr)
   exit(0)
 }
 
@@ -896,6 +1039,21 @@ func hangUpAndExit(to who: String, room: String, why: String, capMs: Int = 2000)
     guard once.claim() else { return }
     if !note.isEmpty { fputs(note, stderr) }
     shuttingDown = true
+    // ── ONLY IF THERE WAS A CALL ────────────────────────────────────────────
+    //
+    // Cancelled and declined are a person saying no, and the far end has to be
+    // told -- but it is told through the MAILBOX (`sendBye` above), which draws a
+    // "can't talk right now" card and leaves their app open. The in-band goodbye
+    // ends the far end's process outright, which is right for a hang-up and wrong
+    // for a decline: it would quit the caller's app instead of telling them.
+    //
+    // `Resume.holding` is exactly the difference. It is set at the transport lock
+    // and skipped for a ring preview, so a ring that was never answered has no
+    // record and sends nothing here -- while a call that got as far as media
+    // sends the goodbye, which is the case the mailbox cannot serve at all
+    // because a link invite has no handles to address.
+    if Resume.holding { wire.sendGoodbye() }
+    Resume.end(why: why)
     postFinalBeat(why: why)
     exit(0)
   }
@@ -1136,8 +1294,25 @@ if flag("window") {
              fputs("camera \(off ? "off" : "on")\n", stderr)
            },
            onLeave: { leaveCall() },
+           // The red button and Command-Q put Kin away. They do not hang up: a
+           // call outlives its process now, so reopening walks straight back in.
+           onClose: { closeWindowKeepingCall() },
            invite: inviteText(room: roomName))
     display = d
+    // ── COMING BACK MUST NOT LOOK LIKE STARTING ────────────────────────────────
+    //
+    // A rejoining image opens the same window every launch does, so for the
+    // second before the transport locks it says "waiting for the other person"
+    // and shows the invite link -- which is the screen for a call that has not
+    // begun, put in front of somebody who was mid-conversation ten seconds ago.
+    // One string, and the difference between "it crashed and I have to start
+    // again" and "it is coming back".
+    if flag("resumed") {
+      d.controls?.setStatus("rejoining\u{2026}")
+      setWindowTitle("Kin \u{2014} rejoining")
+      Metrics.fact("resumed", "yes")
+      Metrics.mark("resumed_ms", sinceLaunch())
+    }
     // ── WHEN CAN THE LINK ACTUALLY BE COPIED ──────────────────────────────────
     //
     // Not when `inviteText` is assigned. That happens inside `open()` above, on a
@@ -1782,6 +1957,11 @@ if ringPending {
 func handleBye(_ r: Identity.Ring) {
   // The person we are ringing has said no, or hung up before we gave up.
   if let c = gCalling, r.from == c.who, r.room == c.room {
+    // A bye is a person hanging up, whichever road it came down. The in-band one
+    // on the media socket is faster and works for a link invite; this one still
+    // arrives when the call never got as far as media. Either way the record has
+    // to go, or the next launch would walk back into a call somebody declined.
+    Resume.end(why: "they said no")
     Metrics.count("bye_recv_calling")
     Metrics.mark("bye_recv_ms", sinceLaunch())
     Metrics.fact("outcome", "they said no")
@@ -1796,6 +1976,7 @@ func handleBye(_ r: Identity.Ring) {
   // down, and -- if this copy of Kin exists only to ask -- there is nothing left
   // to ask about.
   if let o = gOffered, r.from == o.from, r.room == o.room {
+    Resume.end(why: "they stopped calling")
     Metrics.count("bye_recv_ringing")
     Metrics.mark("bye_recv_ms", sinceLaunch())
     Metrics.fact("outcome", "they hung up before this Mac answered")
@@ -1907,7 +2088,20 @@ if flag("stun") {
 // needed. If that had come back symmetric, this whole approach would have been
 // the wrong one and the honest answer would have been a relay.
 if let room = arg("room") {
-  let me = arg("id") ?? "mac-\(getpid())"
+  // ── THE NAME IN THE DIRECTORY MUST SURVIVE A RESTART ───────────────────────
+  //
+  // It was `mac-<pid>`. The room's peer map (worker.ts `rvPeers`) is keyed by
+  // this string and swept after 90 s, so a process that crashed and came back
+  // published under a NEW key and left its own corpse in the map for a minute and
+  // a half -- listed to the far end ahead of the live entry, and listed to
+  // ITSELF as a peer to race candidates against. That is `open-socket-is-not-a-
+  // live-peer` and the web app's own `sid` comment, and it is the single most
+  // likely way rejoining fails: the returning process collides with its ghost.
+  //
+  // A stable id makes the map overwrite the entry instead of adding one, so no
+  // ghost is ever created and the server needs no change. Derived per room so it
+  // is not a tracking identifier; see Resume.rendezvousId.
+  let me = arg("id") ?? Resume.rendezvousId(room: room, port: Int(listenPort))
   // ── NO PUBLIC ADDRESS IS NOT THE END OF THE CALL ──────────────────────────
   //
   // This used to be `exit(1)`. On any network that blocks UDP 3478 -- a hotel, a
@@ -2025,7 +2219,7 @@ if let room = arg("room") {
     }
   }
   fputs("room \(room): I am \(me), public \(mine ?? "unknown")"
-      + "\(myLocal.map { ", local " + $0 } ?? "")\n", stderr)
+      + "\(myLocal.map { ", local " + $0 } ?? "") at \(sinceLaunch()) ms\n", stderr)
   var found = false
   var bindTarget: (String, UInt16)?
   // ── A DEADLINE, NOT A COUNT ─────────────────────────────────────────────────
@@ -2057,9 +2251,14 @@ if let room = arg("room") {
     // A nil return is a poll that did not answer in time, which is what the next
     // iteration is for.
     let relayNow = relay.get()
-    let peers = Launcher.runPumping(pump: display != nil || mdisplay != nil) {
+    // Two optionals, two different failures, and both mean "try again next
+    // iteration" HERE: runPumping's nil is "the pump timed out", exchange's is
+    // "the directory did not answer". Flattened rather than conflated, because
+    // the caller further down that DOES care about the difference reads it
+    // unflattened.
+    let peers = (Launcher.runPumping(pump: display != nil || mdisplay != nil) {
       Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relayNow)
-    } ?? []
+    } ?? nil) ?? []
     if let p = peers.first {
       // Every address we have, raced by measured RTT — LAN, public, and the
       // peer's TURN relayed address. First-packet-wins was the public internet
@@ -2172,12 +2371,41 @@ if let room = arg("room") {
     var gone = 0
     /// Ticks since the transport locked, for the deadline below.
     var sinceLocked = 0
+    // ── HOLDING A CALL WHOSE OTHER END IS RESTARTING ──────────────────────────
+    //
+    // `gapBegan` is host time at the moment media stopped arriving, and it is the
+    // only honest ruler for "how long was the far end without us". Printed when
+    // media returns, because a rig -- and a person -- both need the number, and
+    // the two ends of a call cannot each measure their own half of it.
+    var gapBegan: UInt64 = 0
+    var announcedHold = false
     while true {
       // RE-ARMED WITH THE LOCK, not counted once for the life of the process.
       // Left running, `sinceLocked > 4` was permanently true after the first
       // rediscovery, so the "we have not heard their status yet" deadline was
       // already expired at the first tick of every subsequent lock -- and that
       // deadline fails OPEN, towards "treat them as answered".
+      // ── THE GAP, MEASURED FROM TWO PACKET STAMPS ─────────────────────────────
+      //
+      // Checked HERE, at the top, before anything about locks or status bytes --
+      // and computed as the difference between the LAST packet before the silence
+      // and the FIRST one after it, never from the moment this loop happened to
+      // notice. The first version reported when the poll loop declared the peer
+      // connected, which waits on a half-second tick AND on a status byte
+      // arriving from a peer that has just re-keyed: it turned a one-second
+      // recovery into a four-second one in the log while media had been flowing
+      // the whole time. A ruler has to measure the thing it is named after, and
+      // both stamps are already recorded, so the honest number is free.
+      if wire.peerBackAt != 0 {
+        let ms = Int(Clock.msSigned(wire.peerBackAt, wire.peerGoneAt))
+        wire.peerBackAt = 0; wire.peerGoneAt = 0
+        Metrics.mark("rejoin_gap_ms", ms)
+        Metrics.count("rejoins_seen")
+        fputs("room \(room): they are back -- media gap \(ms) ms\n", stderr)
+        gapBegan = 0
+        announcedHold = false
+        display?.controls?.setStatus("connected")
+      }
       if !wire.locked { sinceLocked = 0 }
       if wire.locked {
         sinceLocked += 1
@@ -2225,7 +2453,13 @@ if let room = arg("room") {
           // which is what makes "calling" -> "talked" the ordinary story.
           Metrics.fact("outcome", "talked")
           Metrics.fact("path", wire.lockedFrom.hasPrefix("relay") ? "relay" : "direct")
-          fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
+          // WITH THE LAUNCH CLOCK ON IT. `connected_ms` has been marked here for a
+          // while and only ever left in a telemetry beat, so the number that says
+          // how long this Mac took to get into a call was invisible to anybody
+          // running the app -- and rejoining is a launch-to-media budget in
+          // exactly the same way a first join is. Printing it is what makes it
+          // possible to say where the time went instead of guessing.
+          fputs("room \(room): connected via \(wire.lockedFrom) at \(sinceLaunch()) ms\n", stderr)
           // ── AND THE PERSON WE CALLED GOES IN THE LIST ──────────────────────
           //
           // The mirror of the answer path, which writes a contact down the moment
@@ -2299,6 +2533,27 @@ if let room = arg("room") {
           //
           // Deliberately silent rather than a log line: a link call is the
           // ordinary case, and "recorded nobody" is not news every time.
+          // ── THE CALL BECOMES A FACT ON DISK, HERE AND NOWHERE EARLIER ────────
+          //
+          // At the LOCK, not at launch. A process that never found anybody was
+          // never in a call, and a record written hopefully at startup would send
+          // the next launch straight into an empty room with the camera on.
+          //
+          // Not for a ring preview either: that image is showing a card, and a
+          // record written there would make a ring somebody declined into a call
+          // that reopens itself.
+          if !ringPreview {
+            Resume.begin(room: room, port: Int(listenPort), peer: peerSpec,
+                         video: videoArg, who: arg("calling") ?? arg("incoming") ?? "",
+                         call: Telemetry.call, path: wire.lockedFrom)
+          }
+          // ── AND THE GAP, IF THIS LOCK IS A RETURN ───────────────────────────
+          //
+          // Measured on the side that STAYED, which is the only side that can
+          // measure it: the returning process has no idea how long it was away
+          // from the far end's point of view, and its own launch clock starts
+          // after the silence began. One number, printed once, in the plainest
+          // form a rig can grep for.
           // ── NOT `if sawRemote`. THE LOCK IS THE ARRIVAL. ──────────────────
           //
           // A locked transport with packets flowing IS the other person being
@@ -2390,6 +2645,11 @@ if let room = arg("room") {
         if wire.lastFromPeer != 0, Clock.msSigned(Clock.now(), wire.lastFromPeer) > 3000 {
           Metrics.count("rediscoveries")
           fputs("room \(room): nothing from \(wire.lockedFrom) for 3 s -- looking again\n", stderr)
+          // The gap started when the last packet arrived, NOT when this branch
+          // noticed. Three seconds of the silence had already happened by the time
+          // the detector fired, and a ruler that starts at the alarm rather than at
+          // the event under-reports by exactly its own threshold.
+          if gapBegan == 0 { gapBegan = wire.lastFromPeer }
           wire.unlockForRediscovery()
           announcedFor = ""
           // ── SAY SOMETHING ─────────────────────────────────────────────────
@@ -2399,6 +2659,13 @@ if let room = arg("room") {
           // call timer still counting -- which looks exactly like the app having
           // died, so they close the window and blame it. The web app has said
           // "reconnecting…" for this the whole time.
+          //
+          // AND SAID OUT LOUD, not only drawn. A status pill exists only when
+          // there is a window, so every headless run -- which is most of the rigs
+          // in tools/ -- could not tell "the app decided to say reconnecting" from
+          // "the app said nothing at all". Same reason the mirror-clearing line
+          // above it prints.
+          fputs("  telling them: reconnecting\n", stderr)
           display?.controls?.setStatus("reconnecting…")
           gone = 0
         }
@@ -2407,7 +2674,8 @@ if let room = arg("room") {
       }
       // Unlocked: refresh the directory as well as probing, because if the peer
       // moved, its old address is exactly the one we would otherwise keep trying.
-      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get())
+      let answer = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get())
+      let peers = answer ?? []
       // ── A BLIP AND A DEPARTURE ARE NOT THE SAME THING ────────────────────
       //
       // From the media side they are identical: silence. From the DIRECTORY they
@@ -2430,7 +2698,58 @@ if let room = arg("room") {
         // a camera-off peer could not be detected leaving either, so the call sat
         // on a dead line saying "connected" forever.
         gone += 1
-        if gone == 4 {
+        // ── AND NOW: GONE QUIET IS NOT GONE ──────────────────────────────────
+        //
+        // Every line below used to fire at two seconds of silence: "the other
+        // person left", the waiting card back over their frozen face, presence
+        // off. That is right for somebody who hung up and wrong for the four
+        // things that look identical from here -- an update re-exec, a crash, a
+        // force-quit, a closed lid -- and only one of those is a decision.
+        //
+        // A person who hangs up now SAYS so, on the media socket
+        // (`Wire.sendGoodbye`), and that goodbye ends the call at both ends
+        // immediately. So silence is no longer evidence of anything except
+        // silence, and while a call record is open this end HOLDS: the timer
+        // keeps running, the picture stays, the invite card does not come back
+        // (a card reading "waiting for the other person" over a call that is
+        // paused is what makes a return feel like a brand new call), and the
+        // probes keep going out for as long as it takes.
+        //
+        // The one thing that DOES end the hold without a goodbye is the room
+        // forgetting them. `answer == nil` means this Mac could not ask, which is
+        // not a fact about them (`blind-instruments-report-negatives`), so only a
+        // real answer with an empty list counts -- and an empty list means the
+        // 90 s lease expired with nobody republishing. A restarting process
+        // republishes within about a second, hundreds of times inside that
+        // window, which is what makes the two ends agree without two timeouts.
+        let holding = Resume.holding
+        if holding, gone >= 4 {
+          if !announcedHold {
+            announcedHold = true
+            let who = arg("calling") ?? arg("incoming") ?? ""
+            let name = who.isEmpty ? "They" : Identity.display(who)
+            Metrics.count("peer_held")
+            fputs("room \(room): \(name.lowercased()) went quiet without hanging up"
+                + " -- holding the call open\n", stderr)
+            display?.controls?.setStatus("\(name)\u{2019}ll be right back\u{2026}")
+          }
+          // The room has forgotten them: 90 s with nobody publishing. That is the
+          // shared fact both ends read, and it is the bound on the hold.
+          if let a = answer, a.isEmpty,
+             wire.lastFromPeer != 0,
+             Clock.msSigned(Clock.now(), wire.lastFromPeer) > Double(Resume.roomLeaseMs) {
+            fputs("room \(room): nobody has been in \(room) for \(Resume.roomLeaseMs / 1000) s"
+                + " -- treating that as gone\n", stderr)
+            Resume.end(why: "the room lease expired with nobody in it")
+            Metrics.count("peer_left")
+            display?.controls?.setStatus("the other person left")
+            display?.controls?.setPeerPresent(false)
+            peerHere = false
+            sinceLock = -1
+            pictureCleared = false
+            announcedHold = false
+          }
+        } else if !holding, gone == 4 {
           let why = peers.isEmpty ? "not in the room" : "silent for \(peers[0].ageMs / 1000)s"
           fputs("room \(room): peer is \(why) -- telling the window\n", stderr)
           display?.controls?.setStatus("the other person left")
@@ -2460,7 +2779,7 @@ if let room = arg("room") {
   Thread {
     while true {
       Thread.sleep(forTimeInterval: 20)
-      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get())
+      let peers = Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relay.get()) ?? []
       // Only worth acting on while unresolved. Once a packet has arrived, the
       // address it came from is better evidence than anything the rendezvous can
       // tell us -- and re-pointing a working call at a directory entry is how a
@@ -4203,6 +4522,33 @@ Thread {
   }
 }.start()
 
+// ── THE OTHER END HUNG UP ────────────────────────────────────────────────────
+//
+// The one message that ends a call. Assigned BEFORE the receive loop starts, not
+// after: this is the same ordering trap as `Update.onPending` and `beforeReexec`
+// -- a handler installed after the thread that fires it can miss the very first
+// event, and the first event here is somebody pressing the button.
+//
+// It runs on the receive thread, so everything slow is handed to a queue and the
+// exit is the last thing. The record goes first: if anything below this line
+// hangs, the call must already be over on this disk, or the next launch would
+// reopen a room the person deliberately left.
+wire.onPeerBye = {
+  Resume.end(why: "they hung up")
+  Metrics.count("bye_recv_inband")
+  Metrics.fact("outcome", "they hung up")
+  shuttingDown = true
+  display?.controls?.setStatus("the other person hung up")
+  fputs("call: the other person hung up -- ending\n", stderr)
+  // Off the receive thread: postFinalBeat waits on a semaphore for up to 1.5 s,
+  // and blocking the media reader for that long would stall audio for anybody
+  // else still arriving. Nothing is left to receive, but the rule holds anyway.
+  DispatchQueue.global().async {
+    postFinalBeat(why: "they hung up")
+    exit(0)
+  }
+}
+
 let t = Thread { wire.recvLoop(into: audio.ring, video: vasm) }
 t.start()
 
@@ -5604,6 +5950,14 @@ func reportLoop() {
   // Once a second, on the report thread: turns two instantaneous signals into a
   // duration. Never from a callback -- see the note in Audio.sampleQuality.
   audio.sampleQuality()
+  // ── "THIS CALL WAS ALIVE AS OF NOW" ────────────────────────────────────────
+  //
+  // One small atomic write a second, on the thread that was already waking once a
+  // second, nowhere near audio or video. It is the freshness stamp the next launch
+  // reads to decide whether walking back in is safe -- without it a record could
+  // only ever say when the call STARTED, and a four-hour call would look four
+  // hours stale the moment it crashed.
+  Resume.touch()
   // Same cadence, same thread, same reason: never from a callback.
   audio.tuneInputGain()
   // Same cadence: headphones appearing mid-call open it to full duplex.

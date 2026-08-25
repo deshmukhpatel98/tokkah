@@ -66,3 +66,4 @@ testbed/peer/media/
 # binary is not source. Untracked going forward rather than rewritten out of
 # history: the old objects stay in the pack, but no new ones land.
 mac/.build/
+mac/tools/__pycache__/

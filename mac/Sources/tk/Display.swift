@@ -110,9 +110,18 @@ final class Display {
   private var keyMonitor: Any?
   private var closer: WindowCloser?
 
+  /// `onLeave` is the hang-up control: it ends the call for both people.
+  /// `onClose` is the red button and Command-Q: it puts the app away, and since a
+  /// call now outlives its process those are two different acts. They were one
+  /// closure, which is the `one-condition-two-concerns` shape this project keeps
+  /// paying for -- and here it meant that closing a window hung up on somebody.
+  /// `onClose` falls back to `onLeave` so a caller that has not been taught the
+  /// difference behaves exactly as before rather than losing its window delegate.
   func open(title: String, w: Int, h: Int, room: String? = nil,
             onMic: ((Bool) -> Void)? = nil, onCam: ((Bool) -> Void)? = nil,
-            onLeave: (() -> Void)? = nil, invite: String = "") {
+            onLeave: (() -> Void)? = nil, onClose: (() -> Void)? = nil,
+            invite: String = "") {
+    let onClose = onClose ?? onLeave
     let rect = NSRect(x: 0, y: 0, width: w, height: h)
     let window = NSWindow(contentRect: rect,
       styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
@@ -268,12 +277,14 @@ final class Display {
       // A real menu bar, so Command-Q, Command-W and Command-M mean what they mean
       // everywhere else. Installed here because this is the path that has a window.
       Menu.controls = c
-      Menu.onQuit = onLeave
+      // Command-Q is "put this away", not "hang up on them" -- same reasoning as
+      // the red button below.
+      Menu.onQuit = onClose
       Menu.install()
     }
     window.contentView = root
-    if let onLeave {
-      let cl = WindowCloser(onClose: onLeave)
+    if let onClose {
+      let cl = WindowCloser(onClose: onClose)
       window.delegate = cl
       closer = cl
     }

@@ -170,14 +170,27 @@ enum Rendezvous {
   struct Peer { let id: String; let ip: String; let port: UInt16; let ageMs: Int; let localIP: String?; let localPort: UInt16?; let relayIP: String?; let relayPort: UInt16? }
 
   /// Publish our address and return whoever else is in the room.
+  ///
+  /// ── nil IS NOT AN EMPTY ROOM ────────────────────────────────────────────────
+  ///
+  /// This returned `[]` for both "the directory says nobody else is here" and
+  /// "the request never completed", and for as long as the only consumer was
+  /// "keep waiting" that difference cost nothing. It is not free any more: the
+  /// room directory is now the evidence that decides whether a peer who went
+  /// quiet has LEFT or is coming back, and one launch with no wifi would have
+  /// read as a departure and ended a call nobody hung up on.
+  ///
+  /// `blind-instruments-report-negatives` -- an instrument that cannot see the
+  /// event returns the same value as a real negative. So the two answers are two
+  /// values, and the caller that only wants to keep waiting still writes `?? []`.
   static func exchange(room: String, me: String, addr: String?, local: String? = nil,
-                       relay: String? = nil, base: String = "https://room.tokkah.com") -> [Peer] {
+                       relay: String? = nil, base: String = "https://room.tokkah.com") -> [Peer]? {
     var u = "\(base)/api/room/\(room)/rv?me=\(me)"
     if let a = addr { u += "&addr=\(a)" }
     if let l = local { u += "&local=\(l)" }
     if let r = relay { u += "&relay=\(r)" }
-    guard let url = URL(string: u) else { return [] }
-    var out: [Peer] = []
+    guard let url = URL(string: u) else { return nil }
+    var out: [Peer]?
     let sem = DispatchSemaphore(value: 0)
     var req = URLRequest(url: url)
     req.timeoutInterval = 8
@@ -187,6 +200,10 @@ enum Rendezvous {
       guard let d,
             let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
             let arr = o["peers"] as? [[String: Any]] else { return }
+      // Assigned HERE and not before the guards: an answer that arrived and did
+      // not parse is not an answer about the room, and promoting it to "the room
+      // is empty" is the same mistake in a different costume.
+      out = []
       for p in arr {
         guard let a = p["addr"] as? String, let id = p["id"] as? String else { continue }
         let bits = a.split(separator: ":")
@@ -201,9 +218,9 @@ enum Rendezvous {
           let rb = r.split(separator: ":")
           if rb.count == 2, let rp = UInt16(rb[1]) { rip = String(rb[0]); rport = rp }
         }
-        out.append(Peer(id: id, ip: String(bits[0]), port: port,
-                        ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport,
-                        relayIP: rip, relayPort: rport))
+        out?.append(Peer(id: id, ip: String(bits[0]), port: port,
+                         ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport,
+                         relayIP: rip, relayPort: rport))
       }
     }.resume()
     _ = sem.wait(timeout: .now() + 10)
