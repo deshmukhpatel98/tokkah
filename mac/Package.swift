@@ -25,6 +25,11 @@ let package = Package(
         .linkedFramework("CoreAudio"),
         .linkedFramework("AudioToolbox"),
         .linkedFramework("AVFoundation"),
+        // The system recogniser, used when there is no local Qwen daemon --
+        // which is every machine but the one this was built on. Weak by
+        // availability rather than by link: the whole file is behind
+        // `#available(macOS 26.0, *)` and the package floor is 14.
+        .linkedFramework("Speech"),
       ]
     ),
     // A separate binary on purpose: it opens the microphone and a window, and it

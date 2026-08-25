@@ -255,7 +255,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
-  "no-subtitles", "asr-port", "subtitle-debug",
+  "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -1959,6 +1959,83 @@ if flag("cue-test") {
 // a judgement about a conversation, so it is asserted clause by clause -- and the
 // clause that matters most is the REFUSAL: an even conversation with two
 // simultaneous starts must leave both people alone.
+// ── THE RULER FOR THE THING THAT FEEDS THE RECOGNISER ───────────────────────
+//
+// A resampler is invisible: it produces audio that sounds fine and a transcript
+// that is quietly worse. The filter this replaces was four cascaded one-poles,
+// which is 24 dB per octave from about 3.5 kHz -- so it removed most of the
+// energy in s, sh, f and t, the band a recogniser needs to tell them apart. It
+// was doing that for months and nothing could see it, because every check was of
+// the transcript and not of the signal.
+//
+// So the filter is measured directly, against a swept tone: flat where speech
+// lives, gone before anything can fold back.
+if flag("decimator-test") {
+  var bad = false
+  func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
+    print("  \(what.padding(toLength: 40, withPad: " ", startingAt: 0)) \(got.padding(toLength: 12, withPad: " ", startingAt: 0)) (want \(want))  \(ok ? "ok" : "WRONG")")
+    if !bad { bad = !ok }
+  }
+  /// Level at the OUTPUT for a tone at `f` at the input, in dB relative to a
+  /// tone at 300 Hz. Measured, not modelled: the same code the call runs.
+  func level(_ f: Double) -> Double {
+    let n = Int(SR * 0.6)
+    var x = [Float](repeating: 0, count: n)
+    for i in 0..<n { x[i] = Float(sin(2 * .pi * f * Double(i) / SR)) }
+    let d = Decimator3()
+    let y = x.withUnsafeBufferPointer { d.run($0.baseAddress!, n) }
+    // Skip the filter's own fill, then RMS.
+    let skip = min(y.count / 2, Decimator3.taps)
+    var e = 0.0
+    for i in skip..<y.count { e += Double(y[i]) * Double(y[i]) }
+    return 10 * log10(e / Double(max(1, y.count - skip)) * 2)
+  }
+  let ref = level(300)
+  func rel(_ f: Double) -> Double { level(f) - ref }
+  // ── PASSBAND: SPEECH HAS TO COME THROUGH UNTOUCHED ────────────────────────
+  for f in [300.0, 1000, 2000, 3000, 4000, 5000, 6000] {
+    let d = rel(f)
+    show("\(Int(f)) Hz passes", String(format: "%+.1f dB", d), "within 1.5 dB", abs(d) < 1.5)
+  }
+  // ── STOPBAND: NOTHING ABOVE 8 kHz MAY FOLD BACK ───────────────────────────
+  for f in [9000.0, 11000, 14000, 20000] {
+    let d = rel(f)
+    show("\(Int(f)) Hz is gone", String(format: "%+.0f dB", d), "< -40 dB", d < -40)
+  }
+  // And the rate is actually a third.
+  let n = Int(SR)
+  let x = [Float](repeating: 0.1, count: n)
+  let d = Decimator3()
+  let y = x.withUnsafeBufferPointer { d.run($0.baseAddress!, n) }
+  show("one second in, a third out", "\(y.count) samples", "16000", abs(y.count - 16000) <= 1)
+  // Streaming across chunk boundaries must equal one big call, or every 120 ms
+  // tick puts a click into the recogniser's input.
+  var seed: UInt64 = 0x5EED
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  let src = (0..<(48000 * 2)).map { _ in rnd() }
+  let whole = src.withUnsafeBufferPointer { Decimator3().run($0.baseAddress!, src.count) }
+  let piece = Decimator3()
+  var chunked: [Float] = []
+  var i = 0
+  while i < src.count {
+    let take = min(5760, src.count - i)     // 120 ms
+    src.withUnsafeBufferPointer { chunked += piece.run($0.baseAddress! + i, take) }
+    i += take
+  }
+  var worst: Float = 0
+  for k in 0..<min(whole.count, chunked.count) { worst = max(worst, abs(whole[k] - chunked[k])) }
+  show("120 ms chunks == one long call", String(format: "%.2e", Double(worst)), "0",
+       worst < 1e-6 && abs(whole.count - chunked.count) <= 1)
+
+  print(bad ? "  DECIMATOR TEST FAILED"
+            : "  DECIMATOR TEST PASSED -- speech passes flat, nothing above 8 kHz survives to fold"
+              + " back, and a chunk boundary is not a discontinuity")
+  exit(bad ? 1 : 0)
+}
+
 if flag("yield-test") {
   var bad = false
   func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
@@ -2682,8 +2759,13 @@ nonisolated(unsafe) var turnComplete = 0.0
 /// callback; a bool either side of a 120 ms tick, which is why it needs nothing
 /// around it.
 nonisolated(unsafe) var utteranceWasListening = true
+/// Samples the chunk reader handed over, and samples that survived the cleaner.
+/// A gap between them is audio the recogniser never sees, and a gap that GROWS is
+/// a transcript that falls further behind the longer the call runs.
+nonisolated(unsafe) var fedIn = 0
+nonisolated(unsafe) var fedOut = 0
 let subtitles = flag("no-subtitles") ? nil
-  : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789)
+  : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
 
 // RECEIVING IS NOT SENDING, and this was inside the block that needs a
 // recogniser -- so a machine without one could not DISPLAY the far end's words
@@ -2745,7 +2827,8 @@ if let subs = subtitles {
     let audible = Audio.sharedGate.gain * Audio.sharedGate.yieldGainNow > 0.5
     display?.controls?.setMyWords(text, showing: !audible && !listening)
     if flag("subtitle-debug") {
-      fputs("  you said: \(text)\(final ? " ." : " ...")\(listening ? "  (listening)" : "")\n", stderr)
+      fputs("  \(sinceLaunch()) ms you said: \(text)\(final ? " ." : " ...")"
+          + "\(listening ? "  (listening)" : "")\n", stderr)
     }
   }
   // Smart-turn reads the WAVEFORM, so it is judging prosody: a sentence that
@@ -2760,55 +2843,78 @@ if let subs = subtitles {
     let cleaner = Audio.SubtitleCleaner()
     var wasVocal = false
     var spokeFor = 0.0
+    var resetListening = true
     while !shuttingDown {
       Thread.sleep(forTimeInterval: 0.12)
       guard Audio.gate.on else { continue }
       let vocal = Audio.sharedGate.vocal != .quiet
-      // The gate latches this across the whole vocalisation, so this thread only
-      // reads it. It used to be derived HERE, from two samples 120 ms apart, and
-      // that is how six seconds of speech got labelled a listening noise and
-      // rendered as a bloom across the whole window: the poll saw `backchannel`
-      // at the start of the sentence and nothing later moved it.
+      // ── THE FLAG BELONGS TO THE UTTERANCE BEING TRANSCRIBED ────────────────
       //
-      // ONLY WHILE VOCAL. The gate clears the latch the moment somebody stops,
-      // and the FINAL revision of a sentence is published after that -- so
-      // reading it unconditionally re-labelled the last line of every turn a
-      // listening noise, which is the same bug wearing a different hat. Holding
-      // the last in-flight value is correct: it belongs to the utterance being
-      // transcribed, not to the silence after it.
-      if vocal { utteranceWasListening = !Audio.sharedGate.everClaimed }
+      // Third time around on this one, and the fix is finally about SCOPE rather
+      // than about timing. The gate's vocalisation and the recogniser's utterance
+      // are not the same span: a long sentence contains pauses over 450 ms, so
+      // the gate ends and restarts several times inside one utterance, and every
+      // restart begins as a listening noise again. Measured on a live call, a
+      // 47-word sentence went out labelled a listening noise because its TAIL was
+      // a fresh vocalisation less than 700 ms old.
+      //
+      // So it latches false the moment anything in this utterance becomes a bid,
+      // and it only resets when the RECOGNISER's utterance ends -- and even then
+      // not immediately, but at the next onset, because the final revision is
+      // published asynchronously after that call and would otherwise read the
+      // reset value.
+      if !wasVocal, vocal, resetListening { utteranceWasListening = true; resetListening = false }
+      if vocal, Audio.sharedGate.everClaimed { utteranceWasListening = false }
       if let c = audio.subtitleChunk(), !c.mic.isEmpty {
+        fedIn += c.mic.count
         // Cleaned before it is recognised, because on speakers this microphone
         // also hears the far end and their words would otherwise land in this
         // person's subtitles under this person's name.
-        let clean = cleaner.clean(mic: c.mic, ref: c.ref)
+        // ── THE CLEANER IS NOT FREE, SO IT HAS AN OFF SWITCH ─────────────────
+        //
+        // It exists for the case where this microphone hears the far end off the
+        // speaker. When it does not -- headphones, or the far end silent -- it is
+        // spectral surgery on a signal that needed none, and the only way to know
+        // what it costs the transcript is to measure both arms on the same call.
+        let clean = flag("no-sub-clean") ? c.mic : cleaner.clean(mic: c.mic, ref: c.ref)
+        fedOut += clean.count
         clean.withUnsafeBufferPointer { subs.feed($0.baseAddress!, $0.count) }
       }
-      if vocal { subs.tick() } else if wasVocal { subs.endUtterance() }
+      if vocal { subs.tick() } else if wasVocal { subs.endUtterance(); resetListening = true }
 
-      // ── A SENTENCE ENDS WHEN IT LANDS, NOT WHEN THE ROOM GOES QUIET ─────────
+      // ── A SENTENCE ENDS WHEN IT LANDS, AND ONLY AT A PAUSE ─────────────────
       //
-      // Waiting for silence is what made a long turn grow into a paragraph: the
-      // recogniser kept being handed a longer and longer window, the caption
-      // never committed, and the request cost climbed with it. Somebody talking
-      // steadily for a minute never produces the gap this was waiting for.
+      // Waiting for the 450 ms of silence that ends a vocalisation is what made a
+      // long turn grow into a paragraph: the recogniser was handed a longer window
+      // every time, the caption never committed, and the request cost climbed with
+      // it. Somebody talking steadily for a minute never produces that gap.
       //
-      // Smart-turn already answers the right question and its answer was being
-      // stored and never used. It reads the WAVEFORM, so it hears the difference
-      // between a sentence that landed and one that trailed off -- which is
-      // exactly a sentence boundary, and is the thing no transcript can recover.
+      // Smart-turn answers the right question -- it reads the WAVEFORM, so it
+      // hears a sentence that landed against one that trailed off, which no
+      // transcript can recover. But it has to be ASKED AT A PAUSE. Thresholding
+      // it against a continuous stream chopped read speech every 1.2 seconds:
+      // measured against ground truth on a live call, 85.8% word error, a
+      // transcript of "Mr. Quilter is the." / "Cool." / "Matter."
       //
-      // The floor on `spokeFor` is there because a high probability on 300 ms of
-      // audio is a confident opinion about almost nothing.
+      // So: a real breath (220 ms, shorter than the 450 that ends a turn and
+      // longer than a plosive), and prosody that says it landed, and enough
+      // material behind it to be a sentence at all.
       spokeFor = vocal ? spokeFor + 0.12 : 0
-      if vocal, spokeFor > 1.2, turnComplete > 0.75 {
+      let breath = Audio.sharedGate.quietMsNow
+      if vocal, spokeFor > 1.5, breath > 220, turnComplete > 0.8 {
         subs.endUtterance()
+        resetListening = true
         spokeFor = 0
         // Consumed. The probability belongs to the response that produced it, and
-        // leaving it high would end the next sentence 1.2 s in whether or not it
-        // had landed -- chopping a steady talker into fixed-length pieces, which
-        // is the failure this was fixing.
+        // leaving it high would end the next sentence the moment it drew breath.
         turnComplete = 0
+      } else if vocal, spokeFor > 12 {
+        // A monologue still has to commit. Twelve seconds is past any sentence
+        // and just inside the recogniser's own 14 s window, so this is also what
+        // stops the request growing without bound.
+        subs.endUtterance()
+        resetListening = true
+        spokeFor = 0
       }
       wasVocal = vocal
     }
@@ -3858,7 +3964,8 @@ func reportLoop() {
         + (t.yields > 0 ? String(format: "  gave way %d time(s), %.1f%% of the call%@",
                                  t.yields, audio.yieldedPct,
                                  audio.yieldingNow ? " (NOW)" : "") : "")
-        + (subtitles.map { "  words: \($0.requests) asked, \($0.failures) failed,"
+        + String(format: "  fed %.2f/%.2f s", Double(fedOut) / SR, Double(fedIn) / SR)
+        + (subtitles.map { "  words(\($0.engine)): \($0.requests) asked, \($0.failures) failed,"
                          + " \(String(format: "%.0f", $0.lastMs)) ms, \(subSent) sent \(subGot) got" } ?? "")
         + "\n", stderr)
     if ProcessInfo.processInfo.environment["KIN_GATE_DEBUG"] != nil {

@@ -1545,6 +1545,11 @@ final class Audio {
     /// Where the duck has actually got to, so a test can assert the bound rather
     /// than the intent.
     var yieldGainNow: Float { yieldGain }
+    /// How long this end has been silent inside the current vocalisation. Read by
+    /// the subtitle thread: a completion judgement is only meaningful AT A PAUSE,
+    /// and this is the pause.
+    var quietMsNow: Double { Double(quietSamples) / SR * 1000 }
+    var vocalMsNow: Double { Double(vocalSamples) / SR * 1000 }
     private(set) var closedFrames = 0
     private(set) var openFrames = 0
     private(set) var backchannels = 0
