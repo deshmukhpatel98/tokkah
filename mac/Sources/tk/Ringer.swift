@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 
 /// A ring you can hear AND see. A window that appears silently behind whatever
 /// someone is doing is not a call arriving, and the whole point of the watcher
@@ -28,13 +29,19 @@ enum Ringer {
   static func start(raising window: NSWindow? = nil) {
     lock.lock()
     guard timer == nil else { lock.unlock(); return }
-    let t = Timer(timeInterval: 2.5, repeats: true) { _ in play() }
+    // ── ONE CONDITION, TWO CONCERNS ──────────────────────────────────────────
+    //
+    // `timer` was the sound AND the "is this still ringing" flag that three later
+    // closures test. With the sound now a looping player, the flag needs to exist
+    // on its own -- so this timer's only job is to be that flag, and it fires
+    // nothing.
+    let t = Timer(timeInterval: 3600, repeats: false) { _ in }
     timer = t
     lock.unlock()
 
     Metrics.count("ring_ui_shown")
     NSApp.requestUserAttention(.criticalRequest)
-    play()
+    startTone()
     RunLoop.main.add(t, forMode: .common)
     // Stops itself after 40 s so a missed call does not ring the room all day.
     DispatchQueue.main.asyncAfter(deadline: .now() + 40) { stop() }
@@ -96,6 +103,7 @@ enum Ringer {
   }
 
   static func stop() {
+    stopTone()
     lock.lock()
     timer?.invalidate(); timer = nil
     let w = raised; raised = nil
@@ -106,9 +114,67 @@ enum Ringer {
     if let w { DispatchQueue.main.async { w.level = lvl; w.collectionBehavior = beh } }
   }
 
-  private static func play() {
-    // A named system sound rather than a bundled asset: nothing to ship, nothing
-    // to license, and it is a sound this Mac already uses for attention.
+  // ── THE SOUND A CALL MAKES ON A MAC ────────────────────────────────────────
+  //
+  // It was `NSSound(named: "Submarine")` on a 2.5 s timer -- a system ALERT, the
+  // noise a Mac makes when something needs looking at. A call is not an alert, and
+  // "Submarine" is what nothing else on this machine uses for a call, so an
+  // arriving call sounded like a notification from an app nobody could name.
+  //
+  // Apple's own ringtones are already on every Mac, in the tone library FaceTime
+  // and Messages draw from. Reading one is not shipping one: nothing is bundled,
+  // nothing is redistributed, and the file only ever plays on the machine it came
+  // from. `Reflection` is the current default; `Opening` was the default before
+  // it and is still present on older systems, so it is the first fallback rather
+  // than a guess. If the library has moved, a system alert is still better than
+  // silence -- which is why the old path is the last rung and not deleted.
+  private static let toneDir =
+    "/System/Library/PrivateFrameworks/ToneLibrary.framework/Versions/A/Resources/Ringtones/"
+  private static var player: AVAudioPlayer?
+
+  /// The ladder, tried in order, reported so a Mac that lands on a lower rung
+  /// says which one. A ring that fell back silently would be indistinguishable
+  /// from a ring that chose to sound like an alert.
+  private static func startTone() {
+    for name in ["Reflection", "Opening", "Marimba"] {
+      let url = URL(fileURLWithPath: toneDir + name + ".m4r")
+      guard FileManager.default.isReadableFile(atPath: url.path) else { continue }
+      do {
+        let p = try AVAudioPlayer(contentsOf: url)
+        // A ringtone is a loop, not a sample. The old 2.5 s timer was a stand-in
+        // for looping and it would have layered a 25 s tone on top of itself ten
+        // times over.
+        p.numberOfLoops = -1
+        p.prepareToPlay()
+        p.play()
+        lock.lock(); player = p; lock.unlock()
+        fputs("ring: sounding \(name) -- Apple's own ringtone\n", stderr)
+        Metrics.count("ring_tone_apple")
+        return
+      } catch {
+        fputs("ring: \(name).m4r would not play (\(error))\n", stderr)
+      }
+    }
+    // No tone library on this Mac. An alert on a repeating timer, which is what
+    // this always was.
+    fputs("ring: no ringtone found -- falling back to a system alert\n", stderr)
+    Metrics.count("ring_tone_fallback")
+    let t = Timer(timeInterval: 2.5, repeats: true) { _ in
+      if let s = NSSound(named: "Submarine") { s.play() } else { NSSound.beep() }
+    }
+    lock.lock(); alertTimer = t; lock.unlock()
+    RunLoop.main.add(t, forMode: .common)
     if let s = NSSound(named: "Submarine") { s.play() } else { NSSound.beep() }
+  }
+
+  private static var alertTimer: Timer?
+
+  private static func stopTone() {
+    lock.lock()
+    let p = player; player = nil
+    let t = alertTimer; alertTimer = nil
+    lock.unlock()
+    p?.stop()
+    t?.invalidate()
   }
 }

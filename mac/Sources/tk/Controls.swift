@@ -1887,6 +1887,20 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     let was = armed
     armed = nil
     guard let v = was, !v.isHidden, v.frame.contains(p) else {
+      // ── A PRESS THAT DID NOT COMMIT SAYS WHY ────────────────────────────────
+      //
+      // This is the release half of answer, decline, cancel and call again -- the
+      // four presses in this app that a person cannot repeat without consequence.
+      // It refused one in ten under test and said nothing at all, which is the
+      // same silence as no click ever arriving. Three separate conditions can
+      // refuse it, so the log names which.
+      if was != nil || mode == .ringing || mode == .calling || mode == .noAnswer {
+        fputs("card: a release did NOT commit -- armed="
+            + (was.map { "\(type(of: $0))" } ?? "nothing")
+            + " hidden=\(was?.isHidden.description ?? "-")"
+            + " inside=\(was.map { $0.frame.contains(p).description } ?? "-")"
+            + " at \(Int(p.x)),\(Int(p.y)) mode=\(mode.rawValue)\n", stderr)
+      }
       super.mouseUp(with: event); return
     }
     if v === answerButton { onAnswer?() }

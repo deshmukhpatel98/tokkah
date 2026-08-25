@@ -354,6 +354,21 @@ func resolveVideoArg() -> String {
 }
 let videoArg = resolveVideoArg()
 
+// ── THIS IMAGE WAS LAUNCHED TO ASK, NOT TO TALK ──────────────────────────────
+//
+// `--incoming` is set and nobody has answered yet, so there is no call here: no
+// room, no socket, no microphone and no camera. See the waiting block further
+// down, and `tools/preanswer-check.sh`.
+//
+// Declared HERE, beside `videoArg`, and not next to the block it guards. Top-level
+// statements run in file order, and the first thing that has to ask this question
+// is the camera bring-up several hundred lines above that block -- which is
+// exactly how the first version of this fix still turned the camera on. The rig
+// could not see it either, because the rig passed `--video off` while the watcher
+// passes `--video camera`: a parameter the harness hardcoded and the product
+// chooses at runtime.
+let ringPending = arg("incoming") != nil
+
 // ── Double-clicked from the Finder? Ask where to call, then be a normal call ──
 //
 // After flag validation, so a typo is still refused, and before anything touches
@@ -891,7 +906,8 @@ func attachCamera(_ cam: CameraSource) {
   }
 }
 
-if videoArg == "camera", flag("window"),
+// `!ringPending`: no green light next to somebody who is only being asked.
+if videoArg == "camera", flag("window"), !ringPending,
    AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
   fputs("camera: already granted at \(sinceLaunch()) ms -- starting it before the window\n", stderr)
   let cam = CameraSource()
@@ -1101,7 +1117,11 @@ if let shot = arg("shot") {
 // left is what could not go there: a file source, and a camera whose permission
 // is not yet settled -- where the system's modal dialog has to appear over a
 // window that already exists, so it can only be asked for from here.
-if earlyCam == nil, videoArg != "off", display != nil || mdisplay != nil {
+// `!ringPending` for the same reason as the fast path above, and it matters more
+// here: this is the branch that can put up the SYSTEM's camera permission dialog,
+// so without it a ring from somebody could ask a stranger's Mac for camera access
+// before its owner had agreed to take the call.
+if earlyCam == nil, videoArg != "off", !ringPending, display != nil || mdisplay != nil {
   if videoArg == "camera" {
     // The call path asks too, in case the app was started from the command line and
     // never saw the join window. Blocking here is fine and deliberate: the answer is
@@ -1332,6 +1352,55 @@ display?.controls?.onDeclineRing = {
   Metrics.tap("decline")
   Metrics.count("ring_declined")
   gOffered = nil
+  // ── A PROCESS THAT EXISTS ONLY TO ASK IS DONE WHEN THE ANSWER IS NO ───────
+  //
+  // The watcher opens a whole new copy of Kin for each ring, precisely so that
+  // declining does not take the watcher down with it. That copy has no room, no
+  // socket and nothing else to do, and leaving it running left an app on screen
+  // showing an empty invite box for a call that was refused.
+  //
+  // Only when this image IS the ring. An app that was already open and in a call
+  // when somebody rang must not exit on decline -- there is a call in it.
+  if ringPending {
+    postFinalBeat(why: "declined")
+    fputs("ring: declined -- nothing else for this copy to do\n", stderr)
+    exit(0)
+  }
+}
+
+// ── A RING IS NOT A CALL UNTIL SOMEBODY SAYS SO ───────────────────────────────
+//
+// Measured on a real call, and it is the worst thing this app has done. The
+// watcher launches Kin with BOTH `--room <r>` and `--incoming <who>`, so the copy
+// that exists to ask "do you want to talk to Meera?" fell straight through into
+// the rendezvous and joined the room. With nobody having pressed anything:
+//
+//     the caller           status=connected   card=hidden
+//     the callee           sent 1513/s  recv 1510/s  played 1503/s
+//
+// So the ring answered itself. The caller saw the call connect; the callee's
+// microphone was live in a room with them; and `setPeerPresent(true)` then HID the
+// ringing card, which is the control that would have let them say no. On top of
+// that the ringtone was playing out of the speakers into that live microphone,
+// which is the echo on both ends that came with it.
+//
+// The fix is the sentence in the heading. This copy shows a card and waits. It
+// opens no socket, no microphone and no camera, and it turns on no green light
+// next to somebody who has not agreed to be on a call. Answering re-execs into
+// the room -- which is what `onAnswerRing` already did -- and that new image is an
+// ordinary call with no `--incoming` on it.
+//
+// Placed HERE, above every line that touches a device or a socket, and gated on
+// the flag rather than on the watcher's argv: the resident watcher is the last
+// thing to update (see `updater-ships-only-what-it-can-install`), so the app has
+// to defend itself against the OLD watcher's launch line, which is the one that
+// will keep arriving for as long as somebody stays logged in.
+if ringPending {
+  fputs("ring: waiting to be answered -- no room, no microphone, no camera\n", stderr)
+  Metrics.count("ring_offered")
+  NSApplication.shared.activate(ignoringOtherApps: true)
+  NSApplication.shared.run()
+  exit(0)
 }
 
 // ── AND IT HAS TO START WHEN THE HANDLE ARRIVES, NOT WHEN THIS LINE RUNS ────
