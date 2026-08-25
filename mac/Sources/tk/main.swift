@@ -695,6 +695,19 @@ nonisolated(unsafe) var peerHere = false
 /// `false` straight back. The flag was set, then unset, by two lines that both
 /// looked right, and the far end went on seeing nothing with no explanation.
 nonisolated(unsafe) var noCameraHere = videoArg == "off"
+/// Whether the doorbell's poll thread is up. Declared HERE, not beside the
+/// function that sets it: `Identity.onClaimed` can fire while the claim's network
+/// round trips are still finishing, which is before that line of top-level code
+/// has run -- and main.swift is top-level code, so a variable declared later has
+/// not been initialised yet. That exact trap cost an hour today one flag over
+/// (see `noCameraHere` above).
+nonisolated(unsafe) var ringingStarted = false
+/// A LOCK AND NOT THE MAIN THREAD. The obvious way to make `startRingingOnce`
+/// single-entry is to hop it onto main -- and that was written, and it never ran:
+/// without `--window` there is no pumped run loop, so the block sat on the main
+/// queue for the whole call and the doorbell stayed off. A latch that depends on
+/// a run loop existing is a latch that is only correct in the windowed build.
+let ringStartLock = NSLock()
 /// Set from the control bar's camera button.
 nonisolated(unsafe) var camOff = false
 /// ── THE LINK SAID NO, SO NOTHING LEAVES ──────────────────────────────────────
@@ -1108,6 +1121,9 @@ Metrics.mark("identity_ready", sinceLaunch())
 Identity.onClaimed = { name in
   Metrics.mark("handle_claimed", sinceLaunch())
   display?.controls?.setHandle(name)
+  // The other edge. See `startRingingOnce` below -- on a first install the handle
+  // is won several seconds after the line that used to decide this.
+  startRingingOnce()
 }
 // Already claimed on a previous launch: the sheet should not wait for a network
 // round trip to show a name that is on this disk.
@@ -1180,6 +1196,7 @@ if let from = arg("incoming"), let r = arg("room") {
     Ringer.start(raising: display?.callWindow)
   }
 }
+startRingingOnce()
 display?.controls?.onCall = { who in
   // Off main: signing and an HTTPS round trip, on the thread that draws.
   Thread {
@@ -1244,7 +1261,33 @@ display?.controls?.onDeclineRing = {
   gOffered = nil
 }
 
-if Identity.claimed, !flag("no-rings") {
+// ── AND IT HAS TO START WHEN THE HANDLE ARRIVES, NOT WHEN THIS LINE RUNS ────
+//
+// `Identity.claimed` is written by a background thread -- the claim is a network
+// round trip, and on a first install it is SEVERAL, because the obvious names are
+// taken and it walks down the list. This line runs long before any of that
+// finishes, so on a fresh install it read false and the doorbell never started:
+// you claim a name, you tell somebody, and you cannot be rung until you quit and
+// reopen Kin. First run is exactly when a person tries this.
+//
+// So it is a function called from BOTH edges -- here for the launch that already
+// has a handle on disk, and from `onClaimed` for the launch that wins one while
+// running -- with a latch, because `startRinging` spawns a thread and two of them
+// would poll the same mailbox and take turns losing rings to each other.
+// `once-fired-probes-record-transients`: a state read once at startup is a
+// birth certificate, not a subscription.
+func startRingingOnce() {
+  // The two edges arrive on different threads -- this launch's top-level code,
+  // and the claim's completion on its network thread -- and two of them through
+  // the guard means two poll threads on one mailbox, taking turns losing rings to
+  // each other. Decided under the lock, acted on outside it: `startRinging`
+  // spawns a thread and nothing it does needs to be serialised with this.
+  ringStartLock.lock()
+  let go = !ringingStarted && Identity.claimed && !flag("no-rings")
+  if go { ringingStarted = true }
+  ringStartLock.unlock()
+  guard go else { return }
+  fputs("ring: listening for calls to @\(Identity.handle)\n", stderr)
   // The whole ring, not a pair of strings: answering has to remember the KEY that
   // rang, and an earlier version of this line kept only the name and bound the
   // contact to an empty string -- which would have made every later ring from
