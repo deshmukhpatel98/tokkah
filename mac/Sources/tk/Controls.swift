@@ -1517,7 +1517,35 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   }
 
   /// One place decides what is on screen.
+  // ── A CLICK NOBODY AIMED ───────────────────────────────────────────────────
+  //
+  // Three times in one afternoon this card answered a call with nobody at the
+  // keyboard, each time at a slightly different point inside the answer pill --
+  // so a real pointer, not this app's own synthetic presses, which always land on
+  // a control's exact centre. The shape is always the same: the ring window sets
+  // itself `.floating`, orders itself in front of everything and activates five
+  // times over two seconds (see Ringer), and it does all of that UNDERNEATH a
+  // pointer that has been sitting still. Whatever click then arrives was aimed at
+  // whatever used to be there.
+  //
+  // Two facts separate that from a person answering, and both are recorded the
+  // moment the card changes mode:
+  //
+  //   · a person has to SEE the card before they can decide. Nobody reads a name
+  //     and hits a 74-point pill in under a third of a second.
+  //   · a person MOVES THE POINTER to the button. A click at the exact pixel the
+  //     pointer was already parked on, with no movement in between, was aimed at
+  //     whatever was on screen before this card took the front.
+  //
+  // Either one alone would be too blunt. Together they refuse the accident and
+  // let every real press through -- and a refusal says so, because a control that
+  // silently ignores a finger is the bug this is meant to prevent, inverted.
+  private var modeAt = Date.distantPast
+  private var pointerAtMode = NSPoint(x: -10_000, y: -10_000)
+
   private func applyMode() {
+    modeAt = Date()
+    pointerAtMode = NSEvent.mouseLocation
     let m = mode
     // The three states that say a person's name are the three that need a surface
     // under the words. `invite` and `dial` are two controls on the picture.
@@ -1824,9 +1852,43 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // has a higher z-index. Here it is a subview added last, so without the
   // `hitTest` below it would swallow every click on mic, camera and leave, and the
   // call would look frozen while being perfectly fine.
-  /// A card that appears the instant the app opens: its first click is the one
-  /// that matters most, and it used to be eaten by activation.
-  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+  // ── THE CLICK THAT BRINGS KIN FORWARD MUST NOT ANSWER THE CALL ────────────
+  //
+  // Measured, twice, on a ring nobody touched:
+  //
+  //     ring: answer committed by leftMouseUp at (606.75, 294.92)
+  //     ring: answer committed by leftMouseUp at (605.44, 289.64)
+  //
+  // Two different fractional points a few pixels apart -- so not this app's own
+  // synthetic presses, which always land on a control's exact centre. That is a
+  // real pointer, over a window that had just raised and activated ITSELF to
+  // ring, with `acceptsFirstMouse` saying yes to everything on it. The call was
+  // answered, the microphone went live, and nobody had decided anything.
+  //
+  // So the card now answers that question per control. The link still copies on
+  // a first click -- it always did, it is harmless, and a card that appears the
+  // instant the app opens should not need two clicks to be useful. Answer,
+  // decline, cancel and call-again do not: they join a room, end a call, or place
+  // one, and every Mac app makes you bring a window forward before a control like
+  // that will fire. This is the same argument as commit-on-release two hundred
+  // lines below, one step earlier in the same event.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+    guard let event else { return true }
+    let p = convert(event.locationInWindow, from: nil)
+    for v in [answerButton, declineButton, cancelButton, againButton] as [NSView]
+    where !v.isHidden && v.frame.contains(p) { return false }
+    return true
+  }
+
+  /// What `acceptsFirstMouse` would say at a control's own centre, for the audit.
+  /// Read out rather than reasoned about: the rule above is geometry, and geometry
+  /// written down in a comment is geometry nobody checks again.
+  func firstMouseAt(_ v: NSView) -> Bool {
+    let mid = v.convert(NSPoint(x: v.bounds.midX, y: v.bounds.midY), to: self)
+    for c in [answerButton, declineButton, cancelButton, againButton] as [NSView]
+    where !c.isHidden && c.frame.contains(mid) { return false }
+    return true
+  }
 
   /// Only what is actually on screen, so the `?` audit cannot report a control
   /// the current mode has hidden.
@@ -1877,7 +1939,45 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     let p = convert(event.locationInWindow, from: nil)
     armed = nil
     for v in [answerButton, declineButton, cancelButton, againButton] as [NSView]
-    where !v.isHidden && v.frame.contains(p) { armed = v; return }
+    where !v.isHidden && v.frame.contains(p) {
+      let since = Date().timeIntervalSince(modeAt)
+      let here = NSEvent.mouseLocation
+      let moved = abs(here.x - pointerAtMode.x) > 2 || abs(here.y - pointerAtMode.y) > 2
+      // `eventNumber == 0` is this app's own harness, which has no pointer to move
+      // and is not the thing being defended against.
+      // ONE SECOND, and it is not a guess. Caught in the act while four test rigs
+      // were running and somebody was using this Mac at the same time:
+      //
+      //   card: PillButton ringing armed at 612,309 -- eventNumber=2777 subtype=3
+      //   card: PillButton ringing armed at 603,284 -- eventNumber=2810 clicks=2
+      //
+      // Real trackpad taps (subtype 3, non-zero event numbers, one of them a
+      // double-click) landing on a ring card that had just thrown itself in front
+      // of what that person was doing. Their click was aimed at another app and
+      // answered a call instead. A second is longer than any accident and shorter
+      // than anybody who has to see a name before deciding.
+      if event.eventNumber != 0, since < 1.0 || !moved {
+        fputs("card: ignored a click nobody aimed -- \(Int(since * 1000)) ms after the"
+            + " \(mode.rawValue) card appeared, pointer moved=\(moved)\n", stderr)
+        Metrics.count("card_click_unaimed")
+        return
+      }
+      armed = v
+      // ── WHERE A CONSEQUENTIAL PRESS CAME FROM ────────────────────────────
+      //
+      // These four join a room, end a call or place one, and this app has twice
+      // recorded one committing with nobody at the keyboard. `eventNumber` is the
+      // window server's own counter: a real device event carries a non-zero one,
+      // and this app's own synthetic presses are built with zero. `clickCount`
+      // and `pressure` say the same thing from another angle. Printed at the
+      // PRESS, because by the release the process may already be gone.
+      fputs("card: \(type(of: v)) \(mode.rawValue) armed at \(Int(p.x)),\(Int(p.y))"
+          + " -- eventNumber=\(event.eventNumber) clicks=\(event.clickCount)"
+          + " pressure=\(event.pressure) active=\(NSApp.isActive)"
+          + " subtype=\(event.subtype.rawValue)"
+          + " after=\(Int(since * 1000))ms moved=\(moved)\n", stderr)
+      return
+    }
     if !urlGlass.isHidden, urlGlass.frame.contains(p) { onCopy?(); return }
     super.mouseDown(with: event)
   }
@@ -2265,6 +2365,10 @@ final class CallControls: NSView {
   var onMic: ((Bool) -> Void)?
   var onCam: ((Bool) -> Void)?
   var onLeave: (() -> Void)?
+  /// Cancelling a call that has not been answered. Distinct from `onLeave`
+  /// because there is somebody on the other end who has to be TOLD -- see
+  /// `sendBye` in main.swift. Optional, and the fallback below is `onLeave`.
+  var onHangUp: (() -> Void)?
   var onCamPick: ((Int) -> Void)?
   var inviteText = "" { didSet { onMain { [weak self] in self?.waiting.url = self?.inviteText ?? "" } } }
   /// Set once the key exchange has happened; blank until then, and a blank code
@@ -2441,14 +2545,16 @@ final class CallControls: NSView {
     // doorbell that is not wired, which the field used to be missing.
     waiting.onCall = { [weak self] h in self?.dial(h) }
     waiting.onAnswer = { [weak self] in self?.onAnswerRing?() }
-    // Through the leave that is already wired, rather than a second path out of a
-    // call. There is no un-ring to send -- the ring is in their mailbox and they
-    // may still answer -- so cancelling is hanging up on a phone still ringing.
     waiting.onCallGaveUp = { [weak self] line in self?.setStatus(line) }
     waiting.onCancelCall = { [weak self] in
+      guard let self else { return }
       Metrics.tap("cancel_call")
-      self?.setStatus("call cancelled")
-      self?.onLeave?()
+      self.setStatus("call cancelled")
+      // Through the hang-up hook when there is one, so the other Mac is told
+      // instead of ringing on into a timeout nobody can see. Falls back to the
+      // plain leave, which is what this did when there was nothing to send: an
+      // unwired hook must never be the difference between leaving and staying.
+      if let hangUp = self.onHangUp { hangUp() } else { self.onLeave?() }
     }
     waiting.onDecline = { [weak self] in
       self?.waiting.clearIncoming()
@@ -4104,7 +4210,12 @@ extension CallControls {
       }
       let got = hit.map { "\(type(of: $0))" } ?? "nil"
       let verdict = reached ? "OK  " : (forwards ? "SELF" : "FAIL")
-      lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)")
+      // `first=no` means a click that merely brings Kin forward will not fire
+      // this control. It should read `no` on everything consequential and `yes`
+      // on the rest -- see WaitingCard.acceptsFirstMouse.
+      let first = waiting.clickTargets.contains(where: { $0.1 === v })
+        ? (waiting.firstMouseAt(v) ? "  first=yes" : "  first=no") : ""
+      lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)\(first)")
     }
     return lines
   }
@@ -4141,6 +4252,31 @@ extension CallControls {
     guard let (_, v) = clickTargets.first(where: { $0.0 == name }) else {
       fputs("click: \(name) is not on screen\n", stderr); return false
     }
+    // ── FORWARD FIRST, BECAUSE THAT IS WHAT A FINGER DOES ────────────────────
+    //
+    // A person clicking a control has already brought the window to the front --
+    // either it was there, or their click did it and the next one acted. A
+    // synthetic press into a window that is neither key nor active is testing
+    // AppKit's activation rules instead of the button, and it showed: the same
+    // `@decline` press committed in one run and vanished without a trace in the
+    // next, differing only in `key=` and `active=`. Now the harness starts from
+    // the state a real press starts from, and the activation rules have their own
+    // assertion (`first=` in the audit) rather than being tested by accident.
+    if !win.isKeyWindow {
+      NSApp.activate(ignoringOtherApps: true)
+      win.makeKeyAndOrderFront(nil)
+      // AND WAIT FOR IT. `activate` is a request to the window server; keyness
+      // arrives on a later turn of the run loop, so the line above on its own
+      // still clicked into an inactive window -- which is where a posted release
+      // goes missing. Bounded, and said out loud when it does not arrive, because
+      // a harness that quietly presses into a window nobody can reach reports the
+      // same nothing as a broken button.
+      let deadline = Date().addingTimeInterval(1)
+      while !win.isKeyWindow, Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+      }
+      if !win.isKeyWindow { fputs("  click: window never became key -- pressing anyway\n", stderr) }
+    }
     let p = v.convert(NSPoint(x: v.bounds.midX, y: v.bounds.midY), to: nil)
     func ev(_ t: NSEvent.EventType) -> NSEvent? {
       NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
@@ -4157,8 +4293,41 @@ extension CallControls {
     // behind it hangs the process there forever -- waiting for a finger that does
     // not exist.
     if holdFor <= 0 {
-      win.postEvent(up, atStart: false)
-      win.sendEvent(down)
+      // ── A WINDOW THAT WILL NOT BECOME KEY ────────────────────────────────
+      //
+      // Measured: the same `@decline` press committed in one run and vanished
+      // without a trace in the next -- no commit, and not even the "release did
+      // NOT commit" line, because neither half reached the view. The difference
+      // was `key=false active=false`, and on a bare command-line binary with
+      // another copy of the app fighting for the front, activation is simply
+      // refused: the pump above gives up saying so.
+      //
+      // Through the window when it IS key, which is the faithful path and the one
+      // that exercises AppKit's own routing. Straight to the view when it is not,
+      // because otherwise the harness is testing activation policy instead of the
+      // button -- and the activation rule that actually matters has its own
+      // assertion, `first=` in the audit, rather than being proved by accident.
+      let direct = win.isKeyWindow ? nil : hitNow
+      // ── WHO EATS THE RELEASE ─────────────────────────────────────────────
+      //
+      // `NSControl` -- every NSButton on this window, and SheetRow -- runs its own
+      // tracking loop inside `mouseDown` and pulls the release out of the event
+      // queue itself. It must therefore be QUEUED before the press, or the press
+      // blocks the main thread forever waiting for a finger that does not exist;
+      // that is what the original ordering here was for, and dropping it hung the
+      // invite card's handset mid-run. Handing such a control a second, direct
+      // release would be a second click.
+      //
+      // A plain NSView -- the waiting card, its pills -- commits on a release that
+      // has to be handed over here, because a queued one never reaches a window
+      // that is not key. Queuing one anyway would land later on an already
+      // disarmed card and log a refusal that did not happen.
+      let tracks = (direct ?? hitNow) is NSControl
+      if direct == nil || tracks { win.postEvent(up, atStart: false) }
+      guard let direct else { win.sendEvent(down); return true }
+      fputs("  click: window is not key -- delivering straight to \(type(of: direct))\n", stderr)
+      direct.mouseDown(with: down)
+      if !tracks { direct.mouseUp(with: up) }
       return true
     }
     // A real hold. The release cannot go through `DispatchQueue.main`: the hold's

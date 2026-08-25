@@ -456,12 +456,30 @@ enum Identity {
     /// This handle has rung before from a DIFFERENT key. Someone is claiming a
     /// name that is not theirs, or the person reinstalled and lost their seed.
     let keyChanged: Bool
+    /// nil on an ordinary ring. "bye" means the sender is NO LONGER calling --
+    /// they declined, or they cancelled before this end answered. Same envelope,
+    /// opposite news, and it is why a cancelled call stops looking like a call.
+    let kind: String?
   }
+
+  /// The words a ring may carry. Anything else is dropped rather than shown: a
+  /// future client will invent one, and a message this version cannot act on is
+  /// not a message it should guess about.
+  static let ringKinds: Set<String> = ["bye"]
 
   /// Its own domain, and it covers every field with an effect: swap any of them
   /// and the signature stops verifying.
-  private static func ringMessage(to: String, from: String, room: String, t: Int) -> String {
-    "kin-ring-v1|\(to)|\(from)|\(room)|\(t)"
+  private static func ringMessage(to: String, from: String, room: String, t: Int,
+                                 kind: String? = nil) -> String {
+    // A HANG-UP SIGNS A DIFFERENT DOMAIN, and that is the whole compatibility
+    // story. An older client verifies every ring it is handed against the v1
+    // string, so a `bye` it has never heard of fails verification and is
+    // dropped -- it falls back to the ring timeout, which is exactly what it did
+    // before byes existed. Sign the same domain and that same old client would
+    // instead verify a valid signature and draw a card for a call nobody is on.
+    // New meaning, new domain.
+    guard let kind else { return "kin-ring-v1|\(to)|\(from)|\(room)|\(t)" }
+    return "kin-\(kind)-v1|\(to)|\(from)|\(room)|\(t)"
   }
 
   // ── Who we have spoken to ──────────────────────────────────────────────────
@@ -528,10 +546,12 @@ enum Identity {
 
   /// Ring `to` and tell them which room to join. Synchronous; call it off main.
   /// Returns the room on success so the caller joins the one it actually sent.
-  static func ring(to raw: String, room: String) -> String? {
+  static func ring(to raw: String, room: String, kind: String? = nil) -> String? {
     guard let to = sanitize(raw) else {
       fputs("ring: @\(raw) is not a handle\n", stderr); return nil
     }
+    if let kind { precondition(ringKinds.contains(kind), "unknown ring kind \(kind)") }
+    let noun = kind == nil ? "ring" : kind!
     var s = ensure()
     // A name is the return address on the ring, so there is no ringing without
     // one. Every caller of this is already off the main thread (`onCall` spawns
@@ -543,12 +563,14 @@ enum Identity {
           let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: s.seed)
     else { return nil }
     let t = Int(Date().timeIntervalSince1970)
-    guard let sig = sign(ringMessage(to: to, from: s.handle, room: room, t: t), seed: s.seed)
+    guard let sig = sign(ringMessage(to: to, from: s.handle, room: room, t: t, kind: kind),
+                        seed: s.seed)
     else { return nil }
-    let body: [String: Any] = [
+    var body: [String: Any] = [
       "to": to, "from": s.handle, "room": room, "t": t, "sig": sig,
       "k": k.publicKey.rawRepresentation.base64EncodedString(),
     ]
+    if let kind { body["kind"] = kind }
     guard let d = try? JSONSerialization.data(withJSONObject: body) else { return nil }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
@@ -569,10 +591,10 @@ enum Identity {
       // A 200 says the ring is in their mailbox, nothing more. Silence and
       // "away" are indistinguishable by design, so this is the only honest
       // report either way.
-      fputs("ring: @\(to) -> \(status) \(payload)\n", stderr)
+      fputs("\(noun): @\(to) -> \(status) \(payload)\n", stderr)
       return nil
     }
-    fputs("ring: @\(to) in room \(room)\n", stderr)
+    fputs("\(noun): @\(to) in room \(room)\n", stderr)
     return room
   }
 
@@ -739,7 +761,19 @@ enum Identity {
               let pkD = Data(base64Encoded: kb64), pkD.count == 32,
               let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkD)
         else { fputs("ring: dropped a malformed ring\n", stderr); continue }
-        let msg = ringMessage(to: s.handle, from: from, room: room, t: t)
+        // A word this version does not know is dropped BEFORE the signature is
+        // checked, because there is nothing sensible to do with a valid
+        // signature over a meaning we cannot read. Named in the log: a client
+        // silently discarding a message a newer peer keeps sending is the
+        // hardest kind of incompatibility to find from either end.
+        let kind = r["kind"] as? String
+        if let kind, !ringKinds.contains(kind) {
+          fputs("ring: @\(from) sent \"\(kind)\", which this version does not know -- dropped\n",
+                stderr)
+          Metrics.count("ring_kind_unknown")
+          continue
+        }
+        let msg = ringMessage(to: s.handle, from: from, room: room, t: t, kind: kind)
         guard pk.isValidSignature(sigD, for: Data(msg.utf8)) else {
           // Never shown. An unverifiable ring is not a call from someone whose
           // name we cannot confirm -- it is a ring nobody proved they sent.
@@ -748,7 +782,8 @@ enum Identity {
         out.append(Ring(from: from, room: room, t: t, k: kb64,
                         ageMs: (r["ageMs"] as? Int) ?? 0,
                         known: known[from] == kb64,
-                        keyChanged: known[from] != nil && known[from] != kb64))
+                        keyChanged: known[from] != nil && known[from] != kb64,
+                        kind: kind))
       }
     }
     task.resume()
@@ -1097,6 +1132,40 @@ enum Identity {
       ok = false; fputs("  FAIL candidate \(c) is not already canonical\n", stderr)
     }
     if Set(cands).count != cands.count { ok = false; fputs("  FAIL duplicate candidates\n", stderr) }
+
+    // ── DOMAIN SEPARATION, WHICH IS THE WHOLE COMPATIBILITY STORY FOR A BYE ──
+    //
+    // Every version of Kin ever shipped verifies a polled ring against the v1
+    // RING string. A `bye` is signed under its own domain precisely so those
+    // clients fail that check and drop it -- falling back to the 45 s timeout,
+    // which is exactly what they did before byes existed. Sign the same domain
+    // and an old client would instead see a valid signature and draw a card for
+    // a call nobody is on.
+    //
+    // Asserted as a PAIR, because a verifier that refuses everything would pass
+    // the negative half on its own and would also have killed the doorbell.
+    let k = Curve25519.Signing.PrivateKey()
+    let (to, from, room, t) = ("meera", "devesh", "abcd-efgh-ijk", 1_800_000_000)
+    let ringMsg = ringMessage(to: to, from: from, room: room, t: t)
+    let byeMsg  = ringMessage(to: to, from: from, room: room, t: t, kind: "bye")
+    eq("ring domain", ringMsg, "kin-ring-v1|meera|devesh|abcd-efgh-ijk|1800000000")
+    eq("bye domain", byeMsg, "kin-bye-v1|meera|devesh|abcd-efgh-ijk|1800000000")
+    func check(_ what: String, sign: String, verify: String, want: Bool) {
+      guard let sig = try? k.signature(for: Data(sign.utf8)) else {
+        ok = false; fputs("  FAIL \(what): could not sign\n", stderr); return
+      }
+      let got = k.publicKey.isValidSignature(sig, for: Data(verify.utf8))
+      if got != want { ok = false; fputs("  FAIL \(what): verified=\(got), want \(want)\n", stderr) }
+      else { fputs("  ok   \(what) -> verified=\(got)\n", stderr) }
+    }
+    check("a ring verifies as a ring", sign: ringMsg, verify: ringMsg, want: true)
+    check("a bye verifies as a bye", sign: byeMsg, verify: byeMsg, want: true)
+    check("a BYE read as a ring is refused", sign: byeMsg, verify: ringMsg, want: false)
+    check("and a ring read as a bye is refused", sign: ringMsg, verify: byeMsg, want: false)
+    // The room is covered too: a bye lifted from one call must not end another.
+    check("a bye for another room is refused", sign: byeMsg,
+          verify: ringMessage(to: to, from: from, room: "zzzz-yyyy-xxx", t: t, kind: "bye"),
+          want: false)
     return ok
   }
 

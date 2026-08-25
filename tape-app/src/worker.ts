@@ -2103,7 +2103,21 @@ const KIN_REG_MAX_BODY = 512;
 // feature turns on: the callee looks `k` up in its own contact list, verifies
 // `sig` against it, and rings only if both hold. It rides in the ring because
 // the callee cannot ask anyone else for it.
+// ── ONE OPTIONAL FIELD, AND WHY THE SET IS NOW A FLOOR AND A CEILING ────────
+//
+// A ring was one-directional: the caller drops a note in the callee's mailbox and
+// that is the whole conversation. So a callee who pressed `decline` had no way to
+// say so, and the caller sat on "Calling Meera" until a 45 s timeout. Reported
+// from a real call as "it just kept showing calling, forever".
+//
+// `kind: 'bye'` is that word, sent the same way and down the same pipe: a bye is
+// a ring in reverse. It is OPTIONAL, so every existing client keeps sending six
+// keys and keeps working, and a server that has this deployed is compatible with
+// an app that does not — which matters because the app updates on its own
+// schedule and the server updates now.
 const KIN_RING_KEYS = new Set(['to', 'from', 'room', 'sig', 't', 'k']);
+const KIN_RING_OPTIONAL = new Set(['kind']);
+const KIN_KINDS = new Set(['bye']);
 // The exact string a registration signature covers. Version-prefixed and
 // field-separated so a signature can never be replayed into a different
 // meaning: no field may contain '|' (handle and tok are checked by regex, `t` is
@@ -2215,7 +2229,12 @@ export interface KinQuiet {
   at: number;           // server receipt ms, for support questions only
 }
 
-export interface KinRing { to: string; from: string; room: string; t: number; sig: string; k: string; }
+export interface KinRing {
+  to: string; from: string; room: string; t: number; sig: string; k: string;
+  /// Absent on an ordinary ring. 'bye' means the sender is no longer calling —
+  /// they declined, or they hung up before the other side answered.
+  kind?: string;
+}
 export interface KinStored extends KinRing {
   at: number;      // server receipt, ms
   bornAt: number;  // min(at, t*1000) — see kinBoxPut
@@ -2469,8 +2488,19 @@ export function kinRingDecide(
   }
   const b = parsed as Record<string, unknown>;
   const keys = Object.keys(b);
-  if (keys.length !== KIN_RING_KEYS.size || keys.some((k) => !KIN_RING_KEYS.has(k))) {
+  // Every required key present, and nothing outside required ∪ optional. Checked
+  // as two conditions rather than one length test: with an optional field, a
+  // length test alone would accept a body that swapped a required key for the
+  // optional one.
+  if (keys.some((k) => !KIN_RING_KEYS.has(k) && !KIN_RING_OPTIONAL.has(k))
+      || [...KIN_RING_KEYS].some((k) => !keys.includes(k))) {
     return { status: 400, body: { error: 'bad fields' } };
+  }
+  // Closed set, not a free string. The callee acts on this word, and an unknown
+  // one must be refused here rather than reach a client that will not know what
+  // to do with it. `undefined` is the ordinary ring and the common case.
+  if (b.kind !== undefined && (typeof b.kind !== 'string' || !KIN_KINDS.has(b.kind))) {
+    return { status: 400, body: { error: 'bad kind' } };
   }
   // SKEW FIRST, before any other judgement is passed on this ring. Nothing is
   // stored or acted on until every check below passes, so the ordering costs
@@ -2498,26 +2528,37 @@ export function kinRingDecide(
   // the contact list that says whether this key may ring this person, and a
   // server that could verify a ring is a server that could forge one.
   if (typeof b.k !== 'string' || !KIN_KEY_RE.test(b.k)) return { status: 400, body: { error: 'bad k' } };
-  // Per-caller windows before the per-`to` one: a refused caller must not also
-  // spend the victim's global budget, or one flooder could lock everybody else
-  // out at the per-caller rate. Two sibling windows, `k` and `from`, so minting
-  // one identity does not buy the other's allowance.
-  if (!kinWindow(hits, 'key:' + b.k + '>' + to, now, 60_000, KIN_RING_PER_KEY)) {
+  // ── A HANG-UP IS NOT CHARGED TO THE DOORBELL ───────────────────────────────
+  //
+  // Every window below exists to bound DISTURBANCE: how often a stranger can
+  // make somebody's Mac ring. A `bye` disturbs nobody -- it makes no sound,
+  // draws no card, and is dropped on arrival unless it matches a call the
+  // client already has in flight. Charging it to the ring budget would mean
+  // two things, both bad: a caller who cancels twice could not place a third
+  // call, and the hourly denial-of-sleep bound would be halved for the honest
+  // caller while a flooder -- who never sends a bye -- kept all sixty.
+  //
+  // So a bye is metered on its own sibling windows, at the same limits. It can
+  // never spend a ring's allowance, and a bye flood is bounded exactly as
+  // tightly as a ring flood.
+  const w = b.kind === undefined ? '' : b.kind + ':';
+  if (!kinWindow(hits, w + 'key:' + b.k + '>' + to, now, 60_000, KIN_RING_PER_KEY)) {
     return { status: 429, body: { error: 'rate' } };
   }
-  if (!kinWindow(hits, 'pair:' + b.from + '>' + to, now, 60_000, KIN_RING_PER_FROM)) {
+  if (!kinWindow(hits, w + 'pair:' + b.from + '>' + to, now, 60_000, KIN_RING_PER_FROM)) {
     return { status: 429, body: { error: 'rate' } };
   }
   // The two backstops, and the only caps a flooder cannot mint its way around.
   // Minute first: a burst is refused by the cheaper window, and the hour's
   // budget is not spent on a request the minute already rejected.
-  if (!kinWindow(hits, 'to:' + to, now, 60_000, KIN_RING_PER_TO)) {
+  if (!kinWindow(hits, w + 'to:' + to, now, 60_000, KIN_RING_PER_TO)) {
     return { status: 429, body: { error: 'rate' } };
   }
-  if (!kinWindow(hits, 'toh:' + to, now, 3600_000, KIN_RING_PER_TO_HOUR)) {
+  if (!kinWindow(hits, w + 'toh:' + to, now, 3600_000, KIN_RING_PER_TO_HOUR)) {
     return { status: 429, body: { error: 'rate' } };
   }
-  const ring: KinRing = { to, from: b.from, room: b.room, t, sig: b.sig, k: b.k };
+  const ring: KinRing = { to, from: b.from, room: b.room, t, sig: b.sig, k: b.k,
+                          ...(b.kind === undefined ? {} : { kind: b.kind as string }) };
   // SILENT MODE, and it is the LAST thing consulted on purpose. Every gate above
   // — validation, both per-caller windows, both per-`to` windows — has already
   // run and charged, so a silent handle behaves identically to a live one all
@@ -2526,7 +2567,15 @@ export function kinRingDecide(
   // says 429 is a handle whose owner has visibly turned something on.
   //
   // Expiry is evaluated HERE, at arrival, from the stored row: nothing sweeps.
-  const muted = kinQuietActive(quiet, now);
+  //
+  // AND NOT TO A BYE. Silent mode suppresses being called; it must not suppress
+  // being told a call ENDED, or the one person guaranteed to be staring at a
+  // "Calling Meera…" card -- someone who set their own Mac to silent and then
+  // placed a call -- is the one person who never learns it was declined. The
+  // denial-of-sleep argument does not reach here either: waking a held poll to
+  // hand over a bye ends one HTTP request early and shows, sounds and lights
+  // nothing, and the sibling windows above bound how often it can happen.
+  const muted = b.kind === undefined && kinQuietActive(quiet, now);
   const r = kinBoxPut(box, ring, now, muted);
   // ONE return, ONE body, shared by both paths. There is deliberately no
   // early return for the silent case: two return sites are two literals that
@@ -2673,8 +2722,13 @@ export function kinPollBody(
     // against its contact list — a poll that drops `k` turns every ring into
     // an unverifiable one, which the callee then correctly refuses to show.
     // That failure looks exactly like "nobody is calling".
+    // `kind` comes back out for the same reason `k` does: a field the server
+    // accepts, stores, and then drops on the way to the client is a field that
+    // does nothing at all. Omitted rather than nulled when absent, so an ordinary
+    // ring is shaped exactly as it was before byes existed.
     rings: rings.map((r) => ({
       from: r.from, room: r.room, t: r.t, sig: r.sig, k: r.k, ageMs: now - r.bornAt,
+      ...(r.kind === undefined ? {} : { kind: r.kind }),
     })),
     // ALWAYS PRESENT, even when nothing is stored, so a Swift decoder sees one
     // shape and "no row yet" cannot be mistaken for "the field was dropped".

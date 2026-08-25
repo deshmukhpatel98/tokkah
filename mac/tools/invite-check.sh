@@ -23,7 +23,7 @@ TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/invite-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
-trap 'reap; rm -rf "$SP"' EXIT
+trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
 # A room nobody is in. Reusing a real invite code puts this rig into somebody's
 # call: an earlier version of this test joined the room in the screenshot that

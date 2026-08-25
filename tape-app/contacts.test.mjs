@@ -1540,6 +1540,132 @@ const DEV2 = await device('dev2');
 
   // (i0) Prove the OLD code really was broken, or "the new one works" proves
   // nothing about what it fixed. This is the exact loop that shipped.
+  sec('(n) THE HANG-UP: one envelope, the opposite news');
+  // Measured on a real call, and it was the loudest complaint about the whole
+  // feature: cancel a call and the other Mac "just kept showing calling
+  // forever". There was no un-ring to send. This is it -- the same signed
+  // envelope with `kind: "bye"` on it, which travels the same mailbox, wakes the
+  // same held poll, and is dropped by any client that does not recognise it.
+  //
+  // The pairs that MUST be ranked differently, or this is a one-sided test:
+  //   · kind "bye" is accepted AND kind "hangup" is refused. A closed set that
+  //     accepted anything would let an unknown word reach a client that has no
+  //     idea what to do with it.
+  //   · a bye IS delivered to a silent handle AND an ordinary ring is NOT. One
+  //     without the other is either a silence switch that leaks calls or a
+  //     caller who never learns they were declined.
+  //   · a bye does NOT spend the ring budget AND is still bounded by its own.
+  {
+    const bye = (over = {}) => ring({ kind: 'bye', ...over });
+    const s0 = fresh();
+    const d0 = kinRingDecide(bye(), TO, s0.box, s0.hits, NOW);
+    console.log(`  kind bye     -> ${d0.status} ${JSON.stringify(d0.body)}`);
+    eq(d0.status, 200, '(n) a bye is accepted');
+    for (const bad of ['hangup', 'BYE', 'bye ', '', 'ring']) {
+      eq(kinRingDecide(bye({ kind: bad }), TO, fresh().box, fresh().hits, NOW).status, 400,
+        `(n) kind ${JSON.stringify(bad)} is not a word this server knows`);
+    }
+    eq(kinRingDecide(bye({ kind: 5 }), TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) nor is a number');
+    eq(kinRingDecide(bye({ kind: null }), TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) nor null -- absent means absent, and JSON null is a value');
+    // Every other rule still applies to it. A `kind` is not a bypass.
+    eq(kinRingDecide(bye({ t: T + 61 }), TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) a bye is skew-checked like anything else');
+    eq(kinRingDecide(bye({ from: TO }), TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) and cannot be sent to yourself');
+    eq(kinRingDecide(bye({ room: 'short' }), TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) and still needs a real room');
+    eq(kinRingDecide(JSON.stringify({ to: TO, from: FROM, room: ROOM, t: T, sig: SIG, kind: 'bye' }),
+      TO, fresh().box, fresh().hits, NOW).status, 400,
+      '(n) and `kind` does not substitute for a required field');
+
+    // ── IT REACHES THE CLIENT, with the word intact ─────────────────────────
+    const s1 = fresh();
+    put(s1, { kind: 'bye' });
+    const body1 = kinPollBody(TO, s1.box, NOW, null, 0);
+    console.log(`  polled: ${JSON.stringify(body1.rings)}`);
+    eq(body1.rings.length, 1, '(n) a poll hands the bye over');
+    eq(body1.rings[0].kind, 'bye', '(n) with `kind` still on it -- a field dropped in transit does nothing at all');
+    // CONTROL: an ordinary ring carries NO kind key at all, not kind:null. A
+    // Swift decoder reading `nil` and a JSON `null` are the same thing here, but
+    // the shape on the wire is what an older client parses.
+    const s1b = fresh();
+    put(s1b);
+    const plain = kinPollBody(TO, s1b.box, NOW, null, 0).rings[0];
+    ok(!('kind' in plain), '(n) CONTROL: an ordinary ring is shaped exactly as it was before byes existed');
+
+    // ── A CANCEL THAT ARRIVES BEFORE THE FIRST POLL REPLACES THE RING ──────
+    // kinBoxPut replaces on (from, room), which is what makes this work: a
+    // caller who rings and immediately cancels leaves ONE entry saying "bye",
+    // not a ring the callee is about to be shown for a call nobody is on.
+    const s2 = fresh();
+    put(s2);
+    const rep = put(s2, { kind: 'bye' }, NOW + 500);
+    console.log(`  ring then bye, unpolled: queued ${rep.body.queued}, replaced in place`);
+    eq(rep.body.queued, 1, '(n) the bye takes the ring\'s slot rather than queueing behind it');
+    const after = kinPollBody(TO, s2.box, NOW + 600, null, 0).rings;
+    eq(after.length, 1, '(n) so the callee is handed one message');
+    eq(after[0].kind, 'bye', '(n) and it is the hang-up, not a phantom ring');
+
+    // ── SILENT MODE: the pair that has to be ranked differently ────────────
+    const QON = { quiet: true, until: 0, exceptKnown: false, at: NOW };
+    ok(kinQuietActive(QON, NOW), '(n) setup: the row reads as silent');
+    const sq = fresh();
+    kinRingDecide(ring(), TO, sq.box, sq.hits, NOW, QON);
+    eq(kinPollBody(TO, sq.box, NOW, QON, 0).rings.length, 0,
+      '(n) a RING to a silent handle is swallowed, exactly as before');
+    const sq2 = fresh();
+    const dq = kinRingDecide(bye(), TO, sq2.box, sq2.hits, NOW, QON);
+    ok(!dq.muted, '(n) a BYE to a silent handle is not marked muted');
+    // BEFORE the poll, because kinPollBody DRAINS. Asked in this order the first
+    // time round and it read false for a bye that was sitting right there --
+    // the mailbox was empty because the assertion above had just emptied it.
+    ok(kinBoxHas(sq2.box, TO, NOW), '(n) it counts as something to hand over, so a held poll wakes for it');
+    eq(kinPollBody(TO, sq2.box, NOW, QON, 0).rings.length, 1,
+      '(n) and is delivered -- silence stops you being called, not being told a call ended');
+    const sq3 = fresh();
+    kinRingDecide(ring(), TO, sq3.box, sq3.hits, NOW, QON);
+    ok(!kinBoxHas(sq3.box, TO, NOW), '(n) CONTROL: a silenced ring still wakes nothing');
+
+    // ── THE BUDGETS ARE SIBLINGS ───────────────────────────────────────────
+    // Four calls placed and four cancelled inside a minute. If the bye were
+    // charged to the ring window the fourth call could not be placed, and if
+    // rings were charged to the bye window the fourth cancel would be lost.
+    const sb = fresh();
+    let rings = 0, byes = 0;
+    for (let i = 0; i < 4; i++) {
+      if (put(sb, { room: ROOM + i }, NOW + i * 2).status === 200) rings++;
+      if (put(sb, { room: ROOM + i, kind: 'bye' }, NOW + i * 2 + 1).status === 200) byes++;
+    }
+    console.log(`  four call-and-cancel pairs in one minute: ${rings} rings, ${byes} byes`);
+    eq(rings, 4, '(n) all four rings land');
+    eq(byes, 4, '(n) and all four byes land -- a hang-up is not charged to the doorbell');
+    // And the bye window is a real window: the fifth is refused, so a bye flood
+    // is bounded exactly as tightly as a ring flood.
+    eq(put(sb, { room: ROOM + 'x', kind: 'bye' }, NOW + 20).status, 429,
+      '(n) the fifth bye in a minute is refused');
+    eq(put(sb, { room: ROOM + 'x' }, NOW + 21).status, 429,
+      '(n) CONTROL: and so is the fifth ring, on its own window');
+    eq(put(sb, { room: ROOM + 'y', kind: 'bye', t: T + 61 }, NOW + 61_000).status, 200,
+      '(n) and the bye window reopens rather than being a ban');
+
+    // The hourly denial-of-sleep bound must be UNCHANGED by byes existing: the
+    // honest caller who cancels must not run out of rings sooner than a flooder
+    // who never does.
+    const sh = fresh();
+    let landed = 0;
+    for (let i = 0; i < 60; i++) {
+      const at = NOW + i * 6000, ts = T + i * 6;
+      kinRingDecide(JSON.stringify({ to: TO, from: handle(600 + i), room: ROOM + (i % 7),
+        t: ts, sig: SIG, k: kk(600 + i), kind: 'bye' }), TO, sh.box, sh.hits, at);
+      if (kinRingDecide(JSON.stringify({ to: TO, from: handle(600 + i), room: ROOM + (i % 7),
+        t: ts, sig: SIG, k: kk(600 + i) }), TO, sh.box, sh.hits, at + 1).status === 200) landed++;
+    }
+    console.log(`  sixty rings in an hour, each preceded by a bye: ${landed} landed`);
+    eq(landed, 60, '(n) sixty rings an hour still, byes or no byes');
+  }
+
   sec('(i0) the loop this replaced picked whatever Cloudflare listed LAST');
   const oldPick = (iceServers) => {
     let host = '', port = 3478;

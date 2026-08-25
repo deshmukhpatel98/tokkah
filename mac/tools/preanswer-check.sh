@@ -26,7 +26,7 @@ TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/preanswer-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
-trap 'reap; rm -rf "$SP"' EXIT
+trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
 # ── PART ONE: ringing, unanswered ───────────────────────────────────────────
 R1="preans$$a"

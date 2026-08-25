@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.61.0"
+let VERSION = "0.62.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -138,6 +138,22 @@ if let who = arg("ring-only") {
   }
   exit(1)
 }
+// The other half of handle-dialling: tell somebody the call is off. Same shape
+// as `--ring-only` and for the same reason -- the network half of a feature that
+// only exists inside a window is a feature only a window can test, and this one
+// has two ends that have to be driven from two terminals.
+if let who = arg("bye-only") {
+  guard let room = arg("room") else {
+    fputs("--bye-only needs --room: a bye is about ONE call, and the room is\n"
+        + "  the half of it the other end matches on\n", stderr)
+    exit(2)
+  }
+  fputs("bye-only: pressed at \(Int(Date().timeIntervalSince1970 * 1000))\n", stderr)
+  if Identity.ring(to: who, room: room, kind: "bye") != nil {
+    fputs("bye-only: told @\(who) the call in \(room) is off\n", stderr); exit(0)
+  }
+  exit(1)
+}
 // Drain the mailbox once, or listen for a while. Prints every ring it verifies.
 //
 // THROUGH THE SAME LOOP THE APP USES. This used to be its own `poll; sleep 2.2`
@@ -157,7 +173,7 @@ if flag("rings") || arg("rings-for") != nil {
     seen += 1
     // The wall clock at the instant the ring reached this process. Subtract the
     // caller's `pressed` stamp above and that difference IS the ring latency.
-    fputs("ring from @\(r.from) room \(r.room) age \(r.ageMs) ms"
+    fputs("\(r.kind ?? "ring") from @\(r.from) room \(r.room) age \(r.ageMs) ms"
         + " known=\(r.known) keyChanged=\(r.keyChanged)"
         + " at \(Int(Date().timeIntervalSince1970 * 1000))\n", stderr)
   }
@@ -262,7 +278,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "ring-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
+  "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
@@ -368,6 +384,27 @@ let videoArg = resolveVideoArg()
 // passes `--video camera`: a parameter the harness hardcoded and the product
 // chooses at runtime.
 let ringPending = arg("incoming") != nil
+
+// ── THE CALL IN FLIGHT, DECLARED WHERE NOTHING CAN READ IT FIRST ────────────
+//
+// Both of these are written by the poll thread and read by the ring handlers, so
+// where the DECLARATION sits is the whole safety argument -- see
+// `top-level-code-runs-in-order`, which this file has been bitten by twice. Top
+// level `var`s in main.swift are initialised in file order, so one declared below
+// `startRingingOnce()` is a variable a live poll thread can write to and then
+// have its own initialiser silently undo a few microseconds later. Nothing above
+// this line touches them; everything that does is far below it.
+//
+// gOffered: a ring reaches this process either from the in-app poll or, when Kin
+// was closed, from the watcher via argv. `onAnswerRing` reads exactly one
+// variable, because an answer path that only understands one of the two routes is
+// a button that works or does nothing depending on how the call arrived -- and
+// the watcher route is precisely the one nobody would test by hand.
+nonisolated(unsafe) var gOffered: Identity.Ring?
+// gCalling: WHO AND WHICH ROOM, not just who. A bye is matched on both, and the
+// room is the half a stranger cannot guess -- it was minted for this call minutes
+// ago and only the two ends have ever seen it.
+nonisolated(unsafe) var gCalling: (who: String, room: String)?
 
 // ── Double-clicked from the Finder? Ask where to call, then be a normal call ──
 //
@@ -715,6 +752,73 @@ func leaveCall() -> Never {
   postFinalBeat(why: "leave")
   fputs("left the call\n", stderr)
   exit(0)
+}
+
+/// One shot, whichever thread arrives first. Two racing paths that both end the
+/// process would otherwise file two final beats and exit twice.
+final class Latch: @unchecked Sendable {
+  private let lock = NSLock()
+  private var fired = false
+  func claim() -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    if fired { return false }
+    fired = true
+    return true
+  }
+}
+
+// ── TELLING THEM IT IS OVER ─────────────────────────────────────────────────
+//
+// The complaint, in the words it was reported in: cancel a call and the other
+// Mac "just kept showing calling forever". It was true, and there was nothing
+// wrong with it -- there was simply no un-ring to send. A ring sat in a mailbox
+// with a 60 s lease and both ends waited it out.
+//
+// A bye is the same signed envelope with `kind: "bye"` on it. It travels the
+// same route, wakes the same held poll, and is dropped unread by any client too
+// old to know the word -- see `ringMessage`, which signs a different domain for
+// exactly that reason. Off the main thread always: this is an HTTPS round trip
+// and the caller of this is usually the thread that draws.
+func sendBye(to who: String, room: String, why: String, then done: (() -> Void)? = nil) {
+  guard !who.isEmpty, !room.isEmpty else {
+    fputs("bye (\(why)): nobody to tell\n", stderr)
+    done?()
+    return
+  }
+  Metrics.count("bye_sent_try")
+  Thread {
+    let ok = Identity.ring(to: who, room: room, kind: "bye") != nil
+    Metrics.count(ok ? "bye_sent_ok" : "bye_sent_fail")
+    // Said out loud either way. A message believed-sent and never sent is the
+    // worse of the two, and the failure is invisible from this end otherwise.
+    fputs("bye (\(why)): @\(who) \(ok ? "told" : "NOT told -- they wait out the timeout")\n",
+          stderr)
+    done?()
+  }.start()
+}
+
+/// Tell them, then go. The window goes NOW and the process follows when the
+/// message is out or after `capMs`, whichever is first -- a quit hung on
+/// somebody else's network is a hang, and the person pressed the button to be
+/// gone. `why` is also the ending recorded on the final beat, so cancelled and
+/// declined are separable in the analytics from an ordinary leave.
+func hangUpAndExit(to who: String, room: String, why: String, capMs: Int = 2000) {
+  let once = Latch()
+  // Straight away, and before anything that can block. Everything after this
+  // point is the message going out; there is no reason to make somebody look at
+  // a window for it.
+  display?.callWindow?.orderOut(nil)
+  func go(_ note: String) {
+    guard once.claim() else { return }
+    if !note.isEmpty { fputs(note, stderr) }
+    shuttingDown = true
+    postFinalBeat(why: why)
+    exit(0)
+  }
+  sendBye(to: who, room: room, why: why) { go("") }
+  DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(capMs)) {
+    go("bye: gave the message \(capMs) ms and left anyway\n")
+  }
 }
 
 // ── A WINDOW AND A PICTURE BEFORE THERE IS ANYONE TO CALL ────────────────────
@@ -1259,13 +1363,12 @@ if let who = arg("call") {
 // because an answer path that only understands one of the two routes is a button
 // that works or does nothing depending on how the call arrived -- and the
 // watcher route is precisely the one nobody would test by hand.
-nonisolated(unsafe) var gOffered: Identity.Ring?
 if let from = arg("incoming"), let r = arg("room") {
   // No signature to check here: the watcher already verified it before deciding
   // to launch this process at all. No key either, so this contact is not
   // remembered on answer -- it will be, the next time they ring an open app.
   gOffered = Identity.Ring(from: from, room: r, t: 0, k: "", ageMs: 0,
-                           known: false, keyChanged: false)
+                           known: false, keyChanged: false, kind: nil)
   Metrics.count("ring_recv_watch")
   DispatchQueue.main.async {
     display?.controls?.showIncoming(from: from, room: r)
@@ -1281,6 +1384,7 @@ if let from = arg("incoming"), let r = arg("room") {
 // opened. The one thing the caller needed to know, the name of the person being
 // rung, was the one thing the re-exec threw away.
 if let who = arg("calling") {
+  gCalling = (who, arg("room") ?? "")
   DispatchQueue.main.async { display?.controls?.showOutgoing(to: who) }
 }
 startRingingOnce()
@@ -1347,10 +1451,21 @@ display?.controls?.onAnswerRing = {
   display?.controls?.setStatus("answering \(Identity.display(o.from))…")
   Launcher.reexec(room: o.room, extra: ["--video", "camera", "--window"], why: "ring answered")
 }
+// Cancelling a call nobody has answered yet. `onLeave` still exists and still
+// just leaves; this one exists because there is a person on the other end whose
+// Mac is ringing, and until now the only thing that stopped it was a timeout.
+display?.controls?.onHangUp = {
+  guard let c = gCalling else { leaveCall() }
+  hangUpAndExit(to: c.who, room: c.room, why: "cancelled")
+}
 display?.controls?.onDeclineRing = {
   Ringer.stop()
   Metrics.tap("decline")
   Metrics.count("ring_declined")
+  // Read BEFORE it is cleared. This is the only record of who is being
+  // declined, and the whole point of the next few lines is telling them.
+  let who = gOffered?.from ?? ""
+  let room = gOffered?.room ?? ""
   gOffered = nil
   // ── A PROCESS THAT EXISTS ONLY TO ASK IS DONE WHEN THE ANSWER IS NO ───────
   //
@@ -1362,10 +1477,13 @@ display?.controls?.onDeclineRing = {
   // Only when this image IS the ring. An app that was already open and in a call
   // when somebody rang must not exit on decline -- there is a call in it.
   if ringPending {
-    postFinalBeat(why: "declined")
     fputs("ring: declined -- nothing else for this copy to do\n", stderr)
-    exit(0)
+    hangUpAndExit(to: who, room: room, why: "declined")
+    return
   }
+  // Already in a call when somebody rang: this image stays, but the person who
+  // rang still has to hear no. Fire and forget -- nothing here is exiting.
+  sendBye(to: who, room: room, why: "declined")
 }
 
 // ── A RING IS NOT A CALL UNTIL SOMEBODY SAYS SO ───────────────────────────────
@@ -1418,6 +1536,55 @@ if ringPending {
 // would poll the same mailbox and take turns losing rings to each other.
 // `once-fired-probes-record-transients`: a state read once at startup is a
 // birth certificate, not a subscription.
+// ── A BYE IS ONLY EVER ABOUT THE CALL YOU ARE ON ───────────────────────────
+//
+// Matched on `from` AND `room`, both, before it is allowed to change anything.
+// The room is the half that carries the weight: it was minted for this call
+// minutes ago and the only two machines that have ever seen it are the two ends.
+// A stranger who knows a handle can put a signed bye in this mailbox all day and
+// every one of them lands here and is dropped.
+//
+// Deliberately NOT gated on the contact list. The first call from somebody new
+// is trust-on-first-use for the ring, and a bye that only worked for people you
+// had already spoken to would leave the very first call -- the one most likely
+// to be declined -- as the one that hangs.
+func handleBye(_ r: Identity.Ring) {
+  // The person we are ringing has said no, or hung up before we gave up.
+  if let c = gCalling, r.from == c.who, r.room == c.room {
+    Metrics.count("bye_recv_calling")
+    Metrics.mark("bye_recv_ms", sinceLaunch())
+    fputs("bye: @\(r.from) is not taking the call\n", stderr)
+    // Plain words, and no blame in either direction: from here we cannot tell
+    // declined from cancelled-at-the-same-moment from a Mac that went to sleep.
+    display?.controls?.showCallFailed("\(Identity.display(r.from)) can\u{2019}t talk right now",
+                                      because: "try again in a little while")
+    return
+  }
+  // The caller gave up while this Mac was ringing. Stop the noise, take the card
+  // down, and -- if this copy of Kin exists only to ask -- there is nothing left
+  // to ask about.
+  if let o = gOffered, r.from == o.from, r.room == o.room {
+    Metrics.count("bye_recv_ringing")
+    Metrics.mark("bye_recv_ms", sinceLaunch())
+    Ringer.stop()
+    gOffered = nil
+    display?.controls?.hideIncoming()
+    display?.controls?.setStatus("\(Identity.display(r.from)) hung up")
+    fputs("bye: @\(r.from) stopped calling\n", stderr)
+    if ringPending {
+      shuttingDown = true
+      postFinalBeat(why: "caller hung up")
+      exit(0)
+    }
+    return
+  }
+  // Counted, not silent. A bye that matches nothing is either a stale message
+  // from a call that already ended -- ordinary -- or the two ends disagreeing
+  // about which room they are in, which is not.
+  Metrics.count("bye_recv_stale")
+  fputs("bye: @\(r.from) hung up on a call this Mac is not on -- ignored\n", stderr)
+}
+
 func startRingingOnce() {
   // The two edges arrive on different threads -- this launch's top-level code,
   // and the claim's completion on its network thread -- and two of them through
@@ -1436,6 +1603,9 @@ func startRingingOnce() {
   // that person read as a changed key.
 
   Identity.startRinging(gapMs: Int(arg("ring-gap") ?? "5000") ?? 5000) { r in
+    // FIRST, above every line that treats this as a call. A bye is not a ring:
+    // it makes no sound, draws no card, and remembers no contact.
+    if r.kind == "bye" { handleBye(r); return }
     // A ring older than its lease is not a call, it is a record of one.
     guard r.ageMs < 60_000 else { return }
     if r.keyChanged {

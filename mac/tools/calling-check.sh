@@ -27,7 +27,7 @@ TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/calling-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
-trap 'reap; rm -rf "$SP"' EXIT
+trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
 BASE="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
 
