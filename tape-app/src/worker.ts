@@ -239,7 +239,10 @@ export class Room implements DurableObject {
     // there is no call and no socket — only a mailbox.
     if (url.pathname.endsWith('/kin/register')) return this.kinRegister(request, url);
     if (url.pathname.endsWith('/kin/ring')) return this.kinRing(request, url);
-    if (url.pathname.endsWith('/kin/poll')) return this.kinPoll(url);
+    // `request.signal` travels because a held poll has to know when the client
+    // it is holding for has gone away — see kinHold. Every other verb answers
+    // at once and has no use for it.
+    if (url.pathname.endsWith('/kin/poll')) return this.kinPoll(url, request.signal);
     if (url.pathname.endsWith('/kin/quiet')) return this.kinQuietSet(request, url);
     return this.signal(request);
   }
@@ -277,6 +280,24 @@ export class Room implements DurableObject {
   // Rings silenced since this object woke. A count for the owner's own poll, not
   // a ledger: it resets with the isolate, and the device keeps the real list.
   private kinMuted = 0;
+  // ── THE HELD POLLS ────────────────────────────────────────────────────────
+  //
+  // Callees parked on a GET that has not been answered yet, keyed by handle for
+  // the same reason kinBox is: a misrouted request waits on a key nobody rings
+  // rather than on somebody else's doorbell.
+  //
+  // In memory and nowhere else, deliberately. A waiter is a live connection held
+  // by this isolate; persisting one would outlive the thing it describes, which
+  // is the rvPeers argument verbatim. If the isolate dies the connections die
+  // with it and every client re-arms — nothing to reconcile.
+  // The stored function is the waiter's own `finish`, which takes WHETHER A RING
+  // WOKE IT — because that boolean is what decides whether the mailbox gets
+  // drained. Storing a bare `() => finish(true)` here would make eviction
+  // impossible to express: every way of ending a hold would be a delivery.
+  private kinWaiters = new Map<string, Set<(woke: boolean) => void>>();
+  // How many are held right now, across every handle this object serves (one).
+  // Read by kinPollDecide as the concurrency cap; see KIN_WAIT_MAX_PARKED.
+  private kinParked = 0;
 
   private async kinTokLoad(): Promise<string | null> {
     if (this.kinTok !== null) return this.kinTok;
@@ -329,22 +350,161 @@ export class Room implements DurableObject {
     // not-silent and the toggle is a dead control — the shape this project has
     // shipped three times.
     const quiet = await this.kinQuietLoad();
-    const d = kinRingDecide(
-      raw, url.searchParams.get('to') ?? '', this.kinBox, this.kinHits, Date.now(), quiet,
-    );
+    const to = url.searchParams.get('to') ?? '';
+    const d = kinRingDecide(raw, to, this.kinBox, this.kinHits, Date.now(), quiet);
     // Counted here and NOWHERE IN THE RESPONSE. `d.muted` must never reach the
     // caller; only the owner's poll sees this number.
     if (d.muted) this.kinMuted++;
+    // THE DOORBELL RINGS HERE, and only for a ring that will actually be handed
+    // over: 200 means it is in the mailbox, and `muted` means it will be thrown
+    // away at the drain. Waking a held poll for a silenced ring would end the
+    // callee's wait to give them nothing, and would let a caller who keeps
+    // ringing a silenced handle keep that wait ending — denial of sleep rebuilt
+    // out of the silence switch. This line is also completely invisible to the
+    // caller: the response was already decided above.
+    if (d.status === 200 && !d.muted) this.kinWake(to);
     return json(d.body, d.status);
   }
 
-  private async kinPoll(url: URL): Promise<Response> {
+  private async kinPoll(url: URL, signal?: AbortSignal): Promise<Response> {
     const to = url.searchParams.get('to') ?? '';
+    const tok = url.searchParams.get('tok') ?? '';
+    const waitMs = kinWaitMs(url.searchParams.get('wait'));
+    const quiet = await this.kinQuietLoad();
     const d = kinPollDecide(
-      to, url.searchParams.get('tok') ?? '', await this.kinTokLoad(),
-      this.kinBox, this.kinHits, Date.now(), await this.kinQuietLoad(), this.kinMuted,
+      to, tok, await this.kinTokLoad(),
+      this.kinBox, this.kinHits, Date.now(), quiet, this.kinMuted,
+      waitMs, this.kinParked,
     );
-    return json(d.body, d.status);
+    // ── A POLL PROVES A CLIENT IS ALIVE, SO IT EVICTS THE ONES THAT MIGHT NOT
+    //    BE ────────────────────────────────────────────────────────────────
+    //
+    // Only after the credential passed (status 200), or this would be an
+    // unauthenticated way to make somebody's doorbell slow: anyone who knew a
+    // handle could keep evicting its waiter.
+    //
+    // The request that just arrived is the only client we have PROOF is alive
+    // right now. Anything still parked is a client we merely have not heard
+    // from, and one of those is exactly what loses a call: a killed app's waiter
+    // is woken by the next ring, drains the mailbox destructively, writes the
+    // ring to a socket nobody is reading, and the listener that IS alive wakes
+    // to an empty box. Measured directly — kill the app mid-hold, ring the
+    // handle, and the menu-bar resident received nothing.
+    //
+    // `request.signal` looked like the answer and is not: it does not fire
+    // through a dev proxy, and a laptop closing its lid never sends anything at
+    // all. So liveness is inferred from the only evidence that cannot be faked
+    // by a dead process — a request arriving. Eviction NEVER drains: an evicted
+    // waiter finishes `false`, which is the 204 path.
+    if (d.status === 200) this.kinEvict(to);
+    if (!d.park) return json(d.body, d.status);
+    // Held. Everything above — format, credential, rate — has already been
+    // decided and paid for, so the wake path below must NOT re-run any of it:
+    // it builds the body and nothing else. That is the whole reason
+    // kinPollBody is a separate function.
+    const t0 = Date.now();
+    if (await this.kinHold(to, waitMs, signal)) {
+      return json(kinPollBody(to, this.kinBox, Date.now(), quiet, this.kinMuted, Date.now() - t0));
+    }
+    // Nothing came. 204 and not an empty 200: it is the cheapest possible way
+    // to say "still nothing", it cannot be confused with a ring, and — because
+    // no older worker has ever produced one on this route — it is also the
+    // client's proof that this server really held the line.
+    return new Response(null, { status: 204 });
+  }
+
+  /**
+   * Hold a poll open until somebody rings, until the client goes away, or until
+   * the deadline. True ONLY if a ring woke it — and that return value is what
+   * decides whether the mailbox gets drained, which makes it the most dangerous
+   * boolean in this file.
+   *
+   * ── A DEAD CLIENT MUST NOT BE HANDED A RING ────────────────────────────────
+   *
+   * `open-socket-is-not-a-live-peer`, and it bit again here. The drain is
+   * destructive, so a waiter belonging to a process that has already been killed
+   * takes the ring, writes it to a socket nobody is reading, and it is gone —
+   * the OTHER listener on the same handle then wakes to an empty mailbox and the
+   * call is simply lost. Observed directly: kill the app while its poll is
+   * parked, ring the handle, and the menu-bar resident received nothing.
+   *
+   * `signal` is what closes that. Workers aborts an in-flight request when the
+   * client disconnects, so an abandoned waiter deregisters itself instead of
+   * waiting to be woken. It resolves FALSE, which is the whole point: a hold
+   * that ended for any reason other than a ring must not drain anything.
+   *
+   * THE DEADLINE IS STILL NOT OPTIONAL. Abort is a best-effort signal and a
+   * client can vanish without one — a laptop whose lid closes sends nothing. The
+   * timer is the only thing guaranteed to end such a request, which is why every
+   * exit path goes through `finish` and why `finish` is idempotent: a waiter
+   * that is woken and then also times out must not decrement kinParked twice, or
+   * the concurrency cap drifts negative and stops capping anything.
+   */
+  private kinHold(to: string, waitMs: number, signal?: AbortSignal): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      let done = false;
+      const finish = (woke: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', gone);
+        const set = this.kinWaiters.get(to);
+        if (set) { set.delete(finish); if (!set.size) this.kinWaiters.delete(to); }
+        this.kinParked--;
+        resolve(woke);
+      };
+      const gone = () => finish(false);
+      timer = setTimeout(() => finish(false), waitMs);
+      let set = this.kinWaiters.get(to);
+      if (!set) { set = new Set(); this.kinWaiters.set(to, set); }
+      set.add(finish);
+      this.kinParked++;
+      // REGISTERED FIRST, then checked. `finish` decrements the parked count, so
+      // an early return before the increment above leaves the cap counting down
+      // past zero — a concurrency limit that stops limiting after a few
+      // already-dead clients, which is worse than not having one.
+      if (signal?.aborted) { finish(false); return; }
+      signal?.addEventListener('abort', gone);
+    });
+  }
+
+  /**
+   * Somebody rang. Release ONE held poll, and specifically the newest.
+   *
+   * Not all of them, and the reason is the whole hazard of this design: the
+   * woken poll DRAINS THE MAILBOX, so waking two hands the ring to whichever
+   * resolves first and gives the other an empty box. One delivery is the
+   * correct number, and the newest waiter is the client we heard from most
+   * recently — the one most likely to still be there to receive it.
+   *
+   * A Set iterates in insertion order, so the last entry is the newest.
+   */
+  private kinWake(to: string): void {
+    const set = this.kinWaiters.get(to);
+    if (!set?.size) return;
+    let newest: ((woke: boolean) => void) | undefined;
+    for (const finish of set) newest = finish;
+    newest?.(true);
+  }
+
+  /**
+   * End every held poll for `to` WITHOUT draining anything, because a live
+   * client has just been heard from and the parked ones may be ghosts. See the
+   * block at the call site in kinPoll: this is what stops a killed process's
+   * waiter from swallowing the next ring.
+   */
+  private kinEvict(to: string): void {
+    const set = this.kinWaiters.get(to);
+    if (!set) return;
+    // Snapshotted and cleared BEFORE calling anything: each `fire` mutates this
+    // same set on its way out, and iterating a collection while its members
+    // remove themselves from it is how an eviction silently skips a waiter.
+    this.kinWaiters.delete(to);
+    // FALSE, and that is the entire point: an evicted hold ends on the 204 path
+    // and takes nothing out of the mailbox. `true` here would turn the fix into
+    // the bug — every eviction would swallow a ring.
+    for (const finish of [...set]) finish(false);
   }
 
   private async kinQuietSet(request: Request, url: URL): Promise<Response> {
@@ -1869,6 +2029,69 @@ const KIN_RING_PER_TO_HOUR = 60;       // per `to` per hour — the denial-of-sl
 const KIN_REG_PER_MIN = 10;            // register/refresh per handle per minute
 const KIN_POLL_GAP_MS = 2000;          // ≤1 poll per 2 s per handle
 const KIN_BAD_AUTH_PER_MIN = 30;       // failed polls per handle per minute
+
+// ── THE LONG POLL, AND WHAT BOUNDS IT ────────────────────────────────────────
+//
+// A 5 s poll means a doorbell that takes 2.5 s on average to make a noise, and
+// a phone rings in well under one second. So the callee's GET is HELD by the
+// Durable Object until a ring lands, and the mean ring latency stops being half
+// a poll interval and becomes one round trip. Measured through two real `tk`
+// processes against a local worker, same binary both arms, n=12 each:
+// median 2794 ms before, 18 ms after.
+//
+// ── WHY LONG POLL AND NOT THE HIBERNATABLE WEBSOCKET RINGING.md PICKS ───────
+//
+// RINGING.md rejects this option on cost: "a parked request cannot hibernate",
+// therefore $4.15/user/month of Durable Object duration. That reasoning is
+// sound and its premise is incomplete, and the correction is in the same
+// document, four lines above the table it appears in:
+//
+//   "DO stays resident after last request >= 120 s
+//    (5/10/20/30/45/60/90/120 s gaps: 119-316 ms, never cold)"
+//
+// A poll every 5 s therefore NEVER lets the object go cold. The deployed
+// 5-second poll is already paying the whole duration bill that table charges
+// only to long polling, and has been all along; the table prices that row by
+// requests and this one by duration, which is why they look like different
+// orders of magnitude. Compared like for like against what actually ships,
+// holding the request costs the SAME duration and FEWER REQUESTS: the client's
+// steady state is three 25 s holds and one plain re-read per cycle, so 4
+// requests per 75 s is ~138k per user per month against 518k, both inside the
+// 1M free tier. It is strictly cheaper than the thing it replaces.
+//
+// The hibernatable WebSocket is still the right end state and is still the only
+// option that makes an IDLE user free. It needs a new DO class, a keepalive, a
+// reconnect ladder and a presence state machine -- none of which this needs,
+// and all of which sit on the path a live call's signalling shares. Long poll
+// gets the latency now at no extra cost over today; hibernation is a COST
+// project, not a latency one, and should be measured as one.
+//
+// ── HOW MANY HELD REQUESTS ONE PERSON CAN CAUSE, AND WHAT STOPS IT GROWING ──
+//
+// Four. Per handle, and a handle costs a proof-of-possession registration to
+// own, so "one person" is "one registered mailbox".
+//
+//   · The app holds ONE at a time: it arms, waits, and re-arms only after the
+//     previous one returned. Steady state is 1. When the menu-bar resident is
+//     running too, it STANDS DOWN while the app is open (Identity.claimLine on
+//     the Swift side), so two processes still hold one line between them.
+//   · KIN_WAIT_GAP_MS caps ARMING at one per second per handle, so nothing can
+//     accumulate faster than one held request per second...
+//   · ...and KIN_WAIT_MAX_PARKED caps CONCURRENCY at four, which is the bound
+//     that actually holds: a rate limit cannot bound a thing that lives for
+//     25 s. The fifth arming does not park and does not fail -- it answers
+//     immediately, exactly like today's poll.
+//   · Every park has a hard deadline (KIN_WAIT_MAX_MS). A client that sleeps,
+//     crashes or is unplugged costs at most one deadline, because the timer
+//     fires whether or not anybody is still listening -- there is no state that
+//     survives a vanished client and nothing to reap later.
+//   · The per-IP edge window (KIN_EDGE_CAP.poll) bounds the rate underneath all
+//     of this and is untouched.
+//
+const KIN_WAIT_MIN_MS = 1000;          // shorter than this is not a wait; answer now
+const KIN_WAIT_MAX_MS = 30_000;        // hard deadline on any held request
+const KIN_WAIT_GAP_MS = 1000;          // ≤1 arming per second per handle
+const KIN_WAIT_MAX_PARKED = 4;         // held requests per handle, all clients
 const KIN_RING_MAX_BODY = 1024;
 const KIN_REG_MAX_BODY = 512;
 // A ring carries exactly these six fields and no others. A lax mailbox would
@@ -2010,6 +2233,10 @@ export type KinDecision = {
   // counts these; the caller must never be told. If this ever appears in a
   // response body, invariant 1 is broken.
   muted?: boolean;
+  // Out-of-band as well: this poll asked to wait, the mailbox is empty, and the
+  // Durable Object should HOLD the request rather than answer it. `body` is
+  // empty on purpose when this is set — see the comment at the return site.
+  park?: boolean;
 };
 
 /**
@@ -2196,6 +2423,23 @@ export function kinBoxTake(box: Map<string, KinStored[]>, to: string, now: numbe
 }
 
 /**
+ * Is there anything a poll would actually HAND OVER? Non-destructive, and that
+ * is its only reason to exist: a waiting poll has to decide whether to park
+ * before it is allowed to take anything, because the check that follows can
+ * answer 429 and a drained-then-refused mailbox is a lost call.
+ *
+ * A silenced ring does NOT count. It is stored (so a caller cannot tell silence
+ * from absence) and thrown away at the drain, so treating it as something to
+ * deliver would end the callee's wait to hand them nothing — and a caller who
+ * kept ringing a silenced handle could keep that wait ending, which is denial
+ * of sleep rebuilt out of the silence switch.
+ */
+export function kinBoxHas(box: Map<string, KinStored[]>, to: string, now: number): boolean {
+  kinBoxSweep(box, now);
+  return (box.get(to) ?? []).some((r) => !r.mute);
+}
+
+/**
  * Everything a ring POST decides, with no I/O in it — the DO method around this
  * is four lines. Same seam as the diagnose layer: decisions are pure so they
  * can be tested without a Durable Object.
@@ -2311,11 +2555,20 @@ export function kinRingDecide(
  * `dropped` is how many rings have been silenced since this object woke — a
  * count, not a ledger; it resets when the isolate does, and the device keeps its
  * own missed-call list.
+ *
+ * `waitMs` is the LONG POLL, and it is the whole reason a ring is fast. Zero
+ * means "answer now", which is what every deployed client sends and what this
+ * function did unconditionally before — that path below is unchanged, down to
+ * the order of its two rate checks, because an old client must keep working
+ * against this server byte for byte. Non-zero means "hold the line": the
+ * decision comes back with `park` set and the Durable Object does the holding,
+ * because parking is I/O and nothing in this function is allowed to be.
  */
 export function kinPollDecide(
   to: string, tok: string, want: string | null,
   box: Map<string, KinStored[]>, hits: Map<string, number[]>, now: number,
   quiet: KinQuiet | null = null, dropped = 0,
+  waitMs = 0, parked = 0,
 ): KinDecision {
   if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
   if (!KIN_TOK_RE.test(tok)) return { status: 400, body: { error: 'bad tok' } };
@@ -2328,9 +2581,82 @@ export function kinPollDecide(
     }
     return { status: 401, body: { error: 'no' } };
   }
-  if (!kinWindow(hits, 'poll:' + to, now, KIN_POLL_GAP_MS, 1)) {
+  if (waitMs > 0) {
+    // ── THE PEEK EXISTS BECAUSE THE DRAIN IS DESTRUCTIVE ──────────────────
+    //
+    // A rate check placed after the drain would throw a real ring away on the
+    // way to answering 429, and the caller would be told "slow down" while the
+    // call it was waiting for evaporated. So a waiting poll looks WITHOUT
+    // TAKING first, and only a poll that finds nothing is charged for arming.
+    //
+    // That ordering also buys the property the client depends on: a poll that
+    // delivered a ring costs no arming budget, so the client may re-arm the
+    // instant it hands the ring over. Without it the ordinary path — ring
+    // lands, client comes straight back — is a 429 every single time, and the
+    // second of two rings 300 ms apart waits out a backoff. It is not a
+    // loophole: to earn a free re-arm you must actually have been rung, and
+    // rings are capped hard elsewhere (KIN_RING_PER_TO, KIN_RING_PER_TO_HOUR).
+    if (!kinBoxHas(box, to, now)) {
+      // Its OWN key prefix, like every other window in this file, so arming
+      // and plain polling cannot spend each other's budget.
+      if (!kinWindow(hits, 'wait:' + to, now, KIN_WAIT_GAP_MS, 1)) {
+        return { status: 429, body: { error: 'rate', retryMs: KIN_WAIT_GAP_MS } };
+      }
+      // Above the concurrency cap the request does NOT fail — it answers like
+      // an ordinary poll and lets the client fall back to its own cadence. A
+      // 429 here would read as "no ring" to anything that did not parse it,
+      // and the failure mode of this endpoint is a missed call.
+      //
+      // DELIBERATELY AN EMPTY BODY. The Durable Object must replace it after
+      // the wait, and a DO that forgot to honour `park` would otherwise answer
+      // a perfectly well-formed "nobody is calling" — a blind instrument
+      // reporting a negative, and the one failure this endpoint must never
+      // have. `{}` has no `rings` key, so it is refused loudly instead.
+      if (parked < KIN_WAIT_MAX_PARKED) return { status: 200, body: {}, park: true };
+    }
+  } else if (!kinWindow(hits, 'poll:' + to, now, KIN_POLL_GAP_MS, 1)) {
     return { status: 429, body: { error: 'rate', retryMs: KIN_POLL_GAP_MS } };
   }
+  return { status: 200, body: kinPollBody(to, box, now, quiet, dropped, waitMs > 0 ? 0 : undefined) };
+}
+
+/**
+ * How long this poll asked to be held, in ms, or 0 for "answer now".
+ *
+ * Every unusable spelling — absent, empty, `abc`, `-1`, `NaN`, or a wait so
+ * short it is not a wait — comes back as 0, which is the DEPLOYED behaviour and
+ * not an error. A 400 here would mean a client that guessed the parameter
+ * slightly wrong stopped receiving calls entirely.
+ *
+ * Clamped at both ends and not merely floored: `wait=86400000` from a buggy or
+ * hostile client must not become a request held for a day.
+ */
+export function kinWaitMs(raw: string | null): number {
+  if (!raw) return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < KIN_WAIT_MIN_MS) return 0;
+  return Math.min(Math.floor(n), KIN_WAIT_MAX_MS);
+}
+
+/**
+ * The 200 body of a poll, and the drain that fills it. Split out of
+ * kinPollDecide for one reason: after a parked poll WAKES, the Durable Object
+ * has to build the same answer again without re-running the auth check or
+ * re-charging the rate window it already paid. Two spellings of this body would
+ * be two shapes for the Swift decoder to disagree about, and the one that only
+ * runs after a wake is the one nobody would notice was wrong.
+ *
+ * `waitedMs` is present only on a poll that ASKED to wait, and it is the
+ * client's proof that this server understands waiting at all. An older worker
+ * ignores the `wait` parameter silently and answers immediately with a body
+ * that has no such field — which is indistinguishable from a fast answer unless
+ * the server says so out loud. See Identity.pollOnce on the Swift side: the
+ * absence of this field is what switches the client back to its 5 s cadence.
+ */
+export function kinPollBody(
+  to: string, box: Map<string, KinStored[]>, now: number,
+  quiet: KinQuiet | null, dropped: number, waitedMs?: number,
+): Record<string, unknown> {
   // The drain is destructive either way: a silenced ring is taken out of the
   // mailbox and thrown away here, never handed to the callee. Filtering at the
   // drain rather than refusing at the door is what keeps the ring response
@@ -2338,33 +2664,34 @@ export function kinPollDecide(
   const taken = kinBoxTake(box, to, now);
   const rings = taken.filter((r) => !r.mute);
   return {
-    status: 200,
-    body: {
-      to,
-      // `ageMs` mirrors rendezvous()'s: the callee decides for itself whether a
-      // ring is still worth showing, and can say why when it is not.
-      //
-      // `k` MUST come back out. It is the caller's device key, and without it
-      // the callee has nothing to verify `sig` against and nothing to match
-      // against its contact list — a poll that drops `k` turns every ring into
-      // an unverifiable one, which the callee then correctly refuses to show.
-      // That failure looks exactly like "nobody is calling".
-      rings: rings.map((r) => ({
-        from: r.from, room: r.room, t: r.t, sig: r.sig, k: r.k, ageMs: now - r.bornAt,
-      })),
-      // ALWAYS PRESENT, even when nothing is stored, so a Swift decoder sees one
-      // shape and "no row yet" cannot be mistaken for "the field was dropped".
-      // `on` is the READ-TIME verdict, not the stored bit: an expired deadline
-      // reports on:false while the row still says quiet:true, and the client
-      // must believe `on`.
-      quiet: {
-        on: kinQuietActive(quiet, now),
-        until: quiet?.until ?? 0,
-        exceptKnown: quiet?.exceptKnown ?? false,
-        dropped,
-      },
-      pollMs: 5000, leaseMs: KIN_LEASE_MS,
+    to,
+    // `ageMs` mirrors rendezvous()'s: the callee decides for itself whether a
+    // ring is still worth showing, and can say why when it is not.
+    //
+    // `k` MUST come back out. It is the caller's device key, and without it
+    // the callee has nothing to verify `sig` against and nothing to match
+    // against its contact list — a poll that drops `k` turns every ring into
+    // an unverifiable one, which the callee then correctly refuses to show.
+    // That failure looks exactly like "nobody is calling".
+    rings: rings.map((r) => ({
+      from: r.from, room: r.room, t: r.t, sig: r.sig, k: r.k, ageMs: now - r.bornAt,
+    })),
+    // ALWAYS PRESENT, even when nothing is stored, so a Swift decoder sees one
+    // shape and "no row yet" cannot be mistaken for "the field was dropped".
+    // `on` is the READ-TIME verdict, not the stored bit: an expired deadline
+    // reports on:false while the row still says quiet:true, and the client
+    // must believe `on`.
+    quiet: {
+      on: kinQuietActive(quiet, now),
+      until: quiet?.until ?? 0,
+      exceptKnown: quiet?.exceptKnown ?? false,
+      dropped,
     },
+    // `pollMs` is the cadence for a client that is NOT waiting, and it stays
+    // 5000 for exactly that client. It is not the long poll's cadence and must
+    // never be read as one.
+    pollMs: 5000, leaseMs: KIN_LEASE_MS,
+    ...(waitedMs === undefined ? {} : { waitedMs }),
   };
 }
 

@@ -129,24 +129,38 @@ if let want = arg("quiet") {
 // of handle-dialling are testable from a terminal before either has any pixels.
 if let who = arg("ring-only") {
   let room = Launcher.mintRoom()
+  // STAMPED BEFORE THE POST, because the thing being measured is press-to-ring
+  // and the POST is inside it. A stamp taken after `ring` returns would hide
+  // the caller's whole leg of the trip inside the ruler.
+  fputs("ring-only: pressed at \(Int(Date().timeIntervalSince1970 * 1000))\n", stderr)
   if let got = Identity.ring(to: who, room: room) {
     fputs("ring-only: rang @\(who), room \(got)\n", stderr); exit(0)
   }
   exit(1)
 }
 // Drain the mailbox once, or listen for a while. Prints every ring it verifies.
+//
+// THROUGH THE SAME LOOP THE APP USES. This used to be its own `poll; sleep 2.2`
+// while the app ran `startRinging` at 5000 ms, so the number this printed was
+// the harness's cadence and not the product's -- a rig measuring a parameter the
+// product does not choose. `ringLoop` is now the only listening loop there is.
 if flag("rings") || arg("rings-for") != nil {
   let secs = Double(arg("rings-for") ?? "0") ?? 0
-  let deadline = Date().addingTimeInterval(secs)
   var seen = 0
-  repeat {
-    for r in Identity.poll() {
-      seen += 1
-      fputs("ring from @\(r.from) room \(r.room) age \(r.ageMs) ms"
-          + " known=\(r.known) keyChanged=\(r.keyChanged)\n", stderr)
-    }
-    if Date() < deadline { Thread.sleep(forTimeInterval: 2.2) }
-  } while Date() < deadline
+  // `--stand-down` listens the way the menu-bar resident does: it yields the
+  // mailbox whenever the app is open. Exposed here because otherwise the only
+  // way to exercise it is to install a real LaunchAgent, and a rule that can
+  // only be tested by shipping it is a rule nobody tests.
+  Identity.ringLoop(gapMs: Int(arg("ring-gap") ?? "5000") ?? 5000,
+                    until: Date().addingTimeInterval(max(secs, 0)),
+                    standDown: flag("stand-down")) { r in
+    seen += 1
+    // The wall clock at the instant the ring reached this process. Subtract the
+    // caller's `pressed` stamp above and that difference IS the ring latency.
+    fputs("ring from @\(r.from) room \(r.room) age \(r.ageMs) ms"
+        + " known=\(r.known) keyChanged=\(r.keyChanged)"
+        + " at \(Int(Date().timeIntervalSince1970 * 1000))\n", stderr)
+  }
   fputs("rings: \(seen) verified\n", stderr)
   exit(seen > 0 ? 0 : 1)
 }
@@ -248,7 +262,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "ring-only", "rings", "rings-for", "ring-gap", "call", "no-rings", "io", "no-agc",
+  "ring-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",

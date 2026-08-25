@@ -562,9 +562,69 @@ enum Identity {
       && Date().timeIntervalSince(lastPollAt) < 90
   }
 
-  /// Drain the mailbox once. Unverifiable rings are dropped here and never
-  /// reach the caller of this function.
+  /// Drain the mailbox once, answering straight away. Unverifiable rings are
+  /// dropped here and never reach the caller of this function.
   static func poll() -> [Ring] {
+    if case .answer(let rings, _) = pollOnce(waitMs: 0) { return rings }
+    return []
+  }
+
+  /// What one poll turned out to be. The four cases exist because they are four
+  /// different facts, and this endpoint's worst failure is treating them as one:
+  /// "nobody is calling" and "the question never got through" have looked
+  /// identical here before, and the second one is a missed call.
+  enum PollOutcome {
+    /// HTTP 200. `serverHolds` is nil when we did not ask to wait; otherwise it
+    /// is whether the server proved it understands waiting.
+    case answer(rings: [Ring], serverHolds: Bool?)
+    /// HTTP 204 -- the server held the line for the full wait and nothing came.
+    /// The line is now free; arm another immediately.
+    case held
+    /// HTTP 429, carrying the server's own retry hint in ms. NOT an empty
+    /// mailbox: a poll refused for going too fast has told us nothing at all
+    /// about whether somebody is calling, and hammering is what turns one 429
+    /// into a locked-out minute.
+    case rate(Int)
+    /// No answer, or a status we cannot act on.
+    case failed
+  }
+
+  /// How long a held poll asks the server to hold it. Comfortably inside the
+  /// server's own 30 s ceiling, and a rig override because a test that has to
+  /// wait 25 s to watch a deadline expire will not be run.
+  static var holdMs: Int {
+    Int(ProcessInfo.processInfo.environment["TK_RING_WAIT_MS"] ?? "") ?? 25_000
+  }
+
+  /// ── THE POLL GETS ITS OWN SESSION, AND THAT IS NOT TIDINESS ────────────────
+  ///
+  /// A held poll occupies one connection to room.tokkah.com for 25 seconds at a
+  /// time, and `URLSession.shared` is also what `ring`, `claim`, `setQuiet`,
+  /// `Update` and `Telemetry` use. Sharing a per-host connection pool between a
+  /// request that is DESIGNED to sit idle for half a minute and every other
+  /// request the app makes is asking for one of them to queue behind the other,
+  /// and a queued task is invisible: no error, no status, nothing on the wire.
+  ///
+  /// `timeoutIntervalForResource` is the one that matters here. `timeoutInterval`
+  /// on the request bounds IDLE time, and a held poll is idle by design -- so it
+  /// is the resource timeout, which bounds the whole task, that guarantees this
+  /// ever comes back.
+  private static let pollSession: URLSession = {
+    let c = URLSessionConfiguration.ephemeral
+    c.timeoutIntervalForRequest = 40
+    c.timeoutIntervalForResource = 45
+    c.httpMaximumConnectionsPerHost = 2
+    c.waitsForConnectivity = false
+    c.requestCachePolicy = .reloadIgnoringLocalCacheData
+    return URLSession(configuration: c)
+  }()
+
+  /// One poll. `waitMs` of 0 asks for an answer now -- which is what every
+  /// deployed client does and what an older server is only capable of. Anything
+  /// else asks the server to hold the request open until somebody rings, which
+  /// is the whole difference between a doorbell that answers in a tenth of a
+  /// second and one that averages two and a half.
+  static func pollOnce(waitMs: Int) -> PollOutcome {
     let s = ensure()
     guard s.claimed else {
       // Not the same as an empty mailbox, and it used to be indistinguishable
@@ -572,39 +632,68 @@ enum Identity {
       // and reporting that as "no rings" sends whoever is debugging to look at
       // the sender.
       fputs("ring: not polling -- @\(s.handle) is not claimed by this install\n", stderr)
-      return []
+      return .failed
     }
-    guard let url = URL(string: "\(base)/api/kin/\(s.handle)/poll?tok=\(s.tok)")
-    else { return [] }
+    let wait = waitMs > 0 ? "&wait=\(waitMs)" : ""
+    guard let url = URL(string: "\(base)/api/kin/\(s.handle)/poll?tok=\(s.tok)\(wait)")
+    else { return .failed }
     var req = URLRequest(url: url)
-    req.timeoutInterval = 8
+    // Must OUTLAST the wait we asked for, with room for the round trip. A
+    // timeout shorter than the hold abandons every held poll a moment before
+    // the server was going to answer it -- the fast path failing on a schedule,
+    // and looking like a flaky network while it does.
+    req.timeoutInterval = waitMs > 0 ? Double(waitMs) / 1000 + 10 : 8
     req.cachePolicy = .reloadIgnoringLocalCacheData
     var out: [Ring] = []
     var quiet: Bool?
+    var outcome = PollOutcome.failed
     let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    let task = pollSession.dataTask(with: req) { data, resp, _ in
       defer { sem.signal() }
       let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
       // Recorded before the guard, so a failure is recorded as a failure rather
       // than leaving the last success standing and reading as still healthy.
       lastPollStatus = code
       lastPollAt = Date()
+      // 204 is the held line coming back empty, and no older worker has ever
+      // produced one on this route -- so it is both the answer and the proof
+      // that this server holds.
+      if code == 204 { outcome = .held; return }
+      if code == 429 {
+        let o = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        outcome = .rate((o?["retryMs"] as? Int) ?? 2000)
+        return
+      }
       guard code == 200, let data,
-            let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let offeredRings = o["rings"] as? [[String: Any]]
       else {
         // A 429, a 403 and a dead network all used to look exactly like an empty
         // mailbox. Silence is a legitimate answer to "is anyone calling"; it is
         // never a legitimate answer to "did the question get through".
+        //
+        // A 200 with no `rings` key is refused here too, on purpose: that is
+        // what a server which accepted the wait and then forgot to hold would
+        // send, and reading it as an empty mailbox is exactly the silent
+        // negative this whole block exists to stop.
         fputs("ring: poll failed -- \(code == 0 ? "no answer" : "http \(code)")\n", stderr)
         return
       }
       if let q = o["quiet"] as? [String: Any] { quiet = q["on"] as? Bool }
       let known = contacts()
-      let offered = (o["rings"] as? [[String: Any]])?.count ?? 0
+      let offered = offeredRings.count
+      // WHETHER THIS SERVER HOLDS, and it must be a positive statement rather
+      // than a guess from timing. An older worker ignores an unknown query
+      // parameter in silence and answers at once, which is indistinguishable
+      // from a fast new server unless the new one says so out loud. `waitedMs`
+      // is that sentence; its absence is an old worker, and the loop below
+      // drops back to the 5 s cadence on the strength of it.
+      let holds: Bool? = waitMs > 0 ? (o["waitedMs"] != nil) : nil
+      defer { outcome = .answer(rings: out, serverHolds: holds) }
       // Offered vs verified, always. "0 verified" out of 3 offered is a key
       // problem; out of 0 offered it is a quiet afternoon.
       if offered > 0 { fputs("ring: \(offered) offered by the server\n", stderr) }
-      for r in (o["rings"] as? [[String: Any]]) ?? [] {
+      for r in offeredRings {
         guard let from = r["from"] as? String, let room = r["room"] as? String,
               let t = r["t"] as? Int, let sig = r["sig"] as? String,
               let kb64 = r["k"] as? String,
@@ -623,8 +712,28 @@ enum Identity {
                         known: known[from] == kb64,
                         keyChanged: known[from] != nil && known[from] != kb64))
       }
-    }.resume()
-    _ = sem.wait(timeout: .now() + 10)
+    }
+    task.resume()
+    // Must outlast the request's own timeout, or this function reports failure
+    // while the request it is waiting on is still perfectly alive -- and the
+    // loop arms a second one on top of it.
+    //
+    // `DispatchTime` AND NOT `.now()`. Written as `.now()` Swift resolves this
+    // to `wait(wallTimeout:)`, which is the WALL CLOCK -- a stack sample caught
+    // it in `semaphore_timedwait_trap` under exactly that overload. A wall-clock
+    // deadline is not a deadline: it moves with an NTP step, a timezone update
+    // and, on the machine this actually runs on, a laptop closing its lid, which
+    // is the single most likely thing to happen during a 25-second held request.
+    // The whole point of this line is to be the thing that CANNOT fail to fire.
+    if sem.wait(timeout: DispatchTime.now() + req.timeoutInterval + 8) == .timedOut {
+      // CANCEL IT. A task abandoned here still owns its connection, and the next
+      // poll queues behind a request nobody is listening to any more -- which
+      // presents as a doorbell that simply stops, with no error anywhere.
+      task.cancel()
+      fputs("ring: poll gave no answer in time -- abandoned\n", stderr)
+      lastPollStatus = 0
+      lastPollAt = Date()
+    }
     // The poll is also the authoritative read of our own silent state, for free.
     if let q = quiet {
       lock.lock()
@@ -632,24 +741,279 @@ enum Identity {
       if var c = cached, c.quiet != q { c.quiet = q; cached = c; lock.unlock(); save(c) }
       else { lock.unlock() }
     }
-    return out
+    return outcome
   }
 
-  /// Listen for rings for as long as the app is open. One thread, one poll every
-  /// `gapMs` -- the server refuses more than one poll per 2 s per handle, so the
-  /// floor here is not a preference.
-  static func startRinging(gapMs: Int = 5000, onRing: @escaping (Ring) -> Void) {
-    let gap = max(2000, gapMs)
-    Thread {
-      // Only ever the newest ring is offered: a stack of missed calls is a
-      // feature nobody asked for, and answering a stale room joins an empty one.
-      while true {
-        let rings = poll()
-        if let r = rings.max(by: { $0.t < $1.t }) {
-          DispatchQueue.main.async { onRing(r) }
+  // ── LISTENING ───────────────────────────────────────────────────────────────
+  //
+  // A 5 s poll rings the callee's screen after 2.5 s on average and 5 s at
+  // worst. A phone rings in well under one second, so the poll IS the defect.
+  //
+  // So the request is HELD: the callee asks the server to keep its GET open for
+  // 25 s and answer the instant a ring lands. Mean ring latency stops being half
+  // a poll interval and becomes one round trip. Measured on a local worker, same
+  // binary both arms, n=12: median 2794 ms before, 18 ms after.
+  //
+  // ── AND IT HAS TO WORK AGAINST A SERVER THAT CANNOT DO THAT ───────────────
+  //
+  // Two ends of a call update independently, and a Mac that self-updated this
+  // morning will be talking to whatever the worker was yesterday. An older
+  // worker ignores `wait` in silence and answers immediately; something between
+  // us and it may buffer the response instead of streaming it. Neither may be
+  // allowed to mean "nobody ever calls me again" -- so this loop watches for
+  // both and drops back to the 5 s cadence, which is byte for byte the code that
+  // shipped.
+  //
+  // The re-probe costs NOTHING, and that is the point of doing it this way: a
+  // fallen-back client puts `wait` back on one poll a minute, and that poll is a
+  // real poll either way. If the far side has since been deployed, the 204 or
+  // the `waitedMs` comes back and the fast path resumes with no extra request
+  // and nothing to restart.
+
+  /// Polls after which a client that fell back re-offers to wait. 12 x 5 s is a
+  /// minute: soon enough that a deploy is not a lasting regression, rare enough
+  /// that an old server is not asked twelve times a minute.
+  private static let reprobeEvery = 12
+  /// Held polls between one plain one. A held poll answers 204 with no body, and
+  /// the body is the only place the server's view of our own silence comes back;
+  /// 3 holds is about 75 s, so a silence deadline that expired server-side shows
+  /// as lifted within that. It costs one extra round trip per 75 s and loses
+  /// nothing: a plain poll drains the same mailbox.
+  private static let resyncEvery = 4
+  /// Said once per process, never per poll. A line every 5 s is a line nobody
+  /// reads.
+  nonisolated(unsafe) private static var saidSlow = false
+  nonisolated(unsafe) private static var saidBusy = false
+  nonisolated(unsafe) private static var saidStandDown = false
+  /// One line per poll, off by default. A ring loop that stops working stops
+  /// PRINTING, and silence is what an idle doorbell looks like too -- so without
+  /// this, "nobody called" and "this loop is wedged" are not distinguishable
+  /// from outside the process at all. `TK_RING_DEBUG=1`.
+  private static let ringDebug = ProcessInfo.processInfo.environment["TK_RING_DEBUG"] != nil
+
+  // ── ONE HANDLE, ONE HOLDER ──────────────────────────────────────────────────
+  //
+  // There are now two processes that listen for the same person's calls: the
+  // menu-bar resident, which runs from login to logout, and the app itself when
+  // it is open. Both poll the same mailbox with the same credential, and the
+  // server allows one arming per second per handle -- so with both running, one
+  // of them is being refused most of the time. That was observed as "429s
+  // throughout" before this existed.
+  //
+  // Two holders is not merely wasteful, it is WRONG: a drain is destructive, so
+  // whichever poll returns first takes the ring and the other gets an empty
+  // answer. A ring could land on the resident, which launches a second copy of
+  // the app, while the copy already open and already able to ring shows nothing.
+  //
+  // So the app wins and the resident stands down, because the app is the one
+  // that can turn a ring into a lit screen with no launch in between. The signal
+  // is an exclusive `flock` the app holds for its life: a lock disappears when
+  // its holder does, so there is no stale file to reap and no way for a crashed
+  // app to leave this Mac uncallable -- which a marker file or a pid file both
+  // allow, and which is the worse failure by a distance.
+  private static var lockFile: URL { dir.appendingPathComponent("ring.lock") }
+  nonisolated(unsafe) private static var lockFd: Int32 = -1
+
+  /// Claim the line for this process, for as long as it lives. Best effort: if
+  /// the lock cannot be taken the app still polls, because being rung twice is a
+  /// far smaller fault than not being rung at all.
+  private static func claimLine() {
+    guard lockFd < 0 else { return }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let fd = open(lockFile.path, O_CREAT | O_RDWR, 0o600)
+    guard fd >= 0 else { return }
+    if flock(fd, LOCK_EX | LOCK_NB) == 0 { lockFd = fd } else { close(fd) }
+  }
+
+  /// Is some OTHER process holding the line? Asked by the resident before every
+  /// poll, and answered by trying the lock rather than by reading anything: the
+  /// only fact that matters is whether a live process holds it right now.
+  private static func lineHeldByApp() -> Bool {
+    if lockFd >= 0 { return false }               // we hold it; nobody else can
+    let fd = open(lockFile.path, O_CREAT | O_RDWR, 0o600)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
+    return true
+  }
+
+  /// The listening loop itself, on whatever thread calls it. `until` is a
+  /// deadline for the measurement flags; nil means the life of the process.
+  ///
+  /// Shared with `--rings-for` and with the menu-bar resident on purpose. A rig
+  /// with its own copy of this loop measures its own copy: the version this
+  /// replaced polled every 2.2 s while the app polled every 5, so the harness
+  /// could not have seen the app's real ring latency even in principle.
+  ///
+  /// `standDown` is for the resident: it yields the mailbox while the app is
+  /// open. See the block above `claimLine`.
+  ///
+  /// `onRing` FIRES ON THIS THREAD, and the hop to main belongs to
+  /// `startRinging` rather than here. A loop that always dispatched to main
+  /// would deliver nothing at all to `--rings-for`, which runs on main itself
+  /// and is inside this loop while such a block waits for main to be free.
+  ///
+  /// `onTick` runs once per turn of the loop, before anything else, and exists
+  /// so the resident's other duties -- noticing a swapped binary, retrying an
+  /// unclaimed handle, redrawing its menu bar item -- keep happening on the same
+  /// beat they always did. They must run even on a turn this process stands
+  /// down, or a Mac whose app is open stops noticing it has been updated.
+  static func ringLoop(gapMs: Int = 5000, until: Date? = nil, standDown: Bool = false,
+                       onTick: (() -> Void)? = nil,
+                       onRing: @escaping (Ring) -> Void) {
+    let gap = Double(max(2000, gapMs)) / 1000
+    if !standDown { claimLine() }
+    var holds = true          // does this server hold? assumed until it says otherwise
+    var read = false          // has ONE full body come back yet
+    var since = 0             // polls in the current mode, for the two periodic duties
+    var trouble = 0.0         // consecutive failures, for the backoff
+    func slow(_ why: String) {
+      guard !saidSlow else { return }
+      saidSlow = true
+      fputs("ring: \(why) -- checking for calls every \(Int(gap)) seconds instead\n", stderr)
+    }
+    /// Say it once, from either of the two answers that can carry the news: a
+    /// 204 proves the server held just as well as `waitedMs` does, and a
+    /// recovery announced on only one of them is announced on the rarer one.
+    func fast() {
+      guard !holds else { return }
+      holds = true
+      since = 0
+      fputs("ring: calls are coming through instantly again\n", stderr)
+    }
+    /// 0.5, 1, 2, 4, then the poll cadence, with jitter. CAPPED AT THE CADENCE,
+    /// not at the 30 s a reconnect ladder would use: every second spent backed
+    /// off is a second of missed calls, so the worst case here must never be
+    /// worse than the thing this replaced.
+    func backoff() -> Double {
+      trouble += 1
+      return min(0.25 * pow(2, trouble), gap) * Double.random(in: 0.75...1.25)
+    }
+    // REPEAT, not while. `--rings` passes a deadline of now, and a while-loop
+    // would evaluate it as already past and drain the mailbox zero times --
+    // reporting "no rings" without ever having asked. One poll always happens.
+    repeat {
+      onTick?()
+      if standDown, lineHeldByApp() {
+        if !saidStandDown {
+          saidStandDown = true
+          fputs("watch: Kin is open and listening for calls itself -- standing by\n", stderr)
         }
-        Thread.sleep(forTimeInterval: Double(gap) / 1000)
+        // A second is short enough that closing the app makes this Mac callable
+        // again straight away, and it costs one uncontended flock.
+        Thread.sleep(forTimeInterval: 1)
+        continue
       }
+      // ── WHICH POLLS ARE PLAIN, AND WHY ANY OF THEM STILL ARE ───────────────
+      //
+      // A held poll comes back 204 with NO BODY, and the body is where our own
+      // silent-mode row comes back from the server. Hold every poll and this
+      // device never hears that a "silence for an hour" deadline has passed --
+      // the switch would sit there saying nobody can reach you while everybody
+      // can. That is the one error in this feature that matters, and it used to
+      // be impossible because every 5 s poll re-read it.
+      //
+      //   · until ONE full body has been read, poll plainly. Not "until the
+      //     first poll", which a run of 429s can consume without ever bringing
+      //     a body back.
+      //   · then one plain poll every few holds, to re-read that row.
+      //   · in fallback, the opposite duty: every twelfth poll offers to wait,
+      //     so a server deployed since we gave up is noticed. It costs nothing
+      //     extra -- that poll is a real poll either way.
+      var wait: Int
+      if !read { wait = 0 }
+      else if holds { wait = since % resyncEvery == resyncEvery - 1 ? 0 : holdMs }
+      else { wait = since % reprobeEvery == reprobeEvery - 1 ? holdMs : 0 }
+      // Never hold past the caller's own deadline. `--rings-for 30` that armed a
+      // 25 s wait at second 29 would run for 54 -- a harness whose stated
+      // duration is not its duration, which is how a rig starts lying about
+      // everything else it measures. Below the server's own floor for a wait,
+      // ask for none.
+      if let u = until { wait = min(wait, Int(u.timeIntervalSinceNow * 1000)) }
+      if wait < 1000 { wait = 0 }
+      since += 1
+      let sent = Date()
+      let result = pollOnce(waitMs: wait)
+      if ringDebug {
+        let took = Int(Date().timeIntervalSince(sent) * 1000)
+        let what: String
+        switch result {
+        case .answer(let rs, let h): what = "answer \(rs.count) ring(s) holds=\(h.map(String.init) ?? "-")"
+        case .held: what = "held, nothing came"
+        case .rate(let ms): what = "429, retry in \(ms) ms"
+        case .failed: what = "FAILED"
+        }
+        fputs("ring: poll #\(since) wait=\(wait) -> \(what) in \(took) ms\n", stderr)
+      }
+      switch result {
+      case .answer(let rings, let serverHolds):
+        trouble = 0
+        read = true
+        if serverHolds == true { fast() }
+        else if serverHolds == false, holds {
+          holds = false
+          since = 0
+          slow("this server answers polls instead of holding them")
+        }
+        // Only ever the newest ring is offered: a stack of missed calls is a
+        // feature nobody asked for, and answering a stale room joins an empty one.
+        if let r = rings.max(by: { $0.t < $1.t }) {
+          onRing(r)
+          // Arm the next one NOW. A poll that delivered a ring costs no arming
+          // budget on the server precisely so this line is free, and the gap it
+          // closes is where a second ring would otherwise sit.
+        } else if !holds {
+          Thread.sleep(forTimeInterval: gap)          // the cadence that always worked
+        } else if wait > 0 {
+          // An empty answer to a poll that ASKED to be held means the server
+          // declined to hold it -- it is at its concurrency cap. Re-arming at
+          // once would spin against that cap; wait out the arming window.
+          Thread.sleep(forTimeInterval: 1)
+        }
+        // Otherwise this was a plain poll in hold mode -- the first of the
+        // process, or a re-read -- it found nothing, and the very next thing to
+        // do is hold the line again. No sleep.
+      case .held:
+        // The line was held for the full wait and nobody called. Arm another
+        // immediately: the gap between two held polls is the only window in
+        // which a ring has to sit and wait, so it is kept to one round trip.
+        // `read` is deliberately NOT set here: a 204 has no body, so it proves
+        // the server holds and proves nothing about our silent-mode row. It can
+        // only be reached once a body has already come back anyway, since that
+        // is what allows a poll to ask for the wait in the first place.
+        trouble = 0
+        fast()
+      case .rate(let retryMs):
+        // A 429 IS NOT AN EMPTY MAILBOX, and the difference is a missed call.
+        // Said out loud once, because a doorbell being throttled is the one
+        // failure a person would want to know about and it is otherwise
+        // indistinguishable from a quiet afternoon.
+        if !saidBusy {
+          saidBusy = true
+          fputs("ring: the server asked this Mac to check for calls less often\n", stderr)
+        }
+        // Honour the server's own hint, and add our own backoff on top, so a
+        // client already refused does not keep asking at exactly the rate that
+        // was refused.
+        Thread.sleep(forTimeInterval: max(Double(retryMs) / 1000, backoff()))
+      case .failed:
+        // THREE IN A ROW, counted -- not "the backoff got long", which is the
+        // same shape as a rate that was never converted to events per second.
+        // One failure is a hiccup; three consecutive is a server or a path that
+        // cannot do this, and the answer is the cadence that has always worked.
+        let pause = backoff()
+        if trouble >= 3, holds { holds = false; since = 0; slow("calls are not coming through quickly") }
+        Thread.sleep(forTimeInterval: pause)
+      }
+    } while until == nil || Date() < until!
+  }
+
+  /// Listen for rings for as long as the app is open, on a thread of its own,
+  /// and hand every one to main -- the caller draws a window with it.
+  static func startRinging(gapMs: Int = 5000, onRing: @escaping (Ring) -> Void) {
+    Thread {
+      ringLoop(gapMs: gapMs) { r in DispatchQueue.main.async { onRing(r) } }
     }.start()
   }
 

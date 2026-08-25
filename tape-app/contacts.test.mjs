@@ -101,8 +101,8 @@ await build({
   logLevel: 'silent',
 });
 const {
-  kinRingDecide, kinPollDecide, kinRegisterDecide, kinQuietDecide, kinQuietActive,
-  kinBoxPut, kinBoxTake, kinWindow, kinTimingSafeEqual, turnOrderUdp,
+  kinRingDecide, kinPollDecide, kinPollBody, kinRegisterDecide, kinQuietDecide, kinQuietActive,
+  kinBoxPut, kinBoxTake, kinBoxHas, kinWaitMs, kinWindow, kinTimingSafeEqual, turnOrderUdp,
   kinB64, kinB64Encode, kinVerifyEd25519,
   KIN_HANDLE_RE, KIN_ROUTE_RE,
 } = await import(bundle);
@@ -1344,6 +1344,188 @@ const DEV2 = await device('dev2');
   }
 }
 
+// ── (m) THE HELD POLL ──────────────────────────────────────────────────────
+//
+// The doorbell used to be a 5 s poll, so a call took 2.5 s on average and 5 s at
+// worst to reach a screen. The callee now asks the server to HOLD its GET open
+// and answer the instant somebody rings.
+//
+// The dangerous bugs here are all shaped like the ones above: quiet, and
+// indistinguishable from "nobody is calling".
+//
+//   - (m2) a poll asked to wait comes back with `park` and an EMPTY body. That
+//     is on purpose and is asserted as a property: a Durable Object that
+//     forgot to honour `park` would otherwise send a perfectly well-formed
+//     "no rings" and the feature would silently be a 25-second poll.
+//   - (m3/m4) `waitedMs` is present exactly when the caller asked to wait, and
+//     ABSENT otherwise. That field is the client's only positive evidence that
+//     the far side understands waiting — an older worker ignores an unknown
+//     query parameter in silence, which is indistinguishable from a fast new
+//     one. (m4) compares a plain poll's body key for key against the shape that
+//     shipped, because an old client must keep working against this server.
+//   - (m5) is the drain-then-refuse bug, and it is the one that would lose real
+//     calls. The drain is destructive; a rate check placed after it throws a
+//     ring away on the way to answering 429. So a ring already in the mailbox
+//     must be delivered EVEN WHEN THE ARMING WINDOW IS EXHAUSTED, and (m5)
+//     proves both halves — the same exhausted window refuses an empty poll.
+//   - (m7) the concurrency cap answers 200, never 429. A 429 there reads as
+//     "no ring" to anything that does not parse it, and this endpoint's failure
+//     mode is a missed call.
+//   - (m9) a silenced ring does not count as something to deliver. If it did,
+//     a caller ringing a silenced handle could end the callee's wait over and
+//     over — denial of sleep rebuilt out of the silence switch.
+{
+  sec('(m) the held poll: parking, and the ways it must not lose a ring');
+  // Not exported, for the reason in the (j4) block: worker.ts is the worker
+  // ENTRY module and workerd refuses to start when a named export is not a
+  // function or an ExportedHandler. Read out of the source, like the context
+  // strings above.
+  const numOf = (name) => {
+    const m = srcText.match(new RegExp(`const ${name} = ([0-9_]+)`));
+    return m ? Number(m[1].replace(/_/g, '')) : null;
+  };
+  const MAXPARKED = numOf('KIN_WAIT_MAX_PARKED');
+  const WAITGAP = numOf('KIN_WAIT_GAP_MS');
+  const MAXWAIT = numOf('KIN_WAIT_MAX_MS');
+  const MINWAIT = numOf('KIN_WAIT_MIN_MS');
+  ok(MAXPARKED && WAITGAP && MAXWAIT && MINWAIT, '(m0) the four wait constants are readable from the source');
+
+  // ── (m1) the ruler: known inputs, including two that MUST rank differently ─
+  for (const [raw, want] of [
+    [null, 0], ['', 0], ['abc', 0], ['-1', 0], ['0', 0], ['NaN', 0], ['Infinity', 0],
+    [String(MINWAIT - 1), 0],          // below the floor is NOT a wait
+    [String(MINWAIT), MINWAIT],        // ...and the floor itself IS one
+    ['25000', 25000],
+    ['25000.7', 25000],                // floored, never fractional ms
+    [String(MAXWAIT * 1000), MAXWAIT], // clamped at the top, not merely floored
+  ]) {
+    eq(kinWaitMs(raw), want, `(m1) kinWaitMs(${JSON.stringify(raw)}) is ${want}`);
+  }
+
+  // ── (m2) an empty mailbox parks, with nothing in the body ─────────────────
+  {
+    const s = fresh();
+    const d = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0);
+    eq(d.status, 200, '(m2) a waiting poll on an empty mailbox is a 200');
+    eq(d.park, true, '(m2) and is marked for the DO to hold');
+    deep(d.body, {}, '(m2) with an EMPTY body — a DO that ignored `park` must not send a plausible "no rings"');
+    ok(!('rings' in d.body), '(m2) and no `rings` key at all, so it cannot be read as an empty mailbox');
+  }
+
+  // ── (m3) a mailbox with something in it answers at once, and says it waited ─
+  {
+    const s = fresh();
+    put(s, {});
+    const d = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0);
+    eq(d.status, 200, '(m3) a waiting poll with a ring waiting answers at once');
+    eq(d.park, undefined, '(m3) and does not park');
+    eq(d.body.rings.length, 1, '(m3) handing over the ring');
+    eq(d.body.waitedMs, 0, '(m3) and reporting that it waited no time — the field is the client\'s proof this server holds');
+  }
+
+  // ── (m4) THE OLD CLIENT'S POLL IS UNCHANGED ───────────────────────────────
+  // Key for key against the shape that shipped. Two ends of a call update
+  // independently, so an old Mac must keep working against this worker.
+  {
+    const s = fresh();
+    const d = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW);
+    deep(Object.keys(d.body).sort(), ['leaseMs', 'pollMs', 'quiet', 'rings', 'to'],
+      '(m4) a poll with no `wait` has exactly the keys it always had');
+    ok(!('waitedMs' in d.body), '(m4) and NO waitedMs — its absence is what tells an old client nothing changed');
+    eq(d.body.pollMs, 5000, '(m4) and it is still told to come back in 5 s');
+    // The same request with wait= differs by exactly one key and nothing else.
+    const s2 = fresh();
+    const w = kinPollDecide(TO, TOK, TOK, s2.box, s2.hits, NOW, null, 0, 25000, MAXPARKED);
+    deep(Object.keys(w.body).sort(), ['leaseMs', 'pollMs', 'quiet', 'rings', 'to', 'waitedMs'],
+      '(m4) and a waiting poll differs from it by exactly one added key');
+  }
+
+  // ── (m5) THE DRAIN IS DESTRUCTIVE, SO THE RATE CHECK LOOKS FIRST ──────────
+  {
+    const s = fresh();
+    // Exhaust the arming window on an empty mailbox.
+    const first = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0);
+    eq(first.park, true, '(m5) the first waiting poll parks');
+    const refused = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 10, null, 0, 25000, 0);
+    eq(refused.status, 429, '(m5) a second one 10 ms later is refused — the window is real');
+    eq(refused.body.retryMs, WAITGAP, '(m5) and says how long to wait, so the client does not guess');
+    // NOW a ring lands, and the window is still shut.
+    put(s, {}, NOW + 20);
+    const delivered = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 30, null, 0, 25000, 0);
+    eq(delivered.status, 200,
+      '(m5) a poll inside the SAME shut window is NOT refused when a ring is waiting');
+    eq(delivered.body.rings.length, 1, '(m5) and the ring is handed over rather than thrown away');
+    // And the refusal really did leave the mailbox alone: the ring above was put
+    // after the 429, so prove the non-destructive half directly.
+    const s2 = fresh();
+    put(s2, {});
+    ok(kinBoxHas(s2.box, TO, NOW), '(m5) kinBoxHas sees a live ring');
+    eq(s2.box.get(TO)?.length, 1, '(m5) and LOOKING DID NOT TAKE IT — a peek that drained would lose the call it refused');
+  }
+
+  // ── (m6) a poll that delivered costs no arming budget ─────────────────────
+  // Without this the ordinary path — ring lands, client comes straight back —
+  // is a 429 every single time, and the second of two rings 300 ms apart waits
+  // out a backoff for no reason.
+  {
+    const s = fresh();
+    put(s, { from: handle(1) });
+    eq(kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0).body.rings.length, 1,
+      '(m6) the first waiting poll delivers');
+    put(s, { from: handle(2) }, NOW + 5);
+    const again = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 6, null, 0, 25000, 0);
+    eq(again.status, 200, '(m6) and a second one 6 ms later is allowed, because the first one did work');
+    eq(again.body.rings.length, 1, '(m6) delivering the second ring immediately');
+    // CONTROL, or "the window works" is indistinguishable from no window at all.
+    const empty = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 7, null, 0, 25000, 0);
+    eq(empty.park, true, '(m6) CONTROL: the next empty one parks (it is the first unproductive arming)');
+    eq(kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 8, null, 0, 25000, 0).status, 429,
+      '(m6) CONTROL: and the one after that is refused — unproductive armings ARE charged');
+  }
+
+  // ── (m7) at the concurrency cap: answer, never refuse ─────────────────────
+  {
+    const s = fresh();
+    const d = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, MAXPARKED);
+    eq(d.status, 200, '(m7) a waiting poll above the parked cap is answered, not refused');
+    eq(d.park, undefined, '(m7) and is not parked');
+    eq(d.body.rings.length, 0, '(m7) with a real, parseable empty mailbox');
+    eq(d.body.waitedMs, 0, '(m7) still saying this server holds — the client must not fall back over a busy moment');
+    const under = kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + WAITGAP + 1, null, 0, 25000, MAXPARKED - 1);
+    eq(under.park, true, '(m7) CONTROL: one below the cap still parks');
+  }
+
+  // ── (m8) the two windows cannot spend each other ──────────────────────────
+  {
+    const s = fresh();
+    kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0);      // charges wait:
+    eq(kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 10, null, 0, 25000, 0).status, 429,
+      '(m8) the arming window is spent');
+    eq(kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW + 10).status, 200,
+      '(m8) and a plain poll still goes through — an old client cannot be locked out by a new one');
+    const s2 = fresh();
+    kinPollDecide(TO, TOK, TOK, s2.box, s2.hits, NOW);                        // charges poll:
+    eq(kinPollDecide(TO, TOK, TOK, s2.box, s2.hits, NOW + 10).status, 429, '(m8) the plain window is spent');
+    eq(kinPollDecide(TO, TOK, TOK, s2.box, s2.hits, NOW + 10, null, 0, 25000, 0).park, true,
+      '(m8) and a waiting poll still parks — a new client cannot be locked out by an old one');
+  }
+
+  // ── (m9) a silenced ring is not something to deliver ──────────────────────
+  {
+    const s = fresh();
+    kinBoxPut(s.box, { ...JSON.parse(ring()), t: T }, NOW, true);   // muted
+    ok(!kinBoxHas(s.box, TO, NOW), '(m9) a silenced ring does not count as something waiting');
+    eq(kinPollDecide(TO, TOK, TOK, s.box, s.hits, NOW, null, 0, 25000, 0).park, true,
+      '(m9) so a waiting poll still parks rather than ending to hand over nothing');
+    // CONTROL: the same ring, not silenced, does count.
+    const s2 = fresh();
+    kinBoxPut(s2.box, { ...JSON.parse(ring()), t: T }, NOW, false);
+    ok(kinBoxHas(s2.box, TO, NOW), '(m9) CONTROL: a live ring does count');
+    // And an expired one does not, whatever its mute bit says.
+    eq(kinBoxHas(s2.box, TO, NOW + 61_000), false, '(m9) an expired ring does not count either');
+  }
+}
+
 // ── (i) TURN: which UDP port the app is told to use ───────────────────────
 {
   const cf = (ports, user = 'u') => [{
@@ -1564,8 +1746,20 @@ const DEV2 = await device('dev2');
   ok(ringHandler.indexOf('kinQuietLoad') < ringHandler.indexOf('kinRingDecide('),
     '(j4) before it decides, and passes it in');
   ok(/kinRingDecide\([\s\S]*quiet[\s\S]*\)/.test(ringHandler), '(j4) as the sixth argument');
-  eq((ringHandler.match(/\bif \(/g) ?? []).length, 2,
-    '(j4) and the only branches in kinRing are the method check and the mute counter — the load is unconditional, so a silent handle costs the same read as a live one');
+  eq((ringHandler.match(/\bif \(/g) ?? []).length, 3,
+    '(j4) and the only branches in kinRing are the method check, the mute counter and the wake — the load is unconditional, so a silent handle costs the same read as a live one');
+  // ── THE WAKE, and the two things that must be true of it ──────────────────
+  // The doorbell is what releases a held poll, so this line is the whole
+  // latency win. It must be gated on `!d.muted` — a silenced ring that woke a
+  // waiter would end the callee's wait to hand them nothing, and a caller who
+  // kept ringing a silenced handle could keep ending it, which is denial of
+  // sleep rebuilt out of the silence switch. And it must come AFTER the
+  // decision, or it is a branch that can change what the caller is told and the
+  // indistinguishability the whole (l) section proves is gone.
+  ok(/if \(d\.status === 200 && !d\.muted\) this\.kinWake\(/.test(ringHandler),
+    '(j4) the wake fires only for a ring that will actually be handed over');
+  ok(ringHandler.indexOf('kinRingDecide(') < ringHandler.indexOf('this.kinWake('),
+    '(j4) and only after the response has been decided, so it cannot change it');
   ok(!/headers/.test(ringHandler),
     '(j4) the handler sets no headers of its own, so both paths get json()\'s — identical, not merely similar');
   const quietHandler = method('kinQuietSet', 'private rendezvous(');
@@ -1579,6 +1773,44 @@ const DEV2 = await device('dev2');
   ok(/kinQuietLoad\(\)/.test(pollHandler), '(j4) and poll reads the toggle back out for the owner');
   ok(/this\.kinMuted/.test(pollHandler), '(j4) along with the count of what was swallowed');
   ok(/if \(d\.muted\) this\.kinMuted\+\+/.test(ringHandler), '(j4) which the ring path is what increments');
+
+  // ── (j5) THE HOLD, read out of the source ─────────────────────────────────
+  //
+  // (k3) proves the DO holds and wakes at runtime. These four read the things
+  // that a passing runtime test would still be compatible with: a `park` the
+  // handler quietly ignores, a hold with no deadline, and a cap that only ever
+  // counts up. All three are invisible until the day they are not.
+  ok(/if \(!d\.park\) return json\(/.test(pollHandler),
+    '(j5) kinPoll HONOURS `park` — a handler that ignored it would answer a plausible "no rings" forever');
+  ok(/await this\.kinHold\(/.test(pollHandler), '(j5) and holds the request itself');
+  ok(/status: 204/.test(pollHandler), '(j5) answering 204 when the wait ran out');
+  ok(/setTimeout\(\(\) => finish\(false\), waitMs\)/.test(pollHandler),
+    '(j5) the hold has a DEADLINE, so a client that vanished costs one wait and not a leaked request');
+  ok(/if \(done\) return;/.test(pollHandler),
+    '(j5) and finishing is idempotent — a waiter woken and then timed out must not decrement the cap twice');
+  eq((pollHandler.match(/this\.kinParked\+\+/g) ?? []).length, 1, '(j5) the parked count goes up in one place');
+  eq((pollHandler.match(/this\.kinParked--/g) ?? []).length, 1, '(j5) and down in one place, which is that idempotent exit');
+
+  // ── (j6) THE GHOST WAITER, which is the bug this design nearly shipped ─────
+  //
+  // The wake DRAINS, destructively. So a waiter belonging to a process that has
+  // already been killed takes the ring, writes it to a socket nobody is reading,
+  // and the listener that IS alive wakes to an empty mailbox. Measured: kill the
+  // app mid-hold, ring the handle, and the menu-bar resident got nothing.
+  //
+  // Three lines hold the fix together and each is invisible at runtime when it
+  // is wrong — a wake-all still passes every "the ring arrives" test as long as
+  // exactly one listener exists.
+  ok(/let newest: \(\(woke: boolean\) => void\) \| undefined;[\s\S]{0,160}newest\?\.\(true\)/.test(pollHandler),
+    '(j6) a ring wakes exactly ONE waiter, the newest — waking two hands the ring to whichever resolves first and gives the other an empty box');
+  ok(/if \(d\.status === 200\) this\.kinEvict\(to\)/.test(pollHandler),
+    '(j6) an authenticated poll evicts the parked waiters, because it is the only client proven alive');
+  ok(!/if \(d\.park\) this\.kinEvict|this\.kinEvict\(to\);\s*\n\s*const d =/.test(pollHandler),
+    '(j6) and eviction is AFTER the credential check — otherwise anyone who knew a handle could keep evicting its waiter and make the doorbell slow');
+  ok(/for \(const finish of \[\.\.\.set\]\) finish\(false\)/.test(pollHandler),
+    '(j6) eviction finishes FALSE — `true` would turn the fix into the bug and every eviction would swallow a ring');
+  ok(/this\.kinWaiters\.delete\(to\);\s*\n(\s*\/\/[^\n]*\n)*\s*for \(const finish of \[\.\.\.set\]\)/.test(pollHandler),
+    '(j6) and snapshots the set before firing — each waiter removes itself, and iterating a mutating set skips waiters');
 
   // kinQuietDecide: the same order-of-checks law as register, plus the one that
   // is specific to this route — WHOSE key the proof is checked against.
@@ -1800,6 +2032,147 @@ const DEV2 = await device('dev2');
       '(k2) an unclaimed handle cannot be silenced, and the verb routes');
     eq((await hit('quiet: GET instead of POST', 'GET', `/api/kin/${SILENT}/quiet`)).status, 405,
       '(k2) and the verb is POST-only at the edge');
+
+    // ── (k3) THE HELD POLL, IN REAL WORKERD ─────────────────────────────────
+    //
+    // Every assertion in (m) is about a pure function deciding to park. NOTHING
+    // there proves a Durable Object actually holds a request open, actually
+    // wakes on a ring, or actually answers 204 at the deadline — the decision
+    // and the holding are different code, and the holding is the half that
+    // cannot be unit tested. `Room.kinHold` is a promise, a timer and a set of
+    // callbacks; a wake that skipped a waiter, a timer that was never cleared,
+    // or a `park` the DO forgot to honour would all leave (m) entirely green.
+    //
+    // So this section uses a real clock and real elapsed time, and asserts on
+    // BOTH ends of it: fast when rung, and not-fast when not.
+    sec('(k3) the held poll end to end: a real request, really held, really woken');
+    const HELD = 'holdone';
+    const TOKH = '4'.repeat(64);
+    const H1 = await device('h1');
+    eq((await hit('register: holdone', 'POST', `/api/kin/${HELD}/register`,
+      await reg(H1, { to: HELD, tok: TOKH, t: Math.floor(Date.now() / 1000) }))).status, 200,
+      '(k3) the owner claims holdone');
+
+    // 1. Held and woken. The poll goes out first and is NOT awaited; a ring
+    //    follows 250 ms later; the poll must come back with it, long before its
+    //    own 8 s deadline.
+    {
+      const t0 = Date.now();
+      const parked = mf.dispatchFetch(`http://x/api/kin/${HELD}/poll?tok=${TOKH}&wait=8000`);
+      await new Promise((r) => setTimeout(r, 250));
+      const rang = await hit('ring: while a poll is parked', 'POST', `/api/kin/${HELD}/ring`,
+        JSON.stringify({
+          to: HELD, from: 'asha', room: 'RVROOMROOMROOMROOM55',
+          t: Math.floor(Date.now() / 1000), sig: 's'.repeat(86) + '==', k: DEV2.k,
+        }));
+      eq(rang.status, 200, '(k3) the ring is accepted while somebody is parked on the mailbox');
+      const r = await parked;
+      const took = Date.now() - t0;
+      const body = await r.json();
+      console.log(`  held poll returned after ${took} ms with ${body.rings?.length} ring(s)`);
+      eq(r.status, 200, '(k3) the held poll returns 200');
+      eq(body.rings?.length, 1, '(k3) carrying the ring that woke it');
+      eq(body.rings?.[0].room, 'RVROOMROOMROOMROOM55', '(k3) the right ring, intact');
+      ok(took < 3000, `(k3) and it returned in ${took} ms, not at its 8 s deadline — the DO really woke it`);
+      ok(took >= 250, `(k3) CONTROL: it did not return BEFORE the ring (${took} ms >= 250)`);
+      ok(body.waitedMs >= 250, `(k3) and it reports how long it was held (${body.waitedMs} ms)`);
+    }
+
+    // 2. Held to the deadline. Nothing rings, so the answer must be a 204 that
+    //    arrives at the deadline and not before — an immediate 204 would be a
+    //    server that answered without holding, which is the failure this whole
+    //    change is trying not to be.
+    {
+      await new Promise((r) => setTimeout(r, 1100));   // clear the arming window
+      const t0 = Date.now();
+      const r = await mf.dispatchFetch(`http://x/api/kin/${HELD}/poll?tok=${TOKH}&wait=1500`);
+      const took = Date.now() - t0;
+      console.log(`  unrung held poll returned ${r.status} after ${took} ms`);
+      eq(r.status, 204, '(k3) an unrung held poll ends in 204');
+      eq(await r.text(), '', '(k3) with no body at all');
+      ok(took >= 1400, `(k3) after the full wait (${took} ms), not immediately — proof it was really held`);
+      ok(took < 4000, `(k3) and it does end (${took} ms) — the deadline is a deadline, not a leak`);
+    }
+
+    // 3. An OLD client, unchanged. Same handle, no `wait`, and the body must be
+    //    the shape that shipped — including no `waitedMs`, which is the field a
+    //    new client reads to decide whether to trust this server at all.
+    {
+      await new Promise((r) => setTimeout(r, 2100));   // clear the plain poll gap
+      const old = await hit('poll: an OLD client, no wait param', 'GET', `/api/kin/${HELD}/poll?tok=${TOKH}`);
+      eq(old.status, 200, '(k3) an old client still polls this worker');
+      deep(Object.keys(old.body).sort(), ['leaseMs', 'pollMs', 'quiet', 'rings', 'to'],
+        '(k3) and gets exactly the keys it always got');
+      ok(!('waitedMs' in old.body), '(k3) with no waitedMs, so nothing about its behaviour changes');
+    }
+
+    // 4. A wait it cannot honour is not an error. `wait=50` is below the floor
+    //    and must degrade to an ordinary poll rather than a 400 — a client that
+    //    guessed the parameter slightly wrong must not stop receiving calls.
+    {
+      await new Promise((r) => setTimeout(r, 2100));
+      const t0 = Date.now();
+      const r = await hit('poll: wait=50, below the floor', 'GET', `/api/kin/${HELD}/poll?tok=${TOKH}&wait=50`);
+      eq(r.status, 200, '(k3) a sub-floor wait is answered, not refused');
+      ok(Date.now() - t0 < 500, '(k3) and answered at once rather than held');
+      ok(!('waitedMs' in r.body), '(k3) and honestly reports that it did not wait');
+    }
+
+    // ── (k4) TWO HOLDERS: THE GHOST MUST NOT SWALLOW THE RING ────────────────
+    //
+    // This is the bug the design nearly shipped, and no single-listener test can
+    // see it. Two processes listen for one person: the menu-bar resident and the
+    // app. One of them is killed while its poll is parked — the server has no
+    // way to know, and a socket that is still open is not a live peer. The next
+    // ring wakes it, it DRAINS THE MAILBOX DESTRUCTIVELY, and the listener that
+    // is actually alive gets nothing.
+    //
+    // Reproduced here as two overlapping held polls where the FIRST is the
+    // ghost: it stays parked, the second arrives after it, and the ring must go
+    // to the second. Measured against the real thing before the fix, the app was
+    // killed mid-hold and the resident received nothing at all.
+    {
+      sec('(k4) two held polls on one handle: the ring goes to the live one');
+      const GH = 'ghostone';
+      const TOKG = '5'.repeat(64);
+      const G1 = await device('g1');
+      eq((await hit('register: ghostone', 'POST', `/api/kin/${GH}/register`,
+        await reg(G1, { to: GH, tok: TOKG, t: Math.floor(Date.now() / 1000) }))).status, 200,
+        '(k4) the owner claims ghostone');
+
+      // The ghost parks first and is never read again by anybody.
+      const gT0 = Date.now();
+      const ghost = mf.dispatchFetch(`http://x/api/kin/${GH}/poll?tok=${TOKG}&wait=9000`);
+      await new Promise((r) => setTimeout(r, 1200));    // clear the arming window
+      // The live listener arrives second. Its very arrival is the only evidence
+      // the server has that anyone is alive, and it is what evicts the ghost.
+      const live = mf.dispatchFetch(`http://x/api/kin/${GH}/poll?tok=${TOKG}&wait=9000`);
+      await new Promise((r) => setTimeout(r, 400));
+      eq((await hit('ring: with one ghost and one live holder', 'POST', `/api/kin/${GH}/ring`,
+        JSON.stringify({
+          to: GH, from: 'asha', room: 'RVROOMROOMROOMROOM66',
+          t: Math.floor(Date.now() / 1000), sig: 's'.repeat(86) + '==', k: DEV2.k,
+        }))).status, 200, '(k4) the ring is accepted');
+
+      const liveRes = await live;
+      const liveBody = liveRes.status === 200 ? await liveRes.json() : null;
+      const ghostRes = await ghost;
+      const ghostMs = Date.now() - gT0;
+      const ghostBody = ghostRes.status === 200 ? await ghostRes.json() : null;
+      console.log(`  live holder -> ${liveRes.status} with ${liveBody?.rings?.length ?? 0} ring(s);`
+        + `  ghost -> ${ghostRes.status} with ${ghostBody?.rings?.length ?? 0} ring(s) after ${ghostMs} ms`);
+      eq(liveRes.status, 200, '(k4) the LIVE holder gets a 200');
+      eq(liveBody?.rings?.length, 1, '(k4) carrying the ring — this is 0 when the ghost drains it first');
+      eq(ghostRes.status, 204, '(k4) and the ghost was evicted with a 204');
+      eq(ghostBody, null, '(k4) having taken NOTHING out of the mailbox — an eviction that drained would lose the call');
+      // TIMING IS THE ASSERTION THAT CAN FAIL. Status 204 alone is also what a
+      // ghost left to rot produces when its own deadline finally expires, so
+      // without this the two are indistinguishable and the eviction could be
+      // deleted with every other line here still green. It was evicted the
+      // moment a live poll arrived — about 1.2 s in, not at its 9 s deadline.
+      ok(ghostMs < 4000,
+        `(k4) and was evicted when the live poll ARRIVED (${ghostMs} ms), not left until its own 9 s deadline`);
+    }
   } finally {
     await mf.dispose();
   }

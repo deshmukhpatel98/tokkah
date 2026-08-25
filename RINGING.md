@@ -463,7 +463,7 @@ a call at 75 GB-s). That is decisive.
 |---|---|---|---|---|
 | held WS, **non**-hibernatable (today’s code) | ~93 ms | **$4.15/user/mo**; free tier = 1 user | best — one connection, radio idle | **reject on cost** |
 | held WS, **hibernatable** (new DO class) | ~93 ms | ~$0 idle; ~$0.02/user/mo of pings, or ~$0 with auto-response | best | **BUILD THIS** |
-| long-poll (DO parks the GET 25 s) | ~93 ms + a ~127 ms gap between parks | same $4.15 — **a parked request cannot hibernate** | good | **reject; strictly worse than a WS** |
+| long-poll (DO parks the GET 25 s) | ~93 ms + a ~127 ms gap between parks | same $4.15 — **a parked request cannot hibernate** | good | ~~reject; strictly worse than a WS~~ **SHIPPED — see the correction below** |
 | fast poll (1 s) | mean 500 ms | 2.6M req/user/mo vs a 1M free tier | worst — a radio wake every second | reject |
 | 5 s poll (deployed) | mean 2500, p95 4750 | 518k req/user/mo | poor | today; the thing being replaced |
 
@@ -471,6 +471,64 @@ a call at 75 GB-s). That is decisive.
 long-poll measurably is not enough." Long-poll delivers the *same* latency as a socket (in
 both cases the client is already parked at the DO when the ring arrives) and carries the
 *same* duration billing with no hibernation path ever. **Skip V2. V3 is the answer.**
+
+> ### CORRECTION, 2026-08-25 — the long-poll row is priced against nothing
+>
+> **The row above rejects long-poll on a cost it shares with the row below it, and the
+> disproof is four lines up this same page.** `DO stays resident after last request >= 120 s`
+> — 5/10/20/30/45/60/90/120 s gaps, never cold, measured here. **A 5-second poll therefore
+> never lets the object go cold**, so the deployed doorbell is already paying the whole
+> $4.15/user/month of duration this table charges only to long polling. The two rows were
+> priced on different axes: requests for one, duration for the other. Compared like for like
+> against *what actually ships*, holding the request costs the **same duration and fewer
+> requests** — the client's steady state is three 25 s holds and one plain re-read, so ~138k
+> requests/user/month against 518k, both inside the free tier.
+>
+> So **long-poll is shipped**, and the verdict above is wrong only relative to today. Nothing
+> it says about the hibernatable WebSocket changes: that is still the only option that makes
+> an *idle* user free, and it is still worth building. But it is a **cost** project, not a
+> latency one, and should be measured as one — the latency it buys over a held GET is zero,
+> which this table already says.
+>
+> Measured after shipping, through two real `tk` processes, same binary both arms, against a
+> local worker so the network leg is excluded and the poll interval is what is isolated. The
+> before-arm is that same binary talking to a worker WITHOUT the endpoint — the committed
+> `worker.ts` from this branch — so the before-number and the proof that the fallback fires
+> are the same experiment.
+>
+> One matched pair, n=12 each:
+>
+> ```
+> before (5 s poll)   min 115   median 1159   mean 1819   p95 4905   max 4905 ms
+> after  (held GET)   min  14   median   17   mean   18   p95   25   max   25 ms
+> ```
+>
+> **Quote the mean, not the median.** Twelve samples of a uniform 0–5000 ms distribution give
+> a median that wanders — 1159, 1485, 2794, 3021 and 3302 ms across five runs of the before
+> arm, all of the same thing. The mean is the stable statistic and it converges where theory
+> says it must, on half a poll interval. Pooled across every run taken:
+>
+> ```
+> before   n=57   mean 2346 ms      after   n=70   mean 21 ms      112x
+> ```
+>
+> The number that changes the feel of it is not the mean anyway. It is the tail: the worst
+> ring went from 4905 ms to 25 ms, because there is no longer an interval to be unlucky in.
+>
+> The "~127 ms gap between parks" the row charges long-poll is real but is not a latency
+> cost: the mailbox is durable, so a ring landing in that gap is delivered by the next park
+> rather than lost. And it is smaller than written — a poll that delivered a ring costs no
+> arming budget on the server, so the client re-arms immediately instead of waiting out a
+> rate window.
+>
+> **Two pollers, one handle.** The menu-bar resident and the open app both listen for the
+> same person. That was already producing 429s, and it is worse than wasteful: a drain is
+> destructive, so whichever poll returns first TAKES the ring and the other gets an empty
+> answer — a ring could launch a second copy of the app while the copy already open shows
+> nothing. The resident now stands down while the app is open, signalled by an exclusive
+> `flock` the app holds for its life (`Identity.claimLine`). A lock dies with its holder, so
+> a crashed app cannot leave this Mac uncallable — which a marker file or a pid file both
+> allow, and which is the worse failure by a distance.
 
 Build it as a **new `Doorbell` DO class, not a retrofit of `Room`.** `Room` holds eight
 `WebSocket`-keyed maps plus `heldTimers`, `pendingLeaves` and `lastSeen` (the field block at

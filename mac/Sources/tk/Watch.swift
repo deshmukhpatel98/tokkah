@@ -289,7 +289,6 @@ enum Watch {
   }
 
   private static func watchForever(gapMs: Int) {
-    let gap = Double(max(2000, gapMs)) / 1000
     let bundle = Bundle.main.bundleURL.path
     // ── RIG OVERRIDE, AND THE ONE IT EXISTS FOR ───────────────────────────────
     //
@@ -320,53 +319,63 @@ enum Watch {
     // uncallable until the next login, on the very first launch, silently. So an
     // unclaimed identity is a thing to keep trying, not a reason to die.
     var nextClaim = Date.distantPast
-    while true {
+    // ── THE SAME LOOP THE OPEN APP USES, AND STANDING DOWN FOR IT ─────────────
+    //
+    // This was its own `poll; sleep` copy. Two consequences, and the second is
+    // the one that was actually happening: the held poll would have made a call
+    // instant for everyone with Kin open and left it averaging 2.5 s for
+    // everyone without -- which is the entire population this process exists for
+    // -- and, with both halves polling one handle on one credential, the server
+    // was refusing one of them most of the time.
+    //
+    // `standDown: true` yields the mailbox whenever the app is open. See the
+    // block above `Identity.claimLine`: the app wins because it is the half that
+    // can turn a ring into a lit screen with no launch in between, and because a
+    // destructive drain means whichever poll returns first TAKES the ring --
+    // two holders is not merely wasteful, it loses calls.
+    //
+    // `gapMs` is no longer the cadence. It is only what the loop falls back to
+    // when the server turns out not to hold.
+    Identity.ringLoop(gapMs: gapMs, standDown: true, onTick: {
       // A binary swapped underneath us. Checked here rather than on a timer of
       // its own so it cannot fire in the middle of opening a call.
       if let born, let now = imageStamp(), born != now {
         fputs("watch: this Mac has a newer Kin -- restarting into it\n", stderr)
         exit(3)
       }
-      guard Identity.claimed else {
-        if Date() >= nextClaim {
-          nextClaim = Date().addingTimeInterval(60)
-          Identity.claim()
-          Resident.refresh()
-        }
-        Thread.sleep(forTimeInterval: 5)
-        continue
-      }
-      for r in Identity.poll() {
-        guard r.ageMs < 60_000, r.room != lastRoom else { continue }
-        lastRoom = r.room
-        // Timestamped, because "how long from ringing to a window" is the only
-        // number this feature is judged on and the two halves of it are measured
-        // in two different processes.
-        fputs("watch: \(String(format: "%.3f", Date().timeIntervalSince1970))"
-            + " @\(r.from) is calling -- opening Kin\n", stderr)
-        // A NEW process, not this one. If the watcher became the call, declining
-        // it would leave nothing watching and this Mac would go uncallable until
-        // the next login.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        // `--stderr` and not a pipe: `open` returns immediately, so there is no
-        // parent left to drain a pipe, and the app it launched outlives it by the
-        // length of the call. A file is the only sink that survives that.
-        p.arguments = ["-n", "-a", bundle,
-                       "--stderr", logDir().appendingPathComponent("ring.log").path,
-                       "--args",
-                       "--room", r.room, "--incoming", r.from,
-                       "--video", "camera", "--window"] + extraArgs
-        do { try p.run() } catch {
-          fputs("watch: could not open Kin: \(error)\n", stderr)
-        }
+      if !Identity.claimed, Date() >= nextClaim {
+        nextClaim = Date().addingTimeInterval(60)
+        Identity.claim()
       }
       Resident.refresh()
-      // A 429 is the server saying this handle is being asked about too often --
-      // which happens whenever the app is open beside us, since it polls too.
-      // Hammering through it costs the poll budget the OTHER half needs.
-      Thread.sleep(forTimeInterval: Identity.lastPollStatus == 429 ? gap + 4 : gap)
+    }) { r in
+      guard r.ageMs < 60_000, r.room != lastRoom else { return }
+      lastRoom = r.room
+      // Timestamped, because "how long from ringing to a window" is the only
+      // number this feature is judged on and the two halves of it are measured
+      // in two different processes.
+      fputs("watch: \(String(format: "%.3f", Date().timeIntervalSince1970))"
+          + " @\(r.from) is calling -- opening Kin\n", stderr)
+      // A NEW process, not this one. If the watcher became the call, declining
+      // it would leave nothing watching and this Mac would go uncallable until
+      // the next login.
+      let p = Process()
+      p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+      // `--stderr` and not a pipe: `open` returns immediately, so there is no
+      // parent left to drain a pipe, and the app it launched outlives it by the
+      // length of the call. A file is the only sink that survives that.
+      p.arguments = ["-n", "-a", bundle,
+                     "--stderr", logDir().appendingPathComponent("ring.log").path,
+                     "--args",
+                     "--room", r.room, "--incoming", r.from,
+                     "--video", "camera", "--window"] + extraArgs
+      do { try p.run() } catch {
+        fputs("watch: could not open Kin: \(error)\n", stderr)
+      }
     }
+    // ringLoop with no deadline never returns; this is here only because the
+    // signature promises Never.
+    exit(0)
   }
 }
 
