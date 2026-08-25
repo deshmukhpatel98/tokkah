@@ -1588,7 +1588,24 @@ final class Audio {
     }
 
     func process(_ x: UnsafeMutablePointer<Float>, _ n: Int) {
-      guard cfg.on else { vocal = .quiet; return }
+      // ── THE CLASSIFIER IS NOT THE GATE, AND IT USED TO DIE WITH IT ──────────
+      //
+      // This line was `guard cfg.on else { vocal = .quiet; return }`, and
+      // `cfg.on` is false on headphones -- correctly, because there is no echo
+      // path there to protect against. But everything downstream reads `vocal`,
+      // so on headphones the classifier never ran, `vocal` was permanently
+      // `.quiet`, and with it went the cues, the captions, the ledger and the
+      // deadlock rule. THE ENTIRE TURN-TAKING PRODUCT WAS OFF FOR ANYONE WEARING
+      // HEADPHONES -- which is most people, on most calls, and is precisely the
+      // situation where two people CAN talk over each other freely and most need
+      // to be shown that they are.
+      //
+      // `feature-behind-a-flag-nobody-runs`, with the flag being a pair of
+      // headphones. The gate is an ECHO judgement and belongs to the speaker
+      // route. Classifying a voice, drawing a cue and writing a caption are
+      // CONVERSATION judgements and belong to every call. They are separated
+      // below rather than here: this function always runs, and only the two
+      // places that touch the samples ask whether the gate is on.
       // ── EVERY CONSTANT HERE IS A TIME, NOT A PER-BLOCK NUMBER ────────────────
       //
       // This is the third instance of the bug class in this project and the most
@@ -1665,7 +1682,19 @@ final class Audio {
       // which a laptop does. So it relaxes as the coupling rises: there is less
       // room to be clever exactly where being clever is dangerous.
       let effMargin = max(1.35, cfg.margin - 1.5 * coupling)
-      let aboveEcho = nearEnv > expected * effMargin
+      // ── AND ON HEADPHONES THERE IS NOTHING TO EXPLAIN AWAY ─────────────────
+      //
+      // No acoustic path from the earcup to the microphone means no near-mic
+      // energy can be echo, so the test is not merely unnecessary -- keeping it
+      // would be actively wrong, and wrong in the worst possible place.
+      // `coupling` is a MINIMUM tracker that only updates while this end is
+      // making sound, so somebody who plugs headphones in and then listens keeps
+      // whatever coupling their speakers taught it. The far end's voice would
+      // then explain away their own, and the classifier would go deaf exactly
+      // during simultaneous speech -- the one moment it exists for.
+      // `directional-property-measured-at-wrong-end` in miniature: a property of
+      // the ROUTE, applied after the route changed.
+      let aboveEcho = cfg.on ? nearEnv > expected * effMargin : true
       let aboveRoom = nearEnv > max(floor * 4.0, 0.006)
       // TWO CONSECUTIVE BLOCKS was the rule, and two blocks is 5.3 ms on the rig
       // and 0.67 ms on the machine -- less than a single glottal period, so it
@@ -1727,7 +1756,10 @@ final class Audio {
       // the gap if it turns out to be a bid. Until that exists, a continuer is
       // audible, which is exactly what happens today.
       let nearTalking = !farTalking || aboveEcho
-      let want: Float = (farTalking && !nearTalking)
+      // ONE OF THE TWO PLACES THAT TOUCHES SAMPLES, and the only one that is
+      // about echo. On headphones this is always 1: nothing is held down,
+      // because nothing would be heard twice.
+      let want: Float = (cfg.on && farTalking && !nearTalking)
         ? Float(pow(10, cfg.floorDb / 20)) : 1
 
       // OPEN FAST, CLOSE SLOW. Backwards, this clips the first syllable of every
@@ -1740,6 +1772,12 @@ final class Audio {
       // echo judgement made every block, and this is a turn judgement made once
       // per collision. 80 ms down so it is a duck and not a cut, 50 ms back up so
       // the moment the deadlock ends you are simply talking again.
+      //
+      // THE OTHER PLACE, and it is NOT conditioned on `cfg.on`. A deadlock --
+      // both people start together and neither backs off -- is a social event,
+      // not an acoustic one. It happens on headphones exactly as it does on
+      // speakers, so the duck belongs to every call and is switched off by
+      // `--no-yield` alone.
       let yWant: Float = (cfg.yieldOn && yielding) ? Float(pow(10, cfg.yieldDb / 20)) : 1
       let yStep: Float = yWant > yieldGain ? 0.00042 : 0.00026
       for k in 0..<n {

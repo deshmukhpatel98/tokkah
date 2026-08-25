@@ -256,6 +256,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
+  "headphone-test",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -2117,13 +2118,139 @@ if flag("yield-test") {
   exit(bad ? 1 : 0)
 }
 
-if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false }
+// `--no-gate` means HANDS OFF THE AUDIO, so it has to turn off both of the
+// things that touch it. The duck is not part of the gate -- it survives on
+// headphones, where the gate does not -- so leaving it on here would make
+// "no gate" a measurement of audio that something else was still attenuating.
+if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false; Audio.gate.yieldOn = false }
 if flag("no-yield") { Audio.gate.yieldOn = false }
 if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
 if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
 if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
 if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
+
+// ── THE SAME CALL, WITH HEADPHONES ON ─────────────────────────────────────
+//
+// The gate is off on headphones, correctly: there is no acoustic path from the
+// earcup to the microphone, so there is no echo to protect against. Everything
+// else was off with it, and nothing said so. `vocal` sat at `.quiet` for the
+// whole call, so the cues never drew, the captions never appeared, the ledger
+// never moved and the deadlock rule never fired -- the entire turn-taking
+// product, off for anyone wearing headphones.
+//
+// The assertions below are PAIRS, because the cheap way to pass "a headphone
+// user still gets a bid" is a classifier that says bid to everything.
+if flag("headphone-test") {
+  var bad = false
+  func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
+    print("  \(what.padding(toLength: 52, withPad: " ", startingAt: 0)) "
+        + "\(got.padding(toLength: 14, withPad: " ", startingAt: 0)) (want \(want))  \(ok ? "ok" : "WRONG")")
+    if !bad { bad = !ok }
+  }
+  let n = Int(SR * 12)
+  var seed: UInt64 = 0x4EAD
+  func rnd() -> Float {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+  }
+  func active(_ i: Int, _ spans: [(Double, Double)]) -> Bool {
+    let t = Double(i) / SR
+    return spans.contains { t >= $0.0 && t < $0.1 }
+  }
+  // The far end talks almost throughout; the near end interrupts at 3 s. That
+  // overlap is the whole subject: it is where a bid has to be seen, and it is
+  // exactly where an echo test that should not be running would hide it.
+  let farSpans = [(1.0, 11.0)]
+  let nearSpans = [(3.0, 5.0), (8.0, 9.0)]
+  var far = [Float](repeating: 0, count: n)
+  var near = [Float](repeating: 0, count: n)
+  for i in 0..<n {
+    let env = Float(0.55 + 0.45 * sin(2 * Double.pi * 4.3 * Double(i) / SR))
+    if active(i, farSpans) { far[i] = rnd() * 0.5 * env }
+    if active(i, nearSpans) { near[i] = rnd() * 0.35 * env }
+  }
+  /// Run one route through the gate and report what the classifier saw during
+  /// the overlap, and what the audio came out like.
+  func run(gateOn: Bool, mic src: [Float], warm: (() -> Audio.DuplexGate)? = nil)
+      -> (claim: Bool, changed: Double, claims: Int) {
+    let g = warm?() ?? Audio.DuplexGate()
+    var cfg = Audio.Gate(); cfg.on = gateOn; cfg.yieldOn = false
+    g.cfg = cfg
+    var out = src
+    var sawClaim = false
+    let blk = 16                      // what CoreAudio actually delivers here
+    out.withUnsafeMutableBufferPointer { op in
+      var i = 0
+      while i + blk <= n {
+        for k in i..<(i + blk) { g.noteFar(far[k]) }
+        g.process(op.baseAddress! + i, blk)
+        if active(i, nearSpans), g.vocal == .claim { sawClaim = true }
+        i += blk
+      }
+    }
+    var worst = 0.0
+    for i in 0..<n where abs(src[i]) > 1e-4 {
+      worst = max(worst, Double(abs(out[i] - src[i]) / abs(src[i])))
+    }
+    return (sawClaim, worst, g.claims)
+  }
+
+  // On headphones the microphone hears the near end and a whisper of bleed --
+  // never the far end at any level that matters.
+  var hp = [Float](repeating: 0, count: n)
+  for i in 0..<n { hp[i] = near[i] + 0.004 * far[i] }
+  // On speakers it hears the far end loudly, delayed by the trip through the room.
+  var spk = [Float](repeating: 0, count: n)
+  for i in 0..<n { spk[i] = near[i] + 0.8 * (i >= 400 ? far[i - 400] : 0) }
+
+  print("\n  ── the route the gate was built for ──")
+  let a = run(gateOn: true, mic: spk)
+  show("speakers: a bid over the far end is still seen", a.claim ? "yes" : "no", "yes", a.claim)
+
+  print("\n  ── headphones ──")
+  let b = run(gateOn: false, mic: hp)
+  show("headphones: the bid is seen", b.claim ? "yes" : "no", "yes", b.claim)
+  show("headphones: the audio is untouched", String(format: "%.1e", b.changed), "0", b.changed < 1e-9)
+
+  // THE PAIR. Same route, same far end, and NOBODY TALKING at this end -- only
+  // the bleed. A classifier that answered `claim` to the test above because it
+  // answers `claim` to everything fails here.
+  var quiet = [Float](repeating: 0, count: n)
+  for i in 0..<n { quiet[i] = 0.004 * far[i] }
+  let c = run(gateOn: false, mic: quiet)
+  show("headphones: silence is not a bid", "\(c.claims) bids", "0", c.claims == 0)
+
+  // ── AND THE CASE THAT MOTIVATED THE FIX ──────────────────────────────────
+  //
+  // `coupling` is a MINIMUM tracker that only updates while this end is making
+  // sound. Somebody who calls on speakers and then puts headphones on keeps the
+  // coupling their room taught it -- so the far end's voice can still "explain"
+  // their own, and the classifier goes deaf during simultaneous speech, which is
+  // the one moment it exists for. It also starts at 0.5, so a cold headphone
+  // call had the same defect without any learning at all.
+  print("\n  ── headphones plugged in mid-call, after a loud room ──")
+  let d = run(gateOn: false, mic: hp, warm: {
+    // Teach it a very reflective room first, on speakers, exactly as a real
+    // call would.
+    let g = Audio.DuplexGate()
+    var on = Audio.Gate(); on.on = true; on.yieldOn = false
+    g.cfg = on
+    var warmMic = spk
+    warmMic.withUnsafeMutableBufferPointer { op in
+      var i = 0
+      while i + 16 <= n { for k in i..<(i + 16) { g.noteFar(far[k]) }; g.process(op.baseAddress! + i, 16); i += 16 }
+    }
+    return g
+  })
+  show("the bid survives the route change", d.claim ? "yes" : "no", "yes", d.claim)
+
+  print(bad ? "\n  HEADPHONE TEST FAILED"
+            : "\n  HEADPHONE TEST PASSED -- the classifier is alive on headphones, the audio is"
+              + " bit-for-bit untouched, silence is still silence, and a coupling learned on"
+              + " speakers cannot deafen it after the route changes")
+  exit(bad ? 1 : 0)
+}
 
 // ── DOES A TALKING NEAR END GET THROUGH UNTOUCHED? ────────────────────────
 //
@@ -2846,7 +2973,10 @@ if let subs = subtitles {
     var resetListening = true
     while !shuttingDown {
       Thread.sleep(forTimeInterval: 0.12)
-      guard Audio.gate.on else { continue }
+      // NO `guard Audio.gate.on`. It was here, and `gate.on` is false on
+      // headphones, so this thread returned immediately and NOBODY WEARING
+      // HEADPHONES EVER SAW A SUBTITLE. Recognising speech has nothing to do
+      // with whether there is an echo path to protect against.
       let vocal = Audio.sharedGate.vocal != .quiet
       // ── THE FLAG BELONGS TO THE UTTERANCE BEING TRANSCRIBED ────────────────
       //
@@ -3954,29 +4084,29 @@ func reportLoop() {
     let sim = audio.echoSim ? "  [SIMULATED echo path armed]" : ""
     fputs("  room: \(corr) correlation at \(at) ms\(sim)\(verdict)\n", stderr)
   }
-  if Audio.gate.on {
-    let t = audio.turns
-    let held = String(format: "%.0f", audio.floorHeldPct)
-    let ttf = audio.timeToFloorP50 >= 0 ? String(format: "%.0f ms", audio.timeToFloorP50) : "-"
-    fputs("  floor: yours \(held)% of the call, \(t.backchannels) listening noises,"
-        + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)"
-        + "  now \(["quiet", "listening", "bidding"][Audio.sharedGate.vocal.rawValue])"
-        + (t.yields > 0 ? String(format: "  gave way %d time(s), %.1f%% of the call%@",
-                                 t.yields, audio.yieldedPct,
-                                 audio.yieldingNow ? " (NOW)" : "") : "")
-        + String(format: "  fed %.2f/%.2f s", Double(fedOut) / SR, Double(fedIn) / SR)
-        + (subtitles.map { "  words(\($0.engine)): \($0.requests) asked, \($0.failures) failed,"
-                         + " \(String(format: "%.0f", $0.lastMs)) ms, \(subSent) sent \(subGot) got" } ?? "")
-        + "\n", stderr)
-    if ProcessInfo.processInfo.environment["KIN_GATE_DEBUG"] != nil {
-      fputs("  gate: \(Audio.sharedGate.innards)\n", stderr)
-    }
-    if t.collisions > 0 || t.gateFlaps > 0 {
-      let avg = t.collisions > 0 ? String(format: "%.0f ms", t.collisionMs / Double(t.collisions)) : "-"
-      fputs("  overlap: \(t.collisions) times both talking, \(avg) each"
-          + " (who stopped first is not decidable from one end -- see the beat)"
-          + (t.gateFlaps > 0 ? "  \(t.gateFlaps) CHOPPY OPENINGS" : "") + "\n", stderr)
-    }
+  // Reported on every call, not only the gated ones: these are turns taken, and
+  // a headphone call has those too.
+  let t = audio.turns
+  let held = String(format: "%.0f", audio.floorHeldPct)
+  let ttf = audio.timeToFloorP50 >= 0 ? String(format: "%.0f ms", audio.timeToFloorP50) : "-"
+  fputs("  floor: yours \(held)% of the call, \(t.backchannels) listening noises,"
+      + " \(t.claims) bids (\(t.claimsGranted) heard, median \(ttf) to be audible)"
+      + "  now \(["quiet", "listening", "bidding"][Audio.sharedGate.vocal.rawValue])"
+      + (t.yields > 0 ? String(format: "  gave way %d time(s), %.1f%% of the call%@",
+                               t.yields, audio.yieldedPct,
+                               audio.yieldingNow ? " (NOW)" : "") : "")
+      + String(format: "  fed %.2f/%.2f s", Double(fedOut) / SR, Double(fedIn) / SR)
+      + (subtitles.map { "  words(\($0.engine)): \($0.requests) asked, \($0.failures) failed,"
+                       + " \(String(format: "%.0f", $0.lastMs)) ms, \(subSent) sent \(subGot) got" } ?? "")
+      + "\n", stderr)
+  if ProcessInfo.processInfo.environment["KIN_GATE_DEBUG"] != nil {
+    fputs("  gate: \(Audio.sharedGate.innards)\n", stderr)
+  }
+  if t.collisions > 0 || t.gateFlaps > 0 {
+    let avg = t.collisions > 0 ? String(format: "%.0f ms", t.collisionMs / Double(t.collisions)) : "-"
+    fputs("  overlap: \(t.collisions) times both talking, \(avg) each"
+        + " (who stopped first is not decidable from one end -- see the beat)"
+        + (t.gateFlaps > 0 ? "  \(t.gateFlaps) CHOPPY OPENINGS" : "") + "\n", stderr)
   }
   if audio.acoustic {
     let heard = audio.acRound.p(0.50)
