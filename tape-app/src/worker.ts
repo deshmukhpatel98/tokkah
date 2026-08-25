@@ -3151,6 +3151,19 @@ const HB_WINDOW_MS = 60 * 60_000;
 const HB_MAX_PER_HOUR = 30; // a legit client sends ≤2 per call
 const hbPosts = new Map<string, number[]>();
 const macPosts = new Map<string, number[]>();
+// ── Crash reports get their own budget ───────────────────────────────────────
+//
+// A SIBLING MAP, for the same reason the doorbell has one: a Mac that beats hard
+// during a long call must not lose the ability to report the crash that ends it,
+// and a Mac stuck in a crash loop must not silence its own telemetry. Two
+// unrelated things failing as one is the thing being avoided.
+//
+// 200/h is deliberately loose for something a healthy machine sends zero of. A
+// crash loop is the case this whole feature exists for, and it is also the case
+// that posts most: a copy that dies on launch, relaunches, sends the previous
+// death, and dies again. Being rate limited out of reporting exactly then would
+// leave the loudest possible failure looking like silence.
+const crashPosts = new Map<string, number[]>();
 const HB_MAX_BODY = 2048;
 const HB_MAX_ROWS = 50_000;
 const HB_EVT = new Set(['connect', 'end', 'fail']);
@@ -3886,6 +3899,47 @@ export class Health implements DurableObject {
     // above: the table already exists in production, so CREATE cannot add it
     // and "duplicate column name" here is the expected no-op.
     try { this.sql.exec(`ALTER TABLE mac_beats ADD COLUMN pair TEXT`); } catch { /* already there */ }
+    // ── How the app DIED, which no beat has ever been able to say ─────────────
+    //
+    // A beat describes a call that is happening. The one thing it can never
+    // describe is the app not being there any more, and until now that was the
+    // whole of what anybody knew about a crash on somebody else's Mac: the beats
+    // stop. "Stopped beating" is also what a closed lid, a lost network and a
+    // person hanging up look like, so it said nothing.
+    //
+    // Own table, because the questions are different: not "which of my calls was
+    // bad" but "is the version we pushed this afternoon killing people's Macs".
+    // That question is asked across installs and across versions, and it has to
+    // be answerable from a row that has no call in it at all -- a copy that dies
+    // during launch never had one.
+    //
+    // `incident` is the crash report's own UUID (or `run-<id>` for a death that
+    // left no report), and it is UNIQUE: the client will not knowingly send one
+    // twice, and a client that has lost its state file will. Better a conflict
+    // the database refuses than a crash counted five times, which would make a
+    // single bad build look like an outbreak.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mac_crashes (
+        incident TEXT PRIMARY KEY,
+        wall REAL NOT NULL,
+        at REAL,
+        install TEXT,
+        kind TEXT,
+        app_version TEXT,
+        reporter_version TEXT,
+        proc TEXT,
+        model TEXT,
+        os TEXT,
+        exc TEXT,
+        sig TEXT,
+        where_sym TEXT,
+        ran_ms REAL,
+        crashed_call TEXT,
+        fields TEXT NOT NULL
+      );
+    `);
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_crash_wall ON mac_crashes(wall)`); } catch {}
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_crash_ver ON mac_crashes(app_version, wall)`); } catch {}
     try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_call ON mac_beats(call, wall)`); } catch {}
     try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_wall ON mac_beats(wall)`); } catch {}
     try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_pair ON mac_beats(pair, wall)`); } catch {}
@@ -3938,6 +3992,95 @@ export class Health implements DurableObject {
       // that the DO stays small without a scheduled job to remember.
       this.sql.exec(`DELETE FROM mac_beats WHERE wall < ?`, Date.now() / 1000 - 7 * 86400);
       return json({ ok: true });
+    }
+
+    // ── A crash, arriving from the launch AFTER the one that died ────────────
+    if (url.pathname === '/mac/crash' && request.method === 'POST') {
+      const b = await request.json().catch(() => null) as Record<string, unknown> | null;
+      if (!b || typeof b.install !== 'string' || typeof b.incident !== 'string') {
+        return json({ ok: false, why: 'need install and incident' }, 400);
+      }
+      // Same refusal as the beat route: the room name is the encryption salt on
+      // this app and must never leave the two machines. A crash report has no
+      // business carrying one, and a server that quietly accepted it would make
+      // the guarantee unverifiable.
+      for (const k of ['room', 'secret', 'peer']) if (k in b) delete b[k];
+      const {
+        install, incident, kind, app_version: appVer, version, proc, model, os,
+        exc, sig, at, ran_ms: ranMs, crashed_call: crashedCall, ...rest
+      } = b as any;
+      const wh = typeof (b as any).where === 'string' ? (b as any).where : null;
+      // INSERT OR REPLACE on the incident: a client that lost its "already sent"
+      // file re-sends, and the honest answer to the same crash twice is one row,
+      // not two. The count on this table is read as "how many times did this
+      // build fall over", and a duplicate there is a fabricated outbreak.
+      this.sql.exec(
+        `INSERT OR REPLACE INTO mac_crashes
+           (incident, wall, at, install, kind, app_version, reporter_version, proc,
+            model, os, exc, sig, where_sym, ran_ms, crashed_call, fields)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        String(incident).slice(0, 64), Date.now() / 1000,
+        typeof at === 'number' ? at : null,
+        String(install).slice(0, 40),
+        kind === 'vanished' || kind === 'restart' ? kind : 'crash',
+        String(appVer ?? '').slice(0, 24), String(version ?? '').slice(0, 24),
+        String(proc ?? '').slice(0, 40), String(model ?? '').slice(0, 40),
+        String(os ?? '').slice(0, 48), String(exc ?? '').slice(0, 40),
+        String(sig ?? '').slice(0, 24), wh === null ? null : wh.slice(0, 160),
+        typeof ranMs === 'number' ? ranMs : null,
+        String(crashedCall ?? '').slice(0, 40) || null,
+        packFields(rest, 24_000));
+      // Kept a month, not a week like the beats. A beat is about a call somebody
+      // remembers having; a crash is about a RELEASE, and "did 0.61 do this too"
+      // is asked long after the call it happened on has been forgotten.
+      this.sql.exec(`DELETE FROM mac_crashes WHERE wall < ?`, Date.now() / 1000 - 30 * 86400);
+      return json({ ok: true });
+    }
+
+    // Crashes, newest first, with the call each one ended when there was one.
+    if (url.pathname === '/mac/crashes') {
+      const n = Math.min(200, Number(url.searchParams.get('n') ?? 40));
+      const rows = [...this.sql.exec(
+        `SELECT * FROM mac_crashes ORDER BY wall DESC LIMIT ?`, n)] as any[];
+      // ── HOW BAD IS THIS, RIGHT NOW ───────────────────────────────────────
+      //
+      // The count alone cannot answer it: five crashes across five weeks and
+      // five crashes this afternoon are the same number and completely
+      // different news. So the day is broken out, and so is the split by
+      // version -- because the question this table exists to answer is whether
+      // the build that went out unattended is the one killing people.
+      //
+      // Broken out by kind as well, because they are not the same news and a
+      // single total would make them look like it. A crash has a stack and a
+      // cause; a run that vanished has neither, and a headline that called
+      // eleven of those "crashes" would be training whoever reads this page to
+      // stop believing the number.
+      const now = Date.now() / 1000;
+      const day = [...this.sql.exec(
+        `SELECT COUNT(*) AS n, COUNT(DISTINCT install) AS macs,
+                SUM(CASE WHEN kind = 'crash' THEN 1 ELSE 0 END) AS crashed,
+                SUM(CASE WHEN kind != 'crash' THEN 1 ELSE 0 END) AS died
+           FROM mac_crashes WHERE wall > ?`, now - 86400)][0] as any;
+      const byVersion = [...this.sql.exec(
+        `SELECT app_version AS version, kind, COUNT(*) AS n,
+                COUNT(DISTINCT install) AS macs, MAX(wall) AS last
+           FROM mac_crashes WHERE wall > ?
+          GROUP BY app_version, kind ORDER BY n DESC LIMIT 24`, now - 7 * 86400)] as any[];
+      return json({
+        now,
+        today: {
+          total: Number(day?.n ?? 0), macs: Number(day?.macs ?? 0),
+          crashes: Number(day?.crashed ?? 0), deaths: Number(day?.died ?? 0),
+        },
+        byVersion,
+        crashes: rows.map((r) => ({
+          incident: r.incident, wall: r.wall, at: r.at, install: r.install,
+          kind: r.kind, appVersion: r.app_version, reporterVersion: r.reporter_version,
+          proc: r.proc, model: r.model, os: r.os, exc: r.exc, sig: r.sig,
+          where: r.where_sym, ranMs: r.ran_ms, crashedCall: r.crashed_call,
+          ...safeParse(r.fields),
+        })),
+      });
     }
 
     // Calls with a beat in the last 90 s AND NO FINAL BEAT: still going.
@@ -4550,9 +4693,33 @@ export default {
           headers: { 'content-type': 'application/json' } }),
       );
     }
+    // ── A crash on a Mac nobody is watching ──────────────────────────────────
+    //
+    // Its own route rather than a `kind` on the beat, because it is a different
+    // thing: it describes a process that is already dead, it belongs to a
+    // PREVIOUS run, and it must have its own rate budget (see crashPosts) so a
+    // machine in a crash loop can still be heard.
+    //
+    // The body cap is larger than a beat's because a stack is larger than a set
+    // of counters, and the client has already dropped WHOLE FIELDS to fit under
+    // its own 6 KB. Anything past this is not a crash report we wrote.
+    if (url.pathname === '/api/mac/crash' && request.method === 'POST') {
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      const now = Date.now();
+      const hits = (crashPosts.get(ip) ?? []).filter((t) => now - t < 3600_000);
+      if (hits.length >= 200) { crashPosts.set(ip, hits); return json({ error: 'rate' }, 429); }
+      hits.push(now);
+      crashPosts.set(ip, hits);
+      const body = await request.text();
+      if (body.length > 32_768) return json({ error: 'too big' }, 413);
+      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+        new Request('https://do/mac/crash', { method: 'POST', body,
+          headers: { 'content-type': 'application/json' } }),
+      );
+    }
     if (url.pathname.startsWith('/api/mac/') && request.method === 'GET') {
       const tail = url.pathname.slice('/api/mac/'.length);
-      if (!['live', 'recent', 'call', 'diagnose'].includes(tail)) return json({ error: 'no' }, 404);
+      if (!['live', 'recent', 'call', 'diagnose', 'crashes'].includes(tail)) return json({ error: 'no' }, 404);
       if (!dashOK()) return json({ error: 'private' }, 403);
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/mac/${tail}${url.search}`),

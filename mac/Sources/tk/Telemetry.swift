@@ -22,6 +22,19 @@ import Foundation
 enum Telemetry {
   nonisolated(unsafe) static var enabled = true
   nonisolated(unsafe) static var endpoint = "https://room.tokkah.com/api/mac/beat"
+  /// Where a crash goes. Its own route because a crash is not a beat: it belongs
+  /// to a PREVIOUS process, it is stored in its own table, and it must not be
+  /// rate limited into oblivion by a machine that is also making calls.
+  ///
+  /// Derived from `endpoint` whenever that is set, so `--tel-endpoint` remains
+  /// the single control and a rig pointing beats at a local sink cannot
+  /// accidentally leave crashes going to production -- which is the shape of
+  /// mistake that has sent rig traffic to the real server before.
+  nonisolated(unsafe) static var crashEndpoint = "https://room.tokkah.com/api/mac/crash"
+  static func aimAt(_ beat: String) {
+    endpoint = beat
+    crashEndpoint = beat.hasSuffix("/beat") ? String(beat.dropLast(4)) + "crash" : beat
+  }
   /// Random per install, so repeat calls from one machine can be grouped without
   /// knowing whose machine it is.
   nonisolated(unsafe) private(set) static var install: String = {
@@ -53,17 +66,23 @@ enum Telemetry {
   /// Fire and forget, on a background queue. A beat must never delay a call:
   /// nothing here runs on the audio path, and a failure is counted and dropped
   /// rather than retried, because a stale beat is worth less than a fresh one.
-  /// `done` fires when the request has finished, however it finished. It exists
-  /// for the two paths that post and then immediately `exit(0)`: without it the
-  /// FINAL beat of every call was handed to URLSession and then killed with the
-  /// process a microsecond later, so the record the dashboard cares about most
-  /// was the one least likely to arrive. Measured against a local sink: not one
-  /// final beat from the Leave button was delivered. It is called on every exit
-  /// from this function, including the two `guard`s, so a waiter can never be
-  /// left holding a semaphore that nothing will signal.
-  static func post(_ fields: [String: Any], final: Bool = false,
-                   done: (@Sendable () -> Void)? = nil) {
-    guard enabled else { done?(); return }
+  /// `done` fires when the request has finished, however it finished, and says
+  /// WHETHER IT LANDED. It exists for the two paths that post and then
+  /// immediately `exit(0)`: without it the FINAL beat of every call was handed to
+  /// URLSession and then killed with the process a microsecond later, so the
+  /// record the dashboard cares about most was the one least likely to arrive.
+  /// Measured against a local sink: not one final beat from the Leave button was
+  /// delivered. It is called on every exit from this function, including the
+  /// three `guard`s, so a waiter can never be left holding a semaphore that
+  /// nothing will signal.
+  ///
+  /// The Bool was added for crash reporting, where it is load bearing rather than
+  /// informational: the mark that stops a crash being sent twice is written only
+  /// when this says the server took it, and reading the shared `sent` counter
+  /// instead would race with whatever beat the live call posted in the meantime.
+  static func post(_ fields: [String: Any], to url0: String? = nil, final: Bool = false,
+                   done: (@Sendable (Bool) -> Void)? = nil) {
+    guard enabled else { done?(false); return }
     var f = fields
     f["install"] = install
     f["call"] = call
@@ -73,8 +92,8 @@ enum Telemetry {
     f["version"] = VERSION
     f["model"] = model
     f["phase"] = final ? "final" : "live"
-    guard let body = try? JSONSerialization.data(withJSONObject: f) else { done?(); return }
-    guard let url = URL(string: endpoint) else { done?(); return }
+    guard let body = try? JSONSerialization.data(withJSONObject: f) else { done?(false); return }
+    guard let url = URL(string: url0 ?? endpoint) else { done?(false); return }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -83,6 +102,7 @@ enum Telemetry {
     // seconds to deliver is describing the past.
     req.timeoutInterval = final ? 6 : 4
     URLSession.shared.dataTask(with: req) { _, resp, err in
+      var ok = false
       if let err {
         failed += 1
         lastError = err.localizedDescription
@@ -91,8 +111,9 @@ enum Telemetry {
         lastError = "http \(h.statusCode)"
       } else {
         sent += 1
+        ok = true
       }
-      done?()
+      done?(ok)
     }.resume()
   }
 }

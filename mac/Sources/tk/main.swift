@@ -220,6 +220,40 @@ if flag("watch") {
         + " -- this Mac stays current whether or not anybody opens the app\n", stderr)
     Update.startPolling(current: VERSION, every: every, firstAfter: first)
   }
+  // ── AND THE PROCESS THAT NEVER STOPS HAD NO WAY TO REPORT ITS OWN DEATH ────
+  //
+  // Exactly the fault named twenty lines above, in the same block, found the
+  // same way: `Watch.run` returns `Never`, so the crash sweep several hundred
+  // lines below this is unreachable from here. Nothing switched it off -- it was
+  // simply underneath a function that does not come back.
+  //
+  // This is the process where it matters most. It is the one that lives from
+  // login to logout, the one that now fetches and installs a new Kin with nobody
+  // watching, and therefore the one where a bad release does its damage
+  // invisibly: it would crash, launchd would restart it, and the only symptom
+  // anybody would ever see is that their Mac quietly stopped ringing.
+  //
+  // The telemetry settings have to be applied here too. They live several
+  // hundred lines below as well, so `--no-telemetry` was already inert on this
+  // path -- a rig watcher would have posted to the production endpoint.
+  if flag("no-telemetry") { Telemetry.enabled = false }
+  if let e = arg("tel-endpoint") { Telemetry.aimAt(e) }
+  if Telemetry.enabled { Thread { Crash.begin() }.start() }
+  atexit { Crash.endRun() }
+  // A daemon is not quit, it is signalled: launchd sends SIGTERM at logout.
+  // Without this, every single logout would file the watcher as a death nobody
+  // could explain, and a crash panel full of those is a panel nobody reads.
+  // Its own array of sources, declared here rather than reusing the one further
+  // down the file -- top-level code runs in order, and a global referenced above
+  // its own declaration is one this project has already been caught by.
+  nonisolated(unsafe) var watchSignals: [DispatchSourceSignal] = []
+  for sig in [SIGINT, SIGTERM] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    src.setEventHandler { Crash.endRun(); exit(0) }
+    src.resume()
+    watchSignals.append(src)
+  }
   Watch.run(gapMs: Int(arg("ring-gap") ?? "4000") ?? 4000)
 }
 if flag("watch-install") { fputs(Watch.install() + "\n", stderr); exit(0) }
@@ -657,7 +691,34 @@ guard let wire = Wire(listen: listenPort, peerHost: peerHost, peerPort: pPort) e
 // that would have switched it off had not been reached yet. Same ordering fault
 // as the crash above it: the window can act before the setup below it exists.
 if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
-if let e = arg("tel-endpoint") { Telemetry.endpoint = e }
+// One control, both routes. Setting only `endpoint` would have left a rig's
+// crash reports going to the production server while its beats went to a local
+// sink -- one flag answering one question, unlike the two this project has
+// already been bitten by.
+if let e = arg("tel-endpoint") { Telemetry.aimAt(e) }
+
+// ── WHAT HAPPENED THE LAST TIME THIS APP STOPPED ─────────────────────────────
+//
+// Every crash on somebody else's Mac has been invisible until now: the window
+// goes away, they open it again, and the .ips file macOS wrote is in a folder
+// they will never look in. That was survivable while a release only reached
+// whoever ran the curl line by hand -- and it stopped being survivable when the
+// always-on watcher started updating itself unattended, because a release that
+// crashes now spreads to every Mac with nobody watching it happen.
+//
+// On its own thread and on every launch, like the login-item check above it. The
+// main thread pays for one `Thread` and nothing else: the common case is a
+// machine that has not crashed, and the common case reads no files at all. See
+// Crash.swift for how it stays that cheap, and for why it never asks what the
+// process was called.
+if Telemetry.enabled { Thread { Crash.begin() }.start() }
+// EVERY ORDINARY ENDING CLOSES THE BOOKS, not just the ones that file a beat.
+// `postFinalBeat` covers Leave, Ctrl-C, SIGTERM and a re-exec; this covers the
+// rest of the `exit()` calls in this file -- a bind that failed, a rendezvous
+// nobody joined, a self test that finished -- and it is exactly the right
+// primitive, because the things that do NOT run an atexit handler are precisely
+// the things that should be reported: a signal death, an abort, a SIGKILL.
+atexit { Crash.endRun() }
 // ── AN IMAGE THAT IS ABOUT TO BE REPLACED FILES ITS REPORT FIRST ─────────────
 //
 // And hands its call id to its successor. The id is random per PROCESS, so a
@@ -776,6 +837,12 @@ nonisolated(unsafe) var beatReady = false
 /// ended after four seconds.
 @discardableResult
 func postFinalBeat(why: String) -> Bool {
+  // FIRST, and above the telemetry guard: this is the one place Leave, Ctrl-C,
+  // SIGTERM and a re-exec all pass through, and a re-exec is the case an atexit
+  // handler cannot cover -- `execv` replaces the image without unwinding
+  // anything. Without this line every answered ring would have been reported as
+  // an app that died without saying goodbye.
+  Crash.endRun()
   guard Telemetry.enabled else { return false }
   // Last second's percentiles, not a live sort of the audio-thread buffer.
   var beat = audioBeat(uptime: Double(beatTick),
@@ -786,7 +853,7 @@ func postFinalBeat(why: String) -> Bool {
   beat["ended"] = why
   let done = DispatchSemaphore(value: 0)
   let before = Telemetry.sent
-  Telemetry.post(beat, final: true) { done.signal() }
+  Telemetry.post(beat, final: true) { _ in done.signal() }
   // A report is not worth hanging a quit on: the person clicked Leave because
   // they wanted out, so 1.5 s and go regardless. Said out loud either way,
   // because a beat believed-sent and never sent is the worse of the two.

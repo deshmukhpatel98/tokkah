@@ -166,6 +166,21 @@ function analyse(c) {
   }
 
   const ev = c.events || {}, tapf = c.tap_fails || {};
+  // ── THE APP FELL OVER, AND THIS CALL IS THE ONE THAT SAW IT ────────────────
+  //
+  // A crash is reported by the launch AFTER the one that died, so it arrives on
+  // a different row from the call it ended. These counters are on the row that
+  // did the reporting, and they are here so that somebody reading one call
+  // cannot miss the fact that this Mac has been falling over -- the Crashes
+  // panel at the top of the page is where the detail is.
+  if (ev.crash_found) {
+    faults.push('THIS MAC CRASHED ' + ev.crash_found + '× -- see Crashes at the top of this page');
+  }
+  if (ev.died_without_ending) {
+    faults.push('the app DIED WITHOUT SAYING GOODBYE ' + ev.died_without_ending
+      + '× -- no crash report, so a hang, a force quit or a kill');
+  }
+  if (ev.crash_send_fail) faults.push('a crash report could not be delivered and is still waiting');
   if (ev.ring_front_fail) faults.push(ev.ring_front_fail + ' ring(s) stayed BEHIND other windows');
   if (ev.ring_no_window) faults.push(ev.ring_no_window + ' ring(s) had no window to show');
   if (ev.watch_install_fail) faults.push('this Mac CANNOT be rung while Kin is closed');
@@ -300,6 +315,12 @@ const EVENT_WORDS = {
   watch_turn_on_fail: 'switching calls-when-closed on FAILED',
   watch_fix_move: 'asked to move Kin to Applications',
   watch_fix_loginitems: 'sent to Login Items to switch Kin back on',
+  // ── Crashes, reported by the launch that came after the one that died ─────
+  crash_found: 'THIS MAC HAD CRASHED, and this launch found the report',
+  crash_sent: 'and the crash was delivered',
+  crash_send_fail: 'a crash report could NOT be delivered -- it is still waiting',
+  died_without_ending: 'a previous run DIED WITH NO CRASH REPORT -- a hang, a force quit or a kill',
+  died_at_restart: 'a previous run was still open when the Mac restarted',
 };
 const MARK_WORDS = {
   cam_first_frame_ms: 'camera first frame',
@@ -831,6 +852,152 @@ function callCard(c, live) {
   return el;
 }
 
+// ── WHEN THE APP FELL OVER ───────────────────────────────────────────────────
+//
+// Every crash on somebody else's Mac used to be invisible. macOS wrote an .ips
+// file into a folder they will never open, the app came back, and nothing on
+// this page changed -- a call that ends in a crash and a call that ends in a
+// hang-up looked identical here, because both of them are just "the beats
+// stopped".
+//
+// It matters more now than it did: the always-on watcher updates itself with
+// nobody watching, so a build that crashes reaches every Mac on its own. This
+// panel is the only thing that would say so, which is why it sits at the top of
+// the page and why it says nothing at all when there is nothing to say. An empty
+// crash panel is the normal state and should be easy to skip; a full one should
+// be impossible to.
+//
+// Three kinds, and the difference between them IS the finding:
+const CRASH_WORDS = {
+  crash: 'crashed',
+  vanished: 'disappeared with no crash report',
+  restart: 'was still running when the Mac restarted',
+};
+// A signal is a cause of death, and nobody reading a dashboard at speed should
+// have to remember which. Said the way somebody would describe what happened.
+const SIGNAL_WORDS = {
+  SIGSEGV: 'it read memory that was not there',
+  SIGBUS: 'it read memory the wrong way',
+  SIGABRT: 'it gave up on purpose -- an assertion, or the system refusing it something',
+  SIGTRAP: 'it hit a check in our own code that should never fail',
+  SIGILL: 'it ran an instruction that is not one',
+  SIGKILL: 'something killed it outright',
+  SIGFPE: 'a divide by zero or similar',
+};
+// "340 ms in" and "40 minutes in" are the difference between a release that
+// cannot start and a call that went wrong, which is the first thing anybody
+// needs to know. Silent when there is no number rather than saying "0 ms",
+// because a report with no lifetime in it should not be dressed up as one that
+// died instantly.
+function howLong(ms) {
+  if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '';
+  if (ms < 1000) return Math.round(ms) + ' ms in';
+  if (ms < 90_000) return Math.round(ms / 1000) + ' s in';
+  if (ms < 5_400_000) return Math.round(ms / 60_000) + ' min in';
+  return (ms / 3_600_000).toFixed(1) + ' hours in';
+}
+function crashCard(c) {
+  const el = document.createElement('div');
+  el.className = 'call crash';
+  // The headline is a sentence, not a metric name. "0.61.0 crashed after 340 ms
+  // -- it read memory that was not there, in reportLoop()" is the whole report
+  // for most crashes, and everything below it is for the one that is not.
+  const what = CRASH_WORDS[c.kind] || c.kind || 'stopped';
+  const bits = [];
+  if (c.sig && SIGNAL_WORDS[c.sig]) bits.push(SIGNAL_WORDS[c.sig]);
+  else if (c.why) bits.push(c.why);
+  if (c.where) bits.push('in <code>' + esc(String(c.where).slice(0, 70)) + '</code>');
+  const rows = [];
+  const row = (k, v) => { if (v) rows.push([k, v]); };
+  row('what it was doing', c.crashedCall
+    ? 'call <code>' + esc(c.crashedCall) + '</code> -- its beats stop where this begins'
+    : (c.kind === 'crash' ? 'no call was running, so this happened during launch' : ''));
+  row('the fault', [c.exc, c.sig].filter(Boolean).map(esc).join(' / '));
+  row('what the system said', c.term_details ? esc(c.term_details) : esc(c.term || ''));
+  row('and libsystem', esc(c.asi || ''));
+  row('killed by', esc(c.killed_by || ''));
+  row('running as', [esc(c.proc || ''), esc(c.path || '')].filter(Boolean).join(' at '));
+  row('on', [esc(c.model || ''), esc(c.os || '')].filter(Boolean).join(' · '));
+  row('reported by', c.reporterVersion
+    ? 'a later launch running ' + esc(c.reporterVersion) : '');
+  row('fields dropped to fit', (c.dropped || []).map(esc).join(', '));
+  el.innerHTML =
+    '<div class="top">' +
+      '<span class="badge bad">' + (c.kind === 'crash' ? 'CRASH' : 'DIED') + '</span>' +
+      '<span class="id">' + esc(c.appVersion ? 'v' + c.appVersion : 'unknown version') + '</span>' +
+      '<span class="id">' + esc(c.install || '') + '</span>' +
+      '<span class="id">' + (c.at ? new Date(c.at * 1000).toLocaleString() : '') + '</span>' +
+    '</div>' +
+    '<div class="headline">' +
+      esc(c.appVersion ? 'Kin ' + c.appVersion : 'Kin') + ' ' + what + ' ' +
+      howLong(c.ranMs) + (bits.length ? ' &mdash; ' + bits.join(', ') : '') +
+    '</div>' +
+    (rows.length
+      ? '<div class="ledger">' + rows.map((r) =>
+          '<div class="lrow"><span class="lk">' + r[0] + '</span>' +
+          '<span class="lv">' + r[1] + '</span></div>').join('') + '</div>'
+      : '') +
+    ((c.frames || []).length
+      ? '<div class="stack">' + c.frames.map((f) => esc(f)).join('\n') +
+        (c.frames_total > c.frames.length
+          ? '\n… ' + (c.frames_total - c.frames.length) + ' more frames not sent' : '') +
+        '</div>'
+      : '');
+  return el;
+}
+// Everything below comes off a machine we do not control and is put into HTML,
+// so it is escaped. A symbol name legitimately contains < and >.
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function loadCrashes() {
+  const box = document.getElementById('crashes');
+  try {
+    const r = await fetch('/api/mac/crashes?n=25&cb=' + Date.now()).then((x) => x.json());
+    const list = r.crashes || [];
+    if (!list.length) {
+      // Said plainly, and kept small. "No crashes" is the normal state of this
+      // page and it should not look like a finding.
+      box.innerHTML = '<div class="empty">No Mac has reported a crash. '
+        + 'Every copy checks its own crash folder at launch, so this is a real'
+        + ' answer rather than a missing one.</div>';
+      return;
+    }
+    // THE HEADLINE FIRST, because a count with no denominator is decoration:
+    // five crashes over five weeks and five this afternoon are the same number
+    // and completely different news.
+    // A crash and a run that vanished are not the same news, so they are not
+    // added together: one has a stack and a cause, the other has neither, and a
+    // headline that called eleven force-quits "crashes" would teach whoever
+    // reads this page to stop believing the number.
+    const t = r.today || {};
+    let head = '';
+    if (t.total) {
+      const said = [];
+      if (t.crashes) said.push(t.crashes + ' crash' + (t.crashes === 1 ? '' : 'es'));
+      if (t.deaths) said.push(t.deaths + ' unexplained death' + (t.deaths === 1 ? '' : 's'));
+      head = '<div class="alarm">' + said.join(' and ') + ' in the last 24 hours, on '
+        + t.macs + ' Mac' + (t.macs === 1 ? '' : 's') + '.</div>';
+    }
+    // Which VERSION. This is the question the whole panel exists for now that a
+    // release installs itself on machines nobody is watching: if one version's
+    // row is long and the others are empty, that release is the bug.
+    const bv = (r.byVersion || []).filter((v) => v.n > 0);
+    if (bv.length) {
+      head += '<div class="byver">last 7 days: ' + bv.map((v) =>
+        '<b>' + esc(v.version || 'unknown') + '</b> ' + v.n + '× '
+        + (CRASH_WORDS[v.kind] || v.kind) + ' on ' + v.macs + ' Mac'
+        + (v.macs === 1 ? '' : 's')).join(' &middot; ') + '</div>';
+    }
+    box.innerHTML = head;
+    list.forEach((c) => box.appendChild(crashCard(c)));
+  } catch (e) {
+    box.innerHTML = '<div class="empty">Could not load crashes.</div>';
+  }
+}
+
 async function tick() {
   try {
     const r = await fetch('/api/mac/live?cb=' + Date.now()).then((x) => x.json());
@@ -872,6 +1039,9 @@ async function loadRecent() {
   }
 }
 
-tick(); loadRecent();
+tick(); loadRecent(); loadCrashes();
 setInterval(tick, 3000);
 setInterval(loadRecent, 20000);
+// Slower than the calls: a crash arrives from the launch AFTER the one that
+// died, so it is never news by the second.
+setInterval(loadCrashes, 30000);
