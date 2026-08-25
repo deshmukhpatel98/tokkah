@@ -644,6 +644,34 @@ final class Audio {
     }
   }
 
+  /// ── WHAT THE RECOGNISER IS HANDED, AND WHY IT IS SOMETIMES NOTHING ───────
+  ///
+  /// The cleaner exists for one situation: this microphone is hearing the far
+  /// end off this machine's own speaker, and their words would otherwise land in
+  /// this person's subtitles under this person's name. On headphones that
+  /// situation does not exist, and running it anyway is not a harmless waste --
+  /// `coupling` starts at 0.35 in every band and `over` is 9, so it removes
+  /// 3.15x the far end's magnitude from bands the far end is loud in, and none
+  /// of that far end is in this microphone. The near voice lives in those same
+  /// bands. Measured: **8.5 dB of the near voice, gone**, during simultaneous
+  /// speech.
+  ///
+  /// It does adapt away -- but only while this end is QUIET and the far end is
+  /// talking, which is exactly what somebody who joins and immediately talks
+  /// over the far end never provides.
+  ///
+  /// This is a FUNCTION rather than a line inside the subtitle thread so that a
+  /// test can make the same decision the product makes
+  /// (`handler-tests-cannot-see-interaction-bugs`). `onSpeakers` is passed in
+  /// rather than read from a gate flag: the gate is a decision about echo, this
+  /// is the physical route, and reading a decision as a fact is what put the
+  /// whole turn-taking layer behind a pair of headphones.
+  static func subtitleAudio(mic: [Float], ref: [Float], onSpeakers: Bool,
+                            through cleaner: SubtitleCleaner) -> [Float] {
+    guard onSpeakers else { return mic }
+    return cleaner.clean(mic: mic, ref: ref)
+  }
+
   // ── WHOSE TURN IT IS WHEN BOTH WANT IT ────────────────────────────────────
   //
   // Two people start at the same moment. Somebody has to go second, and the

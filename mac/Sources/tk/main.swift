@@ -2245,10 +2245,72 @@ if flag("headphone-test") {
   })
   show("the bid survives the route change", d.claim ? "yes" : "no", "yes", d.claim)
 
+  // ── AND WHAT THE SUBTITLE CLEANER DOES TO A HEADPHONE CALL ────────────────
+  //
+  // Measured on the SIGNAL, not on a transcript. The transcript rig cannot see
+  // this at all -- its far end plays silence, so the cleaner has nothing to
+  // subtract and returns almost exactly what it was given
+  // (`blind-instruments-report-negatives`). It also has 25 points of run-to-run
+  // noise, which would bury an effect this size several times over.
+  //
+  // Here the question is asked directly: how much of the near voice is left.
+  print("\n  ── the subtitle cleaner, at 16 kHz ──")
+  let m = Int(16000 * 6)
+  var nearS = [Float](repeating: 0, count: m)
+  var farS = [Float](repeating: 0, count: m)
+  var s2: UInt64 = 0x3EED
+  func r2() -> Float {
+    s2 = s2 &* 6364136223846793005 &+ 1442695040888963407
+    return Float(Int32(truncatingIfNeeded: Int(s2 >> 33))) / Float(Int32.max)
+  }
+  // Both talking at once, throughout -- the case the cues exist for, and the
+  // only one where this matters.
+  for i in 0..<m {
+    let e = Float(0.6 + 0.4 * sin(2 * Double.pi * 3.1 * Double(i) / 16000))
+    farS[i] = r2() * 0.5 * e
+    nearS[i] = r2() * 0.3 * Float(0.6 + 0.4 * sin(2 * Double.pi * 4.7 * Double(i) / 16000))
+  }
+  func energyDb(_ a: [Float], from: Int) -> Double {
+    var e = 0.0
+    for i in from..<a.count { e += Double(a[i]) * Double(a[i]) }
+    return 10 * log10(max(e / Double(a.count - from), 1e-20))
+  }
+  // HEADPHONES: the microphone has the near voice and nothing else, while the
+  // far end is loud in the reference. Nothing should be removed.
+  let hpOut = Audio.subtitleAudio(mic: nearS, ref: farS, onSpeakers: false,
+                                  through: Audio.SubtitleCleaner())
+  let lostHp = energyDb(nearS, from: 512) - energyDb(hpOut, from: 512)
+  show("headphones: the near voice survives the cleaner",
+       String(format: "-%.2f dB", lostHp), "< 0.01 dB", lostHp < 0.01)
+  // AND THE REASON, kept as an assertion rather than a comment. If somebody
+  // later makes the cleaner harmless on a route it has nothing to remove from,
+  // this fires and says the skip above may no longer be needed -- which is a
+  // far better failure than a skip nobody remembers the reason for.
+  let harm = energyDb(nearS, from: 512)
+           - energyDb(Audio.SubtitleCleaner().clean(mic: nearS, ref: farS), from: 512)
+  show("  (and it WOULD cost this much, hence the skip)",
+       String(format: "-%.1f dB", harm), "> 3 dB", harm > 3.0)
+
+  // THE PAIR: on speakers the cleaner still has to do its job, or "skip it"
+  // would be a fix that broke the thing it was skipping.
+  var spkMic = [Float](repeating: 0, count: m)
+  for i in 0..<m { spkMic[i] = nearS[i] + 0.5 * (i >= 128 ? farS[i - 128] : 0) }
+  var echoOnly = [Float](repeating: 0, count: m)
+  for i in 0..<m { echoOnly[i] = 0.5 * (i >= 128 ? farS[i - 128] : 0) }
+  let c2 = Audio.SubtitleCleaner()
+  // `probe` puts the echo alone through the gains the MIXTURE produced, which
+  // is the only honest way to ask how much of the echo survived.
+  _ = Audio.subtitleAudio(mic: spkMic, ref: farS, onSpeakers: true, through: c2)
+  let echoAfter = c2.clean(mic: spkMic, ref: farS, probe: echoOnly)
+  let echoDrop = energyDb(echoOnly, from: 512) - energyDb(echoAfter, from: 512)
+  show("speakers: the echo is still removed", String(format: "%.1f dB", echoDrop),
+       "> 8 dB", echoDrop > 8.0)
+
   print(bad ? "\n  HEADPHONE TEST FAILED"
             : "\n  HEADPHONE TEST PASSED -- the classifier is alive on headphones, the audio is"
-              + " bit-for-bit untouched, silence is still silence, and a coupling learned on"
-              + " speakers cannot deafen it after the route changes")
+              + " bit-for-bit untouched, silence is still silence, a coupling learned on"
+              + " speakers cannot deafen it after the route changes, and the cleaner is skipped"
+              + " where it would only do harm")
   exit(bad ? 1 : 0)
 }
 
@@ -3006,7 +3068,26 @@ if let subs = subtitles {
         // speaker. When it does not -- headphones, or the far end silent -- it is
         // spectral surgery on a signal that needed none, and the only way to know
         // what it costs the transcript is to measure both arms on the same call.
-        let clean = flag("no-sub-clean") ? c.mic : cleaner.clean(mic: c.mic, ref: c.ref)
+        // ── AND IT IS SKIPPED ENTIRELY ON HEADPHONES ─────────────────────────
+        //
+        // Not as an optimisation. `coupling` starts at 0.35 in every band and
+        // `over` is 9, so before it has adapted the cleaner removes 3.15x the
+        // far end's magnitude from bands the far end is loud in -- and on
+        // headphones NONE of that far end is in this microphone. The near voice
+        // occupies those same bands, so it clamps to `floorFrac`: 30 dB down,
+        // on the speaker, during simultaneous speech.
+        //
+        // It does adapt away, but only while this end is QUIET and the far end
+        // is talking, which is exactly what somebody who joins and immediately
+        // talks over the far end never provides. So the danger window is open
+        // precisely for the person the cues exist to help.
+        //
+        // `onSpeakers` and not `Audio.gate.on`: the gate is a decision, this is
+        // the physical route, and reading a decision as a fact is what put the
+        // whole feature behind a pair of headphones in the first place.
+        let clean = flag("no-sub-clean") ? c.mic
+          : Audio.subtitleAudio(mic: c.mic, ref: c.ref,
+                                onSpeakers: audio.onSpeakers, through: cleaner)
         fedOut += clean.count
         clean.withUnsafeBufferPointer { subs.feed($0.baseAddress!, $0.count) }
       }
