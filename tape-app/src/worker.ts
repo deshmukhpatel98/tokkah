@@ -4393,7 +4393,22 @@ export default {
       return Response.redirect('https://kin.tokkah.com/', 302);
     }
     let assetReq = request;
-    if (url.hostname === 'kin.tokkah.com' && url.pathname === '/' && !url.searchParams.has('r')) {
+    // ── AND ON room.tokkah.com TOO, WHICH WAS THE LAST BROWSER-CALL DOOR ─────
+    //
+    // This used to be scoped to kin.tokkah.com, so typing the older hostname
+    // still opened the browser call shell -- a call UI that can no longer place
+    // a call, presented as the front door. Somebody arriving there saw the
+    // retired product and no way to the real one.
+    //
+    // The reasoning above does not depend on which hostname was typed: a bare
+    // root with no room in the path and no ?r= is "nobody invited me, I came to
+    // look", on either door. It is an internal rewrite rather than a redirect
+    // because a front door that bounces before it opens is a worse front door.
+    //
+    // ?web=1 and ?hb=1 still reach the shell, which is what keeps the
+    // browser-to-browser measurement rigs alive.
+    if (url.pathname === '/' && !url.searchParams.has('r')
+        && url.searchParams.get('web') !== '1' && !url.searchParams.has('hb')) {
       const front = new URL(url);
       // The extensionless form: the assets layer 307s '/kin.html' to '/kin'
       // (html_handling), and a front door that bounces once before opening is
@@ -4426,9 +4441,23 @@ export default {
     // Every backend surface the app depends on is upstream of this line and
     // untouched: /api/room/<code>/ws (signaling), /api/ice + /api/mac/turn,
     // /macos/* (manifest, install.sh, dl/), /api/* (telemetry, health).
+    // ── `far-away-lab` IS A 3-4-3 CODE, AND THAT BROKE EVERY RIG ─────────────
+    //
+    // The permanent cross-planet room is called far-away-lab, which matches the
+    // minted-invite pattern exactly -- 3 letters, 4, 3. So the funnel below
+    // caught it, and the human side of the lab stopped being a call and started
+    // being a download page. Every browser rig goes to `${BASE}/${ROOM}?hb=1`,
+    // five call sites of it, and all five were pointed at the funnel.
+    //
+    // ?web=1 was the documented escape hatch and the rigs never carried it,
+    // because they were written before the funnel existed. Rather than editing
+    // five URLs and waiting for the sixth, `hb` counts too: it is the rig
+    // heartbeat flag, nothing else sets it, and a request carrying it is by
+    // definition not a person who was sent a link.
     const invitePath = /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(url.pathname);
     const inviteQuery = url.pathname === '/' && url.searchParams.has('r');
-    if ((invitePath || inviteQuery) && url.searchParams.get('web') !== '1') {
+    const wantsShell = url.searchParams.get('web') === '1' || url.searchParams.has('hb');
+    if ((invitePath || inviteQuery) && !wantsShell) {
       const funnel = new URL(url);
       // Extensionless, for the same reason as '/kin': the assets layer 307s
       // '/join.html' -> '/join', and one redirect before the page is a slower

@@ -580,7 +580,7 @@ input,select{background:#1b2027;color:var(--fg);border:1px solid var(--line);bor
 <p class=sub>A real call, on real Cloudflare hardware, from as far away as this network will place a browser.</p>
 
 <div class=link>
-  <b><a href="https://room.tokkah.com/far-away-lab">room.tokkah.com/far-away-lab</a></b>
+  <b><a href="https://room.tokkah.com/far-away-lab?web=1">room.tokkah.com/far-away-lab?web=1</a></b>
   &nbsp;<span class=d>&rarr; a browser in <b>US West</b>, 305 ms away</span><br>
   <b><a href="https://room.tokkah.com/far-away-two">room.tokkah.com/far-away-two</a></b>
   &nbsp;<span class=d>&rarr; a browser in <b>US East</b>, 305 ms away</span>
