@@ -37,6 +37,10 @@
 #   7. CONTROL for 6: with the gate off (`--no-gate`, which is what headphones
 #      do), it never leaves `through` at all
 #   8. the caption is readable in ONE frame, not in twelve
+#   9. the green edge is up exactly when this end is audible, and dark when it is
+#      muted, held, or merely bidding -- with no glow bleeding inward from it
+#  10. and it still reads against a near-white picture, because it is separated
+#      from its background by HUE and not by brightness
 #
 # Every one of those numbers was measured against the build before this change,
 # by running this rig with TK= pointed at a binary built from b6616e5: arm 1
@@ -90,7 +94,10 @@ cant() { echo "  COULD NOT RUN: $1"; exit 2; }
 # `--mute` is the RIG's speaker flag: the speakers belong to whoever is sitting at
 # this Mac, and a rig that plays audio at them is a defect. `--press mic` is the
 # app's own microphone button, which is a different thing entirely.
-C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings"
+# `--video` is NOT in here: one arm feeds a bright picture through it, and two
+# `--video` flags on one command line is an argument nobody should have to reason
+# about. `shoot` supplies exactly one, always.
+C="--window --mute --no-telemetry --no-update --no-relocate --no-rings"
 
 # ── ONE PHOTOGRAPH, AND THE RECTANGLES THAT GO WITH IT ──────────────────────
 #
@@ -98,14 +105,14 @@ C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rin
 # for exactly this, and a full-screen capture once swept up a person's own
 # desktop. `-o` drops the window shadow, so the image is the window and the
 # app's own `at=x,y,w,h win=WxH` audit line indexes straight into it.
-shoot() {   # $1 = press tokens, $2 = name, $3 = extra flags
+shoot() {   # $1 = press tokens, $2 = name; $VIDEO = picture, default off
   reap
   # `~,~` before the audit, and it is not padding. The reach is EASED -- 300 ms
   # down -- so an audit 0.7 s after the press reads 0.40 on its way to 0.34 and
   # an assertion written against the settled number fails on a working build.
   # The photograph is taken later still, so without this the rig would be
   # asserting one moment and measuring another.
-  spawn "$TK" $C ${3:-} --room "flr$$$2" --listen 8334 \
+  spawn "$TK" $C --video "${VIDEO:-off}" --room "flr$$$2" --listen 8334 \
         --press "$1,~,~,?" --press-after 3 > "$SP/$2.log" 2>&1
   perl -e 'select undef,undef,undef,12'
   WID="$(grep -oE 'window id [0-9]+' "$SP/$2.log" | head -1 | grep -oE '[0-9]+')"
@@ -122,13 +129,19 @@ shoot() {   # $1 = press tokens, $2 = name, $3 = extra flags
 #
 # Two numbers per photograph:
 #
-#   edge    mean (blue - max(red, green)) in the ring 0-4 pt inside the window's
-#           own edge. The accent in this app is blue and the picture behind it in
-#           these arms is black, so any accent laid on the edge shows up here and
-#           nothing else does. The band has to START at 0: the stroke was drawn at
-#           `insetBy(1.5)` with `lineWidth 3`, so a band beginning at 3 pt walks
-#           straight past it -- measured, and it reported +1.2 for a rim that is
-#           really +20.5, which is a ruler that would have passed the old build.
+#   blue    mean (blue - max(red, green)) in the ring 0-4 pt inside the window's
+#           own edge. The refused rim was accent BLUE, so this is the channel that
+#           has to stay flat forever. The band has to START at 0: that stroke was
+#           drawn at `insetBy(1.5)` with `lineWidth 3`, so a band beginning at 3 pt
+#           walks straight past it -- measured, and it reported +1.2 for a rim that
+#           is really +20.5, which is a ruler that would have passed the old build.
+#
+#   green   mean (green - max(red, blue)) in the same ring: the audible border.
+#           CHROMATIC and not luminance, deliberately, because that is the whole
+#           reason a thin green line works on a white wall as well as on a dark
+#           one -- it is separated from its background by hue, and a luminance
+#           ruler would have reported it as nearly invisible at +1.4:1 against
+#           white while a person can see it perfectly well.
 #
 #   ink     mean of the brightest tenth of the pixels inside a button's own
 #           rectangle: the glyph, and not the disc it sits on. Reported as a RATIO
@@ -136,7 +149,7 @@ shoot() {   # $1 = press tokens, $2 = name, $3 = extra flags
 #           actually judges -- the row is the reference, nobody reads a glyph's
 #           opacity in the absolute -- and because a ratio cancels the window's
 #           exposure, its scale and the material underneath.
-measure() {  # $1 = name -> "edge micink camink ratio"
+measure() {  # $1 = name -> "blue green micink camink ratio"
   python3 - "$SP/$1.png" "$SP/$1.rects" <<'PY'
 import sys, re, numpy as np
 from PIL import Image
@@ -148,7 +161,7 @@ for ln in open(rectfile):
     if m:
         rc[m.group(1)] = tuple(int(m.group(i)) for i in range(2, 8))
 if "microphone" not in rc or "camera" not in rc:
-    print("nan nan nan nan"); raise SystemExit
+    print("nan nan nan nan nan"); raise SystemExit
 winw = rc["microphone"][4]
 H, W = a.shape[:2]
 s = W / float(winw)
@@ -159,7 +172,8 @@ m[H-i1:H-i0, i0:W-i0] = True
 m[i0:H-i0, i0:i1] = True
 m[i0:H-i0, W-i1:W-i0] = True
 r, g, b = a[...,0][m], a[...,1][m], a[...,2][m]
-edge = float(np.mean(b - np.maximum(r, g)))
+blue = float(np.mean(b - np.maximum(r, g)))
+green = float(np.mean(g - np.maximum(r, b)))
 def ink(rect):
     x, y, w, h = rect[:4]
     sx, sy, sw, sh = (int(round(v * s)) for v in (x, y, w, h))
@@ -167,7 +181,7 @@ def ink(rect):
     L = 0.2126*crop[...,0] + 0.7152*crop[...,1] + 0.0722*crop[...,2]
     return float(np.mean(np.sort(L.ravel())[-max(1, int(L.size*0.10)):]))
 mi, ca = ink(rc["microphone"]), ink(rc["camera"])
-print(f"{edge:.3f} {mi:.2f} {ca:.2f} {mi/ca if ca else float('nan'):.4f}")
+print(f"{blue:.3f} {green:.3f} {mi:.2f} {ca:.2f} {mi/ca if ca else float('nan'):.4f}")
 PY
 }
 # `and`, not `&&`. Python is not the shell, and a `&&` inside here is a
@@ -181,23 +195,33 @@ r() { python3 -c "print(round($1, 3))"; }
 echo "── 1-3. the picture, and the control"
 shoot cue-quiet quiet || cant "the window never came up for the quiet arm"
 shoot cue-claim claim || cant "the window never came up for the claiming arm"
-read -r E_Q MIC_Q CAM_Q R_Q <<<"$(measure quiet)"
-read -r E_C MIC_C CAM_C R_C <<<"$(measure claim)"
+read -r E_Q G_Q MIC_Q CAM_Q R_Q <<<"$(measure quiet)"
+read -r E_C G_C MIC_C CAM_C R_C <<<"$(measure claim)"
 [ "$E_Q" = "nan" ] && cant "the app did not print both button rectangles"
-note "edge accent: quiet $E_Q, far end claiming $E_C"
+note "edge: quiet blue $E_Q green $G_Q, far end claiming blue $E_C green $G_C"
 
 # THE ONE THE OLD BUILD FAILS. The rim was +20.5 here.
 f "abs($E_C - $E_Q) < 2.0" \
-  && say "OK" "the window's own edge does not change when the far end takes the floor (Δ$(r "$E_C-$E_Q"))" \
+  && say "OK" "the window's own edge does not change when the far end takes the floor (Δblue $(r "$E_C-$E_Q"))" \
   || say "FAIL" "something is still painted on the picture: the edge moved by $(r "$E_C-$E_Q") -- the old build's rim was +20.5"
+
+# ── AND THE SAME BUG IN THE NEW COLOUR ──────────────────────────────────────
+#
+# The green border is MINE: it says this end is audible. A border that also
+# arrives when the far end takes the floor would be the deleted rim wearing a new
+# colour, and it would say the opposite of the truth -- lighting up at the exact
+# moment this person is NOT getting through.
+f "abs($G_C - $G_Q) < 2.0" \
+  && say "OK" "and it does not go GREEN for them either (Δgreen $(r "$G_C-$G_Q")) -- the border is this end's, not theirs" \
+  || say "FAIL" "the green border lit up for the FAR end taking the floor (Δgreen $(r "$G_C-$G_Q")) -- that is the old bug in a new colour"
 
 echo "── 4. three states, three pictures"
 shoot floor-through through || cant "the window never came up for the through arm"
 shoot floor-bid bid || cant "the window never came up for the bidding arm"
 shoot floor-held held || cant "the window never came up for the held arm"
-read -r E_T MIC_T CAM_T R_T <<<"$(measure through)"
-read -r E_B MIC_B CAM_B R_B <<<"$(measure bid)"
-read -r E_H MIC_H CAM_H R_H <<<"$(measure held)"
+read -r E_T G_T MIC_T CAM_T R_T <<<"$(measure through)"
+read -r E_B G_B MIC_B CAM_B R_B <<<"$(measure bid)"
+read -r E_H G_H MIC_H CAM_H R_H <<<"$(measure held)"
 note "mic ink / cam ink:  through $R_T   bidding $R_B   held $R_H"
 
 for n in through bid held; do
@@ -224,6 +248,100 @@ CAMSPREAD="$(r "max($CAM_T,$CAM_B,$CAM_H)/max(1e-6,min($CAM_T,$CAM_B,$CAM_H))")"
 f "$CAMSPREAD < 1.05" \
   && say "OK" "CONTROL: the camera button is unmoved across all three (${CAMSPREAD}x), so this is the microphone and not the exposure" \
   || say "FAIL" "CONTROL: the camera glyph moved ${CAMSPREAD}x too -- this ruler is measuring the whole photograph"
+
+echo "── 9. the green edge: visible exactly when this end is audible"
+# ── ASKED FOR IN THESE WORDS ────────────────────────────────────────────────
+#
+#   "We will need a green edge border or something like that. Very thin. Which
+#    when you are actually audible is visible, so that you know for sure that
+#    you are audible... And people interrupt when the green thing is not
+#    visible, but when they actually say something it becomes visible."
+#
+# Four states, and MUTED is driven through the real mute button with no pin at
+# all -- it is the one arm where the product's own condition can be reached
+# without help, and it is also the arm most likely to be got wrong, because the
+# glyph deliberately stays at FULL ink while muted and it would have been easy to
+# let the border follow the glyph instead of the truth.
+shoot mic muted || cant "the window never came up for the muted arm"
+read -r E_M G_M MIC_M CAM_M R_M <<<"$(measure muted)"
+note "edge green:  audible $G_T   bidding $G_B   held $G_H   muted $G_M   at rest $G_Q"
+
+for n in through bid held muted; do
+  grep -qE "edge=(on|off)/" "$SP/$n.state" \
+    || cant "this build's audit line has no edge= field -- the instrument cannot see the subject"
+done
+grep -qE "edge=on/" "$SP/through.state" \
+  && say "OK" "PRECONDITION: the app says the border is up when audible ($(grep -oE 'edge=[^ ]+' "$SP/through.state"))" \
+  || say "FAIL" "the app never raised the border when audible: $(grep -oE 'edge=[^ ]+' "$SP/through.state")"
+
+f "$G_T > $G_Q + 15" \
+  && say "OK" "audible: the edge is green, $(r "$G_T-$G_Q") above rest, photographed" \
+  || say "FAIL" "there is no green border when this end is audible ($G_T vs $G_Q at rest)"
+
+# THE THREE THAT MUST BE DARK. Held is the one the feature turns on: a person
+# deciding whether to interrupt is reading the ABSENCE of this.
+f "abs($G_H - $G_Q) < 2.0" \
+  && say "OK" "held: no border, which is the signal to interrupt (Δ$(r "$G_H-$G_Q"))" \
+  || say "FAIL" "the border was up while this end was HELD (Δ$(r "$G_H-$G_Q")) -- it is telling people the opposite of the truth"
+f "abs($G_M - $G_Q) < 2.0" \
+  && say "OK" "muted, through the real mute button: no border (Δ$(r "$G_M-$G_Q"))" \
+  || say "FAIL" "a muted microphone still showed the audible border (Δ$(r "$G_M-$G_Q"))"
+f "$G_B < $G_Q + 15" \
+  && say "OK" "bidding: still no border -- it arrives when the gate opens, not when you start talking" \
+  || say "FAIL" "the border came up for a bid that was not yet audible ($G_B)"
+
+# ── AND IT MUST NOT HAVE ACQUIRED A GLOW ────────────────────────────────────
+#
+# The refused rim was 3 pt with an 18 pt shadow; this is 1.5 pt with none. A glow
+# is energy spread INWARD from the line, so it shows up as green in a band that
+# starts where the stroke ends. If the ring 4-20 pt in has picked up green,
+# something has been added to this layer that should not be there.
+HALO="$(python3 - "$SP/through.png" <<'PY'
+import sys, numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert("RGB")).astype(np.float64)
+H, W = a.shape[:2]; s = W / 1280.0
+i0, i1 = int(round(4*s)), int(round(20*s))
+m = np.zeros((H, W), bool)
+m[i0:i1, i0:W-i0] = True; m[H-i1:H-i0, i0:W-i0] = True
+m[i0:H-i0, i0:i1] = True; m[i0:H-i0, W-i1:W-i0] = True
+r, g, b = a[...,0][m], a[...,1][m], a[...,2][m]
+print(f"{float(np.mean(g - np.maximum(r, b))):.3f}")
+PY
+)"
+f "abs($HALO - $G_Q) < 2.0" \
+  && say "OK" "and no glow: the ring just inside the stroke is unchanged ($HALO vs $G_Q) -- it is a line, not a light" \
+  || say "FAIL" "green is bleeding inward from the border ($HALO vs $G_Q at rest) -- something added a shadow to it"
+
+echo "── 10. CONTROL: the border on a near-white wall"
+# ── A GREEN LINE ON A WHITE WALL ────────────────────────────────────────────
+#
+# The app is dark-only, so "survive light and dark" is about the PICTURE, which
+# is somebody's room and can be a bright window. This is the arm that would catch
+# a colour chosen only against black: the same flat field tools/glass-check.sh
+# uses, 235,233,228, fed through `--video`.
+if command -v ffmpeg >/dev/null 2>&1; then
+  python3 - "$SP" <<'PY'
+import sys
+from PIL import Image
+Image.new("RGB", (1280, 720), (235, 233, 228)).save(f"{sys.argv[1]}/flat-src.png")
+PY
+  if ffmpeg -y -loglevel error -loop 1 -i "$SP/flat-src.png" -t 40 -r 30 \
+       -c:v libx264 -qp 0 -pix_fmt yuv444p "$SP/flat.mov" 2>/dev/null; then
+    VIDEO="$SP/flat.mov" shoot floor-through litethrough || cant "the bright-wall arm never came up"
+    VIDEO="$SP/flat.mov" shoot floor-held litheld || cant "the bright-wall control never came up"
+    read -r E_LT G_LT MIC_LT CAM_LT R_LT <<<"$(measure litethrough)"
+    read -r E_LH G_LH MIC_LH CAM_LH R_LH <<<"$(measure litheld)"
+    note "on a near-white wall: audible green $G_LT, held green $G_LH"
+    f "$G_LT > $G_LH + 15" \
+      && say "OK" "the border still reads on a bright picture ($(r "$G_LT-$G_LH") of hue), because it is separated by COLOUR and not by brightness" \
+      || say "FAIL" "the green border disappears against a bright picture ($G_LT vs $G_LH)"
+  else
+    note "ffmpeg could not encode the flat field -- the bright-wall arm did not run"
+  fi
+else
+  note "no ffmpeg on this machine -- the bright-wall arm did not run, and its absence is not a pass"
+fi
 
 echo "── 5. a held microphone is still a button"
 # ── THE RIG HAS TO CLICK ────────────────────────────────────────────────────
@@ -300,6 +418,12 @@ note "live transitions on A: [$SEEN]  ($(grep -cE '^mic floor ' "$SP/gate-a.log"
 echo " $SEEN" | grep -qE "held|bidding" \
   && say "OK" "on a live call with a real gate the microphone button actually leaves 'through': [$SEEN]" \
   || say "FAIL" "the gate never reached the button on a live call -- arm 4 proved a drawing and nothing else"
+# The border on the same live evidence. Arms 9 and 10 pin the state to photograph
+# it; this is the one that says a real gate on a real call puts the border out.
+GOFF="$(grep -cE '^mic floor .* edge off' "$SP/gate-a.log")"
+[ "$GOFF" -gt 0 ] \
+  && say "OK" "and the green border really goes dark on a live call ($GOFF times), not only under a pin" \
+  || say "FAIL" "the border never went dark on a live call -- arms 9-10 proved a drawing and nothing else"
 
 live nogate "--no-gate --gate-margin 20" 8332 8333
 grep -q "connected via" "$SP/nogate-a.log" || cant "the control pair never connected"
@@ -319,6 +443,14 @@ note "control arm was awake: $CUEIN far-end vocal edges arrived"
 echo " $SEEN2" | grep -qE "held|bidding" \
   && say "FAIL" "CONTROL: with the gate OFF the button still claimed to be held: [$SEEN2]" \
   || say "OK" "CONTROL: same room, same margin, gate off -- which is what headphones do -- and it never leaves 'through' [${SEEN2:-no transitions at all}]"
+# On headphones there is nothing to hold this end back, so a person is always
+# audible and the border should never once go out. The mirror of the arm above,
+# off the same log, and the pair is what says the border tracks the GATE rather
+# than tracking a timer or the far end.
+NOFF="$(grep -cE '^mic floor .* edge off' "$SP/nogate-a.log")"
+[ "$NOFF" -eq 0 ] \
+  && say "OK" "CONTROL: and the green border never goes dark there either -- with no gate you are always through" \
+  || say "FAIL" "CONTROL: the border went dark $NOFF times on a call with no gate to hold anybody"
 
 echo "── 8. the caption is readable in one frame"
 reap
@@ -483,8 +615,9 @@ FLOOR2="$(grep -oE 'floor: yours .*' "$SP/gate-b.log" | tail -1)"
 
 echo
 if [ "$fail" = 0 ]; then
-  echo "FLOOR CHECK PASSED -- the picture is untouched, the microphone button carries"
-  echo "  the three states, a finger still reaches it, and a real gate gets there"
+  echo "FLOOR CHECK PASSED -- nothing is painted on the picture, the microphone button"
+  echo "  carries the three states, the green edge is up exactly when this end is"
+  echo "  audible, a finger still reaches the button, and a real gate gets to both"
 else
   echo "FLOOR CHECK FAILED -- see above; logs and photographs in $SP (KEEP=1 to keep them)"
 fi

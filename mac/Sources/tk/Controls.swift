@@ -2545,6 +2545,25 @@ final class CallControls: NSView {
       barGroup.content.addSubview(b)
     }
     addSubview(moreButton)
+    // ── THE GREEN EDGE GOES IN LAST ───────────────────────────────────────────
+    //
+    // After every `addSubview`, so it sits above their layers and cannot be
+    // covered. Nothing else in this window draws within two points of the frame,
+    // so this is belt and braces rather than a fix -- but a state indicator that
+    // is sometimes behind something is worse than one that is never there.
+    //
+    // It is a LAYER, so it takes no part in hit testing: `decoration-inside-a-
+    // control-eats-clicks` cost this app every glass button once, and the answer
+    // there was that a view over a control is a view a click can land on. This
+    // cannot be, at any width.
+    edge.fillColor = nil
+    edge.lineWidth = CallControls.edgeWidth
+    // `Palette.ok`, which this app already uses for "clear", "good" and the
+    // answer button. A new green would have been a second word for a thing the
+    // palette already says.
+    edge.strokeColor = Palette.ok.cgColor
+    edge.opacity = 0
+    layer?.addSublayer(edge)
     micButton.target = self; micButton.action = #selector(toggleMic)
     camButton.target = self; camButton.action = #selector(toggleCam)
     peekButton.onHold = { [weak self] on in
@@ -2690,6 +2709,9 @@ final class CallControls: NSView {
   override func layout() {
     super.layout()
     let w = bounds.width, h = bounds.height
+    // The edge follows the window, so its path is rebuilt whenever the window
+    // changes shape and never on the 30 Hz tick, which only touches opacity.
+    layoutEdge()
 
     // ── `.bar`, TRANSCRIBED ───────────────────────────────────────────────────
     //
@@ -3040,20 +3062,22 @@ final class CallControls: NSView {
   //   bidding   I have started talking and am about to be heard
   //   held      the other person has the floor and I am not getting through
   //
-  // MUTED IS NOT ONE OF THEM. It is already unmistakable -- red glyph, slash --
-  // and it is the person's own decision, so dimming it as well would be saying
-  // the same thing twice in two vocabularies. `micFloor` stays `.through` while
-  // muted and the arithmetic below never runs.
+  // MUTED IS ITS OWN CASE, and it draws at FULL ink. It is already unmistakable
+  // -- red glyph, slash -- and it is the person's own decision, so dimming it as
+  // well would be saying the same thing twice in two vocabularies. It is a case
+  // rather than a flag beside the enum because the green edge below has to tell
+  // it apart from `through`, and two booleans answering one question is how this
+  // file has been bitten before.
   enum MicFloor: String {
-    case through, bidding, held
+    case through, bidding, held, muted
     /// What the glyph draws at. `held` is 0.34 rather than something fainter
     /// because the ink has to stay clearly PRESENT: the reading is "this one is
     /// quieter than its neighbours", never "this one is missing".
     var reach: CGFloat {
       switch self {
-      case .through: return 1.00
-      case .bidding: return 0.66
-      case .held:    return 0.34
+      case .through, .muted: return 1.00
+      case .bidding:         return 0.66
+      case .held:            return 0.34
       }
     }
   }
@@ -3073,7 +3097,50 @@ final class CallControls: NSView {
   /// testing its own override.
   var floorPin: MicFloor?
 
-  /// What the gate is actually doing to this end's voice, right now.
+  // ── THE GREEN EDGE ─────────────────────────────────────────────────────────
+  //
+  // Asked for in these words: "we will need a green edge border or something
+  // like that, very thin, which when you are actually audible is visible, so that
+  // you know for sure that you are audible -- that's the visual confirmation that
+  // you're allowed to speak and you can speak. And people interrupt when the
+  // green thing is not visible, but when they actually say something it becomes
+  // visible, and then they can go say it."
+  //
+  // ── AND WHY THIS IS NOT THE THING THAT WAS REFUSED ────────────────────────
+  //
+  // The rim deleted in the commit before this one was three points wide with an
+  // eighteen-point glow, BREATHING at 0.55 Hz, and it reported the FAR end taking
+  // the floor. This is one and a half points, steady, no shadow, no gradient, no
+  // pulse, and it reports THIS end actually reaching the other person. One is
+  // decoration applied to the picture; the other is a state indicator, and the
+  // difference is not the width -- it is that this one only ever says a fact
+  // about the person looking at it, and says it without moving.
+  //
+  // If a glow, a pulse, a gradient or a breath ever gets added to this layer it
+  // has become the other thing. There is a photographed assertion in
+  // `tools/floor-check.sh` that the edge does not change when the FAR end takes
+  // the floor, which is exactly the old bug wearing a new colour.
+  //
+  // A layer and not a `draw(_:)`, for the reason the old one gave and got right:
+  // the alternative is invalidating a 1280x720 view thirty times a second to
+  // repaint two hundred pixels of stroke.
+  private let edge = CAShapeLayer()
+  /// 0...1, eased. Not a bool, because a gate transition every few hundred
+  /// milliseconds would otherwise strobe the whole window edge.
+  private var edgeOn: CGFloat = 0
+  /// Very thin, and 1.5 rather than 1 so it is three whole pixels on a 2x screen
+  /// rather than two -- a 1 pt stroke inset by 0.5 lands on a half-pixel boundary
+  /// and comes out as two grey rows instead of one green one.
+  static let edgeWidth: CGFloat = 1.5
+
+  /// What the gate is actually doing to this end's voice, right now: the word the
+  /// microphone glyph draws with, and whether this person is genuinely reaching
+  /// the far end.
+  ///
+  /// ONE FUNCTION RETURNING BOTH, from a single read of the gate. They are two
+  /// renderings of one fact and they must never be able to disagree -- the glyph
+  /// saying `through` while the edge is dark would be the app contradicting
+  /// itself about the only thing either of them is for.
   ///
   /// Read straight off `Audio.sharedGate` rather than pushed in from the audio
   /// thread. Two reasons, and the second is the real one: a push would need a new
@@ -3083,16 +3150,37 @@ final class CallControls: NSView {
   /// 32-bit floats written by the capture thread; the subtitle thread in
   /// main.swift already reads exactly this pair the same way, and a display that
   /// reads a stale float for one frame at 30 Hz is not a defect anybody can see.
-  private func floorNow() -> MicFloor {
-    if let p = floorPin { return p }
-    guard !micMuted, startedAt != nil else { return .through }
+  private func floorNow() -> (MicFloor, Bool) {
+    if let p = floorPin { return (p, p == .through) }
+    // MUTED IS NEVER AUDIBLE, and that is the case the edge exists to be honest
+    // about: the glyph stays at full ink because the slash is already saying it,
+    // and the edge goes dark because the words are not arriving.
+    if micMuted { return (.muted, false) }
+    // NOBODY TO REACH. Before the other person arrives there is no such thing as
+    // being audible to them, so the edge stays dark rather than promising a
+    // through-line to an empty room.
+    guard startedAt != nil else { return (.through, false) }
     let g = Audio.sharedGate
     // The same test main.swift uses to decide whether a sentence needs
     // subtitling: "is my voice reaching them". Written once there and once here
     // is once too many, but the alternative is a cross-file dependency for a
     // threshold, and this comment is the link.
-    if g.gain * g.yieldGainNow > 0.5 { return .through }
-    return g.vocal == .claim ? .bidding : .held
+    if g.gain * g.yieldGainNow > 0.5 { return (.through, true) }
+    return (g.vocal == .claim ? .bidding : .held, false)
+  }
+
+  /// Concentric with the window's own corner and inset by half the stroke, so the
+  /// line lands INSIDE the window rather than straddling an edge the compositor
+  /// is about to round away.
+  private func layoutEdge() {
+    let ins = CallControls.edgeWidth / 2
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    edge.frame = bounds
+    edge.path = CGPath(roundedRect: bounds.insetBy(dx: ins, dy: ins),
+                       cornerWidth: max(0, Metric.windowRadius - ins),
+                       cornerHeight: max(0, Metric.windowRadius - ins), transform: nil)
+    CATransaction.commit()
   }
 
   private func wakeFloor() {
@@ -3111,7 +3199,7 @@ final class CallControls: NSView {
     let now = CACurrentMediaTime()
     let dt = CGFloat(min(0.1, max(0.001, now - floorLastTick)))
     floorLastTick = now
-    let want = floorNow()
+    let (want, audible) = floorNow()
     // ── A RECORD, NOT FIVE SNAPSHOTS ─────────────────────────────────────────
     //
     // Printed on the CHANGE. A rig that samples this through the audit line sees
@@ -3123,8 +3211,9 @@ final class CallControls: NSView {
     // visible in one line rather than inferred from two.
     if want != micFloor, ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
       let g = Audio.sharedGate
-      fputs(String(format: "mic floor %.3f  %@ -> %@  (gain %.2f x yield %.2f, vocal %d%@)\n",
+      fputs(String(format: "mic floor %.3f  %@ -> %@  edge %@  (gain %.2f x yield %.2f, vocal %d%@)\n",
                    Date().timeIntervalSince1970, micFloor.rawValue, want.rawValue,
+                   audible ? "on" : "off",
                    g.gain, g.yieldGainNow, g.vocal.rawValue,
                    floorPin != nil ? ", PINNED" : ""), stderr)
     }
@@ -3142,10 +3231,29 @@ final class CallControls: NSView {
     if abs(target - micReach) < 0.004 { micReach = target }
     micButton.reach = micReach
 
+    // ── THE EDGE, ON THE SAME CLOCK AND THE SAME CONSTANTS ───────────────────
+    //
+    // 60 ms on, 300 ms off, identical to the glyph beside it: they are two
+    // renderings of one fact, so easing them differently would let a person watch
+    // them disagree. Quick on because the whole promise is "you are through now,
+    // go ahead" and a person mid-interruption is waiting for exactly that;
+    // slower off because a gate that ticks shut around one syllable of theirs
+    // must not strobe the window.
+    let eTarget: CGFloat = audible ? 1 : 0
+    edgeOn += (eTarget - edgeOn) * min(1, dt / (eTarget > edgeOn ? 0.06 : 0.30))
+    if abs(eTarget - edgeOn) < 0.004 { edgeOn = eTarget }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)   // or every frame animates over 0.25 s
+    // NO shadow, NO gradient, NO breath -- see the note on `edge`. Opacity is the
+    // only property that moves and it moves only because the gate did.
+    edge.opacity = Float(edgeOn)
+    CATransaction.commit()
+
     // Stop when there is nothing to watch: fully through, settled, and a second
     // of that. It cannot miss the START of a hold -- see `setFloor` above for why
     // there is exactly one thing that can begin one and why it wakes this.
-    floorSettled = (want == .through && micReach >= 0.999) ? floorSettled + 1 : 0
+    let still = micReach >= 0.999 && abs(eTarget - edgeOn) < 0.004
+    floorSettled = (want == .through && still) ? floorSettled + 1 : 0
     if floorSettled > 30 {
       floorTimer?.invalidate(); floorTimer = nil
     }
@@ -3154,7 +3262,15 @@ final class CallControls: NSView {
   /// The word for the audit line, plus where the ease has actually got to, so an
   /// assertion can be made about the DRAWING and not only about the decision.
   var micFloorState: String {
-    micMuted ? "muted" : "\(micFloor.rawValue)/\(String(format: "%.2f", micReach))"
+    "\(micFloor.rawValue)/\(String(format: "%.2f", micReach))"
+  }
+  /// The green edge, as the layer is actually drawing it. A separate field from
+  /// `micfloor` on purpose: they answer two questions -- "how much of my voice is
+  /// getting out" and "am I through, yes or no" -- and the whole point of the
+  /// edge is the second one. A rig can assert this without a photograph; the
+  /// photograph is what proves the layer agrees with it.
+  var edgeState: String {
+    (edgeOn > 0.5 ? "on" : "off") + "/" + String(format: "%.2f", edgeOn)
   }
 
   /// Flattens foreign text for the one-line state dump. See `clip=` in
@@ -3252,9 +3368,9 @@ final class CallControls: NSView {
     micButton.off = micMuted
     // Muting has to take the glyph back to full ink in the same breath, or a
     // microphone that was being HELD when you pressed it stays half-drawn in red
-    // and reads as a mute that half worked. `floorNow` already answers `.through`
-    // while muted; this is what makes the drawing agree without waiting a frame.
-    if micMuted { micReach = 1; micFloor = .through; micButton.reach = 1 }
+    // and reads as a mute that half worked. `floorNow` already answers `.muted`
+    // here; this is what makes the drawing agree without waiting a frame.
+    if micMuted { micReach = 1; micFloor = .muted; micButton.reach = 1 }
     wakeFloor()
     // The button says it happened. A mute is invisible by definition -- there is no
     // change on screen to confirm it except the glyph turning red, and a colour
@@ -4488,7 +4604,7 @@ final class CallControls: NSView {
       // disagree -- this file has paid for that before. Without the number an
       // assertion can only see that the app CHOSE a state, which is exactly the
       // half that was never the bug here.
-      + "  micfloor=\(micFloorState)"
+      + "  micfloor=\(micFloorState) edge=\(edgeState)"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"
       + "  more=\(moreOpen ? "open" : "closed") peek=\(peeking)\(peekButton.holding ? "/held" : "")"
       // A CUMULATIVE count, not a flag. A boolean sampled after the fact is a birth
