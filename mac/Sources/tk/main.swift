@@ -263,7 +263,7 @@ let KNOWN_FLAGS: Set<String> = [
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
   "ring-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
-  "watch", "watch-install", "watch-remove", "watch-status", "incoming",
+  "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
@@ -1252,6 +1252,17 @@ if let from = arg("incoming"), let r = arg("room") {
     Ringer.start(raising: display?.callWindow)
   }
 }
+// ── WHO THIS IMAGE IS RINGING ──────────────────────────────────────────────
+//
+// The mirror of `--incoming`, and it exists because placing a call RE-EXECS. The
+// process that sent the ring dies at `execv`; its successor knows only that it is
+// alone in a room, so it drew the ordinary waiting card -- "Waiting for the other
+// person…" over an invite link, pixel-identical to an app somebody had just
+// opened. The one thing the caller needed to know, the name of the person being
+// rung, was the one thing the re-exec threw away.
+if let who = arg("calling") {
+  DispatchQueue.main.async { display?.controls?.showOutgoing(to: who) }
+}
 startRingingOnce()
 display?.controls?.onCall = { who in
   // Off main: signing and an HTTPS round trip, on the thread that draws.
@@ -1264,13 +1275,19 @@ display?.controls?.onCall = { who in
       // anything else means we could not put it there. Neither says whether they
       // are awake, and silence is indistinguishable from away by design.
       display?.controls?.setStatus("could not reach @\(who)")
+      // On the card too. The status pill is four words in a corner; the card is
+      // where the person is looking, and it is currently showing them a ring that
+      // is not happening.
+      display?.controls?.showCallFailed("Couldn't reach @\(who)",
+                                        because: "check the name, or try again in a moment")
       return
     }
     Metrics.count("ring_sent_ok")
     Metrics.mark("ring_sent_ms", sinceLaunch())
     DispatchQueue.main.async {
       display?.controls?.setStatus("ringing @\(who)…")
-      Launcher.reexec(room: got, extra: ["--video", "camera", "--window"], why: "call placed")
+      Launcher.reexec(room: got, extra: ["--video", "camera", "--window", "--calling", who],
+                      why: "call placed")
     }
   }.start()
 }

@@ -1276,7 +1276,19 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // The panel went with the words. A panel exists to hold text on top of a moving
   // picture; with no text there is nothing to hold, and a pane of glass around a
   // pane of glass was the thing that made this read as a dialog.
-  enum Mode: String { case invite, dial, ringing }
+  // ── PLACING A CALL IS A STATE, AND IT LOOKED LIKE NO STATE AT ALL ─────────
+  //
+  // `calling` and `noAnswer` are the caller's half of `ringing`, and their absence
+  // was a real bug: placing a call re-execs into the new room, the successor knows
+  // only that it is in a room by itself, and so it drew the ordinary waiting card
+  // -- "Waiting for the other person…" over an invite link. Identical, to the
+  // pixel, to an app that had just been opened and was doing nothing.
+  //
+  // So the person who pressed call saw no name, no progress and no way to stop,
+  // and had to guess between "it is ringing" and "it crashed". The two states are
+  // built here as one screen with two sides on purpose: whatever the person
+  // ringing sees, the person being rung should see the mirror of.
+  enum Mode: String { case invite, dial, ringing, calling, noAnswer }
   /// One value decides what is on screen, so two states cannot both be. This was
   /// three booleans that had to agree, and the ringing state got its visibility
   /// from a different one than its layout did.
@@ -1333,6 +1345,32 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
                                     help: "Call someone by name", variant: .regular)
   private let answerButton = PillButton("answer")
   private let declineButton = PillButton("decline")
+  private let cancelButton = PillButton("cancel")
+  private let againButton = PillButton("try again")
+  // ── SOMETHING THAT IS OBVIOUSLY ALIVE ─────────────────────────────────────
+  //
+  // The complaint this whole state answers is "you don't know if you're calling or
+  // something crashed", and a caption alone cannot settle that -- a frozen app
+  // shows its last caption perfectly. Three dots taking turns cannot be a
+  // screenshot of a dead process.
+  //
+  // Layers with their own animations rather than a timer retitling the label: the
+  // panel is sized to its widest child, so text that grows and shrinks four times
+  // a second would resize the card four times a second. These are drawn at a fixed
+  // place and the layout never hears about them.
+  // ── AND THEY HAVE TO BE ABOVE THE PANEL ───────────────────────────────────
+  //
+  // These began as sublayers of the CARD's own layer, which is below `panel` --
+  // a subview added on top of it. They animated perfectly, behind a pane of
+  // glass, and the photograph showed a card with a considerate empty gap in it
+  // where the one moving thing was supposed to be. A layer added to `self.layer`
+  // is under every subview, and the panel is a subview.
+  //
+  // A view of their own, added after the panel, puts them where the title and the
+  // hint already are.
+  private let dotsView = NSView()
+  private let dots = [CALayer(), CALayer(), CALayer()]
+  private var calleeName = ""
 
   /// Kept separately from `urlField.stringValue`, which the copy confirmation
   /// borrows for two seconds. Reading the link back out of the label would hand
@@ -1351,6 +1389,13 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   var onCall: ((String) -> Void)?
   var onAnswer: (() -> Void)?
   var onDecline: (() -> Void)?
+  /// Stop calling. There is no un-ring -- the ring is already in their mailbox and
+  /// they may still answer -- so this ends the call this side, exactly as hanging
+  /// up on a phone that is still ringing does.
+  var onCancelCall: (() -> Void)?
+  /// The card gave up. The pill says what the card says, or it sits there reading
+  /// "calling @meera…" underneath a card that has stopped calling anybody.
+  var onCallGaveUp: ((String) -> Void)?
 
   /// Somebody is ringing. Set to switch the card from "invite" to "answer".
   private(set) var incoming: (from: String, room: String)?
@@ -1363,6 +1408,62 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     applyMode()
   }
 
+  /// This app is ringing somebody. The mirror of `setIncoming`.
+  func setOutgoing(to who: String) {
+    calleeName = who
+    title.stringValue = "Calling @\(who)"
+    hint.stringValue = "you will both be in the same room when they answer"
+    mode = .calling
+    applyMode()
+    startRingTimeout()
+  }
+
+  /// They picked up. Separate from "the card was hidden": the card is hidden and
+  /// shown for several reasons, and a ring that is still counting down behind a
+  /// hidden card will eventually declare no-answer in the middle of the call it
+  /// is answering -- then show that verdict the moment the other person steps
+  /// away and the card comes back.
+  func callAnswered() {
+    ringTimer?.invalidate(); ringTimer = nil
+    guard mode == .calling || mode == .noAnswer else { return }
+    calleeName = ""
+    mode = .invite
+    applyMode()
+  }
+
+  /// Nobody picked up. Not an error -- a person who was not at their Mac.
+  private func ringTimedOut() {
+    guard mode == .calling else { return }
+    setCallFailed("@\(calleeName) didn\u{2019}t answer",
+                  because: "their Mac may be closed — you can try again")
+  }
+
+  /// The two ways a call can fail to start, in one state. A ring that could not be
+  /// delivered and a ring nobody answered look different from here and identical
+  /// to the person waiting: no call. What differs is the sentence.
+  func setCallFailed(_ line: String, because why: String) {
+    guard mode == .calling else { return }
+    title.stringValue = line
+    hint.stringValue = why
+    mode = .noAnswer
+    applyMode()
+    onCallGaveUp?(line)
+  }
+
+  // ── A CADENCE WITH A RIG OVERRIDE ─────────────────────────────────────────
+  //
+  // 45 s is about as long as a phone rings. A test that had to sit through it
+  // would be a test nobody runs, so the wait is settable from the environment and
+  // the product's own number is the default.
+  private var ringTimer: Timer?
+  private func startRingTimeout() {
+    ringTimer?.invalidate()
+    let secs = Double(ProcessInfo.processInfo.environment["TK_RING_TIMEOUT"] ?? "") ?? 45
+    let t = Timer(timeInterval: secs, repeats: false) { [weak self] _ in self?.ringTimedOut() }
+    RunLoop.main.add(t, forMode: .common)
+    ringTimer = t
+  }
+
   func clearIncoming() {
     guard incoming != nil || mode == .ringing else { return }
     incoming = nil
@@ -1373,16 +1474,24 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// One place decides what is on screen.
   private func applyMode() {
     let m = mode
-    panel.isHidden = m != .ringing
-    title.isHidden = m != .ringing
-    hint.isHidden = m != .ringing
+    // The three states that say a person's name are the three that need a surface
+    // under the words. `invite` and `dial` are two controls on the picture.
+    let worded = m == .ringing || m == .calling || m == .noAnswer
+    panel.isHidden = !worded
+    title.isHidden = !worded
+    hint.isHidden = !worded
     urlGlass.isHidden = m != .invite
     urlField.isHidden = m != .invite
     dialGlass.isHidden = m != .dial
     dialField.isHidden = m != .dial
-    callIcon.isHidden = m == .ringing
+    callIcon.isHidden = worded
     answerButton.isHidden = m != .ringing
     declineButton.isHidden = m != .ringing
+    cancelButton.isHidden = m != .calling && m != .noAnswer
+    againButton.isHidden = m != .noAnswer
+    dotsView.isHidden = m != .calling
+    if m == .calling { startDots() } else { stopDots() }
+    if m != .calling { ringTimer?.invalidate(); ringTimer = nil }
     // The same circle means "ask me who" and then "ring them". Saying so is the
     // difference between a button that changed and a button that moved.
     callIcon.toolTip = m == .dial ? "Call this name" : "Call someone by name"
@@ -1572,6 +1681,19 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     callIcon.action = #selector(callIconPressed)
     addSubview(callIcon)
 
+    cancelButton.tint = Palette.fg
+    againButton.prominent = true
+    addSubview(cancelButton)
+    addSubview(againButton)
+    dotsView.wantsLayer = true
+    // Decoration. It must never take a click that belongs to the card underneath.
+    dotsView.isHidden = true
+    addSubview(dotsView)
+    for d in dots {
+      d.backgroundColor = Palette.fg.cgColor
+      d.cornerRadius = 3
+      dotsView.layer?.addSublayer(d)
+    }
     answerButton.tint = Palette.ok
     // Deliberately NO `onPress` on these two: the card routes them through
     // mouseDown/mouseUp below so they commit on release. Wiring `onPress` as well
@@ -1606,6 +1728,31 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     leaveDial()
   }
 
+  // Phase-shifted so they take turns rather than blinking together, which reads as
+  // a fault light rather than as waiting.
+  private func startDots() {
+    for (i, d) in dots.enumerated() where d.animation(forKey: "pulse") == nil {
+      let a = CABasicAnimation(keyPath: "opacity")
+      a.fromValue = 0.25; a.toValue = 1.0
+      a.duration = 0.55
+      a.autoreverses = true
+      a.repeatCount = .infinity
+      a.beginTime = CACurrentMediaTime() + Double(i) * 0.18
+      a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      d.add(a, forKey: "pulse")
+    }
+  }
+  private func stopDots() { for d in dots { d.removeAnimation(forKey: "pulse") } }
+
+  /// Whether the waiting dots are actually running, for the state dump. "The
+  /// layer exists" and "it is animating" are two claims and only the second one is
+  /// the reassurance this state is for.
+  var dotsAlive: Bool { dots.allSatisfy { $0.animation(forKey: "pulse") != nil } }
+
+  /// What the card is saying, when it is saying anything. Empty in the two states
+  /// that are controls rather than sentences.
+  var cardWords: String { title.isHidden ? "" : title.stringValue }
+
   @objc private func callIconPressed() {
     if mode == .dial { dialConfirmed() } else { enterDial() }
   }
@@ -1626,6 +1773,8 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   var clickTargets: [(String, NSView)] {
     switch mode {
     case .ringing: return [("answer", answerButton), ("decline", declineButton)]
+    case .calling: return [("cancel", cancelButton)]
+    case .noAnswer: return [("again", againButton), ("cancel", cancelButton)]
     case .invite: return [("link", urlGlass), ("call", callIcon)]
     case .dial: return [("dial", dialField), ("call", callIcon)]
     }
@@ -1647,7 +1796,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     // second, press-to-commit path to starting a call.
     if !dialField.isHidden, dialGlass.frame.contains(p) { return dialField }
     if !callIcon.isHidden, callIcon.frame.contains(p) { return callIcon }
-    for v in [urlGlass, answerButton, declineButton]
+    for v in [urlGlass, answerButton, declineButton, cancelButton, againButton]
     where !v.isHidden && v.frame.contains(p) { return self }
     return nil
   }
@@ -1667,7 +1816,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   override func mouseDown(with event: NSEvent) {
     let p = convert(event.locationInWindow, from: nil)
     armed = nil
-    for v in [answerButton, declineButton] as [NSView]
+    for v in [answerButton, declineButton, cancelButton, againButton] as [NSView]
     where !v.isHidden && v.frame.contains(p) { armed = v; return }
     if !urlGlass.isHidden, urlGlass.frame.contains(p) { onCopy?(); return }
     super.mouseDown(with: event)
@@ -1682,6 +1831,12 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     }
     if v === answerButton { onAnswer?() }
     else if v === declineButton { onDecline?() }
+    else if v === cancelButton { onCancelCall?() }
+    else if v === againButton {
+      let who = calleeName
+      setOutgoing(to: who)
+      onCall?(who)
+    }
   }
 
   /// The hand is the affordance. With the `copy` button gone it is the only thing
@@ -1714,6 +1869,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   override func layout() {
     super.layout()
     let cx = bounds.midX, cy = bounds.midY
+    let worded = mode == .ringing || mode == .calling || mode == .noAnswer
     let gap = Metric.s2
     let uh = Metric.fieldHeight
 
@@ -1751,16 +1907,30 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     let boxW = min(max(max(linkText, dialText) + Metric.s6, 180), bounds.width * 0.7)
     let rowW = boxW + gap + callIcon.frame.width
 
-    if mode == .ringing {
+    // ── THE THREE STATES THAT SAY A NAME SHARE ONE LAYOUT ─────────────────────
+    //
+    // Deliberately, and it is the whole point of the change: the person ringing
+    // and the person being rung are looking at the same card in the same place
+    // with the same shape, so neither of them has to work out which side of the
+    // call they are on. Only the words and the buttons differ.
+    if worded {
       let pad = Metric.cardPad
       let titleH: CGFloat = 24, hintH: CGFloat = 16
-      let ringRowW = answerButton.frame.width + gap + declineButton.frame.width
+      let row: [PillButton]
+      switch mode {
+      case .ringing: row = [answerButton, declineButton]
+      case .calling: row = [cancelButton]
+      case .noAnswer: row = [againButton, cancelButton]
+      default: row = []
+      }
+      let rowW = row.reduce(0) { $0 + $1.frame.width } + gap * CGFloat(max(0, row.count - 1))
       // A card has to be as wide as its widest CHILD, and the words are children:
       // sized from the row alone, the hint read "answer and you will both be in
       // the sa", clipped mid-word by a panel built around two small pills.
-      let contentW = max(ringRowW, textW(title), textW(hint))
+      let contentW = max(rowW, textW(title), textW(hint))
       let panelW = min(bounds.width - Metric.gutter * 2, contentW + pad * 2)
-      let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + uh + pad
+      let dotsH: CGFloat = mode == .calling ? Metric.s6 : 0
+      let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + dotsH + uh + pad
       panel.frame = NSRect(x: cx - panelW / 2, y: cy - panelH / 2,
                            width: panelW, height: panelH)
       panel.radius = Metric.cardRadius
@@ -1768,12 +1938,30 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
       title.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: titleH)
       y -= Metric.s1 + hintH
       hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
-      y -= Metric.s5 + uh
-      var ax = cx - ringRowW / 2
-      answerButton.frame.origin = NSPoint(x: ax, y: y + (uh - answerButton.frame.height) / 2)
-      ax += answerButton.frame.width + gap
-      declineButton.frame.origin = NSPoint(x: ax, y: y + (uh - declineButton.frame.height) / 2)
-      // The ringing state still has the card it was drawn for, so it keeps the
+      y -= Metric.s5
+      if mode == .calling {
+        // No implicit animation on the placement. A CALayer animates its own frame
+        // by default, so every layout pass would slide the dots across the card --
+        // on top of the pulse they are running, which is the one motion here that
+        // is supposed to mean something.
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        let d: CGFloat = 6, dg: CGFloat = 7
+        let w = d * 3 + dg * 2
+        dotsView.frame = NSRect(x: cx - w / 2, y: y - dotsH / 2 - d / 2, width: w, height: d)
+        var dx: CGFloat = 0
+        for dot in dots {
+          dot.frame = CGRect(x: dx, y: 0, width: d, height: d)
+          dx += d + dg
+        }
+        CATransaction.commit()
+      }
+      y -= dotsH + uh
+      var ax = cx - rowW / 2
+      for b in row {
+        b.frame.origin = NSPoint(x: ax, y: y + (uh - b.frame.height) / 2)
+        ax += b.frame.width + gap
+      }
+      // These states still have the card the wash was drawn for, so they keep the
       // window-wide wash it was drawn with.
       wash.frame = bounds
       setWash(alpha: 0.55)
@@ -2154,6 +2342,15 @@ final class CallControls: NSView {
     // doorbell that is not wired, which the field used to be missing.
     waiting.onCall = { [weak self] h in self?.dial(h) }
     waiting.onAnswer = { [weak self] in self?.onAnswerRing?() }
+    // Through the leave that is already wired, rather than a second path out of a
+    // call. There is no un-ring to send -- the ring is in their mailbox and they
+    // may still answer -- so cancelling is hanging up on a phone still ringing.
+    waiting.onCallGaveUp = { [weak self] line in self?.setStatus(line.lowercased()) }
+    waiting.onCancelCall = { [weak self] in
+      Metrics.tap("cancel_call")
+      self?.setStatus("call cancelled")
+      self?.onLeave?()
+    }
     waiting.onDecline = { [weak self] in
       self?.waiting.clearIncoming()
       self?.setStatus("declined")
@@ -2372,6 +2569,10 @@ final class CallControls: NSView {
       // Re-stated, not trusted. `inviteText`'s observer is what normally pushes the
       // URL into the card, and it last ran before the call; this is the one place
       // that reads it back out after a whole call has happened.
+      // They picked up. Stops the no-answer countdown, which would otherwise fire
+      // in the middle of the call it is measuring and leave that verdict waiting
+      // on the card for the moment the other person steps away.
+      if present { self.waiting.callAnswered() }
       if !present { self.waiting.url = self.inviteText }
       // A ring that arrived and was never answered must not be sitting on this
       // card when the peer leaves and it comes back -- the room in it is long
@@ -2631,6 +2832,11 @@ final class CallControls: NSView {
       setStatus("link copied — send it to @\(h)")
       return
     }
+    // Before the round trip, not after it. Signing and an HTTPS ring take long
+    // enough to notice, and this is precisely the gap the person was staring into.
+    // The successor process re-enters the same state from `--calling`, so the card
+    // is continuous across the re-exec rather than blinking back to the link.
+    waiting.setOutgoing(to: h)
     setStatus("calling @\(h)…")
     ring(h)
   }
@@ -2651,6 +2857,24 @@ final class CallControls: NSView {
   }
 
   func hideIncoming() { onMain { [weak self] in self?.waiting.clearIncoming() } }
+
+  /// This Mac is ringing somebody. The mirror of `showIncoming`, and the reason
+  /// the caller no longer stares at an invite link wondering if it worked.
+  func showOutgoing(to who: String) {
+    onMain { [weak self] in
+      guard let self, !self.sawPeer else { return }
+      self.waiting.setOutgoing(to: who)
+      self.setStatus("calling @\(who)…")
+      self.nudgeBar()
+    }
+  }
+
+  /// The ring could not be delivered at all. Said on the card, not only in the
+  /// status pill: the pill is four words in a corner and the card is what the
+  /// person is looking at.
+  func showCallFailed(_ line: String, because why: String) {
+    onMain { [weak self] in self?.waiting.setCallFailed(line, because: why) }
+  }
 
   /// True once the far end has been seen, which is what makes a ring untimely.
   private var sawPeer = false
@@ -3455,6 +3679,12 @@ final class CallControls: NSView {
       // the field could be focused and typed into and could not show that the
       // letters arrived -- an instrument blind to the one thing the step is for.
       + (waiting.mode == .dial ? "  dialtext=\"\(waiting.dialText)\"" : "")
+      // The card's own words, which are the whole of the calling state, and
+      // whether the dots are ANIMATING rather than merely present -- "it is on
+      // screen" and "it is visibly alive" are two claims and this state exists
+      // entirely for the second one.
+      + (waiting.cardWords.isEmpty ? "" : "  says=\"\(waiting.cardWords)\"")
+      + (waiting.mode == .calling ? "  dots=\(waiting.dotsAlive ? "alive" : "STILL")" : "")
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"

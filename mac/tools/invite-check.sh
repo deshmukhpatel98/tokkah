@@ -38,14 +38,28 @@ L="$SP/a.log"
 #   @call      the handset: the link goes, the question arrives
 #   +meera     type a name into whatever that focused
 #   ?          read it back
-#   @call      the handset again: now it means "ring them"
-#   ?          and the card is a link again
-#   @call/esc  reopen, then cancel with a real Escape
+#   esc        a real Escape -- the question goes, the link comes back
+#   ?          confirm it did
+#   @call/+meera/@call   and this time go through with it
+#
+# There is deliberately no token after that last press. Placing a call RE-EXECS,
+# and `Launcher.reexec` drops `--press` on purpose so the successor does not
+# replay the sequence and place a second call. Anything queued behind the press
+# therefore never runs, and a `?` written there would read as an audit that
+# vanished. The press's own `click ... -> <tree>` line is the last thing this
+# image says, so that is what gets read.
+#
+# Escape is tested BEFORE the call is placed, deliberately. It used to be tested
+# after, back when placing a call left the invite card up -- and the moment the
+# caller got a card of their own, that step was asserting that Escape cancels a
+# call in flight. It does not, and it should not: Escape dismisses a question, and
+# there is a `cancel` button for ending a call precisely because ending one should
+# take aim. `calling-check.sh` owns everything past the press.
 spawn "$TK" --window --room "$R" --listen 7981 --peer 127.0.0.1:7982 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
-      --press-after 2 --press "?,@link,@call,+meera,?,@call,?,@call,esc,?" \
+      --press-after 2 --press "?,@link,@call,+meera,?,esc,?,@call,+meera,@call" \
       > "$L" 2>&1
-perl -e 'select undef,undef,undef,12'
+perl -e 'select undef,undef,undef,14'
 reap
 
 # ── DID IT EVEN RUN? ────────────────────────────────────────────────────────
@@ -115,10 +129,23 @@ grep -q 'status=calling @meera…' "$L" \
 # ── 5. ESCAPE PUTS THE LINK BACK ────────────────────────────────────────────
 # Posted to the app queue, not handed to a handler: the key has to survive the
 # field editor, which is the only reason this line can fail.
-tail=$(grep -o 'card=[a-z]*' "$L" | tail -1)
-[ "$tail" = "card=invite" ] \
+esc=$(grep '^audit state' "$L" | sed -n '3p' | grep -o 'card=[a-zA-Z]*')
+[ "$esc" = "card=invite" ] \
   && say "OK" "Escape cancelled the question and the link came back" \
-  || say "FAIL" "after Escape the card was [$tail]"
+  || say "FAIL" "after Escape the card was [$esc]"
+
+# ── 6. AND GOING THROUGH WITH IT LEAVES THE CALLER SOMETHING TO LOOK AT ─────
+# The shallow end of it only -- that the press does not dump the caller back on
+# the invite link, which is the bug `calling-check.sh` exists for.
+#
+# From the PRESS's own line, not from the last `audit state` in the file. The last
+# audit in this log is the one after Escape, three tokens earlier, because the
+# re-exec ended the image before any later token could run -- so `tail -1` reported
+# a true reading of the wrong moment, which is the most expensive kind.
+tail=$(grep 'click call: sent' "$L" | tail -1 | grep -o 'card=[a-zA-Z]*')
+[ "$tail" = "card=calling" ] \
+  && say "OK" "and placing the call leaves the calling card up, not the link" \
+  || say "FAIL" "after placing the call the card was [$tail]"
 
 echo
 if [ "$fail" = 0 ]; then

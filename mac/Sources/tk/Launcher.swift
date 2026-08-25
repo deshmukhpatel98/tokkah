@@ -689,7 +689,12 @@ enum Launcher {
       // whole sequence -- so a test that pressed `call` once placed a second
       // call from the new image, and a rig that double-fires is a rig that
       // cannot tell you whether the thing under test fired once.
-      if t == "--gui" || t == "--call" || t == "--incoming"
+      // `--calling` belongs to ONE image: the successor of the process that sent
+      // the ring. If that image re-execs again -- answering somebody else, a
+      // deferred update -- carrying it forward would put a "Calling @meera" card
+      // over a call that has nothing to do with meera. Same rule as `--incoming`
+      // one line up: a call being placed is an event, not a property of the room.
+      if t == "--gui" || t == "--call" || t == "--incoming" || t == "--calling"
         || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
       seen.insert(t)
       args.append(t)
