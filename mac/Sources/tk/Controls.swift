@@ -3802,7 +3802,7 @@ final class CallControls: NSView {
     if people.isEmpty {
       // NOT an empty panel, and not a greyed row. The truthful thing to say is how
       // somebody gets one, and this is the whole of it.
-      items.append(SheetHint("Call someone once and they'll show up here."))
+      items.append(SheetHint("Talk to someone once and they’ll show up here."))
     }
     for h in people {
       let r = ContactRow(handle: h)
