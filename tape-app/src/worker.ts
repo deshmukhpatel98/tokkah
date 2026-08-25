@@ -232,7 +232,135 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/xlate')) return this.xlate(request);
     if (url.pathname.endsWith('/lab') && request.method === 'POST') return this.lab(request);
     if (url.pathname.endsWith('/rv')) return this.rendezvous(url);
+    // ── The doorbell. THESE MUST RETURN BEFORE signal() BELOW. ───────────────
+    // signal() answers 426 "expected websocket" to anything without an upgrade
+    // header, so a handler added after the fallthrough is inert behind a
+    // perfectly plausible-looking log line. Under this DO name ("inbox:<handle>")
+    // there is no call and no socket — only a mailbox.
+    if (url.pathname.endsWith('/kin/register')) return this.kinRegister(request, url);
+    if (url.pathname.endsWith('/kin/ring')) return this.kinRing(request, url);
+    if (url.pathname.endsWith('/kin/poll')) return this.kinPoll(url);
+    if (url.pathname.endsWith('/kin/quiet')) return this.kinQuietSet(request, url);
     return this.signal(request);
+  }
+
+  // ── Mailbox state: in memory, exactly like rvPeers above ──────────────────
+  //
+  // Keyed by handle even though this DO is already per-handle: it keeps the pure
+  // functions general enough to test, and a misrouted request lands in a key
+  // nobody polls instead of in somebody else's mailbox.
+  private kinBox = new Map<string, KinStored[]>();
+  // One map for every in-DO window (pair:, to:, poll:, bad:, reg:). Distinct key
+  // prefixes mean the budgets cannot spend each other.
+  private kinHits = new Map<string, number[]>();
+  // The poll credential, cached after the first read. Register is first-writer-
+  // wins so this value never changes once set, which makes the cache safe and
+  // takes a storage read off the 5 s poll path. Cached on HIT only — a miss must
+  // stay re-readable, because a register may land later.
+  // NOT cached the way kinTok was before proof-of-possession: `tok` is now
+  // refreshable by the owning device, so a cached copy can go stale within the
+  // isolate's life. Only the HIT is cached, and only after a write updates it —
+  // see kinTokLoad.
+  private kinTok: string | null = null;
+  // The device key that owns this mailbox, canonical base64. Unlike `tok` this
+  // one really is write-once, so caching a hit is safe forever.
+  private kinKey: string | null = null;
+  // The silent-mode row. THREE STATES, and the third is why this one is not
+  // `KinQuiet | null`: `undefined` is "not read yet", `null` is "read, nothing
+  // stored". A toggle can be turned OFF, so "falsy" and "unknown" are different
+  // facts here in a way they never were for `tok` — collapsing them would make
+  // every ring re-read storage after silence was lifted.
+  //
+  // Safe to cache both ways because this DO is the only writer of its own row:
+  // kinQuietSet updates the cache in the same turn it writes.
+  private kinQuiet: KinQuiet | null | undefined = undefined;
+  // Rings silenced since this object woke. A count for the owner's own poll, not
+  // a ledger: it resets with the isolate, and the device keeps the real list.
+  private kinMuted = 0;
+
+  private async kinTokLoad(): Promise<string | null> {
+    if (this.kinTok !== null) return this.kinTok;
+    const v = await this.state.storage.get<string>('kin_tok');
+    if (v) this.kinTok = v;
+    return v ?? null;
+  }
+
+  private async kinKeyLoad(): Promise<string | null> {
+    if (this.kinKey !== null) return this.kinKey;
+    const v = await this.state.storage.get<string>('kin_key');
+    if (v) this.kinKey = v;
+    return v ?? null;
+  }
+
+  private async kinQuietLoad(): Promise<KinQuiet | null> {
+    if (this.kinQuiet !== undefined) return this.kinQuiet;
+    const v = await this.state.storage.get<KinQuiet>('kin_quiet');
+    this.kinQuiet = v ?? null;
+    return this.kinQuiet;
+  }
+
+  private async kinRegister(request: Request, url: URL): Promise<Response> {
+    if (request.method !== 'POST') return json({ error: 'method' }, 405);
+    const raw = await request.text();
+    const have = await this.kinTokLoad();
+    const haveKey = await this.kinKeyLoad();
+    const d = await kinRegisterDecide(
+      raw, url.searchParams.get('to') ?? '', have, haveKey, this.kinHits, Date.now(),
+    );
+    // ONE write for both rows. A separate put per key could land the credential
+    // without the key that owns it, and a mailbox holding a `tok` with no `k` is
+    // precisely the legacy shape kinRegisterDecide has to treat as suspect.
+    const row: Record<string, string> = {};
+    if (d.put !== undefined) row.kin_tok = d.put;
+    if (d.putKey !== undefined) row.kin_key = d.putKey;
+    if (Object.keys(row).length) {
+      await this.state.storage.put(row);
+      if (d.put !== undefined) this.kinTok = d.put;
+      if (d.putKey !== undefined) this.kinKey = d.putKey;
+    }
+    return json(d.body, d.status);
+  }
+
+  private async kinRing(request: Request, url: URL): Promise<Response> {
+    if (request.method !== 'POST') return json({ error: 'method' }, 405);
+    const raw = await request.text();
+    // The silent-mode row is loaded for EVERY ring (cached after the first, and
+    // this DO is its only writer). Without it kinRingDecide defaults to
+    // not-silent and the toggle is a dead control — the shape this project has
+    // shipped three times.
+    const quiet = await this.kinQuietLoad();
+    const d = kinRingDecide(
+      raw, url.searchParams.get('to') ?? '', this.kinBox, this.kinHits, Date.now(), quiet,
+    );
+    // Counted here and NOWHERE IN THE RESPONSE. `d.muted` must never reach the
+    // caller; only the owner's poll sees this number.
+    if (d.muted) this.kinMuted++;
+    return json(d.body, d.status);
+  }
+
+  private async kinPoll(url: URL): Promise<Response> {
+    const to = url.searchParams.get('to') ?? '';
+    const d = kinPollDecide(
+      to, url.searchParams.get('tok') ?? '', await this.kinTokLoad(),
+      this.kinBox, this.kinHits, Date.now(), await this.kinQuietLoad(), this.kinMuted,
+    );
+    return json(d.body, d.status);
+  }
+
+  private async kinQuietSet(request: Request, url: URL): Promise<Response> {
+    if (request.method !== 'POST') return json({ error: 'method' }, 405);
+    const raw = await request.text();
+    const d = await kinQuietDecide(
+      raw, url.searchParams.get('to') ?? '', await this.kinKeyLoad(), this.kinHits, Date.now(),
+    );
+    if (d.putQuiet !== undefined) {
+      await this.state.storage.put('kin_quiet', d.putQuiet);
+      // The cache MUST be refreshed here, or the next ring in this isolate reads
+      // the value from before the toggle and rings a phone that was just
+      // silenced — a durable write that looks like it worked and did nothing.
+      this.kinQuiet = d.putQuiet;
+    }
+    return json(d.body, d.status);
   }
 
   /**
@@ -251,7 +379,7 @@ export class Room implements DurableObject {
    * handing out mappings that expired hours ago — worse than handing out nothing,
    * because the caller would spend its whole punch budget on a dead address.
    */
-  private rvPeers = new Map<string, { addr: string; local?: string; at: number }>();
+  private rvPeers = new Map<string, { addr: string; local?: string; relay?: string; at: number }>();
 
   private rendezvous(url: URL): Response {
     const me = url.searchParams.get('me') ?? '';
@@ -262,19 +390,23 @@ export class Room implements DurableObject {
     for (const [k, v] of this.rvPeers) if (now - v.at > 90_000) this.rvPeers.delete(k);
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(me)) return json({ error: 'bad me' }, 400);
     const local = url.searchParams.get('local') ?? '';
+    const relay = url.searchParams.get('relay') ?? '';
     const addrOk = (a: string) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(a);
     if (addr) {
       if (!addrOk(addr)) return json({ error: 'bad addr' }, 400);
       if (local && !addrOk(local)) return json({ error: 'bad local' }, 400);
+      if (relay && !addrOk(relay)) return json({ error: 'bad relay' }, 400);
       // The LAN address travels too. Two machines behind one NAT should talk over
       // the LAN: it is a shorter path, and reaching your own public address from
       // inside requires NAT hairpinning that many routers refuse outright. The
       // client compares public IPs and picks; this only carries both.
-      this.rvPeers.set(me, { addr, local: local || undefined, at: now });
+      // `relay` is this machine's TURN-allocated address — the short path on a
+      // long call, raced against STUN and LAN by measured RTT.
+      this.rvPeers.set(me, { addr, local: local || undefined, relay: relay || undefined, at: now });
     }
     const others = [...this.rvPeers.entries()]
       .filter(([k]) => k !== me)
-      .map(([k, v]) => ({ id: k, addr: v.addr, local: v.local, ageMs: now - v.at }));
+      .map(([k, v]) => ({ id: k, addr: v.addr, local: v.local, relay: v.relay, ageMs: now - v.at }));
     return json({ me, peers: others });
   }
 
@@ -1597,6 +1729,918 @@ export class Room implements DurableObject {
 
 const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// "TAP A NAME TO CALL" — THE DOORBELL  (CONTACTS.md §4/§5, build step 2)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// One device rings another BY HANDLE; the callee's app polls for rings. That is
+// the entire server half of the contact feature, and it is deliberately the
+// smallest thing that could work: no presence, no roster, no message store.
+//
+//   POST /api/kin/<handle>/register   {to, tok, k, t, sig}       → claim the mailbox
+//   POST /api/kin/<handle>/ring       {to, from, room, t, sig, k} → ring it
+//   GET  /api/kin/<handle>/poll?tok=  →                             drain it
+//   POST /api/kin/<handle>/quiet      {to, k, t, sig, quiet, until} → silence it
+//
+// TWO SIGNATURES, TWO COMPLETELY DIFFERENT JOBS, and confusing them is the
+// mistake this section is arranged to prevent:
+//
+//   · register.sig  IS verified here, by us, against register.k. It is the only
+//     thing standing between a person and someone taking their name. See
+//     kinRegisterDecide.
+//   · ring.sig      is NEVER verified here. It is stored and handed back.
+//
+// ── THE SERVER DOES NOT VERIFY THE RING SIGNATURE. THIS IS THE DESIGN. ───────
+//
+//   ring.sig = Ed25519(callerDevicePriv, "ring|" + to + "|" + from + "|" + room + "|" + t)
+//   ring.k   = the caller's 32-byte Ed25519 public key, base64
+//
+// The CALLEE verifies it: it looks `k` up in its own contact list and drops,
+// silently, any ring whose key it does not already know or whose signature does
+// not check out. The server holds no contact list and cannot tell whether a key
+// is welcome, so it stores the bytes and hands them back.
+//
+// That is the whole security model, not a hole in it: a stranger who guesses a
+// handle can write into a mailbox and can NEVER make a Mac ring. Do NOT
+// "improve" this into server-side verification — a server that could verify a
+// ring is a server that could FORGE one, which would turn a mailbox into an
+// identity authority and hand whoever runs it the power to ring anybody as
+// anybody. `k` arriving in the ring does not change that: an attacker is free to
+// present a key of their own, and it is the callee's list, not our arithmetic,
+// that says whose keys count.
+//
+// ── HANDLE FORMAT ────────────────────────────────────────────────────────────
+//
+// A handle is a NAME, not a hash: short, lowercase, human-readable, and read
+// aloud without spelling it. `devesh`. It is assigned by the machine at first
+// launch from the Mac's short username, silently, walking a collision ladder
+// (devesh → deveshp → devesh2 → …) until a register succeeds.
+//
+// 2–32 chars, must START WITH A LETTER, then lowercase letters and digits. No
+// hyphens or underscores for now — a separator is the one thing that cannot be
+// added later without ambiguity (is `a-b` a new handle or the old `ab`?), so it
+// stays out until there is a reason.
+//
+// THE PRICE OF READABLE NAMES, stated plainly: the namespace is now guessable.
+// The 26-char hash this replaced was 130 bits and unguessable, and that
+// unguessability was doing real work — it was the ONLY thing standing between a
+// stranger and someone's mailbox. Readable names delete that protection, which
+// is exactly why register now demands a proof-of-possession signature (see
+// kinRegisterDecide). Without that signature this format would hand `devesh` to
+// whoever sent the first HTTP request. Do not loosen one without the other.
+//
+// Note this format satisfies ROOM_RE above for free, so a handle is also a
+// legal room code — which is why `room` in a ring is checked against ROOM_RE
+// and nothing stricter.
+export const KIN_HANDLE_RE = /^[a-z][a-z0-9]{1,31}$/;
+// Must agree with KIN_HANDLE_RE, CHARACTER CLASS FOR CHARACTER CLASS. The DO
+// re-validates with KIN_HANDLE_RE anyway, so if these two ever drift the DO is
+// the authority and the edge is only a prefilter — but a one-character
+// disagreement between them is a 404 nobody can explain, because the request
+// never reaches the code that would have said why.
+//
+// The verb is always the LAST of four fixed segments and the capture group
+// cannot contain a slash, so a handle that happens to spell a verb is
+// unambiguous: /api/kin/register/ring is handle `register`, verb `ring`. No
+// reserved-word list, on purpose — someone's Mac account really is called
+// `poll`, and silently refusing them their own name would be a bug we could
+// not see. Asserted in contacts.test.mjs (b3).
+export const KIN_ROUTE_RE = /^\/api\/kin\/([a-z][a-z0-9]{1,31})\/(register|ring|poll|quiet)$/;
+// tok = SHA256("tk-inbox-v1" | devicePriv), lowercase hex.
+const KIN_TOK_RE = /^[a-f0-9]{64}$/;
+// A ring's `sig` is the caller's Ed25519 signature over the ring, 64 bytes = 88
+// chars of base64. The range tolerates url-safe/unpadded spellings without ever
+// letting `sig` become a payload channel. THE SERVER NEVER VERIFIES IT — see the
+// block at the top of this section; only the callee holds the caller's key.
+const KIN_SIG_RE = /^[A-Za-z0-9+/=_-]{40,96}$/;
+// An Ed25519 public key is 32 raw bytes: 44 chars of base64 with padding, 43
+// without. Exact length, because unlike `sig` this one IS decoded and used.
+const KIN_KEY_RE = /^[A-Za-z0-9+/_-]{43}=?$/;
+// A registration signature is 64 raw bytes: 88 chars padded, 86 without. Exact,
+// so junk is refused by a regex instead of by the curve — an attacker should not
+// get to spend our CPU on 96 characters of garbage.
+const KIN_REG_SIG_RE = /^[A-Za-z0-9+/_-]{86}(==)?$/;
+
+// A ring's `t` is UNIX SECONDS, and it is the client's own clock. |now − t| > 60 s
+// is refused BEFORE anything else is looked at, because without that gate a
+// captured ring replays forever — the sig is a fixed string over fixed inputs,
+// so replay protection has to come from the timestamp or from nowhere.
+const KIN_SKEW_S = 60;
+// Mailbox lease, mirroring rvPeers' 90 s (see the block above rendezvous()):
+// "an address is only true while the binding is alive" applies verbatim to a
+// ring. A ring is only true while the caller is still sitting there waiting, so
+// a stale ring is worse than no ring — it rings a phantom and the callee
+// answers nobody. Shorter than the rendezvous lease on purpose: rendezvous has
+// to survive a slow start on the far side, a doorbell does not.
+const KIN_LEASE_MS = 60_000;
+const KIN_BOX_MAX = 8;                 // rings held per handle
+
+// ── THE RING BUDGET, and what each number is actually buying ─────────────────
+//
+// The shipped numbers were 6/min per (from,to), 30/min per `to`, 240/h per IP.
+// The per-pair cap was worthless: `from` is unauthenticated and free to mint, so
+// 100 invented `from`s bought 600 rings/min. The only real cap was 30/min per
+// `to` — a phone ringing every two seconds, forever, for free. That is not a
+// doorbell, it is a denial-of-sleep budget.
+//
+// HONEST LIMITATION, so nobody reads more into these than they hold: keying on
+// the caller's device key `k` is NOT cryptographically stronger than keying on
+// `from`, because the server verifies neither and 32 random bytes are as free to
+// mint as a handle. What keying on `k` does buy is alignment: `k` is the
+// identity the CALLEE authorizes on, so the per-caller window now limits the
+// entity that can actually make a screen light up, instead of limiting a string
+// nobody checks. Both windows are kept — a flooder must mint both to get past
+// either, and neither raises the other's ceiling.
+//
+// THE BACKSTOP IS THE PER-`to` PAIR, and it is a pair on purpose. A per-minute
+// cap alone cannot bound denial of sleep: 12/min sustained is 17,280 rings a
+// day. So the minute cap bounds BURSTINESS and the hour cap bounds TOTAL.
+//
+// The strict rule — "only people I know may ring me" — CANNOT live here. The
+// server has no contact list and must never have one: it would have to be told
+// who each person knows, which is the entire social graph, to enforce a rule the
+// callee can enforce for free by dropping any ring whose `k` is not in its own
+// list. These numbers only bound what reaches the mailbox; what reaches the
+// SCREEN is the client's decision, and that is where the real gate lives.
+const KIN_RING_PER_KEY = 4;            // per (k,to) per minute — the caller's DEVICE
+const KIN_RING_PER_FROM = 4;           // per (from,to) per minute — the mintable name
+const KIN_RING_PER_TO = 12;            // per `to` per minute (was 30), from anyone
+const KIN_RING_PER_TO_HOUR = 60;       // per `to` per hour — the denial-of-sleep bound
+const KIN_REG_PER_MIN = 10;            // register/refresh per handle per minute
+const KIN_POLL_GAP_MS = 2000;          // ≤1 poll per 2 s per handle
+const KIN_BAD_AUTH_PER_MIN = 30;       // failed polls per handle per minute
+const KIN_RING_MAX_BODY = 1024;
+const KIN_REG_MAX_BODY = 512;
+// A ring carries exactly these six fields and no others. A lax mailbox would
+// be an unauthenticated write channel into the callee's JSON parser — anyone
+// who guesses a handle could post arbitrary shapes at a Mac. Strict allowlist,
+// same reasoning as the health-beat ingest.
+//
+// `k` is the caller's 32-byte Ed25519 public key, and it is the field the whole
+// feature turns on: the callee looks `k` up in its own contact list, verifies
+// `sig` against it, and rings only if both hold. It rides in the ring because
+// the callee cannot ask anyone else for it.
+const KIN_RING_KEYS = new Set(['to', 'from', 'room', 'sig', 't', 'k']);
+// The exact string a registration signature covers. Version-prefixed and
+// field-separated so a signature can never be replayed into a different
+// meaning: no field may contain '|' (handle and tok are checked by regex, `t` is
+// a number), so the concatenation is unambiguous.
+// NOT EXPORTED, and neither is KIN_QUIET_CONTEXT below. This module is the
+// worker ENTRY, so every named export is an entrypoint as far as workerd is
+// concerned — and a STRING export is not "a function or ExportedHandler", so
+// the runtime refuses to start at all. Adding `export` to this line is a
+// DEPLOY-BREAKING change that typechecks perfectly; contacts.test.mjs (k)
+// caught it in miniflare. RegExps and Sets survive because they are objects, so
+// the existing exported regexes prove nothing about this line. The tests read
+// both context strings out of the source text instead.
+const KIN_REG_CONTEXT = 'kin-reg-v1|';
+
+// ── SILENT MODE: "if that is enabled, no one can call you" ───────────────────
+//
+// The user's own words. One toggle on the callee's device, and rings stop
+// arriving. What follows is the server half.
+//
+// ── THE SERVER IS AN OPTIMISATION, NOT THE SECURITY BOUNDARY ────────────────
+//
+// The CLIENT enforces silent mode locally: the callee's app knows its own state
+// and refuses to ring the screen regardless of what this mailbox does. That is
+// deliberate and it is the load-bearing half — everything here can be bypassed
+// by a mailbox that has not learned the toggle yet (a client that set it while
+// offline), by an isolate that has just started, or by a deploy that drops this
+// code. What the server buys is that the callee's Mac never wakes for a call it
+// was never going to show. DO NOT move a security decision here on the strength
+// of it, and do not remove the client-side check on the strength of this one.
+//
+// ── INVARIANT 1: SILENT MUST BE INDISTINGUISHABLE FROM AWAY ─────────────────
+//
+// A caller must not be able to tell "she has silenced her phone" from "her Mac
+// is shut". Telling them is worse than silence: it converts a quiet no into a
+// social fact, and it is a fact about the callee that the caller is not owed.
+//
+// So a ring to a silent handle returns EXACTLY what a ring to a handle nobody
+// polls returns — same status, same body, same fields, same numbers, over a
+// whole SEQUENCE of rings and not merely on the first one. The way that is
+// achieved is the important part, because the obvious implementation breaks it:
+//
+//   The obvious implementation — "if silent, return early with ok:true" —
+//   FABRICATES the response. `queued` then stops tracking the mailbox, so a
+//   caller who rings twice reads 1,1 from a silent handle and 1,2 from an absent
+//   one, and the toggle is legible from the outside after two doorbell presses.
+//
+// Instead a silenced ring travels the ENTIRE normal path: every validation, every
+// rate window, the same kinBoxPut, the same response line. The only difference is
+// one flag on the stored ring (`mute`), and poll drops flagged rings before the
+// callee ever sees them. The indistinguishability is then STRUCTURAL — the two
+// responses are produced by the same code — rather than a pair of literals two
+// people have to keep in sync.
+//
+// Consequences of that choice, stated so nobody "tidies" them away:
+//   · a silenced ring occupies a mailbox slot for its 60 s lease. Bounded at 8,
+//     in memory, and evict-oldest means a real ring arriving after the toggle
+//     goes off still lands. Cheaper than a legible toggle.
+//   · silenced rings still spend the caller's rate budget. That is REQUIRED: a
+//     silent handle that stopped 429ing would be legible from the outside.
+//   · silence is decided at ARRIVAL. A ring that came in during silence stays
+//     undelivered even if the deadline passes a second later — the doorbell was
+//     silenced when it was pressed.
+//
+// ── NO ALLOWLIST IN v1 ──────────────────────────────────────────────────────
+//
+// Silent means silent. `exceptKnown` exists in the stored shape so a later
+// client can carry "except people I know" without a storage migration, and it
+// is ALWAYS false today: there is no wire field for it, the server has no
+// contact list, and caller classification belongs on the device that holds one.
+// WHEN THAT FIELD IS ADDED IT MUST JOIN THE SIGNED STRING and the context must
+// become kin-quiet-v2 — a field that changes behaviour and is not signed is a
+// field an attacker flips by replaying a captured signature.
+const KIN_QUIET_CONTEXT = 'kin-quiet-v1|';
+// Its own domain string, NOT KIN_REG_CONTEXT. A signature is a statement about
+// one operation; two operations that share a prefix are one input coincidence
+// away from a signature valid for the first being replayable as the second.
+// Cheap to separate now, impossible to separate after clients ship.
+const KIN_QUIET_KEYS = new Set(['to', 'k', 't', 'sig', 'quiet', 'until']);
+const KIN_QUIET_MAX_BODY = 512;
+// A human presses this a few times a day. Charged only to attempts that already
+// carry the OWNING key, so a stranger cannot lock the owner out of their own
+// toggle (the same split as poll's bad: window, and the same reason).
+const KIN_QUIET_PER_MIN = 6;
+// The outer bound on `until`, ~10 years. Its job is not policy — indefinite is
+// spelled `until: 0` — it is to turn "the client sent milliseconds" into a 400
+// instead of into a mute lasting 57,000 years, which is indistinguishable from
+// indefinite and therefore invisible.
+//
+// IT IS ALSO THE GATE THAT CATCHES 1e21, and that is not a nicety. The integer
+// check does NOT catch it: Number.isInteger(1e21) is TRUE, and 1e21 stringifies
+// as "1e+21" — a spelling no Swift client will reproduce, so the signature would
+// verify on the device and never here. On `t` the SKEW gate catches that shape
+// (measured: it answers `skew`, not `bad t`). `until` has no skew gate, so this
+// horizon is the only thing standing there. Removing it re-opens the class.
+const KIN_QUIET_MAX_S = 315_360_000;
+
+/**
+ * The stored toggle. `until` is UNIX SECONDS and 0 means indefinite.
+ *
+ * EVALUATED AT READ TIME, never swept: an expired deadline just reads as
+ * not-silent. A sweep would need an alarm, and an alarm that does not fire (a
+ * cold object, a failed deploy) leaves someone silently unreachable — the exact
+ * failure this feature must not have.
+ */
+export interface KinQuiet {
+  quiet: boolean;       // the toggle as the owning device last set it
+  until: number;        // unix seconds deadline, 0 = indefinite
+  exceptKnown: boolean; // reserved; always false in v1, see the block above
+  at: number;           // server receipt ms, for support questions only
+}
+
+export interface KinRing { to: string; from: string; room: string; t: number; sig: string; k: string; }
+export interface KinStored extends KinRing {
+  at: number;      // server receipt, ms
+  bornAt: number;  // min(at, t*1000) — see kinBoxPut
+  // Silenced on arrival: stored so the ring response is byte-identical to a
+  // live one, never delivered. Absent (not false) on a live ring, so a stored
+  // ring is shaped exactly as it was before silent mode existed.
+  mute?: boolean;
+}
+export type KinDecision = {
+  status: number; body: Record<string, unknown>;
+  put?: string;      // kin_tok to persist
+  putKey?: string;   // kin_key to persist, canonical base64
+  putQuiet?: KinQuiet; // kin_quiet to persist
+  // Out-of-band, deliberately NOT in `body`: the ring was silenced. The DO
+  // counts these; the caller must never be told. If this ever appears in a
+  // response body, invariant 1 is broken.
+  muted?: boolean;
+};
+
+/**
+ * Is this handle silent right now? The ONLY place the toggle is interpreted.
+ *
+ * Read-time expiry, so the same stored row answers differently at two clocks
+ * and nothing has to run in between.
+ */
+export function kinQuietActive(q: KinQuiet | null | undefined, now: number): boolean {
+  if (!q || !q.quiet) return false;
+  // `until` is seconds, `now` is ms. Multiply rather than divide: integer
+  // arithmetic has one answer, and a deadline that lands half a millisecond
+  // early is a toggle that lies about itself at exactly the moment someone
+  // looks at it.
+  if (q.until && now >= q.until * 1000) return false;
+  return true;
+}
+
+/**
+ * Constant-time string compare for the poll credential. Both sides are fixed
+ * 64-char hex so the length check leaks nothing.
+ */
+export function kinTimingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+/**
+ * base64 → exactly `wantBytes` bytes, or null. Tolerant of the url-safe
+ * alphabet and of missing padding, strict about the DECODED LENGTH — which is
+ * the only check that matters, because atob is lenient in ways a regex is not.
+ */
+export function kinB64(s: string, wantBytes: number): Uint8Array | null {
+  let t = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (t.length % 4 !== 0) t += '=';
+  let bin: string;
+  try { bin = atob(t); } catch { return null; }
+  if (bin.length !== wantBytes) return null;
+  const out = new Uint8Array(wantBytes);
+  for (let i = 0; i < wantBytes; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** bytes → canonical standard-alphabet, padded base64. One spelling per key. */
+export function kinB64Encode(u8: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+
+export type KinVerify = (pub: Uint8Array, sig: Uint8Array, msg: Uint8Array) => Promise<boolean>;
+
+// WHICH ALGORITHM STRING THE RUNTIME WANTS, and why there are two of them.
+//
+// Workers has spelled Ed25519 two ways over its life: the legacy
+// "NODE-ED25519" (which also insisted on a namedCurve) and the standard
+// "Ed25519". CONFIRMED BY PROBE against the workerd binary this project ships
+// (miniflare, compatibility_date 2026-05-01 and 2023-01-01 both): all of
+// {name:'Ed25519'}, {name:'Ed25519',namedCurve:'Ed25519'} and
+// {name:'NODE-ED25519',namedCurve:'NODE-ED25519'} import a raw 32-byte key and
+// verify RFC 8032 test vector 1 correctly — returning true for the real
+// signature and false for the same signature with one bit flipped. So the
+// probe could tell a working verifier from a rubber stamp, which is the only
+// version of that check worth running.
+//
+// 'Ed25519' is therefore first and is what production will use. The legacy
+// spelling stays as a fallback because it costs nothing on the happy path (one
+// try, then cached for the isolate's life) and because a runtime that has only
+// the old name would otherwise fail EVERY registration silently — a whole
+// feature dead, with a 401 that blames the user's key.
+const KIN_ED_ALGS = ['Ed25519', 'NODE-ED25519'];
+let kinEdAlg: string | null = null;
+
+/**
+ * Verify a 64-byte Ed25519 signature over `msg` with a raw 32-byte public key.
+ *
+ * Returns false on ANY failure, including an unusable key — a registration that
+ * cannot be proved is refused, never waved through.
+ */
+export async function kinVerifyEd25519(
+  pub: Uint8Array, sig: Uint8Array, msg: Uint8Array,
+): Promise<boolean> {
+  for (const name of kinEdAlg ? [kinEdAlg] : KIN_ED_ALGS) {
+    let key: CryptoKey;
+    try {
+      key = await crypto.subtle.importKey('raw', pub, { name, namedCurve: name }, false, ['verify']);
+    } catch {
+      continue;  // wrong spelling for this runtime, or a point not on the curve
+    }
+    // Import succeeded, so this spelling is the right one for this runtime.
+    kinEdAlg = name;
+    try { return await crypto.subtle.verify(name, key, sig, msg); } catch { return false; }
+  }
+  return false;
+}
+
+// Sliding-window counters can otherwise grow one key per distinct caller
+// forever. Above this many keys, a touch sweeps every dead key out.
+const KIN_HITS_MAX_KEYS = 4096;
+
+/**
+ * One sliding window, used for every limit in this feature — at the edge per
+ * IP and inside the DO per handle and per pair.
+ *
+ * Returns true if the hit is allowed (and records it), false if the window is
+ * full. THE WRITE-BACK ON THE REFUSAL PATH IS LOAD-BEARING: pruning only ever
+ * happens here, so a limiter that returns without writing the filtered array
+ * back never prunes the caller it just refused — and becomes a permanent ban
+ * instead of a window. /api/mac/beat and /api/health both do this write-back;
+ * this is the same shape, factored so it is tested once.
+ */
+export function kinWindow(
+  map: Map<string, number[]>, key: string, now: number, windowMs: number, max: number,
+): boolean {
+  const hits = (map.get(key) ?? []).filter((t) => now - t < windowMs);
+  if (hits.length >= max) { map.set(key, hits); return false; }
+  hits.push(now);
+  map.set(key, hits);
+  if (map.size > KIN_HITS_MAX_KEYS) {
+    for (const [k, v] of map) if (!v.length || now - v[v.length - 1] >= windowMs) map.delete(k);
+  }
+  return true;
+}
+
+/** Drop every ring past its lease, and forget handles left with none. */
+export function kinBoxSweep(box: Map<string, KinStored[]>, now: number): void {
+  for (const [k, list] of box) {
+    const live = list.filter((r) => now - r.bornAt <= KIN_LEASE_MS);
+    if (!live.length) box.delete(k);
+    else if (live.length !== list.length) box.set(k, live);
+  }
+}
+
+/**
+ * Put a ring in a mailbox. Sweep-on-touch, like rendezvous().
+ *
+ * `bornAt` is min(receipt, client stamp): the client's `t` is used only to make
+ * a ring SHORTER-lived, never longer, so a lying clock can only hurt the caller
+ * who lies. Without it the skew gate (60 s) and the lease (60 s) would stack
+ * into 120 s of tolerated staleness.
+ *
+ * Repeat rings from the same caller for the same room REPLACE each other rather
+ * than accumulating — the caller re-rings while it waits, and eight copies of
+ * one doorbell press is not eight calls. That is also what makes the cap
+ * meaningful.
+ *
+ * At the cap the OLDEST goes. That direction matters: a jammer holding a leaked
+ * handle can fill all eight slots, and evicting the oldest means a genuine ring
+ * arriving afterwards still lands, where evicting the newest would let the
+ * jammer wall the mailbox off permanently.
+ */
+export function kinBoxPut(
+  box: Map<string, KinStored[]>, ring: KinRing, now: number, muted = false,
+): { queued: number; evicted: number; replaced: boolean } {
+  kinBoxSweep(box, now);
+  const list = box.get(ring.to) ?? [];
+  const stored: KinStored = {
+    ...ring, at: now, bornAt: Math.min(now, ring.t * 1000),
+    // A silenced ring is STORED, not dropped, so `queued` and `evicted` keep
+    // tracking the mailbox and the response stays indistinguishable from a
+    // handle nobody polls. See the silent-mode block above. Absent when live.
+    ...(muted ? { mute: true } : {}),
+  };
+  const i = list.findIndex((r) => r.from === ring.from && r.room === ring.room);
+  let evicted = 0;
+  let replaced = false;
+  if (i >= 0) { list[i] = stored; replaced = true; }
+  else {
+    list.push(stored);
+    while (list.length > KIN_BOX_MAX) { list.shift(); evicted++; }
+  }
+  box.set(ring.to, list);
+  return { queued: list.length, evicted, replaced };
+}
+
+/** Drain a mailbox. A poll takes every live ring exactly once. */
+export function kinBoxTake(box: Map<string, KinStored[]>, to: string, now: number): KinStored[] {
+  kinBoxSweep(box, now);
+  const list = box.get(to) ?? [];
+  box.delete(to);
+  return list;
+}
+
+/**
+ * Everything a ring POST decides, with no I/O in it — the DO method around this
+ * is four lines. Same seam as the diagnose layer: decisions are pure so they
+ * can be tested without a Durable Object.
+ *
+ * `to` is the handle from the URL (the DO's own name). The body carries `to`
+ * as well because the caller's signature covers it, and the two must agree — a ring
+ * signed for one handle must not be filed under another.
+ *
+ * `quiet` is the callee's stored silent-mode row, or null. It is consulted at
+ * the very LAST step, where the ring is stored, and it changes nothing a caller
+ * can see — read the silent-mode block above kinQuietActive before touching the
+ * ordering. It DEFAULTS TO NULL, i.e. not silent, so a caller that forgets to
+ * pass it rings the doorbell rather than muting the world: the client enforces
+ * silence locally, so failing open here costs an unwanted ring and failing
+ * closed would cost every call.
+ */
+export function kinRingDecide(
+  raw: string, to: string, box: Map<string, KinStored[]>, hits: Map<string, number[]>, now: number,
+  quiet: KinQuiet | null = null,
+): KinDecision {
+  if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
+  if (raw.length > KIN_RING_MAX_BODY) return { status: 413, body: { error: 'too big' } };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return { status: 400, body: { error: 'bad json' } }; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { status: 400, body: { error: 'bad body' } };
+  }
+  const b = parsed as Record<string, unknown>;
+  const keys = Object.keys(b);
+  if (keys.length !== KIN_RING_KEYS.size || keys.some((k) => !KIN_RING_KEYS.has(k))) {
+    return { status: 400, body: { error: 'bad fields' } };
+  }
+  // SKEW FIRST, before any other judgement is passed on this ring. Nothing is
+  // stored or acted on until every check below passes, so the ordering costs
+  // nothing — but a replay gate that sits after other work is a replay gate
+  // someone eventually moves.
+  const t = b.t;
+  // Integer seconds, same rule and same reason as the registration's `t`: the
+  // callee reconstructs the signed string from this number, so a value with more
+  // than one spelling is a signature that fails on one end for no visible
+  // reason. Kept symmetric with kinRegisterDecide deliberately — an asymmetry
+  // between two `t` validations is a bug waiting for whoever reads only one.
+  if (typeof t !== 'number' || !Number.isInteger(t)) return { status: 400, body: { error: 'bad t' } };
+  const skew = Math.abs(now / 1000 - t);
+  if (skew > KIN_SKEW_S) return { status: 400, body: { error: 'skew', skewS: Math.round(skew) } };
+  if (typeof b.to !== 'string' || !KIN_HANDLE_RE.test(b.to)) return { status: 400, body: { error: 'bad to' } };
+  if (b.to !== to) return { status: 400, body: { error: 'to mismatch' } };
+  if (typeof b.from !== 'string' || !KIN_HANDLE_RE.test(b.from)) return { status: 400, body: { error: 'bad from' } };
+  if (b.from === b.to) return { status: 400, body: { error: 'self' } };
+  if (typeof b.room !== 'string' || !ROOM_RE.test(b.room) || b.room.length < 8) {
+    return { status: 400, body: { error: 'bad room' } };
+  }
+  if (typeof b.sig !== 'string' || !KIN_SIG_RE.test(b.sig)) return { status: 400, body: { error: 'bad sig' } };
+  // `k` is checked for SHAPE and nothing else. The server does not decode it,
+  // does not verify `sig` against it, and must not start: only the callee holds
+  // the contact list that says whether this key may ring this person, and a
+  // server that could verify a ring is a server that could forge one.
+  if (typeof b.k !== 'string' || !KIN_KEY_RE.test(b.k)) return { status: 400, body: { error: 'bad k' } };
+  // Per-caller windows before the per-`to` one: a refused caller must not also
+  // spend the victim's global budget, or one flooder could lock everybody else
+  // out at the per-caller rate. Two sibling windows, `k` and `from`, so minting
+  // one identity does not buy the other's allowance.
+  if (!kinWindow(hits, 'key:' + b.k + '>' + to, now, 60_000, KIN_RING_PER_KEY)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  if (!kinWindow(hits, 'pair:' + b.from + '>' + to, now, 60_000, KIN_RING_PER_FROM)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  // The two backstops, and the only caps a flooder cannot mint its way around.
+  // Minute first: a burst is refused by the cheaper window, and the hour's
+  // budget is not spent on a request the minute already rejected.
+  if (!kinWindow(hits, 'to:' + to, now, 60_000, KIN_RING_PER_TO)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  if (!kinWindow(hits, 'toh:' + to, now, 3600_000, KIN_RING_PER_TO_HOUR)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  const ring: KinRing = { to, from: b.from, room: b.room, t, sig: b.sig, k: b.k };
+  // SILENT MODE, and it is the LAST thing consulted on purpose. Every gate above
+  // — validation, both per-caller windows, both per-`to` windows — has already
+  // run and charged, so a silent handle behaves identically to a live one all
+  // the way down to here. Moving this check any earlier (to "save the work")
+  // would make a silent handle stop refusing a flooder, and a handle that never
+  // says 429 is a handle whose owner has visibly turned something on.
+  //
+  // Expiry is evaluated HERE, at arrival, from the stored row: nothing sweeps.
+  const muted = kinQuietActive(quiet, now);
+  const r = kinBoxPut(box, ring, now, muted);
+  // ONE return, ONE body, shared by both paths. There is deliberately no
+  // early return for the silent case: two return sites are two literals that
+  // drift, and the first thing that drifts is `queued`.
+  return {
+    status: 200,
+    body: { ok: true, queued: r.queued, evicted: r.evicted, leaseMs: KIN_LEASE_MS },
+    ...(muted ? { muted: true } : {}),
+  };
+}
+
+/**
+ * Everything a mailbox poll decides. `want` is the registered credential, or
+ * null if nobody has claimed this handle.
+ *
+ * A wrong or missing credential gets the SAME generic 401 either way — a
+ * distinguishable "not registered" would make this endpoint an oracle for which
+ * handles exist, and a handle is the one thing the contact graph is built on.
+ *
+ * `quiet` is the stored silent-mode row and is REPORTED BACK. That is not a
+ * convenience: a device that was restarted, updated, or reinstalled has no idea
+ * what it last set, and a toggle that has silently desynchronised from the
+ * server is how someone believes they are reachable while they are not. The poll
+ * is authenticated, so this tells only the owner about their own state.
+ *
+ * `dropped` is how many rings have been silenced since this object woke — a
+ * count, not a ledger; it resets when the isolate does, and the device keeps its
+ * own missed-call list.
+ */
+export function kinPollDecide(
+  to: string, tok: string, want: string | null,
+  box: Map<string, KinStored[]>, hits: Map<string, number[]>, now: number,
+  quiet: KinQuiet | null = null, dropped = 0,
+): KinDecision {
+  if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
+  if (!KIN_TOK_RE.test(tok)) return { status: 400, body: { error: 'bad tok' } };
+  if (!want || !kinTimingSafeEqual(want, tok)) {
+    // Failed auth is charged to its OWN window. Charging it to the handle's
+    // poll budget would let anyone who knows a handle 429 the real owner off
+    // their own mailbox — the owner never fails auth, so the two must not share.
+    if (!kinWindow(hits, 'bad:' + to, now, 60_000, KIN_BAD_AUTH_PER_MIN)) {
+      return { status: 429, body: { error: 'rate' } };
+    }
+    return { status: 401, body: { error: 'no' } };
+  }
+  if (!kinWindow(hits, 'poll:' + to, now, KIN_POLL_GAP_MS, 1)) {
+    return { status: 429, body: { error: 'rate', retryMs: KIN_POLL_GAP_MS } };
+  }
+  // The drain is destructive either way: a silenced ring is taken out of the
+  // mailbox and thrown away here, never handed to the callee. Filtering at the
+  // drain rather than refusing at the door is what keeps the ring response
+  // identical to an unpolled handle's — see the silent-mode block.
+  const taken = kinBoxTake(box, to, now);
+  const rings = taken.filter((r) => !r.mute);
+  return {
+    status: 200,
+    body: {
+      to,
+      // `ageMs` mirrors rendezvous()'s: the callee decides for itself whether a
+      // ring is still worth showing, and can say why when it is not.
+      //
+      // `k` MUST come back out. It is the caller's device key, and without it
+      // the callee has nothing to verify `sig` against and nothing to match
+      // against its contact list — a poll that drops `k` turns every ring into
+      // an unverifiable one, which the callee then correctly refuses to show.
+      // That failure looks exactly like "nobody is calling".
+      rings: rings.map((r) => ({
+        from: r.from, room: r.room, t: r.t, sig: r.sig, k: r.k, ageMs: now - r.bornAt,
+      })),
+      // ALWAYS PRESENT, even when nothing is stored, so a Swift decoder sees one
+      // shape and "no row yet" cannot be mistaken for "the field was dropped".
+      // `on` is the READ-TIME verdict, not the stored bit: an expired deadline
+      // reports on:false while the row still says quiet:true, and the client
+      // must believe `on`.
+      quiet: {
+        on: kinQuietActive(quiet, now),
+        until: quiet?.until ?? 0,
+        exceptKnown: quiet?.exceptKnown ?? false,
+        dropped,
+      },
+      pollMs: 5000, leaseMs: KIN_LEASE_MS,
+    },
+  };
+}
+
+// The exact fields a registration carries. Five, no more: same reasoning as
+// KIN_RING_KEYS, and here it also means the signed string covers every field
+// that has any effect, which is what makes the signature worth anything.
+const KIN_REG_KEYS = new Set(['to', 'tok', 'k', 't', 'sig']);
+
+/**
+ * Everything a register/refresh decides. `put`/`putKey` in the result are the
+ * DO's instructions to persist — the only durable state this whole feature adds.
+ *
+ * ── PROOF OF POSSESSION, and what it replaces ───────────────────────────────
+ *
+ * The version this replaces was first-writer-wins with NO proof at all, and its
+ * own comment admitted the server "cannot check that `tok` and `to` come from
+ * the same keypair". While handles were 130-bit hashes that was survivable: you
+ * had to know a handle to squat it, and you could not guess one. Handles are now
+ * people's names. `devesh` is guessable by anyone who has met Devesh, so
+ * without a proof the name belongs to WHOEVER SENDS THE FIRST HTTP REQUEST,
+ * not to the person. Worse, under the old rule merely PROBING a free handle
+ * with a random `tok` claimed it — one request was both the enumeration and the
+ * theft, and the rightful owner's first launch would find their own name gone.
+ *
+ * So a registration now carries the device's Ed25519 public key `k` and a
+ * signature `sig` over KIN_REG_CONTEXT + to + '|' + tok + '|' + t. The signature
+ * covers the handle (so it cannot be lifted onto another name), the credential
+ * (so it cannot be lifted onto another `tok`) and the timestamp (so it cannot be
+ * replayed).
+ *
+ * ── THE ORDER OF THESE CHECKS IS PART OF THE DESIGN ─────────────────────────
+ *
+ *  1. SKEW BEFORE CRYPTO. A captured registration must expire, and it can only
+ *     expire on the timestamp — nothing else in the message ages. Putting the
+ *     skew gate first also means junk never buys an attacker a curve operation:
+ *     signature verification is the most expensive thing this endpoint does, and
+ *     it is unauthenticated, so it must be the LAST thing reached, not the first.
+ *  2. VERIFY `sig` AGAINST THE PRESENTED `k`. This proves the sender holds that
+ *     private key and is talking about THIS handle at THIS moment. Nothing about
+ *     the mailbox's state has been revealed yet.
+ *  3. FIRST-WRITER-WINS ON `handle -> k`, and a re-register is checked against
+ *     the STORED key. Because both keys are canonicalised to one base64
+ *     spelling before comparison, `k === haveKey` is byte equality of the key
+ *     material, so accepting a re-register is the same statement as "the
+ *     signature verified under the stored key". That equivalence is the whole
+ *     protection and it is why the canonical form exists — comparing raw
+ *     user-supplied strings would let a padding variant of the same key read as
+ *     a different device, or a different device read as the same key.
+ *
+ * Steps 2 and 3 are in that order so the two failures stay TELLABLE APART: a
+ * squatter gets 403 `taken`, a broken signer gets 401 `no`. Collapsing them
+ * would make a client with a signing bug walk its whole collision ladder and
+ * quietly claim `devesh7`, with nothing anywhere saying why. And 403 discloses
+ * nothing that is not already public: the collision ladder only works because a
+ * client can find out that `devesh` is taken.
+ *
+ * `tok` REMAINS REFRESHABLE, by the original device only. Step 3 gates on `k`,
+ * not on `tok`, so the owner can rotate its poll credential and a stranger
+ * cannot rotate anything. `tok` is still only READ access to one mailbox — it
+ * can never ring anyone, because ringing needs a key the server has never seen.
+ */
+export async function kinRegisterDecide(
+  raw: string, to: string, have: string | null, haveKey: string | null,
+  hits: Map<string, number[]>, now: number,
+  verify: KinVerify = kinVerifyEd25519,
+): Promise<KinDecision> {
+  if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
+  if (raw.length > KIN_REG_MAX_BODY) return { status: 413, body: { error: 'too big' } };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return { status: 400, body: { error: 'bad json' } }; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { status: 400, body: { error: 'bad body' } };
+  }
+  const b = parsed as Record<string, unknown>;
+  const keys = Object.keys(b);
+  if (keys.length !== KIN_REG_KEYS.size || keys.some((k) => !KIN_REG_KEYS.has(k))) {
+    return { status: 400, body: { error: 'bad fields' } };
+  }
+  if (typeof b.to !== 'string' || b.to !== to) return { status: 400, body: { error: 'to mismatch' } };
+  if (typeof b.tok !== 'string' || !KIN_TOK_RE.test(b.tok)) return { status: 400, body: { error: 'bad tok' } };
+  if (typeof b.k !== 'string' || !KIN_KEY_RE.test(b.k)) return { status: 400, body: { error: 'bad k' } };
+  // (1) SKEW, before any crypto. See the note above — this ordering is load
+  // bearing and a signature check moved above it would be a silent regression.
+  //
+  // INTEGER, not merely finite. `t` is STRINGIFIED into the signed message, so
+  // its spelling is part of the contract: JS renders 1e21 as "1e+21" and
+  // 1800000000.5 with a decimal point, and a Swift client formatting either
+  // differently would produce a signature that verifies perfectly on the device
+  // and fails here, forever, with a 401 that blames the key. Integers have one
+  // spelling in every language, so requiring one removes the whole class.
+  if (typeof b.t !== 'number' || !Number.isInteger(b.t)) return { status: 400, body: { error: 'bad t' } };
+  const skew = Math.abs(now / 1000 - b.t);
+  if (skew > KIN_SKEW_S) return { status: 400, body: { error: 'skew', skewS: Math.round(skew) } };
+  if (typeof b.sig !== 'string' || !KIN_REG_SIG_RE.test(b.sig)) return { status: 400, body: { error: 'bad sig' } };
+  if (!kinWindow(hits, 'reg:' + to, now, 60_000, KIN_REG_PER_MIN)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  const pub = kinB64(b.k, 32);
+  const sig = kinB64(b.sig, 64);
+  if (!pub) return { status: 400, body: { error: 'bad k' } };
+  if (!sig) return { status: 400, body: { error: 'bad sig' } };
+  // (2) The proof. Everything above this line is free; this is the one
+  // expensive operation, and it is deliberately the last gate crossed.
+  const msg = new TextEncoder().encode(KIN_REG_CONTEXT + to + '|' + b.tok + '|' + b.t);
+  if (!await verify(pub, sig, msg)) return { status: 401, body: { error: 'no' } };
+  // (3) First-writer-wins on the KEY. One canonical spelling on both sides, so
+  // this comparison is byte equality of key material and cannot be fooled by a
+  // url-safe or unpadded rendering of the very same key.
+  const kc = kinB64Encode(pub);
+  if (haveKey && kc !== haveKey) return { status: 403, body: { error: 'taken' } };
+  // LEGACY ROWS, and why they are not a second squat window: a mailbox
+  // registered before proof-of-possession existed has a `tok` and no key. If
+  // such a row could be key-claimed by any valid signature, the migration
+  // itself would be a takeover window — exactly the hole being closed. So a
+  // legacy row is adoptable only by someone who already knows its `tok`, which
+  // in practice is the device that wrote it.
+  if (have && !haveKey && !kinTimingSafeEqual(have, b.tok)) {
+    return { status: 403, body: { error: 'taken' } };
+  }
+  // Write only what actually changed, so the durable-write count stays honest:
+  // a steady-state refresh from an unchanged device writes nothing at all.
+  const putTok = have === b.tok ? undefined : b.tok;
+  const putKey = haveKey === kc ? undefined : kc;
+  return {
+    status: 200,
+    body: { ok: true, fresh: !haveKey, pollMs: 5000, leaseMs: KIN_LEASE_MS },
+    ...(putTok === undefined ? {} : { put: putTok }),
+    ...(putKey === undefined ? {} : { putKey }),
+  };
+}
+
+/**
+ * Everything a silent-mode toggle decides. Read the block above kinQuietActive
+ * first — this function is the write half of it.
+ *
+ *   POST /api/kin/<handle>/quiet   {to, k, t, sig, quiet, until}
+ *   sig = Ed25519(devicePriv, "kin-quiet-v1|" + to + "|" + quiet + "|" + until + "|" + t)
+ *
+ * `haveKey` is the STORED device key for this handle, canonical base64, or null.
+ *
+ * ── ONLY THE OWNING DEVICE MAY SILENCE A HANDLE ─────────────────────────────
+ *
+ * The signature is verified against the STORED key, never against the key in
+ * the request. Verifying against the presented key would prove only "somebody
+ * holds some private key" — which every attacker does — and would let anyone
+ * silence anyone. So the presented `k` must first be byte-equal to the stored
+ * key (both canonicalised, exactly as in kinRegisterDecide step 3), and the
+ * proof is then checked under the stored bytes.
+ *
+ * A handle with NO registered key therefore cannot be silenced: there is nothing
+ * to prove possession against. It answers 401 `no` — the SAME response as a
+ * wrong key, because a distinguishable "nobody has claimed this" would be a
+ * second existence oracle. (Register already discloses existence, by design, via
+ * 403 `taken`; this endpoint must not add another, and it must not spend a curve
+ * operation on a key that cannot possibly be the owner's either.)
+ *
+ * ── THE ORDER, same law as register ─────────────────────────────────────────
+ *
+ *  1. shape, then SKEW BEFORE ANY CRYPTO — a captured toggle must expire, and it
+ *     can only expire on the timestamp;
+ *  2. the ownership comparison, which is free, so a stranger never buys a curve
+ *     operation and is charged to a window of their own;
+ *  3. the owner's rate window;
+ *  4. the proof.
+ */
+export async function kinQuietDecide(
+  raw: string, to: string, haveKey: string | null,
+  hits: Map<string, number[]>, now: number,
+  verify: KinVerify = kinVerifyEd25519,
+): Promise<KinDecision> {
+  if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
+  if (raw.length > KIN_QUIET_MAX_BODY) return { status: 413, body: { error: 'too big' } };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return { status: 400, body: { error: 'bad json' } }; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { status: 400, body: { error: 'bad body' } };
+  }
+  const b = parsed as Record<string, unknown>;
+  const keys = Object.keys(b);
+  if (keys.length !== KIN_QUIET_KEYS.size || keys.some((k) => !KIN_QUIET_KEYS.has(k))) {
+    return { status: 400, body: { error: 'bad fields' } };
+  }
+  if (typeof b.to !== 'string' || b.to !== to) return { status: 400, body: { error: 'to mismatch' } };
+  if (typeof b.k !== 'string' || !KIN_KEY_RE.test(b.k)) return { status: 400, body: { error: 'bad k' } };
+  // A BOOLEAN, and it is stringified into the signed message as 'true'/'false'.
+  // Not a number, not '1': the signed string is a cross-language contract and
+  // `String(true)` is the one spelling Swift and JS agree on without argument.
+  if (typeof b.quiet !== 'boolean') return { status: 400, body: { error: 'bad quiet' } };
+  // (1) `t` integer, then skew, before any crypto. Same rule and same reason as
+  // register and ring: `t` is stringified into the signature, and 1e21 renders
+  // as "1e+21" — a signature that verifies on the device and never here.
+  if (typeof b.t !== 'number' || !Number.isInteger(b.t)) return { status: 400, body: { error: 'bad t' } };
+  const skew = Math.abs(now / 1000 - b.t);
+  if (skew > KIN_SKEW_S) return { status: 400, body: { error: 'skew', skewS: Math.round(skew) } };
+  // `until`: 0 is indefinite, otherwise a deadline AFTER the moment it was
+  // signed and inside the horizon. Integer for the same stringification reason.
+  // A deadline already in the past would store as a toggle that reads on and
+  // behaves off, which is the desynchronised state this feature exists to avoid.
+  const until = b.until;
+  if (typeof until !== 'number' || !Number.isInteger(until) || until < 0) {
+    return { status: 400, body: { error: 'bad until' } };
+  }
+  if (until !== 0 && (until <= b.t || until - b.t > KIN_QUIET_MAX_S)) {
+    return { status: 400, body: { error: 'bad until' } };
+  }
+  if (typeof b.sig !== 'string' || !KIN_REG_SIG_RE.test(b.sig)) return { status: 400, body: { error: 'bad sig' } };
+  const pub = kinB64(b.k, 32);
+  if (!pub) return { status: 400, body: { error: 'bad k' } };
+  const sig = kinB64(b.sig, 64);
+  if (!sig) return { status: 400, body: { error: 'bad sig' } };
+  // ONE refusal for every way this can fail to be the owner — unclaimed handle,
+  // wrong key, or a signature that does not check out. Three causes, one answer.
+  const deny: KinDecision = { status: 401, body: { error: 'no' } };
+  // (2) The ownership comparison. Free, so it comes before the window and before
+  // the curve: a stranger spends neither.
+  const stored = haveKey ? kinB64(haveKey, 32) : null;
+  if (!stored || kinB64Encode(pub) !== haveKey) {
+    // Charged to its OWN window, exactly like a failed poll: if failures shared
+    // the owner's budget, anyone who knows a handle could 429 its owner out of
+    // their own silent-mode toggle.
+    if (!kinWindow(hits, 'qbad:' + to, now, 60_000, KIN_BAD_AUTH_PER_MIN)) {
+      return { status: 429, body: { error: 'rate' } };
+    }
+    return deny;
+  }
+  // (3) The owner's window. Bounds both the curve operations and the durable
+  // writes this route can cause, and a human pressing a toggle never reaches it.
+  if (!kinWindow(hits, 'quiet:' + to, now, 60_000, KIN_QUIET_PER_MIN)) {
+    return { status: 429, body: { error: 'rate' } };
+  }
+  // (4) The proof, under the STORED key. `stored` and `pub` are byte-equal by
+  // the check above; passing `stored` is the statement the comment makes.
+  const msg = new TextEncoder().encode(
+    KIN_QUIET_CONTEXT + to + '|' + String(b.quiet) + '|' + until + '|' + b.t,
+  );
+  if (!await verify(stored, sig, msg)) return deny;
+  // Stored verbatim, so the row matches the signature that authorised it. With
+  // quiet:false a non-zero `until` is retained and has no effect — kinQuietActive
+  // short-circuits on the toggle — but a client should send 0.
+  const row: KinQuiet = { quiet: b.quiet, until, exceptKnown: false, at: now };
+  return {
+    status: 200,
+    // The evaluated verdict, not the raw bit, so the device can compare what it
+    // asked for against what is actually in force.
+    body: { ok: true, quiet: kinQuietActive(row, now), until, exceptKnown: row.exceptKnown },
+    putQuiet: row,
+  };
+}
+
+// ── Edge rate limits for the doorbell: A SIBLING MAP, not macPosts ───────────
+//
+// macPosts is telemetry's 5000/h budget. Sharing it would mean a Mac that beats
+// hard cannot ring, and a ring flood silences telemetry — two unrelated things
+// failing as one. Same shape, own map, and the three verbs get their own
+// budgets inside it via the key so they cannot spend each other either.
+//
+// THE COST THESE NUMBERS ARE REALLY CAPPING, stated plainly: every distinct
+// handle touched here mints a Room DO via idFromName("inbox:" + handle), and
+// Room's constructor does blockConcurrencyWhile with two storage.get and, the
+// first time, two storage.put plus CREATE TABLE events. So an unauthenticated
+// POST to a made-up handle leaves a durable, empty-table DO behind. Reusing
+// Room is what makes this feature deployable with no new class and no
+// migration, and that storage is the price; the per-IP window is the only thing
+// bounding it. Sized accordingly: `ring` and `register` are tight because a
+// human presses call a few times an hour, `poll` is loose because a false 429
+// there is a SILENTLY MISSED CALL and a real NAT can hold many Macs (a poll
+// every 5 s is 720/h per device, so 20k/h is ~27 devices behind one address).
+// The proper fix is a registry the ring path can consult before minting
+// anything, which is a v2 item and is named as one.
+const KIN_EDGE_WINDOW_MS = 3600_000;
+// `quiet` is sized like `register`: both are pressed by a person, not by a loop,
+// and both mint a DO on first touch. Its own key inside the map, so a ring flood
+// cannot stop someone turning their own silence off.
+const KIN_EDGE_CAP: Record<string, number> = { ring: 240, poll: 20_000, register: 120, quiet: 120 };
+const kinPosts = new Map<string, number[]>();
+
 // ── /api/ice abuse control ────────────────────────────────────────────────────
 // The hole: the route was unauthenticated and unbound, so anyone could mint
 // unlimited 1-hour TURN credentials against our Cloudflare account. The current
@@ -1623,6 +2667,93 @@ const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ICE_MINT_WINDOW_MS = 10 * 60_000;
 const ICE_MINT_MAX = 20;
 const iceMints = new Map<string, number[]>();
+
+// ── Which UDP relay port the native app is told to use ───────────────────────
+//
+// THE BUG THIS REPLACES WAS NOT A WRONG CONSTANT, IT WAS AN UNPINNED ONE.
+//
+// /api/mac/turn used to loop over every UDP `turn:` URL Cloudflare returned and
+// OVERWRITE host/port on each match, so whichever URL Cloudflare happened to
+// list LAST silently became our transport. `let port = 3478` looked like a
+// default but was a dead initializer — the first parsed URL killed it. There
+// was no preference in the code at all.
+//
+// Two consequences, and the second is the one worth remembering: the port we
+// shipped was wrong (`:53`), and it was decided by the ORDER OF A THIRD PARTY'S
+// JSON. Cloudflare reordering its response would have changed our media
+// transport with no deploy, no commit and no log line on our side. A value that
+// can change under you without a deploy is not a configuration, it is a
+// liability — pin it, or measure it every time.
+//
+// EVIDENCE for the rank below, measured 2026-08-24 from this network against
+// turn.cloudflare.com with real minted credentials: 3478 answered an Allocate
+// in 4 ms; 443 and 53 both TIMED OUT. So here 3478 is not merely preferable, it
+// is the only port that answers.
+//
+// 443 and 53 are NOT removed, and must not be. They exist for networks that
+// block 3478 outright — exactly the networks this fallback list is for — and one
+// measurement from one network says nothing about theirs. This change is a
+// PREFERENCE, not a removal: 3478 goes first because it is the standard STUN/TURN
+// port and the one measured working, 443 next because a network that blocks 3478
+// is usually letting https-shaped traffic out, 53 last because DNS-port UDP is
+// the most likely to be intercepted or rewritten by a captive resolver.
+const TURN_PORT_RANK = [3478, 443, 53];
+
+export interface TurnPick {
+  host: string; port: number; ports: number[]; username: string; credential: string;
+}
+
+/**
+ * Pick the UDP relay to hand the native app, in preference order.
+ *
+ * Pure and exported so the ordering can be proved without a deploy or a live
+ * Cloudflare key — same seam as the diagnose layer. `null` means "no usable UDP
+ * relay in this response", which the caller answers as p2pOnly exactly like a
+ * missing key or a failed mint.
+ *
+ * Only `turn:` UDP entries are considered: the app speaks raw UDP STUN/TURN and
+ * has no TLS or TCP relay path, so a `turns:`/`transport=tcp` URL is not a
+ * fallback for it, it is a dead end.
+ */
+export function turnOrderUdp(
+  iceServers: { urls?: string | string[]; username?: string; credential?: string }[] | undefined,
+): TurnPick | null {
+  const cands: { host: string; port: number; username: string; credential: string; seq: number }[] = [];
+  let seq = 0;
+  for (const s of iceServers ?? []) {
+    const urls = Array.isArray(s.urls) ? s.urls : s.urls ? [s.urls] : [];
+    for (const u of urls) {
+      if (typeof u !== 'string' || !u.startsWith('turn:')) continue;
+      if (u.includes('transport=tcp')) continue;
+      const hp = u.slice(5).split('?')[0];
+      const colon = hp.lastIndexOf(':');
+      if (colon < 0) continue;
+      const host = hp.slice(0, colon);
+      const port = Number(hp.slice(colon + 1));
+      if (!host || !Number.isInteger(port) || port < 1 || port > 65_535) continue;
+      // A relay with no credential is not a relay. The old code took the LAST
+      // entry's username whatever it was, so one credential-less entry at the
+      // end of the list turned a working mint into p2pOnly.
+      if (!s.username) continue;
+      cands.push({ host, port, username: s.username, credential: s.credential ?? '', seq: seq++ });
+    }
+  }
+  if (!cands.length) return null;
+  const rank = (p: number): number => {
+    const i = TURN_PORT_RANK.indexOf(p);
+    return i < 0 ? TURN_PORT_RANK.length : i;
+  };
+  // Stable by construction: equal rank falls back to arrival order, so a
+  // response made entirely of unranked ports is passed through in Cloudflare's
+  // own order rather than shuffled into an arbitrary one.
+  cands.sort((a, b) => rank(a.port) - rank(b.port) || a.seq - b.seq);
+  const best = cands[0];
+  // Only ports on the CHOSEN host. A fallback list that silently changed host
+  // mid-array would hand the client an address its credential does not cover.
+  const ports: number[] = [];
+  for (const c of cands) if (c.host === best.host && !ports.includes(c.port)) ports.push(c.port);
+  return { host: best.host, port: best.port, ports, username: best.username, credential: best.credential };
+}
 
 // ── Call-health beacon (task #49) ─────────────────────────────────────────────
 // One singleton DO accumulating anonymous per-call outcomes: did it connect,
@@ -1728,6 +2859,33 @@ const PROBE_REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'o
 /// A stored beat's fields are JSON in one column, so every reader goes through
 /// this: a malformed row must not take down a dashboard that is showing forty
 /// other calls.
+/// The mirror of safeParse, and the reason it needs to exist.
+///
+/// `JSON.stringify(x).slice(0, n)` cuts a valid document mid-token. safeParse()
+/// turns invalid JSON into `{}`. So one oversized beat did not lose its longest
+/// field -- it lost EVERY field it had and read as a completely blind end, which
+/// is the single thing this layer must never silently do. A dashboard would show
+/// "cannot see" for a client that was in fact reporting everything.
+///
+/// Drop whole keys instead, largest serialised first, and leave the count behind
+/// so a reader can tell "trimmed here" from "never sent by the client". Always
+/// returns parseable JSON, including the degenerate case of one enormous field.
+export function packFields(rest: Record<string, unknown>, limit = 8000): string {
+  let out = JSON.stringify(rest);
+  if (out.length <= limit) return out;
+  const kept: Record<string, unknown> = { ...rest };
+  const bySize = Object.keys(kept).sort(
+    (a, b) => JSON.stringify(kept[b] ?? null).length - JSON.stringify(kept[a] ?? null).length);
+  let dropped = 0;
+  for (const k of bySize) {
+    delete kept[k];
+    dropped++;
+    out = JSON.stringify({ ...kept, fields_dropped: dropped });
+    if (out.length <= limit) return out;
+  }
+  return JSON.stringify({ fields_dropped: dropped });
+}
+
 function safeParse(t: unknown): Record<string, unknown> {
   if (typeof t !== 'string') return {};
   try { const v = JSON.parse(t); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
@@ -1738,6 +2896,544 @@ function shapeMacRow(r: any): Record<string, unknown> {
     call: r.call, install: r.install, version: r.version, model: r.model,
     phase: r.phase, wall: r.wall, ...safeParse(r.fields),
   };
+}
+
+// ── Self-diagnosis: turning stored beats into a NAMED fault ─────────────────
+//
+// DIAGNOSE.md is the design. Three properties matter more than the rule list:
+//
+// 1. Every rule is a FRACTION or a RATE. A count carries no meaning without the
+//    seconds it happened over: "40 concealments" is a clean call across one beat
+//    and a broken one across ten.
+// 2. Every latency rule subtracts prop = rtt_ms/2, exactly as calls.js:23-25
+//    already does for the dashboard. Distance is not a defect, and an absolute-ms
+//    threshold containing propagation is a hidden distance limit -- a bug this
+//    codebase has now shipped four separate times.
+// 3. The BLINDNESS GATE runs first. An instrument that cannot see an event
+//    returns the same value as a real negative, so a missing field must produce
+//    `unknown` with a named reason -- never a default, and never `healthy`.
+//
+// The client does not send most of the fields below yet, so a diagnose over
+// today's beats is expected to come back mostly `unknown`. That is the correct
+// answer, not a gap: it says exactly which instrument is missing.
+//
+// Pure functions on purpose. The Durable Object below only fetches rows; the
+// verdicts are computed by `diagnoseEnd` / `diagnoseAgreement`, which can be
+// fed hand-written beats and checked without a deploy.
+
+const DIAG_EXPECTED_PPS = 1500;   // 48 kHz / 32 samples per packet
+const DIAG_EXPECTED_FPS = 30;
+const DIAG_WINDOW = 3;            // last 3 beats ~ 15 s
+const DIAG_MIN_BEATS = 2;
+
+type DiagSev = 'critical' | 'major' | 'minor' | 'info' | 'none' | 'unknown';
+type DiagSource = 'local' | 'peer_report' | 'mixed';
+
+const DIAG_SEV: Record<string, DiagSev> = {
+  never_connected: 'critical', no_route: 'critical', dropped: 'critical',
+  one_way_out: 'critical', one_way_in: 'critical', mic_denied: 'critical',
+  capture_broken: 'critical', mic_silent: 'critical', crypto_broken: 'critical',
+  video_black_in: 'critical', video_frozen_in: 'critical',
+  audio_dropouts_in: 'major', audio_dropouts_out: 'major', starved: 'major',
+  high_latency: 'major', video_lag: 'major', path_flapping: 'major',
+  internal_defect: 'major', echo: 'major', version_skew: 'major',
+  device_wrong: 'major',
+  jittery_audio: 'minor', aec_thrashing: 'minor', video_stutter_in: 'minor',
+  video_pixelated_in: 'minor', video_low_res_in: 'minor',
+  mic_muted: 'info', peer_left: 'info', reconnecting: 'info',
+};
+const DIAG_RANK: Record<DiagSev, number> = {
+  critical: 5, major: 4, minor: 3, info: 2, unknown: 1, none: 0,
+};
+
+interface DiagFault { name: string; severity: DiagSev; evidence: string; source: DiagSource; }
+interface DiagSkip { rule: string; why: string; }
+interface DiagDirection {
+  verdict: string; severity: DiagSev; reason: string | null;
+  coverage: boolean; faults: DiagFault[]; skipped: DiagSkip[];
+}
+interface DiagLatency {
+  m2e_p50: number | null; m2e_p99: number | null; rtt_ms: number | null;
+  prop_ms: number | null; overhead_ms: number | null;
+  g2g_p50: number | null; g2g_overhead_ms: number | null;
+  probes: number | null; graded: boolean; why: string | null;
+}
+export interface DiagEnd {
+  call: string; install: string | null; version: string | null; model: string | null;
+  verdict: string; severity: DiagSev; reason: string | null;
+  directions: { audio_in: DiagDirection; audio_out: DiagDirection; video_in: DiagDirection };
+  latency: DiagLatency;
+  coverage: Record<string, boolean>;
+  faults: DiagFault[];
+  skipped: DiagSkip[];
+  beatsInWindow: number; lastBeatAgeS: number | null; endedCleanly: boolean;
+}
+export interface DiagEndInput {
+  call: string;
+  install?: string | null; version?: string | null; model?: string | null;
+  beats: Record<string, unknown>[];   // any order; `wall` in SECONDS
+  endedCleanly?: boolean;
+  now?: number;                       // seconds
+}
+
+function dnum(v: unknown): number | null {
+  return typeof v === 'number' && isFinite(v) ? v : null;
+}
+function diagRound(v: number | null, d = 2): number | null {
+  if (v === null) return null;
+  const m = Math.pow(10, d);
+  return Math.round(v * m) / m;
+}
+
+/// The window's view of one field. Nothing here ever invents a value: a field
+/// the beats do not carry comes back `null`, and the caller must then name the
+/// blindness instead of grading it.
+function diagWindow(beats: Record<string, unknown>[]) {
+  const first = beats[0];
+  const last = beats[beats.length - 1];
+  const spanS = Math.max(0, (dnum(last.wall) ?? 0) - (dnum(first.wall) ?? 0));
+  const vals = (k: string): number[] =>
+    beats.map((b) => dnum(b[k])).filter((v): v is number => v !== null);
+  const avg = (k: string): number | null => {
+    const v = vals(k);
+    return v.length ? v.reduce((a, x) => a + x, 0) / v.length : null;
+  };
+  const maxOf = (k: string): number | null => {
+    const v = vals(k);
+    return v.length ? v.reduce((a, x) => (x > a ? x : a), v[0]) : null;
+  };
+  const has = (k: string): boolean => vals(k).length > 0;
+  const flips = (k: string): boolean => {
+    const v = vals(k);
+    return v.length > 1 && v.some((x) => x !== v[0]);
+  };
+  // A counter's RATE per second, or null when these beats cannot yield one.
+  //
+  // `foo_ps` is a rate already and is believed directly. Everything else in
+  // this schema is a CUMULATIVE total -- that is how calls.js reads every one
+  // of them -- so its rate is the delta over the seconds between the beats,
+  // and a flat counter means a rate of zero. That is the whole point: a
+  // `peer_played` that does not move is one-way audio.
+  //
+  // Two cases yield null instead of a number, because they are genuinely
+  // unreadable rather than zero: no beat carried the field at all, and a
+  // counter that went DOWN (a restarted peer resets to zero, and this codebase
+  // has already been bitten by treating that as data).
+  const rateOf = (k: string): number | null => {
+    const ps = avg(k + '_ps');
+    if (ps !== null) return ps;
+    const v = vals(k);
+    if (!v.length) return null;
+    const d = v[v.length - 1] - v[0];
+    if (d < 0) return null;
+    if (spanS <= 0) return null;
+    return d / spanS;
+  };
+  return { beats, first, last, spanS, vals, avg, maxOf, has, flips, rateOf };
+}
+
+/// One end's account of one call. `beats` should be that end's most recent
+/// beats; only the last DIAG_WINDOW of them are graded.
+export function diagnoseEnd(input: DiagEndInput): DiagEnd {
+  const now = input.now ?? Date.now() / 1000;
+  const all = (input.beats ?? []).slice()
+    .sort((a, b) => (dnum(a.wall) ?? 0) - (dnum(b.wall) ?? 0));
+  // ── A `pre_connect` beat is not a blind end. It is a call that had not
+  // started yet ───────────────────────────────────────────────────────────────
+  // The mac client's audioBeat returns early before its time-sync exists and
+  // emits seven fields marked `pre_connect: 1` -- no rtt, no probes, no rings,
+  // correctly, because none of them exist at that moment. Left in the window
+  // they made a fully instrumented client look like one that had stopped
+  // sending `probes`, and sent a whole lane hunting for a field that has been in
+  // every beat since 0.20.1. The instrument was fine; the call had not begun.
+  //
+  // "Never got past setup" is a verdict of its own, and it is the useful one --
+  // it points at rendezvous, ICE and TURN rather than at audio.
+  const connected = all.filter((b) => dnum((b as any).pre_connect) !== 1);
+  const preConnectOnly = all.length > 0 && connected.length === 0;
+  const thinReason = preConnectOnly ? 'pre_connect_only' : 'insufficient_beats';
+  const lastWall = all.length ? dnum(all[all.length - 1].wall) : null;
+  const lastBeatAgeS = lastWall !== null ? diagRound(now - lastWall, 1) : null;
+  const endedCleanly = input.endedCleanly === true;
+  const ident = {
+    call: input.call, install: input.install ?? null,
+    version: input.version ?? null, model: input.model ?? null,
+  };
+  const blindDir = (reason: string): DiagDirection => ({
+    verdict: 'unknown', severity: 'unknown', reason,
+    coverage: false, faults: [], skipped: [],
+  });
+
+  // ── Blindness gate, first rule: two beats is the minimum from which a rate
+  // can exist at all. One beat is a birth certificate, not a health record.
+  if (connected.length < DIAG_MIN_BEATS) {
+    return {
+      ...ident,
+      verdict: 'unknown', severity: 'unknown', reason: thinReason,
+      directions: {
+        audio_in: blindDir(thinReason),
+        audio_out: blindDir(thinReason),
+        video_in: blindDir(thinReason),
+      },
+      latency: {
+        m2e_p50: null, m2e_p99: null, rtt_ms: null, prop_ms: null, overhead_ms: null,
+        g2g_p50: null, g2g_overhead_ms: null, probes: null,
+        graded: false, why: thinReason,
+      },
+      coverage: { beats: false, latency: false, audio_in: false, audio_out: false, video_in: false, v_glass: false },
+      faults: [], skipped: [], beatsInWindow: connected.length, lastBeatAgeS, endedCleanly,
+    };
+  }
+
+  const win = connected.slice(-DIAG_WINDOW);
+  const w = diagWindow(win);
+
+  // ── Blindness gate: latency ───────────────────────────────────────────────
+  // prop is NEVER 0 when the round trip is unknown. Defaulting it turns a
+  // 300 ms antipodal call -- the whole point of the product -- into a fault.
+  const rtt = w.avg('rtt_ms');
+  const probes = w.maxOf('probes');
+  const m2e = w.avg('m2e_p50');
+  const m2e99 = w.avg('m2e_p99');
+  const g2g = w.avg('g2g_p50');
+  let latWhy: string | null = null;
+  if (rtt === null) latWhy = 'no_rtt_ms';
+  else if (probes === null) latWhy = 'no_probe_count';
+  else if (probes < 20) latWhy = 'probes_lt_20';
+  const latGraded = latWhy === null;
+  const prop = latGraded && rtt !== null ? rtt / 2 : null;
+  const over = prop !== null && m2e !== null ? m2e - prop : null;
+  const g2gOver = prop !== null && g2g !== null ? g2g - prop : null;
+  const latency: DiagLatency = {
+    m2e_p50: diagRound(m2e), m2e_p99: diagRound(m2e99), rtt_ms: diagRound(rtt),
+    prop_ms: diagRound(prop), overhead_ms: diagRound(over),
+    g2g_p50: diagRound(g2g), g2g_overhead_ms: diagRound(g2gOver),
+    probes, graded: latGraded, why: latWhy,
+  };
+
+  // ── Blindness gate: the peer's receive report ─────────────────────────────
+  // Nothing an end measures about its OWN sending is evidence about the path
+  // out of it. cap_ps says packets left; only the far end can say they landed.
+  const peerReports = w.maxOf('peer_reports');
+  const outBlind = peerReports === null ? 'no_peer_report'
+    : peerReports <= 0 ? 'no_peer_report' : null;
+
+  // ── Blindness gate: is video even running? ───────────────────────────────
+  const vEncodes = w.rateOf('v_encodes');
+  const vFrags = w.rateOf('v_frags');
+  let videoRunning: boolean | null = null;
+  let videoSrc = 'v_encodes/v_frags';
+  if (vEncodes !== null || vFrags !== null) {
+    videoRunning = (vEncodes ?? 0) > 0 || (vFrags ?? 0) > 0;
+  } else {
+    const encPs = w.rateOf('v_enc');
+    const decPs = w.rateOf('v_dec');
+    if (encPs !== null || decPs !== null) {
+      videoRunning = (encPs ?? 0) > 0 || (decPs ?? 0) > 0;
+      videoSrc = 'v_enc_ps/v_dec_ps';
+    } else {
+      videoSrc = 'none';
+    }
+  }
+
+  // ── Blindness gate: a percentile over a tenth of the frames is not a
+  // latency (main.swift:2286-2294), so below half coverage it is discarded.
+  const glassCov = w.avg('v_glass_cov');
+  const glassOk = glassCov !== null && glassCov >= 0.5;
+  const glass = glassOk ? w.avg('v_glass_ms_p50') : null;
+
+  const endFaults: DiagFault[] = [];
+  const endSkipped: DiagSkip[] = [];
+  const mk = (
+    bag: DiagFault[], name: string, evidence: string, source: DiagSource = 'local',
+  ): void => { bag.push({ name, severity: DIAG_SEV[name] ?? 'major', evidence, source }); };
+
+  // ── audio_in: the path INTO this end. Receiver-side evidence only. ────────
+  const inFaults: DiagFault[] = [];
+  const inSkipped: DiagSkip[] = [];
+  const concealPs = w.rateOf('conceal');
+  const recvPs = w.rateOf('recv');
+  const peerStatus = w.maxOf('peer_status');
+  const audioInCov = concealPs !== null || recvPs !== null || m2e !== null;
+
+  if (concealPs === null) inSkipped.push({ rule: 'audio_dropouts_in', why: 'no_conceal_ps' });
+  else if (concealPs / DIAG_EXPECTED_PPS > 0.005) {
+    mk(inFaults, 'audio_dropouts_in',
+      `${diagRound(concealPs, 1)} concealed/s = ${diagRound(100 * concealPs / DIAG_EXPECTED_PPS, 2)}% of ${DIAG_EXPECTED_PPS}/s (>0.5%)`);
+  }
+  if (recvPs === null) {
+    inSkipped.push({ rule: 'one_way_in', why: 'no_inbound_packet_rate' });
+    inSkipped.push({ rule: 'starved', why: 'no_inbound_packet_rate' });
+  } else if (recvPs === 0 && peerStatus !== 2) {
+    mk(inFaults, 'one_way_in', `0 packets/s arriving; peer_status=${peerStatus ?? 'unknown'}`);
+  } else if (recvPs > 0 && recvPs / DIAG_EXPECTED_PPS < 0.5) {
+    mk(inFaults, 'starved',
+      `${diagRound(recvPs, 0)} pkt/s in = ${diagRound(100 * recvPs / DIAG_EXPECTED_PPS, 1)}% of expected (<50%)`);
+  }
+  const latePs = w.rateOf('late');
+  const snapPs = w.rateOf('snaps');
+  if (latePs === null && snapPs === null) inSkipped.push({ rule: 'jittery_audio', why: 'no_late_or_snaps' });
+  else if ((snapPs ?? 0) > 0.1 || (latePs ?? 0) / DIAG_EXPECTED_PPS > 0.02) {
+    mk(inFaults, 'jittery_audio',
+      `${diagRound(snapPs ?? 0, 2)} cursor jumps/s, late ${diagRound(100 * (latePs ?? 0) / DIAG_EXPECTED_PPS, 2)}% of expected`);
+  }
+  if (!latGraded) inSkipped.push({ rule: 'high_latency', why: latWhy ?? 'latency_blind' });
+  else if (over !== null && over > 40) {
+    mk(inFaults, 'high_latency',
+      `m2e ${diagRound(m2e, 1)} ms - prop ${diagRound(prop, 1)} ms = ${diagRound(over, 1)} ms overhead (>40)`);
+  } else if (over === null) inSkipped.push({ rule: 'high_latency', why: 'no_m2e_p50' });
+
+  // ── audio_out: the path OUT of this end. Only the peer can testify. ───────
+  const outFaults: DiagFault[] = [];
+  const outSkipped: DiagSkip[] = [];
+  const capPs = w.rateOf('cap');
+  const sigRms = w.avg('sig_rms');
+  const micMuted = w.maxOf('mic_muted');
+  const capCbPs = w.rateOf('cap_callbacks');
+  if (!outBlind) {
+    const peerPlayedPs = w.rateOf('peer_played');
+    if (capPs === null) outSkipped.push({ rule: 'one_way_out', why: 'no_cap_ps' });
+    else if (peerPlayedPs === null) outSkipped.push({ rule: 'one_way_out', why: 'no_peer_played' });
+    else if (capPs / DIAG_EXPECTED_PPS >= 0.5 && peerPlayedPs === 0) {
+      mk(outFaults, 'one_way_out',
+        `sending ${diagRound(capPs, 0)} pkt/s but the peer played 0/s`, 'peer_report');
+    }
+    const lostPs = w.rateOf('peer_rx_lost');
+    const recPs = w.rateOf('peer_rx_recovered');
+    if (lostPs === null && recPs === null) outSkipped.push({ rule: 'audio_dropouts_out', why: 'no_peer_rx_lost' });
+    else if (capPs === null || capPs <= 0) outSkipped.push({ rule: 'audio_dropouts_out', why: 'no_cap_ps' });
+    else {
+      const frac = ((lostPs ?? 0) + (recPs ?? 0)) / capPs;
+      if (frac > 0.02) {
+        mk(outFaults, 'audio_dropouts_out',
+          `peer lost+recovered ${diagRound(100 * frac, 2)}% of what this end sent (>2%)`, 'peer_report');
+      }
+    }
+  } else {
+    outSkipped.push({ rule: 'one_way_out', why: outBlind });
+    outSkipped.push({ rule: 'audio_dropouts_out', why: outBlind });
+  }
+  // Local capture faults belong to the outbound direction: they are the reason
+  // the peer hears nothing, and they need no peer report to establish.
+  if (micMuted === null) outSkipped.push({ rule: 'mic_muted', why: 'no_mic_muted' });
+  else if (micMuted > 0) mk(outFaults, 'mic_muted', 'the microphone is muted at this end');
+  if (capCbPs === null) outSkipped.push({ rule: 'capture_broken', why: 'no_cap_callbacks' });
+  else if (capCbPs === 0) mk(outFaults, 'capture_broken', 'the capture callback is not firing');
+  if (sigRms === null) outSkipped.push({ rule: 'mic_silent', why: 'no_sig_rms' });
+  else if (sigRms < 0.0005 && (micMuted ?? 0) === 0 && (capCbPs === null || capCbPs > 0)) {
+    mk(outFaults, 'mic_silent',
+      `capture is running but the signal is silent (rms ${sigRms.toExponential(1)})`);
+  }
+  const micAccess = w.maxOf('mic_access');
+  if (micAccess === null) outSkipped.push({ rule: 'mic_denied', why: 'no_mic_access' });
+  else if (micAccess === 0) mk(outFaults, 'mic_denied', 'microphone permission is not granted');
+
+  // ── video_in: the picture arriving at this end ────────────────────────────
+  const vidFaults: DiagFault[] = [];
+  const vidSkipped: DiagSkip[] = [];
+  let vidBlind: string | null = null;
+  if (videoRunning === null) vidBlind = 'no_video_counters';
+  else if (!videoRunning) vidBlind = 'video_not_running';
+  if (!vidBlind) {
+    const shownPs = w.rateOf('v_shown');
+    const decPs = w.rateOf('v_dec');
+    const fragPs = vFrags;
+    if (shownPs === null && decPs === null) vidSkipped.push({ rule: 'video_frozen_in', why: 'no_v_shown_or_v_dec_ps' });
+    else if ((shownPs ?? decPs ?? 0) === 0 && (fragPs === null || fragPs > 0)) {
+      mk(vidFaults, 'video_frozen_in', 'frames are arriving but none reached the screen');
+    } else {
+      const fps = shownPs ?? decPs ?? 0;
+      if (fps > 0 && fps / DIAG_EXPECTED_FPS < 0.6) {
+        mk(vidFaults, 'video_stutter_in',
+          `${diagRound(fps, 1)} fps shown = ${diagRound(100 * fps / DIAG_EXPECTED_FPS, 0)}% of ${DIAG_EXPECTED_FPS} (<60%)`);
+      }
+    }
+    const luma = w.avg('dec_luma');
+    if (luma === null) vidSkipped.push({ rule: 'video_black_in', why: 'no_dec_luma' });
+    else if (luma < 4) mk(vidFaults, 'video_black_in', `decoded luma ${diagRound(luma, 1)} -- the picture is black, not frozen`);
+    const peerQ = w.avg('peer_q_level');
+    const bpf = w.avg('v_bytes_frame');
+    if (peerQ === null && bpf === null) vidSkipped.push({ rule: 'video_pixelated_in', why: 'no_peer_q_level_or_v_bytes_frame' });
+    else if ((peerQ !== null && peerQ <= 0) || (bpf !== null && bpf < 1500)) {
+      mk(vidFaults, 'video_pixelated_in',
+        peerQ !== null && peerQ <= 0 ? 'the sender is pinned at its lowest quality level'
+          : `${diagRound(bpf, 0)} bytes/frame is below the floor for a watchable picture`,
+        peerQ !== null ? 'peer_report' : 'local');
+    }
+    const rxW = w.maxOf('v_rx_w');
+    if (rxW === null) vidSkipped.push({ rule: 'video_low_res_in', why: 'no_v_rx_w' });
+    else if (rxW > 0 && rxW < 640) mk(vidFaults, 'video_low_res_in', `arriving at ${rxW} px wide`);
+    if (!latGraded) vidSkipped.push({ rule: 'video_lag', why: latWhy ?? 'latency_blind' });
+    else if (g2gOver !== null && g2gOver > 90) {
+      mk(vidFaults, 'video_lag',
+        `g2g ${diagRound(g2g, 0)} ms - prop ${diagRound(prop, 0)} ms = ${diagRound(g2gOver, 0)} ms overhead (>90)`);
+    } else if (g2gOver === null) vidSkipped.push({ rule: 'video_lag', why: 'no_g2g_p50' });
+    if (!glassOk) vidSkipped.push({ rule: 'v_glass_ms_p50', why: glassCov === null ? 'no_v_glass_cov' : 'v_glass_cov_lt_0.5' });
+  }
+
+  // ── Faults that belong to the call rather than to one direction ───────────
+  const route = w.maxOf('route');
+  const turnOk = w.maxOf('turn_ok');
+  if (route === null) endSkipped.push({ rule: 'no_route', why: 'no_route_field' });
+  else if (route === 2 && turnOk === 0) mk(endFaults, 'no_route', 'relay was the only path left and TURN did not come up');
+  if (route !== null && w.flips('route')) mk(endFaults, 'path_flapping', 'the media path changed inside the window');
+  const relockPs = w.rateOf('relocks');
+  const restartPs = w.rateOf('peer_restarts');
+  if (relockPs === null && restartPs === null) endSkipped.push({ rule: 'path_flapping', why: 'no_relocks_or_peer_restarts' });
+  else if ((relockPs ?? 0) > 0 || (restartPs ?? 0) > 0) {
+    mk(endFaults, 'path_flapping',
+      `${diagRound(relockPs ?? 0, 2)} relocks/s, ${diagRound(restartPs ?? 0, 2)} peer restarts/s`);
+  }
+  const crypt = w.maxOf('crypt');
+  const cryptBadPs = w.rateOf('crypt_bad');
+  if (crypt !== null && crypt === 0) mk(endFaults, 'crypto_broken', 'media is not encrypted');
+  else if (cryptBadPs !== null && cryptBadPs > 0) mk(endFaults, 'crypto_broken', `${diagRound(cryptBadPs, 2)} packets/s failed to decrypt`);
+  else if (crypt === null && cryptBadPs === null) endSkipped.push({ rule: 'crypto_broken', why: 'no_crypt_fields' });
+  const fmtPs = w.rateOf('fmt_mismatch');
+  if (fmtPs === null) endSkipped.push({ rule: 'version_skew', why: 'no_fmt_mismatch' });
+  else if (fmtPs > 0) mk(endFaults, 'version_skew', `${diagRound(fmtPs, 2)} packets/s refused for format mismatch`);
+  const renderErrPs = w.rateOf('render_errs');
+  const auditDelta = w.maxOf('audit_delta');
+  const enqFailPs = w.rateOf('v_enq_fail');
+  if (renderErrPs !== null && renderErrPs > 0) mk(endFaults, 'internal_defect', `${diagRound(renderErrPs, 2)} render errors/s`);
+  else if (auditDelta !== null && auditDelta !== 0) mk(endFaults, 'internal_defect', `sample audit off by ${auditDelta}`);
+  else if (enqFailPs !== null && enqFailPs > 0) mk(endFaults, 'internal_defect', `${diagRound(enqFailPs, 2)} frames/s the window refused`);
+  else if (renderErrPs === null && auditDelta === null && enqFailPs === null) {
+    endSkipped.push({ rule: 'internal_defect', why: 'no_render_errs_or_audit' });
+  }
+  const inRate = w.maxOf('in_rate');
+  const outRate = w.maxOf('out_rate');
+  if (inRate === null && outRate === null) endSkipped.push({ rule: 'device_wrong', why: 'no_in_rate_or_out_rate' });
+  else if ((inRate !== null && inRate !== 48000) || (outRate !== null && outRate !== 48000)) {
+    mk(endFaults, 'device_wrong', `device is running at ${inRate ?? '?'} in / ${outRate ?? '?'} out, not 48000`);
+  }
+  const echoCorr = w.avg('echo_corr');
+  const erle = w.avg('erle_db');
+  const mute = w.maxOf('mute');
+  if (echoCorr === null || erle === null || mute === null) {
+    endSkipped.push({ rule: 'echo', why: 'no_echo_corr_erle_db_or_mute' });
+  } else if (echoCorr > 0.45 && mute === 0 && erle < 6) {
+    mk(endFaults, 'echo', `correlation ${diagRound(echoCorr, 2)} with only ${diagRound(erle, 1)} dB ERLE, speaker live`);
+  }
+  const freezePs = w.rateOf('aec_freezes');
+  if (freezePs === null) endSkipped.push({ rule: 'aec_thrashing', why: 'no_aec_freezes' });
+  else if (freezePs > 0.2) mk(endFaults, 'aec_thrashing', `${diagRound(freezePs, 2)} canceller freezes/s`);
+  if (peerStatus === null) endSkipped.push({ rule: 'peer_left', why: 'no_peer_status' });
+  else if (peerStatus === 2) mk(endFaults, 'peer_left', 'the peer left');
+  else if (peerStatus === 1) mk(endFaults, 'reconnecting', 'this end is reconnecting');
+  if (probes !== null && probes === 0 && recvPs === 0) {
+    mk(endFaults, 'never_connected', 'no time-sync probe ever answered and nothing arrived');
+  } else if (probes === null) endSkipped.push({ rule: 'never_connected', why: 'no_probe_count' });
+  if (!endedCleanly && lastBeatAgeS !== null && lastBeatAgeS > 30) {
+    mk(endFaults, 'dropped', `beats stopped ${lastBeatAgeS} s ago with no final beat`);
+  }
+
+  // ── Roll up. `healthy` requires the gate to have PASSED. ─────────────────
+  const dir = (
+    faults: DiagFault[], skipped: DiagSkip[], coverage: boolean, blind: string | null,
+  ): DiagDirection => {
+    // A fired fault is a finding whatever else is blind, so it is reported
+    // first -- blindness cannot erase evidence that did arrive.
+    if (faults.length) {
+      const worst = faults.reduce((a, f) => (DIAG_RANK[f.severity] > DIAG_RANK[a.severity] ? f : a), faults[0]);
+      return { verdict: worst.name, severity: worst.severity, reason: null, coverage, faults, skipped };
+    }
+    if (blind || !coverage) {
+      return { verdict: 'unknown', severity: 'unknown', reason: blind ?? 'no_instrument',
+               coverage: false, faults, skipped };
+    }
+    // Nothing fired -- but a rule that could not RUN is not a rule that passed,
+    // and calling this direction green would be the exact shape of every green
+    // metric in this project that turned out to be hiding a defect.
+    if (skipped.length) {
+      return { verdict: 'unknown', severity: 'unknown',
+               reason: 'blind_rules:' + skipped.map((s) => s.rule).join(','),
+               coverage: true, faults, skipped };
+    }
+    return { verdict: 'healthy', severity: 'none', reason: null, coverage: true, faults, skipped };
+  };
+  const directions = {
+    audio_in: dir(inFaults, inSkipped, audioInCov, audioInCov ? null : 'no_inbound_instrument'),
+    audio_out: dir(outFaults, outSkipped, outBlind === null, outBlind),
+    video_in: dir(vidFaults, vidSkipped, vidBlind === null, vidBlind),
+  };
+  const coverage = {
+    beats: true,
+    latency: latGraded,
+    audio_in: directions.audio_in.coverage,
+    audio_out: directions.audio_out.coverage,
+    video_in: directions.video_in.coverage,
+    v_glass: glassOk,
+    video_source: videoSrc !== 'none',
+  };
+  const faults = [...directions.audio_in.faults, ...directions.audio_out.faults,
+                  ...directions.video_in.faults, ...endFaults];
+
+  let verdict: string;
+  let severity: DiagSev;
+  let reason: string | null = null;
+  if (faults.length) {
+    const worst = faults.reduce((a, f) => (DIAG_RANK[f.severity] > DIAG_RANK[a.severity] ? f : a), faults[0]);
+    verdict = worst.name; severity = worst.severity;
+  } else {
+    // Green with a blind instrument is not green. Video is the one exception:
+    // an audio-only call is a legitimate call, so a missing picture blocks the
+    // VIDEO verdict without blocking the call's. Latency, inbound audio and the
+    // peer's receive report all gate `healthy`.
+    const missing = (['latency', 'audio_in', 'audio_out'] as const).filter((k) => !coverage[k]);
+    const blindRules = [...directions.audio_in.skipped, ...directions.audio_out.skipped,
+                        ...directions.video_in.skipped, ...endSkipped];
+    if (missing.length) {
+      verdict = 'unknown'; severity = 'unknown';
+      reason = missing.map((k) => k === 'latency' ? (latWhy ?? 'latency_blind')
+        : k === 'audio_out' ? (outBlind ?? 'no_peer_report') : 'no_inbound_instrument').join(',');
+    } else if (blindRules.length) {
+      verdict = 'unknown'; severity = 'unknown';
+      reason = 'blind_rules:' + blindRules.map((s) => s.rule).join(',');
+    } else { verdict = 'healthy'; severity = 'none'; }
+  }
+
+  return {
+    ...ident, verdict, severity, reason, directions, latency, coverage, faults,
+    skipped: endSkipped,
+    beatsInWindow: win.length, lastBeatAgeS, endedCleanly,
+  };
+}
+
+/// One end saying `one_way_out` and the other not saying `one_way_in` is not a
+/// tie to be broken -- the DISAGREEMENT is the finding, because one of the two
+/// instruments is wrong and which one matters more than the verdict.
+const DIAG_MIRROR: [string, string][] = [
+  ['one_way_out', 'one_way_in'],
+  ['audio_dropouts_out', 'audio_dropouts_in'],
+];
+export function diagnoseAgreement(ends: DiagEnd[]): { agree: boolean | null; notes: string[] } {
+  if (ends.length < 2) return { agree: null, notes: ['single_end'] };
+  const notes: string[] = [];
+  let contradiction = false;
+  let blind = false;
+  for (const a of ends) {
+    for (const b of ends) {
+      if (a === b) continue;
+      const an = new Set(a.faults.map((f) => f.name));
+      const bn = new Set(b.faults.map((f) => f.name));
+      for (const [out, inn] of DIAG_MIRROR) {
+        if (!an.has(out)) continue;
+        if (!b.directions.audio_in.coverage) {
+          blind = true;
+          notes.push(`${a.call} says ${out}; ${b.call} cannot see inbound audio (${b.directions.audio_in.reason ?? 'unknown'})`);
+        } else if (!bn.has(inn)) {
+          contradiction = true;
+          notes.push(`${a.call} says ${out} but ${b.call} does not report ${inn} -- one of the two instruments is wrong`);
+        } else {
+          notes.push(`${a.call} ${out} matches ${b.call} ${inn}`);
+        }
+      }
+    }
+  }
+  if (contradiction) return { agree: false, notes };
+  if (blind) return { agree: null, notes };
+  return { agree: true, notes };
 }
 
 export class Health implements DurableObject {
@@ -1800,8 +3496,18 @@ export class Health implements DurableObject {
         fields TEXT NOT NULL
       );
     `);
+    // `pair` joins the TWO ENDS of one call, added 2026-08-24. It is the first
+    // 8 hex of SHA-256("tk-pair-v1" || sharedKey), computed once at handshake:
+    // both ends land on the same value, and there is no path from it back to
+    // the room code or the key. Without it the two accounts of one call cannot
+    // be put side by side -- `call` is per-PROCESS -- and "the damage is on the
+    // path out of me" is unsayable. Same idempotent-ALTER pattern as `beats`
+    // above: the table already exists in production, so CREATE cannot add it
+    // and "duplicate column name" here is the expected no-op.
+    try { this.sql.exec(`ALTER TABLE mac_beats ADD COLUMN pair TEXT`); } catch { /* already there */ }
     try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_call ON mac_beats(call, wall)`); } catch {}
     try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_wall ON mac_beats(wall)`); } catch {}
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS mac_pair ON mac_beats(pair, wall)`); } catch {}
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS rooms (
         code TEXT PRIMARY KEY,
@@ -1831,13 +3537,22 @@ export class Health implements DurableObject {
       // client is not supposed to send one, and a server that quietly accepts it
       // would make the guarantee unverifiable.
       for (const k of ['room', 'secret', 'peer']) if (k in b) delete b[k];
+      // `pair` is NOT a room code and is deliberately not on that list: it is a
+      // one-way hash of the shared key with a fixed prefix, so it identifies
+      // "these two beats are the same call" and nothing else. It gets its own
+      // indexed column rather than living in `fields`, because joining the two
+      // ends is a query, not a display value. Hex only, so a client that sent
+      // something else cannot smuggle a room name through this door.
+      const pairRaw = typeof b.pair === 'string' ? b.pair.toLowerCase() : '';
+      const pair = /^[0-9a-f]{4,32}$/.test(pairRaw) ? pairRaw : null;
+      delete b.pair;
       const { install, call, version, model, phase, ...rest } = b as any;
       this.sql.exec(
-        `INSERT INTO mac_beats (wall, install, call, version, model, phase, fields)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO mac_beats (wall, install, call, version, model, phase, pair, fields)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now() / 1000, String(install).slice(0, 40), String(call).slice(0, 40),
         String(version ?? '').slice(0, 20), String(model ?? '').slice(0, 40),
-        phase === 'final' ? 'final' : 'live', JSON.stringify(rest).slice(0, 8000));
+        phase === 'final' ? 'final' : 'live', pair, packFields(rest));
       // Keep a week. Long enough for "the call on Tuesday was bad", short enough
       // that the DO stays small without a scheduled job to remember.
       this.sql.exec(`DELETE FROM mac_beats WHERE wall < ?`, Date.now() / 1000 - 7 * 86400);
@@ -1901,6 +3616,103 @@ export class Health implements DurableObject {
       const rows = [...this.sql.exec(
         `SELECT wall, phase, fields FROM mac_beats WHERE call = ? ORDER BY wall ASC LIMIT 2000`, id)];
       return json({ call: id, beats: (rows as any[]).map((r) => ({ wall: r.wall, phase: r.phase, ...safeParse(r.fields) })) });
+    }
+
+    // ── What is wrong with this call, in words ────────────────────────────────
+    //
+    // Same rows /mac/call already serves, read through the verdict layer above.
+    // Zero client cost: the app posts numbers, the opinion lives here, and an
+    // opinion that changes does not need every installed copy to update first.
+    //
+    // Default is every call with a beat in the last 90 s -- the same window
+    // /mac/live uses -- so "a call is bad right now" is one request.
+    if (url.pathname === '/mac/diagnose') {
+      const now = Date.now() / 1000;
+      const qCall = (url.searchParams.get('call') ?? '').slice(0, 40);
+      const qPair = (url.searchParams.get('pair') ?? '').slice(0, 32);
+      let ids: string[] = [];
+      if (qCall) {
+        // Asking about ONE end pulls in the other one: half of the design is
+        // that the far end's beat is the only evidence about the path out.
+        ids = [qCall];
+        const p = [...this.sql.exec(
+          `SELECT pair FROM mac_beats WHERE call = ? AND pair IS NOT NULL ORDER BY wall DESC LIMIT 1`,
+          qCall)][0] as any;
+        if (p?.pair) {
+          ids = ([...this.sql.exec(
+            `SELECT DISTINCT call FROM mac_beats WHERE pair = ? LIMIT 8`, p.pair)] as any[])
+            .map((r) => String(r.call));
+          if (!ids.includes(qCall)) ids.push(qCall);
+        }
+      } else if (qPair) {
+        ids = ([...this.sql.exec(
+          `SELECT DISTINCT call FROM mac_beats WHERE pair = ? LIMIT 40`, qPair)] as any[])
+          .map((r) => String(r.call));
+      } else {
+        ids = ([...this.sql.exec(
+          `SELECT call, MAX(wall) AS w FROM mac_beats WHERE wall > ?
+             GROUP BY call ORDER BY w DESC LIMIT 40`, now - 90)] as any[])
+          .map((r) => String(r.call));
+      }
+
+      interface DiagRow { pair: string | null; end: DiagEnd; startedAt: number; endedAt: number; }
+      const rowsOut: DiagRow[] = [];
+      for (const id of ids) {
+        // More beats than the window needs: the window is the last 3, but
+        // `dropped` and the call's own span are questions about all of them.
+        const raw = [...this.sql.exec(
+          `SELECT wall, phase, pair, install, version, model, fields FROM mac_beats
+             WHERE call = ? ORDER BY wall DESC LIMIT 12`, id)] as any[];
+        if (!raw.length) continue;
+        const asc = raw.slice().reverse();
+        const span = [...this.sql.exec(
+          `SELECT MIN(wall) AS a, MAX(wall) AS b,
+                  SUM(CASE WHEN phase = 'final' THEN 1 ELSE 0 END) AS fin
+             FROM mac_beats WHERE call = ?`, id)][0] as any;
+        const newest = raw[0];
+        rowsOut.push({
+          pair: (asc.map((r) => r.pair).filter((v: unknown) => typeof v === 'string' && v)[0] as string | undefined) ?? null,
+          startedAt: Number(span?.a ?? newest.wall),
+          endedAt: Number(span?.b ?? newest.wall),
+          end: diagnoseEnd({
+            call: id, install: newest.install, version: newest.version, model: newest.model,
+            beats: asc.map((r) => ({ wall: r.wall, phase: r.phase, ...safeParse(r.fields) })),
+            endedCleanly: Number(span?.fin ?? 0) > 0, now,
+          }),
+        });
+      }
+
+      // Group by `pair` when the ends computed one; otherwise a call is its own
+      // group. One end still gets a verdict -- it just cannot be checked against
+      // the other side's account of the same seconds, and `agree` says so.
+      const groups = new Map<string, DiagRow[]>();
+      for (const r of rowsOut) {
+        const k = r.pair ? 'pair:' + r.pair : 'call:' + r.end.call;
+        const g = groups.get(k);
+        if (g) g.push(r); else groups.set(k, [r]);
+      }
+      const calls = [];
+      for (const g of groups.values()) {
+        const ag = diagnoseAgreement(g.map((r) => r.end));
+        const startedAt = Math.min(...g.map((r) => r.startedAt));
+        const endedAt = Math.max(...g.map((r) => r.endedAt));
+        const worst = g.map((r) => r.end)
+          .reduce((a, e) => (DIAG_RANK[e.severity] > DIAG_RANK[a.severity] ? e : a), g[0].end);
+        calls.push({
+          pair: g[0].pair, call: g[0].end.call,
+          verdict: ag.agree === false ? 'ends_disagree' : worst.verdict,
+          severity: worst.severity,
+          agree: ag.agree, agreement: ag.notes,
+          startedAt, endedAt, durationS: Math.round(endedAt - startedAt),
+          endedCleanly: g.every((r) => r.end.endedCleanly),
+          ends: g.map((r) => r.end),
+        });
+      }
+      calls.sort((a, b) => b.endedAt - a.endedAt);
+      return json({
+        now, windowBeats: DIAG_WINDOW, expectedPps: DIAG_EXPECTED_PPS,
+        expectedFps: DIAG_EXPECTED_FPS, calls,
+      });
     }
 
     // Times the hop from THIS Durable Object to one pinned in another region --
@@ -2250,6 +4062,51 @@ export default {
       }
     }
 
+    // Native Mac app — no Sec-Fetch-Site, so /api/ice 403s it. Same TURN mint,
+    // same per-IP cap, no origin gate. A missing relay must never block a call:
+    // the app races STUN + LAN if this returns ok:false.
+    if (url.pathname === '/api/mac/turn') {
+      const none = { ok: false, p2pOnly: true };
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      const now = Date.now();
+      const hits = (iceMints.get(ip) ?? []).filter((t) => now - t < ICE_MINT_WINDOW_MS);
+      if (hits.length >= ICE_MINT_MAX) {
+        iceMints.set(ip, hits);
+        return json({ ...none, gated: 'rate' }, 429);
+      }
+      hits.push(now);
+      iceMints.set(ip, hits);
+      if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return json(none);
+      try {
+        const res = await fetch(
+          `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
+          {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ ttl: 3600 }),
+          },
+        );
+        if (!res.ok) return json(none);
+        const body = (await res.json()) as {
+          iceServers?: { urls?: string | string[]; username?: string; credential?: string }[];
+        };
+        // Ordered by turnOrderUdp — see the rank and the measurement beside it.
+        // `host`/`port` stay SCALARS on purpose: every installed client reads
+        // o["port"] as one Int (Turn.swift:54, defaulting to 3478 only when the
+        // key is absent), so correcting this one field switches TURN on for the
+        // whole installed base without another app release. `ports` is the
+        // ordered fallback list, additive and ignored by today's decoder.
+        const pick = turnOrderUdp(body.iceServers);
+        if (!pick) return json(none);
+        return json({ ok: true, ...pick });
+      } catch {
+        return json(none);
+      }
+    }
+
     // Call-health beacon. POST is the client's beat; GET /summary is aggregate
     // numbers only (no per-call rows are ever served). The per-IP cap bounds a
     // hostile flooder; the DO's allowlist bounds a careless client.
@@ -2314,7 +4171,7 @@ export default {
     }
     if (url.pathname.startsWith('/api/mac/') && request.method === 'GET') {
       const tail = url.pathname.slice('/api/mac/'.length);
-      if (!['live', 'recent', 'call'].includes(tail)) return json({ error: 'no' }, 404);
+      if (!['live', 'recent', 'call', 'diagnose'].includes(tail)) return json({ error: 'no' }, 404);
       if (!dashOK()) return json({ error: 'private' }, 403);
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/mac/${tail}${url.search}`),
@@ -2431,6 +4288,34 @@ export default {
       );
     }
 
+    // ── The doorbell: /api/kin/<handle>/(register|ring|poll) ─────────────────
+    //
+    // Deliberately its OWN path family, not a room verb. Two reasons, and the
+    // second is a requirement:
+    //   · a handle is not a room code, and putting it through /api/room/ would
+    //     make every future room verb reachable on an inbox DO;
+    //   · the room-seen registry stamp below is inside the /api/room/ match, so
+    //     a ring physically cannot reach it. An inbox is not a call, and a
+    //     mailbox write must never appear in the operator's "which room was
+    //     live when" table — that table is for turning a complaint into a call
+    //     log, and a doorbell press is not a call.
+    const kin = url.pathname.match(KIN_ROUTE_RE);
+    if (kin) {
+      const handle = kin[1];
+      const verb = kin[2];
+      if (request.method !== (verb === 'poll' ? 'GET' : 'POST')) return json({ error: 'method' }, 405);
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      if (!kinWindow(kinPosts, verb + '|' + ip, Date.now(), KIN_EDGE_WINDOW_MS, KIN_EDGE_CAP[verb])) {
+        return json({ error: 'rate' }, 429);
+      }
+      // The handle rides along as ?to= for the same reason the room code does
+      // below: the DO's URL is rewritten to https://do/<verb>, so the DO cannot
+      // otherwise see which mailbox it is. It re-validates the handle itself.
+      const doUrl = new URL(`https://do/kin/${verb}${url.search}`);
+      doUrl.searchParams.set('to', handle);
+      return env.ROOM.get(env.ROOM.idFromName('inbox:' + handle)).fetch(new Request(doUrl.toString(), request));
+    }
+
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary | …/warm
     const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab|warm|rv)$/);
     if (m) {
@@ -2475,9 +4360,10 @@ export default {
       obj.writeHttpMetadata(h);
       h.set('etag', obj.httpEtag);
       // Immutable ONLY when the filename carries a version, because then the bytes
-      // behind the URL never change. `Tokkah.dmg` is the stable link a human
-      // shares, so its content changes every release and a year of caching would
-      // pin the world to whatever shipped first.
+      // behind the URL never change. `Kin.dmg` (and the retained `Tokkah.dmg`)
+      // is the stable link a human shares, so its content changes every release
+      // and a year of caching would pin the world to whatever shipped first.
+      // Neither stable name contains a version, so both fall to max-age=300.
       const versioned = /\d+\.\d+\.\d+/.test(rel[1]);
       h.set('cache-control', versioned
         ? 'public, max-age=31536000, immutable'
@@ -2489,11 +4375,70 @@ export default {
       return new Response(obj.body, { headers: h });
     }
     // Short invite links: room.tokkah.com/etm-bkmb-iev (Meet-shaped, minted by
-    // the client). The path IS the room; the asset behind it is the app shell.
-    // Tightly scoped to the minted format so real assets (/app.js, /embed.js)
-    // can never be shadowed by a room name.
+    // the client). The path IS the room. Tightly scoped to the minted format so
+    // real assets (/app.js, /embed.js) can never be shadowed by a room name.
+    // ── kin.tokkah.com is the front door ─────────────────────────────────────
+    //
+    // The product's name is Kin (0.41.0); the native app mints its invite links
+    // as kin.tokkah.com/<room> and kin.tokkah.com/?r=<room>. So on that host the
+    // BARE root -- no room in the path, no ?r= -- is the only URL that means
+    // "nobody invited me, I came to look", and it gets the landing page. Every
+    // invite shape now goes to the funnel below instead of the app shell: this
+    // worker serves both hostnames, so nothing else needs to know which door
+    // was used.
+    //
+    // /mac was the landing page's first home, for one day; a 302 keeps whatever
+    // links exist alive without maintaining two copies of the page.
+    if (url.pathname === '/mac' || url.pathname === '/mac.html') {
+      return Response.redirect('https://kin.tokkah.com/', 302);
+    }
     let assetReq = request;
-    if (/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(url.pathname)) {
+    if (url.hostname === 'kin.tokkah.com' && url.pathname === '/' && !url.searchParams.has('r')) {
+      const front = new URL(url);
+      // The extensionless form: the assets layer 307s '/kin.html' to '/kin'
+      // (html_handling), and a front door that bounces once before opening is
+      // a worse front door. '/kin' serves kin.html's bytes directly.
+      front.pathname = '/kin';
+      assetReq = new Request(front.toString(), request);
+    }
+    // ── AN INVITE LINK NO LONGER LANDS IN A BROWSER CALL ─────────────────────
+    //
+    // Kin, the Mac app, is the only way into a call now. An invite therefore has
+    // exactly two honest destinations and neither of them is this origin's call
+    // page: the app (via its URL scheme) for people who have it, or the download
+    // for people who don't. /join.html is that fork; it fires the deep link on
+    // load, and falls back to the DMG plus the room name in plain text.
+    //
+    // The two invite shapes, both minted by the app's roomURL() (main.swift):
+    //   /<abc-defg-hij>   a minted 3-4-3 code -- the path IS the room
+    //   /?r=<name>        any named room
+    // Both are recognised on either hostname, because room.tokkah.com and
+    // kin.tokkah.com are the same worker and links of both shapes are already
+    // out in the world.
+    //
+    // NOTHING IS DELETED. The app shell is still at / and still reachable with
+    // ?web=1 on an invite URL -- the browser-to-browser rigs (testbed, the
+    // far-away lab room) are the only remaining users of it, and taking it away
+    // would cost the measurement lane for no gain in the pivot. What ends here
+    // is a browser LANDING in a call from a link somebody was sent, which is the
+    // whole of the retired surface as far as an invited person can see it.
+    //
+    // Every backend surface the app depends on is upstream of this line and
+    // untouched: /api/room/<code>/ws (signaling), /api/ice + /api/mac/turn,
+    // /macos/* (manifest, install.sh, dl/), /api/* (telemetry, health).
+    const invitePath = /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(url.pathname);
+    const inviteQuery = url.pathname === '/' && url.searchParams.has('r');
+    if ((invitePath || inviteQuery) && url.searchParams.get('web') !== '1') {
+      const funnel = new URL(url);
+      // Extensionless, for the same reason as '/kin': the assets layer 307s
+      // '/join.html' -> '/join', and one redirect before the page is a slower
+      // page. The address bar keeps the ORIGINAL invite URL -- this is an
+      // internal rewrite -- which is what lets /join.js read the room out of
+      // the link the sender actually pasted.
+      funnel.pathname = '/join';
+      funnel.search = '';
+      assetReq = new Request(funnel.toString(), request);
+    } else if (invitePath) {
       const rewritten = new URL(url);
       rewritten.pathname = '/';
       assetReq = new Request(rewritten.toString(), request);
