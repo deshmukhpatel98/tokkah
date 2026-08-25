@@ -115,6 +115,11 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   private let session = AVCaptureSession()
   /// Written only by the capture queue, read only by it. One-shot.
   private var firstFrameLogged = false
+  /// When `startRunning()` returned. Written on `sessionQ` before any frame can
+  /// arrive (the delegate is only called after the session is running), read on
+  /// the capture queue -- a plain UInt64, so the worst case is a stale zero and a
+  /// nonsense number in one log line, never a torn object reference.
+  private var runReturnedAt: UInt64 = 0
   private let out = AVCaptureVideoDataOutput()
   private let q = DispatchQueue(label: "tk.cam")
   // ── ONE QUEUE OWNS THE SESSION ──────────────────────────────────────────────
@@ -177,7 +182,27 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     return s.devices
   }
   /// Remembered across launches: choosing a camera every call is not a feature.
-  private static let pickKey = "tk.cameraId"
+  static let pickKey = "tk.cameraId"
+
+  // ── MEASUREMENT ARMS, ANNOUNCED IN BOTH DIRECTIONS ─────────────────────────
+  //
+  // Two builds that differ in one line is the only way to attribute a stage, and
+  // the reason these are environment variables rather than argv is that the
+  // camera has to be launched through LaunchServices to get its grant (a binary
+  // exec'd by a shell is attributed to the terminal and answered `.denied`), and
+  // an env var survives `open` in the plist while another argv flag would have to
+  // be registered in main.swift's KNOWN_FLAGS -- a file another lane is editing.
+  //
+  // Read once, and printed on the bring-up line whenever set: `silent-no-op-flags`
+  // has cost this project three A/Bs that compared an arm against itself.
+  static let armFastFind = ProcessInfo.processInfo.environment["TK_CAM_FASTFIND"] == "1"
+  static let armNoConfigure = ProcessInfo.processInfo.environment["TK_CAM_NOCFG"] == "1"
+  static var armDescription: String {
+    var on: [String] = []
+    if armFastFind { on.append("fastfind") }
+    if armNoConfigure { on.append("nocfg") }
+    return on.isEmpty ? "" : " ARM[" + on.joined(separator: "+") + "]"
+  }
   static var preferred: AVCaptureDevice? { preferred(in: available()) }
   /// The same choice, made against a list the caller has already built. `bringUp`
   /// is on the launch critical path and was building the discovery session twice
@@ -262,11 +287,42 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       session.commitConfiguration()
     }
     let tFind = Clock.now()
-    let devs = CameraSource.available()
-    // The remembered one if it is still plugged in, else whatever macOS prefers,
-    // else the first thing we can find.
-    guard let dev = CameraSource.preferred(in: devs) ?? AVCaptureDevice.default(for: .video) ?? devs.first
-    else { throw Err.e("no camera") }
+    // ── ARM: SKIP THE DISCOVERY SESSION ───────────────────────────────────────
+    //
+    // `AVCaptureDevice.DiscoverySession` measured 63-65 ms here, and it is first
+    // in a strictly serial chain -- every millisecond of it delays `startRunning`
+    // and therefore the first frame by the same millisecond. When a camera has
+    // already been chosen once, its uniqueID is on disk and `AVCaptureDevice(
+    // uniqueID:)` answers the same question without enumerating anything.
+    //
+    // MEASURED, n=5 alternated against base: it makes no difference at all --
+    // 48-82 ms either way. So the cost is not enumerating devices, it is first
+    // contact with the camera assistant, and the same toll is paid by whichever
+    // call reaches it first. The arm stays so the null can be re-derived rather
+    // than taken on trust; it is not the default because it also gives up
+    // `AVCaptureDevice.default` as a fallback for no gain.
+    var devs: [AVCaptureDevice] = []
+    var picked: AVCaptureDevice?
+    if CameraSource.armFastFind {
+      let id = UserDefaults.standard.string(forKey: CameraSource.pickKey)
+      picked = id.flatMap { AVCaptureDevice(uniqueID: $0) }
+      // AN ARM THAT QUIETLY DID NOT RUN LOOKS EXACTLY LIKE AN ARM THAT DID NOT
+      // HELP. There is no remembered camera until somebody picks one, so on most
+      // machines this shortcut has nothing to shortcut and falls straight back to
+      // the path it is being compared against -- an A/B of base against base,
+      // reported as a clean null. Third time this class has cost this project a
+      // measurement, so the arm says which branch it took.
+      let took = picked != nil ? "resolved by id, no discovery session"
+                               : "NO remembered camera, THIS ARM DID NOTHING"
+      fputs("camera: ARM fastfind -- \(took)\n", stderr)
+    }
+    if picked == nil {
+      devs = CameraSource.available()
+      // The remembered one if it is still plugged in, else whatever macOS prefers,
+      // else the first thing we can find.
+      picked = CameraSource.preferred(in: devs) ?? AVCaptureDevice.default(for: .video) ?? devs.first
+    }
+    guard let dev = picked else { throw Err.e("no camera") }
     setCurrent(dev)
     meta.lock(); name = dev.localizedName; meta.unlock()
     if devs.count > 1 {
@@ -306,6 +362,21 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     if flag("cam-twopass") {
       session.commitConfiguration()
       configure(dev)
+    } else if CameraSource.armNoConfigure {
+      // ── ARM: DO NOT NEGOTIATE A FORMAT AT ALL ──────────────────────────────
+      //
+      // The question this answers is whether the ~640 ms between `startRunning`
+      // returning and the first buffer is the sensor powering up, or the sensor
+      // being told to change mode. If it is the mode change, this arm is fast and
+      // there is something to attack. If it is power-up, this arm is identical and
+      // the number is a platform floor -- which is a result, not a failure.
+      //
+      // MEASURED, n=5 alternated: identical. Sensor 644-650 ms with the format
+      // negotiated, 644-650 ms without it. The mode change is not the cost.
+      //
+      // NOT SHIPPABLE as-is: the encoder is hardcoded to 1280x720, so this arm can
+      // feed it the wrong size. It exists to attribute the cost, nothing else.
+      session.commitConfiguration()
     } else {
       configure(dev)
       session.commitConfiguration()
@@ -313,13 +384,15 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     let tRun = Clock.now()
     session.startRunning()
     let end = Clock.now()
+    runReturnedAt = end
     started = true
     // Broken out because "the camera took 150 ms" is not actionable and
     // "AVCaptureDeviceInput took 96 ms of it" is. Discovery, opening the sensor,
     // negotiating the format, and starting the graph fail and stall for entirely
     // different reasons.
     fputs("camera: startRunning took \(Int(Clock.msSigned(end, tRun))) ms\n", stderr)
-    fputs("camera: bring-up \(Int(Clock.msSigned(end, tFind))) ms off-main"
+    fputs("camera: bring-up\(CameraSource.armDescription)"
+        + " \(Int(Clock.msSigned(end, tFind))) ms off-main"
         + " (find \(Int(Clock.msSigned(tOpen, tFind)))"
         + ", open \(Int(Clock.msSigned(tCfg, tOpen)))"
         + ", configure \(Int(Clock.msSigned(tRun, tCfg)))"
@@ -417,7 +490,19 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     if !firstFrameLogged {
       firstFrameLogged = true
       Metrics.mark("cam_first_frame_ms", sinceLaunch())
-      fputs("camera: FIRST FRAME at \(sinceLaunch()) ms\n", stderr)
+      // ── THE STAGE NOBODY COULD SEE, AND THE ONE BEFORE OUR CODE ─────────────
+      //
+      // Two numbers used to have to be subtracted by hand from two different log
+      // lines to learn the only thing that matters here: how long the sensor took
+      // AFTER `startRunning()` returned. That gap is ~80% of the wait and it was
+      // the one quantity never printed. `exec` is the other invisible stage --
+      // dyld mapping AVFoundation, AppKit and VideoToolbox before main.swift's
+      // first statement -- and without it "process start to first frame" is a
+      // claim made against a clock that starts late.
+      fputs("camera: FIRST FRAME at \(sinceLaunch()) ms"
+          + " (\(Int(Clock.sinceExec())) ms since exec"
+          + ", sensor \(Int(Clock.msSigned(Clock.now(), runReturnedAt))) ms after startRunning)\n",
+            stderr)
     }
     // The sensor's own timestamp, converted to the host clock -- the same clock
     // the audio path stamps with. This is the whole reason for being native.

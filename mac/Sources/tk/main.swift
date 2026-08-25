@@ -723,10 +723,37 @@ let displayKind = arg("display") ?? "avsbdl"
 //
 // `startRunning()` returning is not a picture, and until this file measured the
 // FIRST FRAME nothing here knew the difference. Measured from a signed bundle
-// with a real grant, launched through LaunchServices: session up at 138 ms, first
-// frame at 464 ms (n=4, 456-467) -- and 807 ms on the first launch after the
-// camera has been idle a while. The gap is sensor power-up and exposure
-// convergence: ~325 ms warm, ~670 ms cold, none of which this program can shorten.
+// with a real grant, launched through LaunchServices, with every stage named:
+//
+//   exec -> our first statement        17-21 ms   (dyld; ~470 ms once, right
+//                                                  after the bundle is re-signed)
+//   -> camera bring-up starts          14 ms      (this block, before AppKit)
+//   -> device found                    48-82 ms
+//   -> sensor opened                   20-25 ms
+//   -> format negotiated               1-3 ms
+//   -> startRunning() returns          24-32 ms
+//   -> FIRST FRAME                     640-650 ms cold  /  283-294 ms warm
+//
+// ── "COLD" AND "WARM" ARE NOT ABOUT HOW LONG THE CAMERA HAS BEEN IDLE ────────
+//
+// This comment used to say "807 ms on the first launch after the camera has been
+// idle a while", which put the reader onto a cool-down curve that does not exist.
+// Swept directly (n=2 each at 2/10/30/60/120 s idle): dead flat, 769-792 ms at
+// every one of them. Swept again below two seconds: 409-445 ms at gaps of
+// 0.15-1.8 s and 770-790 ms at 2.0 s and above, with the step landing between
+// 1.8 and 2.0 s and repeating on both sides. It is a latch, not a curve -- the
+// camera assistant keeps the sensor powered for about 1.9 s after the last client
+// lets go, and after that the next open pays a full 350 ms power-up.
+//
+// Two consequences worth stating because they are not obvious:
+//   * The re-exec paths (placing a call, answering a ring) already land inside
+//     that window and already get the warm number -- 429 ms, measured on a real
+//     answered ring. Nothing needs doing there.
+//   * A cold launch cannot be brought under 500 ms from here. 640 ms of the
+//     ~780 ms is the sensor, everything this program owns adds up to ~120 ms, and
+//     two attempts at that 120 ms (resolving the device by remembered id instead
+//     of a discovery session; skipping the format negotiation entirely) both
+//     measured exactly zero, n=5 each, arms rotated. See Video.swift.
 //
 // What it CAN do is stop making the sensor wait its turn. Everything below --
 // NSApplication, the window, the control bar, `makeKeyAndOrderFront` -- is ~95 ms

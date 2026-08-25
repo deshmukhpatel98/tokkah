@@ -51,6 +51,35 @@ enum Clock {
   }
 
   static var timebaseDescription: String { "\(tb.numer)/\(tb.denom)" }
+
+  // ── THE TIME BEFORE OUR FIRST LINE OF CODE ─────────────────────────────────
+  //
+  // `launchT0` is stamped by the first statement in main.swift, so everything
+  // measured against it starts AFTER dyld has mapped every framework this binary
+  // links -- AVFoundation, AppKit, CoreAudio, VideoToolbox. Any claim of the form
+  // "process start to first frame" that uses launchT0 is therefore too small by
+  // however long that took, and a budget that cannot see a stage cannot decide
+  // whether the stage is worth attacking.
+  //
+  // The kernel knows. `p_starttime` is the fork time, which is the earliest
+  // moment this process can be said to exist, and the difference is the runtime's
+  // own bill. Measured on this Mac: 17-21 ms on a warm bundle, and ~470 ms on the
+  // first launch after the bundle's signature changes -- which is worth knowing
+  // before anybody times a launch straight after a build.
+  //
+  /// Milliseconds from `fork` to now, so a stage breakdown can start where the
+  /// process does rather than where our code does.
+  static func sinceExec() -> Double {
+    var kp = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+    guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0 else { return -1 }
+    let t = kp.kp_proc.p_starttime
+    var nowTV = timeval()
+    gettimeofday(&nowTV, nil)
+    return Double(nowTV.tv_sec - t.tv_sec) * 1000
+         + Double(Int(nowTV.tv_usec) - Int(t.tv_usec)) / 1000.0
+  }
 }
 
 // A fixed-capacity percentile bucket. Allocation-free after construction
