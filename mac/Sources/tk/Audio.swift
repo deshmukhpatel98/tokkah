@@ -387,6 +387,107 @@ final class Audio {
   private(set) var echoCorr: Double = 0
   private(set) var echoErleDb: Double = 0
 
+  // ── AND THE SAME SEARCH RUN BACKWARDS: ARE YOU TWO IN THE SAME ROOM? ───────
+  //
+  // Reported from a live call: "two devices side by side, a lot of echo, and only
+  // one mic is active at a time, which was very confusing." It is confusing
+  // because it is not echo and no echo canceller can touch it. Person speaks.
+  // This Mac's microphone hears them through the air. The OTHER Mac's microphone
+  // hears them too, ships it over the network, and this Mac's SPEAKER plays them
+  // back into the same room a mouth-to-ear later. They hear themselves, late,
+  // out of the machine in front of them. Nothing about that is this speaker
+  // feeding this microphone, and the duplex gate cannot help either -- the
+  // problem is a live SPEAKER, not a second live microphone.
+  //
+  // So the fix is not cancellation, it is noticing. And there is a signature
+  // that a genuinely remote call cannot produce:
+  //
+  //     same room:   playout(t)  ~=  mic(t - L)      L = one crossing, 30-150 ms
+  //                  -> THE MICROPHONE HEARD THEM BEFORE THE SPEAKER DID
+  //
+  // A remote voice cannot be in this room before the network delivers it. The
+  // existing estimator searches the other direction only -- mic(t) ~= spk(t-lag),
+  // "my speaker reached my mic" -- so it is blind to this by construction, which
+  // is why the complaint had no number attached to it for so long.
+  //
+  // The two searches share a thread, a decimation and a score, so `roomCorr` and
+  // `echoCorr` are the same kind of number and can be compared to each other.
+  private(set) var roomCorr: Double = 0
+  private(set) var roomLagMs: Double = -1
+  /// How loud each side of the last estimate was. Published because the first
+  /// live run of this feature produced correlations from 0.13 to 0.98 on one
+  /// call, and the only way to tell a weak ROOM from a weak WINDOW is to be able
+  /// to see how much sound was in the window at all.
+  private(set) var roomRefRms: Double = 0
+  private(set) var roomMicRms: Double = 0
+  /// What the backward hit was attributed to. See `RoomVerdict`.
+  private(set) var roomVerdict = RoomVerdict.unknown
+  /// ── HOW MANY OF THE LAST TWENTY SAID "ROOM" ───────────────────────────────
+  ///
+  /// A rate over a window, not a run of consecutive estimates, and that is a
+  /// change made BY measurement rather than by preference. Driven through a real
+  /// call carrying a genuine same-room signature, the per-estimate correlation
+  /// ranged from 0.22 to 0.98 -- within one call, one room, one recording, with
+  /// the LAG pinned to 43-72 ms the whole time. The evidence is unmistakable and
+  /// individual half-seconds of it are not.
+  ///
+  /// Some of that is the jitter buffer: the playout is resampled by a governor
+  /// that tracks the sender, so over a 400 ms window the reference is stretched
+  /// by a few tenths of a percent against a microphone that is not stretched at
+  /// all, which is enough to halve a correlation on its own. `--sameroom-test`
+  /// measures how much (see the time-warp case). It is a property of every call
+  /// this feature will ever run on, so the controller is built for it instead of
+  /// against it.
+  ///
+  /// Requiring six consecutive strong estimates would therefore have produced a
+  /// feature that never fires: measured on that call, the longest run was two.
+  /// Requiring eight of the last twenty separates it from a genuinely remote
+  /// call by 52 percentage points against 0.
+  private var roomWin: UInt32 = 0
+  private var roomWinN = 0
+  /// Same-room estimates among the last `ROOM_WINDOW` scored ones, and how full
+  /// that window is. A judgement is refused until it is full.
+  var roomRecent: Int { roomWin.nonzeroBitCount }
+  var roomWindowFull: Bool { roomWinN >= Audio.ROOM_WINDOW }
+  /// Half-second estimates that landed in each band, for the end-of-call line.
+  private(set) var roomHits = 0, loopbackHits = 0
+  /// Estimates that were scored at all: the denominator. A bare hit count with
+  /// nothing to divide it by is decoration (`counted-without-a-denominator`).
+  private(set) var roomScored = 0
+  /// CONFIRMED, and therefore acted on. Written by the estimator thread, read by
+  /// the render callback as a plain load, exactly like `mute`.
+  private(set) var roomConfirmed = false
+  /// How many times the judgement has flipped on. One is correct for a call held
+  /// in one room; a number that climbs is the oscillation this whole design is
+  /// built to avoid, and it is reported rather than assumed away.
+  private(set) var roomEnters = 0
+  /// The person said no. Survives until they say otherwise or the call ends: an
+  /// automatic action that re-applies itself over a decision somebody just made
+  /// is worse than not having the action.
+  var roomOverride = false
+  /// Off switch for the whole layer (`--no-sameroom`), so the rig has a control
+  /// arm that is the same binary with the behaviour disabled.
+  var sameRoomEnabled = true
+  /// What the speaker actually does. THIS is the one the render callback reads.
+  var roomSpeakerOff: Bool { roomConfirmed && !roomOverride }
+
+  enum RoomVerdict: Int {
+    /// Not enough history, the far end is silent, or this call has no honest
+    /// mouth-to-ear yet -- so there is nothing to attribute. An instrument that
+    /// cannot see the event must not return the same answer as a real negative
+    /// (`blind-instruments-report-negatives`), so this is its own value.
+    case unknown = 0
+    /// The microphone does not hear the far voice early. A real remote call.
+    case remote = 1
+    /// Early by ONE crossing, while the far stream is vocal. Same room.
+    case sameRoom = 2
+    /// Early by TWO crossings: our own voice going out, coming off THEIR speaker
+    /// into THEIR microphone, and arriving back. A real and different fault --
+    /// counted and named, never acted on from this end, because the machine that
+    /// can fix it is the other one.
+    case farLoopback = 3
+  }
+
   // ── The canceller ──────────────────────────────────────────────────────────
   //
   // Normalised least-mean-squares, 1024 taps at 48 kHz = 21.3 ms, positioned at
@@ -1257,7 +1358,781 @@ final class Audio {
       guard best >= 0 else { continue }
       echoCorr = Double(bestScore)
       echoDelayMs = Double(best * D) / SR * 1000.0
+
+      // ── AND NOW THE SAME 400 ms, SLID THE OTHER WAY ─────────────────────────
+      //
+      // Same thread, same cadence, same decimation, same normalisation, so the
+      // two numbers mean the same thing. It reads the same two histories one
+      // more time rather than reusing the arrays above, because the fixed side
+      // and the sliding side swap over and the windows are different lengths.
+      let hit = Audio.scoreSameRoom(mic: ch, micW: cw, spk: eh, spkW: ew,
+                                    micWin: &backMic, refWin: &backRef)
+      judgeSameRoom(hit)
     }
+  }
+
+  // ── THE BACKWARD SEARCH, AS A FUNCTION OF ITS INPUTS AND NOTHING ELSE ──────
+  //
+  // Pure, static, and given its own scratch, for one reason: it is the RULER, and
+  // a ruler has to be calibrated against known answers before anything is allowed
+  // to act on it (`validate-the-ruler-against-known-inputs`). `--sameroom-test`
+  // calls THIS function -- not a copy of it written to agree with it -- on
+  // synthetic and on real speech, and prints what it says about inputs whose
+  // answer is known in advance.
+  //
+  // Fix the most recent WIN of PLAYOUT. Slide MIC HISTORY earlier by 0..MAXBACK.
+  // A hit at lag L means the microphone had that content L ms before the speaker
+  // did, which is the one thing a remote voice cannot do.
+  static let RD = 8                                   // decimation -> 6 kHz, as above
+  static let RWIN = 19200 / RD                        // 400 ms of evidence
+  static let RMAXBACK = Int(0.300 * SR) / RD          // search out to 300 ms early
+  /// A vocal far end, in peak-normalised RMS. Matches the duplex gate's own
+  /// `farTalking` threshold (0.004) so "the far end is talking" means one thing
+  /// in this file rather than two.
+  static let RFAR_VOCAL = 0.004
+
+  struct RoomHit {
+    var corr: Double = 0
+    var lagMs: Double = -1
+    /// How loud the fixed PLAYOUT window was. This is the far-end-vocal test, and
+    /// it is deliberately taken from `echoHist` rather than from the speaker:
+    /// see the note on `roomSpeakerOff` in the render callback.
+    var refRms: Double = 0
+    var micRms: Double = 0
+    /// ── HOW FAR THE PEAK STANDS ABOVE THE REST OF THE SEARCH ─────────────────
+    ///
+    /// The correlation coefficient answers "how much of the microphone is this",
+    /// and that is the right question for entering. It is the WRONG question for
+    /// staying, because adding an uncorrelated near voice inflates the
+    /// denominator and the coefficient falls even though the room has not
+    /// changed at all: measured on real speech, 0.794 -> 0.285 as a second voice
+    /// goes from silent to equal-loudness, with the peak at 70.0 ms throughout.
+    ///
+    /// This is the peak divided by the mean score over all 1801 candidate lags.
+    /// Both halves fall together when energy is added, so it barely moves -- and
+    /// an unrelated signal has no peak to stand proud of its own sidelobes.
+    ///
+    /// ── AND IT IS REPORTED, NOT USED. IT FAILED CALIBRATION. ─────────────────
+    ///
+    /// It was built to fix exactly the weakness above and on real speech it does:
+    /// null worst 7.18, same room 12.8-18.9, and 16.5 at the double-talk level
+    /// where `corr` had already fallen to 0.471. A clean 2x separation.
+    ///
+    /// On the synthetic voice the SAME statistic ranks BACKWARDS: null worst
+    /// 2.95, and a true same-room case with an equally loud near voice scores
+    /// 2.80. Two calibrated sources disagree about which way it points, so there
+    /// is no threshold that is right on both, and a number that ranks backwards
+    /// on any known input is not a ruler yet (`no-reference-picture-quality-
+    /// failed`, where three blockiness metrics died the same way).
+    ///
+    /// The synthetic voice is more self-similar than a person -- fixed formants,
+    /// one syllable rate -- so its sidelobes are unusually high, and it is
+    /// plausible that real speech is the fair test. Plausible is not measured.
+    /// It stays printed on every run, because the next person to look at this
+    /// should have the numbers rather than the argument.
+    var snr: Double = 0
+    /// False when there was not enough history or the playout window was silent.
+    /// NOT the same as a low correlation, and never collapsed into one.
+    var scored = false
+  }
+
+  static func scoreSameRoom(mic: UnsafeMutablePointer<Float>, micW: Int,
+                            spk: UnsafeMutablePointer<Float>, spkW: Int,
+                            micWin: inout [Float], refWin: inout [Float]) -> RoomHit {
+    var out = RoomHit()
+    let D = RD, win = RWIN, maxBack = RMAXBACK
+    // Enough history on both sides, with a couple of thousand samples of margin
+    // so the read never walks into the region a callback is writing.
+    guard spkW > win * D + 2000, micW > (win + maxBack) * D + 2000 else { return out }
+    if refWin.count != win { refWin = [Float](repeating: 0, count: win) }
+    if micWin.count != win + maxBack { micWin = [Float](repeating: 0, count: win + maxBack) }
+    // Decimate by AVERAGING, not by dropping -- dropping aliases everything above
+    // 3 kHz down into the band the correlation is computed in.
+    for i in 0..<win {
+      var a: Float = 0
+      for j in 0..<D { a += spk[((spkW - (win - i) * D + j) % ECHO_MAX + ECHO_MAX) % ECHO_MAX] }
+      refWin[i] = a / Float(D)
+    }
+    for i in 0..<(win + maxBack) {
+      var a: Float = 0
+      for j in 0..<D { a += mic[((micW - (win + maxBack - i) * D + j) % CAPH + CAPH) % CAPH] }
+      micWin[i] = a / Float(D)
+    }
+    var refE: Float = 0
+    for v in refWin { refE += v * v }
+    var micEAll: Float = 0
+    for v in micWin { micEAll += v * v }
+    out.refRms = Double((refE / Float(win)).squareRoot())
+    out.micRms = Double((micEAll / Float(win + maxBack)).squareRoot())
+    // A SILENT PLAYOUT IS NOT A REMOTE CALL. It is no evidence at all, and the
+    // difference is the whole reason `scored` exists.
+    guard out.refRms > RFAR_VOCAL, refE > 1e-6 else { return out }
+    out.scored = true
+
+    var best = -1, bestScore: Float = 0
+    var sum: Double = 0, nLags = 0
+    for lag in 0...maxBack {
+      var num: Float = 0, den: Float = 0
+      // ref[i] sits at playout time (spkW - (win-i)*D); the mic sample lag*D
+      // EARLIER than it is micWin[maxBack + i - lag]. Derived once, here, rather
+      // than tuned until the numbers looked right.
+      let off = maxBack - lag
+      for i in 0..<win {
+        let mv = micWin[i + off]
+        num += refWin[i] * mv
+        den += mv * mv
+      }
+      guard den > 1e-9 else { continue }
+      // Normalised by BOTH energies -- the same coefficient the forward search
+      // reports, with the fixed and sliding sides swapped.
+      let r = abs(num) / (den * refE).squareRoot()
+      sum += Double(r); nLags += 1
+      if r > bestScore { bestScore = r; best = lag }
+    }
+    guard best >= 0, nLags > 0 else { out.scored = false; return out }
+    out.corr = Double(bestScore)
+    out.lagMs = Double(best * D) / SR * 1000.0
+    // One lag out of eighteen hundred cannot move the mean enough to matter, so
+    // it is not excluded -- which keeps this a single pass with no second buffer.
+    let floorScore = sum / Double(nLags)
+    out.snr = floorScore > 1e-9 ? out.corr / floorScore : 0
+    return out
+  }
+
+  // ── ATTRIBUTION, THEN SUSTAIN, THEN ACT ────────────────────────────────────
+  //
+  // An early hit has exactly two innocent explanations and they are separated by
+  // HOW early:
+  //
+  //   one crossing   the far person's voice, captured at their machine and
+  //                  played out of this one. Same room.
+  //   two crossings  OUR voice, played out of their speaker, back into their
+  //                  microphone, and returned. Their room is feeding their own
+  //                  machine, which is a real fault -- but it is theirs, and
+  //                  silencing THIS speaker would not fix it.
+  //
+  // The two are a full mouth-to-ear apart, at every distance, because the second
+  // one contains the first. So the split is stated in terms of the mouth-to-ear
+  // this call is actually measuring, not in absolute milliseconds -- an absolute
+  // threshold containing propagation is a hidden distance limit, and this project
+  // has shipped four of those (`rtt-blind-timeouts`).
+  //
+  // What the backward search measures is BUFFER to BUFFER: `echoHist` is written
+  // in the render callback, one output-device latency before the air, and
+  // `capHist` in the capture callback, one input-device latency after it. `m2e`
+  // is air to air and ADDS both. So the same-room lag this search should see is
+  // `m2e - outLatencyMs - inLatencyMs`, and the far end's own input latency
+  // cancels out of the subtraction entirely.
+  private var backMic = [Float](), backRef = [Float]()
+  private var roomLastLog = 0.0
+
+  /// The expected same-room lag for THIS call, in ms, or nil while the call has
+  /// no honest mouth-to-ear. Nil is a refusal to attribute, not a verdict.
+  private var roomPipeMs: Double? {
+    guard thetaValid, m2e.count > 20, let p50 = m2e.p(0.50), p50 > 0 else { return Audio.roomPipeOverride }
+    let pipe = p50 - outLatencyMs - inLatencyMs
+    // A negative pipe means the device-latency terms are larger than the whole
+    // measured mouth-to-ear, which happens on a loopback rig -- two processes on
+    // one Mac, where the whole mouth-to-ear is 12.5 ms and the two device
+    // latencies alone are 21. Refuse rather than attribute off a number that
+    // cannot be right.
+    guard pipe > 0 else { return Audio.roomPipeOverride }
+    return pipe
+  }
+
+  // ── TWO RIG OVERRIDES, AND WHAT EACH ONE IS ALLOWED TO CHANGE ──────────────
+  //
+  // `TK_ROOM_WINDOW` shortens the ten seconds of evidence the decision is taken
+  // over, which is a CADENCE: a thing provable in ten seconds should be provable
+  // in ten, and every timed thing in this project has one of these. It scales
+  // the enter and leave counts with it, so the RATE being demanded is unchanged.
+  //
+  // `TK_ROOM_PIPE_MS` supplies the one-crossing reference the attribution needs,
+  // and ONLY when the call cannot measure its own -- which on a same-machine
+  // loopback it never can, for the reason above. It does not lower a threshold,
+  // does not force a verdict, and does not touch a single sample: the
+  // correlation still has to come out of the real histories on a real call. Both
+  // are announced in the log when set, because an override nobody can see in the
+  // output is how a rig ends up measuring a different product.
+  /// `TK_SRC_WALLCLOCK=1`: phase-lock `--audio` to the host clock, so two
+  /// processes on one Mac hear the same sample at the same instant. See the note
+  /// at the substitution site -- it is a property of the fake microphone, not of
+  /// anything the product decides.
+  nonisolated(unsafe) static let srcWallLock: Bool = {
+    guard ProcessInfo.processInfo.environment["TK_SRC_WALLCLOCK"] == "1" else { return false }
+    fputs("audio source: phase-locked to the host clock, so both ends of a"
+        + " loopback pair hear one room. RIG ONLY.\n", stderr)
+    return true
+  }()
+
+  nonisolated(unsafe) static let roomPipeOverride: Double? = {
+    guard let v = ProcessInfo.processInfo.environment["TK_ROOM_PIPE_MS"],
+          let d = Double(v), d > 0 else { return nil }
+    fputs("room: TK_ROOM_PIPE_MS=\(d) -- this call cannot measure its own one-way"
+        + " delay, so attribution is using that. RIG ONLY.\n", stderr)
+    return d
+  }()
+
+  private func judgeSameRoom(_ hit: RoomHit) {
+    roomCorr = hit.corr
+    roomLagMs = hit.lagMs
+    roomRefRms = hit.refRms
+    roomMicRms = hit.micRms
+    guard sameRoomEnabled else { roomVerdict = .unknown; return }
+    guard hit.scored else {
+      // The far end is quiet. That confirms nothing and denies nothing, so
+      // neither counter moves and the state is HELD. A pause in a conversation
+      // is not evidence that the two of you left the room, and treating it as
+      // evidence is how a control loop learns to flap once a second.
+      roomVerdict = .unknown
+      return
+    }
+    roomScored += 1
+    guard let pipe = roomPipeMs, let m2eP50 = m2e.p(0.50) else {
+      roomVerdict = .unknown
+      return
+    }
+    // Half a mouth-to-ear of slack above one crossing. A loop exceeds one
+    // crossing by a WHOLE mouth-to-ear plus the far room, so the band that
+    // separates them is as wide as the thing being measured.
+    let ceiling = pipe + max(15.0, m2eP50 * 0.5)
+    // And it cannot be EARLIER than one crossing by more than the jitter buffer
+    // moves; the far machine's capture cannot precede the sound reaching it.
+    let floorMs = max(0.0, pipe - 30.0)
+    let inBand = hit.lagMs >= floorMs && hit.lagMs <= ceiling
+    // ── AND THE FIRST VERSION OF THIS WAS A ONE-WAY DOOR ─────────────────────
+    //
+    // It had two thresholds and only counted AGAINST below the lower one, so an
+    // estimate landing between them moved nothing -- and the measured null sits
+    // exactly there. The rig caught it in one run: the state entered and could
+    // never leave, whatever it was shown afterwards. `held-is-a-one-way-door`,
+    // built fresh, inside a feature whose entire design note is about not
+    // building it. Every scored estimate now moves the window by one, either
+    // way, and the hysteresis is in the two RATES rather than in two levels.
+    var same = false
+    if inBand, hit.corr >= Audio.ROOM_ON {
+      roomVerdict = .sameRoom
+      roomHits += 1
+      same = true
+    } else if hit.corr >= Audio.ROOM_ON, hit.lagMs > ceiling {
+      // NAMED AND COUNTED, NOT ACTED ON. It is worth saying out loud because
+      // "there is an echo" gets reported for this and for the same-room case in
+      // identical words, and the two need opposite fixes on opposite machines.
+      roomVerdict = .farLoopback
+      loopbackHits += 1
+    } else {
+      roomVerdict = .remote
+    }
+    // Every SCORED estimate moves the window by exactly one, whichever way it
+    // went. An estimate that moved nothing is how the first version of this
+    // became a door that only opened.
+    let mask: UInt32 = Audio.ROOM_WINDOW >= 32 ? .max : (1 << UInt32(Audio.ROOM_WINDOW)) - 1
+    roomWin = ((roomWin << 1) | (same ? 1 : 0)) & mask
+    roomWinN = min(roomWinN + 1, Audio.ROOM_WINDOW)
+    guard roomWinN >= Audio.ROOM_WINDOW else { return }
+    let hits = roomWin.nonzeroBitCount
+    if !roomConfirmed, hits >= Audio.ROOM_ENTER {
+      roomConfirmed = true
+      roomEnters += 1
+      fputs("room: you are both in the same room -- this speaker is off"
+          + String(format: " (%d of the last %d estimates, %.2f at %.0f ms,"
+                         + " one crossing is %.0f ms)",
+                   hits, Audio.ROOM_WINDOW, hit.corr, hit.lagMs, pipe) + "\n", stderr)
+    } else if roomConfirmed, hits <= Audio.ROOM_LEAVE {
+      roomConfirmed = false
+      // START THE WINDOW AGAIN. Without this the very next same-room estimate is
+      // judged against a window that is already nearly full of them, and the
+      // decision can come straight back -- which is the flap this whole design
+      // exists to prevent, rebuilt one line lower down.
+      roomWin = 0; roomWinN = 0
+      fputs("room: not the same room any more -- this speaker is back"
+          + String(format: " (%d of the last %d)", hits, Audio.ROOM_WINDOW) + "\n", stderr)
+    }
+  }
+
+  /// ── THE THRESHOLD, AND THE NULL IT WAS CHOSEN FROM ────────────────────────
+  ///
+  /// `tk --sameroom-test`, 2026-08-26, twenty independent draws per arm:
+  ///
+  ///                                  real recorded speech    synthetic voice
+  ///   remote, two different voices        worst 0.385          worst 0.426
+  ///   remote, and they sound ALIKE        worst 0.385          worst 0.371
+  ///   same room, one person talking       0.792 - 0.901        0.802 - 0.888
+  ///   their room looping us back          0.939 at 180 ms      0.940 at 180 ms
+  ///
+  /// So the null is 0.43, not the 0.26 the FORWARD search measured -- this one
+  /// searches 300 ms instead of 200, half again as many candidate lags for an
+  /// unrelated signal to find something in. The first version of these constants
+  /// was written before the measurement and put the leave threshold at 0.40,
+  /// UNDER the synthetic null: noise alone could have held a confirmed room on
+  /// forever. Measured first, then written down.
+  ///
+  /// ── AND WHY IT IS 0.50 RATHER THAN 0.62 ───────────────────────────────────
+  ///
+  /// Those offline numbers are one clean window each. Driven through a real call
+  /// the same evidence scores 0.22 to 0.98 estimate to estimate (see `roomWin`),
+  /// so a per-estimate threshold set where the offline same-room cases sit would
+  /// have fired on a fifth of them. 0.50 is above every remote draw either
+  /// source has produced and below the live median of 0.50-0.54, and the SAFETY
+  /// margin has been moved into the rate: a remote call has to produce eight
+  /// separate coincidences inside ten seconds, all of them in the lag band.
+  ///
+  /// Measured hit rates at this threshold, live: same room 52%, remote 0%.
+  static var ROOM_ON = 0.50
+  /// Twenty scored estimates is ten seconds of a call. Enter at 8 (40%), leave
+  /// at 2 (10%), so entering is a claim and leaving is only the absence of one.
+  static var ROOM_WINDOW = {
+    if let v = ProcessInfo.processInfo.environment["TK_ROOM_WINDOW"], let n = Int(v), n > 1, n <= 31 {
+      fputs("room: TK_ROOM_WINDOW=\(n) estimates instead of 20. RIG ONLY.\n", stderr)
+      return n
+    }
+    return 20
+  }()
+  static var ROOM_ENTER = max(2, Int((Double(ROOM_WINDOW) * 0.40).rounded()))
+  static var ROOM_LEAVE = max(0, Int(Double(ROOM_WINDOW) * 0.10))
+
+  // ══ CALIBRATING THE RULER ═══════════════════════════════════════════════════
+  //
+  // Nothing above is allowed to silence anybody's speaker until this has shown
+  // that the detector ranks two KNOWN inputs in opposite directions, and by how
+  // much. The margin between them IS the feature: a false positive silences a
+  // call that is working perfectly, in a room where the person cannot see why.
+  //
+  // Deterministic and offline, like `--gate-test`: fixed seed, synthetic input,
+  // no wall clock, no socket, no microphone. It calls `scoreSameRoom` -- the same
+  // function the live estimator calls -- rather than a re-implementation written
+  // to agree with it.
+  //
+  // ── AND THE SIGNAL IS SPEECH, NOT NOISE ────────────────────────────────────
+  //
+  // The forward estimator's own note records the reason: two UNRELATED speech
+  // signals correlate at 0.26, because both carry speech's envelope and a pitch
+  // in the same octave, and the best of a thousand candidate lags finds
+  // something. Two unrelated NOISE bursts do not do that -- they would report a
+  // null near zero, a margin that looks enormous, and a detector that fires on
+  // the first real conversation. So the built-in source is a source-filter voice
+  // (a glottal pulse train at a moving F0 through three formants, with syllables
+  // and pauses), and `--sameroom-audio a.wav,b.wav` runs the whole thing again on
+  // real recorded speech, which is the number worth quoting.
+  //
+  // ── AND THE TWO VOICES MUST NOT SHARE A CLOCK ──────────────────────────────
+  //
+  // The first version gave both of them the same syllabic envelope, at the same
+  // phase, and the same pitch shimmer. Two unrelated speakers with their
+  // syllables locked in phase is not a thing, and it cost the null 0.10:
+  // measured 0.494 worst with the envelopes shared and 0.426 with them
+  // independent. A rig that puts a common periodic component into both arms is
+  // measuring its own generator (`measure-the-rigs-noise-first`).
+  private static func voice(seed: UInt64, n: Int, f0: Double, syllHz: Double, shimmerHz: Double,
+                            formants: [(Double, Double)]) -> [Float] {
+    var s = seed &* 6364136223846793005 &+ 1442695040888963407
+    func rnd() -> Double {
+      s = s &* 6364136223846793005 &+ 1442695040888963407
+      return Double(Int32(truncatingIfNeeded: Int(s >> 33))) / Double(Int32.max)
+    }
+    var x = [Float](repeating: 0, count: n)
+    // Two-pole resonators, one per formant. This is the vocal tract; without it
+    // the excitation is a buzz and correlates like a buzz.
+    var y1 = [Double](repeating: 0, count: formants.count)
+    var y2 = [Double](repeating: 0, count: formants.count)
+    var phase = 0.0
+    // Syllables: on for 140-260 ms, off for 40-160 ms. Speech is mostly silence
+    // and a detector meets it that way.
+    var syllLeft = 0, speaking = true
+    var jitter = 1.0
+    for i in 0..<n {
+      if syllLeft <= 0 {
+        speaking.toggle()
+        let ms = speaking ? 140 + rnd().magnitude * 120 : 40 + rnd().magnitude * 120
+        syllLeft = Int(ms / 1000 * SR)
+        jitter = 1 + 0.18 * rnd()                 // a new pitch for each syllable
+      }
+      syllLeft -= 1
+      var exc = 0.0
+      if speaking {
+        // Glottal pulses, with a shimmer so the period is never exactly constant.
+        let step = f0 * jitter * (1 + 0.01 * sin(2 * Double.pi * shimmerHz * Double(i) / SR)) / SR
+        phase += step
+        if phase >= 1 { phase -= 1; exc = 1.0 }
+        exc += 0.02 * rnd()                        // breath
+      }
+      var acc = 0.0
+      for (k, f) in formants.enumerated() {
+        let (freq, bw) = f
+        let r = exp(-Double.pi * bw / SR)
+        let c = 2 * r * cos(2 * Double.pi * freq / SR)
+        let v = exc + c * y1[k] - r * r * y2[k]
+        y2[k] = y1[k]; y1[k] = v
+        acc += v / Double(k + 2)
+      }
+      let env = 0.55 + 0.45 * sin(2 * Double.pi * syllHz * Double(i) / SR + Double(seed % 97))
+      x[i] = Float(acc * 0.02 * env)
+    }
+    var pk: Float = 0
+    for v in x { pk = max(pk, abs(v)) }
+    if pk > 0 { for i in 0..<n { x[i] = x[i] / pk * 0.25 } }
+    return x
+  }
+
+  /// A light early-reflection pattern. The same voice reaching a second
+  /// microphone across a desk is NOT a bit-exact copy of what reached the first,
+  /// and a rig that pretends it is reports a correlation no room can produce.
+  private static func throughRoom(_ x: [Float], seedNoise: UInt64) -> [Float] {
+    var s = seedNoise
+    func rnd() -> Float {
+      s = s &* 6364136223846793005 &+ 1442695040888963407
+      return Float(Int32(truncatingIfNeeded: Int(s >> 33))) / Float(Int32.max)
+    }
+    let taps: [(Int, Float)] = [(0, 0.70), (Int(0.0029 * SR), 0.35),
+                                (Int(0.0061 * SR), 0.20), (Int(0.0110 * SR), 0.12),
+                                (Int(0.0187 * SR), 0.07)]
+    var y = [Float](repeating: 0, count: x.count)
+    for (d, g) in taps {
+      if d >= x.count { continue }
+      for i in d..<x.count { y[i] += g * x[i - d] }
+    }
+    // Room noise at about -40 dB relative to the speech. Real rooms have a floor
+    // and it is part of what the correlation has to survive.
+    for i in 0..<y.count { y[i] += rnd() * 0.0025 }
+    return y
+  }
+
+  /// Resample by `1 + eps`, linearly. This is the jitter buffer's rate governor,
+  /// which tracks the sender and therefore stretches the PLAYOUT against a
+  /// microphone nothing is stretching -- the single largest reason a live
+  /// estimate is noisier than an offline one.
+  private static func warp(_ x: [Float], eps: Double) -> [Float] {
+    var y = [Float](repeating: 0, count: x.count)
+    for i in 0..<x.count {
+      let t = Double(i) * (1 + eps)
+      let j = Int(t)
+      if j + 1 >= x.count { break }
+      let f = Float(t - Double(j))
+      y[i] = x[j] * (1 - f) + x[j + 1] * f
+    }
+    return y
+  }
+
+  /// Read a file as 48 kHz mono. Level-matched, so a quiet recording does not
+  /// read as a silent far end.
+  static func loadMono48(_ path: String) -> [Float]? {
+    guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)),
+          let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SR,
+                                  channels: 1, interleaved: false),
+          let conv = AVAudioConverter(from: file.processingFormat, to: fmt) else { return nil }
+    let frames = AVAudioFrameCount(file.length)
+    guard let inBuf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames),
+          (try? file.read(into: inBuf)) != nil else { return nil }
+    let outCap = AVAudioFrameCount(Double(file.length) * SR / file.processingFormat.sampleRate) + 4096
+    guard let outBuf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: outCap) else { return nil }
+    var done = false
+    var err: NSError?
+    conv.convert(to: outBuf, error: &err) { _, status in
+      if done { status.pointee = .noDataNow; return nil }
+      done = true; status.pointee = .haveData; return inBuf
+    }
+    if err != nil { return nil }
+    let n = Int(outBuf.frameLength)
+    guard n > 0, let ch = outBuf.floatChannelData?[0] else { return nil }
+    var out = [Float](repeating: 0, count: n)
+    for i in 0..<n { out[i] = ch[i] }
+    var pk: Float = 0
+    for v in out { pk = max(pk, abs(v)) }
+    if pk > 0.001 { for i in 0..<n { out[i] = out[i] / pk * 0.25 } }
+    return out
+  }
+
+  /// One estimate over a pair of prepared histories. Writes them into rings of
+  /// exactly the shipped sizes, at a write head that is not a multiple of
+  /// anything, so a wrap bug in the indexing shows up here rather than on a call.
+  private static func oneEstimate(mic: [Float], spk: [Float],
+                                  micWin: inout [Float], refWin: inout [Float]) -> RoomHit {
+    let ch = UnsafeMutablePointer<Float>.allocate(capacity: CAPH)
+    let eh = UnsafeMutablePointer<Float>.allocate(capacity: ECHO_MAX)
+    defer { ch.deallocate(); eh.deallocate() }
+    ch.initialize(repeating: 0, count: CAPH)
+    eh.initialize(repeating: 0, count: ECHO_MAX)
+    let cw = CAPH + 7717, ew = ECHO_MAX + 3313
+    let micTake = min(mic.count, (RWIN + RMAXBACK) * RD + 8000)
+    let spkTake = min(spk.count, RWIN * RD + 8000)
+    for k in 0..<micTake { ch[((cw - micTake + k) % CAPH + CAPH) % CAPH] = mic[mic.count - micTake + k] }
+    for k in 0..<spkTake { eh[((ew - spkTake + k) % ECHO_MAX + ECHO_MAX) % ECHO_MAX] = spk[spk.count - spkTake + k] }
+    return scoreSameRoom(mic: ch, micW: cw, spk: eh, spkW: ew, micWin: &micWin, refWin: &refWin)
+  }
+
+  /// `tk --sameroom-test [--sameroom-audio a.wav,b.wav]`. Returns true on pass.
+  static func sameRoomSelfTest(_ files: String?) -> Bool {
+    let n = Int(SR * 20)
+    var srcA: [Float], srcB: [Float], what: String
+    if let f = files {
+      let parts = f.split(separator: ",").map(String.init)
+      guard parts.count == 2, let a = loadMono48(parts[0]), let b = loadMono48(parts[1]),
+            a.count > 2 * ((RWIN + RMAXBACK) * RD + 20000),
+            b.count > (RWIN + RMAXBACK) * RD + 20000 else {
+        print("  cannot read two usable files from --sameroom-audio \(f)")
+        return false
+      }
+      srcA = a; srcB = b
+      what = "REAL RECORDED SPEECH"
+    } else {
+      srcA = voice(seed: 0x5A11, n: n, f0: 118, syllHz: 3.1, shimmerHz: 5.3,
+                   formants: [(620, 80), (1180, 100), (2500, 140)])
+      srcB = voice(seed: 0xB0B2, n: n, f0: 168, syllHz: 4.4, shimmerHz: 7.1,
+                   formants: [(420, 70), (1900, 110), (2820, 150)])
+      what = "a synthetic source-filter voice (no recording given)"
+    }
+    print("  ruler calibrated on \(what)")
+    var micWin = [Float](), refWin = [Float]()
+    func slice(_ x: [Float], from: Int, len: Int) -> [Float] {
+      var out = [Float](repeating: 0, count: len)
+      for i in 0..<len { out[i] = x[(from + i) % x.count] }
+      return out
+    }
+    let need = (RWIN + RMAXBACK) * RD + 8000
+
+    // ── 1. THE NULL ───────────────────────────────────────────────────────────
+    //
+    // A genuinely remote call: the microphone has one person in it and the
+    // playout has the other, and they share nothing but being speech. Fourteen
+    // independent draws, because one draw of a null is an anecdote -- and the
+    // number that matters for a false positive is the WORST of them.
+    var nulls: [Double] = [], nullSnrs: [Double] = []
+    for k in 0..<8 {
+      let mic = throughRoom(slice(srcA, from: k * 31_000 + 1000, len: need), seedNoise: 0xA1 &+ UInt64(k))
+      let spk = slice(srcB, from: k * 47_000 + 500, len: need)
+      let h = oneEstimate(mic: mic, spk: spk, micWin: &micWin, refWin: &refWin)
+      if h.scored { nulls.append(h.corr); nullSnrs.append(h.snr) }
+    }
+    // ── AND THE HARDEST NULL THERE IS: THE SAME VOICE, TWICE ─────────────────
+    //
+    // Two different people is the easy version. The adversarial remote call is
+    // one where both ends sound alike -- same pitch, same tract, same room tone,
+    // different words -- because then the only thing separating them is that the
+    // content does not line up. A detector that cannot hold that apart silences
+    // calls between people with similar voices, which nobody would ever guess
+    // from the outside. Half the source apart, always, so the two stretches can
+    // never be the same words with a wrap in between.
+    var sameVoiceNulls: [Double] = []
+    let half = srcA.count / 2
+    for k in 0..<6 {
+      let at = (k * srcA.count) / 8
+      let mic = throughRoom(slice(srcA, from: at, len: need), seedNoise: 0xA9 &+ UInt64(k))
+      let spk = slice(srcA, from: at + half, len: need)
+      let h = oneEstimate(mic: mic, spk: spk, micWin: &micWin, refWin: &refWin)
+      if h.scored { sameVoiceNulls.append(h.corr); nullSnrs.append(h.snr) }
+    }
+    guard !nulls.isEmpty else { print("  the null case scored nothing at all"); return false }
+    if let w = sameVoiceNulls.max() {
+      print(String(format: "  remote, and they sound ALIKE (%d draws): worst %.3f", sameVoiceNulls.count, w))
+      nulls.append(contentsOf: sameVoiceNulls)
+    }
+    let nullWorst = nulls.max()!, nullMean = nulls.reduce(0, +) / Double(nulls.count)
+    print(String(format: "  remote (unrelated voices, %d draws): worst %.3f, mean %.3f  <- THE NULL",
+                 nulls.count, nullWorst, nullMean))
+    print(String(format: "      and its peak-over-floor: worst %.2f, mean %.2f",
+                 nullSnrs.max() ?? 0,
+                 nullSnrs.isEmpty ? 0 : nullSnrs.reduce(0, +) / Double(nullSnrs.count)))
+
+    // ── 2. THE SAME ROOM ──────────────────────────────────────────────────────
+    //
+    // One person, two machines. The far machine captured them and this one plays
+    // them out L ms later; this machine's own microphone heard them directly, so
+    // it has them EARLY by L. The microphone copy goes through a different set of
+    // early reflections and picks up room noise.
+    var rooms: [(Double, Double, Double, Double)] = []   // corr, lag, expected, peak/floor
+    for (k, lagMs) in [30.0, 55.0, 90.0, 140.0].enumerated() {
+      let lag = Int(lagMs / 1000 * SR)
+      let base = k * 37_000 + 2000
+      let mic = throughRoom(slice(srcA, from: base + lag, len: need), seedNoise: 0xB1 &+ UInt64(k))
+      let spk = slice(srcA, from: base, len: need)
+      let h = oneEstimate(mic: mic, spk: spk, micWin: &micWin, refWin: &refWin)
+      rooms.append((h.corr, h.lagMs, lagMs, h.snr))
+    }
+    let roomWorst = rooms.map(\.0).min()!
+    for (c, l, e, sn) in rooms {
+      print(String(format: "  same room, one crossing of %.0f ms: %.3f at %.1f ms (%+.1f ms), peak/floor %.1f",
+                   e, c, l, l - e, sn))
+    }
+
+    // ── 3. THE SAME ROOM, WITH THE NEAR PERSON TALKING TOO ───────────────────
+    //
+    // Swept rather than asserted at one level, because a detector has a level at
+    // which it stops working and the useful output is WHERE, not pass/fail. The
+    // ratio is the near voice against the far voice as the near microphone
+    // receives it -- the far one arrives across a room, so 1.0 is already a near
+    // talker considerably louder than the far one.
+    let lagDT = Int(0.070 * SR)
+    let dtRef = slice(srcA, from: 5000, len: need)
+    var dtRow: [(Double, Double, Double, Double)] = []   // ratio, corr, lag, peak/floor
+    var micDT = [Float]()
+    for ratio in [0.0, 0.25, 0.5, 1.0, 2.0] {
+      var m = throughRoom(slice(srcA, from: 5000 + lagDT, len: need), seedNoise: 0xC1)
+      let nearOwn = slice(srcB, from: 12_345, len: need)
+      for i in 0..<need { m[i] += nearOwn[i] * Float(ratio) }
+      let h = oneEstimate(mic: m, spk: dtRef, micWin: &micWin, refWin: &refWin)
+      dtRow.append((ratio, h.corr, h.lagMs, h.snr))
+      if ratio == 0.5 { micDT = m }
+    }
+    print("  same room, with the near person talking too (70 ms crossing):")
+    for (r, c, l, sn) in dtRow {
+      print(String(format: "      near voice at %.2fx the far one: %.3f at %.1f ms, peak/floor %.1f%@",
+                   r, c, l, sn, c >= ROOM_ON ? "" : "   <- below the threshold"))
+    }
+    let dt = dtRow.first { $0.0 == 0.5 }!
+
+    // ── 4. AND WITH THE JITTER BUFFER STRETCHING THE PLAYOUT ──────────────────
+    //
+    // This is why a live estimate is noisier than any of the ones above, and it
+    // is not a defect in either end. The playout is resampled by a governor
+    // tracking the far sender's clock; the microphone is not resampled at all.
+    // Over a 400 ms window a few tenths of a percent is a fraction of a
+    // millisecond of drift, which is a large fraction of a cycle at the top of
+    // the band being correlated.
+    print("  same room, with the playout clock running slightly fast or slow:")
+    var warpRow: [(Double, Double)] = []
+    for eps in [0.0, 0.001, 0.003, 0.010] {
+      let m = throughRoom(warp(slice(srcA, from: 5000 + lagDT, len: need + 2000), eps: eps),
+                          seedNoise: 0xC3)
+      let h = oneEstimate(mic: Array(m.prefix(need)), spk: dtRef, micWin: &micWin, refWin: &refWin)
+      warpRow.append((eps, h.corr))
+      print(String(format: "      %.1f%% clock offset: %.3f at %.1f ms", eps * 100, h.corr, h.lagMs))
+    }
+
+    // ── 5. THE FAR END LOOPING US BACK ────────────────────────────────────────
+    //
+    // Our own voice, off their speaker, into their microphone, returned. It is
+    // an early hit too -- and it must NOT be called same room, because silencing
+    // this speaker would not fix it. It is early by two crossings, not one.
+    let rt = Int(0.180 * SR)
+    let loopMic = throughRoom(slice(srcB, from: 9000 + rt, len: need), seedNoise: 0xD1)
+    let loop = oneEstimate(mic: loopMic, spk: slice(srcB, from: 9000, len: need),
+                           micWin: &micWin, refWin: &refWin)
+    print(String(format: "  their room looping us back, two crossings:    %.3f at %.1f ms, peak/floor %.1f (expected 180)",
+                 loop.corr, loop.lagMs, loop.snr))
+
+    // ── 6. A SILENT FAR END IS NOT A REMOTE CALL ──────────────────────────────
+    let quiet = oneEstimate(mic: throughRoom(slice(srcA, from: 3000, len: need), seedNoise: 0xE1),
+                            spk: [Float](repeating: 0, count: need),
+                            micWin: &micWin, refWin: &refWin)
+    print("  far end silent: \(quiet.scored ? "SCORED ANYWAY -- wrong" : "not scored, which is the honest answer")")
+
+    // ── THE VERDICT IS THE MARGIN ─────────────────────────────────────────────
+    let margin = roomWorst - nullWorst
+    print(String(format: "  MARGIN: worst same room %.3f - worst remote %.3f = %.3f", roomWorst, nullWorst, margin))
+    print(String(format: "  shipped: fire above %.2f, and %d of the last %d estimates to decide (leave at %d)",
+                 ROOM_ON, ROOM_ENTER, ROOM_WINDOW, ROOM_LEAVE))
+
+    var bad = false
+    func check(_ ok: Bool, _ line: String) {
+      print(ok ? "   ok   \(line)" : "  WRONG \(line)")
+      if !ok { bad = true }
+    }
+    check(margin >= 0.20, String(format: "the two known inputs rank opposite ways by %.3f", margin))
+    check(nullWorst < ROOM_ON, "no remote draw reaches the threshold at all")
+    check(roomWorst >= ROOM_ON, "every same-room case clears it")
+    // ── DOUBLE TALK IS REPORTED, NOT GRADED ──────────────────────────────────
+    //
+    // On real speech the room stops being detectable once an UNCORRELATED near
+    // voice reaches about half the far one, and that is a property of
+    // cross-correlation rather than a bug to tune out. It costs detections,
+    // never false ones -- which is the safe direction, and is what is asserted.
+    // It also matters less than it looks: when the near person talks, the FAR
+    // machine's gate closes on them, the far stream goes quiet, and the estimate
+    // is not scored at all.
+    let loudest = dtRow.filter { $0.1 >= ROOM_ON }.map(\.0).max() ?? 0
+    print(String(format: "  LIMIT: double talk holds up to a near voice %.2fx the far one, and not above", loudest))
+    print(String(format: "  LIMIT: a %.1f%% playout clock offset takes it from %.3f to %.3f",
+                 warpRow.last!.0 * 100, warpRow.first!.1, warpRow.last!.1))
+    var monotone = true
+    for i in 1..<dtRow.count where dtRow[i].1 > dtRow[i - 1].1 + 0.02 { monotone = false }
+    check(monotone, "a louder near voice only ever makes it LESS sure, never more")
+    check(dt.1 < roomWorst + 0.01, "double talk cannot raise the score above the clean case")
+    for (_, l, e, _) in rooms {
+      check(abs(l - e) <= 8, String(format: "the %.0f ms crossing is located to within 8 ms", e))
+    }
+    check(loop.corr >= ROOM_ON, "the far-end loop is seen at all")
+    check(abs(loop.lagMs - 180) <= 12, "and is located at two crossings, not one")
+    check(!quiet.scored, "a silent far end scores nothing rather than scoring low")
+
+    // ── 7. THE CONTROLLER, INCLUDING THE PART AFTER IT ACTS ───────────────────
+    //
+    // A rig that only tests the entry condition cannot see an oscillation. The
+    // buffers here are IDENTICAL before and after the speaker is silenced,
+    // because that is what silencing does to them -- nothing: `echoHist` is fed
+    // `played` regardless, and `capHist` is the raw microphone regardless. So
+    // this replays the same evidence long after the decision and requires the
+    // state to hold and the decision count to stay at one.
+    let a = Audio()
+    a.thetaValid = true
+    a.outLatencyMs = 12; a.inLatencyMs = 9
+    // A call whose mouth-to-ear is 91 ms: one crossing lands at 91-12-9 = 70 ms,
+    // which is where the evidence below sits.
+    for _ in 0..<64 { a.m2e.add(91.0) }
+    let roomEvidence = oneEstimate(mic: throughRoom(slice(srcA, from: 5000 + lagDT, len: need),
+                                                    seedNoise: 0xC2),
+                                   spk: dtRef, micWin: &micWin, refWin: &refWin)
+    let hardEvidence = oneEstimate(mic: micDT, spk: dtRef, micWin: &micWin, refWin: &refWin)
+    let remoteEvidence = oneEstimate(mic: throughRoom(slice(srcA, from: 1000, len: need), seedNoise: 0xF1),
+                                     spk: slice(srcB, from: 500, len: need),
+                                     micWin: &micWin, refWin: &refWin)
+    var enteredAfter = -1
+    for i in 0..<(ROOM_WINDOW + 30) {
+      a.judgeSameRoom(roomEvidence)
+      if a.roomConfirmed, enteredAfter < 0 { enteredAfter = i + 1 }
+    }
+    check(enteredAfter == ROOM_WINDOW,
+          "it refuses to decide until the window is full, then does (\(enteredAfter) of \(ROOM_WINDOW))")
+    check(a.roomConfirmed, "and it is STILL sure fifteen seconds after the speaker went off")
+    check(a.roomEnters == 1, "having decided ONCE (\(a.roomEnters)), which is what not oscillating looks like")
+    check(a.roomVerdict == .sameRoom, "and it still names the room as the reason")
+    // A quiet far end must HOLD, not restore: a pause in a conversation is not
+    // evidence that anybody left the room, and a gate that reads a pause as a
+    // negative flips once per sentence.
+    for _ in 0..<40 { a.judgeSameRoom(quiet) }
+    check(a.roomConfirmed, "a long silence holds the decision instead of flipping it")
+    // Sustained double talk. Measured to drop the decision on real speech and to
+    // hold it on the synthetic voice; both are right for the evidence each
+    // carries. What must not happen is the two alternating.
+    for _ in 0..<12 { a.judgeSameRoom(hardEvidence) }
+    let survivedDT = a.roomConfirmed
+    for _ in 0..<(ROOM_WINDOW + 6) { a.judgeSameRoom(roomEvidence) }
+    check(a.roomConfirmed, "it is sure again once the near person stops talking over them")
+    check(a.roomEnters <= 2, "and that whole sequence produced \(a.roomEnters) decision(s), not a flap")
+    print("  double talk for 6 s while confirmed: \(survivedDT ? "held" : "dropped, and recovered")")
+    // Now the evidence genuinely stops: they left, or it was never a room.
+    var leftAfter = -1
+    for i in 0..<(ROOM_WINDOW + 10) {
+      a.judgeSameRoom(remoteEvidence)
+      if !a.roomConfirmed, leftAfter < 0 { leftAfter = i + 1 }
+    }
+    check(leftAfter == ROOM_WINDOW - ROOM_LEAVE,
+          "and it comes back once the window has emptied (\(leftAfter) estimates)")
+    // AND IT MUST NOT COME STRAIGHT BACK ON. The window is restarted on the way
+    // out, so re-deciding needs a fresh quorum of evidence -- not the single
+    // estimate that would otherwise top up a window still full of the decision
+    // that was just abandoned.
+    var reEntered = -1
+    for i in 0..<(ROOM_WINDOW * 2) {
+      a.judgeSameRoom(roomEvidence)
+      if a.roomConfirmed, reEntered < 0 { reEntered = i + 1 }
+    }
+    check(reEntered >= ROOM_ENTER,
+          "re-deciding needs \(ROOM_ENTER) fresh estimates, not one (took \(reEntered))")
+
+    // And the loop case, on the same call, must never confirm.
+    let b = Audio()
+    b.thetaValid = true
+    b.outLatencyMs = 12; b.inLatencyMs = 9
+    for _ in 0..<64 { b.m2e.add(91.0) }
+    for _ in 0..<(ROOM_WINDOW * 3) { b.judgeSameRoom(loop) }
+    check(!b.roomConfirmed, "the far-end loop never silences this speaker")
+    check(b.roomVerdict == .farLoopback && b.loopbackHits > 0,
+          "it is counted and named as their room, not ours (\(b.loopbackHits) estimates)")
+
+    print(bad ? "  SAME ROOM TEST FAILED"
+              : "  SAME ROOM TEST PASSED -- the detector ranks a room and a remote call opposite ways,"
+              + String(format: " by %.3f, and survives its own fix", margin))
+    return !bad
   }
 
   /// Load a file as 48 kHz mono float32 to stand in for the microphone.
@@ -2495,6 +3370,27 @@ final class Audio {
 
     // Substitute the file, if one was given, before anything looks at the samples.
     if let src = srcSamples, srcCount > 0 {
+      // ── ONE ROOM MEANS ONE SOUND, AT ONE INSTANT, IN BOTH MICROPHONES ──────
+      //
+      // Normally the file starts at whatever moment this process reached
+      // `loadAudioSource`, which is correct for every rig that only cares what
+      // the microphone contains. It is WRONG for a rig about two machines
+      // hearing the same room: measured on a live loopback pair given the same
+      // recording, the two processes' file positions were 215 ms apart, purely
+      // from launch skew -- so the backward search found the far voice 266 ms
+      // early instead of 51, and the app correctly refused to call that one
+      // room. The rig was modelling two machines playing the same record from
+      // different points, which is not what a room is.
+      //
+      // Phase-locked to the host clock, both processes read the same sample at
+      // the same instant, and the launch skew disappears by construction. Both
+      // are on one Mac, so `mach_absolute_time` is literally the same clock.
+      // TEST INPUT ONLY: it changes what the microphone contains and nothing
+      // about the product's own logic.
+      if Audio.srcWallLock {
+        let t = Double(Clock.ns(host0)) / 1e9 * SR
+        srcPos = ((Int(t) % srcCount) + srcCount) % srcCount
+      }
       for k in 0..<Int(n) {
         inScratch[k] = src[srcPos]
         srcPos += 1
@@ -2865,7 +3761,30 @@ final class Audio {
         // because that is what the speaker actually plays into the microphone.
         let played = presence(val)
         noteFar(played)
-        out[i] = mute ? 0 : played
+        // ── SILENCED WHERE `mute` IS SILENCED, AND FOR THE SAME REASON ────────
+        //
+        // `roomSpeakerOff` turns this Mac's speaker off when both people are in
+        // one room. It joins `mute` HERE, on the way out of the machine, and
+        // touches nothing below -- and that placement is the entire stability
+        // argument for the feature.
+        //
+        // The detector correlates the DECODED FAR STREAM against the microphone.
+        // Not the acoustic output of the speaker: `echoHist` records `played`
+        // whatever `mute` and `roomSpeakerOff` say, and `capHist` records the RAW
+        // microphone whatever the duplex gate says. So after the speaker goes
+        // quiet: the far person is still in the room, so the microphone still
+        // hears them; the far stream still arrives over the network, so
+        // `echoHist` still has it; and the correlation therefore SURVIVES the fix
+        // and the detector keeps agreeing with itself.
+        //
+        // Key it off anything the fix removes -- the speaker's actual output, an
+        // acoustic measurement, the gate's decision -- and it silences, loses its
+        // evidence, unsilences, hears the room again, and silences again: a call
+        // oscillating once a second. Two bugs in this codebase already have that
+        // exact shape (`held-is-a-one-way-door`,
+        // `control-loops-steer-on-flattering-signals`), and both were a recovery
+        // gate reading a signal its own action had switched off.
+        out[i] = (mute || roomSpeakerOff) ? 0 : played
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
@@ -2952,7 +3871,10 @@ final class Audio {
         }
         let played = presence(val)
         noteFar(played)
-        out[i] = mute ? 0 : played
+        // The concealment path silences too, or a room that has been detected
+        // still leaks every invented sample out of the speaker. Same placement,
+        // same reason: `echoHist` below is written either way.
+        out[i] = (mute || roomSpeakerOff) ? 0 : played
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
