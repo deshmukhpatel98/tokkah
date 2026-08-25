@@ -2140,6 +2140,24 @@ final class CallControls: NSView {
       // card when the peer leaves and it comes back -- the room in it is long
       // expired, and "answer" would join an empty one.
       if !present { self.waiting.clearIncoming() }
+      // ── AND EVERY READOUT ABOUT THEM, BECAUSE THEY ARE GONE ────────────────
+      //
+      // These describe a peer, and they hold their last value forever: after a
+      // departure the window said
+      //
+      //     the other person left        their camera is off      breaking up
+      //
+      // all at once. Read together that is somebody still on the call with their
+      // camera off and a bad line, which is the opposite of what happened. A
+      // stale fact next to a fresh one is read as current.
+      //
+      // Cleared HERE and not at the call site, because there is one departure
+      // path today and there will be more.
+      if !present {
+        self.warnText = ""
+        self.warnPill.text = ""
+        self.qualityText = ""
+      }
       if present { self.sawPeer = true }
       self.waiting.isHidden = present
       // The control row must not fade out while this card is the only way off this

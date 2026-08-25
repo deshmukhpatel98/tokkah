@@ -1764,6 +1764,12 @@ if let room = arg("room") {
           // does -- the sheet's invite row was removed because this exists.
           Metrics.count("peer_left")
           display?.controls?.setPeerPresent(false)
+          // Presence is OFF now, and everything downstream reads it: the report
+          // loop stops publishing peer-derived readouts, and a peer who comes
+          // back gets the same first-frame grace they got the first time.
+          peerHere = false
+          sinceLock = -1
+          pictureCleared = false
         }
         // Keep probing anyway: a peer that comes BACK republishes, and the status
         // is a report, not a decision to stop trying.
@@ -4228,7 +4234,23 @@ func reportLoop() {
     let lostNow = Double(r.concealLost - lastUiLost) + Double(r.recovered - lastUiRecovered)
     lastUiLost = r.concealLost; lastUiRecovered = r.recovered
     let lossPct = lostNow / expectedPkts * 100.0
-    c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
+    // ── DO NOT DESCRIBE SOMEBODY WHO HAS LEFT ────────────────────────────────
+    //
+    // These readouts hold their last value, and this loop republishes them every
+    // second, so clearing them on departure was overwritten a second later. After
+    // somebody left, the window said
+    //
+    //     the other person left     breaking up     their camera is off
+    //
+    // all at once -- which reads as a person still on the call with a bad line
+    // and their camera off, the opposite of what happened. A stale fact beside a
+    // fresh one is read as current.
+    if peerHere {
+      c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
+    } else {
+      c.setQuality(m2eMs: nil, concealPct: 0, lossPct: 0)
+      c.setWarning("")
+    }
     // ── NO SPEAKER, NO ECHO ───────────────────────────────────────────────────
     //
     // The on-screen echo warning is gone (Controls.setEcho), so this line no
@@ -4818,7 +4840,10 @@ func reportLoop() {
     Metrics.count(pMuted ? "peer_muted" : "peer_unmuted")
     fputs("  voice: the far end's microphone is \(pMuted ? "OFF" : "on")\n", stderr)
   }
-  display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff, peerMuted: pMuted)
+  // Same rule as the quality readout above: nothing about a peer who is not here.
+  if peerHere {
+    display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff, peerMuted: pMuted)
+  }
 
   // LAST in the loop, on purpose: every section above has now computed its
   // numbers, so the beat and the lines printed beside it cannot disagree about
