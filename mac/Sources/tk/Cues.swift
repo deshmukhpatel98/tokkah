@@ -354,6 +354,27 @@ final class BloomLabel: NSView {
 //
 // Head truncation, not tail: the newest words are the ones that matter, so what
 // falls off the front is what falls off.
+/// ── HOW LONG A CAPTION LIVES, WITH A RIG OVERRIDE ON IT ──────────────────────
+///
+/// A caption is a cadence like every other one in this app, and every other one
+/// has a way for a test to compress it. This did not, and it cost a real
+/// diagnosis: `immersive-check` proves the row can fade while the words stay,
+/// which needs one audit holding both facts at once. The words expire 2.2 s after
+/// they arrive; the rig's presses queue by up to 1.5 s on a loaded machine. So on
+/// a quiet machine it passed and on a busy one it reported "the subtitles broke"
+/// -- a rig failing for a reason that has nothing to do with its subject, which
+/// is how a rig stops being believed.
+///
+/// A MULTIPLIER rather than an absolute, so the three lifetimes keep their
+/// relationship to each other -- an interim caption still goes before a final
+/// one, and the twelve-second backstop still outlives both. Nothing in the app
+/// sets it; the shipped behaviour is scale 1.
+enum CaptionClock {
+  static let scale: Double =
+    (ProcessInfo.processInfo.environment["TK_CAPTION_SCALE"].flatMap { Double($0) })
+      .map { max(1.0, $0) } ?? 1.0
+}
+
 final class CaptionBand: NSView {
   // Clear, over the HIG's dim. The band floats in the MIDDLE of the window, where
   // neither scrim reaches, so it is on its own for contrast -- and it is two lines
@@ -750,9 +771,10 @@ final class TurnCues: NSView {
     if !band.theirText.isEmpty {
       let quiet = cue.vocal == 0
       let since = now - theirsAt
-      if (quiet && since > (theirsFinal ? 1.6 : 2.2)) || since > 12 { band.theirText = "" }
+      if (quiet && since > (theirsFinal ? 1.6 : 2.2) * CaptionClock.scale)
+          || since > 12 * CaptionClock.scale { band.theirText = "" }
     }
-    if !band.myText.isEmpty, now - mineAt > 3.0 { band.myText = "" }
+    if !band.myText.isEmpty, now - mineAt > 3.0 * CaptionClock.scale { band.myText = "" }
 
     band.refit()
     let wantH = band.wantedHeight

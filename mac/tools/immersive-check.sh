@@ -98,6 +98,7 @@ trace() {
       else if (b == "hidden")            printf "H"
       else if (b == "shown/held:notyet") printf "W"
       else if (b == "shown/held:card")   printf "C"
+      else if (b == "shown/held:waiting") printf "R"
       else if (b == "shown/held:alone")  printf "A"
       else if (b == "shown/held:panel")  printf "P"
       else if (b == "shown/held:leaving") printf "L"
@@ -183,11 +184,11 @@ R1="imchk${$}a"
 spawn "$TK" --window --room "$R1" --listen 8081 --peer 127.0.0.1:8082 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       > "$SP/a.log" 2>&1
-spawn env TK_IMMERSIVE_MS="$STILL" TK_LEAVE_HOLD_MS=3000 "$TK" --window --room "$R1" \
+spawn env TK_IMMERSIVE_MS="$STILL" TK_LEAVE_HOLD_MS=3000 TK_CAPTION_SCALE=8 "$TK" --window --room "$R1" \
       --listen 8082 --peer 127.0.0.1:8081 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --press-after 3 \
-      --press "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,blind-tap,?,?,?,?,fade,?,?,?,@peek:5,?,?,?,?,?,?,?,?,?,?,?,?,leave,?,?,?,?,?,?,?,?,?,unleave,?,?,?,?,@more,?,?,?,?,said,mine,?,?,esc,?,?,?,?,said,mine,?,?,?,?,?,sighted-tap,?,?" \
+      --press "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,blind-tap,?,?,?,?,fade,?,?,?,@peek:5,?,?,?,?,?,?,?,?,?,?,?,?,leave,?,?,?,?,?,?,?,?,?,unleave,?,?,?,?,@more,?,?,?,?,said,mine,?,?,esc,?,?,?,?,said,mine,fade,?,?,?,?,sighted-tap,?,?" \
       > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,88'
 reap
@@ -389,13 +390,28 @@ esac
 # ARE the card -- the invite link, the name field, the handset -- so a fade here
 # is a window with a dead frame in it and nothing on it at all.
 echo "── 6. the waiting card keeps the controls"
+# ── WHAT A VANISHED PEER MEANS NOW ──────────────────────────────────────────
+#
+# This part used to kill A and wait for the waiting card, because a peer that
+# stopped sending WAS a peer who had left. A call is now a fact on disk that ends
+# only when somebody hangs up, so a killed process is held open instead: no card,
+# no departure, "they'll be right back".
+#
+# The property under test did not change and is worth more than the old wording:
+# a state where the person has a decision in front of them must not take the
+# controls away. The hold is exactly that state -- and it was FAILING it. A held
+# call passes through none of `notyet`, `card` or `alone` (`peerPresent` stays
+# true on purpose so nothing tears down), so the row faded on its stillness timer
+# and stayed faded: their last frame frozen, a pill saying they will be back, and
+# no hang-up button anywhere until the person moved the mouse to find out whether
+# the app was still alive. `held:waiting` is that fix, and this is what holds it.
 case "$T2" in
-  *C*) BEFORE_C="${T2%%C*}"; AFTER_C="${T2#*C}" ;;
+  *R*) BEFORE_C="${T2%%R*}"; AFTER_C="${T2#*R}" ;;
   *)   BEFORE_C=""; AFTER_C="" ;;
 esac
 case "$T2" in
-  *C*) say "OK" "the other person left and the row is held up by the card (held:card)" ;;
-  *)   say "FAIL" "the card never came back in this run: [$T2]" ;;
+  *R*) say "OK" "they went quiet and the row came BACK and stayed (held:waiting)" ;;
+  *)   say "FAIL" "the row never came back for the hold: [$T2]" ;;
 esac
 case "$BEFORE_C" in
   *H*) say "OK" "CONTROL: the SAME call faded while they were still here" ;;
@@ -405,12 +421,23 @@ case "$AFTER_C" in
   *H*) say "FAIL" "and then it faded behind the card anyway: [$AFTER_C]" ;;
   *)   say "OK" "and it never faded again for the rest of the run" ;;
 esac
-grep -q "card=invite" "$SP/d.log" \
-  && say "OK" "the card really is on screen -- card=invite, with the link on it" \
-  || say "FAIL" "nothing shows a card, so 'held:card' is describing an empty screen"
-grep -q "bar: staying up -- card" "$SP/d.log" \
-  && say "OK" "and the fade timer came for it and was refused, by name" \
-  || say "FAIL" "the timer never fired after the departure -- the row is up for some other reason"
+grep -q "holding the call open" "$SP/d.log" \
+  && say "OK" "and the call really was being held -- not ended, not a card" \
+  || say "FAIL" "nothing was held, so 'held:waiting' is describing an ordinary call"
+grep -qE "right back" "$SP/d.log" \
+  && say "OK" "and the person was told so, rather than left with a frozen frame" \
+  || say "FAIL" "the row came up but nothing on it says why"
+# Read from the tree dump rather than the log. The app only prints "staying up --
+# <why>" when the fade timer FIRES and is refused, and the timer waits for
+# whichever is later, the stillness or a pin left over from an earlier state
+# change -- so on a short run it can be up for the right reason and never once
+# have been asked. The dump is the same claim from the side that matters: this is
+# the reason the window itself is reporting, sampled repeatedly.
+HELDW="$(grep -c 'bar=shown/held:waiting' "$SP/d.log")"
+case "${HELDW:-0}" in
+  0|1) say "FAIL" "the row is up but never named 'waiting' -- it is up for some other reason" ;;
+  *)   say "OK" "and the window names the reason itself, $HELDW times running: held:waiting" ;;
+esac
 
 # ── 7. THE SUBTITLES ARE NOT CONTROLS ───────────────────────────────────────
 #
@@ -425,6 +452,23 @@ grep -q "bar: staying up -- card" "$SP/d.log" \
 # up to 1.3 s, so an arm that needs the row to still be shown when the audit
 # lands is an arm that fails on a busy machine and says the subtitles broke. With
 # the panel open the row is held up by something that is not a timer.
+#
+# The MAIN arm had the mirror of that problem and it caught this rig out: it
+# waited for the stillness timer to hide the row on its own, so the caption had
+# to outlive both the queue and the fade. Measured on a busier machine the
+# presses queued 836 and 1493 ms and the audits landed on `band=82%` with the
+# text already cleared -- a caption mid-fade, reported as "the subtitles broke".
+# `fade` puts the row exactly where the timer would, on demand, so the caption
+# and the empty row are read from the same instant by construction rather than by
+# luck. A rig that fails on a busy machine is a rig somebody stops believing.
+#
+# And `TK_CAPTION_SCALE=8` is the other half, which is the half that was actually
+# failing: the row state was never the problem, the WORDS were expiring. A caption
+# lives 2.2 s and the presses queued 836 and 1493 ms, so on a loaded machine the
+# audit arrived after the text had already been cleared and every arm -- including
+# the control -- reported that the subtitles had broken. The multiplier holds all
+# three caption lifetimes in proportion, so what is under test here is still
+# whether the FADE touches the caption, and no longer whether this Mac was busy.
 echo "── 7. the subtitles stay"
 CAP='theirs="|mine="'
 SUB="$(grep -oE 'audit state controls.*' "$SP/b.log" | grep 'bar=hidden' | grep -m1 -E "$CAP")"

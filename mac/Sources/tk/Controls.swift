@@ -2815,6 +2815,24 @@ final class CallControls: NSView {
   // be what hides the card again when somebody comes BACK, and a card left on top
   // of a returning peer's picture is a worse bug than the one being fixed. So the
   // two directions live in one call that cannot be half-wired.
+  /// The far end has gone quiet and the call is being held open for them. Not the
+  /// same question as `peerPresent`, which stays true through a hold because the
+  /// CALL has not ended -- this is the narrower "is anybody actually there right
+  /// now", and it is what the control row has to answer.
+  private var barHolding = false
+  func setHolding(_ on: Bool) {
+    guard on != barHolding else { return }
+    barHolding = on
+    // Shown, deliberately NOT pinned. A pin would hold the row for ten seconds and
+    // then hand it to `barHoldReason`, which means for those ten seconds the row
+    // is up for a reason nobody can observe -- and the fade timer, the thing that
+    // has to refuse, never fires at all. `waiting` holds it up on its own for as
+    // long as the hold lasts, so showing it once is enough and the refusal is
+    // visible the first time the timer comes round. A pin here would have hidden
+    // whether the fix worked.
+    if on { showBar() } else { nudgeBar() }
+  }
+
   func setPeerPresent(_ present: Bool) {
     onMain { [weak self] in
       guard let self else { return }
@@ -2947,6 +2965,20 @@ final class CallControls: NSView {
   /// says this person is owed.
   func setFloor(peerVocal: Int, nudge: Double) {
     onMain { [weak self] in self?.cues.setFloor(peerVocal: peerVocal, nudge: nudge) }
+  }
+
+  /// Flattens foreign text for the one-line state dump. See `clip=` in
+  /// `describeTree` for what it cost to learn that this was needed.
+  static func oneLine(_ raw: String?, cap: Int = 120) -> String {
+    guard let raw, !raw.isEmpty else { return "-" }
+    var out = ""
+    for ch in raw {
+      if ch == "\n" || ch == "\r" { out += "\u{23CE}" }        // ⏎
+      else if ch == "\t" { out += " " }
+      else { out.append(ch) }
+      if out.count >= cap { return out + "\u{2026}" }
+    }
+    return out
   }
 
   var cueState: String { cues.describe }
@@ -3359,6 +3391,17 @@ final class CallControls: NSView {
     if startedAt == nil { return "notyet" }
     if !waiting.isHidden { return "card" }
     if !peerPresent { return "alone" }
+    // ── WAITING FOR SOMEBODY TO COME BACK ──────────────────────────────────
+    //
+    // A held call passes through none of the three above: it has started, no
+    // card is up, and `peerPresent` stays TRUE on purpose so that nothing tears
+    // down while the person is only away. So the row faded on its stillness
+    // timer and stayed faded -- the picture frozen on their last frame, "they'll
+    // be right back" in a pill, and no hang-up button anywhere until the person
+    // moved the mouse to find out whether the app was still alive. The one
+    // moment they most need a way out was the one moment the way out was
+    // invisible.
+    if barHolding { return "waiting" }
     if moreOpen { return "panel" }
     if leaveArmed { return "leaving" }
     if peekButton.holding || leaveButton.holding { return "held" }
@@ -4254,7 +4297,22 @@ final class CallControls: NSView {
       // percentage is the only way a fill can be asserted without a screenshot.
       + "  leave=\(leaveState) bar=\(barState)"
       + "  handle=\(handle.isEmpty ? "-" : handle) people=\(people.count)"
-      + "  clip=\(NSPasteboard.general.string(forType: .string) ?? "-")"
+      // ── SOMEBODY ELSE'S TEXT, INSIDE OUR RECORD ────────────────────────────
+      //
+      // This is the one field whose contents this app does not control: it is
+      // whatever the person happened to copy. Pasted in raw, a clipboard holding
+      // a newline SPLITS THIS LINE IN TWO -- and everything after `clip=`, which
+      // is the entire caption section, lands on a second line that no rig
+      // matches. That is exactly what happened: `immersive-check` part seven
+      // reported "the subtitles broke" on a healthy build, three runs running,
+      // because a URL had been copied on this Mac. A diagnostic that a bystander
+      // can corrupt by copying text is not a diagnostic.
+      //
+      // Newlines and tabs become a visible glyph rather than being dropped, so a
+      // multi-line clipboard still reads as multi-line, and the whole thing is
+      // capped -- the invite links this field exists to prove are short, and a
+      // copied document has no business in a one-line state dump.
+      + "  clip=\(Self.oneLine(NSPasteboard.general.string(forType: .string)))"
       + "  \(cues.describe)"
       + (moreOpen ? "\n  sheet=\(sheetPage.rawValue)["
                   + sheet.rows.map { $0.spoken }.joined(separator: " | ") + "]"

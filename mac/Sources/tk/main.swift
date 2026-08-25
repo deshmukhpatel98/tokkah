@@ -1185,6 +1185,13 @@ nonisolated(unsafe) var ringingStarted = false
 /// Used to give a healthy call time to deliver its first frame before the window
 /// is blanked. See the note beside `clearPicture` in the presence thread.
 nonisolated(unsafe) var sinceLock = -1
+/// Whether the other person is silent RIGHT NOW while the call is being held
+/// open for them. Distinct from `peerHere`, which stays true across a hold on
+/// purpose -- the call has not ended and nothing should tear down. This is the
+/// narrower question every READOUT has to ask: is there a person on the far end
+/// to describe? Set where the hold is announced, cleared when they come back and
+/// when the room lease finally decides they are gone.
+nonisolated(unsafe) var peerHeld = false
 nonisolated(unsafe) var pictureCleared = false
 /// A LOCK AND NOT THE MAIN THREAD. The obvious way to make `startRingingOnce`
 /// single-entry is to hop it onto main -- and that was written, and it never ran:
@@ -2471,6 +2478,8 @@ if let room = arg("room") {
         fputs("room \(room): they are back -- media gap \(ms) ms\n", stderr)
         gapBegan = 0
         announcedHold = false
+        peerHeld = false
+        display?.controls?.setHolding(false)
         display?.controls?.setStatus("connected")
       }
       if !wire.locked { sinceLocked = 0 }
@@ -2799,6 +2808,11 @@ if let room = arg("room") {
             fputs("room \(room): \(name.lowercased()) went quiet without hanging up"
                 + " -- holding the call open\n", stderr)
             display?.controls?.setStatus("\(name)\u{2019}ll be right back\u{2026}")
+            // Everything that DESCRIBES them has to stop here too -- see the
+            // report loop. Holding the call open is not the same as having
+            // somebody to measure.
+            peerHeld = true
+            display?.controls?.setHolding(true)
           }
           // The room has forgotten them: 90 s with nobody publishing. That is the
           // shared fact both ends read, and it is the bound on the hold.
@@ -2809,6 +2823,8 @@ if let room = arg("room") {
                 + " -- treating that as gone\n", stderr)
             Resume.end(why: "the room lease expired with nobody in it")
             Metrics.count("peer_left")
+            peerHeld = false
+            display?.controls?.setHolding(false)
             display?.controls?.setStatus("the other person left")
             display?.controls?.setPeerPresent(false)
             peerHere = false
@@ -5407,7 +5423,15 @@ func reportLoop() {
     // all at once -- which reads as a person still on the call with a bad line
     // and their camera off, the opposite of what happened. A stale fact beside a
     // fresh one is read as current.
-    if peerHere {
+    // `peerHeld` joins `peerHere` here rather than replacing it. A held call has
+    // not ended -- peerHere stays true so nothing tears down -- but there is
+    // nobody on the far end to measure, and these numbers hold their last value
+    // and are republished every second. So a peer who vanished mid-call showed
+    // "they'll be right back" beside "23 ms - breaking up": a fresh sentence and
+    // a stale measurement, and the stale one reads as current. Exactly the fault
+    // named above, reached through the one door that did not exist when it was
+    // written.
+    if peerHere, !peerHeld {
       c.setQuality(m2eMs: p50, concealPct: concealPct, lossPct: lossPct)
     } else {
       c.setQuality(m2eMs: nil, concealPct: 0, lossPct: 0)
