@@ -357,16 +357,14 @@ enum Launcher {
     camBox.layer = host
     v.addSubview(camBox)
 
-    // A dim over the picture, for the same reason the call window has one: the
-    // glass below is clear-adjacent and the thing behind it is a face lit by
-    // whatever is in the room. 35%, the HIG's number.
-    let dim = CAGradientLayer()
-    dim.frame = NSRect(x: 0, y: 0, width: W, height: H * 0.62)
-    dim.startPoint = CGPoint(x: 0.5, y: 1)
-    dim.endPoint = CGPoint(x: 0.5, y: 0)
-    dim.colors = [NSColor.clear.cgColor, Palette.dim.cgColor]
-    dim.autoresizingMask = [.layerWidthSizable]
-    host.addSublayer(dim)
+    // ── AND NOTHING OVER THE PICTURE ─────────────────────────────────────────
+    //
+    // A `CAGradientLayer` ran up 62% of this window at 35%, so the first thing
+    // anybody ever saw of themselves in this app was their own face fading into
+    // the dark at the bottom. Deleted with the two in the call window and for the
+    // same reason: the dimming a control needs belongs inside that control, and
+    // `joinCard` and `hintPill` below both carry theirs. See the note beside the
+    // scrims in `CallControls.init`.
 
     // ── WHAT THE CAMERA IS DOING, IN A PILL ───────────────────────────────────
     //
@@ -374,7 +372,9 @@ enum Launcher {
     // the middle where the picture would be, so "Starting camera…" and "Camera
     // access is off" arrive as a statement about the picture rather than as a
     // caption floating in a void.
-    let hintPill = Glass(radius: Metric.capsule(Metric.pillHeight), variant: .regular)
+    // It sits at the TOP edge of the gradient above, where the gradient is still
+    // transparent, so it gets no help from it and carries its own dim.
+    let hintPill = Glass("hintPill", radius: Metric.capsule(Metric.pillHeight))
     let hint = NSTextField(labelWithString: "")
     hint.font = Type_.status
     hint.textColor = Palette.fg
@@ -409,8 +409,11 @@ enum Launcher {
     let cardH: CGFloat = pad + 24 + Metric.s1 + 32 + Metric.s5 + Metric.fieldHeight
                        + Metric.s1 + statusH + (recents.isEmpty ? 0 : Metric.s2 + 24) + pad
     let cardW = W - Metric.gutter * 2
-    let card = Glass(radius: Metric.cardRadius, variant: .regular)
-    card.tint = Palette.glassTint
+    // Clear, with the dim underneath rather than a tint inside. The tint was
+    // `Palette.glassTint` and it is gone from every surface in the app -- see rule
+    // 2 in `Glass.swift`. This card sits over your own face in the bottom half of
+    // the window, below where the gradient above has any strength left.
+    let card = Glass("joinCard", radius: Metric.cardRadius)
     card.frame = NSRect(x: Metric.gutter, y: Metric.gutter, width: cardW, height: cardH)
     v.addSubview(card)
 
@@ -513,9 +516,10 @@ enum Launcher {
       pl.videoGravity = .resizeAspectFill
       pl.frame = CGRect(x: 0, y: 0, width: W, height: H)
       pl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-      // BELOW the dim, or the gradient that keeps the glass legible ends up behind
-      // the picture doing nothing.
-      host.insertSublayer(pl, below: dim)
+      // At index 0: the preview is the CONTENT of this window and everything else
+      // in it floats above. It used to be inserted below the dimming gradient for
+      // the same reason, and the gradient is gone.
+      host.insertSublayer(pl, at: 0)
       setHint("")
       DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
     }
@@ -619,11 +623,37 @@ enum Launcher {
 
     w.makeKeyAndOrderFront(nil)
     w.makeFirstResponder(field)
-    app.activate(ignoringOtherApps: true)
+    // ── THE ONE WINDOW IN THIS APP THAT STILL TOOK THE FRONT ─────────────────
+    //
+    // `Display.open` has had this switch since a rig's ring cards started landing
+    // under a real person's trackpad taps, and the call window has been polite
+    // ever since. This one was not: `activate(ignoringOtherApps:)` with nothing in
+    // front of it, so every `--gui` run in a harness threw a 560x520 window over
+    // whatever the person at this Mac was doing and then waited for a click to go
+    // away. Which is why the join card was the one surface no rig had ever
+    // photographed -- it could not be reached without interrupting somebody.
+    //
+    // Same switch, same three parts, same reasons written out in `Display.open`:
+    // out of the way, click-through so a real finger passes to whatever is
+    // behind, and no activation. Nothing in the app sets it, so a person opening
+    // Kin still gets a window that comes to the front and takes the keyboard.
+    if ProcessInfo.processInfo.environment["TK_NO_RAISE"] == "1" {
+      if let vis = NSScreen.main?.visibleFrame {
+        w.setFrameOrigin(NSPoint(x: vis.minX + 4, y: vis.minY + 4))
+      }
+      w.ignoresMouseEvents = true
+    } else {
+      app.activate(ignoringOtherApps: true)
+    }
     // The same line the call window prints, and for the same reason: a material is
     // composited by the window server, so the only capture that can see this
     // screen is one aimed at this window.
     fputs("window id \(w.windowNumber) -- screencapture -l \(w.windowNumber) -x out.png\n", stderr)
+    // And what its surfaces are made of. The call window says this on `--press ?`;
+    // this window has no press path, and two of the app's surfaces live only here.
+    // A policy that holds for fifteen surfaces and was never checked on the other
+    // two is the shape of the drift this whole audit exists to catch.
+    for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
 
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.

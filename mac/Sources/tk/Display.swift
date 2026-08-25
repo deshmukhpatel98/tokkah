@@ -206,16 +206,22 @@ final class Display {
     // everybody notices instantly and cannot name: you raise your left hand and the
     // wrong hand moves.
     selfLayer.transform = CATransform3DMakeScale(-1, 1, 1)
-    // The web app's glass line, and a real shadow so the corner reads as floating
-    // above the picture rather than punched into it.
+    // The web app's glass line. The hairline is the whole of the edge now.
     selfLayer.borderColor = Palette.fill(0.16).cgColor
     selfLayer.backgroundColor = Palette.bg.cgColor
-    selfLayer.shadowColor = NSColor.black.cgColor
-    selfLayer.shadowOpacity = 0.45
-    selfLayer.shadowRadius = 14
-    selfLayer.shadowOffset = CGSize(width: 0, height: -4)
-    // masksToBounds clips the shadow, so the rounding is done by the corner radius
-    // on a layer that is allowed to draw outside itself.
+    // ── AND NO DROP SHADOW ────────────────────────────────────────────────────
+    //
+    // `shadowOpacity = 0.45, shadowRadius = 14, offset (0, -4)`, so the tile threw
+    // a soft black halo fourteen points out onto the far end's face. The argument
+    // for it was that the corner should read as floating rather than punched in,
+    // and that is a real thing a shadow does -- but it is also ink on somebody's
+    // picture that fades across it, which is the one thing this pass is removing
+    // everywhere else in the app. A dark cloud around a rectangle is a vignette
+    // whether it is called a scrim or a shadow.
+    //
+    // The tile still reads as floating: it has the same 1 pt hairline every glass
+    // control in the app has, and Liquid Glass draws its own specular rim beside
+    // it. That is how everything else here says "above the picture".
     selfLayer.masksToBounds = true
     selfLayer.frame = Display.selfFrame(in: rect)
     // The blur covers the far end's picture and nothing else. It goes UNDER the
@@ -276,7 +282,27 @@ final class Display {
     // Every other call app on this machine comes forward when it starts; this one
     // opened unfocused, which also meant the first click on any control was spent
     // activating the app instead of pressing the button.
-    NSApp.activate(ignoringOtherApps: true)
+    //
+    // ── EXCEPT UNDER TK_NO_RAISE, WHICH IT WAS IGNORING ──────────────────────
+    //
+    // The block forty lines up has moved this window into a corner, made it
+    // click-through and put it on the desktop level, all so a rig cannot land on
+    // top of somebody who is using their Mac -- and then this line took the whole
+    // application to the front anyway. Every rig in `mac/tools` has been pulling
+    // focus off whatever the person at this keyboard was doing, on every run,
+    // while three separate comments explained why it must not.
+    //
+    // It surfaced as a measurement problem before anybody noticed it as a rudeness:
+    // `NSGlassEffectView` renders markedly more opaque when its window is not the
+    // active one, so whether the activation happened to win decided whether a
+    // photograph of the card measured 0.67 or 0.16 of the picture surviving. Six
+    // identical runs came out three of each, and each one was stable to three
+    // decimal places within itself -- so either answer looked solid on its own.
+    // `describeGlass` reports `active=` for this reason and `glass-check.sh`
+    // refuses to compare two arms that were not in the same state.
+    if ProcessInfo.processInfo.environment["TK_NO_RAISE"] != "1" {
+      NSApp.activate(ignoringOtherApps: true)
+    }
     win = window
     // ── SAY WHICH WINDOW THIS IS ───────────────────────────────────────────────
     //

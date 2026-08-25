@@ -266,11 +266,11 @@ enum Glyph {
 // three circles red put two more of them next to the one irreversible button.
 final class IconButton: NSButton {
   private let shape: Glyph.Shape
-  // CLEAR, and interactive. A bar circle carries a glyph rather than a sentence
-  // and floats over a live face, which is precisely the case the HIG names for the
-  // clear variant: "components that float above media backgrounds -- such as
-  // photos and videos -- to create a more immersive content experience." The dim
-  // that keeps it legible is a gradient on the overlay, not a fill in here.
+  // Clear and interactive, like every surface in the app now. A bar circle carries
+  // a glyph rather than a sentence and floats over a live face, which is precisely
+  // the case the HIG names: "components that float above media backgrounds -- such
+  // as photos and videos -- to create a more immersive content experience." The
+  // dim that keeps it legible is inside this circle, and stops at its edge.
   private let glass: Glass
   private var hovering = false
   /// Bar circles are 58; the corner `more` button is 48, like the web app.
@@ -393,23 +393,31 @@ final class IconButton: NSButton {
   var confirmLabel: String?
   var confirming = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
 
-  // ── WHICH MATERIAL, AND WHY IT IS A PARAMETER ──────────────────────────────
+  // ── HOW MUCH DIM, AND WHY IT IS STILL A PARAMETER ──────────────────────────
   //
-  // `.clear` is right for the bar, and the HIG note above says why: circles
-  // floating over a face, with a gradient under the row keeping them legible. The
-  // handset on the waiting card is the same button in a different place -- alone
-  // in the middle of the picture, with no gradient under it and nothing else
-  // nearby to borrow contrast from. Photographed over a white frame it was a pale
-  // circle with a white glyph in it, which is to say it was not there.
+  // This used to choose a MATERIAL -- `.clear` for the bar, `.regular` for the one
+  // button that needed more help -- and there is only one material now, so the
+  // parameter is the dim instead.
   //
-  // `.regular` is the variant that adjusts luminosity to keep what is on it
-  // legible. Passing it is cheaper and more honest than painting a second dim
-  // behind one button.
+  // It defaults to the HIG's number rather than to 0, and that changed when the
+  // window's two scrims were deleted. While they existed, a bar circle sat in
+  // 0.35 of gradient already and adding its own would have compounded to 0.58; the
+  // circles were the one place in the app the borrowed contrast was correct. With
+  // nothing painted on the picture any more there is nothing to borrow, so every
+  // circle carries its own dim inside its own 58 pt round rectangle -- which is
+  // the same total darkness a person sees at the button, and none of it anywhere
+  // else. That is the entire trade this change makes.
+  //
+  // Which means no caller passes anything but the default today. The parameter
+  // stays because the question is real -- put a control back inside something dark
+  // and its own dim becomes double-counting -- but if it is still the only value a
+  // year from now, delete it, the way `Glass.Variant` was deleted for being a
+  // choice that was never once made differently.
   init(_ shape: Glyph.Shape, size: CGFloat = 58, help: String,
-       variant: Glass.Variant = .clear) {
+       dim: CGFloat = Palette.dimAlpha) {
     self.shape = shape
     self.box = size
-    self.glass = Glass(radius: 0, variant: variant, interactive: true)
+    self.glass = Glass("icon:\(help)", radius: 0, dim: dim, interactive: true)
     super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
     isBordered = false
     title = ""
@@ -696,10 +704,11 @@ final class IconButton: NSButton {
 /// A 999px information pill: room name, call quality, a warning.
 final class Pill: NSView {
   private let label = NSTextField(labelWithString: "")
-  // REGULAR: it carries words, over a face, with nothing dimming it. The regular
-  // variant "blurs and adjusts the luminosity of background content to maintain
-  // legibility of text", which is the whole job of this view.
-  private let glass = Glass(radius: 0, variant: .regular)
+  // It carries words, over a face, with nothing else dimming it -- the top scrim
+  // is 0.28 and stops well short of a pill in the middle of the window. So: clear,
+  // over the full dim, which is the same job `.regular` used to be asked for and
+  // is the half of it that was actually about legibility.
+  private let glass = Glass("pill", radius: 0)
   var textColor: NSColor = Palette.fg { didSet { label.textColor = textColor } }
 
   init(font: NSFont = Type_.status) {
@@ -1171,10 +1180,12 @@ final class SheetHint: NSView {
 // exactly the space the bar lives in. Floating it clear of the bar means the two
 // no longer share any pixels.
 final class Sheet: NSView {
-  /// REGULAR: this is the one surface in the app made mostly of sentences, and the
-  /// guidance names exactly this case -- "components have a significant amount of
-  /// text, such as alerts, sidebars, or popovers".
-  private let glass = Glass(radius: Metric.sheetRadius, variant: .regular)
+  /// The one surface in the app made mostly of sentences, which is the case the
+  /// guidance names for `.regular` -- "components have a significant amount of
+  /// text, such as alerts, sidebars, or popovers". It is clear anyway, because the
+  /// person whose app this is asked for that everywhere; the reading it has to
+  /// carry is why it takes the full dim and not a fraction of it.
+  private let glass = Glass("sheet", radius: Metric.sheetRadius)
   private(set) var rows: [SheetRow] = []
   /// The one field a page can carry, so `clickTargets` can name it without every
   /// caller having to hold on to the view it just handed over.
@@ -1197,16 +1208,16 @@ final class Sheet: NSView {
   init() {
     super.init(frame: .zero)
     wantsLayer = true
-    // ── A TINT, BECAUSE THIS ONE HAS TO BE READ ───────────────────────────────
+    // ── THE TINT THAT USED TO BE HERE ─────────────────────────────────────────
     //
-    // Regular glass already "blurs and adjusts the luminosity of background content
-    // to maintain legibility", and over a dark room it is enough on its own. Over a
-    // brightly lit face it is not: photographed open on a real call, the hint line
-    // under the encryption code was grey text on a grey astronaut. Tinting is the
-    // sanctioned way to push a surface toward a value -- it is still a material,
-    // still refracting, just no longer at the mercy of what the camera is pointed
-    // at.
-    glass.tint = Palette.glassTint
+    // `glass.tint = Palette.glassTint`, and the reason given was real: over a
+    // brightly lit face, the hint line under the encryption code photographed as
+    // grey text on a grey astronaut. The fix was aimed one layer too high. A tint
+    // is IN the material, so it dims the picture and the refraction together and
+    // the surface stops reading as glass; stacked on `.regular` it is the milky
+    // slab the person using this app reported. The dim under the material does the
+    // same contrast job and leaves the refraction alone. It is `Palette.dimAlpha`
+    // by default and this surface takes all of it -- see the declaration above.
     addSubview(glass)
     // The grip -- a 36x4 pill at the top -- went with the bottom tray. It is a
     // phone affordance for a sheet you drag off the bottom of a screen, and this is
@@ -1326,8 +1337,11 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // The ringing state is the one moment here that has to say words -- WHO is
   // calling -- and a name over an unknown camera frame needs a surface. So the
   // panel, the title and the hint are alive, and they belong to `.ringing` alone.
-  private let panel = Glass(radius: Metric.cardRadius, variant: .regular)
-  private let wash = CAGradientLayer()
+  /// THE CARD IN THE SCREENSHOT. It was `.regular` with `glassTint` painted into
+  /// it, over a 0.55 radial wash across the whole window -- three dimming devices
+  /// and a blur, and what came out was a milky slab with a face somewhere behind
+  /// it. Clear now, over one dim, and the dim stops at the card's own corners.
+  private let panel = Glass("card", radius: Metric.cardRadius)
   /// Who the card is about. There is no photograph in this app and never will be
   /// (see CONTACTS.md), so the circle IS the person: their own colour, derived
   /// from their handle and the same on both Macs for ever.
@@ -1345,10 +1359,10 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // There is no panel now, so the rule points the other way: this is a lone
   // control sitting directly on somebody's picture, which is the case the real
   // material exists for. The flat fill could not do it -- white at 10% over a
-  // white wall is a white box, and the link on it measured 3.7:1. `.regular`
-  // "blurs and adjusts luminosity to keep text legible", in both directions,
-  // which is the whole job here and is not something a constant alpha can do.
-  private let urlGlass = Glass(radius: Metric.cardFieldRadius, variant: .regular)
+  // white wall is a white box, and the link on it measured 3.7:1. Clear glass over
+  // the dim beats both: the dim is a known quantity under a material that adapts
+  // to what is behind it, which is what a constant alpha cannot do on its own.
+  private let urlGlass = Glass("url", radius: Metric.cardFieldRadius)
   // ── A HOLDER, BECAUSE THE GLASS OWNS ITS CONTENT VIEW ─────────────────────
   //
   // `NSGlassEffectView` places and sizes whatever it is given as `contentView` --
@@ -1366,14 +1380,14 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // never beside it: the link is for people you have never called, the field is
   // for the ones you have, and being asked to choose between two boxes at the
   // moment you open the app is the choice this screen exists to not make you make.
-  private let dialGlass = Glass(radius: Metric.cardFieldRadius, variant: .regular)
+  private let dialGlass = Glass("dial", radius: Metric.cardFieldRadius)
   private let dialHolder = NSView()
   private let dialField = NSTextField()
   /// A handset, not the word "call". The row it sits in is a link and a button;
   /// the link is already the only thing here carrying text, and a word next to it
   /// makes two things to read where there is one thing to do.
   private let callIcon = IconButton(Glyph.phone, size: Metric.fieldHeight,
-                                    help: "Call someone by name", variant: .regular)
+                                    help: "Call someone by name")
   private let answerButton = PillButton("answer")
   private let declineButton = PillButton("decline")
   private let cancelButton = PillButton("cancel")
@@ -1690,13 +1704,21 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     super.init(frame: .zero)
     wantsLayer = true
     // `radial-gradient(ellipse at center, rgba(6,8,13,.55), transparent 72%)`.
-    wash.type = .radial
-    wash.locations = [0, 0.72]
-    wash.startPoint = CGPoint(x: 0.5, y: 0.5)
-    wash.endPoint = CGPoint(x: 1.0, y: 1.0)
-    layer?.addSublayer(wash)
+    // ── THE RADIAL WASH IS GONE ───────────────────────────────────────────────
+    //
+    // `radial-gradient(ellipse at center, rgba(6,8,13,.55), transparent 72%)`,
+    // transcribed from the web app and kept for as long as this card has existed.
+    // It was a window-sized ellipse of dark centred on the middle of the picture:
+    // the textbook definition of a vignette, and the single largest thing making
+    // the calling card look like a slab -- 55% of the frame gone before the
+    // material had done anything at all.
+    //
+    // What it was for lives inside `panel` now, at the card's own size and with
+    // the card's own corners. Nothing this class owns paints outside a control.
 
-    panel.tint = Palette.glassTint
+    // No tint. It was `Palette.glassTint` and it was half of what the person using
+    // this app was looking at when they said "transparent, not frosted" -- see the
+    // declaration of `panel` and rule 2 in `Glass.swift`.
     addSubview(panel)
     addSubview(face)
 
@@ -2059,22 +2081,16 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
 
   // ── THE DIM IS THE SIZE OF THE THING IT IS DIMMING FOR ────────────────────
   //
-  // The wash was `inset: 0` because it was lighting a CARD -- a panel with a
-  // title, a hint and three rows in it, wide enough that a window-sized ellipse
-  // read as the card's own shadow. With the card down to a link and a button, the
-  // same gradient over a bright frame is a large grey smudge in the middle of
-  // somebody's picture with two small things floating in it. Photographed against
-  // white, that is the first thing you see and the link is the second.
+  // `setWash(alpha:)` used to be here, and the heading above it was already
+  // arguing the right principle while the code kept getting the scope wrong. It
+  // started window-sized at 0.55, was cut to the width of the link row when the
+  // card shrank, and was still an ellipse of dark on somebody's picture in every
+  // version of it.
   //
-  // So it is sized to the row now, and darker for being smaller: concentrated over
-  // 330 points instead of 1280 it is a local shadow rather than a fog, and it is
-  // what carries the contrast the panel used to. Measured on a white frame, the
-  // link's ratio against its own fill goes 3.7:1 -> 6.4:1, which is the difference
-  // between reading a URL and squinting at one.
-  private func setWash(alpha: CGFloat) {
-    wash.colors = [NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: alpha).cgColor,
-                   NSColor.clear.cgColor]
-  }
+  // The heading survives because it is now literally true and enforced by
+  // geometry: the only dimming device left is `Glass.dim`, whose bounds ARE the
+  // control's bounds. There is no alpha to tune and no ellipse to size, so no
+  // future edit can widen it back onto the face by half a screen.
 
   override func layout() {
     super.layout()
@@ -2196,10 +2212,6 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
         b.frame.origin = NSPoint(x: ax, y: y + (uh - b.frame.height) / 2)
         ax += b.frame.width + gap
       }
-      // These states still have the card the wash was drawn for, so they keep the
-      // window-wide wash it was drawn with.
-      wash.frame = bounds
-      setWash(alpha: 0.55)
       return
     }
 
@@ -2228,15 +2240,6 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
                              width: boxW - Metric.s8, height: 17)
     callIcon.frame.origin = NSPoint(x: x + boxW + gap,
                                     y: y + (uh - callIcon.frame.height) / 2)
-    // ── AND NO WASH AT ALL ────────────────────────────────────────────────────
-    //
-    // The gradient existed to light a card of text. Both things it was for now
-    // belong to the material: the link is legible because the glass adjusts to
-    // what is behind it, and the handset is legible for the same reason. Left in,
-    // it is a dark ellipse floating on a bright picture with two small controls
-    // inside it -- photographed against white, the first thing you see and the
-    // link is the second.
-    wash.frame = .zero
     // The link stops being a control the moment it stops being on screen.
     window?.invalidateCursorRects(for: self)
   }
@@ -2334,11 +2337,21 @@ final class CallControls: NSView {
   static let barHeight: CGFloat = Metric.barInset + Metric.control + Metric.s4
 
   private let roomPill = Pill(font: Type_.status)
-  /// The dark layer the HIG asks for behind clear glass over bright content, at
-  /// the 35% it names. Two of them, because there are controls at both ends of the
-  /// window and a face in the middle that neither should touch.
-  private let scrim = CAGradientLayer()
-  private let topScrim = CAGradientLayer()
+  // ── THE TWO GRADIENTS THAT USED TO BE HERE ─────────────────────────────────
+  //
+  // `scrim` was 190 pt of dark up from the bottom edge, `topScrim` 130 pt down
+  // from the top, and between them they were the HIG's dimming rule applied to the
+  // WINDOW instead of to the surfaces. Both are gone. The report was "there should
+  // be no vignette of any kind... it should all be very natural", and a gradient
+  // fading across a person's chin is exactly a vignette however well it is
+  // justified in the comment above it.
+  //
+  // What they were doing is still done, one layer lower and inside each control's
+  // own rounded rectangle -- see `Glass.dim`. That is the distinction the whole
+  // change turns on: a dark patch the size and shape of a button is part of the
+  // button; a dark patch the size of the window is something painted on the person.
+  // The bar circles used to pass `dim: 0` because the scrim was doing it for them,
+  // and they carry their own now.
   /// The five bar circles, in a container that lets them notice each other. See
   /// GlassGroup: at rest the spacing is below the gap so they stay five separate
   /// targets, and it is animated up only while the row collapses into the leave
@@ -2399,7 +2412,10 @@ final class CallControls: NSView {
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
   private let sheetScrim = ScrimView()
   private let camPicker = NSPopUpButton()
-  private let camGlass = Glass(radius: 0, variant: .regular)
+  /// The camera picker's surface. Up beside the `more` button in the top corner,
+  /// where the scrim is only 0.28 and is a gradient rather than a floor, so it
+  /// carries the full dim of its own.
+  private let camGlass = Glass("camPicker", radius: 0)
   private var camNames: [String] = []
 
   private(set) var micMuted = false
@@ -2431,52 +2447,26 @@ final class CallControls: NSView {
     wantsLayer = true
     autoresizingMask = [.width, .height]
 
-    // A scrim, so white text over a bright picture stays readable. The web app
-    // does exactly this: linear-gradient(transparent, rgba(6,8,13,.72) 62%).
+    // ── NOTHING IS PAINTED ON THE PICTURE ─────────────────────────────────────
     //
-    // ── THE DIRECTION HAS TO BE SAID OUT LOUD ─────────────────────────────────
+    // Two `CAGradientLayer`s used to be added here, and the case for them was a
+    // good one: the HIG's "if the underlying content is bright, consider adding a
+    // dark dimming layer of 35% opacity", and a measured defect where one of them
+    // ran the wrong way round and put a hard dark edge across the middle of the
+    // frame. Both are deleted rather than fixed further.
     //
-    // CAGradientLayer defaults to start (0.5, 0) -> end (0.5, 1), and in an
-    // unflipped AppKit layer (0,0) is the BOTTOM. So [clear, dark] ran dark at the
-    // TOP of the scrim and cleared toward the bottom: a hard dark edge straight
-    // across the picture 190 pt up, and the buttons sitting on the brightest,
-    // least-scrimmed part of it. Measured on a real frame: 97.6 average brightness
-    // above the edge, 37.0 just below it, 139.2 at the very bottom -- precisely
-    // backwards, and doing harm at both ends.
+    // The reason is what a person watching a call actually said, and it is not a
+    // point about gradients: "there should be no vignette of any kind. There
+    // should not be any effect. It should all be very natural." What they were
+    // looking at was somebody's face with the corners and the chin quietly darker
+    // than the middle -- which nobody reads as a legibility device. They read it as
+    // the video being wrong.
     //
-    // It survived every screenshot because the app photographs its own layer tree,
-    // which cannot see an AVSampleBufferDisplayLayer, so every check was a scrim
-    // over black -- where a gradient between two invisible shades of nothing looks
-    // correct whichever way round it is. A contrast device can only be judged
-    // against the thing it is meant to give contrast against.
-    scrim.startPoint = CGPoint(x: 0.5, y: 1)   // top of the scrim, transparent
-    scrim.endPoint = CGPoint(x: 0.5, y: 0)     // bottom of the window, darkest
-    // ── 35%, WHICH IS THE HIG'S NUMBER AND NOT THE WEB APP'S ─────────────────
-    //
-    // This was 0.72, transcribed from CSS where it had to be that dark because
-    // there was no material underneath it -- the whole job of legibility fell on
-    // the scrim. There is a material now, so the scrim only has to do the part the
-    // guidance describes: "If the underlying content is bright, consider adding a
-    // dark dimming layer of 35% opacity." At 0.72 it was a black band across the
-    // bottom of somebody's face; at 0.35 it is a shadow.
-    scrim.colors = [NSColor.clear.cgColor, Palette.dim.cgColor]
-    scrim.locations = [0, 0.62]
-    layer?.addSublayer(scrim)
-
-    // ── AND ONE AT THE TOP, FOR THE SAME REASON ──────────────────────────────
-    //
-    // The bottom of the window had a dim and the top did not, so the status pill
-    // and the `more` button floated over an undimmed face -- and `more` is clear
-    // glass, which over a bright forehead is a smudge you cannot find. It also
-    // protects the traffic lights, which `.fullSizeContentView` put on top of the
-    // picture. Lighter than the bottom and shorter, because there is one small
-    // control up here and five big ones down there.
-    topScrim.startPoint = CGPoint(x: 0.5, y: 0)
-    topScrim.endPoint = CGPoint(x: 0.5, y: 1)
-    topScrim.colors = [NSColor.clear.cgColor,
-                       Palette.dim.withAlphaComponent(0.28).cgColor]
-    topScrim.locations = [0, 0.7]
-    layer?.addSublayer(topScrim)
+    // So the rule this file follows now: the picture gets NOTHING. Every dimming
+    // device in the app is inside the bounds of the control it is for, and those
+    // bounds are a rounded rectangle you can point at. If a control is hard to read
+    // over a bright face, the answer is in `Glass.dim` for that control -- never a
+    // wash across the frame that also lands on somebody's cheek.
 
     // ── THE ROW GOES IN THE GROUP, NOT ON THE OVERLAY ────────────────────────
     //
@@ -2639,8 +2629,6 @@ final class CallControls: NSView {
   override func layout() {
     super.layout()
     let w = bounds.width, h = bounds.height
-    scrim.frame = CGRect(x: 0, y: 0, width: w, height: 190)
-    topScrim.frame = CGRect(x: 0, y: h - 130, width: w, height: 130)
 
     // ── `.bar`, TRANSCRIBED ───────────────────────────────────────────────────
     //

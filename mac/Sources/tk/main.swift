@@ -1179,6 +1179,15 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
         for line in display?.controls?.auditClicks() ?? ["no controls"] {
           fputs("audit \(line)\n", stderr)
         }
+        // ── AND WHAT EVERY SURFACE IS MADE OF ─────────────────────────────────
+        //
+        // A material cannot be audited by hit-testing it and cannot be judged from
+        // the app's own snapshot -- the layer tree does not contain the blur. But
+        // the ANSWER each surface gave when it was built is a fact the process
+        // knows, and for months nobody asked it: `Glass.swift`'s header described a
+        // policy that nine of the ten surfaces did not implement. So they say it
+        // now, and `tools/glass-check.sh` holds them to it.
+        for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
         fputs("audit state \(display?.controls?.describeTree ?? "-")\n", stderr)
       } else if token.hasPrefix("%") {
         // `%Check for Updates…` -- a MENU item, through AppKit's own dispatch.

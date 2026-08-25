@@ -45,15 +45,39 @@ Every decision in `Glass.swift` traces to one of them.
 | Rule | Quote | What it decided here |
 |---|---|---|
 | Glass is the **functional** layer | "Don't use Liquid Glass in the content layer." | The picture never gets a material. The bar, pills, sheet and cards float above it. |
-| **Clear** over rich content | "Only use clear Liquid Glass for components that appear over visually rich backgrounds." | The five bar circles and `more` are `.clear`. They carry glyphs and float over a live face. |
-| **Regular** under text | "…when components have a significant amount of text, such as alerts, sidebars, or popovers." | The sheet, the waiting card, the status pills. |
-| **Dim** behind clear | "If the underlying content is bright, consider adding a dark dimming layer of 35% opacity." | The bottom scrim went from **0.72 → 0.35**. A top scrim was added at 0.28. |
+| **Clear** over rich content | "Only use clear Liquid Glass for components that appear over visually rich backgrounds." | **Every** surface is `.clear`. The content of this app is a live face, and there is no variant parameter left to choose anything else with. |
+| ~~**Regular** under text~~ | "…when components have a significant amount of text, such as alerts, sidebars, or popovers." | **Overruled.** This is the guidance for the sheet and the waiting card and it is not followed — see below. |
+| **Dim** behind clear | "If the underlying content is bright, consider adding a dark dimming layer of 35% opacity." | Taken at 35%, and confined to each control's own rounded rectangle. Every window-sized version of it has been deleted. |
 | **Sparingly** | "…overusing this material in multiple custom controls can provide a subpar user experience by distracting from that content." | Nothing is glass-on-glass. See §4. |
 
-The 0.72 scrim was transcribed from the web app's CSS, where it had to be that dark
-because there was no material at all — legibility fell entirely on the scrim. At
-0.72 it was a black band across the bottom of somebody's face. There is a material
-now, so the scrim is a shadow.
+### Where this app departs from the guidance, and why
+
+Two instructions from the person whose app it is, on two different days:
+
+> "everywhere I want transparent liquid glass, not frosted"
+
+> "there should be no vignette of any kind. There should not be any effect. It
+> should all be very natural."
+
+The first overrules the `.regular` row above. `.regular` is what Apple names for
+panels full of sentences, and the sheet and the waiting card are exactly that; they
+are clear anyway. The legibility job `.regular` was doing is now `Glass.dim`, a dark
+layer **under** the material rather than a blur in it — measured, that keeps the
+words readable while leaving the picture visibly moving behind them.
+
+The second is stricter than the HIG's dimming rule, not a reading of it. Four
+`CAGradientLayer`s used to dim the window: 190 pt up from the bottom, 130 pt down
+from the top, a window-wide radial ellipse behind the waiting card, and one over the
+join window's camera preview. Each cited the 35% sentence. Together they were a
+vignette, and nobody reads a vignette as a legibility device — they read it as the
+video being broken. Measured on a flat, evenly lit source frame, the old build
+rendered the top of the picture at **0.758** and the bottom at **0.662** of the
+middle, with the centre **1.186** darker than the sides. On a real talking head the
+bottom edge of the frame came back **1.45×** brighter once they were gone.
+
+So: **the picture gets nothing.** The only dimming device left is `Glass.dim`, whose
+bounds are the control's bounds. A dark patch the size of a button is part of the
+button; a dark patch the size of the window is something painted on the person.
 
 ---
 
@@ -127,11 +151,22 @@ vibrancy — `Vibrant` in `Glass.swift`, which is what the sheet's rows already 
 
 | Surface | Material |
 |---|---|
-| Bar circles, `more` | `.clear` glass, interactive, over a 0.35 dim |
+| Bar circles, `more` | `.clear` glass, interactive, each over its own 0.35 dim |
 | Leave | `.clear` glass over a red fill, tinted 0.35 |
-| Status / warning pills | `.regular` glass |
-| Sheet, waiting card, join card | `.regular` glass, tinted `glassTint` |
+| Status / warning pills | `.clear` glass over a 0.35 dim |
+| Sheet, waiting card, join card | `.clear` glass over a 0.35 dim |
 | Anything **inside** those | `Vibrant` — a rounded fill + hairline |
+
+Seventeen surfaces in the call window and two in the join window, and the table is
+no longer the source of truth for any of them: each one states what it is at
+runtime (`Glass.describeGlass`, printed by `--press "?"`) and `tools/glass-check.sh`
+compares that against the policy. This table was wrong for months and nothing could
+tell — see §9.
+
+`Palette.glassTint` is gone. It was set on the sheet, the waiting card and the join
+card, and at 0.18 it was described in the source as "barely there". It was not on
+its own: it sat on `.regular`, over a 0.55 radial wash. Four dimming devices
+stacked, three of them invisible from the source of any one of them.
 
 ---
 
@@ -246,6 +281,40 @@ twice before. Every control audits `OK`, and `@mic` actually mutes.
 
 ---
 
+## 8a. `glass-check.sh`, and the three kinds of evidence
+
+```bash
+mac/tools/glass-check.sh          # KEEP=1 to keep the photographs
+```
+
+Structural, photometric and vignette, because each is blind to something the others
+catch, and **every one of them has an arm that must rank the other way**:
+
+| Evidence | What it sees | The arm that must fail |
+|---|---|---|
+| **Structural** | what each of the 19 surfaces asked the system for, including ones not on screen | `TK_GLASS_STYLE=regular` — the audit has to report `regular`, or it is reading the argument and not the object |
+| **Photometric** | what a camera sees through the card over 40 pt bars of two bright saturated colours | `TK_REDUCE_TRANSPARENCY=1` — an opaque rectangle, which must measure near zero |
+| **Vignette** | what the app did to a flat, evenly lit frame; every ratio is 1.000 or the app painted something | the old bottom scrim re-applied to the same photograph — the meter has to see it |
+
+`glass-measure.py --calibrate` runs first and is fatal. It asks the ruler six
+questions whose answers are already known (a bare photograph, a 35% dim, a heavy
+blur, opaque paint, and white text on two greys whose contrast ratios are
+arithmetic). That is not ceremony — it caught three blind instruments, in §9.
+
+Two things the rig cannot do, stated rather than hidden:
+
+- **The material renders differently when Kin is not the front application** —
+  0.67 of the picture surviving the card when it is, 0.17 when it is not, stable to
+  three decimals within a run and flipping between runs of an identical command.
+  The rig's own null A/B (four identical runs) puts its noise at **0.0003**, which
+  is what proved the two modes were real. A rig has no business bringing a window
+  to the front on a Mac somebody is using, so the clear-versus-frosted comparison
+  *in pixels* only lands some runs; it is printed as not-reached otherwise. The
+  structural half catches a frosted app in either state.
+- **A real sensor**, as in §10.
+
+---
+
 ## 9. Defects this found
 
 - **A black rectangle behind the invite link.** `urlGlass.layer?.backgroundColor =
@@ -260,6 +329,36 @@ twice before. Every control audits `OK`, and `@mic` actually mutes.
   looked like the mirror had stopped working. `talkingheadB.mov` is *itself* a
   pre-mirrored clip — the app un-mirrors it, which is the transform working. Checked
   before reporting, which is the only reason it is not in this list as a bug.
+
+### And these, from the transparency pass
+
+- **A header describing a policy the code never implemented.** §2 above said "the
+  five bar circles and `more` are `.clear`" and it was true of those six surfaces
+  and false of the other thirteen, every one of which spelled `.regular` at its own
+  call site. `grep "variant: \.clear"` returned nothing at all. That is why every
+  surface now *states* what it is into the log and a rig compares it: a comment is
+  not a policy.
+- **Every rig in `mac/tools` was stealing the user's focus.** `Display.open` moved
+  the window into a corner, made it click-through and put it on the desktop level
+  under `TK_NO_RAISE` — and then called `NSApp.activate(ignoringOtherApps: true)`
+  unconditionally on the next line. Three comments explained why it must not. It
+  surfaced as a measurement problem (§8a) before anyone noticed it as a rudeness.
+  `Launcher.askRoom` had never honoured `TK_NO_RAISE` at all, which is why the join
+  card was the one surface no rig had ever photographed.
+- **The self-view tile threw a 14 pt black shadow onto the far end's face.**
+  A drop shadow is a vignette that happens to be shaped like a rectangle. Removed;
+  the 1 pt hairline every other floating control has is the whole of the edge.
+- **Three blind instruments, all caught by calibration and control arms.** The
+  transparency meter built its reference by joining the strip left of the card to
+  the strip right of it, putting a phase break in a periodic pattern — it then
+  reported that *nothing* survives a clear pane, a heavy blur or a sheet of paint:
+  the same catastrophic-looking answer for all three. The contrast meter found text
+  by brightness, so on a light background it classified the background as text and
+  returned no reading in the one case that had to fail loudly. And the vignette
+  check once passed on a photograph of a **black window** — all four arms shared one
+  room name, the rendezvous believed a peer had come and gone, and a uniformly
+  black rectangle has no vignette in it. Only the control arm caught that one: you
+  cannot darken black.
 
 ---
 

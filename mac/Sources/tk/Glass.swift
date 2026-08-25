@@ -29,17 +29,67 @@ import AppKit
 //      above it; the picture itself never gets a material.
 //
 //   2. "Only use clear Liquid Glass for components that appear over visually rich
-//      backgrounds." A live camera feed is the definition of one, so the control
-//      row is `.clear`. Panels carrying sentences are `.regular`, which "blurs and
-//      adjusts the luminosity of background content to maintain legibility" --
-//      the guidance names alerts, sidebars and popovers, and this app's sheet and
-//      waiting card are the same kind of thing.
+//      backgrounds." Every surface in this app appears over one -- the content of
+//      this app IS a live camera feed -- so EVERY surface is `.clear`. There is no
+//      second variant and no parameter to choose one with.
+//
+//      That is a decision, not a reading of the guidance, and the guidance says
+//      the opposite about half of it: `.regular` is what Apple names for "alerts,
+//      sidebars, or popovers", and the sheet and the waiting card are that kind of
+//      thing. The person whose app this is looked at the card that says who they
+//      are calling -- a milky slab with a face somewhere behind it -- and said:
+//      "everywhere I want transparent liquid glass, not frosted." Their preference
+//      wins. See rule 3 for what happens to the problem `.regular` was solving,
+//      because the problem is real and it does not go away by being overruled.
+//
+//      HOW IT DRIFTED, because the shape of this is worth more than the fix. The
+//      paragraph that used to be here said "the control row is `.clear`" and it
+//      was TRUE of the control row -- `IconButton` defaults to it. It was false of
+//      everything else, and nothing ever said so: ten surfaces, nine of them
+//      spelling `.regular` at the call site, under a header that read as though the
+//      choice had been made per surface with a reason. A comment describing a
+//      policy is not the policy. So `describeGlass` and `glass-check.sh` exist:
+//      every surface now STATES what it is, out loud, into the log, and a rig
+//      compares that against the policy in this comment. A claim in here that the
+//      code does not implement is now a failing test rather than a paragraph.
 //
 //   3. "If the underlying content is bright, consider adding a dark dimming layer
-//      of 35% opacity." The old scrim was 72% -- a black band across the bottom of
-//      somebody's face, transcribed from the web app's CSS where it was
-//      compensating for having no material at all. It is 35% now because the glass
-//      is doing the rest of the work.
+//      of 35% opacity." This app takes the 35% and REFUSES THE LAYER, and the
+//      distinction is the most important sentence in this file.
+//
+//      Read literally, the guidance is about a dimming layer between content and
+//      glass, and it does not say how big one should be. This app answered "as big
+//      as the window" four separate times: a 190 pt gradient up from the bottom
+//      edge, a 130 pt one down from the top, a window-wide radial ellipse behind
+//      the waiting card, and a 62% one over the join window's camera preview.
+//      Every one of them was argued for in a comment, every one cited this rule,
+//      and together they were a vignette. The person using the app said so: "there
+//      should be no vignette of any kind. There should not be any effect. It
+//      should all be very natural." They were not looking at a legibility device.
+//      They were looking at a video of somebody whose chin and corners were darker
+//      than their nose, and reading it as the picture being broken.
+//
+//      So the rule here is stricter than the HIG's and easy to check: THE PICTURE
+//      GETS NOTHING. No gradient, no scrim, no wash, no drop shadow spilling off a
+//      control onto a face. The only dimming device left in the app is
+//      `Glass.dim`, whose bounds are exactly the bounds of the control it belongs
+//      to -- a rounded rectangle you can point at, that stops at its own corners.
+//      A dark patch the size of a button is part of the button. A dark patch the
+//      size of the window is something painted on the person.
+//
+//      UNDER, not in or over, and the preposition is the other half of the idea. A
+//      dark layer over the glass, or a dark tint IN the glass, is paint -- what the
+//      old `Glass` did with `rgba(10,14,22,.72)` and what the card in the
+//      screenshot was still doing with `glassTint` at 0.18 on top of `.regular`.
+//      Paint does not refract. A dim UNDER clear glass darkens the patch of
+//      picture that the material then refracts, so the words on it are legible and
+//      the picture is still visibly there, moving, through them.
+//
+//      The cost is real and is not hidden: the bar circles used to take their
+//      contrast from the bottom scrim and now carry it themselves, so the total
+//      darkness at a button is about what it was -- and the face between the
+//      buttons, which used to be under 35% of black, is now the camera's own
+//      pixels and nothing else.
 //
 //   4. "Use Liquid Glass effects sparingly... overusing this material in multiple
 //      custom controls can provide a subpar user experience by distracting from
@@ -265,13 +315,40 @@ enum Palette {
   static let destructiveTint = NSColor(srgbRed: 0xf2/255, green: 0x4b/255, blue: 0x4b/255,
                                        alpha: 0.35)
 
-  /// What glass is tinted toward. Barely there on purpose: a tint is for
-  /// suggesting prominence, and anything heavier stops being a material.
-  static let glassTint = NSColor(srgbRed: 10/255, green: 14/255, blue: 22/255, alpha: 0.18)
+  // ── THE TINT THAT WAS HALF THE FROSTING ────────────────────────────────────
+  //
+  // `glassTint` -- 10,14,22 at 0.18 -- used to be set on the sheet, the waiting
+  // card and the join card, and it is gone. It was described in here as "barely
+  // there on purpose", and on its own it nearly was. It was not on its own: it sat
+  // on `.regular`, so the card that says who you are calling was a luminosity
+  // adjustment plus a blur plus a dark wash IN the material, over a 0.55 gradient.
+  // Four dimming devices stacked, three of them invisible in the source of any one
+  // of them.
+  //
+  // A tint is still the right tool for the one thing the HIG names it for --
+  // "assign a tint color to suggest prominence" -- which is `destructiveTint`
+  // above, on the one button that must never be mistaken for its neighbours. It is
+  // not a legibility tool. Legibility is `Glass.dim`, which goes UNDER.
 
-  /// The dimming layer the HIG asks for behind clear glass over bright content.
-  /// 0.35, and it is the whole of the number.
-  static let dim = NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: 0.35)
+  // ── THE DIM, AS A NUMBER AND AN INK, AND NEVER AS A COLOUR ─────────────────
+  //
+  // `static let dim = rgba(6,8,13,0.35)` used to be here, and it is deleted rather
+  // than left unused. It was the colour four `CAGradientLayer`s were built out of,
+  // and a pre-mixed 35%-transparent dark is a thing you can only really do one
+  // thing with: paint it over an area. Leaving it in the palette leaves the next
+  // gradient across somebody's face one line away, which is how this one lasted.
+  //
+  // What is left is an alpha and an opaque ink, which is what a LAYER needs -- and
+  // a layer has bounds, which is the whole point (see rule 3 in the header).
+
+  /// The HIG's dimming number, and it is the whole of the number. Every surface
+  /// that needs it asks by this name rather than typing 0.35, so there is one place
+  /// to turn if the answer ever changes.
+  static let dimAlpha: CGFloat = 0.35
+  /// The same ink at full strength. A `CALayer` carries its own `opacity`, so the
+  /// alpha belongs to the layer and not to the colour -- otherwise a surface asking
+  /// for half the dim would get 0.35 x 0.5 and nobody would notice which.
+  static let dimInk = NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: 1)
 
   /// What a surface is when there is no material: Reduce Transparency, or a Mac
   /// too old for Liquid Glass and too bright behind for `.hudWindow` alone.
@@ -353,13 +430,23 @@ enum Palette {
 ///
 /// The call sites do not know which, and that is the point.
 final class Glass: NSView {
-  enum Variant {
-    /// Over a face, a photo, a video. Highly translucent; needs `Palette.dim`
-    /// underneath it when the picture behind might be bright.
-    case clear
-    /// Under sentences. Blurs and adjusts luminosity to keep text legible.
-    case regular
-  }
+  // ── THERE IS NO VARIANT ────────────────────────────────────────────────────
+  //
+  // This was `enum Variant { case clear, regular }` and a parameter on every call
+  // site. Both are gone, and the deletion is the fix: while there were two, nine
+  // of the ten surfaces asked for the frosted one and the header claimed
+  // otherwise. A choice that is made the same way every time is not a choice, and
+  // leaving the parameter there is leaving the drift a place to happen again.
+  //
+  // What actually differs between surfaces is `dim` -- how much dark goes UNDER
+  // the material -- and that is a real per-surface question with a real per-surface
+  // answer, because it depends on whether the thing already sits in a scrim.
+
+  /// What this surface is called in the log. Not decoration: a surface with no name
+  /// cannot be asserted about, and the whole reason this file drifted for so long
+  /// is that nothing in the running program ever said what it was. See
+  /// `describeGlass` and `tools/glass-check.sh`.
+  let name: String
 
   // ── DECORATION IS NOT A TARGET ─────────────────────────────────────────────
   //
@@ -374,8 +461,28 @@ final class Glass: NSView {
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-  private let variant: Variant
   private let interactive: Bool
+  // ── THE DIM, AND WHY IT IS A LAYER AND NOT A BACKGROUND COLOUR ─────────────
+  //
+  // `layer?.backgroundColor` on this view is the shape of a defect this file has
+  // already paid for once: `urlGlass.layer?.backgroundColor = rgba(8,11,18,.9)`
+  // was harmless while `Glass` WAS the blur, and the day it became a wrapper the
+  // same line painted a hard-edged opaque rectangle across the material and out
+  // past its own corners, because the wrapper's layer is the un-rounded outer box.
+  // Invisible in every screenshot, because every screenshot was over black.
+  //
+  // So the dim is its own layer with its own `cornerRadius`, kept in step with the
+  // surface's in `applyRadius`. It is added to THIS view's layer rather than as a
+  // subview, which is what puts it underneath: a sublayer of a view's own layer
+  // draws below every one of that view's subviews, and the material is a subview.
+  private let dimLayer = CALayer()
+  /// How much dark goes under the material, 0...1. `Palette.dimAlpha` is the HIG's
+  /// number and the answer for anything sitting directly on somebody's face; 0 is
+  /// the answer for anything already inside a scrim, because two 0.35 dims stacked
+  /// are one 0.58 dim and that is the frosting coming back by another door.
+  var dim: CGFloat {
+    didSet { guard dim != oldValue else { return }; applyDim() }
+  }
   /// The real thing, on a Mac new enough to have it. `NSGlassEffectView` is
   /// macOS 26, so this is untyped storage and every use is behind `#available`.
   private var glassView: NSView?
@@ -432,15 +539,25 @@ final class Glass: NSView {
     }
   }
 
-  init(radius: CGFloat, variant: Variant = .regular, interactive: Bool = false) {
+  init(_ name: String, radius: CGFloat, dim: CGFloat = Palette.dimAlpha,
+       interactive: Bool = false) {
+    self.name = name
     self.radius = radius
-    self.variant = variant
+    // A surface that asked for no dim keeps none: the bar circles sit in the
+    // overlay's own gradient, and sweeping them along with the panels would be
+    // sweeping two different questions with one number.
+    self.dim = dim > 0 ? (Glass.forcedDim ?? dim) : 0
     self.interactive = interactive
     super.init(frame: .zero)
     wantsLayer = true
     // The material is composited by the window server behind this view, so this
     // view must not paint anything of its own on top of it.
     layer?.backgroundColor = NSColor.clear.cgColor
+    // Below the material, and below it because it is a sublayer rather than a
+    // subview. Colour at full strength, alpha carried by the layer -- see
+    // `Palette.dimInk`.
+    dimLayer.backgroundColor = Palette.dimInk.cgColor
+    layer?.addSublayer(dimLayer)
 
     plain.wantsLayer = true
     plain.autoresizingMask = [.width, .height]
@@ -448,6 +565,7 @@ final class Glass: NSView {
     addSubview(plain)
 
     build()
+    Glass.living.append(Weak(self))
     // Reduce Transparency can be turned on mid-call, and the HIG is explicit that
     // custom elements have to be tested against it rather than assumed to adapt.
     NSWorkspace.shared.notificationCenter.addObserver(
@@ -474,6 +592,34 @@ final class Glass: NSView {
   private static let forcedReduce =
     ProcessInfo.processInfo.environment["TK_REDUCE_TRANSPARENCY"] == "1"
 
+  /// `TK_GLASS_STYLE=regular` -- the control arm, and nothing else. See the note
+  /// over `g.style` in `build()`. Any other value, including absent, is `nil` and
+  /// the app is clear.
+  @available(macOS 26.0, *)
+  static var forcedStyle: NSGlassEffectView.Style? {
+    ProcessInfo.processInfo.environment["TK_GLASS_STYLE"] == "regular" ? .regular : nil
+  }
+
+  // ── AND THE DIM SWEEPS TOO ─────────────────────────────────────────────────
+  //
+  // `TK_GLASS_DIM=0.15`. The dim is the one number in this file with two costs
+  // pulling opposite ways -- too little and white text over a bright face is
+  // unreadable, too much and the surface is the frosted slab this whole change is
+  // undoing -- and a number like that should never be chosen by argument. It was
+  // 0.35 because the HIG says 0.35, and the HIG is describing a dimming layer
+  // under a material you built yourself, not under Apple's own clear glass, which
+  // turns out to bring a darkening of its own. Photographed: clear at 0.35 came
+  // out DARKER than `.regular` at 0.35, which is the two dims stacking.
+  //
+  // So the value ships as whatever the sweep in `glass-check.sh` says it should
+  // be, and this exists so the sweep can be re-run in a minute rather than by
+  // rebuilding six times.
+  static let forcedDim: CGFloat? = {
+    guard let s = ProcessInfo.processInfo.environment["TK_GLASS_DIM"],
+          let v = Double(s) else { return nil }
+    return CGFloat(max(0, min(1, v)))
+  }()
+
   static var reduceTransparency: Bool {
     forcedReduce || NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
   }
@@ -498,6 +644,7 @@ final class Glass: NSView {
       plain.layer?.borderColor = Palette.fill(0.22).cgColor
       applyRadius()
       applyTint()
+      applyDim()
       attachContent()
       return
     }
@@ -505,7 +652,25 @@ final class Glass: NSView {
     if #available(macOS 26.0, *) {
       let g = NSGlassEffectView(frame: bounds)
       g.autoresizingMask = [.width, .height]
-      g.style = variant == .clear ? .clear : .regular
+      // ── ALWAYS `.clear`, AND THE ONE WAY TO GET ANYTHING ELSE IS A RIG ──────
+      //
+      // The product has no way to ask for `.regular`. There is no parameter, no
+      // per-surface choice and no branch on anything the app knows: rule 2 in the
+      // header is transparent glass everywhere, and the legibility half of what
+      // `.regular` was doing is `dimLayer`, one layer underneath.
+      //
+      // `TK_GLASS_STYLE=regular` is the arm that has to rank the other way, and
+      // without it the whole check is decoration. `glass-check.sh` asserts that
+      // every surface reports `style=clear` -- and a reader that had been wired to
+      // a constant, or to the argument rather than the object, would pass that
+      // assertion on an app that was entirely frosted. So the rig runs this once
+      // and requires the audit to say `regular`, and requires the photograph to
+      // measurably lose the picture. An instrument that cannot see the defect
+      // returns the same value as a clean bill of health.
+      //
+      // Nothing in the app sets it, and it is read once at build time from the
+      // environment, so no code path in the product can reach it.
+      g.style = Glass.forcedStyle ?? .clear
       g.cornerRadius = radius
       // ── SET THROUGH KVC, DELIBERATELY ────────────────────────────────────────
       //
@@ -542,14 +707,31 @@ final class Glass: NSView {
     }
     applyRadius()
     applyTint()
+    applyDim()
   }
 
   private func applyRadius() {
     plain.layer?.cornerRadius = radius
     effectView?.layer?.cornerRadius = radius
+    dimLayer.cornerRadius = radius
     if #available(macOS 26.0, *), let g = glassView as? NSGlassEffectView {
       g.cornerRadius = radius
     }
+  }
+
+  // ── ONLY UNDER THE REAL MATERIAL ───────────────────────────────────────────
+  //
+  // The other two paths carry their own darkness already -- `Palette.glass` at
+  // 0.72 behind the old blur, and an opaque surface under Reduce Transparency --
+  // and a dim under either of those is a layer nobody can see. Worse, it would be
+  // a layer nobody can see that still shows up in `describeGlass`, so the audit
+  // would report a dimming device that is doing nothing. An instrument reporting a
+  // thing that is not happening is the failure this whole file is a response to.
+  private func applyDim() {
+    let live: Bool
+    if #available(macOS 26.0, *) { live = glassView != nil } else { live = false }
+    dimLayer.isHidden = !live || dim <= 0
+    dimLayer.opacity = Float(max(0, min(1, dim)))
   }
 
   // ── A TINT IS NOT ONLY A GLASS PROPERTY ────────────────────────────────────
@@ -592,11 +774,128 @@ final class Glass: NSView {
     plain.frame = bounds
     effectView?.frame = bounds
     glassView?.frame = bounds
+    // A layer is not a view: nothing resizes it for us, and there is no
+    // `autoresizingMask` to lean on. Left out, the dim keeps the zero frame it was
+    // born with and every surface is transparent, legible over black, and
+    // unreadable over a face -- which is a bug that only appears over content, and
+    // this file has a whole section on instruments that cannot see content.
+    // Without the transaction it also ANIMATES its way to each new frame, so a
+    // resizing pill trails a dark rectangle behind itself for a third of a second.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    dimLayer.frame = bounds
+    CATransaction.commit()
     // The glass ties its geometry to its content view with Auto Layout, so the
     // content's frame is not decoration here -- it is what the material sizes
     // itself to. Setting it every pass keeps the two from disagreeing when a pill
     // resizes to a longer word.
     content?.frame = bounds
+  }
+
+  // ── EVERY SURFACE SAYS WHAT IT IS ──────────────────────────────────────────
+  //
+  // The header claimed a material policy for months while the code implemented a
+  // different one, and nothing could catch it because nothing in the running
+  // program ever stated which material it had asked for. A screenshot cannot:
+  // frosted-over-a-face and clear-over-a-dim are a judgement call at a glance, and
+  // "looks about right" is what let this run.
+  //
+  // So this is the structural half of the proof, and `tools/glass-check.sh` reads
+  // it. Every field is read off the LIVE object -- `g.style`, the layer that is
+  // actually in the tree -- and never off the constructor arguments, because the
+  // argument is the claim and the object is the fact. `fill` is the one that
+  // matters most: an opaque colour behind Liquid Glass is the exact recipe for the
+  // milky slab in the screenshot that started this, and it is what the old `Glass`
+  // did for its entire life.
+  private final class Weak { weak var g: Glass?; init(_ g: Glass) { self.g = g } }
+  /// Main thread only -- every `Glass` is built during layout and read during the
+  /// `?` audit, both on main. No Swift collection in this program is ever touched
+  /// from two threads; the last one that was took the process down from a render
+  /// callback.
+  private static var living: [Weak] = []
+
+  static func describeAll() -> [String] {
+    living = living.filter { $0.g != nil }
+    return living.compactMap { $0.g?.describeGlass }
+  }
+
+  var describeGlass: String {
+    var path = "none", fill = "none", style = "-"
+    if !plain.isHidden {
+      path = "plain"
+      fill = Glass.describeFill(plain.layer?.backgroundColor)
+    } else if #available(macOS 26.0, *), let g = glassView as? NSGlassEffectView {
+      path = "liquid"
+      style = g.style == .clear ? "clear" : "regular"
+      // Two layers can carry a fill on this path and both would frost it: the
+      // material's own, and this wrapper's -- which is the un-rounded outer box and
+      // the shape of a defect already found here once.
+      fill = Glass.describeFill(g.layer?.backgroundColor, layer?.backgroundColor)
+    } else if effectView != nil {
+      path = "blur"
+      fill = Glass.describeFill(effectView?.layer?.backgroundColor)
+    }
+    let d = dimLayer.isHidden ? 0 : CGFloat(dimLayer.opacity)
+    return "\(name): path=\(path) style=\(style)"
+      + " dim=\(String(format: "%.2f", d))"
+      + " tint=\(tint == nil ? "none" : String(format: "%.2f", tint?.alphaComponent ?? 0))"
+      + " fill=\(fill) \(whereItIs()) shown=\(isEffectivelyVisible)"
+  }
+
+  // ── WHERE IT IS, SO SOMETHING CAN PHOTOGRAPH IT ────────────────────────────
+  //
+  // The structural half of this audit can be satisfied by an app that is entirely
+  // frosted, if the reader is reading the wrong thing -- so the other half is a
+  // photograph, and a photograph needs to know which pixels are the surface. This
+  // is the only way to get that without the rig guessing at a rectangle whose size
+  // depends on how long somebody's name is.
+  //
+  // TOP-LEFT origin, because the only consumer is a screen capture and every image
+  // format on this machine counts rows downward, while AppKit counts them up. The
+  // conversion belongs here, once, rather than in every script that reads the log.
+  private func whereItIs() -> String {
+    guard let win = window else { return "at=- win=- active=-" }
+    let f = convert(bounds, to: nil)                       // window coords, y up
+    let h = win.contentView?.bounds.height ?? win.frame.height
+    let w = win.contentView?.bounds.width ?? win.frame.width
+    // ── AND WHETHER THIS WINDOW IS THE FRONT ONE ──────────────────────────────
+    //
+    // Because the material renders DIFFERENTLY depending on it, and the difference
+    // is not subtle. Photographed with a calibrated pattern behind the card, the
+    // same build with the same dim came out either 0.67 or 0.16 of the picture
+    // surviving, flipping between runs of an identical command -- and stable to
+    // three decimals WITHIN a run, so a single measurement of either mode looks
+    // like a solid result. The rig's own null A/B put its noise at 0.0003, which
+    // is what proved the two modes were real rather than scatter.
+    //
+    // A rig cannot raise a window on somebody's Mac while they are using it, so
+    // this field is how a photograph says which of the two things it caught.
+    let a = "\(win.isKeyWindow ? "key" : "-")/\(win.isMainWindow ? "main" : "-")"
+          + "/\(NSApp.isActive ? "app" : "-")"
+    return "at=\(Int(f.minX)),\(Int(h - f.maxY)),\(Int(f.width)),\(Int(f.height))"
+         + " win=\(Int(w))x\(Int(h)) active=\(a)"
+  }
+
+  /// On screen, as opposed to merely built. A surface behind a closed sheet is
+  /// still a surface and still has to obey the policy, but nothing can photograph
+  /// it -- so the audit says which is which rather than the rig inferring it from
+  /// a zero frame, which is also what a surface looks like before its first layout.
+  private var isEffectivelyVisible: Bool {
+    guard window != nil, !bounds.isEmpty else { return false }
+    var v: NSView? = self
+    while let cur = v {
+      if cur.isHidden || cur.alphaValue < 0.01 { return false }
+      v = cur.superview
+    }
+    return true
+  }
+
+  /// The heaviest fill among the layers handed in, as an alpha, or `none`. Alpha,
+  /// because "is there a colour here" is not the question -- `clear` is a colour.
+  /// How much of the picture it stops is the question.
+  private static func describeFill(_ colours: CGColor?...) -> String {
+    let worst = colours.compactMap { $0 }.map(\.alpha).max() ?? 0
+    return worst <= 0.001 ? "none" : String(format: "%.2f", worst)
   }
 }
 
