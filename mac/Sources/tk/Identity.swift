@@ -479,9 +479,35 @@ enum Identity {
     claimGate.unlock()
     if needStart { Thread { claim() }.start() }
     let deadline = Date().addingTimeInterval(secs)
+    // ── "IT FINISHED AND IT FAILED" STOPPED BEING A REASON TO GIVE UP ────────
+    //
+    // This loop used to break the moment `claiming` went false, on the reading
+    // that a finished ladder which had not won was final. That was true when one
+    // pass was all there ever was. It is not true now: a pass that runs out of
+    // budget leaves the duty loop to come back, so `claiming == false` means
+    // "between attempts", and breaking on it hands the caller a failure while the
+    // app is still working on the answer. The exact case is somebody pressing
+    // Call on a first install whose 429 back-off happens to be mid-wait.
+    //
+    // It also closed a race it was never meant to be part of: `claim()` is
+    // started on another thread above and sets `claiming` under a lock, so the
+    // first pass through this loop could see false because the thread had not run
+    // yet -- and return "no handle" 50 ms after being asked to wait several
+    // seconds for one.
+    //
+    // So it waits out the budget the CALLER chose, and drives a pass itself
+    // rather than waiting on the duty loop's cadence, which doubles out to a
+    // minute. Rate-limited to one kick a second: `claim()` refuses a second
+    // ladder anyway, and a thread spawned every 50 ms to be turned away is a
+    // cost with no purpose.
+    var lastKick = Date.distantPast
     while !claimed, Date() < deadline {
       Thread.sleep(forTimeInterval: 0.05)
-      if !claiming, !claimed { break }        // it finished, and it failed
+      claimGate.lock(); let idle = !claiming; claimGate.unlock()
+      if idle, !claimed, Date().timeIntervalSince(lastKick) > 1 {
+        lastKick = Date()
+        Thread { claim() }.start()
+      }
     }
     return claimed
   }

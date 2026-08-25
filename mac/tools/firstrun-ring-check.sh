@@ -450,6 +450,41 @@ case "$HINTS" in
     say_wrong "no reason on screen -- hints=[$HINTS]";;
 esac
 
+echo "── part 11: pressing Call BETWEEN two attempts must not fail ──"
+# ── THE GAP THE DUTY LOOP OPENED ────────────────────────────────────────────
+#
+# `ring()` waits up to 6 s for a claim in flight, and that wait used to end the
+# moment `claiming` went false, on the reading that a finished ladder which had
+# not won was final. Adding the duty loop made that reading wrong: `claiming` is
+# now false BETWEEN passes as well as after the last one, so a person pressing
+# Call while the app was mid-back-off got "this Mac has no handle yet" from an
+# app that was still working on the answer and would have had it moments later.
+#
+# Made deterministic rather than raced: a budget too small to finish one pass, a
+# retry floor far enough away that the duty loop cannot rescue it, and a stub
+# that says 429 once and then yes. The wait itself has to drive the second pass.
+#
+# The ring is EXPECTED to fail here -- the stub answers /register and 404s the
+# doorbell -- so the assertion is on the one sentence that distinguishes "no
+# name" from "no mailbox". A build with the old early-out prints it; this one
+# must not.
+rm -rf "$SP/kin-gap"
+stub_start "429:2000,200" || say_wrong "part 11: the stub never came up"
+env TK_KIN_DIR="$SP/kin-gap" TK_CLAIM_BUDGET_MS=300 TK_CLAIM_RETRY_MS=30000 \
+    "$TK" --mute --no-telemetry --handle "kinriggap$$" \
+          --ring-only "kinrig-nobody-$$" > "$SP/r8.log" 2>&1
+stub_stop
+GAPN="$(askedN)"
+if grep -q "this Mac has no handle yet" "$SP/r8.log"; then
+  say_wrong "Call refused during the gap between attempts (asked $GAPN time(s): $(asked))"
+elif [ "$GAPN" -lt 2 ]; then
+  # One attempt means the first pass won outright and the gap was never entered,
+  # so a pass here proves nothing -- the same trap part 9 guards against.
+  say_skip "part 11: only $GAPN attempt(s) -- the budget did not bite, nothing proved"
+else
+  say_ok "the wait drove a second attempt and got the name ($GAPN asks: $(asked))"
+fi
+
 [ "$bad" = 0 ] && echo "  FIRST-RUN RING CHECK PASSED -- a new user gets a name and is reachable without restarting Kin" \
                 || echo "  FIRST-RUN RING CHECK FAILED"
 exit $bad
