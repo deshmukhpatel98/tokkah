@@ -551,6 +551,23 @@ final class IconButton: NSButton {
   // accept first mouse for the same reason.
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+  // ── A CIRCLE NOBODY CAN SEE IS NOT A TARGET ────────────────────────────────
+  //
+  // `alphaValue` is a DRAWING property and AppKit's hit testing has no opinion
+  // about it: a button faded to nothing is still exactly where it was and still
+  // fires. For as long as the auto-hide was only an opacity change, the row was
+  // invisible and fully armed -- five circles a person cannot see, with the
+  // hang-up in the middle of them, sitting over the other person's face.
+  //
+  // So invisibility is enforced once, here, for every circle in the app rather
+  // than for the bar alone: the same rule the leave confirmation already relies
+  // on when it collapses four of them to zero. A refused click is not a lost
+  // click -- it falls through to `CallControls`, which brings the row back, which
+  // is what somebody groping for the mute button actually wants to happen.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    alphaValue > 0.01 ? super.hitTest(point) : nil
+  }
+
   override func layout() {
     super.layout()
     glass.frame = bounds
@@ -2844,10 +2861,21 @@ final class CallControls: NSView {
         self.qualityText = ""
       }
       if present { self.sawPeer = true }
+      // ── THE FADE'S OWN PRECONDITION, STATED WHERE IT IS KNOWN ───────────────
+      //
+      // `sawPeer` is a LATCH -- it exists so a ring arriving mid-call is refused,
+      // and it never clears. "Somebody is here now" is a different question, and
+      // it is the one the immersive fade turns on: a window with nobody in it
+      // keeps its controls, whatever has happened to it earlier in the call.
+      self.peerPresent = present
       self.waiting.isHidden = present
       // The control row must not fade out while this card is the only way off this
       // screen. Bounded pin, the same one `markConnected` uses.
       if !present { self.showBar(pin: true) }
+      // And a peer who comes BACK restarts the stillness clock. `markConnected`
+      // fires once per process and cannot do it a second time, so without this a
+      // returning peer gets a row that never fades again for the rest of the call.
+      if present { self.showBar() }
       self.needsLayout = true
       self.layoutSubtreeIfNeeded()
     }
@@ -3273,10 +3301,35 @@ final class CallControls: NSView {
   // remove.
   private var barShown = true
   private var barTimer: Timer?
+  // ── AND THIS NUMBER IS THE WHOLE OF THE IMMERSIVE STATE ───────────────────
+  //
+  // Asked for in these words: "while the call is on ... all the controls should
+  // fade away. Except subtitles only. And they should only come back when there
+  // is a touch of a mouse or a keyboard or something like that. And they will
+  // again fade away in two to three seconds. So it's truly immersive."
+  //
+  // Most of it was already here and doing the wrong half of the job: the row went
+  // to zero opacity and stayed exactly as clickable as before. What was missing
+  // was never the timer -- it was that a faded control is not a control
+  // (`IconButton.hitTest`), that seven states must stop the fade outright
+  // (`barHoldReason`), and that everything a person does counts as being there.
+  //
   /// `Math.max(2600, barPinnedUntil - now)`.
-  private static let barStillness: TimeInterval = 2.6
+  // A CADENCE, so it gets a rig override like `TK_RING_TIMEOUT` and
+  // `TK_LEAVE_HOLD_MS`. A rig that has to sit out two and a half seconds of
+  // stillness per assertion is a rig somebody shortens by deleting assertions.
+  // Nothing in the app sets it; the shipped number is the default below.
+  private static let barStillness: TimeInterval =
+    (ProcessInfo.processInfo.environment["TK_IMMERSIVE_MS"].flatMap { Double($0) }
+       .map { $0 / 1000 }) ?? 2.6
   /// `showBar(true)` pins for 10 s -- a state change earns the row that long.
-  private static let barPin: TimeInterval = 10.0
+  /// ── A MULTIPLE, NOT A SECOND CONSTANT ────────────────────────────────────
+  ///
+  /// Written as two independent numbers, `TK_IMMERSIVE_MS` shortens the fade and
+  /// then leaves a rig sitting out a ten-second pin it never asked about -- a
+  /// cadence with no override hiding inside a cadence that has one. 10 over 2.6 is
+  /// the shipped pair, so the default here is the number that was always here.
+  private static var barPin: TimeInterval { barStillness * (10.0 / 2.6) }
   private var barPinnedUntil = Date.distantPast
 
   /// `pin: true` for a state change (a mute, a camera swap): the row has just said
@@ -3288,6 +3341,64 @@ final class CallControls: NSView {
     scheduleBarHide()
   }
 
+  // ── THE SEVEN STATES THE ROW IS NOT ALLOWED TO LEAVE IN ───────────────────
+  //
+  // A STRING and not a boolean, and that is not decoration. "The bar did not fade"
+  // is the same observation for seven different reasons, and a rig that cannot
+  // tell them apart proves whichever one happened to be true rather than the one
+  // it was written for. `describeTree` prints this, so an assertion can name it.
+  //
+  // Every one of them makes the app unusable if the row goes:
+  //
+  //   notyet   nobody has connected. "Before the call the screen is your own
+  //            mirror and one button, and hiding the controls there just makes
+  //            the app look broken."
+  //   card     the waiting, ringing or calling card is on screen. Its buttons --
+  //            answer, decline, cancel, the invite link -- are the only way off
+  //            that screen
+  //   alone    connected once, nobody here NOW, and no card either
+  //   panel    a decision in progress
+  //   leaving  a hang-up half-confirmed, between the two clicks
+  //   held     a finger is down on peek or on leave
+  //   typing   the caret is in something
+  //
+  // ORDER IS THE ANSWER, not just the list. A departure makes `card` and `alone`
+  // true together -- `setPeerPresent(false)` brings the card back -- and the card
+  // is the one a person is looking at, so it is the one this reports. `alone`
+  // stays underneath it for the case with no card: `markConnected` on its own,
+  // which is a state the rig paths can reach and a real call passes through.
+  private var barHoldReason: String? {
+    if startedAt == nil { return "notyet" }
+    if !waiting.isHidden { return "card" }
+    if !peerPresent { return "alone" }
+    if moreOpen { return "panel" }
+    if leaveArmed { return "leaving" }
+    if peekButton.holding || leaveButton.holding { return "held" }
+    if typing { return "typing" }
+    return nil
+  }
+
+  /// Whether the caret is in something. Asked of the WINDOW rather than of the two
+  /// fields this app owns, because focus is AppKit's fact and not this file's:
+  /// while a field is being typed into the first responder is its field EDITOR, a
+  /// text view neither field holds a reference to. Asking the window is also the
+  /// only version of this that stays true for a field added later.
+  ///
+  /// A BACKSTOP, and today it can never be the reason on its own: both fields
+  /// this app has live inside something that already holds the row up -- the
+  /// rename field is in the panel, the name field is on the card -- so `typing`
+  /// is always shadowed and `immersive-check` cannot assert it in isolation. It
+  /// is here for the third field, which is the one that would otherwise ship with
+  /// the words disappearing out from under a half-typed name.
+  private var typing: Bool {
+    guard let r = window?.firstResponder else { return false }
+    return r is NSTextView || r is NSTextField
+  }
+
+  /// The last thing `setPeerPresent` was told. See the note there for why this is
+  /// not `sawPeer`.
+  private(set) var peerPresent = false
+
   private func scheduleBarHide() {
     barTimer?.invalidate()
     // ── NOT BEFORE THE CALL ───────────────────────────────────────────────────
@@ -3296,6 +3407,10 @@ final class CallControls: NSView {
     // one button, and hiding the controls there just makes the app look broken."
     // This app hid them anyway, so the waiting screen sat there with a link and no
     // visible way to mute, turn the camera off, or leave.
+    //
+    // The ONE reason that stops the timer rather than retrying it: nothing on a
+    // screen with no call on it can turn into a reason to fade, and `markConnected`
+    // is what arms this. Every other reason below clears on its own.
     guard startedAt != nil else { return }
     // Whichever ends later: 2.6 s of stillness, or the pin. Sizing the timer to the
     // ACTUAL remaining time is the difference between the row disappearing where the
@@ -3303,24 +3418,72 @@ final class CallControls: NSView {
     let wait = max(CallControls.barStillness, barPinnedUntil.timeIntervalSinceNow)
     barTimer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
       guard let self else { return }
-      // A sheet open or a leave half-confirmed is a decision in progress, and taking
-      // the controls away mid-decision is how you get a hang-up nobody meant.
-      if self.moreOpen || self.leaveArmed { self.scheduleBarHide(); return }
+      // ASKED AT THE MOMENT OF FIRING, not at the moment of arming. Every reason
+      // above can become true during the wait -- a panel opened, the other person
+      // left, a finger went down -- and a fade decided 2.6 s ago is a fade decided
+      // about a different screen. This was two of the seven, checked here, and it
+      // is why the list lives in one property both this and the readout share.
+      if let why = self.barHoldReason {
+        // A RETRY, not a cancellation. The reason will clear -- a panel closes, a
+        // finger lifts, somebody stops typing -- and nothing else would restart
+        // this, so the row would simply stay up for the rest of the call.
+        if why != self.heldSaid { self.heldSaid = why; fputs("bar: staying up -- \(why)\n", stderr) }
+        self.scheduleBarHide(); return
+      }
+      self.heldSaid = nil
       self.setBar(visible: false)
     }
   }
+  /// So a reason that holds for a whole call says so once instead of every 2.6 s.
+  private var heldSaid: String?
+
   private func setBar(visible: Bool) {
     guard visible != barShown else { return }
     barShown = visible
     let row: [NSView] = [micButton, camButton, peekButton, flipButton, leaveButton, moreButton]
-    // One curve for the whole app. This was a bare 0.22 linear fade, which next to
-    // a material that eases everything it does read as the one thing on screen
-    // that had not been told.
+    // ── WHAT IS NOT IN THAT LIST ──────────────────────────────────────────────
+    //
+    // The caption band, the floor cue and the bloom -- `cues`, the whole turn
+    // layer. "Except subtitles only": the words the other person is saying are the
+    // one thing on this screen that is not furniture, and taking them away with
+    // the buttons would make the immersive state the state in which you can no
+    // longer read what somebody said. They are also below the row already and pass
+    // every click through, so there is nothing to hide them FROM.
+    //
+    // Nor the pills. A warning is a sentence about the call rather than something
+    // to press, and `setWarning` deliberately brings the row back when one arrives.
+    //
+    // ── AND IT IS NOT ONLY OPACITY ────────────────────────────────────────────
+    //
+    // For as long as this was the whole of the fade, the row was invisible and
+    // fully armed. `IconButton.hitTest` refuses a click on a circle below 0.01
+    // alpha, which is the value this line sets, so the drawing and the hit testing
+    // cannot disagree about what is on screen. `clickTargets` reads the same alpha
+    // for the same reason.
+    //
+    // ── BACK FASTER THAN IT WENT ──────────────────────────────────────────────
+    //
+    // Going away is the app's decision and it should be gentle. Coming back is the
+    // PERSON's, made with a hand that is already moving, and any part of it they
+    // can perceive as a wait is the app arguing with them. One curve either way --
+    // half the time on the way in. Reduce Motion gets neither, the same answer
+    // `setRowMerge` gives.
     Motion.run({ for v in row { v.animator().alphaValue = visible ? 1 : 0 } },
-               duration: 0.24)
+               duration: Motion.reduceMotion ? 0 : (visible ? 0.12 : 0.24))
+    // Said out loud: a row at zero opacity and a row that was never built
+    // photograph identically, and this is the app's own account of the moment it
+    // took the controls off somebody's screen.
+    fputs("bar: \(visible ? "back" : "faded away -- the call is the whole window")\n", stderr)
   }
   override func mouseMoved(with event: NSEvent) { showBar() }
   override func mouseEntered(with event: NSEvent) { showBar() }
+  // ── A SCROLL IS A PERSON ──────────────────────────────────────────────────
+  //
+  // Nothing in this window scrolls, which is exactly why this is here rather than
+  // absent: two fingers on a trackpad is somebody at this Mac, the rule is "a
+  // touch of a mouse or a keyboard or something like that", and a gesture the app
+  // has no other use for costs nothing at all to accept as presence.
+  override func scrollWheel(with event: NSEvent) { showBar() }
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
     trackingAreas.forEach(removeTrackingArea)
@@ -3333,6 +3496,63 @@ final class CallControls: NSView {
   /// A press is activity. Without this, `--press` drove the controls while the row
   /// was invisible and every photograph of the result was of an empty bar.
   func nudgeBar() { showBar() }
+
+  // ── THE ONE QUESTION `@mic` CANNOT ASK ────────────────────────────────────
+  //
+  // Every `--press` token calls `nudgeBar()` before it runs, and that is right: a
+  // press models somebody who has just moved a pointer onto a button. It also
+  // means no `@` click can ever land on a FADED control, which is the only thing
+  // about a faded control worth proving.
+  //
+  // So this is one experiment with two arms, and they share every line of it: the
+  // same real click at the mute circle's own centre, built the same way, delivered
+  // through the window and therefore through every `hitTest` on the way down,
+  // differing only in what the row is doing when it arrives. `faded: true` must
+  // change nothing and bring the row back; `faded: false` must mute. An arm that
+  // ranks the same way as the other one proves the click never reached anything.
+  //
+  // It cannot go through `click(_:)` next door, and the reason is the point:
+  // `click` can only reach what `clickTargets` lists, `clickTargets` is documented
+  // as what is on screen RIGHT NOW, and the moment the row fades it correctly
+  // stops being able to name the mute button at all.
+  private func tapWhereTheMicIs(faded: Bool) {
+    // NO `NSApp.activate` HERE, unlike `click`. This press has to be able to
+    // arrive at a window that is not key -- that is half of what it is testing,
+    // and it is the state a real call spends most of its time in. It is also the
+    // press that found `CallControls.acceptsFirstMouse` missing, which activating
+    // first would have hidden completely.
+    guard let win = window else { fputs("bar-tap: no window\n", stderr); return }
+    // `setBar` is what the stillness timer calls, so the row is left in exactly
+    // the state two and a half still seconds would have left it in -- and the
+    // timer is stopped, or it fires mid-assertion and the arms swap.
+    if faded { setBar(visible: false); barTimer?.invalidate() } else { showBar() }
+    let p = micButton.convert(NSPoint(x: micButton.bounds.midX, y: micButton.bounds.midY),
+                              to: nil)
+    let wasShown = barShown
+    let before = micMuted
+    let hit = win.contentView?.hitTest(p)
+    func ev(_ t: NSEvent.EventType) -> NSEvent? {
+      NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
+                         timestamp: ProcessInfo.processInfo.systemUptime,
+                         windowNumber: win.windowNumber, context: nil,
+                         eventNumber: 0, clickCount: 1,
+                         pressure: t == .leftMouseUp ? 0 : 1)
+    }
+    guard let down = ev(.leftMouseDown), let up = ev(.leftMouseUp) else { return }
+    // The release goes into the queue FIRST when an `NSControl` is under the point.
+    // Every button here runs its own tracking loop inside `mouseDown` and pulls the
+    // release out of the queue itself, so a press with nothing behind it hangs the
+    // main thread waiting for a finger that does not exist -- see `click`, which
+    // paid for this once already. A plain view takes the release by hand.
+    let tracks = hit is NSControl
+    if tracks { win.postEvent(up, atStart: false) }
+    win.sendEvent(down)
+    if !tracks { win.sendEvent(up) }
+    fputs("bar-tap: the row was \(wasShown ? "SHOWN" : "HIDDEN") when the click landed"
+        + " -- hit=\(hit.map { "\(type(of: $0))" } ?? "nil")"
+        + " mic \(before ? "muted" : "on")->\(micMuted ? "muted" : "on")"
+        + " row now \(barShown ? "shown" : "hidden")\n", stderr)
+  }
 
   /// Half-confirmed leave. Declared here because the auto-hide has to know about it:
   /// the row must not vanish between the two clicks.
@@ -3391,8 +3611,38 @@ final class CallControls: NSView {
     needsLayout = true
     layoutSubtreeIfNeeded()
   }
+  // ── THE OVERLAY HAS TO ACCEPT THE FIRST CLICK TOO ─────────────────────────
+  //
+  // Every control in this file says yes to this and the surface they sit on said
+  // nothing, which was harmless while the surface did nothing. It is not harmless
+  // now: the click that wakes a faded row lands HERE, and without this it is spent
+  // activating Kin and thrown away -- the row stays invisible and the person
+  // clicks again into a window with no controls on it.
+  //
+  // Measured on the harness before it was added, and this is exactly the shape:
+  //
+  //     bar-tap: the row was HIDDEN when the click landed -- hit=CallControls
+  //              mic on->on row now hidden
+  //
+  // The hit test named this view, the press never arrived, and the fade looked
+  // like a bar that could not be woken. `mouseDown` below is not consequential --
+  // it shows the row and closes an open panel, which are the two things somebody
+  // bringing this window forward is most likely to have meant.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
   /// A click on the scrim -- anywhere outside the panel -- closes it.
   override func mouseDown(with event: NSEvent) {
+    // ── AND A CLICK ON A FADED ROW BRINGS IT BACK RATHER THAN PRESSING ───────
+    //
+    // This is where a click that found nothing arrives. The circles refuse the hit
+    // while they are invisible (`IconButton.hitTest`), the turn layer passes
+    // everything through, and the hidden card and scrim are not in the search at
+    // all -- so a finger aimed at where the mute button used to be lands here.
+    // Showing the row is the whole of the right answer: the person now sees what
+    // they were reaching for and can press it, instead of having pressed something
+    // they could not see. FIRST in this method, because the scrim path below
+    // returns and a person closing a panel is still a person.
+    showBar()
     if moreOpen, !sheet.frame.contains(convert(event.locationInWindow, from: nil)) {
       closeMore(); return
     }
@@ -4014,7 +4264,7 @@ final class CallControls: NSView {
       // The existing field EXTENDED rather than a second one beside it, because two
       // fields describing one control are two fields that can disagree. A
       // percentage is the only way a fill can be asserted without a screenshot.
-      + "  leave=\(leaveState) bar=\(barShown ? "shown" : "hidden")"
+      + "  leave=\(leaveState) bar=\(barState)"
       + "  handle=\(handle.isEmpty ? "-" : handle) people=\(people.count)"
       + "  clip=\(NSPasteboard.general.string(forType: .string) ?? "-")"
       + "  \(cues.describe)"
@@ -4029,6 +4279,15 @@ final class CallControls: NSView {
     return "HOLDING:\(Int((leaveButton.holdProgress * 100).rounded()))"
   }
 
+  /// `shown`, `hidden`, or `shown/held:<reason>`. The EXISTING word plus why, in
+  /// the field that already carried it, because two fields describing one control
+  /// are two fields that can disagree -- this file has paid for that before. And
+  /// the reason is not optional detail: "it did not fade" has seven causes, and an
+  /// assertion that cannot name the one it is testing passes on any of them.
+  private var barState: String {
+    (barShown ? "shown" : "hidden") + (barHoldReason.map { "/held:\($0)" } ?? "")
+  }
+
   /// --press mic,cam,invite,leave,echo,cam#2 -- exercise the wiring before
   /// photographing it. A control that draws and does nothing is this project's
   /// most repeated defect and does not get to be assumed.
@@ -4041,6 +4300,17 @@ final class CallControls: NSView {
   // makes a native app feel like a web page in a frame.
   @discardableResult
   func handleKey(_ event: NSEvent) -> Bool {
+    // ── EVERY KEY IS A PERSON, INCLUDING THE ONES THIS APP IGNORES ────────────
+    //
+    // Before the switch and before every guard. The three keys below are the only
+    // ones this window does anything with, and "the controls come back when you
+    // touch the keyboard" is not a claim about those three -- it is a claim about
+    // the keyboard. A key that falls straight through, which is nearly all of
+    // them, is still somebody sitting at this Mac.
+    //
+    // Safe to put ahead of the returns because this is a local monitor: the event
+    // carries on to whoever it belonged to whatever happens here.
+    nudgeBar()
     let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
     if event.keyCode == 53 {  // esc
       guard moreOpen || leaveArmed else { return false }
@@ -4168,6 +4438,18 @@ final class CallControls: NSView {
     case "leave-hold-cancel":
       leaveHold(false)
       leaveButton.simulateHold(false)
+    // ── THE IMMERSIVE STATE, REACHED WITHOUT WAITING FOR IT ───────────────────
+    //
+    // `fade` puts the row exactly where two and a half still seconds would put it,
+    // through the same call the timer makes. It is how the faded window gets
+    // photographed at all: `screencapture` takes about a second to arm and every
+    // press token nudges the row back on its way past.
+    //
+    // `blind-tap` and `sighted-tap` are the two arms of one experiment -- see
+    // `tapWhereTheMicIs` for why a `@mic` click can never be the first of them.
+    case "fade": setBar(visible: false); barTimer?.invalidate()
+    case "blind-tap": tapWhereTheMicIs(faded: true)
+    case "sighted-tap": tapWhereTheMicIs(faded: false)
     case "people": openPeople()
     case "people-back": showPage(.settings, opening: false)
     case "rename": showPage(.rename, opening: true)
@@ -4387,6 +4669,21 @@ extension CallControls {
       }
       if !win.isKeyWindow { fputs("  click: window never became key -- pressing anyway\n", stderr) }
     }
+    // ── AND NUDGE AGAIN, BECAUSE THE PUMP ABOVE IS DEAD TIME ──────────────────
+    //
+    // `--press` nudges the row before calling this, on the reasoning that a press
+    // models somebody who has just moved a pointer onto a button. The wait for
+    // keyness then spends up to a second in a runloop with nothing happening in
+    // it -- which is exactly what the stillness timer is looking for. Measured:
+    //
+    //     bar: back                      <- the nudge from --press
+    //     bar: faded away                <- the timer, during the pump
+    //     click peek at (678,53) hit=CallControls key=false
+    //
+    // The press named `peek`, was aimed at peek's own centre, and woke the row
+    // instead, because by the time the event was built there was nothing there.
+    // A finger does not pause for a second between arriving and pressing.
+    nudgeBar()
     let p = v.convert(NSPoint(x: v.bounds.midX, y: v.bounds.midY), to: nil)
     func ev(_ t: NSEvent.EventType) -> NSEvent? {
       NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
