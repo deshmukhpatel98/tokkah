@@ -17,12 +17,24 @@
 # without a run loop it cannot fire at all -- a headless run of this test reports
 # a failure that is its own, not the app's (`blind-instruments-report-negatives`).
 set -u
+# ── KILLS ONLY WHAT THIS SCRIPT STARTED ─────────────────────────────────────
+#
+# This used to `pkill -f "$TK"`, and `pkill -f` takes a REGEX: in a path like
+# `./.build/debug/tk` every `.` matches any character, so the pattern also matched
+# `/Users/.../worktrees/agent-XXXX/mac/.build/debug/tk`. It was reaping another
+# agent's processes in another checkout and corrupting their measurements from the
+# outside -- the exact thing lane isolation is supposed to prevent.
+#
+# PIDs, therefore. A rig may only end processes it started.
+PIDS=""
+spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
+reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/firstrun-ring.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
-trap 'pkill -f "$TK" 2>/dev/null; rm -rf "$SP"' EXIT
+trap 'reap; rm -rf "$SP"' EXIT
 
 # An isolated identity dir AND a rig handle, so this never touches the handle the
 # person at this Mac actually uses, and never squats a real-looking name.
@@ -32,9 +44,9 @@ ARGS="--window --video off --mute --no-telemetry --no-update --no-relocate --no-
 bad=0
 
 run() { # log, extra args
-  "$TK" $ARGS --room "frcheck$$" --listen "$2" $3 > "$1" 2>&1 &
+  spawn "$TK" $ARGS --room "frcheck$$" --listen "$2" $3 > "$1" 2>&1
   perl -e "select undef,undef,undef,$4"
-  pkill -f "$TK" 2>/dev/null; wait 2>/dev/null; perl -e 'select undef,undef,undef,0.4'
+  reap; perl -e 'select undef,undef,undef,0.4'
 }
 
 run "$SP/a.log" 7451 "--handle $H" 20

@@ -14,25 +14,37 @@
 # the call must say CONNECTED, and it must say WHY there is no picture. A build
 # that connects and explains nothing is the same silence in a new place.
 set -u
+# ── KILLS ONLY WHAT THIS SCRIPT STARTED ─────────────────────────────────────
+#
+# This used to `pkill -f "$TK"`, and `pkill -f` takes a REGEX: in a path like
+# `./.build/debug/tk` every `.` matches any character, so the pattern also matched
+# `/Users/.../worktrees/agent-XXXX/mac/.build/debug/tk`. It was reaping another
+# agent's processes in another checkout and corrupting their measurements from the
+# outside -- the exact thing lane isolation is supposed to prevent.
+#
+# PIDs, therefore. A rig may only end processes it started.
+PIDS=""
+spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
+reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/camoff-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
-trap 'pkill -f "$TK" 2>/dev/null; rm -rf "$SP"' EXIT
+trap 'reap; rm -rf "$SP"' EXIT
 
 R="camoffchk$$"
 # --mute on both ends, always: the machine's speakers belong to whoever is
 # sitting at it, and a rig that plays out loud gets turned off.
 A_ARGS="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.6'
+reap; perl -e 'select undef,undef,undef,0.6'
 # A HAS NO CAMERA. This is the whole subject.
-"$TK" --room "$R" --listen 7911 --peer 127.0.0.1:7912 --video off $A_ARGS > "$SP/a.log" 2>&1 &
+spawn "$TK" --room "$R" --listen 7911 --peer 127.0.0.1:7912 --video off $A_ARGS > "$SP/a.log" 2>&1
 # B is watching, and B's window is what gets inspected.
-"$TK" --window --room "$R" --listen 7912 --peer 127.0.0.1:7911 --video off $A_ARGS \
-      --press "?" --press-after 9 > "$SP/b.log" 2>&1 &
+spawn "$TK" --window --room "$R" --listen 7912 --peer 127.0.0.1:7911 --video off $A_ARGS \
+      --press "?" --press-after 9 > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,12'
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.4'
+reap; perl -e 'select undef,undef,undef,0.4'
 
 AUDIT="$(grep -oE 'audit state controls.*' "$SP/b.log" | head -1)"
 [ -n "$AUDIT" ] || { echo "  no audit line -- B never opened a window"; sed -n '1,20p' "$SP/b.log"; exit 1; }

@@ -20,25 +20,37 @@
 # The peer here has NO CAMERA, deliberately: that is the case that could not work
 # at all before, so a rig using a normal peer would pass over the bug.
 set -u
+# ── KILLS ONLY WHAT THIS SCRIPT STARTED ─────────────────────────────────────
+#
+# This used to `pkill -f "$TK"`, and `pkill -f` takes a REGEX: in a path like
+# `./.build/debug/tk` every `.` matches any character, so the pattern also matched
+# `/Users/.../worktrees/agent-XXXX/mac/.build/debug/tk`. It was reaping another
+# agent's processes in another checkout and corrupting their measurements from the
+# outside -- the exact thing lane isolation is supposed to prevent.
+#
+# PIDs, therefore. A rig may only end processes it started.
+PIDS=""
+spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
+reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/leave-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
 export TK_KIN_DIR="$SP/kin"
-trap 'pkill -f "$TK" 2>/dev/null; rm -rf "$SP"' EXIT
+trap 'reap; rm -rf "$SP"' EXIT
 
 R="lvchk$$"
 C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.6'
-"$TK" $C --room "$R" --listen 7551 --peer 127.0.0.1:7552 > "$SP/a.log" 2>&1 &
-A=$!
-"$TK" $C --room "$R" --listen 7552 --peer 127.0.0.1:7551 --press "?" --press-after 34 > "$SP/b.log" 2>&1 &
+reap; perl -e 'select undef,undef,undef,0.6'
+spawn "$TK" $C --room "$R" --listen 7551 --peer 127.0.0.1:7552 > "$SP/a.log" 2>&1
+A=$LAST_PID
+spawn "$TK" $C --room "$R" --listen 7552 --peer 127.0.0.1:7551 --press "?" --press-after 34 > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,9'
 grep -q "connected via" "$SP/b.log" || { echo "  SKIPPED: the two ends never connected"; exit 0; }
 { kill -9 "$A"; wait "$A"; } 2>/dev/null                     # they leave, without saying goodbye
 perl -e 'select undef,undef,undef,28'
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.4'
+reap; perl -e 'select undef,undef,undef,0.4'
 
 AUDIT="$(grep -oE 'audit state controls.*' "$SP/b.log" | tail -1)"
 [ -n "$AUDIT" ] || { echo "  no audit line from B"; exit 1; }

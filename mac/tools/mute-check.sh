@@ -15,32 +15,44 @@
 # clears is worse than no banner: it tells you somebody is muted for the rest of
 # a call they are talking on.
 set -u
+# ── KILLS ONLY WHAT THIS SCRIPT STARTED ─────────────────────────────────────
+#
+# This used to `pkill -f "$TK"`, and `pkill -f` takes a REGEX: in a path like
+# `./.build/debug/tk` every `.` matches any character, so the pattern also matched
+# `/Users/.../worktrees/agent-XXXX/mac/.build/debug/tk`. It was reaping another
+# agent's processes in another checkout and corrupting their measurements from the
+# outside -- the exact thing lane isolation is supposed to prevent.
+#
+# PIDs, therefore. A rig may only end processes it started.
+PIDS=""
+spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
+reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/mute-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
 export TK_KIN_DIR="$SP/kin"
-trap 'pkill -f "$TK" 2>/dev/null; rm -rf "$SP"' EXIT
+trap 'reap; rm -rf "$SP"' EXIT
 
 R="mutechk$$"
 # --mute is the RIG's speaker flag (the machine's speakers belong to whoever is
 # sitting at it). `--press mic` is the app's microphone button. Different things.
 C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.6'
+reap; perl -e 'select undef,undef,undef,0.6'
 # A mutes at 6 s and unmutes at 12 s.
-"$TK" $C --room "$R" --listen 7471 --peer 127.0.0.1:7472 \
-      --press "mic" --press-after 6 > "$SP/a.log" 2>&1 &
-"$TK" $C --room "$R" --listen 7472 --peer 127.0.0.1:7471 > "$SP/b.log" 2>&1 &
+spawn "$TK" $C --room "$R" --listen 7471 --peer 127.0.0.1:7472 \
+      --press "mic" --press-after 6 > "$SP/a.log" 2>&1
+spawn "$TK" $C --room "$R" --listen 7472 --peer 127.0.0.1:7471 > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,10'
 # Second press on A, from a fresh process is not possible -- so drive the second
 # edge by pressing again through the same --press list.
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.6'
-"$TK" $C --room "${R}b" --listen 7473 --peer 127.0.0.1:7474 \
-      --press "mic,~,~,mic" --press-after 4 > "$SP/a2.log" 2>&1 &
-"$TK" $C --room "${R}b" --listen 7474 --peer 127.0.0.1:7473 > "$SP/b2.log" 2>&1 &
+reap; perl -e 'select undef,undef,undef,0.6'
+spawn "$TK" $C --room "${R}b" --listen 7473 --peer 127.0.0.1:7474 \
+      --press "mic,~,~,mic" --press-after 4 > "$SP/a2.log" 2>&1
+spawn "$TK" $C --room "${R}b" --listen 7474 --peer 127.0.0.1:7473 > "$SP/b2.log" 2>&1
 perl -e 'select undef,undef,undef,18'
-pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.4'
+reap; perl -e 'select undef,undef,undef,0.4'
 
 bad=0
 if grep -q "voice: the far end's microphone is OFF" "$SP/b.log"; then
