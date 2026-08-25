@@ -355,7 +355,10 @@ final class BloomLabel: NSView {
 // Head truncation, not tail: the newest words are the ones that matter, so what
 // falls off the front is what falls off.
 final class CaptionBand: NSView {
-  private let glass = Glass(radius: 0, variant: .regular)
+  // Clear, over the HIG's dim. The band floats in the MIDDLE of the window, where
+  // neither scrim reaches, so it is on its own for contrast -- and it is two lines
+  // of somebody's speech, which is the most reading anyone does in this app.
+  private let glass = Glass("caption", radius: 0)
   private let holder = NSView()
   private let theirs = NSTextField(labelWithString: "")
   private let mine = NSTextField(labelWithString: "")
