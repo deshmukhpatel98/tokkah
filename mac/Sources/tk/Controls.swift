@@ -2927,20 +2927,43 @@ final class CallControls: NSView {
   /// `Pill.text` hides itself when empty, so there is no second visibility flag
   /// to keep in agreement with the string -- the two have drifted apart in this
   /// file before.
+  /// ── THE ONLY SETTER ON THIS VIEW THAT DID NOT HOP ─────────────────────────
+  ///
+  /// `setStatus` directly above, and `setTheirWords`/`setMyWords` directly below,
+  /// all go through `onMain`. This one did not, and it touches `NSView` state
+  /// three ways -- the pill's text, its origin, and `showBar()`, which reaches
+  /// `-[NSView _setHidden:]`. Called off the main thread that is a SIGABRT, and
+  /// it was: a report-thread call to `setWarning` killed a process outright while
+  /// the same-room work was being built.
+  ///
+  /// It has survived in shipping builds only by luck. `reportLoop` calls
+  /// `setWarning("")` every second from its own thread, and clearing an already
+  /// clear pill returns at the guard below before touching a view -- so the app
+  /// is one non-empty warning off the main thread away from aborting, and always
+  /// has been. See `unexplained-death-is-a-bug`: no AppKit object is touched from
+  /// a thread that is not the main one, and "it has not crashed yet" is not the
+  /// test.
+  ///
+  /// The guard and the log stay on the CALLING thread on purpose: `warnText` is
+  /// the de-duplication and belongs with the caller's ordering, and a log line
+  /// deferred to a main-queue hop would timestamp the wrong moment.
   func setWarning(_ line: String) {
     guard line != warnText else { return }
     warnText = line
-    warnPill.text = line
-    if !line.isEmpty {
+    fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
+    onMain { [weak self] in
+      guard let self else { return }
+      self.warnPill.text = line
+      guard !line.isEmpty else { return }
       // Re-centre: the pill resizes itself to the sentence, so the origin set at
       // layout time belongs to whatever text was there before.
-      warnPill.setFrameOrigin(NSPoint(x: (frame.width - warnPill.frame.width) / 2,
-                                      y: frame.height - warnPill.frame.height - Metric.s4))
+      self.warnPill.setFrameOrigin(
+        NSPoint(x: (self.frame.width - self.warnPill.frame.width) / 2,
+                y: self.frame.height - self.warnPill.frame.height - Metric.s4))
       // A warning is worthless under a hidden bar. Showing the row also makes the
       // mic and camera buttons reachable at the exact moment somebody wants them.
-      showBar()
+      self.showBar()
     }
-    fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
   }
   private(set) var warnText = ""
 

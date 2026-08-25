@@ -670,7 +670,27 @@ Launcher.onURLRoom = { r in
   }
 }
 
-let listenPort = UInt16(arg("listen") ?? "7001") ?? 7001
+// ── A TEST RUN MUST NOT COMPETE FOR A FIXED PORT ────────────────────────────
+//
+// `TEST_FLAGS` excuses a `--*-test` run from the updater, the identity claim and
+// the login item, and the media socket is bound BELOW all of that -- so every one
+// of them still took UDP 7001. Measured while the same-room work was being built:
+// `tk --sameroom-test` spent thirty seconds retrying 7001 against another agent's
+// process and then exited 1, having computed nothing. Seven of these blocks sit
+// hundreds of lines under the bind and cannot be lifted above it without moving
+// code this file has already punished people for moving (see `TEST_FLAGS`).
+//
+// So the PORT moves instead of the code. Zero means "any free one", the socket is
+// still real, every path below is unchanged, and two tests can run at once. An
+// explicit `--listen` still wins, because a rig that names a port means it.
+//
+// Measured with a live call holding 7001, which is what the collision actually
+// is -- two short `--*-test` runs do NOT collide with each other, so the obvious
+// control proves nothing and I ran the wrong one first:
+//
+//   tk --gate-test --listen 7001   ->  exit 1, "socket/bind failed on port 7001"
+//   tk --gate-test                 ->  exit 0, GATE TEST PASSED
+let listenPort = UInt16(arg("listen") ?? "") ?? (isTestRun ? 0 : 7001)
 let peerSpec = arg("peer") ?? "127.0.0.1:7002"
 let parts = peerSpec.split(separator: ":")
 guard parts.count == 2, let pPort = UInt16(parts[1]) else {
