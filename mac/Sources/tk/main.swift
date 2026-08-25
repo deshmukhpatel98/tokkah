@@ -367,6 +367,8 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
+  "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
+  "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
@@ -390,7 +392,7 @@ let KNOWN_FLAGS: Set<String> = [
 // ordering twice today. The side effects are skipped instead, which is the part
 // that can actually hurt somebody.
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
-                  "subtitle-test", "decimator-test", "headphone-test"]
+                  "subtitle-test", "decimator-test", "headphone-test", "predict-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -3086,6 +3088,21 @@ if flag("subtitle-test") {
            : "  SUBTITLE TEST FAILED"
              + (outRatio - inRatio > 12 ? " (it ate the near voice too)" : " (not enough separation)"))
   exit(ok ? 0 : 1)
+}
+
+// ── CAN WE TELL A TURN IS ENDING BEFORE IT ENDS? ──────────────────────────
+//
+// The whole argument, the labels and the control arms live in Predict.swift; this
+// is only the door. It opens a recogniser and no device, which is why it sits
+// with the other `--*-test` blocks rather than anywhere near a call.
+if flag("predict-test") {
+  let media = arg("predict-wav") ?? "testbed/media/real/realA.wav,testbed/media/real/realB.wav"
+  Predict.selfTest(paths: media.split(separator: ",").map(String.init),
+                   seconds: Double(arg("predict-seconds") ?? "600") ?? 600,
+                   useModel: flag("predict-model"),
+                   useCase: arg("predict-usecase") ?? "general",
+                   budget: Double(arg("predict-budget") ?? "0.15") ?? 0.15,
+                   fast: flag("predict-fast"))
 }
 
 if flag("ledger-test") {

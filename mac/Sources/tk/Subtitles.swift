@@ -45,7 +45,36 @@ final class Subtitles {
     /// Smart-turn's probability that the sentence has landed rather than trailed
     /// off. It reads the waveform, so it hears prosody -- the thing no transcript
     /// can recover.
+    ///
+    /// ── AND ON EVERY MACHINE THAT IS NOT THIS ONE IT NEVER FIRES ───────────
+    ///
+    /// Only the Qwen path writes it -- a Python LaunchAgent on one Mac on earth --
+    /// so on the default engine `turnComplete` stays 0.0 and the rule downstream
+    /// (`spokeFor > 1.5 && breath > 220 && turnComplete > 0.8`) cannot fire. That
+    /// reads like `feature-behind-a-flag-nobody-runs` and is not: what the rule
+    /// does is call `endUtterance`, which the system recogniser correctly ignores
+    /// because it finds its own sentence boundaries. The path is inert, not
+    /// broken. Written down because it looks exactly like the bug and the next
+    /// person to notice deserves the two minutes back.
     var onComplete: ((Double) -> Void)?
+
+    // ── THE PRIOR, WHICH IS THE POINT ────────────────────────────────────────
+    //
+    // Kept here rather than beside the gate because this is where the words are,
+    // and the words are most of the evidence. Nothing about it is on the audio
+    // path: it is fed from the 120 ms chunk thread and from the recogniser's own
+    // callback, and what it publishes is one Double.
+    let predict: Predict
+    /// The audio timeline, in ms, from samples handed to `feed`. Not a wall clock:
+    /// a harness feeding a file and a call feeding a microphone have to get the
+    /// same answer out of the predictor, and under load a wall clock would make
+    /// the text look fresher than the audio it describes.
+    private(set) var fedMs = 0.0
+    /// Sub-blocks for the energy trace. 25 ms, so a sentence's last syllable is
+    /// four samples of level rather than one -- at the 120 ms chunk cadence the
+    /// fall that says "this is landing" is a single number and invisible.
+    private var subPeak: Float = 0
+    private var subLeft = 0
 
     private(set) var requests = 0
     private(set) var failures = 0
@@ -113,7 +142,9 @@ final class Subtitles {
     /// local daemon and falls back to the system one if it is not ready; "auto"
     /// is the old order, daemon first. One flag, so an A/B is not a LaunchAgent
     /// being stopped and started.
-    init(host: String = "127.0.0.1", port: Int = 8789, prefer: String = "apple") {
+    init(host: String = "127.0.0.1", port: Int = 8789, prefer: String = "apple",
+         predictModel: Bool = false, predictUseCase: String = "general") {
+        predict = Predict(model: predictModel, useCase: predictUseCase)
         url = URL(string: "http://\(host):\(port)/transcribe")!
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 4
@@ -173,6 +204,11 @@ final class Subtitles {
             // The same contract the daemon path publishes: a running revision,
             // then a commit. Nothing downstream can tell which engine wrote it.
             if !self.available { self.available = true; self.engine = "apple" }
+            // Stamped with the AUDIO clock, not this instant. A revision arrives
+            // about a second after the sound it describes, and the predictor has
+            // to know how old the words are to decide whether to trust them --
+            // stamping on arrival would say every transcript was current.
+            self.predict.noteText(text, at: self.fedMs)
             self.onText?(text, final)
         }
         apple = a
@@ -183,6 +219,23 @@ final class Subtitles {
     /// Safe to call from the audio thread: it filters, decimates and appends,
     /// and never allocates beyond the append.
     func feed(_ x: UnsafePointer<Float>, _ n: Int) {
+        // ── THE ENERGY TRACE, BEFORE ANY ENGINE GETS A SAY ────────────────────
+        //
+        // Above the branch on purpose. The prosody half of the prediction is the
+        // half that works when there is no recogniser at all -- no daemon, no
+        // system model, a machine still fetching its speech assets -- and putting
+        // it below the branch would have made it another thing that only runs
+        // once something else is ready.
+        let per = Int(Subtitles.RATE * 3 * 0.025)      // 25 ms at the 48 kHz input
+        var i = 0
+        while i < n {
+            if subLeft <= 0 { predict.noteEnergy(subPeak); subPeak = 0; subLeft = per }
+            let take = min(subLeft, n - i)
+            for k in i..<(i + take) { let a = abs(x[k]); if a > subPeak { subPeak = a } }
+            subLeft -= take
+            i += take
+        }
+        fedMs += Double(n) / (Subtitles.RATE * 3) * 1000
         // The Apple engine is fed even before `available` flips, because it comes
         // up asynchronously and its own stream tolerates being written to from
         // the first block. The daemon path must not: it would buffer audio for a
@@ -225,10 +278,76 @@ final class Subtitles {
     }
 
     /// Called while this end is talking; rate-limits itself.
-    func tick() {
-        if #available(macOS 26.0, *), apple is AppleSpeech { return }   // it streams
-        guard Date().timeIntervalSince(lastSentAt) * 1000 >= Subtitles.REVISE_MS else { return }
+    ///
+    /// The prediction is updated FIRST and unconditionally. It is not a property
+    /// of an engine -- the level is falling or it is not whether or not a
+    /// recogniser is up -- and every previous version of a conversation feature in
+    /// this file was accidentally gated behind something (`gate.on`, a daemon, an
+    /// engine choice) and reached nobody.
+    @discardableResult
+    func tick() -> Double {
+        let p = predictNow()
+        if #available(macOS 26.0, *), apple is AppleSpeech { return p }   // it streams
+        guard Date().timeIntervalSince(lastSentAt) * 1000 >= Subtitles.REVISE_MS else { return p }
         transcribe(final: false)
+        return p
+    }
+
+    /// ── WHERE THIS VALUE IS SUPPOSED TO GO, AND WHY IT DOES NOT YET ─────────
+    ///
+    /// The prior belongs to the FAR end's gate, not to this one. This machine's
+    /// gate holds THIS microphone down while the far end's voice is coming out of
+    /// this machine's speaker; the moment worth predicting is the far end's turn
+    /// ending, so that this microphone is already open when this person starts.
+    /// But only the speaker's own machine has their transcript -- and by the rule
+    /// in `subs.onText`, subtitles cross the wire only when the sender CANNOT be
+    /// heard, which is exactly not the case while they hold the floor.
+    ///
+    /// So the prior has to travel: computed where the words are, applied where the
+    /// gate is, one number per revision alongside the vocal status byte that
+    /// already crosses in `wire.onPeerVocal`. That is a change in Net.swift and
+    /// one `var` in `Audio.DuplexGate` -- neither of which is this lane's to
+    /// write, with four agents landing in those files at once.
+    ///
+    /// `dead-controls-declared-never-wired` says a callback that is declared and
+    /// invoked and assigned nowhere reads as finished and does nothing, so this is
+    /// deliberately NOT dressed up as wired. It is a measured value with a stated
+    /// consumer, printed under `KIN_PREDICT_DEBUG` so it can be watched on a real
+    /// call today, and `mac/tools/predict-check.sh` says how good it is.
+    ///
+    /// It is deliberately NOT published on `onComplete`. That hook carries
+    /// smart-turn's number, which reads the WAVEFORM and hears prosody no
+    /// transcript can recover, and its one consumer commits a caption -- a job the
+    /// system recogniser already does for itself with its own sentence
+    /// boundaries. Filling a hook because it is empty is how a value ends up
+    /// steering something it was never measured against.
+    private(set) var turnEndingSoon = 0.0
+
+    /// Split out from `tick` so the harness can drive it on a file's own clock
+    /// rather than on this machine's.
+    @discardableResult
+    private func predictNow() -> Double {
+        let p = predict.probability(nowMs: fedMs)
+        turnEndingSoon = p
+        if ProcessInfo.processInfo.environment["KIN_PREDICT_DEBUG"] != nil {
+            fputs(String(format: "predict %.2f  words %.2f  falling %.1f dB  going %.0f ms  quiet %.0f ms\n",
+                         p, predict.lastSyntax, predict.lastFall,
+                         predict.lastVocalMs, predict.lastQuietMs), stderr)
+        }
+        return p
+    }
+
+    /// Test seams. `predict-check.sh` feeds a recording through the SHIPPING
+    /// `feed` and the SHIPPING predictor, and only the clock is supplied from
+    /// outside -- a rig that reimplements the path is a rig that can pass over a
+    /// build where the path is broken.
+    func feedAt(_ x: UnsafePointer<Float>, _ n: Int, ms: Double) {
+        feed(x, n)
+        fedMs = ms
+    }
+    func predictAt(ms: Double) -> Double {
+        fedMs = ms
+        return predictNow()
     }
 
     private func transcribe(final: Bool) {
@@ -310,6 +429,7 @@ final class Subtitles {
             // nothing yet -- publishing it would blank a subtitle mid-sentence.
             guard !text.isEmpty || final else { return }
             if !text.isEmpty { self.lastText = text }
+            self.predict.noteText(text.isEmpty ? self.lastText : text, at: self.fedMs)
             self.onText?(text.isEmpty ? self.lastText : text, final)
         }.resume()
     }
