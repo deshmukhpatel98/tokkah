@@ -258,6 +258,30 @@ let KNOWN_FLAGS: Set<String> = [
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "headphone-test", "route", "contacts-fake",
 ]
+// ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
+//
+// Every `--*-test` below is pure computation -- a gate, a ledger, a filter, a
+// view -- and none of them need a socket, a microphone, a window or the user's
+// login item. They were getting all of it anyway, because they sit far down a
+// file that has already started an app by the time it reaches them. `tk
+// --gate-test` printed
+//
+//     watch: was stale: points at a different copy ...
+//
+// which is a unit test INSPECTING THE USER'S REAL LOGIN ITEM. Both agents
+// working on ringing had to invent isolation overrides to keep their tests off
+// it (`rig-isolation-that-does-not-isolate`), and this is the other half of that
+// problem: the tests that were never supposed to be near it.
+//
+// Not moved -- this file is top-level code and I have been caught by its
+// ordering twice today. The side effects are skipped instead, which is the part
+// that can actually hurt somebody.
+let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
+                  "subtitle-test", "decimator-test", "headphone-test"]
+let isTestRun = CommandLine.arguments.dropFirst().contains { a in
+  a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
+}
+
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
   if KNOWN_FLAGS.contains(name) { continue }
@@ -425,7 +449,7 @@ fputs("packet=\(FPP) frames (\(String(format: "%.2f", Double(FPP) / SR * 1000)) 
 // GRACE, NAMED, AND NOT SMALL: callIsLive() is false for the whole of call setup,
 // so a short first tick re-execs while the user is reading their invite link.
 let UPDATE_FIRST_CHECK_GRACE = 10.0
-if !flag("no-update") {
+if !flag("no-update"), !isTestRun {
   // A held update has to be visible or it is just a stall. The poller lands it by
   // itself the moment the call ends, so this is a notice and not a demand -- there
   // is a "Restart to update" item in the menu for anyone who would rather not wait.
@@ -474,12 +498,12 @@ if !flag("no-update") {
 // A handle nobody asked for, claimed on a thread nobody waits for. If this never
 // completes the app is exactly as usable as it was before handles existed, which
 // is the only acceptable cost for a convenience.
-Identity.start()
+if !isTestRun { Identity.start() }
 // Being callable is the point of having a handle, so an installed copy makes
 // itself reachable rather than waiting to be told. Only from /Applications
 // (Watch.install refuses anything else), only when absent or stale, and never on
 // a rig build -- --no-relocate marks a copy that is not somebody's install.
-if !flag("no-relocate") {
+if !flag("no-relocate"), !isTestRun {
   Thread {
     guard !Watch.healthy() else { Metrics.count("watch_present"); return }
     // Say WHY it is being rewritten. "installed" on a Mac that already had a
@@ -3905,6 +3929,7 @@ nonisolated(unsafe) var vPeerPausedSecs = 0
 nonisolated(unsafe) var vPeerPauses = 0
 nonisolated(unsafe) var lastPeerPaused = false
 nonisolated(unsafe) var lastPeerCamOff = false
+nonisolated(unsafe) var lastPeerMuted = false
 nonisolated(unsafe) var vqPrimed = false
 /// Separate from `vqPrimed`: the peer's baseline is only valid once the peer has
 /// actually reported. See the comment at the priming site.
@@ -4450,6 +4475,7 @@ func reportLoop() {
     vb["v_peer_paused_s"] = vPeerPausedSecs
     vb["v_peer_paused_now"] = lastPeerPaused ? 1 : 0
     vb["v_peer_cam_off"] = lastPeerCamOff ? 1 : 0
+    vb["a_peer_muted"] = lastPeerMuted ? 1 : 0
     // Which arm this call ran, so a pause that never happened can be told from a
     // pause that was switched off. An A/B with an unlabelled control arm is not
     // an A/B.
@@ -4565,10 +4591,6 @@ func reportLoop() {
     // alone: our own FEC repaired 4209 of 4443 outbound losses in the run above,
     // so watching only what survived would report a 3% path as healthy. A packet
     // that had to be repaired still did not arrive the first time.
-    // Our half of the peer report. Set here, once a second, on the thread that
-    // already computes all of this -- never from the send path, which runs at
-    // 375 packets a second and must not read main-thread state.
-    wire.selfMuted = display?.controls?.micMuted ?? false
     wire.selfQLevel = vq.level
     let pLost = wire.peerRxLost, pRec = wire.peerRxRecovered
     // ── THE FIRST REPORT IS A BASELINE, NOT A DELTA ───────────────────────────
@@ -4730,6 +4752,18 @@ func reportLoop() {
   // OR'd in, so a stale bit cannot survive the state changing -- an OR-only
   // status byte is a latch, and a latch is how "their camera is off" outlives
   // the moment they switched it back on.
+  // ── YOUR MUTE IS NOT A VIDEO FACT ────────────────────────────────────────
+  //
+  // This line lived inside `if let e = venc`, the VIDEO ENCODER block, because
+  // that is where the rest of the peer report is assembled. So a call with no
+  // camera -- `--video off`, a camera that refused to open, or an audio call by
+  // choice -- never told the far end you had muted. That is the call where mute
+  // matters MOST: there is no picture to read, so an unexplained silence is the
+  // only thing the other person has, and it looks exactly like a dead line.
+  //
+  // Fourth instance today of one condition answering two questions. "Do I have a
+  // video encoder" was deciding "does the other person find out I muted".
+  wire.selfMuted = display?.controls?.micMuted ?? false
   wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
                   | ((camOff || noCameraHere) ? Wire.ST_CAMOFF : 0)
   let pPaused = wire.peerVideoPaused, pCamOff = wire.peerCamOff
@@ -4748,7 +4782,13 @@ func reportLoop() {
     // was the only one of the two that happened silently.
     fputs("  picture: the far end's camera is \(pCamOff ? "OFF" : "on")\n", stderr)
   }
-  display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff)
+  let pMuted = wire.peerMuted
+  if pMuted != lastPeerMuted {
+    lastPeerMuted = pMuted
+    Metrics.count(pMuted ? "peer_muted" : "peer_unmuted")
+    fputs("  voice: the far end's microphone is \(pMuted ? "OFF" : "on")\n", stderr)
+  }
+  display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff, peerMuted: pMuted)
 
   // LAST in the loop, on purpose: every section above has now computed its
   // numbers, so the beat and the lines printed beside it cannot disagree about

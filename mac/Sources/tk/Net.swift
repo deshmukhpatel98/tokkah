@@ -874,6 +874,11 @@ final class Wire {
   // arbitrating and nothing to deadlock.
   static let ST_BACKCHAN = 4       // a listening noise: "mm-hm", not a bid
   static let ST_CLAIM    = 8       // this end wants to say something
+  // MUTE IS NOT IN THIS BYTE. It rides at TPKTX+4 as its own byte and has since
+  // before this one existed -- see `selfMuted`/`peerMuted` above. Noted here
+  // because "the status byte" reads like the complete list of what one end tells
+  // the other, and it is not.
+
   var selfStatus = 0
   /// What the far end's status byte says. Both are false against a build that
   /// predates the byte, which is correct: it never pauses and never reports.

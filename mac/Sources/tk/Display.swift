@@ -454,7 +454,7 @@ final class Display {
   // of the view tree is hopped onto main. Idempotent by design -- it is called
   // with the same values sixty times a minute and must do nothing on all but the
   // transitions.
-  func setPaused(peer: Bool, selfSide: Bool, peerCamOff camOff: Bool) {
+  func setPaused(peer: Bool, selfSide: Bool, peerCamOff camOff: Bool, peerMuted muted: Bool) {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       let hideBlur = !peer
@@ -489,7 +489,15 @@ final class Display {
       // was a diagnostics panel and it was removed for being one. This is a
       // sentence a person acts on.
       let line: String
-      if peer && camOff {
+      // MUTE FIRST. It is the most actionable thing on this list -- you are
+      // talking to somebody who cannot be heard, and every second you keep going
+      // is wasted. A weak link is worth saying and it is worth saying second; it
+      // comes back on its own the moment they unmute.
+      if muted && camOff {
+        line = "their microphone and camera are off"
+      } else if muted {
+        line = "their microphone is off"
+      } else if peer && camOff {
         line = "their camera is off and their connection is weak"
       } else if peer {
         line = "their connection is weak \u{2014} video paused, audio is still on"
