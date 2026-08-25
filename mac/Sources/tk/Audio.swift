@@ -960,9 +960,21 @@ final class Audio {
   private(set) var outputName = ""
   private(set) var onSpeakers = true
   static var gateAuto = true
+  /// ── PINNING THE ROUTE, BECAUSE THE ROUTE CANNOT BE PLUGGED IN ────────────
+  ///
+  /// The headphone path is now most of the product -- the classifier, the cues,
+  /// the captions and the cleaner all behave differently on it -- and it is
+  /// reached by putting on a pair of headphones, which no test can do. Without
+  /// this, the only headphone evidence available on this machine is a unit test,
+  /// and `handler-tests-cannot-see-interaction-bugs` is the whole history of
+  /// this project.
+  ///
+  /// Production never sets it, so the guard below is unchanged there.
+  static var routeForced: Bool?
 
   func checkOutputRoute() {
-    let (name, speakers) = Audio.outputDevice()
+    var (name, speakers) = Audio.outputDevice()
+    if let f = Audio.routeForced { speakers = f; name = "\(name) [forced \(f ? "speakers" : "headphones")]" }
     guard name != outputName || speakers != onSpeakers else { return }
     let firstLook = outputName.isEmpty
     outputName = name

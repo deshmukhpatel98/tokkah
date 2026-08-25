@@ -256,7 +256,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
-  "headphone-test",
+  "headphone-test", "route",
 ]
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -2127,6 +2127,15 @@ if flag("no-yield") { Audio.gate.yieldOn = false }
 if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
 if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
 if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
+// `--route headphones` on a machine with no headphones. The route decides the
+// classifier, the cues, the captions and the cleaner, so it has to be reachable
+// from a rig or half the product is only ever unit-tested.
+if let r = arg("route") {
+  guard r == "speakers" || r == "headphones" else {
+    fputs("--route takes `speakers` or `headphones`, not \(r)\n", stderr); exit(2)
+  }
+  Audio.routeForced = (r == "speakers")
+}
 if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
 if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
 
