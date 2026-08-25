@@ -496,9 +496,15 @@ enum Launcher {
     settingsButton.onPress = {
       // The exact pane, not the top of Settings: "go and find it" is how a person
       // gives up on an app.
-      if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
-        NSWorkspace.shared.open(u)
-      }
+      //
+      // The URL used to be typed here. It moved to Permissions.swift for two
+      // reasons: the microphone needed the same treatment and had none, so there
+      // would have been two copies of a string whose silent rot cannot be
+      // detected at runtime; and a pane identifier that goes stale opens the TOP
+      // of System Settings while every return value says success, so the one
+      // place it lives is also the place that carries the measurement proving it
+      // lands where it claims.
+      Permissions.reveal(.camera)
     }
     v.addSubview(settingsButton)
 
