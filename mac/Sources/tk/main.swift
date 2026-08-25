@@ -2217,6 +2217,79 @@ if let room = arg("room") {
           Metrics.fact("outcome", "talked")
           Metrics.fact("path", wire.lockedFrom.hasPrefix("relay") ? "relay" : "direct")
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
+          // ── AND THE PERSON WE CALLED GOES IN THE LIST ──────────────────────
+          //
+          // The mirror of the answer path, which writes a contact down the moment
+          // somebody presses answer. `remember` had exactly one call site and it
+          // was that one, so this app recorded a person only when THEY rang YOU:
+          // place the call yourself and nobody was written down, and two people
+          // who met on a link never recorded each other at all. The People panel
+          // promised "call someone once and they'll show up here" over a list
+          // that could only ever fill up for the person who never calls.
+          //
+          // ── WHY HERE AND NOT WHEN THE RING WAS SENT ───────────────────────
+          //
+          // The answer path binds on ANSWER rather than on arrival "because
+          // binding a name to a key when the ring merely turns up would let
+          // whoever rings first own the name". The caller's version of that
+          // question is different, because the caller TYPED the name -- nobody
+          // can claim it out from under them. What the caller can get wrong is
+          // whether the call happened at all: a mistyped handle that happens to
+          // exist, or a person who never picks up, would land in the panel for
+          // ever after one dial that went nowhere. So the equivalent safe moment
+          // is not "we sent the ring" (a 200 only means it reached a mailbox) but
+          // THIS line -- the far end is locked, and `heard && !wire.peerRinging`
+          // above says the far end has told us it is not merely being asked. That
+          // is a person on the other end, which is what "someone you have called"
+          // is supposed to mean.
+          //
+          // ── AND A NAME, NEVER A KEY ────────────────────────────────────────
+          //
+          // `rememberCalled` writes to `called.json` and cannot reach
+          // `contacts.json`. There is no key to write: the doorbell hands the
+          // caller nothing back, and the key on this very socket is an ephemeral
+          // X25519 one that nobody signed. Writing that key here would seed
+          // `known` -- the flag that opens a socket to a caller BEFORE anybody
+          // agrees to talk to them -- off a value a man in the middle picks. A
+          // name is what we honestly have, so a name is what gets stored.
+          //
+          // ── AND IT SURVIVES THE RE-EXEC BY NOT RACING IT ──────────────────
+          //
+          // `Launcher.reexec` is `execv`; it replaces this image on the next
+          // line, and a background thread writing the contact file when that
+          // happens is killed mid-write. Placing a call re-execs -- which is why
+          // nothing is written before it. The name is carried across in argv as
+          // `--calling`, and this line runs in the SUCCESSOR image, where every
+          // `reexec` call site is already behind us (gui prompt, url, call
+          // placed, ring answered all run before the rendezvous). The write is
+          // synchronous on this thread for the same reason the answer path's is.
+          //
+          // `gCalling` is set from `--calling` and nothing else, and the only
+          // thing that passes `--calling` is the re-exec after the server
+          // accepted our signed ring. A link-joined call has no `gCalling`, so it
+          // writes nobody -- see below.
+          if let c = gCalling, !c.who.isEmpty { Identity.rememberCalled(c.who) }
+          // ── TWO PEOPLE WHO MET ON A LINK RECORD NOTHING, ON PURPOSE ───────
+          //
+          // Asked directly: should an hour on a link mean you can call each other
+          // by name afterwards? No, and not because it would be unsafe to want it
+          // -- because there is no name. A room code is a CAPABILITY, not an
+          // identity: `Rendezvous.exchange` sends `me=mac-<pid>` and gets back IP
+          // addresses, the media handshake carries an unsigned ephemeral key and
+          // "no identity, no room code, nothing that is worth anything to a
+          // listener", and neither end ever utters a handle. Whoever holds the
+          // link joined; the app never learned who that is.
+          //
+          // So the choice is not between recording them and not recording them.
+          // It is between recording nothing and INVENTING an identity for a
+          // stranger -- and an entry in the People panel is a promise that
+          // tapping it reaches that person. There is nothing to tap here. The
+          // honest fix for link-joined calls is for one of them to ring the other
+          // by name once, which is a thing they can already do and which lands in
+          // exactly the two files above.
+          //
+          // Deliberately silent rather than a log line: a link call is the
+          // ordinary case, and "recorded nobody" is not news every time.
           // ── NOT `if sawRemote`. THE LOCK IS THE ARRIVAL. ──────────────────
           //
           // A locked transport with packets flowing IS the other person being
