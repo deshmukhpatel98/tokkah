@@ -76,6 +76,26 @@ N="$(grep -c 'ring: listening' "$SP/b.log")"
 if [ "$N" = 1 ]; then echo "   ok   and exactly one poll thread ($N)"
 else echo "  WRONG $N doorbell threads -- they will steal rings from each other"; bad=1; fi
 
+# ── AND CAN A BRAND-NEW USER PLACE ONE? ─────────────────────────────────────
+#
+# The mirror of the bug above, found while measuring ring latency on production.
+# `Identity.ring` refused outright unless a handle was already claimed, and a
+# first install spends 5-8 seconds walking @devesh, @deveshp, @devesh2 ... before
+# it owns one. So: launch Kin, type a friend's name, press call -- and the first
+# thing the app ever does is fail. A one-shot read of a value that arrives later,
+# exactly like the doorbell above it.
+export TK_KIN_DIR="$SP/kin-caller"
+rm -rf "$TK_KIN_DIR"
+if "$TK" --handle "kinrigcall$$" --ring-only "kinrig-nobody-$$" > "$SP/c.log" 2>&1; then
+  : # a ring to a handle nobody owns should NOT succeed
+fi
+if grep -q "this Mac has no handle yet" "$SP/c.log"; then
+  echo "  WRONG a fresh install cannot place a call at all"
+  bad=1
+else
+  echo "   ok   a fresh install gets a name before it needs one"
+fi
+
 [ "$bad" = 0 ] && echo "  FIRST-RUN RING CHECK PASSED -- a new user is reachable without restarting Kin" \
                 || echo "  FIRST-RUN RING CHECK FAILED"
 exit $bad

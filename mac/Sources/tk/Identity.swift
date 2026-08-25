@@ -277,7 +277,41 @@ enum Identity {
   /// working. Everything else -- a 429, a timeout, a 500 -- is about US, and
   /// moving to the next name because the network hiccuped would silently rename
   /// someone who already owns `devesh`.
+  /// True while `claim()` is walking the ladder. Read by `awaitClaim`, which is
+  /// how `ring()` stops failing during the several seconds a first install spends
+  /// asking the server for a name.
+  nonisolated(unsafe) private(set) static var claiming = false
+  private static let claimGate = NSLock()
+
+  /// Wait up to `secs` for a claim that is already in flight, and start one if
+  /// none is. CALL THIS OFF THE MAIN THREAD -- it blocks.
+  ///
+  /// A first install spends 5 to 8 seconds walking @devesh, @deveshp, @devesh2
+  /// ... before it owns a name, and `ring()` refused outright for the whole of
+  /// that window: launch Kin, type a friend's handle, press call, and the first
+  /// thing the app ever does is fail. Same shape as the doorbell that would not
+  /// start on a first install -- a one-shot read of a value that arrives later.
+  @discardableResult
+  static func awaitClaim(_ secs: Double) -> Bool {
+    if claimed { return true }
+    claimGate.lock()
+    let needStart = !claiming && !claimed
+    claimGate.unlock()
+    if needStart { Thread { claim() }.start() }
+    let deadline = Date().addingTimeInterval(secs)
+    while !claimed, Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.05)
+      if !claiming, !claimed { break }        // it finished, and it failed
+    }
+    return claimed
+  }
+
   static func claim() {
+    claimGate.lock()
+    if claiming { claimGate.unlock(); return }   // one ladder at a time
+    claiming = true
+    claimGate.unlock()
+    defer { claimGate.lock(); claiming = false; claimGate.unlock() }
     var s = ensure()
     // Already settled: refresh the lease under the SAME name and stop.
     if s.claimed {
@@ -498,7 +532,11 @@ enum Identity {
     guard let to = sanitize(raw) else {
       fputs("ring: @\(raw) is not a handle\n", stderr); return nil
     }
-    let s = ensure()
+    var s = ensure()
+    // A name is the return address on the ring, so there is no ringing without
+    // one. Every caller of this is already off the main thread (`onCall` spawns
+    // a Thread precisely because this signs and makes an HTTPS round trip).
+    if !s.claimed { Identity.awaitClaim(6); s = ensure() }
     guard s.claimed else { fputs("ring: this Mac has no handle yet\n", stderr); return nil }
     guard to != s.handle else { fputs("ring: that is you\n", stderr); return nil }
     guard let url = URL(string: "\(base)/api/kin/\(to)/ring"),
