@@ -170,6 +170,19 @@ function analyse(c) {
   if (ev.ring_no_window) faults.push(ev.ring_no_window + ' ring(s) had no window to show');
   if (ev.watch_install_fail) faults.push('this Mac CANNOT be rung while Kin is closed');
   if (ev.ring_sent_fail) faults.push(ev.ring_sent_fail + ' dialled call(s) never reached the server');
+  // The ring preview failing leaves no trace anywhere else on this page: the
+  // card still appears and both buttons still work, so a black rectangle where
+  // a face should be is a fault nobody on either end would ever report.
+  if (ev.ring_preview_off) faults.push('the ring card could NOT show who was calling');
+  if (ev.ring_preview_picture && num(c.v_frags) > 0 && !num(c.v_decoded)) {
+    faults.push('their video reached the ring card and NOT ONE frame was decoded');
+  }
+  if (ev.ring_preview_picture && num(c.v_decoded) > 0 && num(c.v_shown) === 0) {
+    faults.push('the caller\u2019s picture was decoded and NEVER DRAWN on the ring card');
+  }
+  if (ev.ring_preview && (num(c.cap_callbacks) || num((c.marks || {}).cam_first_frame_ms) !== null)) {
+    faults.push('a RING NOBODY ANSWERED opened the microphone or the camera');
+  }
   // A button that was pressed and did nothing. The user asked for exactly this.
   Object.keys(tapf).forEach((k) => faults.push(
     tapf[k] + '× "' + k + '" was pressed and did NOT work'));
@@ -208,6 +221,21 @@ const EVENT_WORDS = {
   ring_front_ok: 'the ring came to the front',
   ring_front_fail: 'the ring stayed behind other windows',
   ring_no_window: 'the ring had no window',
+  // ── SEEING WHO IS CALLING, BEFORE ANSWERING ───────────────────────────────
+  //
+  // A Mac that is being rung now joins the room and takes the caller's picture
+  // while the card is still asking, so somebody can see who it is before
+  // deciding. It sends nothing back -- no microphone, no camera, no sound
+  // played -- and it tells the caller it is only RINGING, so that packets
+  // arriving are not read as somebody having said yes.
+  ring_offered: 'somebody was asked here whether to take a call',
+  ring_preview: 'the card could show who was calling',
+  ring_preview_off: 'the card could NOT show who was calling -- a name and nothing else',
+  ring_preview_picture: 'the caller\u2019s video reached the ring card',
+  peer_ringing_seen: 'the far end said it was still RINGING, not answered',
+  ring_tone_apple: 'rang with Apple\u2019s own ringtone',
+  ring_tone_fallback: 'no ringtone on this Mac -- a system alert instead',
+  ring_tone_muted: 'the ring made NO SOUND -- this copy was muted',
   ring_answered: 'answered',
   ring_declined: 'declined',
   ring_key_changed: 'the caller rang with a DIFFERENT key',
@@ -225,6 +253,45 @@ const EVENT_WORDS = {
   peer_video_resume: 'their video came back',
   peer_cam_off: 'they turned their camera off',
   peer_cam_on: 'they turned their camera back on',
+  peer_muted: 'they muted their microphone',
+  peer_unmuted: 'they unmuted',
+  peer_left: 'the other person left',
+  rediscoveries: 'they went quiet and had to be found again at a new address',
+  // ── Hanging up, which used to be something nobody could see ───────────────
+  bye_sent_try: 'told them the call was off',
+  bye_sent_ok: 'and they were told',
+  bye_sent_fail: 'and telling them FAILED -- they waited out the timeout',
+  bye_recv_calling: 'they hung up on us before we gave up',
+  bye_recv_ringing: 'the caller stopped calling while this Mac was ringing',
+  bye_recv_stale: 'a hang-up arrived for a call this Mac was not on',
+  ring_kind_unknown: 'a message this version does not understand was dropped',
+  ring_timed_out: 'we rang for 45 seconds and nobody answered',
+  ring_to_self: 'tried to call THEMSELVES',
+  call_again: 'tried the same person again',
+  // ── The doorbell's own health ─────────────────────────────────────────────
+  ring_malformed: 'a malformed ring was dropped',
+  ring_unverified: 'a ring FAILED VERIFICATION and was never shown',
+  poll_ok: 'checked for calls',
+  poll_refused: 'the doorbell REFUSED this Mac (401/403) -- it cannot be called',
+  poll_rate: 'the doorbell rate-limited this Mac',
+  poll_no_answer: 'the doorbell could not be reached at all',
+  poll_error: 'the doorbell answered with an error',
+  // ── Clicks nobody aimed ───────────────────────────────────────────────────
+  card_click_unaimed: 'a click nobody aimed was refused (the window took somebody\u2019s tap)',
+  card_first_mouse_refused: 'a click that only brought Kin forward was refused',
+  // ── Permissions, which are the difference between silence and a call ──────
+  mic_denied: 'MICROPHONE DENIED -- they hear nothing from this end',
+  mic_granted: 'microphone allowed',
+  cam_denied: 'CAMERA DENIED -- audio only from this end',
+  // ── How loud the microphone was set, which nothing on the call reveals ────
+  mic_gain_low: 'the microphone input was set BELOW A THIRD -- quiet, and it distorts',
+  mic_gain_moved: 'the input level was moved to stop it clipping',
+  // ── Being reachable with Kin closed ───────────────────────────────────────
+  watch_turned_on: 'switched ON calls-when-closed from the panel',
+  watch_turned_off: 'switched OFF calls-when-closed from the panel',
+  watch_turn_on_fail: 'switching calls-when-closed on FAILED',
+  watch_fix_move: 'asked to move Kin to Applications',
+  watch_fix_loginitems: 'sent to Login Items to switch Kin back on',
 };
 const MARK_WORDS = {
   cam_first_frame_ms: 'camera first frame',
@@ -235,6 +302,11 @@ const MARK_WORDS = {
   ring_front_ms: 'ring reached the front',
   ring_recv_ms: 'ring arrived',
   ring_sent_ms: 'ring sent',
+  ring_preview_ms: 'the caller\u2019s picture reached the ring card',
+  answered_ms: 'answered',
+  bye_recv_ms: 'heard they had hung up',
+  cancelled_ms: 'cancelled',
+  declined_ms: 'declined',
 };
 // The camera, its pixel format, the encoder, the audio devices. Names, because
 // "dmb1" is Motion JPEG and nobody reading a dashboard at speed knows that.
@@ -245,9 +317,44 @@ const PIXFMT_WORDS = {
   jpeg: 'JPEG -- already compressed before we re-encode it',
   '2vuy': 'raw video (2vuy)',
 };
+// `mic_mode_wanted` is a raw AVCaptureDevice.MicrophoneMode, and a bare 0/1/2
+// on a dashboard is not a finding. It is only written when the wanted mode and
+// the active one disagree, so this row always means "they asked for something
+// and did not get it".
+const MIC_MODE_WANTED = {
+  '0': 'standard',
+  '1': 'wide spectrum',
+  '2': 'Voice Isolation',
+};
+// One line for "how did this call go", built from the facts the app now writes
+// at each ending. Kept as words rather than a code: this row is the first thing
+// read and the only one somebody skimming will read at all.
+const OUTCOME_WORDS = {
+  talked: 'they talked',
+  calling: 'still ringing when this ended -- nobody picked up',
+  'no answer': 'rang for 45 seconds, nobody answered',
+  cancelled: 'the caller cancelled',
+  declined: 'declined',
+  'they said no': 'the other end hung up before it connected',
+  'could not ring them': 'THE RING NEVER GOT THROUGH',
+  'being asked': 'somebody was rung here and never answered or declined',
+  answered: 'answered -- see the row this one continues',
+  'they hung up before this Mac answered': 'the caller gave up while this Mac was ringing',
+};
 function ledgerOf(c) {
   const rows = [];
   const fx = c.facts || {};
+  if (fx.outcome) rows.push(['how it went', OUTCOME_WORDS[fx.outcome] || fx.outcome]);
+  if (fx.path) rows.push(['route', fx.path === 'relay' ? 'through a RELAY (a detour on every packet)' : 'straight to them']);
+  if (fx.reachable_closed) {
+    rows.push(['reachable with Kin closed',
+      fx.reachable_closed === 'yes' ? 'yes' : 'NO -- ' + (fx.reachable_why || 'unknown')]);
+  }
+  if (fx.mic_access === 'denied' || fx.cam_access) {
+    rows.push(['permissions',
+      (fx.mic_access === 'denied' ? 'microphone DENIED' : 'microphone ok')
+      + (fx.cam_access ? ' · camera ' + fx.cam_access : '')]);
+  }
   if (fx.cam) {
     rows.push(['camera', fx.cam + (fx.cam_kind ? ' (' + fx.cam_kind + ')' : '') +
       (fx.cam_mode ? ' · ' + fx.cam_mode : '') +
@@ -257,6 +364,40 @@ function ledgerOf(c) {
   if (fx.mic_dev || fx.spk_dev) {
     rows.push(['audio devices', (fx.mic_dev || '?') + ' → ' + (fx.spk_dev || '?')
       + (fx.mic_mode ? ' · mic mode ' + fx.mic_mode : '')]);
+  }
+  // Written only when the mode the person picked in Control Center is NOT the
+  // one the audio was recorded under -- the header says the active mode differs
+  // when the route cannot honour the preference. So the key existing IS the
+  // finding, and it explains two calls on one Mac sounding nothing alike.
+  if (fx.mic_mode_wanted) {
+    rows.push(['mic mode they asked for',
+      (MIC_MODE_WANTED[fx.mic_mode_wanted] || fx.mic_mode_wanted)
+      + ' -- the route would not give it, so this call ran '
+      + (fx.mic_mode || 'something else')]);
+  }
+  // SPEAKERS OR HEADPHONES, and it is not a detail: on speakers the sound goes
+  // into the room and back into the microphone, which is the whole reason the
+  // duplex gate exists. Every echo and turn-taking number in this record means
+  // something different depending on this one word, and it was never shown.
+  if (fx.output_route) {
+    rows.push(['they were listening on', fx.output_route === 'speakers'
+      ? 'SPEAKERS -- sound went into the room and back into the microphone'
+      : 'headphones -- nothing leaked back into the microphone']);
+  }
+  // "It sounds quiet" and "it sounds distorted" are the same fault below about a
+  // third: the gain control makes up the difference and overshoots into clipping.
+  if (fx.mic_gain || fx.mic_gain_end || fx.agc) {
+    rows.push(['microphone level',
+      (fx.mic_gain ? 'set to ' + fx.mic_gain : 'unreadable')
+      + (fx.mic_gain_end && fx.mic_gain_end !== fx.mic_gain
+          ? ' → moved to ' + fx.mic_gain_end : '')
+      + (fx.agc ? ' · automatic gain ' + fx.agc : '')]);
+  }
+  if (fx.presence) {
+    rows.push(['how close they sounded', fx.presence
+      + (fx.presence_tail_ms
+          ? ' · reflections out to ' + fx.presence_tail_ms + ' ms, which lengthens the echo path'
+          : '')]);
   }
   const taps = c.taps || {}, fails = c.tap_fails || {};
   const pressed = Object.keys(taps).sort();
@@ -314,6 +455,170 @@ function verdicts(c) {
   const add = (sev, what, why, fix) => v.push({ sev, what, why, fix });
   const f = c.facts || {};
   const n = (k) => num(c[k]);
+  const ev = c.events || {};
+  const e = (k) => ev[k] || 0;
+
+  // ── CAN THIS PERSON BE CALLED AT ALL ─────────────────────────────────────
+  //
+  // First, above everything about how a call sounded, because a call that never
+  // happens has no audio to judge. Every rule here is about the doorbell rather
+  // than the media, and each one is a way somebody is quietly unreachable.
+  if (f.reachable_closed === 'no') {
+    add(2, 'this Mac cannot be rung when Kin is closed',
+        f.reachable_why || 'the login item is not running',
+        'the panel now offers the fix in one tap -- Calls when Kin is closed.'
+          + ' If it says Applications, the copy is somewhere Watch.install refuses.');
+  }
+  if (e('poll_refused')) {
+    add(3, 'the doorbell refused this Mac',
+        e('poll_refused') + ' polls came back 401/403 -- nobody can ring this handle',
+        'Identity: the registration credential. A handle whose poll is refused is'
+          + ' a person who has silently stopped receiving calls.');
+  }
+  if (e('poll_no_answer') >= 3) {
+    add(2, 'the doorbell could not be reached',
+        e('poll_no_answer') + ' polls got no answer at all',
+        'network, or room.tokkah.com. Calls placed to this Mac land in a mailbox'
+          + ' nobody is draining.');
+  }
+  if (e('ring_unverified')) {
+    add(3, 'a ring failed verification and was never shown',
+        e('ring_unverified') + ' rings arrived signed by a key that did not check out',
+        'Identity.ringMessage -- either somebody is forging rings, or the two ends'
+          + ' disagree about what is signed. A version skew here looks exactly'
+          + ' like "they called and my Mac never rang".');
+  }
+  if (e('ring_kind_unknown')) {
+    add(1, 'a newer Kin sent something this one does not understand',
+        e('ring_kind_unknown') + ' messages were dropped unread',
+        'expected while a new message kind is rolling out; it means this copy is'
+          + ' the older half of the pair.');
+  }
+
+  // ── SEEING WHO IS CALLING ────────────────────────────────────────────────
+  //
+  // A Mac that is being rung now joins the room and takes the caller's picture
+  // while the card is still asking. Every way that fails is SILENT: the card
+  // still appears, both buttons still work, and nobody who missed the face ever
+  // thinks to report it -- so it has to be found here or not at all.
+  const frags = n('v_frags'), decoded = n('v_decoded'), shown = n('v_shown');
+  if (e('ring_preview_picture') && frags !== null && frags > 0) {
+    if ((decoded ?? 0) === 0) {
+      add(3, 'the ring never showed who was calling',
+          frags + ' pieces of their video arrived while this Mac was ringing and'
+            + ' not one frame was decoded',
+          'the decode path a ring runs -- the assembler in Net.swift and'
+            + ' DecodeQueue. A ring receives and does nothing else, so a preview'
+            + ' with no picture has very few places left to be wrong.');
+    } else if (shown !== null && shown === 0) {
+      add(3, 'the caller\u2019s picture was decoded and never drawn',
+          decoded + ' frames were decoded and none of them reached the screen',
+          'Display -- the ring card is drawn OVER the picture, and a decode with'
+            + ' no draw is the card covering the one thing it exists to show.');
+    }
+  }
+  if (e('ring_preview_off')) {
+    add(2, 'somebody was rung with no way to see who it was',
+        'the ring came up with the preview off -- a name on a card and nothing else',
+        'the ring bring-up in main.swift: either no --room arrived with the ring'
+          + ' (an older caller, or the watcher dropping it), or TK_RING_PREVIEW=0,'
+          + ' or --no-ring-preview. Only the last two are somebody choosing it.');
+  }
+  // ── AND IT MUST SEND NOTHING ─────────────────────────────────────────────
+  //
+  // No microphone, no camera, no sound played, until a person says yes. That is
+  // the half of this feature nobody on the call can check for themselves, and
+  // the half where being wrong is not a defect but a broken promise.
+  if (e('ring_preview')) {
+    const leaked = [];
+    if (n('cap_callbacks')) {
+      leaked.push('the microphone was capturing (' + n('cap_callbacks') + ' callbacks)');
+    }
+    if (num((c.marks || {}).cam_first_frame_ms) !== null) {
+      leaked.push('the camera produced a frame at '
+        + (c.marks || {}).cam_first_frame_ms + ' ms');
+    }
+    if (n('played')) {
+      leaked.push(n('played') + ' samples of the caller\u2019s voice were played into the room');
+    }
+    if (leaked.length) {
+      add(3, 'a ring nobody had answered opened this Mac up anyway',
+          leaked.join(' · '),
+          'main.swift: audio.start() is skipped while a ring is only being offered'
+            + ' and the camera bring-up is gated on the same thing. One of those'
+            + ' two gates did not hold, and they are the whole of what makes the'
+            + ' card\u2019s promise true.');
+    }
+  }
+  // The bit that stops a ring answering itself. A Mac that is only being ASKED
+  // still punches a hole and still sends packets, and packets arriving is what
+  // this app has always read as "they are here" -- which is exactly how a ring
+  // answered itself once already.
+  if (e('ring_sent_ok') && e('connects') && n('peer_state_reports') === 0) {
+    add(3, 'we called it connected without ever being told they had answered',
+        'this Mac dialled, the far end joined the room, and no status word ever'
+          + ' came back from it -- connected was declared on the two-second'
+          + ' deadline alone',
+        'the RINGING bit in Net.swift. Either the far end predates the bit, or it'
+          + ' stopped being sent -- and the second one is the ring answering'
+          + ' itself again, with a card that comes down before anybody agrees.');
+  }
+  if (e('ring_tone_muted') && !e('ring_tone_apple') && !e('ring_tone_fallback')) {
+    add(1, 'the ring made no sound',
+        'the card was drawn and this copy was muted, so nothing was heard',
+        '--mute, TK_MUTE=1 or TK_NO_RAISE=1. Every test rig passes one of those,'
+          + ' so this is expected on a rig and a missed call on anybody else\u2019s Mac.');
+  }
+
+  // ── HANGING UP ───────────────────────────────────────────────────────────
+  if (e('bye_sent_fail')) {
+    add(2, 'the other end was never told the call was off',
+        e('bye_sent_fail') + ' hang-ups failed to send',
+        'they sat watching a card that said Calling until the 45 s timeout --'
+          + ' which is the exact complaint the bye was built to fix.');
+  }
+  if (e('ring_timed_out')) {
+    add(1, 'nobody answered',
+        'rang for 45 seconds',
+        'not a defect on its own. It is one if it pairs with the callee never'
+          + ' recording ring_recv -- then the ring never arrived.');
+  }
+  if (e('bye_recv_stale')) {
+    add(1, 'a hang-up arrived for a call this Mac was not on',
+        e('bye_recv_stale') + ' of them',
+        'ordinary for a message that outlived its call. Worth looking at if it'
+          + ' happens while a call IS in flight -- the two ends would then'
+          + ' disagree about which room they are in.');
+  }
+
+  // ── CLICKS NOBODY AIMED ──────────────────────────────────────────────────
+  if (e('card_click_unaimed') || e('card_first_mouse_refused')) {
+    add(1, 'the ring window took somebody\u2019s click',
+        (e('card_click_unaimed') + e('card_first_mouse_refused'))
+          + ' clicks were refused because nothing suggested anybody aimed them',
+        'these were REFUSED, so nothing bad happened -- but each one is a person'
+          + ' whose tap went somewhere they did not expect, because Kin threw a'
+          + ' window in front of what they were doing.');
+  }
+
+  // ── PERMISSIONS ──────────────────────────────────────────────────────────
+  if (f.mic_access === 'denied') {
+    add(3, 'the microphone was never allowed',
+        'macOS denied it, so the far end heard silence for the whole call',
+        'System Settings > Privacy & Security > Microphone. Nothing in the audio'
+          + ' path can fix this and every audio number below is meaningless.');
+  }
+  if (f.cam_access && f.cam_access !== 'authorized') {
+    add(2, 'the camera was never allowed',
+        'macOS said ' + f.cam_access + ' -- this end was audio only',
+        'System Settings > Privacy & Security > Camera.');
+  }
+  if (f.outcome === 'could not ring them') {
+    add(3, 'the ring never got through',
+        'the doorbell would not take it',
+        'Identity.ring -- the status is in the app log. A person who dials a name'
+          + ' and gets nothing has no other way to reach that person.');
+  }
 
   // ── Audio ────────────────────────────────────────────────────────────────
   //

@@ -717,6 +717,16 @@ final class Wire {
   /// `locked`, is what "connected" means -- a remembered address is a claim about
   /// the past, and the only evidence a path still works is traffic on it.
   private(set) var lastRecvHost: UInt64 = 0
+  /// The last packet from THE ADDRESS THIS END IS LOCKED TO, which is a different
+  /// question from `lastRecvHost` and the only honest input to "have they gone".
+  ///
+  /// Answering a ring re-execs the callee, and the new image can come from a new
+  /// address -- a fresh TURN allocation always does. The caller stays locked to
+  /// the dead one, while the new one's probes keep refreshing `lastRecvHost` on
+  /// every packet, so a silence detector reading that stamp never fires: media
+  /// goes on being sent to an address nobody is at, forever. Liveness is
+  /// last-heard-from THE PEER, never last-heard-from anybody.
+  private(set) var lastFromPeer: UInt64 = 0
   private(set) var relocks = 0
   private var pathRtt: [String: Double] = [:]
   private var pathAddr: [String: sockaddr_in] = [:]
@@ -874,6 +884,15 @@ final class Wire {
   // arbitrating and nothing to deadlock.
   static let ST_BACKCHAN = 4       // a listening noise: "mm-hm", not a bid
   static let ST_CLAIM    = 8       // this end wants to say something
+  // ── PRESENT IS NOT THE SAME AS ANSWERED ───────────────────────────────────
+  //
+  // A Mac that is only being ASKED now joins the room and receives, so that the
+  // person can see who is calling before deciding. It sends no audio and no
+  // video -- but it does punch a hole, and packets arriving from an address is
+  // exactly what this app has always taken for "they are here". That reading is
+  // what made a ring answer itself once already. So the asking end says so, and
+  // every conclusion drawn from arrival has to consult this bit first.
+  static let ST_RINGING  = 16      // this end is being asked and has not said yes
   // MUTE IS NOT IN THIS BYTE. It rides at TPKTX+4 as its own byte and has since
   // before this one existed -- see `selfMuted`/`peerMuted` above. Noted here
   // because "the status byte" reads like the complete list of what one end tells
@@ -886,6 +905,14 @@ final class Wire {
   var peerCamOff: Bool { peerStatus & Wire.ST_CAMOFF != 0 }
   var peerBackchannel: Bool { peerStatus & Wire.ST_BACKCHAN != 0 }
   var peerClaim: Bool { peerStatus & Wire.ST_CLAIM != 0 }
+  /// The far end is looking at a ring card, not at you. False against every build
+  /// that predates the bit -- correct, because those never joined before
+  /// answering, so their arrival really did mean answered.
+  var peerRinging: Bool { peerStatus & Wire.ST_RINGING != 0 }
+  /// Has a status byte ever arrived from the far end? False both for a peer that
+  /// has said nothing yet and for a build older than the byte -- so a caller
+  /// waiting on it needs a deadline as well.
+  private(set) var peerStatusSeen = false
   var peerVocal: Bool { peerStatus & (Wire.ST_BACKCHAN | Wire.ST_CLAIM) != 0 }
   /// 0 quiet, 1 listening noise, 2 bid for the floor. Fires only when it changes.
   var onPeerVocal: ((Int) -> Void)?
@@ -985,6 +1012,18 @@ final class Wire {
     guard locked else { return }
     locked = false
     lockedFrom = ""
+    // ── AND FORGET WHAT THE OLD PROCESS SAID ABOUT ITSELF ────────────────────
+    //
+    // Answering a ring RE-EXECS the callee, so the peer this end is about to
+    // rediscover is a different image of the same app -- one that is no longer
+    // ringing. Keeping `peerStatus` across that gap would leave `ST_RINGING` set
+    // against a process that has answered, and the caller's microphone is zeroed
+    // on exactly that bit: the first words after somebody picks up would be
+    // silence, for as long as it took the new image's first probe to arrive.
+    // A status is a statement by a particular process, and this is the line
+    // where that process stops existing as far as this end is concerned.
+    peerStatus = 0
+    peerStatusSeen = false
     // Not nested inside `pathLock` below: nothing takes both, and keeping them
     // sequential means no future caller can invent a lock-order deadlock here.
     candLock.lock()
@@ -1001,6 +1040,10 @@ final class Wire {
     sendViaTurn = false
     relocks += 1
   }
+
+  /// Stamped at the lock so the silence detector starts from a fresh reading
+  /// rather than from whatever the previous peer left behind.
+  func markPeerFresh() { lastFromPeer = Clock.now() }
 
   private func adopt(_ from: sockaddr_in) {
     guard !locked else { return }
@@ -1232,6 +1275,9 @@ final class Wire {
       // decrypted, so it came from someone holding the key.
       if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
         lastRecvHost = Clock.now()
+        if locked, src.sin_addr.s_addr == peer.sin_addr.s_addr, src.sin_port == peer.sin_port {
+          lastFromPeer = lastRecvHost
+        }
         // The updater asks "is a call live?" before it restarts the app, and this
         // is the only evidence that answers it. Stamped here rather than exposed
         // as a callback: a hook assigned nowhere would answer "never in a call"
@@ -1318,6 +1364,11 @@ final class Wire {
           peerMuted = plain[TPKTX + 4] == 1
           peerQLevel = Int(plain[TPKTX + 5])
           peerStatus = Int(plain[TPKTX + 6])
+          // ONE WORD FROM THEM, and it is the difference between "their status
+          // byte says they are not ringing" and "we have never heard their
+          // status byte". Those are the same zero, and the caller has to tell
+          // them apart before it decides a call has been answered.
+          peerStatusSeen = true
           Audio.peerVocalNow = peerVocal
           // ── THE FAST HALF OF THE TURN LAYER ─────────────────────────────────
           //

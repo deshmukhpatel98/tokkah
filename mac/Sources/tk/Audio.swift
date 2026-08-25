@@ -2601,7 +2601,17 @@ final class Audio {
         // and it would conceal it -- inventing speech out of a deliberate silence.
         // Silence also compresses to almost nothing, so muting costs bandwidth
         // rather than adding it.
-        if gMicMuted { memset(capBuf, 0, FPP * 4) }
+        // ── AND NOT INTO A ROOM WHERE THE PHONE IS STILL RINGING ────────────
+        //
+        // The far end joins before answering now, so it can show whoever is
+        // calling. It plays nothing -- its audio engine is not running -- but
+        // this microphone would still be reaching a Mac sitting on a desk in a
+        // room nobody has agreed to open. Zeroed for the same reason mute is
+        // zeroed rather than skipped: a gap in the sequence is loss to the far
+        // end, and the moment they answer it would conceal speech out of a
+        // silence we chose. Reading an Int on the audio thread costs nothing and
+        // allocates nothing, which is the only kind of check allowed here.
+        if gMicMuted || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
                    redundant: (redundancy && havePrev) ? prevBuf : nil,
                    redundantCap: prevCap)

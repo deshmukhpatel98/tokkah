@@ -31,12 +31,35 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/preanswer-check.$$"
 mkdir -p "$SP"
+# ── ITS OWN IDENTITY, AND ONE CONTACT IN IT ─────────────────────────────────
+#
+# TK_KIN_DIR because `.applicationSupportDirectory` resolves through the user
+# record and not $HOME, so a rig without it reads and writes the REAL install's
+# contact list. And a contact, because connecting before anybody answers is only
+# allowed for somebody already in it -- see RINGING.md on what a stranger's ring
+# would otherwise reveal. `somebody` is that contact; `astranger` deliberately is
+# not, and part four is the arm that proves the difference.
+export TK_KIN_DIR="$SP/id"
+mkdir -p "$SP/id"
+KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+printf '{"somebody":"%s"}' "$KEY" > "$SP/id/contacts.json"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
 trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
 # ── PART ONE: ringing, unanswered ───────────────────────────────────────────
+# ── THE CALLER HAS TO HAVE A FACE ───────────────────────────────────────────
+#
+# This ran `--video off`, so the callee received audio and never a frame -- and
+# the single worst bug this feature could have was on the path that runs when the
+# FIRST FRAME decodes: it hid the ring card, both buttons and the whole decision,
+# and left the ringtone playing at somebody with nothing to press. A rig whose
+# caller has no picture cannot reach that line at all. A real downloaded talking
+# head, never a synthetic pattern: a decoder and a display behave differently on
+# real texture, and this project has a rule about it.
+MEDIA="${MEDIA:-$HERE/../../testbed/media/real/talkingheadA.mov}"
+[ -f "$MEDIA" ] || { echo "no test media at $MEDIA -- see testbed/media/real/fetch.sh"; exit 2; }
 R1="preans$$a"
-spawn "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video off \
+spawn "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video "$MEDIA" \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester --press-after 8 --press "?" > "$SP/a.log" 2>&1
 perl -e 'select undef,undef,undef,2'
@@ -50,7 +73,7 @@ perl -e 'select undef,undef,undef,2'
 # start. Sweep anything the harness hardcodes that the product picks at runtime.
 spawn "$TK" --window --room "$R1" --listen 8022 --peer 127.0.0.1:8021 --video camera \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
-      --incoming somebody --press-after 7 --press "?" > "$SP/b.log" 2>&1
+      --incoming somebody --incoming-key "$KEY" --press-after 7 --press "?" > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,12'
 reap
 
@@ -62,7 +85,7 @@ spawn "$TK" --window --room "$R2" --listen 8023 --peer 127.0.0.1:8024 --video of
 perl -e 'select undef,undef,undef,2'
 spawn "$TK" --window --room "$R2" --listen 8024 --peer 127.0.0.1:8023 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
-      --incoming somebody --press-after 3 --press "@answer" > "$SP/d.log" 2>&1
+      --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@answer" > "$SP/d.log" 2>&1
 perl -e 'select undef,undef,undef,14'
 reap
 
@@ -77,32 +100,82 @@ reap
 R3="preans$$c"
 spawn env TK_AIM_MS=60000 "$TK" --window --room "$R3" --listen 8025 --peer 127.0.0.1:8026 \
       --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
-      --no-subtitles --incoming somebody --press-after 3 --press "@!answer,?" \
+      --no-subtitles --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@!answer,?" \
       > "$SP/e.log" 2>&1
+perl -e 'select undef,undef,undef,10'
+reap
+
+# ── PART FOUR: A STRANGER'S RING REVEALS NOTHING ────────────────────────────
+#
+# The same launch line with a caller who is NOT in the contact list. RINGING.md:
+# "the callee's probes go to those candidates, so the CALLER learns the callee's
+# IP and that the Mac is online and awake, before consent. This is the real
+# leak." So this arm must behave like the app did before the preview existed --
+# ring, and connect nothing. Without it, part one proves only that the feature
+# works and says nothing about who it works FOR.
+R4="preans$$d"
+spawn "$TK" --window --room "$R4" --listen 8027 --peer 127.0.0.1:8028 \
+      --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --no-subtitles --calling tester > "$SP/f.log" 2>&1
+perl -e 'select undef,undef,undef,2'
+spawn "$TK" --window --room "$R4" --listen 8028 --peer 127.0.0.1:8027 \
+      --video camera --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --no-subtitles --incoming astranger --press-after 6 --press "?" \
+      > "$SP/g.log" 2>&1
 perl -e 'select undef,undef,undef,10'
 reap
 
 fail=0
 say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
-for f in a b c d e; do
+for f in a b c d e f g; do
   grep -q "^tk " "$SP/$f.log" || { echo "PRE-ANSWER CHECK COULD NOT RUN -- tk never started in $f:"; sed -n '1,5p' "$SP/$f.log" | sed 's/^/  /'; exit 2; }
 done
 
-# ── 1. AN UNANSWERED RING SENDS NOTHING ─────────────────────────────────────
-# The report loop only exists once there is a call to report on, so the honest
-# measure is whether it ran at all. A count, not a rate: a rate of zero and no
-# rate at all are the same reading and only one of them is this fix.
-sent=$(grep -cE "^cap " "$SP/b.log")
-[ "$sent" = "0" ] \
-  && say "OK" "an unanswered ring opened no socket and sent nothing" \
-  || say "FAIL" "the unanswered ring ran $sent media reports -- it joined the call"
-grep -q "no room, no microphone, no camera" "$SP/b.log" \
-  && say "OK" "and it says so: no room, no microphone, no camera" \
+# ── 1. AN UNANSWERED RING RECEIVES AND SENDS NOTHING ────────────────────────
+#
+# It joins the room now, on purpose -- that is how you get to see who is calling
+# before you decide. So "did it run any media reports" is no longer the question;
+# it would pass for a ring that never connected at all. The question is what is
+# IN those reports, and every one of them has to read zero on the sending side.
+#
+#   cap 0/s      the microphone captured nothing, so there was nothing to send
+#   played 0/s   their voice was received and never played into this room
+#   no camera    no green light next to somebody who has not agreed to anything
+grep -q "audio engine not started" "$SP/b.log" \
+  && say "OK" "the audio engine was never started -- no capture, no playout" \
+  || say "FAIL" "a ring that has not been answered started the audio engine"
+CAPNZ=$(grep -oE "^cap [0-9]+/s" "$SP/b.log" | grep -vc "^cap 0/s")
+[ "${CAPNZ:-1}" = "0" ] \
+  && say "OK" "and the microphone captured nothing, in every report it made" \
+  || say "FAIL" "the microphone captured audio in $CAPNZ reports before anybody answered"
+PLAYNZ=$(grep -oE "played [0-9]+/s" "$SP/b.log" | grep -vc "played 0/s")
+[ "${PLAYNZ:-1}" = "0" ] \
+  && say "OK" "and nothing was played into a room nobody had opened" \
+  || say "FAIL" "$PLAYNZ reports played their audio before anybody answered"
+grep -q "no microphone, no camera" "$SP/b.log" \
+  && say "OK" "and it says so: no microphone, no camera" \
   || say "FAIL" "it did not take the waiting path at all"
 # The camera light next to somebody who has not agreed to be on a call.
 grep -q "camera: bring-up" "$SP/b.log" \
   && say "FAIL" "it turned the camera on before anybody answered" \
   || say "OK" "and no camera light while somebody is only being asked"
+# ── AND YET IT CAN SEE THEM ─────────────────────────────────────────────────
+# The whole point of the change: "if someone is calling, their video should be
+# visible to you so you know who is calling exactly."
+RECVNZ=$(grep -oE "recv [0-9]+/s" "$SP/b.log" | grep -vc "recv 0/s")
+[ "${RECVNZ:-0}" != "0" ] \
+  && say "OK" "while RECEIVING them -- $RECVNZ reports with their stream arriving" \
+  || say "FAIL" "it received nothing, so there is no picture of who is calling"
+grep -q "their picture is on the ring card" "$SP/b.log" \
+  && say "OK" "and it put their picture behind the card" \
+  || say "FAIL" "their stream arrived and never reached the screen"
+# The caller must not read any of that as an answer.
+grep -q "they are being asked -- not connected yet" "$SP/a.log" \
+  && say "OK" "and the caller knows it is a ring, not an answer" \
+  || say "FAIL" "the caller was never told the far end is only being asked"
+grep -q "connected via" "$SP/a.log" \
+  && say "FAIL" "the caller called it connected while nobody had answered" \
+  || say "OK" "so the caller never said connected"
 
 # ── 2. BOTH ENDS STILL SHOW THE TRUTH ───────────────────────────────────────
 a=$(grep '^audit state' "$SP/a.log" | tail -1)
@@ -132,10 +205,45 @@ car=$(grep -cE "^cap " "$SP/c.log")
 # ── 4. AND IT SOUNDS LIKE A CALL ────────────────────────────────────────────
 grep -q "ring: sounding" "$SP/b.log" \
   && say "OK" "the ring used a real ringtone: $(grep -o 'sounding [A-Za-z]*' "$SP/b.log" | head -1 | cut -d' ' -f2)" \
-  || say "FAIL" "no ringtone was chosen; $(grep -o 'ring: no ringtone.*' "$SP/b.log" | head -1)"
+  || { grep -q "ring: silent -- this copy is muted" "$SP/b.log" \
+       && say "OK" "the ring was silent, because --mute now covers the ringtone too" \
+       || say "FAIL" "no ringtone was chosen; $(grep -o 'ring: no ringtone.*' "$SP/b.log" | head -1)"; }
 
 echo
-if # ── 4. A CLICK NOBODY AIMED IS NOT AN ANSWER ────────────────────────────────
+if # ── 3a. THEIR FACE ARRIVES AND THE CARD SURVIVES IT ─────────────────────────
+#
+# The critical one. `vdec.onDecoded` used to call `markConnected()` on the first
+# frame, which sets `waiting.isHidden = true` -- and the answer and decline
+# buttons are subviews of `waiting`. So the caller's picture arriving took the
+# card, both buttons and the whole decision away, put "connected" in the status
+# pill, and went on ringing for forty seconds at somebody with nothing to press.
+# There is no way back: `showIncoming` refuses to re-open it.
+grep -q "the other side's picture is on screen" "$SP/b.log" \
+  && say "OK" "their picture really did reach the screen" \
+  || say "FAIL" "no frame was ever drawn, so the card-survives test below proves nothing"
+grep -q "behind the ring card, still nobody's decision" "$SP/b.log" \
+  && say "OK" "and it went BEHIND the card rather than replacing it" \
+  || say "FAIL" "the first frame took the ring card away"
+grep -q "card=ringing" "$SP/b.log" \
+  && say "OK" "the card is still ringing after their picture arrived" \
+  || say "FAIL" "the card is [$(grep -o 'card=[a-zA-Z]*' "$SP/b.log" | tail -1)] after their picture arrived"
+grep -q "status=connected" "$SP/b.log" \
+  && say "FAIL" "and it told the person they were connected to a call nobody answered" \
+  || say "OK" "and it never claimed to be connected"
+
+# ── 3b. AND ONLY FOR SOMEBODY YOU HAVE TALKED TO BEFORE ─────────────────────
+grep -q "is not in this Mac's contacts" "$SP/g.log" \
+  && say "OK" "a stranger's ring does not connect early, and says why" \
+  || say "FAIL" "a stranger's ring was treated like a contact's"
+STRANGERECV=$(grep -oE "recv [0-9]+/s" "$SP/g.log" | grep -vc "recv 0/s")
+[ "${STRANGERECV:-1}" = "0" ] \
+  && say "OK" "and it received nothing, so it revealed nothing" \
+  || say "FAIL" "a stranger's ring opened a path: $STRANGERECV reports received"
+grep -q "card=ringing" "$SP/g.log" \
+  && say "OK" "CONTROL: a stranger can still ring you -- the card is there" \
+  || say "FAIL" "a stranger cannot ring at all now, which is not the rule"
+
+# ── 4. A CLICK NOBODY AIMED IS NOT AN ANSWER ────────────────────────────────
 grep -q "ignored a click nobody aimed" "$SP/e.log" \
   && say "OK" "a click nobody aimed was refused, and the log says so" \
   || say "FAIL" "a device-shaped click was taken at face value -- the guard never fired"

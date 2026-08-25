@@ -40,8 +40,25 @@ enum Ringer {
     lock.unlock()
 
     Metrics.count("ring_ui_shown")
-    NSApp.requestUserAttention(.criticalRequest)
-    startTone()
+    // ── --mute MEANS THE SPEAKERS, NOT JUST THE CALL ─────────────────────────
+    //
+    // Reported by the person whose Mac this is, while they were watching
+    // something: the test rigs kept ringing out loud. Every rig passes `--mute`,
+    // and `--mute` silenced PLAYOUT -- the call audio -- because the ringtone is
+    // an AVAudioPlayer that predates nothing and was simply never asked. A
+    // switch called mute that leaves one sound playing is a switch nobody can
+    // rely on. Same shape as one-condition-two-concerns, the other way round: two
+    // sounds, one of them exempt from the only control over them.
+    let quiet = flag("mute")
+      || ProcessInfo.processInfo.environment["TK_MUTE"] == "1"
+      || ProcessInfo.processInfo.environment["TK_NO_RAISE"] == "1"
+    if quiet {
+      fputs("ring: silent -- this copy is muted\n", stderr)
+      Metrics.count("ring_tone_muted")
+    } else {
+      NSApp.requestUserAttention(.criticalRequest)
+      startTone()
+    }
     RunLoop.main.add(t, forMode: .common)
     // Stops itself after 40 s so a missed call does not ring the room all day.
     DispatchQueue.main.asyncAfter(deadline: .now() + 40) { stop() }

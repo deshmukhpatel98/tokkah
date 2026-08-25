@@ -155,6 +155,13 @@ final class Display {
       // harness can still click every control and the person at the keyboard
       // cannot click any of them by accident.
       window.ignoresMouseEvents = true
+      // And BEHIND everything. Corner placement plus click-through still left a
+      // 1280x720 window appearing over whatever the person at this Mac was
+      // watching, again and again, as each rig launched. On the desktop level it
+      // is under every ordinary window -- still composited, so `screencapture -l`
+      // and the audit still see it, and invisible to somebody using their Mac.
+      window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)))
+      window.collectionBehavior.insert(.stationary)
     } else {
       window.center()
     }

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.63.0"
+let VERSION = "0.64.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -279,6 +279,10 @@ let KNOWN_FLAGS: Set<String> = [
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
+  // `no-ring-preview` was read by main.swift and missing from here, so passing it
+  // exited 2 instead of turning the feature off -- a flag whose only effect was
+  // to kill the app. Same family as silent-no-op-flags, one worse.
+  "no-ring-preview", "incoming-key",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
@@ -584,6 +588,12 @@ if !isTestRun, !noIdentity { Identity.start() }
 // a rig build -- --no-relocate marks a copy that is not somebody's install.
 if !flag("no-relocate"), !isTestRun, !noIdentity {
   Thread {
+    // Recorded whichever way it goes. "Can this Mac be rung while Kin is closed"
+    // is the single fact behind the whole doorbell, and until now the only trace
+    // of the answer was a line in stderr on somebody else's machine.
+    let r = Watch.reach()
+    Metrics.fact("reachable_closed", r.on ? "yes" : "no")
+    if !r.on { Metrics.fact("reachable_why", r.says) }
     guard !Watch.healthy() else { Metrics.count("watch_present"); return }
     // Say WHY it is being rewritten. "installed" on a Mac that already had a
     // login item reads as a bug until you know the old one pointed at a copy
@@ -656,6 +666,8 @@ case .notDetermined:
   fputs("mic: asking for permission (look for a dialog)\n", stderr)
   AVCaptureDevice.requestAccess(for: .audio) { ok in
     gMicAccess = ok ? 1 : 0
+    Metrics.count(ok ? "mic_granted" : "mic_denied")
+    Metrics.fact("mic_access", ok ? "granted" : "denied")
     fputs(ok ? "mic: granted\n"
              : "mic: denied -- they will hear silence from this end."
              + " System Settings > Privacy & Security > Microphone\n", stderr)
@@ -803,6 +815,8 @@ func sendBye(to who: String, room: String, why: String, then done: (() -> Void)?
 /// gone. `why` is also the ending recorded on the final beat, so cancelled and
 /// declined are separable in the analytics from an ordinary leave.
 func hangUpAndExit(to who: String, room: String, why: String, capMs: Int = 2000) {
+  Metrics.fact("outcome", why)
+  Metrics.mark("\(why)_ms", sinceLaunch())
   let once = Latch()
   // Straight away, and before anything that can block. Everything after this
   // point is the message going out; there is no reason to make somebody look at
@@ -1251,6 +1265,8 @@ if earlyCam == nil, videoArg != "off", !ringPending, display != nil || mdisplay 
     // the call continues without a picture rather than never starting.
     _ = gate.wait(timeout: .now() + 60)
     if got != .granted {
+      Metrics.count("cam_denied")
+      Metrics.fact("cam_access", "\(got)")
       fputs("camera: not permitted (\(got)) -- continuing with audio only."
           + " System Settings > Privacy & Security > Camera\n", stderr)
       display?.controls?.setStatus("camera off — check Privacy settings")
@@ -1374,8 +1390,13 @@ if let from = arg("incoming"), let r = arg("room") {
   // No signature to check here: the watcher already verified it before deciding
   // to launch this process at all. No key either, so this contact is not
   // remembered on answer -- it will be, the next time they ring an open app.
-  gOffered = Identity.Ring(from: from, room: r, t: 0, k: "", ageMs: 0,
-                           known: false, keyChanged: false, kind: nil)
+  // The key comes from the watcher when the watcher is new enough to send it.
+  // Without it this ring is a NAME and nothing else -- still answerable, still
+  // shown, but not something to open a socket for before anybody agrees.
+  let ik = arg("incoming-key") ?? ""
+  gOffered = Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
+                           known: !ik.isEmpty && Identity.contacts()[from] == ik,
+                           keyChanged: false, kind: nil)
   Metrics.count("ring_recv_watch")
   DispatchQueue.main.async {
     display?.controls?.showIncoming(from: from, room: r)
@@ -1402,6 +1423,7 @@ display?.controls?.onCall = { who in
     Metrics.count("ring_sent_try")
     guard let got = Identity.ring(to: who, room: room) else {
       Metrics.count("ring_sent_fail")
+      Metrics.fact("outcome", "could not ring them")
       // Honest, and vague on purpose. A 200 means the ring is in their mailbox;
       // anything else means we could not put it there. Neither says whether they
       // are awake, and silence is indistinguishable from away by design.
@@ -1446,6 +1468,8 @@ display?.controls?.onAnswerRing = {
   guard let o = gOffered else { Metrics.tap("answer", ok: false); return }
   Metrics.tap("answer")
   Metrics.count("ring_answered")
+  Metrics.mark("answered_ms", sinceLaunch())
+  Metrics.fact("outcome", "answered")
   // Remembered on ANSWER, not on arrival: binding a name to a key when the ring
   // merely turns up would let whoever rings first own the name.
   //
@@ -1469,6 +1493,7 @@ display?.controls?.onDeclineRing = {
   Ringer.stop()
   Metrics.tap("decline")
   Metrics.count("ring_declined")
+  Metrics.fact("outcome", "declined")
   // Read BEFORE it is cleared. This is the only record of who is being
   // declined, and the whole point of the next few lines is telling them.
   let who = gOffered?.from ?? ""
@@ -1520,16 +1545,82 @@ display?.controls?.onDeclineRing = {
 // thing to update (see `updater-ships-only-what-it-can-install`), so the app has
 // to defend itself against the OLD watcher's launch line, which is the one that
 // will keep arriving for as long as somebody stays logged in.
+// ── AND YET THEIR FACE SHOULD BE ON IT ─────────────────────────────────────
+//
+// "If someone is calling, their video should be visible to you so you know who
+// is calling exactly." Both things are true at once, and the shape that makes
+// them true is asymmetric: this copy RECEIVES and never SENDS.
+//
+//   receives   the rendezvous, the socket, the incoming picture, decoded and
+//              drawn behind the card. That is who is calling.
+//   sends      nothing. No microphone is opened, so there is nothing to send and
+//              no green light; no camera is opened, so there is no picture of
+//              this room; and no audio engine is started, so the caller's voice
+//              is received and never played.
+//
+// The two lines that make "sends nothing" true are not new rules bolted on: the
+// camera bring-up is already gated on `ringPending` (0.61.0) and audio is sent
+// from the capture callback, which only exists once `audio.start()` runs -- so
+// the whole of it is one skipped call plus the gate that was already there.
+//
+// And the caller is TOLD. `ST_RINGING` in the status byte is what stops the
+// caller reading packets-arriving as answered -- which is precisely the mistake
+// that made a ring answer itself. Their card keeps saying Calling, and their
+// microphone stays off this wire until somebody says yes.
+// ── AND ONLY FOR SOMEBODY YOU HAVE ALREADY TALKED TO ──────────────────────
+//
+// RINGING.md wrote this rule down before the feature existed, and it is the one
+// thing that keeps it from being a leak: "the callee's probes go to those
+// candidates, so the CALLER learns the callee's IP and that the Mac is online
+// and awake, BEFORE consent. This is the real leak. The mitigation to ship
+// instead: probe only for rings whose `k` is already in the contact list."
+//
+// So a stranger who has learnt your handle can make your Mac ring and learns
+// nothing else -- no address, no proof you are at it. Somebody you have already
+// spoken to gets the fast, visible version, which is the FaceTime contract and
+// is what the feature is for. `known` is set from the contact list above, and
+// for a ring delivered by an older watcher -- which sends no key -- it is false,
+// so those simply do not connect early. That is the pre-0.64 behaviour, which is
+// the right thing to degrade to.
+let ringPreviewAllowed = gOffered?.known ?? false
+let ringPreview = ringPending && arg("room") != nil && ringPreviewAllowed
+  && ProcessInfo.processInfo.environment["TK_RING_PREVIEW"] != "0"
+  && !flag("no-ring-preview")
 if ringPending {
-  fputs("ring: waiting to be answered -- no room, no microphone, no camera\n", stderr)
+  fputs("ring: waiting to be answered -- no microphone, no camera"
+      + (ringPreview ? ", their picture only\n" : ", no room\n"), stderr)
   Metrics.count("ring_offered")
+  Metrics.count(ringPreview ? "ring_preview" : "ring_preview_off")
+  if !ringPreviewAllowed {
+    Metrics.count("ring_preview_stranger")
+    fputs("ring: @\(arg("incoming") ?? "?") is not in this Mac's contacts"
+        + " -- not connecting before you answer\n", stderr)
+  }
+  // ── SET HERE, NOT ONCE A SECOND ─────────────────────────────────────────
+  //
+  // `selfStatus` is otherwise assigned in the report loop, which first runs a
+  // second into the call -- and the hole-punch and time probes go out long
+  // before that. Measured: the caller locked, read a status byte of zero,
+  // announced "connected" and took its calling card down, and only THEN heard
+  // the ring bit. A flag that describes what this process IS must be true from
+  // the moment the process can send anything, not from the first tick of a
+  // loop that reports on it.
+  if ringPreview { wire.selfStatus |= Wire.ST_RINGING }
+  // The callee's own copy never draws a calling card, so without this a ring
+  // that was never answered reported no outcome at all -- and "nothing recorded"
+  // is what a crash looks like too.
+  Metrics.fact("outcome", "being asked")
   // Same switch, same reason: a rig must not take the screen away from whoever
   // is using this Mac. See Display's window placement and Ringer.start.
   if ProcessInfo.processInfo.environment["TK_NO_RAISE"] != "1" {
     NSApplication.shared.activate(ignoringOtherApps: true)
   }
-  NSApplication.shared.run()
-  exit(0)
+  // Without a room to look at there is nothing to fall through TO, and falling
+  // through would run a whole call's worth of setup for a socket with no peer.
+  if !ringPreview {
+    NSApplication.shared.run()
+    exit(0)
+  }
 }
 
 // ── AND IT HAS TO START WHEN THE HANDLE ARRIVES, NOT WHEN THIS LINE RUNS ────
@@ -1564,6 +1655,7 @@ func handleBye(_ r: Identity.Ring) {
   if let c = gCalling, r.from == c.who, r.room == c.room {
     Metrics.count("bye_recv_calling")
     Metrics.mark("bye_recv_ms", sinceLaunch())
+    Metrics.fact("outcome", "they said no")
     fputs("bye: @\(r.from) is not taking the call\n", stderr)
     // Plain words, and no blame in either direction: from here we cannot tell
     // declined from cancelled-at-the-same-moment from a Mac that went to sleep.
@@ -1577,6 +1669,7 @@ func handleBye(_ r: Identity.Ring) {
   if let o = gOffered, r.from == o.from, r.room == o.room {
     Metrics.count("bye_recv_ringing")
     Metrics.mark("bye_recv_ms", sinceLaunch())
+    Metrics.fact("outcome", "they hung up before this Mac answered")
     Ringer.stop()
     gOffered = nil
     display?.controls?.hideIncoming()
@@ -1616,9 +1709,12 @@ func startRingingOnce() {
   Identity.startRinging(gapMs: Int(arg("ring-gap") ?? "5000") ?? 5000) { r in
     // FIRST, above every line that treats this as a call. A bye is not a ring:
     // it makes no sound, draws no card, and remembers no contact.
-    if r.kind == "bye" { handleBye(r); return }
-    // A ring older than its lease is not a call, it is a record of one.
+    // A ring older than its lease is not a call, it is a record of one -- and a
+    // hang-up older than its lease is not a hang-up either. Checked ABOVE the
+    // kind switch, so both get the same freshness rule: a two-minute-old bye
+    // reaching a reused room could otherwise end a call that had just started.
     guard r.ageMs < 60_000 else { return }
+    if r.kind == "bye" { handleBye(r); return }
     if r.keyChanged {
       // The name is one we know and the key is not. Say the name is in doubt
       // rather than dropping it: a reinstall looks exactly like this, and so
@@ -1945,12 +2041,61 @@ if let room = arg("room") {
     var announcedFor = ""
     /// Consecutive rendezvous polls that did not list the peer at all.
     var gone = 0
+    /// Ticks since the transport locked, for the deadline below.
+    var sinceLocked = 0
     while true {
+      // RE-ARMED WITH THE LOCK, not counted once for the life of the process.
+      // Left running, `sinceLocked > 4` was permanently true after the first
+      // rediscovery, so the "we have not heard their status yet" deadline was
+      // already expired at the first tick of every subsequent lock -- and that
+      // deadline fails OPEN, towards "treat them as answered".
+      if !wire.locked { sinceLocked = 0 }
       if wire.locked {
-        if announcedFor != wire.lockedFrom {
+        sinceLocked += 1
+        // ── LOCKED IS NOT ANSWERED ANY MORE ─────────────────────────────────
+        //
+        // A Mac that is only being ASKED joins the room and punches a hole, so
+        // that the person can see who is calling. Packets therefore arrive from
+        // somebody who has decided nothing, and every line below this used to
+        // read that as "they are here": the card came down, the status said
+        // connected, and the call had begun without anybody agreeing to it.
+        //
+        // So this waits for one word from them. `peerStatusSeen` is the word;
+        // `ST_RINGING` is what it says. The deadline exists because a build older
+        // than the bit never sends one -- and those never joined before answering
+        // either, so treating their silence as "answered" after two seconds is
+        // both safe and the old behaviour.
+        // TWENTY TICKS, TEN SECONDS. The deadline exists only for a build that
+        // predates the status BYTE -- not the ringing bit, the byte, which has
+        // shipped for a long time -- so it should almost never decide anything.
+        // At five ticks a lossy link that dropped time probes for two and a half
+        // seconds would have declared a ringing phone answered, which is an
+        // absolute threshold deciding a safety property: exactly the shape this
+        // project keeps finding (see RTT-blind timeouts).
+        let heard = wire.peerStatusSeen || sinceLocked > 20
+        if heard, wire.peerRinging {
+          if announcedFor != "ringing" {
+            announcedFor = "ringing"
+            fputs("room \(room): they are being asked -- not connected yet\n", stderr)
+            Metrics.count("peer_ringing_seen")
+          }
+        } else if heard, announcedFor != wire.lockedFrom {
           announcedFor = wire.lockedFrom
+          wire.markPeerFresh()
           Metrics.mark("connected_ms", sinceLaunch())
           Metrics.count("connects")
+          // NOT for a ring nobody has answered. Booked here, above the split,
+          // every ring on every Mac reported `outcome: talked` and one more
+          // `connects` -- so the answer rate and the connection rate on the
+          // dashboard this release builds would both have been unusable, and a
+          // call nobody took would read as "they talked".
+          // ONE FIELD THAT SAYS HOW THIS CALL WENT, and it is set from both ends
+          // rather than from the caller's card: the callee's own copy never draws
+          // a calling card at all, so an outcome written there would have left
+          // every answered call looking like nothing happened. Last writer wins,
+          // which is what makes "calling" -> "talked" the ordinary story.
+          Metrics.fact("outcome", "talked")
+          Metrics.fact("path", wire.lockedFrom.hasPrefix("relay") ? "relay" : "direct")
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
           // ── NOT `if sawRemote`. THE LOCK IS THE ARRIVAL. ──────────────────
           //
@@ -1958,16 +2103,43 @@ if let room = arg("room") {
           // here; their camera is a separate question, answered by the "their
           // camera is off" banner that `setPaused` already draws. Gating this on
           // video is what left a camera-off peer permanently invisible.
-          peerHere = true
+          // Only a real call. `peerHere` arms the departure detector, and on a
+          // ring preview that meant: caller goes quiet for three seconds ->
+          // `setPeerPresent(false)` -> `clearIncoming()` -> mode back to invite,
+          // which hides the answer and decline buttons while the ringtone is
+          // still going. A phone ringing with nothing to press.
+          if !ringPreview { peerHere = true }
           // Their picture, if any, takes the window; yours stops filling it.
           // Idempotent -- the first-frame path below does the same thing, and
           // whichever happens first is right.
           display?.selfViewOn = true
+          // ── THE HALF A RING GETS, AND THE HALF IT MUST NOT ──────────────────
+          //
+          // This copy is showing somebody a card that asks whether they want to
+          // talk. Their caller's picture arriving is the whole point -- and every
+          // line below would then take the card away, put "connected" in the
+          // status, and title the window as a call in progress. That is the
+          // 0.61.0 bug rebuilt out of the feature that needed the socket.
+          //
+          // So a ring gets the picture and nothing else. The card stays, the
+          // buttons stay, and the only thing that can change any of it is a
+          // person pressing one.
           // The mirror is flushed a moment later, not here -- see `sinceLock`
           // below. Clearing at the lock blanks the window on a HEALTHY call for
           // however long their first frame takes, which is a flicker introduced
           // to fix a still.
           sinceLock = 0
+          if ringPreview {
+            setWindowTitle("Kin — \(Identity.display(arg("incoming") ?? "someone")) is calling")
+            Metrics.count("ring_preview_picture")
+            Metrics.mark("ring_preview_ms", sinceLaunch())
+            // NOT `continue`. The sleep that paces this whole loop is at the
+            // bottom of it, and skipping to the top would turn a half-second poll
+            // into a spin -- on the one image whose entire promise is that it
+            // costs a Mac nothing while it waits to be answered.
+            fputs("room \(room): their picture is on the ring card"
+                + " -- still nobody's decision\n", stderr)
+          } else {
           display?.controls?.markConnected()
           setWindowTitle("Kin — connected")
           display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
@@ -1977,6 +2149,7 @@ if let room = arg("room") {
           // the returning peer for the rest of the call, which is a worse fault
           // than the one it was added to fix.
           display?.controls?.setPeerPresent(true)
+          }
           gone = 0
         }
         // ── AND THE MIRROR, ONCE IT IS CLEAR THEY HAVE NO PICTURE ────────────
@@ -2004,7 +2177,7 @@ if let room = arg("room") {
         // different access point, a DHCP renewal, a lid closed and reopened. The
         // old code locked once and could never reconsider, so any of those ended
         // the call permanently and silently.
-        if wire.lastRecvHost != 0, Clock.msSigned(Clock.now(), wire.lastRecvHost) > 3000 {
+        if wire.lastFromPeer != 0, Clock.msSigned(Clock.now(), wire.lastFromPeer) > 3000 {
           Metrics.count("rediscoveries")
           fputs("room \(room): nothing from \(wire.lockedFrom) for 3 s -- looking again\n", stderr)
           wire.unlockForRediscovery()
@@ -3356,10 +3529,28 @@ vdec.onDecoded = { img, capHost in
     sawRemote = true
     // Their picture takes the window; yours moves to the corner.
     display?.selfViewOn = true
-    display?.controls?.markConnected()
-    setWindowTitle("Kin — connected")
-    display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
-    fputs("the other side's picture is on screen\n", stderr)
+    // ── AND THE CARD STAYS, BECAUSE THIS IS THE PICTURE ON THE CARD ─────────
+    //
+    // The single worst bug this feature could have, and it was here rather than
+    // in any of the places guarded for it. The transport lock has a careful
+    // ringPreview split a thousand lines up; this path does not go through it.
+    // `markConnected()` sets `waiting.isHidden = true`, and the answer and
+    // decline buttons are subviews of `waiting` -- so the caller's FIRST FRAME
+    // took the card, both buttons and the whole decision away, left "connected"
+    // in the status pill, and went on ringing for forty seconds at somebody with
+    // nothing to press. `showIncoming` refuses to re-open it and `markConnected`
+    // is one-shot, so there is no way back.
+    //
+    // Not caught by the rig because its caller ran `--video off`: a ring preview
+    // that never receives a frame cannot reach the line that reacts to one.
+    if !ringPreview {
+      display?.controls?.markConnected()
+      setWindowTitle("Kin — connected")
+      display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
+    }
+    fputs("the other side's picture is on screen"
+        + (ringPreview ? " -- behind the ring card, still nobody's decision" : "") + "\n",
+          stderr)
   }
   display?.show(img)
   // Stamped HERE, not inside show(): the measurement is decode-to-glass, and a
@@ -3383,7 +3574,16 @@ vdec.onDecoded = { img, capHost in
   }
 }
 
-if videoArg != "off" {
+// ── THE THIRD CAMERA BRING-UP, AND THE ONE THE PARK USED TO HIDE ──────────
+//
+// Two bring-ups above this are gated on `ringPending` and have been since 0.61.0.
+// This one never needed a gate, because the park block returned long before the
+// line was reached -- so the moment a ring was allowed to fall through to receive
+// the caller's picture, the green light came on next to somebody who had agreed
+// to nothing. The rig caught it in the first run: `camera: bring-up 95 ms` in an
+// unanswered ring. Third instance of a guard that was really a side effect of
+// control flow somewhere else.
+if videoArg != "off", !ringPreview {
   do {
     // Reuse the preview camera. Opening a second AVCaptureSession on the same
     // device is how you get two permission prompts and one black picture.
@@ -3779,10 +3979,24 @@ Thread {
 let t = Thread { wire.recvLoop(into: audio.ring, video: vasm) }
 t.start()
 
+// ── THE ONE LINE THAT WOULD OPEN THE MICROPHONE ───────────────────────────
+//
+// Skipped while a ring is only being offered. Everything above this point is
+// receive-side -- the rendezvous, the socket, the assembler, the decoder and the
+// display -- and none of it touches a device. `start()` is what opens the input
+// and output units, and it is also what arms the capture callback that sends. So
+// not calling it is simultaneously "no green light", "nothing on the wire" and
+// "their voice is not played into this room". One line, three guarantees, and no
+// new state to get out of step.
+if ringPreview {
+  fputs("ring: audio engine not started -- nothing captured, nothing sent,"
+      + " nothing played\n", stderr)
+} else {
 do { try audio.start() } catch {
   fputs("audio start failed: \(error)\n", stderr)
   fputs("if this is a permission error, macOS must be allowed to use the microphone for the terminal running this.\n", stderr)
   exit(1)
+}
 }
 
 // ── The report ──────────────────────────────────────────────────────────────
@@ -5126,6 +5340,10 @@ func reportLoop() {
   wire.selfMuted = display?.controls?.micMuted ?? false
   wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
                   | ((camOff || noCameraHere) ? Wire.ST_CAMOFF : 0)
+                  // The bit that stops a ring answering itself. See the block
+                  // above `ringPreview`: packets arriving from here mean somebody
+                  // is being ASKED, not that they said yes.
+                  | (ringPreview ? Wire.ST_RINGING : 0)
   let pPaused = wire.peerVideoPaused, pCamOff = wire.peerCamOff
   if pPaused { vPeerPausedSecs += 1 }
   if pPaused != lastPeerPaused {
@@ -5203,7 +5421,12 @@ for sig in [SIGINT, SIGTERM] {
 
 if display != nil || mdisplay != nil {
   Thread { reportLoop() }.start()
-  NSApplication.shared.activate(ignoringOtherApps: true)
+  // Third and last activation site. The ring-preview image no longer stops at
+  // the park, so it reaches this one -- and an unconditional activate here undid
+  // the whole of TK_NO_RAISE for exactly the process that rings.
+  if ProcessInfo.processInfo.environment["TK_NO_RAISE"] != "1" {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+  }
   NSApplication.shared.run()
 } else {
   reportLoop()

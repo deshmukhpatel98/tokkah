@@ -117,7 +117,10 @@ grep -q "bye (cancelled): @$H2 told" "$SP/a.log" \
 grep -q "bye: @$H1 stopped calling" "$SP/b.log" \
   && say "OK" "and the ringing Mac heard it, by name" \
   || say "FAIL" "the ringing Mac never heard the cancel"
-grep -q "ring: sounding\|ring: alert" "$SP/b.log" \
+# "Ringing" here means the ring was OFFERED, not that a sound came out: `--mute`
+# now covers the ringtone as well as the call audio, so a rig that insisted on
+# hearing one would be asserting that this Mac disturbs whoever is using it.
+grep -qE "ring: sounding|ring: alert|ring: silent" "$SP/b.log" \
   && say "OK" "it really was ringing first, so stopping it means something" \
   || say "FAIL" "it never started ringing -- this run proved nothing"
 [ "$B1_GONE" = "yes" ] \

@@ -1451,6 +1451,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
 
   /// This app is ringing somebody. The mirror of `setIncoming`.
   func setOutgoing(to who: String) {
+    Metrics.fact("outcome", "calling")
     calleeName = who
     face.handle = who
     title.stringValue = "Calling \(Identity.display(who))"
@@ -1476,6 +1477,8 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// Nobody picked up. Not an error -- a person who was not at their Mac.
   private func ringTimedOut() {
     guard mode == .calling else { return }
+    Metrics.count("ring_timed_out")
+    Metrics.fact("outcome", "no answer")
     // "their Mac may be closed" asked the reader to think about a machine. What
     // they want to know is about a person, and the honest answer is short: we put
     // the call through and nobody picked it up.
@@ -1876,7 +1879,13 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     guard let event else { return true }
     let p = convert(event.locationInWindow, from: nil)
     for v in [answerButton, declineButton, cancelButton, againButton] as [NSView]
-    where !v.isHidden && v.frame.contains(p) { return false }
+    where !v.isHidden && v.frame.contains(p) {
+      // Counted, because this is a refusal nobody sees. Without it the only trace
+      // of "somebody's click was aimed at another app" is that nothing happened,
+      // which is indistinguishable from a control that does not work.
+      Metrics.count("card_first_mouse_refused")
+      return false
+    }
     return true
   }
 
@@ -2032,6 +2041,8 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     else if v === declineButton { onDecline?() }
     else if v === cancelButton { onCancelCall?() }
     else if v === againButton {
+      Metrics.tap("call_again")
+      Metrics.count("call_again")
       let who = calleeName
       setOutgoing(to: who)
       onCall?(who)

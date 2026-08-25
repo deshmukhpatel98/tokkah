@@ -558,7 +558,10 @@ enum Identity {
     // a Thread precisely because this signs and makes an HTTPS round trip).
     if !s.claimed { Identity.awaitClaim(6); s = ensure() }
     guard s.claimed else { fputs("ring: this Mac has no handle yet\n", stderr); return nil }
-    guard to != s.handle else { fputs("ring: that is you\n", stderr); return nil }
+    guard to != s.handle else {
+      Metrics.count("ring_to_self")
+      fputs("ring: that is you\n", stderr); return nil
+    }
     guard let url = URL(string: "\(base)/api/kin/\(to)/ring"),
           let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: s.seed)
     else { return nil }
@@ -715,6 +718,17 @@ enum Identity {
       // than leaving the last success standing and reading as still healthy.
       lastPollStatus = code
       lastPollAt = Date()
+      // Every answer the doorbell gives, counted by class. "nobody called" and
+      // "this Mac has not reached the doorbell in ten minutes" are the same empty
+      // array to everything above this line, and only one of them is a person
+      // who cannot be called.
+      switch code {
+      case 200, 204: Metrics.count("poll_ok")
+      case 401, 403: Metrics.count("poll_refused")
+      case 429:      Metrics.count("poll_rate")
+      case 0:        Metrics.count("poll_no_answer")
+      default:       Metrics.count("poll_error")
+      }
       // 204 is the held line coming back empty, and no older worker has ever
       // produced one on this route -- so it is both the answer and the proof
       // that this server holds.
@@ -760,7 +774,10 @@ enum Identity {
               let sigD = Data(base64Encoded: sig), sigD.count == 64,
               let pkD = Data(base64Encoded: kb64), pkD.count == 32,
               let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkD)
-        else { fputs("ring: dropped a malformed ring\n", stderr); continue }
+        else {
+          Metrics.count("ring_malformed")
+          fputs("ring: dropped a malformed ring\n", stderr); continue
+        }
         // A word this version does not know is dropped BEFORE the signature is
         // checked, because there is nothing sensible to do with a valid
         // signature over a meaning we cannot read. Named in the log: a client
@@ -777,6 +794,7 @@ enum Identity {
         guard pk.isValidSignature(sigD, for: Data(msg.utf8)) else {
           // Never shown. An unverifiable ring is not a call from someone whose
           // name we cannot confirm -- it is a ring nobody proved they sent.
+          Metrics.count("ring_unverified")
           fputs("ring: @\(from) failed verification -- dropped\n", stderr); continue
         }
         out.append(Ring(from: from, room: room, t: t, k: kb64,
@@ -1029,10 +1047,24 @@ enum Identity {
           since = 0
           slow("this server answers polls instead of holding them")
         }
-        // Only ever the newest ring is offered: a stack of missed calls is a
-        // feature nobody asked for, and answering a stale room joins an empty one.
-        if let r = rings.max(by: { $0.t < $1.t }) {
-          onRing(r)
+        // ── EVERY MESSAGE IN THE BATCH, OLDEST FIRST ─────────────────────
+        //
+        // This used to hand over `rings.max(by: t)` alone and drop the rest of
+        // the drained mailbox, on the grounds that a stack of missed calls is a
+        // feature nobody asked for. That was true when every message was a ring.
+        // It stopped being true the moment a hang-up travelled the same mailbox:
+        //
+        //   Alice rings (t=1000). Carol rings (t=1001). Alice cancels (t=1002).
+        //   One poll drains all three, `max(by: t)` picks Alice's BYE, and
+        //   Carol's ring is destroyed -- this Mac never rings for Carol at all.
+        //
+        // And `t` is integer SECONDS, so a ring and its own cancel inside one
+        // second tie, `max(by:)` keeps the first, and the cancel is the one
+        // thrown away. Ordered oldest first so a ring is always seen before the
+        // bye that ends it; the "no stack of missed calls" rule lives where it
+        // belongs, in the receiver's own age guard.
+        if !rings.isEmpty {
+          for r in rings.sorted(by: { $0.t < $1.t }) { onRing(r) }
           // Arm the next one NOW. A poll that delivered a ring costs no arming
           // budget on the server precisely so this line is free, and the gap it
           // closes is where a second ring would otherwise sit.

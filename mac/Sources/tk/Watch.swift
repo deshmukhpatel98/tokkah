@@ -396,6 +396,20 @@ enum Watch {
       }
       Resident.refresh()
     }) { r in
+      // ── A HANG-UP IS NOT A DOORBELL ────────────────────────────────────
+      //
+      // `ringLoop` hands every verified message to this closure, byes included --
+      // only the app's own listener filtered on kind. So a cancelled call could
+      // open a window, ring, and connect to a room the caller had already left:
+      // rung by somebody who had just hung up. There is nothing for a watcher to
+      // DO with a bye (the copy it launched does its own polling and will hear
+      // its own), so it is dropped here, named, and deliberately does NOT touch
+      // `lastRoom` -- a bye is not a ring this Mac has been shown.
+      if r.kind != nil {
+        fputs("watch: @\(r.from) sent \(r.kind!) for room \(r.room) -- not a call to open\n",
+              stderr)
+        return
+      }
       guard r.ageMs < 60_000, r.room != lastRoom else { return }
       lastRoom = r.room
       // Timestamped, because "how long from ringing to a window" is the only
@@ -415,6 +429,14 @@ enum Watch {
                      "--stderr", logDir().appendingPathComponent("ring.log").path,
                      "--args",
                      "--room", r.room, "--incoming", r.from,
+                     // THE KEY, not just the name. The app decides whether to
+                     // connect before anybody answers -- so it can show who is
+                     // calling -- and it is only allowed to do that for somebody
+                     // already in the contact list. Without this the app has a
+                     // handle and no way to check it, and a handle is a claim.
+                     // An older watcher omits it and the app simply does not
+                     // connect early, which is what it did before this existed.
+                     "--incoming-key", r.k,
                      "--video", "camera", "--window"] + extraArgs
       do { try p.run() } catch {
         fputs("watch: could not open Kin: \(error)\n", stderr)
