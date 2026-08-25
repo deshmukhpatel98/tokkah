@@ -37,6 +37,12 @@ TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/leave-check.$$"
 mkdir -p "$SP"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
+# NO HANDLE AT ALL. `--no-update` no longer disables the identity claim, so
+# without this every run of this script would claim a name on the REAL server,
+# walking @devesh, @deveshp, @devesh2 ... and squatting names a person may want.
+# Pinning `--handle` instead was tried and made this flaky: a first claim is 5-8
+# seconds of network and these presses are timed in seconds.
+export TK_NO_IDENTITY=1
 export TK_KIN_DIR="$SP/kin"
 trap 'reap; rm -rf "$SP"' EXIT
 

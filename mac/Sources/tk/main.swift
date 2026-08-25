@@ -281,6 +281,19 @@ let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
+/// ── AND THE SAME FOR A RIG RUNNING A WHOLE CALL ────────────────────────────
+///
+/// The shell rigs in tools/ drive real calls, so they are not `--*-test` runs and
+/// the guard above does not cover them. They still must not claim a handle: since
+/// `--no-update` stopped (correctly) disabling the identity claim, every one of
+/// them walked @devesh, @deveshp, @devesh2 ... on the REAL server, squatting
+/// plausible names a person might want.
+///
+/// Pinning `--handle` instead was tried and made them FLAKY -- a first claim is
+/// 5 to 8 seconds of network, and these scripts time their presses in seconds.
+/// Not claiming at all is both correct and free. Sibling of TK_KIN_DIR and
+/// TK_UPDATE_POLL; production never sets it.
+let noIdentity = ProcessInfo.processInfo.environment["TK_NO_IDENTITY"] == "1"
 
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))
@@ -498,12 +511,12 @@ if !flag("no-update"), !isTestRun {
 // A handle nobody asked for, claimed on a thread nobody waits for. If this never
 // completes the app is exactly as usable as it was before handles existed, which
 // is the only acceptable cost for a convenience.
-if !isTestRun { Identity.start() }
+if !isTestRun, !noIdentity { Identity.start() }
 // Being callable is the point of having a handle, so an installed copy makes
 // itself reachable rather than waiting to be told. Only from /Applications
 // (Watch.install refuses anything else), only when absent or stale, and never on
 // a rig build -- --no-relocate marks a copy that is not somebody's install.
-if !flag("no-relocate"), !isTestRun {
+if !flag("no-relocate"), !isTestRun, !noIdentity {
   Thread {
     guard !Watch.healthy() else { Metrics.count("watch_present"); return }
     // Say WHY it is being rewritten. "installed" on a Mac that already had a
