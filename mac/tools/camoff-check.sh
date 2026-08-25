@@ -49,6 +49,14 @@ PLAYED="$(grep -oE 'played [0-9]+' "$SP/b.log" | tail -1 | awk '{print $2}')"
 if [ "${PLAYED:-0}" -gt 1000 ]; then echo "   ok   and their audio arrived: $PLAYED frames"
 else echo "  WRONG their audio never arrived: ${PLAYED:-0} frames"; bad=1; fi
 
+# And the window is not left holding a frozen frame of YOU while a banner above
+# it says "their camera is off" -- which reads as them, stopped.
+if grep -q 'clearing the mirror' "$SP/b.log"; then
+  echo "   ok   and the window is not a frozen mirror of yourself"
+else
+  echo "  WRONG the window kept your own last frame under \"their camera is off\""; bad=1
+fi
+
 [ "$bad" = 0 ] && echo "  CAMERA-OFF CHECK PASSED -- a call with no picture is still visibly a call" \
                 || echo "  CAMERA-OFF CHECK FAILED"
 exit $bad

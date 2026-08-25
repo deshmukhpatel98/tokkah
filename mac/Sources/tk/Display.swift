@@ -436,6 +436,24 @@ final class Display {
   }
 
 
+  /// ── STOP SHOWING SOMEBODY THEIR OWN FROZEN FACE ──────────────────────────
+  ///
+  /// Before the far end arrives, YOU are the window -- a mirror, which is right
+  /// while you are waiting. The moment they arrive `selfViewOn` turns on and
+  /// `showSelf` stops feeding this layer, so if they have no camera the window
+  /// keeps the LAST frame of you: a frozen face, in an app whose own HELD.md
+  /// exists because a frozen face is the worst thing to show. Worse here,
+  /// because it is a frozen face of the wrong person, and the banner above it
+  /// says "their camera is off" -- so it reads as THEM, stopped.
+  ///
+  /// Flushed instead. The window becomes the app's own ground, the banner
+  /// explains it, and their first real frame fills it the moment one arrives.
+  func clearPicture() {
+    DispatchQueue.main.async { [weak self] in
+      self?.layer.flushAndRemoveImage()
+    }
+  }
+
   /// The far end's picture: always the window. Peeking puts YOU in the corner tile
   /// on top, it does not displace the person talking.
   func show(_ img: CVImageBuffer) {

@@ -726,6 +726,11 @@ nonisolated(unsafe) var noCameraHere = videoArg == "off"
 /// not been initialised yet. That exact trap cost an hour today one flag over
 /// (see `noCameraHere` above).
 nonisolated(unsafe) var ringingStarted = false
+/// Ticks of the presence loop since the transport locked, or -1 before it has.
+/// Used to give a healthy call time to deliver its first frame before the window
+/// is blanked. See the note beside `clearPicture` in the presence thread.
+nonisolated(unsafe) var sinceLock = -1
+nonisolated(unsafe) var pictureCleared = false
 /// A LOCK AND NOT THE MAIN THREAD. The obvious way to make `startRingingOnce`
 /// single-entry is to hop it onto main -- and that was written, and it never ran:
 /// without `--window` there is no pumped run loop, so the block sat on the main
@@ -1660,10 +1665,15 @@ if let room = arg("room") {
           // camera is off" banner that `setPaused` already draws. Gating this on
           // video is what left a camera-off peer permanently invisible.
           peerHere = true
-          // Their picture, if any, takes the window; yours goes to the corner.
+          // Their picture, if any, takes the window; yours stops filling it.
           // Idempotent -- the first-frame path below does the same thing, and
           // whichever happens first is right.
           display?.selfViewOn = true
+          // The mirror is flushed a moment later, not here -- see `sinceLock`
+          // below. Clearing at the lock blanks the window on a HEALTHY call for
+          // however long their first frame takes, which is a flicker introduced
+          // to fix a still.
+          sinceLock = 0
           display?.controls?.markConnected()
           setWindowTitle("Kin — connected")
           display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
@@ -1674,6 +1684,26 @@ if let room = arg("room") {
           // than the one it was added to fix.
           display?.controls?.setPeerPresent(true)
           gone = 0
+        }
+        // ── AND THE MIRROR, ONCE IT IS CLEAR THEY HAVE NO PICTURE ────────────
+        //
+        // `selfViewOn` stops NEW frames of you filling the window; the last one
+        // stays on it. On a call where they arrive without a camera, that frozen
+        // frame is all there is -- under a banner reading "their camera is off",
+        // so it reads as THEM, stopped. This app has a whole document about why a
+        // frozen face is the worst thing to show; this was one of the wrong
+        // person.
+        //
+        // One tick of grace (0.5 s) rather than clearing at the lock, because on
+        // a healthy call their first frame is moments away and blanking the
+        // window until it lands trades a still for a flicker.
+        if sinceLock >= 0 { sinceLock += 1 }
+        if sinceLock >= 1, !sawRemote, !pictureCleared {
+          pictureCleared = true
+          display?.clearPicture()
+          // Said out loud so a rig can see it. A blanked window and a window that
+          // was never painted look identical from outside.
+          fputs("  picture: nothing from them yet -- clearing the mirror\n", stderr)
         }
         // SILENCE IS THE SIGNAL. Three seconds with nothing arriving means the
         // address we locked onto has stopped being true -- a new NAT port, a
