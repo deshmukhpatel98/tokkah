@@ -487,6 +487,13 @@ enum Identity {
   static var contactsFile: URL { dir.appendingPathComponent("contacts.json") }
 
   /// handle -> base64 device key. Small, local, and never sent anywhere.
+  ///
+  /// EVERY VALUE IN HERE IS A KEY SOMEBODY PROVED THEY HELD. That is the whole
+  /// invariant of this file and it is load-bearing three times over: `known`
+  /// unlocks the pre-answer preview, which opens a socket to a caller before
+  /// anybody has agreed to talk to them; `keyChanged` is the impersonation
+  /// warning; and the People panel is this keyset. `remember` is the only writer
+  /// and it enforces the invariant -- see the guards on it.
   static func contacts() -> [String: String] {
     guard let d = try? Data(contentsOf: contactsFile),
           let o = try? JSONSerialization.jsonObject(with: d) as? [String: String]
@@ -494,12 +501,93 @@ enum Identity {
     return o
   }
 
+  // ── NAMES THIS MAC HAS DIALLED, WHICH IS NOT THE SAME FILE ─────────────────
+  //
+  // A SECOND FILE, and the reason is the invariant above rather than tidiness.
+  //
+  // `remember` only ever ran on ANSWER, so a person was recorded here only when
+  // they rang YOU. Place the call yourself and nobody was written down -- which
+  // meant the person who does the calling had an empty People panel for ever,
+  // under a hint promising the opposite. For a product whose whole direction is
+  // calling people rather than rooms, that is the feature not existing.
+  //
+  // The obvious fix is to write the callee into `contacts.json` when you dial
+  // them. It cannot be done, because THE CALLER NEVER LEARNS THE CALLEE'S KEY.
+  // `/api/kin/<who>/ring` carries our key TO them and answers `{ok,queued,...}`;
+  // there is deliberately no route that maps a handle to its registered key,
+  // because that route would be an oracle for which handles exist. The call
+  // itself does not help either: the handshake on the media socket carries an
+  // EPHEMERAL X25519 key, freshly minted per launch, with no signature over it
+  // and no identity in it. There is exactly one moment the caller is handed the
+  // callee's authenticated Ed25519 key, and it is when they DECLINE -- a `bye` is
+  // a signed envelope and an accept is not.
+  //
+  // So the caller holds a name and no key, and the two available shortcuts are
+  // both worse than doing nothing:
+  //
+  //   * write the name against an empty key. That is the bug this project has
+  //     already had once -- `keyChanged` is `known[from] != nil && != kb64`, so
+  //     an empty value reads as A DIFFERENT KEY and every later ring from that
+  //     person would carry the impersonation warning. See the note above
+  //     `startRinging`, which names it.
+  //   * write the name against the X25519 key off the wire. Nobody signed it, so
+  //     it would seed `known` -- the flag that opens a socket before consent --
+  //     with a value an active man in the middle chooses.
+  //
+  // A name with no key is a real thing and it deserves its own place to live
+  // rather than a sentinel inside a map whose every value is supposed to be a
+  // key. Anything reading `contacts()` keeps the guarantee it already had; the
+  // panel asks a different question and gets a different answer.
+  static var calledFile: URL { dir.appendingPathComponent("called.json") }
+
+  /// Handles this Mac has dialled and actually talked to. NO KEYS, and that is
+  /// the point: nothing in here confers any trust on a ring, ever.
+  static func called() -> [String] {
+    guard let d = try? Data(contentsOf: calledFile),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String]
+    else { return [] }
+    // Filtered on the way out as well as on the way in. This file is small,
+    // local and hand-editable, and a junk entry in it would otherwise become a
+    // row in the People panel that dials something no server will accept.
+    return o.filter { sanitize($0) == $0 }
+  }
+
+  /// Write down somebody we called. Idempotent, and it NEVER touches
+  /// `contacts.json` -- a dialled name must not be able to become a key.
+  static func rememberCalled(_ handle: String) {
+    // Canonical or nothing. `sanitize` is the server's own rule, and a `from`
+    // that does not survive it is not a handle -- refused rather than rewritten,
+    // so what is written here is exactly what a later lookup will ask for.
+    guard sanitize(handle) == handle else {
+      fputs("contacts: refused to write down \"\(handle)\" -- not a handle\n", stderr); return
+    }
+    var list = called()
+    guard !list.contains(handle) else { return }
+    list.append(handle)
+    guard let d = try? JSONSerialization.data(withJSONObject: list.sorted()) else { return }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let tmp = calledFile.appendingPathExtension("tmp")
+    if (try? d.write(to: tmp, options: .atomic)) != nil {
+      _ = try? FileManager.default.replaceItemAt(calledFile, withItemAt: tmp)
+    }
+    fputs("contacts: @\(handle) written down -- we called them and they talked\n", stderr)
+  }
+
   // ── EVERYONE THIS MAC COULD TAP ────────────────────────────────────────────
   //
-  // `contacts()` is the truth and it is keyed by handle, so the panel is that
-  // keyset sorted. Sorted rather than "most recent first" because nothing here
-  // records when a call happened -- and an ordering derived from a field that does
-  // not exist is a list that reshuffles itself for reasons nobody can explain.
+  // TWO SOURCES, ONE QUESTION. The panel asks "who can I tap to call", and that
+  // is answered by anybody this Mac has talked to -- whether they rang us (a
+  // verified key in `contacts.json`) or we rang them (a name in `called.json`,
+  // with no key, because the caller never gets one). Reading only the first was
+  // the whole bug: a person who places calls and never receives one saw an empty
+  // panel for ever.
+  //
+  // A union rather than a merge, and the two files stay separate: everything
+  // downstream of `contacts()` is a trust decision, and a name is not a key.
+  // Sorted rather than "most recent first" because nothing here records when a
+  // call happened -- and an ordering derived from a field that does not exist is
+  // a list that reshuffles itself for reasons nobody can explain.
   //
   // ── AND THE RIG OVERRIDE, WHICH IS NOT OPTIONAL ────────────────────────────
   //
@@ -522,12 +610,32 @@ enum Identity {
       }
       return list
     }
-    return contacts().keys.sorted()
+    return Set(contacts().keys).union(called()).sorted()
   }
 
   /// Bind a handle to the key that actually rang. Called when a call is accepted,
   /// not when a ring arrives -- otherwise anyone who rings once owns the name.
   static func remember(handle: String, key: String) {
+    // ── THE INVARIANT IS ENFORCED HERE, NOT AT THE CALL SITE ─────────────────
+    //
+    // The answer path already guards with `if !o.k.isEmpty`, and it was right to:
+    // the watcher route carries no key, and an empty value here reads as A
+    // DIFFERENT KEY to `keyChanged`, so it would put the impersonation warning on
+    // every later ring from somebody perfectly ordinary. That guard is one `if`
+    // at one call site, and this file now has a second writer next door. A rule
+    // that every value is a 32-byte key somebody proved they held belongs with
+    // the map it describes.
+    //
+    // Shape-checked the same way `pollOnce` shape-checks an incoming `k`, so a
+    // value that could never match a real ring can never be written in the first
+    // place -- a stored key nothing can equal is a contact that can never be
+    // recognised and can never stop warning.
+    guard sanitize(handle) == handle else {
+      fputs("contacts: refused \"\(handle)\" -- not a handle\n", stderr); return
+    }
+    guard let raw = Data(base64Encoded: key), raw.count == 32 else {
+      fputs("contacts: refused a key for @\(handle) -- not a device key\n", stderr); return
+    }
     var c = contacts()
     guard c[handle] != key else { return }
     c[handle] = key
