@@ -143,13 +143,20 @@ prosody.
 
 ### The models were never the problem
 
-Measured against LibriSpeech ground truth, same audio, same machine, two runs:
+Measured against LibriSpeech ground truth, same audio, same machine:
 
 | | word error |
 |---|---|
-| Apple, on-device | **3.0%   3.0%** |
-| Qwen3-ASR, as Kin was streaming it | 50.9%  46.2% |
+| Apple, on-device | **3.0%**  (4 runs: 3.0, 27.8, 3.0, 3.0) |
+| Qwen3-ASR, as Kin was streaming it | 39.6%  50.3%  (and 46.2, 50.9 on an earlier source) |
 | Qwen3-ASR, handed whole utterances | **3.0%** |
+
+**Read the spread, not the best run.** Four IDENTICAL Apple arms scored 3.0,
+27.8, 3.0, 3.0 — so this rig's own noise is 25 points, and any comparison worth
+less than that cannot be made here at all
+([[measure-the-rigs-noise-first]]). The engine gap is far larger than the noise,
+which is the only reason the conclusion below is safe. A smaller question — what
+the cleaner costs, say — has to be asked of the signal instead.
 
 **The two models are identical and the whole 47-point gap was this app's
 streaming of the daemon.** Which is worth saying plainly, because for weeks the
