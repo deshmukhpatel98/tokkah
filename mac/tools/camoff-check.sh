@@ -1,0 +1,54 @@
+#!/bin/bash
+# ── DOES A CALL WITH SOMEBODY WHOSE CAMERA IS OFF LOOK LIKE A CALL? ──────────
+#
+# Two real processes, real UDP, real media. One of them has no camera at all.
+#
+# This exists because presence used to be keyed on the far end's first decoded
+# VIDEO FRAME, so a person who joined with their camera off was, to this app,
+# a person who never arrived. Measured before the fix: 59,574 audio frames
+# played, session encrypted, their turn cue drawing -- and the window still
+# showing "Waiting for the other person..." with the invite link over the top,
+# for the whole call. Turning your camera off is an ordinary thing to do.
+#
+# Both halves are asserted, because either alone is passable by a broken build:
+# the call must say CONNECTED, and it must say WHY there is no picture. A build
+# that connects and explains nothing is the same silence in a new place.
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+TK="${TK:-$HERE/../.build/debug/tk}"
+SP="${SCRATCH:-${TMPDIR:-/tmp}}/camoff-check.$$"
+mkdir -p "$SP"
+[ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
+trap 'pkill -f "$TK" 2>/dev/null; rm -rf "$SP"' EXIT
+
+R="camoffchk$$"
+# --mute on both ends, always: the machine's speakers belong to whoever is
+# sitting at it, and a rig that plays out loud gets turned off.
+A_ARGS="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
+pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.6'
+# A HAS NO CAMERA. This is the whole subject.
+"$TK" --room "$R" --listen 7911 --peer 127.0.0.1:7912 --video off $A_ARGS > "$SP/a.log" 2>&1 &
+# B is watching, and B's window is what gets inspected.
+"$TK" --window --room "$R" --listen 7912 --peer 127.0.0.1:7911 --video off $A_ARGS \
+      --press "?" --press-after 9 > "$SP/b.log" 2>&1 &
+perl -e 'select undef,undef,undef,12'
+pkill -f "$TK" 2>/dev/null; perl -e 'select undef,undef,undef,0.4'
+
+AUDIT="$(grep -oE 'audit state controls.*' "$SP/b.log" | head -1)"
+[ -n "$AUDIT" ] || { echo "  no audit line -- B never opened a window"; sed -n '1,20p' "$SP/b.log"; exit 1; }
+bad=0
+say() { # label, got, want-substring
+  case "$2" in (*"$3"*) echo "   ok   $1: $2";; (*) echo "  WRONG $1: $2  (want $3)"; bad=1;; esac
+}
+STATUS="$(sed -E 's/.*status=(.*)  room=.*/\1/' <<< "$AUDIT")"
+WARN="$(sed -E 's/.*  warn=(.*)  picker=.*/\1/' <<< "$AUDIT")"
+say "the call says it is connected" "$STATUS" "connected"
+say "and says why there is no picture" "$WARN" "camera is off"
+# The pair: the far end really was heard, or "connected" is a label over nothing.
+PLAYED="$(grep -oE 'played [0-9]+' "$SP/b.log" | tail -1 | awk '{print $2}')"
+if [ "${PLAYED:-0}" -gt 1000 ]; then echo "   ok   and their audio arrived: $PLAYED frames"
+else echo "  WRONG their audio never arrived: ${PLAYED:-0} frames"; bad=1; fi
+
+[ "$bad" = 0 ] && echo "  CAMERA-OFF CHECK PASSED -- a call with no picture is still visibly a call" \
+                || echo "  CAMERA-OFF CHECK FAILED"
+exit $bad

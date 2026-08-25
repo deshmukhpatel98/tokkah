@@ -3188,6 +3188,10 @@ final class CallControls: NSView {
       + "  status=\(status.isEmpty ? "-" : status)"
       + "  room=\(roomPill.text)"
       + "  quality=\(qualityText.isEmpty ? "-" : qualityText)"
+      // THE WARNING IS A SENTENCE THE USER READS, so an instrument that cannot see
+      // it cannot check the one thing that matters about it. "their camera is off"
+      // was invisible to every rig here until this line existed.
+      + "  warn=\(warnText.isEmpty ? "-" : warnText)"
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"

@@ -666,6 +666,35 @@ func leaveCall() -> Never {
 // self-view to the other person, and is the only thing that makes those two paths
 // mutually exclusive.
 nonisolated(unsafe) var sawRemote = false
+/// ── THEY ARE HERE, WHICH IS NOT THE SAME AS "I CAN SEE THEM" ────────────────
+///
+/// `sawRemote` means their first video frame decoded, and the whole presence
+/// system used to key off it: the waiting card, the status pill, the call timer,
+/// and the departure detector. So somebody who joined with their camera off was,
+/// to this app, somebody who never arrived. Measured on a real call: 59,574 audio
+/// frames played, the session encrypted, their turn cue drawing on screen -- and
+/// the window still showing "Waiting for the other person..." with the invite
+/// link over the top of it, for the entire call.
+///
+/// Turning your camera off is an ordinary thing to do. `one-condition-two-concerns`:
+/// "is the other person on this call" and "do I have their picture" are different
+/// questions, and the second one was answering both.
+nonisolated(unsafe) var peerHere = false
+/// ── AND THIS END HAS NO PICTURE TO SEND ─────────────────────────────────────
+///
+/// `--video off`, or a camera that refused to open. From the OTHER end this is
+/// indistinguishable from a camera somebody switched off with the button, and
+/// "their camera is off" is the true, plain-words description of both -- so it
+/// is advertised as exactly that. Without it the far end sits looking at a
+/// connected call with no picture and nothing saying why, which is the same
+/// silence this whole change is about.
+///
+/// INITIALISED HERE, not assigned earlier. It was set from `videoArg` up at the
+/// argument parsing, three hundred lines above this declaration -- and main.swift
+/// is TOP-LEVEL CODE, so the declaration's own initialiser runs later and put the
+/// `false` straight back. The flag was set, then unset, by two lines that both
+/// looked right, and the far end went on seeing nothing with no explanation.
+nonisolated(unsafe) var noCameraHere = videoArg == "off"
 /// Set from the control bar's camera button.
 nonisolated(unsafe) var camOff = false
 /// ── THE LINK SAID NO, SO NOTHING LEAVES ──────────────────────────────────────
@@ -727,13 +756,14 @@ func attachCamera(_ cam: CameraSource) {
     // tile while the button is held, nowhere otherwise. Two call sites deciding this
     // independently is exactly how they end up disagreeing.
     display?.showSelf(pb)
-    if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
+    if !sawRemote && !peerHere { mdisplay?.show(pb, at: Clock.now()) }
   }
   cam.startOffMain { err in
     if let err {
       // Not fatal. A call with no camera is still a call, and saying so beats a
       // blank window with no explanation.
       fputs("preview: unavailable (\(err)) -- continuing without a picture\n", stderr)
+      noCameraHere = true
       setWindowTitle("Kin — no camera; waiting for the other person")
       // Cleared so the reuse below the rendezvous builds a fresh source instead of
       // adopting a dead session -- which is also how a camera plugged in after
@@ -798,7 +828,8 @@ if flag("window") {
            onMic: { m in
              gMicMuted = m
              fputs("mic \(m ? "muted" : "live")\n", stderr)
-             d.controls?.setStatus(m ? "you are muted" : (sawRemote ? "connected" : "waiting for the other person"))
+             d.controls?.setStatus(m ? "you are muted"
+                                     : ((sawRemote || peerHere) ? "connected" : "waiting for the other person"))
            },
            onCam: { off in
              camOff = off
@@ -1004,7 +1035,7 @@ if earlyCam == nil, videoArg != "off", display != nil || mdisplay != nil {
     let f = FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
     f.onFrame = { pb, _ in
       display?.showSelf(pb)
-      if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
+      if !sawRemote && !peerHere { mdisplay?.show(pb, at: Clock.now()) }
     }
     do {
       // A file source's `start()` spawns its own reader thread and returns at
@@ -1528,15 +1559,26 @@ if let room = arg("room") {
           Metrics.mark("connected_ms", sinceLaunch())
           Metrics.count("connects")
           fputs("room \(room): connected via \(wire.lockedFrom)\n", stderr)
-          if sawRemote {
-            display?.controls?.setStatus("connected")
-            // The other half of the door. `markConnected` fires once per process
-            // (`if !sawRemote`), so if the waiting card came back on a departure,
-            // this is the only thing that can take it away again -- otherwise it
-            // would sit on top of the returning peer's picture for the rest of the
-            // call, which is a worse fault than the one it was added to fix.
-            display?.controls?.setPeerPresent(true)
-          }
+          // ── NOT `if sawRemote`. THE LOCK IS THE ARRIVAL. ──────────────────
+          //
+          // A locked transport with packets flowing IS the other person being
+          // here; their camera is a separate question, answered by the "their
+          // camera is off" banner that `setPaused` already draws. Gating this on
+          // video is what left a camera-off peer permanently invisible.
+          peerHere = true
+          // Their picture, if any, takes the window; yours goes to the corner.
+          // Idempotent -- the first-frame path below does the same thing, and
+          // whichever happens first is right.
+          display?.selfViewOn = true
+          display?.controls?.markConnected()
+          setWindowTitle("Kin — connected")
+          display?.controls?.setStatus(gMicMuted ? "you are muted" : "connected")
+          // The other half of the door. `markConnected` fires once per process,
+          // so if the waiting card came back on a departure, this is the only
+          // thing that can take it away again -- otherwise it would sit on top of
+          // the returning peer for the rest of the call, which is a worse fault
+          // than the one it was added to fix.
+          display?.controls?.setPeerPresent(true)
           gone = 0
         }
         // SILENCE IS THE SIGNAL. Three seconds with nothing arriving means the
@@ -1582,7 +1624,10 @@ if let room = arg("room") {
       if let p = peers.first, p.ageMs < 4000 {
         gone = 0
         addAll(p)
-      } else if sawRemote {
+      } else if peerHere {
+        // `sawRemote` here too, once, and with the same consequence in reverse:
+        // a camera-off peer could not be detected leaving either, so the call sat
+        // on a dead line saying "connected" forever.
         gone += 1
         if gone == 4 {
           let why = peers.isEmpty ? "not in the room" : "silent for \(peers[0].ageMs / 1000)s"
@@ -2941,7 +2986,7 @@ if videoArg != "off" {
       e.encode(pb, hostTime: host)
       // Same single owner as the early-camera path above.
       display?.showSelf(pb)
-      if !sawRemote { mdisplay?.show(pb, at: Clock.now()) }
+      if !sawRemote && !peerHere { mdisplay?.show(pb, at: Clock.now()) }
     }
     e.onEncoded = { data, host, _ in
       wire.sendVideo(seq: vseq, capHost: host, payload: data, scratch: vscratch)
@@ -4616,7 +4661,7 @@ func reportLoop() {
   // status byte is a latch, and a latch is how "their camera is off" outlives
   // the moment they switched it back on.
   wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
-                  | (camOff ? Wire.ST_CAMOFF : 0)
+                  | ((camOff || noCameraHere) ? Wire.ST_CAMOFF : 0)
   let pPaused = wire.peerVideoPaused, pCamOff = wire.peerCamOff
   if pPaused { vPeerPausedSecs += 1 }
   if pPaused != lastPeerPaused {
@@ -4628,6 +4673,10 @@ func reportLoop() {
   if pCamOff != lastPeerCamOff {
     lastPeerCamOff = pCamOff
     Metrics.count(pCamOff ? "peer_cam_off" : "peer_cam_on")
+    // Said out loud, like the pause above it. This transition decides whether the
+    // far end sees "their camera is off" or an unexplained empty picture, and it
+    // was the only one of the two that happened silently.
+    fputs("  picture: the far end's camera is \(pCamOff ? "OFF" : "on")\n", stderr)
   }
   display?.setPaused(peer: pPaused, selfSide: gVideoPaused, peerCamOff: pCamOff)
 
