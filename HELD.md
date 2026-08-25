@@ -160,3 +160,40 @@ than as a broken display; whether the hairline reads as "still trying" and not
 as a stuck progress bar; whether the chrome really stays full-contrast; whether
 "holding · audio live" means anything to someone who did not write it; and
 reduced-motion behaviour on a machine that has it switched on.
+
+---
+
+## The other silences (2026-08-25)
+
+`held` was built for one cause of a missing picture: a link that could not carry
+it. Testing whole calls by photographing them turned up three more, and all three
+were being reported as nothing at all.
+
+| what is happening | what the app used to do | what it does now |
+|---|---|---|
+| they joined with their camera off | **"Waiting for the other person…"** for the whole call, invite link over the window | connected, `their camera is off` |
+| they muted themselves | nothing — silence, indistinguishable from a dead line | `their microphone is off` |
+| they are here, no picture yet | the last frame of **your own face**, frozen | the window is cleared |
+
+**Presence was keyed on their first decoded video frame.** `sawRemote` decided the
+waiting card, the status pill, the call timer *and* the departure detector — so
+somebody who turned their camera off was, to this app, somebody who had never
+arrived. Measured on a real call: 59,574 audio frames played, session encrypted,
+their turn cue drawing on screen, and the window still offering you a link to
+invite the person you were already talking to. It is the transport lock now; a
+locked path with packets flowing IS the arrival.
+
+**Mute was already on the wire** — its own byte at `TPKTX+4`, sent every second —
+and the only thing reading it was a telemetry field. It was also assembled inside
+`if let e = venc`, the video encoder block, so on a call with no camera it was
+never sent at all. That is the call where it matters most: no picture to read, so
+an unexplained silence is everything the other person has.
+
+**Precedence.** Mute goes above a weak link. A weak link is worth saying and worth
+saying second, because it clears on its own; a person who cannot be heard does
+not, and every second you keep talking is wasted.
+
+All three are asserted on two real processes, both edges each:
+`tools/camoff-check.sh`, `tools/mute-check.sh`. A banner that never clears is
+worse than no banner, so the unmute is tested as hard as the mute
+(`permanent-impairment-hides-recovery`).
