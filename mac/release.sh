@@ -49,13 +49,69 @@ EOF
 echo "== build =="
 swift build -c release
 BIN=.build/release/tk
-codesign -s - -f "$BIN" 2>/dev/null || echo "  (ad-hoc sign skipped)"
+# Signed with the release certificate, not ad-hoc, and not allowed to fail
+# quietly. The old line ended in `2>/dev/null || echo skipped`, so a machine
+# without a working identity shipped an unsigned binary and said so in passing.
+: "${KIN_SIGNING_ENV:=$HOME/.config/kin-signing/env}"
+[ -f "$KIN_SIGNING_ENV" ] || { echo "no signing identity at $KIN_SIGNING_ENV -- run tools/make-identity.sh"; exit 1; }
+# shellcheck disable=SC1090
+set -a; . "$KIN_SIGNING_ENV"; set +a
+security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_NAME" 2>/dev/null || { echo "cannot unlock $KEYCHAIN_NAME"; exit 1; }
+codesign -s "$CN" -f --timestamp=none "$BIN"
 test "$("$BIN" --version)" = "$VER" || { echo "binary reports $("$BIN" --version), expected $VER"; exit 1; }
+
+# ── the two plists must agree ────────────────────────────────────────────────
+#
+# The bundle's metadata is written by hand in TWO places: `bundle/Info.plist`,
+# which ships in the archive and is installed over existing copies by the
+# updater, and the heredoc in `install.sh`, which builds the bundle for a fresh
+# curl install. They had already drifted -- the URL scheme existed in one and not
+# the other, so a curl install could not open a deep link -- and the dangerous
+# field is CFBundleExecutable: if the two disagree, whichever install receives the
+# other one's plist looks for an executable that is not there and stops launching.
+# The migration that renames the app runs once, on a machine that is not this
+# one, and its failure mode is an app that will not launch. Gated, not trusted.
+echo "== rename migration =="
+"$REPO/mac/.build/release/tk" --selftest-rename || { echo "FAILED: rename self-test"; exit 1; }
+
+# relocateIfHomeless fires exactly once, on somebody else's Mac, the first time
+# they open the copy that came out of the DMG -- and it moves the app they just
+# downloaded. Get it wrong and the thing they were about to run is somewhere they
+# did not put it, or gone. There is no second attempt, so it is proven here.
+echo "== install migration =="
+"$REPO/mac/.build/release/tk" --selftest-install || { echo "FAILED: install self-test"; exit 1; }
+
+echo "== plists =="
+python3 - "$REPO/mac/bundle/Info.plist" "$REPO/tape-app/public/macos/install.sh" <<'PYCHK'
+import plistlib, re, sys
+bundle = plistlib.load(open(sys.argv[1], "rb"))
+sh = open(sys.argv[2], encoding="utf-8").read()
+def sh_key(k):
+    m = re.search(r"<key>" + k + r"</key>\s*<string>([^<]*)</string>", sh)
+    return m.group(1) if m else None
+bad = 0
+for k in ("CFBundleExecutable", "CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName"):
+    a, b = bundle.get(k), sh_key(k)
+    if a != b:
+        print(f"  MISMATCH {k}: bundle={a!r} install.sh={b!r}")
+        bad = 1
+    else:
+        print(f"  {k} = {a}")
+sys.exit(bad)
+PYCHK
 
 echo "== icon =="
 # Regenerated every release from the Material Symbols path, so the icon in the
 # repo can never drift from the source it claims to come from.
 swift bundle/mkicon.swift bundle/AppIcon.icns
+
+echo "== bundle =="
+# Built BEFORE packaging, because the archive now carries the finished, signed
+# bundle as well as the loose binary. The .dmg is cut from this same directory,
+# so there is one signed artefact and it cannot disagree with itself.
+APPDIR=$(mktemp -d)
+./bundle/mkapp.sh "$VER" "$BIN" "$APPDIR" >/dev/null
+echo "  signed: $(codesign -dr - "$APPDIR/Kin.app" 2>/dev/null | sed -n 's/^designated => //p')"
 
 echo "== package =="
 STAGE=$(mktemp -d)
@@ -71,51 +127,141 @@ cp "$BIN" "$STAGE/tk"
 mkdir -p "$STAGE/bundle"
 cp bundle/Info.plist "$STAGE/bundle/Info.plist"
 cp bundle/AppIcon.icns "$STAGE/bundle/AppIcon.icns"
+# ── AND THE WHOLE SIGNED BUNDLE, WHICH IS WHAT NEW UPDATERS TAKE ─────────────
+#
+# `tk` + `bundle/` above is the LEGACY payload and stays for now: the updater
+# that applies this release is the one already installed, and every updater at
+# 0.45.0 or older refuses a stage that has no bare `tk` in it. Removing it would
+# strand exactly the people furthest behind.
+#
+# `Kin.app/` is the new payload. An updater that understands it replaces the
+# whole bundle in one move and never runs codesign on the user's machine, so the
+# certificate signature made here survives intact -- which is the entire point:
+# the designated requirement is what a camera or microphone grant is pinned to,
+# and patching files inside a bundle invalidates any real signature over them.
+# Old updaters do not look for this directory and ignore it.
+#
+# `ditto` rather than `cp -R`: it preserves the extended attributes the
+# signature is stored in for some resources. A bundle copied with anything less
+# arrives with a signature that no longer verifies.
+ditto "$APPDIR/Kin.app" "$STAGE/Kin.app"
 TAR="tk-$VER.tar.gz"
-tar -czf "/tmp/$TAR" -C "$STAGE" tk bundle
+tar -czf "/tmp/$TAR" -C "$STAGE" tk bundle Kin.app
 SHA=$(shasum -a 256 "/tmp/$TAR" | awk '{print $1}')
 SIZE=$(stat -f%z "/tmp/$TAR")
 echo "  $TAR  $SIZE bytes  sha256 $SHA"
 
-# ── Tokkah.app, and a .dmg for people who would rather drag than curl ────────
+# ── THE SIGNATURE HAS TO SURVIVE THE ARCHIVE ─────────────────────────────────
 #
-# The TARBALL STAYS EXACTLY ONE BINARY, because that is what every running copy's
-# self-updater fetches and expects. The bundle is assembled around that same
-# binary -- here for the .dmg, and on the user's own machine by install.sh -- so
-# there is one artefact to hash and one thing that can be stale.
-echo "== bundle =="
-APPDIR=$(mktemp -d)
-./bundle/mkapp.sh "$VER" "$BIN" "$APPDIR" >/dev/null
-DMG="Tokkah-$VER.dmg"
+# A bundle can be signed correctly here and still arrive broken, because an
+# archive that drops the wrong metadata invalidates the signature over it. The
+# user's machine cannot re-sign -- that is the whole design -- so a signature
+# damaged in transit is permanent and shows up as a permission prompt nobody can
+# explain. Checked on the extracted copy, which is the artefact that actually
+# reaches people, rather than on the one still sitting in $APPDIR.
+ROUND=$(mktemp -d)
+tar -xzf "/tmp/$TAR" -C "$ROUND"
+codesign --verify --deep --strict "$ROUND/Kin.app" \
+  || { echo "FAILED: signature does not survive the tarball"; exit 1; }
+GOT=$(codesign -dr - "$ROUND/Kin.app" 2>/dev/null | sed -n 's/^designated => //p')
+WANT="identifier \"com.tokkah.tk\" and certificate root = H\"$CERT_SHA1\""
+[ "$GOT" = "$WANT" ] || { echo "FAILED: requirement changed in transit"; echo "  want: $WANT"; echo "  got:  $GOT"; exit 1; }
+echo "  survives extraction, requirement intact"
+rm -rf "$ROUND"
+
+# ── a .dmg for people who would rather drag than curl ────────────────────────
+#
+# Cut from the same signed $APPDIR the archive carries, so the bundle a person
+# drags out of the .dmg and the bundle an updater installs are the same bytes
+# under the same signature.
+echo "== dmg =="
+DMG="Kin-$VER.dmg"
 rm -f "/tmp/$DMG"
 STAGE2=$(mktemp -d)
-cp -R "$APPDIR/Tokkah.app" "$STAGE2/"
+cp -R "$APPDIR/Kin.app" "$STAGE2/"
 ln -s /Applications "$STAGE2/Applications"
-hdiutil create -quiet -volname "Tokkah $VER" -srcfolder "$STAGE2" -ov -format UDZO "/tmp/$DMG"
+hdiutil create -quiet -volname "Kin $VER" -srcfolder "$STAGE2" -ov -format UDZO "/tmp/$DMG"
 DMGSHA=$(shasum -a 256 "/tmp/$DMG" | awk '{print $1}')
 echo "  $DMG  $(stat -f%z "/tmp/$DMG") bytes"
 # The icon travels as a static asset so install.sh can assemble a bundle without a
 # second archive to keep in step.
 cp bundle/AppIcon.icns "$REPO/tape-app/public/macos/AppIcon.icns"
 
+# ── AND AS A PNG, BECAUSE A BROWSER CANNOT RENDER .icns ──────────────────────
+#
+# The download page at /mac shows the app's own mark. The first version of that
+# page REDREW it as inline SVG, off a stale bundle/icon-1024.png, and so spent a
+# day advertising the previous logo while the .icns next to it was already the
+# current one. Exporting from the icns the release just generated means the page
+# cannot disagree with the app it hands you.
+ICONSET=$(mktemp -d)
+iconutil -c iconset bundle/AppIcon.icns -o "$ICONSET/AppIcon.iconset" >/dev/null
+cp "$ICONSET/AppIcon.iconset/icon_512x512.png" "$REPO/tape-app/public/macos/AppIcon.png"
+rm -rf "$ICONSET"
+
 echo "== upload =="
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$TAR" --file="/tmp/$TAR" --remote >/dev/null)
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/$DMG" --file="/tmp/$DMG" --remote >/dev/null)
 # A stable name as well as the versioned one, because the link a human shares
-# should not go stale the next time this runs.
+# should not go stale the next time this runs. Kin.dmg is that name now; the old
+# Tokkah.dmg keeps being written so links already shared out in the world still
+# resolve, at the cost of one extra R2 put per release.
+(cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/Kin.dmg" --file="/tmp/$DMG" --remote >/dev/null)
 (cd "$REPO/tape-app" && npx wrangler r2 object put "tokkah-mac/Tokkah.dmg" --file="/tmp/$DMG" --remote >/dev/null)
 
+# ── THE RENAME FLIPS HERE, AND ONLY THE DIRECTORY ────────────────────────────
+#
+# `appName` has been an optional field the updater knows how to act on for
+# several releases, proven every release by --selftest-rename above; setting it
+# is the whole flip. An updater too old to know the field parses the manifest
+# and ignores it, so those copies stay Tokkah.app and keep updating -- nobody is
+# stranded. CFBundleExecutable does NOT flip in this release, so relocate() only
+# moves the directory and never has to find a renamed binary inside it.
 echo "== manifest =="
 OUT="$REPO/tape-app/public/macos"
 mkdir -p "$OUT"
 cat > "$OUT/manifest.json" <<JSON
-{"version":"$VER","url":"https://room.tokkah.com/macos/dl/$TAR","sha256":"$SHA","size":$SIZE,"notes":"$NOTES","dmg":"https://room.tokkah.com/macos/dl/$DMG","dmgSha256":"$DMGSHA"}
+{"version":"$VER","url":"https://room.tokkah.com/macos/dl/$TAR","sha256":"$SHA","size":$SIZE,"appName":"Kin","notes":"$NOTES","dmg":"https://room.tokkah.com/macos/dl/$DMG","dmgSha256":"$DMGSHA"}
 JSON
 ./tools/sign "$OUT/manifest.json" > "$OUT/manifest.json.sig"
 echo "  signed ($(wc -c < "$OUT/manifest.json.sig" | tr -d ' ') bytes)"
 
+# ── keep the no-JS floor honest ──────────────────────────────────────────────
+#
+# Three pages bake the current version into the download link so they still work
+# with JavaScript off, and their JS moves them forward from the signed manifest at
+# runtime. Without this the baked value drifts: both kin.html and join.html were
+# advertising 0.41.0 while 0.46.0 was live. The manifest is the authority; this
+# only stops the fallback from lying.
+#
+# Asserted, not assumed -- a sed that silently matches nothing is exactly how a
+# "fix" ships as a no-op.
+echo "== page versions =="
+for f in "$REPO/tape-app/public/kin.html" "$REPO/tape-app/public/join.html" \
+         "$REPO/tape-app/public/macos/index.html"; do
+  before=$(grep -coE "Kin-$VER\.dmg" "$f" || true)
+  sed -i '' -E "s/Kin-[0-9]+\.[0-9]+\.[0-9]+\.dmg/Kin-$VER.dmg/g; \
+                s/(<span id=ver>)v[0-9]+\.[0-9]+\.[0-9]+/\1v$VER/g" "$f"
+  after=$(grep -coE "Kin-$VER\.dmg" "$f" || true)
+  [ "$after" -gt 0 ] || { echo "FAILED: $f has no Kin-<version>.dmg link to bump"; exit 1; }
+  echo "  $(basename "$f"): $after link(s) at $VER (was $before)"
+done
+
 echo "== deploy =="
 (cd "$REPO/tape-app" && npx wrangler deploy -c wrangler.prod.jsonc | tail -3)
+
+# ── kin.tokkah.com rides a zone route, not a custom domain ───────────────────
+#
+# Custom-domain attach wedged this hostname (ghost Workers-managed DNS entry,
+# 2026-08-24), so the front door is: plain DNS records + this route. The route
+# survives deploys, but a deploy from a fresh account state would drop it --
+# so every release re-asserts it. Duplicate-route errors are the success case.
+if [ -n "${CF_DNS_API_TOKEN:-}" ]; then
+  curl -s -X POST "https://api.cloudflare.com/client/v4/zones/646e49643a10c7406f2188eb2bae412b/workers/routes" \
+    -H "Authorization: Bearer $CF_DNS_API_TOKEN" -H "Content-Type: application/json" \
+    --data '{"pattern":"kin.tokkah.com/*","script":"tape-app"}' \
+    | grep -q '"success": *true\|already exists\|duplicate' && echo "  kin route ok" || echo "  WARNING: kin route assert failed"
+fi
 
 echo "== verify from the outside =="
 # This used to print the manifest and then say "released" regardless of what came
