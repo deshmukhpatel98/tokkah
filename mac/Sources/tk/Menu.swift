@@ -91,6 +91,16 @@ enum Menu {
     people.keyEquivalentModifierMask = [.command, .shift]; people.target = Target.shared
     let copy = call.addItem(withTitle: "Copy Invite Link", action: #selector(Target.invite), keyEquivalent: "c")
     copy.keyEquivalentModifierMask = [.command, .shift]; copy.target = Target.shared
+    // ── THE SHARE SHEET KEPT A DOOR ────────────────────────────────────────────
+    //
+    // `share` was a pill on the waiting card until the card became a link and a
+    // button. Deleting the button without moving the action would have deleted the
+    // feature: AirDrop and Messages are how an invite actually reaches somebody
+    // sitting in the next room, and the clipboard is not a substitute for either.
+    // A menu item is where a Mac keeps a capability that does not deserve a
+    // permanent control.
+    call.addItem(withTitle: "Share Invite…", action: #selector(Target.share),
+                 keyEquivalent: "").target = Target.shared
     let code = call.addItem(withTitle: "Show Encryption Code", action: #selector(Target.more), keyEquivalent: "")
     code.target = Target.shared
     call.addItem(.separator())
@@ -159,6 +169,7 @@ enum Menu {
     @objc func mic() { Menu.controls?.toggleMic(); Menu.controls?.nudgeBar() }
     @objc func cam() { Menu.controls?.toggleCam(); Menu.controls?.nudgeBar() }
     @objc func invite() { Menu.controls?.invite(); Menu.controls?.nudgeBar() }
+    @objc func share() { Menu.controls?.share(); Menu.controls?.nudgeBar() }
     @objc func more() { Menu.controls?.nudgeBar(); Menu.controls?.openMore() }
     @objc func people() { Menu.controls?.nudgeBar(); Menu.controls?.openPeople() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }

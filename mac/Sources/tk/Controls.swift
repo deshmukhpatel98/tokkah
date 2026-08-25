@@ -229,6 +229,30 @@ enum Glyph {
     p.appendArc(withCenter: NSPoint(x: 12 * k, y: 20 * k), radius: 2 * k,
                 startAngle: 180, endAngle: 0, clockwise: true)
   } }, filled: false)
+
+  // ── ONE HANDSET AT TWO ANGLES ──────────────────────────────────────────────
+  //
+  // A call glyph and a hang-up glyph are the same handset rotated -- that is how
+  // every icon set on every platform draws the pair, and it is why you can read
+  // one as the opposite of the other at 16 pt. Transcribing a second outline by
+  // hand would give two shapes that drift apart the first time either is nudged,
+  // and the two of them would stop reading as a pair without anyone being able to
+  // say why.
+  //
+  // The rotation is NEGATIVE because `path()` has already flipped the y axis: the
+  // 135 degrees clockwise that separates them in the y-down SVG frame is 135
+  // counter-clockwise here. Getting this backwards points the earpiece at the
+  // floor, which is exactly the hang-up glyph, at which point the two controls in
+  // this app that mean opposite things look identical.
+  static let phone = Shape(build: { box in
+    let p = leave.build(box)
+    let t = NSAffineTransform()
+    t.translateX(by: box / 2, yBy: box / 2)
+    t.rotate(byDegrees: -135)
+    t.translateX(by: -box / 2, yBy: -box / 2)
+    p.transform(using: t as AffineTransform)
+    return p
+  }, filled: true)
 }
 
 // ── ONE CIRCLE, THE WEB APP'S ─────────────────────────────────────────────────
@@ -247,7 +271,7 @@ final class IconButton: NSButton {
   // clear variant: "components that float above media backgrounds -- such as
   // photos and videos -- to create a more immersive content experience." The dim
   // that keeps it legible is a gradient on the overlay, not a fill in here.
-  private let glass = Glass(radius: 0, variant: .clear, interactive: true)
+  private let glass: Glass
   private var hovering = false
   /// Bar circles are 58; the corner `more` button is 48, like the web app.
   private let box: CGFloat
@@ -369,9 +393,23 @@ final class IconButton: NSButton {
   var confirmLabel: String?
   var confirming = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
 
-  init(_ shape: Glyph.Shape, size: CGFloat = 58, help: String) {
+  // ── WHICH MATERIAL, AND WHY IT IS A PARAMETER ──────────────────────────────
+  //
+  // `.clear` is right for the bar, and the HIG note above says why: circles
+  // floating over a face, with a gradient under the row keeping them legible. The
+  // handset on the waiting card is the same button in a different place -- alone
+  // in the middle of the picture, with no gradient under it and nothing else
+  // nearby to borrow contrast from. Photographed over a white frame it was a pale
+  // circle with a white glyph in it, which is to say it was not there.
+  //
+  // `.regular` is the variant that adjusts luminosity to keep what is on it
+  // legible. Passing it is cheaper and more honest than painting a second dim
+  // behind one button.
+  init(_ shape: Glyph.Shape, size: CGFloat = 58, help: String,
+       variant: Glass.Variant = .clear) {
     self.shape = shape
     self.box = size
+    self.glass = Glass(radius: 0, variant: variant, interactive: true)
     super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
     isBordered = false
     title = ""
@@ -1221,90 +1259,205 @@ final class Sheet: NSView {
 // This is the whole first experience of the app: no name to invent, no lobby, no
 // button to press before anything happens. The call is already live behind this
 // card -- the card is only how you tell somebody else where it is.
-final class WaitingCard: NSView {
-  // ── ONE CARD, NOT FIVE THINGS FLOATING ────────────────────────────────────
+final class WaitingCard: NSView, NSTextFieldDelegate {
+  // ── THE WHOLE INVITE, IN TWO CONTROLS ──────────────────────────────────────
   //
-  // Title, hint, link, two buttons, a field and a third button, each drifting
-  // separately in the middle of somebody's picture, each carrying its own
-  // `text-shadow: 0 1px 8px rgba(0,0,0,.85)` to stay readable. Seven shadows is
-  // what a screen looks like when nothing on it has a surface to sit on.
+  // This card used to be seven things: a title, a hint, a link, `share`, `copy`, a
+  // name field and `call`, inside a panel sized to hold them all. Every one of
+  // them was defensible on its own and together they were a form -- a form that
+  // opened over your own face, in an app whose entire pitch is that there is
+  // nothing to fill in before a call starts.
   //
-  // A panel gives them one, and it is what the material is FOR: this is the app's
-  // one text-heavy moment, so it is regular glass, tinted, with the picture
-  // refracting through it. The controls are still direct subviews of this card and
-  // the panel is only a sibling behind them -- the hit-testing here has been fixed
-  // three times and moving every frame into a new coordinate space to gain nothing
-  // visible would be asking for a fourth.
+  // What is left is the link and one round button. The link copies when you click
+  // it, which it always did and never said; the button turns the link into a name
+  // field, because sending a link and calling a name are the same intention --
+  // reach a person -- and only one of them can be what you meant at a time.
+  //
+  // The panel went with the words. A panel exists to hold text on top of a moving
+  // picture; with no text there is nothing to hold, and a pane of glass around a
+  // pane of glass was the thing that made this read as a dialog.
+  enum Mode: String { case invite, dial, ringing }
+  /// One value decides what is on screen, so two states cannot both be. This was
+  /// three booleans that had to agree, and the ringing state got its visibility
+  /// from a different one than its layout did.
+  private(set) var mode: Mode = .invite
+
+  // ── STILL A CARD WHEN SOMEBODY IS RINGING ─────────────────────────────────
+  //
+  // The ringing state is the one moment here that has to say words -- WHO is
+  // calling -- and a name over an unknown camera frame needs a surface. So the
+  // panel, the title and the hint are alive, and they belong to `.ringing` alone.
   private let panel = Glass(radius: Metric.cardRadius, variant: .regular)
   private let wash = CAGradientLayer()
-  private let title = NSTextField(labelWithString: "Waiting for the other person…")
-  private let hint = NSTextField(labelWithString: "This link is the key — anyone who has it can join")
+  private let title = NSTextField(labelWithString: "")
+  private let hint = NSTextField(labelWithString: "")
+
   private let urlField = NSTextField(labelWithString: "")
-  // NOT glass. See `Vibrant`: these sit on the card's glass, and a pane of glass on
-  // a pane of glass is the one thing the guidance names outright.
-  private let urlGlass = Vibrant()
-  private let shareButton = PillButton("share")
-  private let copyButton = PillButton("copy")
+  // ── WHICH ONE OF THESE IS CORRECT DEPENDS ON WHAT IS UNDER IT ──────────────
+  //
+  // This was a `Vibrant` -- a flat white-at-10% fill -- and the comment above it
+  // said, correctly, that a pane of glass on a pane of glass is the one thing the
+  // guidance names outright. That was true while there was a PANEL under it.
+  //
+  // There is no panel now, so the rule points the other way: this is a lone
+  // control sitting directly on somebody's picture, which is the case the real
+  // material exists for. The flat fill could not do it -- white at 10% over a
+  // white wall is a white box, and the link on it measured 3.7:1. `.regular`
+  // "blurs and adjusts luminosity to keep text legible", in both directions,
+  // which is the whole job here and is not something a constant alpha can do.
+  private let urlGlass = Glass(radius: Metric.cardFieldRadius, variant: .regular)
+  // ── A HOLDER, BECAUSE THE GLASS OWNS ITS CONTENT VIEW ─────────────────────
+  //
+  // `NSGlassEffectView` places and sizes whatever it is given as `contentView` --
+  // that is the guarantee, and it is the reason the field goes inside rather than
+  // on top. It also means a frame set on the field itself is a frame the glass is
+  // free to overwrite, which it does: the link handed over directly drew hard
+  // against the top of the pill instead of through the middle of it.
+  //
+  // So the glass is handed a plain view to place, and the field is positioned
+  // inside THAT, in coordinates nothing else is going to rewrite.
+  private let urlHolder = NSView()
   // ── CALLING A NAME INSTEAD OF SENDING A LINK ────────────────────────────────
   //
-  // The one editable thing in this app, and it lives here because this screen is
-  // where somebody already is when they want to reach a person: the link is for
-  // people you have never called, the field is for the ones you have.
-  private let dialGlass = Vibrant()
+  // The one editable thing in this app. It is in the same place as the link and
+  // never beside it: the link is for people you have never called, the field is
+  // for the ones you have, and being asked to choose between two boxes at the
+  // moment you open the app is the choice this screen exists to not make you make.
+  private let dialGlass = Glass(radius: Metric.cardFieldRadius, variant: .regular)
+  private let dialHolder = NSView()
   private let dialField = NSTextField()
-  private let callButton = PillButton("call")
+  /// A handset, not the word "call". The row it sits in is a link and a button;
+  /// the link is already the only thing here carrying text, and a word next to it
+  /// makes two things to read where there is one thing to do.
+  private let callIcon = IconButton(Glyph.phone, size: Metric.fieldHeight,
+                                    help: "Call someone by name", variant: .regular)
   private let answerButton = PillButton("answer")
   private let declineButton = PillButton("decline")
-  var url = "" { didSet { urlField.stringValue = url; needsLayout = true } }
+
+  /// Kept separately from `urlField.stringValue`, which the copy confirmation
+  /// borrows for two seconds. Reading the link back out of the label would hand
+  /// somebody "copied ✓" as their invite.
+  private var urlText = ""
+  var url = "" {
+    didSet {
+      urlText = url
+      if !confirming { urlField.stringValue = url }
+      needsLayout = true
+    }
+  }
   var onCopy: (() -> Void)?
-  var onShare: (() -> Void)?
   /// A handle was typed and confirmed. The card does not know how to ring, only
   /// that somebody asked to.
   var onCall: ((String) -> Void)?
   var onAnswer: (() -> Void)?
   var onDecline: (() -> Void)?
 
-  /// Somebody is ringing. Set to switch the card from "invite" to "answer": the
-  /// two states share a layout on purpose, because they are the same screen
-  /// answering the same question -- who is going to be on this call.
+  /// Somebody is ringing. Set to switch the card from "invite" to "answer".
   private(set) var incoming: (from: String, room: String)?
 
   func setIncoming(from: String, room: String) {
     incoming = (from, room)
     title.stringValue = "@\(from) is calling"
     hint.stringValue = "answer and you will both be in the same room"
+    mode = .ringing
     applyMode()
   }
 
   func clearIncoming() {
+    guard incoming != nil || mode == .ringing else { return }
     incoming = nil
-    title.stringValue = "Waiting for the other person…"
-    hint.stringValue = "This link is the key — anyone who has it can join"
+    mode = .invite
     applyMode()
   }
 
-  /// One place decides what is on screen, so the two states cannot both be.
+  /// One place decides what is on screen.
   private func applyMode() {
-    let ringing = incoming != nil
-    for v in [urlGlass, urlField, shareButton, copyButton, dialGlass, dialField, callButton] {
-      v.isHidden = ringing
-    }
-    answerButton.isHidden = !ringing
-    declineButton.isHidden = !ringing
+    let m = mode
+    panel.isHidden = m != .ringing
+    title.isHidden = m != .ringing
+    hint.isHidden = m != .ringing
+    urlGlass.isHidden = m != .invite
+    urlField.isHidden = m != .invite
+    dialGlass.isHidden = m != .dial
+    dialField.isHidden = m != .dial
+    callIcon.isHidden = m == .ringing
+    answerButton.isHidden = m != .ringing
+    declineButton.isHidden = m != .ringing
+    // The same circle means "ask me who" and then "ring them". Saying so is the
+    // difference between a button that changed and a button that moved.
+    callIcon.toolTip = m == .dial ? "Call this name" : "Call someone by name"
+    callIcon.setAccessibilityLabel(callIcon.toolTip)
+    // A field left holding half a name is a field that answers the NEXT question
+    // with the last one's answer. The field editor too -- see `dialConfirmed`.
+    if m != .dial { dialField.currentEditor()?.string = ""; dialField.stringValue = "" }
     needsLayout = true
     needsDisplay = true
+    window?.invalidateCursorRects(for: self)
   }
+
+  // ── THE SWAP ────────────────────────────────────────────────────────────────
+  //
+  // The link does not slide aside to make room; it goes, and the field takes its
+  // place. Both rows are laid out at the SAME width for the same reason -- the
+  // button must not move under a finger that is already on it, because the second
+  // click somebody makes here is on the same circle as the first.
+  func enterDial() {
+    guard mode != .ringing else { return }
+    mode = .dial
+    applyMode()
+    layoutSubtreeIfNeeded()
+    _ = window?.makeFirstResponder(dialField)
+    Metrics.tap("dial_open")
+  }
+
+  /// Back to the link, with nothing typed carried over.
+  @discardableResult
+  func leaveDial() -> Bool {
+    guard mode == .dial else { return false }
+    mode = .invite
+    applyMode()
+    if window?.firstResponder === dialField.currentEditor() || window?.firstResponder === dialField {
+      _ = window?.makeFirstResponder(nil)
+    }
+    return true
+  }
+
+  /// Whatever is in the name field right now, live -- including the letters the
+  /// field editor is holding, which is where they live while somebody is still
+  /// typing. Reading `stringValue` alone reports the value as of the last commit,
+  /// so a rig that types and then looks sees an empty box and calls it a failure.
+  var dialText: String { dialField.currentEditor()?.string ?? dialField.stringValue }
 
   /// What is typed in the field, cleaned up the way the server will see it.
   private func dialled() -> String? {
-    let raw = dialField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    let raw = dialText.trimmingCharacters(in: .whitespacesAndNewlines)
     return Identity.sanitize(raw.hasPrefix("@") ? String(raw.dropFirst()) : raw)
   }
 
   @objc private func dialConfirmed() {
+    // An empty field is not a failed call, it is a change of mind: the same
+    // circle that opened this closes it. Counting that as a failure would put a
+    // fault in the record every time somebody looked at the field and thought
+    // better of it.
+    // `dialText`, NOT `stringValue`. While somebody is typing, the letters live in
+    // the field editor and `stringValue` still holds the value as of the last
+    // COMMIT -- which, for a field nobody has pressed Enter in, is the empty
+    // string. Enter commits first and hid this completely; the button does not,
+    // and reading `stringValue` there meant: type a name, click the handset, watch
+    // the name disappear and no call happen. The control that exists to start a
+    // call would have been the one way to start no call.
+    if dialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      leaveDial(); return
+    }
     guard let h = dialled() else { Metrics.tap("call", ok: false); return }
     Metrics.tap("call")
+    // Both halves: the field editor is what is on screen, `stringValue` is what
+    // the next read returns, and clearing one and not the other leaves the name
+    // behind in whichever of them the next reader happens to look at.
+    dialField.currentEditor()?.string = ""
     dialField.stringValue = ""
+    mode = .invite
+    applyMode()
     onCall?(h)
   }
 
@@ -1314,18 +1467,32 @@ final class WaitingCard: NSView {
   /// that can disagree about what a name is.
   @discardableResult
   func focusDial() -> Bool {
-    guard !dialField.isHidden, let w = window else { return false }
-    return w.makeFirstResponder(dialField)
+    guard mode != .ringing, window != nil else { return false }
+    enterDial()
+    return window?.firstResponder === dialField || window?.firstResponder === dialField.currentEditor()
   }
 
-  /// `#copy:disabled { opacity: 1; color: var(--ok) }` -- "copied ✓" is a
-  /// confirmation, not a dead control.
+  // ── THE CONFIRMATION IS ON THE THING YOU CLICKED ───────────────────────────
+  //
+  // "copied ✓" used to appear on the `copy` button, which was fine while the
+  // button existed and was the whole problem the moment the link itself became
+  // the control: you clicked a box, the box did nothing visible, and the only
+  // evidence was on a pill three inches away. A click with no answer is a click
+  // people make twice and then stop making.
+  private var confirming = false
   func confirmCopied() {
-    copyButton.title2 = "copied ✓"
-    copyButton.tint = Palette.ok
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
-      self?.copyButton.title2 = "copy"
-      self?.copyButton.tint = Palette.fg
+    confirming = true
+    urlField.stringValue = "copied ✓"
+    urlField.textColor = Palette.ok
+    let token = urlText
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+      guard let self, self.confirming else { return }
+      self.confirming = false
+      // From `urlText`, not from the label, and only if the link has not changed
+      // underneath the confirmation.
+      self.urlField.stringValue = self.urlText.isEmpty ? token : self.urlText
+      self.urlField.textColor = Palette.fg
+      self.needsLayout = true
     }
   }
 
@@ -1334,8 +1501,6 @@ final class WaitingCard: NSView {
     wantsLayer = true
     // `radial-gradient(ellipse at center, rgba(6,8,13,.55), transparent 72%)`.
     wash.type = .radial
-    wash.colors = [NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: 0.55).cgColor,
-                   NSColor.clear.cgColor]
     wash.locations = [0, 0.72]
     wash.startPoint = CGPoint(x: 0.5, y: 0.5)
     wash.endPoint = CGPoint(x: 1.0, y: 1.0)
@@ -1352,15 +1517,10 @@ final class WaitingCard: NSView {
       t.alignment = .center
       t.backgroundColor = .clear
       t.isBordered = false
-      // A backstop for the same failure the width calculation fixes. The card is
-      // sized to the text, but the window can be narrower than the text; when it
-      // is, this ends the line with an ellipsis instead of cutting a word in half,
-      // which at least reads as "there is more" rather than as a broken layout.
+      // A backstop for the same failure the width calculation fixes: when the
+      // window is narrower than the sentence, end the line with an ellipsis
+      // instead of cutting a word in half.
       t.lineBreakMode = .byTruncatingTail
-      // The `text-shadow: 0 1px 8px rgba(0,0,0,.85)` that used to be set here is
-      // gone. It existed to keep white text legible over an unknown camera frame,
-      // and there is a panel under the text now doing that job properly. A drop
-      // shadow on type sitting on a material reads as a printing fault.
       addSubview(t)
     }
     urlField.font = Type_.mono
@@ -1368,67 +1528,95 @@ final class WaitingCard: NSView {
     urlField.alignment = .center
     urlField.backgroundColor = .clear
     urlField.isBordered = false
-    urlField.isSelectable = true
-    // ── A BLACK RECTANGLE BEHIND THE LINK ─────────────────────────────────────
-    //
-    // There were two lines here, one for each field:
-    //     urlGlass.layer?.backgroundColor = rgba(8,11,18,.9)
-    // Harmless when `Glass` WAS the blur -- it was the fill that made the old
-    // material readable. Now `Glass` is a wrapper and its own layer is the
-    // un-rounded outer box, so the same line painted a hard-edged opaque black
-    // rectangle across the material and out past its corners.
-    //
-    // Invisible for as long as this screen was photographed over black, which is
-    // every screenshot ever taken of it: the app's own snapshot cannot see a
-    // material, and the capture rig was running the near end with `--video off`.
-    // Over a real picture -- which is what a waiting user is actually looking at,
-    // because `showSelf` puts your own camera in the window until someone
-    // arrives -- it was the first thing you saw.
+    // NOT selectable any more. A selectable label swallows the click that is now
+    // the control: you would drag out a text selection instead of copying, which
+    // is the exact gesture people try when a copy button has just been taken away.
+    urlField.isSelectable = false
     addSubview(urlGlass)
-    addSubview(urlField)
-    shareButton.onPress = { [weak self] in self?.onShare?() }
-    copyButton.onPress = { [weak self] in self?.onCopy?() }
-    addSubview(shareButton)
-    addSubview(copyButton)
+    urlHolder.addSubview(urlField)
+    urlGlass.content = urlHolder
 
     dialField.font = Type_.row
     dialField.textColor = Palette.fg
-    dialField.alignment = .center
+    // ── LEFT, WHERE THE CARET IS ──────────────────────────────────────────────
+    //
+    // Centred, an empty field puts the insertion point at the middle of the box
+    // and the placeholder around it, so the caret is drawn INSIDE the hint --
+    // photographed as a cursor sitting in the middle of the word "want". It reads
+    // as text somebody already typed and half-deleted rather than as an empty box
+    // waiting for a name. Every search field on this platform is left aligned for
+    // this reason, and the link above it is centred because a link is a value to
+    // read, not a place to type.
+    dialField.alignment = .left
     dialField.backgroundColor = .clear
     dialField.drawsBackground = false
     dialField.isBordered = false
     dialField.isEditable = true
     dialField.isSelectable = true
     dialField.focusRingType = .none
-    dialField.placeholderString = "call a name, like @devesh"
+    dialField.placeholderString = "who do you want to call?"
     // Enter sends the action. A field you have to reach for a button after is a
     // field people type into and then wonder why nothing happened.
     dialField.target = self
     dialField.action = #selector(dialConfirmed)
+    dialField.delegate = self
     addSubview(dialGlass)
-    addSubview(dialField)
-    // See the note above mouseDown: `call` commits on release, via the card.
-    addSubview(callButton)
+    dialHolder.addSubview(dialField)
+    dialGlass.content = dialHolder
+
+    // A real NSButton action, not the card's frame routing: `IconButton` with no
+    // `onHold` falls through to `super`, which is press-here-release-here, which
+    // is what every Mac button does and what a control that starts a call has to
+    // do. See the note on `mouseDown` below for why the other three cannot.
+    callIcon.target = self
+    callIcon.action = #selector(callIconPressed)
+    addSubview(callIcon)
 
     answerButton.tint = Palette.ok
-    // Deliberately NO `onPress` on these three: the card routes them through
-    // mouseDown/mouseUp above so they commit on release. Wiring `onPress` as well
+    // Deliberately NO `onPress` on these two: the card routes them through
+    // mouseDown/mouseUp below so they commit on release. Wiring `onPress` as well
     // would give them a second, press-to-commit path -- the exact thing being
     // removed.
-    answerButton.isHidden = true
-    declineButton.isHidden = true
     addSubview(answerButton)
     addSubview(declineButton)
+    applyMode()
   }
   required init?(coder: NSCoder) { fatalError() }
+
+  // ── ESCAPE HAS TO BE ASKED FOR HERE ────────────────────────────────────────
+  //
+  // Not in `CallControls.handleKey` with the app's other keys. While a field is
+  // being typed into, AppKit routes the key to its FIELD EDITOR, which turns
+  // Escape into `cancelOperation:` and consumes it -- so the window's `keyDown`
+  // never sees it and an Escape handler written up there is dead exactly when
+  // somebody wants it. This is the one place the key actually arrives.
+  func control(_ control: NSControl, textView: NSTextView,
+               doCommandBy sel: Selector) -> Bool {
+    guard sel == #selector(NSResponder.cancelOperation(_:)) else { return false }
+    return leaveDial()
+  }
+
+  /// Clicking away from an empty field is the same change of mind as pressing the
+  /// button again, and leaving a blank box with no link under it would be a screen
+  /// with nothing on it at all.
+  func controlTextDidEndEditing(_ obj: Notification) {
+    guard mode == .dial,
+          dialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return }
+    leaveDial()
+  }
+
+  @objc private func callIconPressed() {
+    if mode == .dial { dialConfirmed() } else { enterDial() }
+  }
 
   // ── A FULL-SURFACE OVERLAY MUST NOT EAT THE BAR ────────────────────────────
   //
   // `#waiting` is `inset: 0` so its wash is centred on the window rather than on a
   // box, which means it covers the buttons too. In CSS that is harmless -- the bar
-  // has a higher z-index. Here it is a subview added last, so without this it would
-  // swallow every click on mic, camera and leave, and the call would look frozen
-  // while being perfectly fine.
+  // has a higher z-index. Here it is a subview added last, so without the
+  // `hitTest` below it would swallow every click on mic, camera and leave, and the
+  // call would look frozen while being perfectly fine.
   /// A card that appears the instant the app opens: its first click is the one
   /// that matters most, and it used to be eaten by activation.
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1436,45 +1624,52 @@ final class WaitingCard: NSView {
   /// Only what is actually on screen, so the `?` audit cannot report a control
   /// the current mode has hidden.
   var clickTargets: [(String, NSView)] {
-    if incoming != nil { return [("answer", answerButton), ("decline", declineButton)] }
-    return [("share", shareButton), ("copy", copyButton), ("link", urlGlass),
-            ("dial", dialField), ("call", callButton)]
+    switch mode {
+    case .ringing: return [("answer", answerButton), ("decline", declineButton)]
+    case .invite: return [("link", urlGlass), ("call", callIcon)]
+    case .dial: return [("dial", dialField), ("call", callIcon)]
+    }
   }
 
   override func hitTest(_ point: NSPoint) -> NSView? {
     let p = convert(point, from: superview)
-    // ── THE ONE THING THAT MUST NOT BE ROUTED TO SELF ────────────────────────
+    // ── TWO THINGS THAT MUST NOT BE ROUTED TO SELF ──────────────────────────
     //
-    // Every other target here answers `self`, because the card handles its own
-    // presses. A TEXT FIELD cannot work that way: typing needs it to become first
+    // The pills answer `self`, because the card handles its own presses by frame.
+    // A TEXT FIELD cannot work that way: typing needs it to become first
     // responder, and that only happens if the click actually reaches it. Routing
-    // it to `self` like the rest would give a field that draws, highlights on
-    // hover, and can never be typed into.
+    // it to `self` would give a field that draws, highlights on hover, and can
+    // never be typed into.
+    //
+    // The call button is the second, for a different reason: it is a real
+    // NSButton and its own press/release tracking is what makes it commit on
+    // release. Intercepting the click here to call the action by hand would be a
+    // second, press-to-commit path to starting a call.
     if !dialField.isHidden, dialGlass.frame.contains(p) { return dialField }
-    for v in [urlGlass, shareButton, copyButton, callButton, answerButton, declineButton]
+    if !callIcon.isHidden, callIcon.frame.contains(p) { return callIcon }
+    for v in [urlGlass, answerButton, declineButton]
     where !v.isHidden && v.frame.contains(p) { return self }
     return nil
   }
 
-  // ── THE THREE CONSEQUENTIAL ONES COMMIT ON RELEASE ─────────────────────────
+  // ── THE CONSEQUENTIAL ONES COMMIT ON RELEASE ───────────────────────────────
   //
-  // Copy and share are harmless and fire on press, as they always have. Answer,
-  // decline and call are not: answering joins a room, and a control that commits
-  // on mouse-DOWN commits to whatever the pointer happened to be over. One
-  // unattributed auto-answer during testing was enough -- press-then-release
-  // inside the same pill is what every Mac button does, and it also lets somebody
-  // slide off a pill they did not mean to hit.
+  // Copy is harmless and fires on press, as it always has. Answer and decline are
+  // not: answering joins a room, and a control that commits on mouse-DOWN commits
+  // to whatever the pointer happened to be over. One unattributed auto-answer
+  // during testing was enough -- press-then-release inside the same pill is what
+  // every Mac button does, and it also lets somebody slide off a pill they did not
+  // mean to hit. `call` gets the same guarantee from NSButton itself.
   private var armed: NSView?
 
-  /// The link itself copies when clicked -- `#shareUrl { cursor: pointer }`.
+  /// The link itself copies when clicked -- `#shareUrl { cursor: pointer }`, and
+  /// now the only way to copy it from this screen.
   override func mouseDown(with event: NSEvent) {
     let p = convert(event.locationInWindow, from: nil)
     armed = nil
-    for v in [answerButton, declineButton, callButton] as [NSView]
+    for v in [answerButton, declineButton] as [NSView]
     where !v.isHidden && v.frame.contains(p) { armed = v; return }
     if !urlGlass.isHidden, urlGlass.frame.contains(p) { onCopy?(); return }
-    if !shareButton.isHidden, shareButton.frame.contains(p) { onShare?(); return }
-    if !copyButton.isHidden, copyButton.frame.contains(p) { onCopy?(); return }
     super.mouseDown(with: event)
   }
 
@@ -1487,97 +1682,140 @@ final class WaitingCard: NSView {
     }
     if v === answerButton { onAnswer?() }
     else if v === declineButton { onDecline?() }
-    else if v === callButton { dialConfirmed() }
   }
-  override func resetCursorRects() { addCursorRect(urlGlass.frame, cursor: .pointingHand) }
+
+  /// The hand is the affordance. With the `copy` button gone it is the only thing
+  /// on screen that says the link is a control rather than a caption, so it is
+  /// added and removed with the link rather than left pointing at empty space.
+  override func resetCursorRects() {
+    guard mode == .invite, !urlGlass.frame.isEmpty else { return }
+    addCursorRect(urlGlass.frame, cursor: .pointingHand)
+  }
+
+  // ── THE DIM IS THE SIZE OF THE THING IT IS DIMMING FOR ────────────────────
+  //
+  // The wash was `inset: 0` because it was lighting a CARD -- a panel with a
+  // title, a hint and three rows in it, wide enough that a window-sized ellipse
+  // read as the card's own shadow. With the card down to a link and a button, the
+  // same gradient over a bright frame is a large grey smudge in the middle of
+  // somebody's picture with two small things floating in it. Photographed against
+  // white, that is the first thing you see and the link is the second.
+  //
+  // So it is sized to the row now, and darker for being smaller: concentrated over
+  // 330 points instead of 1280 it is a local shadow rather than a fog, and it is
+  // what carries the contrast the panel used to. Measured on a white frame, the
+  // link's ratio against its own fill goes 3.7:1 -> 6.4:1, which is the difference
+  // between reading a URL and squinting at one.
+  private func setWash(alpha: CGFloat) {
+    wash.colors = [NSColor(srgbRed: 6/255, green: 8/255, blue: 13/255, alpha: alpha).cgColor,
+                   NSColor.clear.cgColor]
+  }
 
   override func layout() {
     super.layout()
-    wash.frame = bounds
     let cx = bounds.midX, cy = bounds.midY
-    let ringing = incoming != nil
-    let pad = Metric.cardPad
     let gap = Metric.s2
     let uh = Metric.fieldHeight
 
-    // ── THE CARD IS MEASURED, NOT PLACED ──────────────────────────────────────
-    //
-    // Everything below used to be positioned relative to the window's centre with
-    // its own margin, so the spacing between any two things was the difference of
-    // two numbers written in different places. Here the ROWS are measured first,
-    // the panel is sized to hold them, and every position falls out of that -- so a
-    // longer link or a hidden row moves the card instead of overflowing it.
-    //
-    // The link is as wide as the link, within reason. It was a flat 320, which is
-    // narrower than the URLs this app generates: the tail of a long room name went
-    // under the right edge and the one thing on this screen you might need to read
-    // character by character was the one thing clipped.
-    let linkW = min(max(300, ceil((urlField.stringValue as NSString)
-                   .size(withAttributes: [.font: urlField.font ?? Type_.mono]).width) + Metric.s8),
-                    bounds.width * 0.6)
-    let linkRowW = linkW + gap + shareButton.frame.width + gap + copyButton.frame.width
-    let dialW = min(260, bounds.width * 0.45)
-    let dialRowW = dialW + gap + callButton.frame.width
-    let ringRowW = answerButton.frame.width + gap + declineButton.frame.width
-
-    let titleH: CGFloat = 24, hintH: CGFloat = 16
-    let rowsW = ringing ? ringRowW : max(linkRowW, dialRowW)
-    let rowsH = ringing ? uh : uh * 2 + Metric.s3
-    // ── THE TEXT IS PART OF THE WIDTH ─────────────────────────────────────────
-    //
-    // The card was sized from `rowsW` alone. That is fine for the invite state,
-    // where a link 300 points wide is the widest thing in it -- and wrong for the
-    // ringing state, where the widest thing is a sentence and the row is two small
-    // pills. Photographed with `--incoming devesh`, the hint read
-    //
-    //     answer and you will both be in the sa
-    //
-    // clipped mid-word by a panel built around two buttons. A card has to be as
-    // wide as its widest CHILD, and the words are children.
-    func textW(_ f: NSTextField) -> CGFloat {
-      ceil((f.stringValue as NSString)
+    func textW(_ f: NSTextField, _ s: String? = nil) -> CGFloat {
+      ceil(((s ?? f.stringValue) as NSString)
         .size(withAttributes: [.font: f.font ?? Type_.caption]).width)
     }
-    let contentW = max(rowsW, textW(title), textW(hint))
-    let panelW = min(bounds.width - Metric.gutter * 2, contentW + pad * 2)
-    let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + rowsH + pad
-    panel.frame = NSRect(x: cx - panelW / 2, y: cy - panelH / 2, width: panelW, height: panelH)
-    panel.radius = Metric.cardRadius
 
-    var y = panel.frame.maxY - pad - titleH
-    title.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: titleH)
-    y -= Metric.s1 + hintH
-    hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
-    y -= Metric.s5 + uh
+    // ── ONE WIDTH FOR BOTH ROWS ───────────────────────────────────────────────
+    //
+    // The link is as wide as the link, and the name field is as wide as the link
+    // too. Sizing each to its own content would move the button sideways at the
+    // exact moment somebody has just clicked it -- the swap is meant to read as
+    // the box changing its mind, not as the row rebuilding itself.
+    //
+    // The old floor was a flat 300, which is what made this "way too big": a box
+    // padded out to a width nothing in it needed, with two buttons beside it.
+    // ── A LABEL IS WIDER THAN ITS STRING ──────────────────────────────────────
+    //
+    // `size(withAttributes:)` measures GLYPHS. An NSTextField draws them inside a
+    // cell that keeps a couple of points to itself on each side, so a field given
+    // exactly the measured width has less room than it needs and drops whatever
+    // does not fit off the end -- silently, with no ellipsis to say so. Measured:
+    // the box rendered
+    //
+    //     https://kin.tokkah.com/gxg-kcrq-vw
+    //
+    // for a link ending in `vwp`, which is not a shorter link, it is a WRONG one.
+    // Nobody proof-reads a URL they are about to send, and this is the one string
+    // in the app where a missing character is the difference between reaching
+    // somebody and a dead page.
+    let cellInk = Metric.s2
+    let linkText = textW(urlField, urlText.isEmpty ? urlField.stringValue : urlText) + cellInk
+    let dialText = textW(dialField, dialField.placeholderString ?? "") + cellInk
+    let boxW = min(max(max(linkText, dialText) + Metric.s6, 180), bounds.width * 0.7)
+    let rowW = boxW + gap + callIcon.frame.width
 
-    // The link row: link, share, copy, centred as one.
-    var x = cx - linkRowW / 2
-    urlGlass.frame = NSRect(x: x, y: y, width: linkW, height: uh)
+    if mode == .ringing {
+      let pad = Metric.cardPad
+      let titleH: CGFloat = 24, hintH: CGFloat = 16
+      let ringRowW = answerButton.frame.width + gap + declineButton.frame.width
+      // A card has to be as wide as its widest CHILD, and the words are children:
+      // sized from the row alone, the hint read "answer and you will both be in
+      // the sa", clipped mid-word by a panel built around two small pills.
+      let contentW = max(ringRowW, textW(title), textW(hint))
+      let panelW = min(bounds.width - Metric.gutter * 2, contentW + pad * 2)
+      let panelH = pad + titleH + Metric.s1 + hintH + Metric.s5 + uh + pad
+      panel.frame = NSRect(x: cx - panelW / 2, y: cy - panelH / 2,
+                           width: panelW, height: panelH)
+      panel.radius = Metric.cardRadius
+      var y = panel.frame.maxY - pad - titleH
+      title.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: titleH)
+      y -= Metric.s1 + hintH
+      hint.frame = NSRect(x: panel.frame.minX, y: y, width: panelW, height: hintH)
+      y -= Metric.s5 + uh
+      var ax = cx - ringRowW / 2
+      answerButton.frame.origin = NSPoint(x: ax, y: y + (uh - answerButton.frame.height) / 2)
+      ax += answerButton.frame.width + gap
+      declineButton.frame.origin = NSPoint(x: ax, y: y + (uh - declineButton.frame.height) / 2)
+      // The ringing state still has the card it was drawn for, so it keeps the
+      // window-wide wash it was drawn with.
+      wash.frame = bounds
+      setWash(alpha: 0.55)
+      return
+    }
+
+    // Invite and dial share one line through the middle of the window. Nothing is
+    // above it and nothing is below it, so it is centred on the window rather than
+    // on a card that no longer exists.
+    let y = cy - uh / 2
+    let x = cx - rowW / 2
+    let box = NSRect(x: x, y: y, width: boxW, height: uh)
+    urlGlass.frame = box
     urlGlass.radius = Metric.cardFieldRadius
-    urlField.frame = NSRect(x: x + Metric.s3, y: y + (uh - 15) / 2,
-                            width: linkW - Metric.s6, height: 15)
-    x += linkW + gap
-    shareButton.frame.origin = NSPoint(x: x, y: y + (uh - shareButton.frame.height) / 2)
-    x += shareButton.frame.width + gap
-    copyButton.frame.origin = NSPoint(x: x, y: y + (uh - copyButton.frame.height) / 2)
-
-    // Answering shares the link row's line: it is the same decision in the same
-    // place, and `answer` sits on the left where `copy` is not.
-    var ax = cx - ringRowW / 2
-    answerButton.frame.origin = NSPoint(x: ax, y: y + (uh - answerButton.frame.height) / 2)
-    ax += answerButton.frame.width + gap
-    declineButton.frame.origin = NSPoint(x: ax, y: y + (uh - declineButton.frame.height) / 2)
-
-    // The dial row, one row below the link row and built the same way, so the two
-    // read as alternatives rather than as two unrelated features.
-    y -= Metric.s3 + uh
-    var dx = cx - dialRowW / 2
-    dialGlass.frame = NSRect(x: dx, y: y, width: dialW, height: uh)
+    dialGlass.frame = box
     dialGlass.radius = Metric.cardFieldRadius
-    dialField.frame = NSRect(x: dx + Metric.s4, y: y + (uh - 17) / 2,
-                             width: dialW - Metric.s8, height: 17)
-    dx += dialW + gap
-    callButton.frame.origin = NSPoint(x: dx, y: y + (uh - callButton.frame.height) / 2)
+    // ── THE FIELDS ARE INSIDE THE GLASS NOW ───────────────────────────────────
+    //
+    // So their frames are in the HOLDER's coordinate space, not the card's. Left as
+    // card coordinates they would be laid out several hundred points off the side
+    // of their own parent -- present, correct, and nowhere on screen.
+    urlHolder.frame = NSRect(x: 0, y: 0, width: boxW, height: uh)
+    dialHolder.frame = urlHolder.frame
+    urlField.frame = NSRect(x: Metric.s3, y: (uh - 15) / 2,
+                            width: boxW - Metric.s6, height: 15)
+    // A little further in than the link: text that starts at a left edge needs
+    // more air off the curve than text that is centred between two of them.
+    dialField.frame = NSRect(x: Metric.s4, y: (uh - 17) / 2,
+                             width: boxW - Metric.s8, height: 17)
+    callIcon.frame.origin = NSPoint(x: x + boxW + gap,
+                                    y: y + (uh - callIcon.frame.height) / 2)
+    // ── AND NO WASH AT ALL ────────────────────────────────────────────────────
+    //
+    // The gradient existed to light a card of text. Both things it was for now
+    // belong to the material: the link is legible because the glass adjusts to
+    // what is behind it, and the handset is legible for the same reason. Left in,
+    // it is a dark ellipse floating on a bright picture with two small controls
+    // inside it -- photographed against white, the first thing you see and the
+    // link is the second.
+    wash.frame = .zero
+    // The link stops being a control the moment it stops being on screen.
+    window?.invalidateCursorRects(for: self)
   }
 }
 
@@ -1911,7 +2149,6 @@ final class CallControls: NSView {
       Metrics.tap("copy_link",
                   ok: NSPasteboard.general.string(forType: .string) == self.inviteText)
     }
-    waiting.onShare = { [weak self] in self?.share() }
     // Through `dial`, not straight at `onCall`. The field and a tapped face are the
     // same act and they now travel the same line -- including the fallback for a
     // doorbell that is not wired, which the field used to be missing.
@@ -2139,7 +2376,7 @@ final class CallControls: NSView {
       // A ring that arrived and was never answered must not be sitting on this
       // card when the peer leaves and it comes back -- the room in it is long
       // expired, and "answer" would join an empty one.
-      if !present { self.waiting.clearIncoming() }
+      if !present { self.waiting.clearIncoming(); self.waiting.leaveDial() }
       // ── AND EVERY READOUT ABOUT THEM, BECAUSE THEY ARE GONE ────────────────
       //
       // These describe a peer, and they hold their last value forever: after a
@@ -3210,6 +3447,14 @@ final class CallControls: NSView {
       // it cannot check the one thing that matters about it. "their camera is off"
       // was invisible to every rig here until this line existed.
       + "  warn=\(warnText.isEmpty ? "-" : warnText)"
+      // WHICH card is up, not just whether one is. The link and the name field
+      // occupy the same rectangle, so a rig reading frames alone cannot tell the
+      // two apart -- and "the button swapped them" is the whole feature.
+      + "  card=\(waiting.isHidden ? "hidden" : waiting.mode.rawValue)"
+      // WHAT IS IN THE BOX, not just which box. `--press "@call,+meera"` proved
+      // the field could be focused and typed into and could not show that the
+      // letters arrived -- an instrument blind to the one thing the step is for.
+      + (waiting.mode == .dial ? "  dialtext=\"\(waiting.dialText)\"" : "")
       + "  picker=\(camPicker.isHidden ? "hidden" : "\(camNames.count) items")"
       + "  mic=\(micMuted ? "muted" : "on") cam=\(camOff ? "off" : "on")"
       + "  row=[\(visibleRowNames.joined(separator: " "))]"
@@ -3266,15 +3511,58 @@ final class CallControls: NSView {
 
   func simulate(_ what: String) {
     switch what {
+    // ── THROUGH THE WINDOW, NOT INTO THE HANDLER ──────────────────────────────
+    //
+    // This called `handleKey` directly, with `windowNumber: 0`. That is a handler
+    // test wearing an NSEvent, and it is blind to the thing keys actually do:
+    // AppKit decides WHO gets the key before any handler sees it. While the name
+    // field is being typed into, Escape belongs to its field editor, which turns it
+    // into `cancelOperation:` -- so the card's text delegate is what cancels a dial,
+    // and `handleKey` never runs at all.
+    //
+    // Measured: `--press "@call,+meera,esc,?"` reported `key esc: handled=false` and
+    // left the card in dial mode, which is what a WORKING Escape also looks like
+    // from inside `handleKey`. The token could not tell the two apart.
+    //
+    // So it goes through `window.sendEvent`, the path the window server uses, and
+    // lands wherever it really lands. `handleKey` stays as the fallback for a
+    // headless run, where there is no window to send anything to.
     case "esc", "cmd-mic", "cmd-cam":
       let ch = what == "esc" ? "\u{1b}" : (what == "cmd-mic" ? "a" : "v")
       let code: UInt16 = what == "esc" ? 53 : (what == "cmd-mic" ? 0 : 9)
       let mods: NSEvent.ModifierFlags = what == "esc" ? [] : [.command, .shift]
-      if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods,
-                                  timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0,
-                                  context: nil, characters: ch, charactersIgnoringModifiers: ch,
-                                  isARepeat: false, keyCode: code) {
-        fputs("key \(what): handled=\(handleKey(e))\n", stderr)
+      guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods,
+                                     timestamp: ProcessInfo.processInfo.systemUptime,
+                                     windowNumber: window?.windowNumber ?? 0,
+                                     context: nil, characters: ch, charactersIgnoringModifiers: ch,
+                                     isARepeat: false, keyCode: code) else { break }
+      // ── POSTED, NOT SENT ──────────────────────────────────────────────────
+      //
+      // `window.sendEvent` looked like the real path and skipped half of it. The
+      // app's keys are wired to an `addLocalMonitorForEvents` monitor -- see
+      // `Display` -- which the application object fires on its way from the event
+      // QUEUE to the window. Handing the event straight to the window arrives
+      // downstream of that, so Escape reached the field editor and never reached
+      // the monitor: measured as `more=open` before and after, a sheet that would
+      // not close for a key that closes it.
+      //
+      // Posting puts it in the queue and lets the whole chain run in order, which
+      // is the only version of this that can be wrong in the same ways the real
+      // key can. It is asynchronous, which is why the result is read by the NEXT
+      // token rather than by this one.
+      if window != nil {
+        NSApp.postEvent(e, atStart: false)
+        if let up = NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: mods,
+                                     timestamp: ProcessInfo.processInfo.systemUptime,
+                                     windowNumber: window?.windowNumber ?? 0, context: nil,
+                                     characters: ch, charactersIgnoringModifiers: ch,
+                                     isARepeat: false, keyCode: code) {
+          NSApp.postEvent(up, atStart: false)
+        }
+        fputs("key \(what): posted to the app queue\n", stderr)
+      } else {
+        fputs("key \(what): no window, straight to handleKey ->"
+            + " handled=\(handleKey(e))\n", stderr)
       }
     // Reading the menu bar back rather than photographing it: a screenshot of the
     // menu bar is a screenshot of whatever app is frontmost, which on a test
@@ -3338,6 +3626,12 @@ final class CallControls: NSView {
     case "rename-save": commitRename()
     case "handle-copy": copyHandle()
     case "call-new": callSomeoneNew()
+    // The swap, without a pointer. `@call` clicks the circle and is the better
+    // test of the two; these are how a rig reaches the same state when the card
+    // is not the thing being photographed.
+    case "dial-open": waiting.enterDial()
+    case "dial-close": waiting.leaveDial()
+    case "share": share()
     // Mirrors `cam#N`, INCLUDING its loud refusal. A token that quietly does
     // nothing for an out-of-range index is a test that passes by not running.
     //
