@@ -54,6 +54,25 @@ let KMAGIC: UInt32 = 0x544B_0003
 // It rides the media socket, so it is sealed by the same key as everything else
 // and takes the same path the voice takes.
 let SMAGIC: UInt32 = 0x544B_0007
+// ── "I HUNG UP", SAID ON THE CALL ITSELF ────────────────────────────────────
+//
+// A call now outlives the process that was carrying it (Resume.swift), which
+// means the far end can no longer read silence as a departure -- it has to be
+// TOLD. There was already a way to say it, `Identity.ring(kind: "bye")`, and it
+// cannot do this job: it is addressed to a HANDLE, and a call joined from a link
+// has no handles at either end. It is also an HTTPS round trip through a mailbox,
+// so it arrives after the process that sent it has gone.
+//
+// So the goodbye rides the media socket, sealed by the same key, straight to the
+// address the media is already flowing to. Eight bytes, sent four times because
+// UDP, and it is the last thing a leaving process does.
+//
+// AN OLD BUILD IS SAFE. `recvLoop` dispatches on the magic and this one matches
+// nothing it knows, so it falls through to `if magic != MAGIC { continue }` and
+// is dropped -- the same property that let the capability bits and the redundant
+// block ship without breaking anybody. An old peer simply falls back to the room
+// lease, which is the bound Resume.swift documents.
+let BMAGIC: UInt32 = 0x544B_0008
 
 // ── The receive ring ────────────────────────────────────────────────────────
 //
@@ -727,6 +746,12 @@ final class Wire {
   /// goes on being sent to an address nobody is at, forever. Liveness is
   /// last-heard-from THE PEER, never last-heard-from anybody.
   private(set) var lastFromPeer: UInt64 = 0
+  /// The last packet before a silence of more than a second, and the first one
+  /// after it. Written only by the receive thread, read by the poll loop, and
+  /// deliberately NOT cleared here -- the reader clears them, so a reader that is
+  /// late still gets the true pair rather than a gap that grew while it waited.
+  var peerGoneAt: UInt64 = 0
+  var peerBackAt: UInt64 = 0
   private(set) var relocks = 0
   private var pathRtt: [String: Double] = [:]
   private var pathAddr: [String: sockaddr_in] = [:]
@@ -1047,13 +1072,31 @@ final class Wire {
 
   private func adopt(_ from: sockaddr_in) {
     guard !locked else { return }
+    adoptFrom(from)
+  }
+
+  /// The same move without the "only once" guard, for the one caller that has
+  /// already established the lock is pointing somewhere the far end is not
+  /// sending from. Kept as a separate entry point rather than relaxing `adopt`,
+  /// because `adopt`'s guard is what stops every arriving packet re-pointing a
+  /// settled call, and there is exactly one place that has earned the right to
+  /// override it.
+  ///
+  /// Run only on the receive thread, which is the only writer of `peer` --
+  /// `adopt` and `pickBestPathLocked` are both reached from it and nowhere else.
+  private func adoptFrom(_ from: sockaddr_in) {
     peer = from
     locked = true
+    sendViaTurn = turn?.isTurnServer(from) == true
     var ipb = [CChar](repeating: 0, count: 64)
     var f = from
     inet_ntop(AF_INET, &f.sin_addr, &ipb, 64)
     lockedFrom = "\(String(cString: ipb)):\(UInt16(bigEndian: from.sin_port))"
   }
+
+  /// Consecutive media packets that decrypted but came from somewhere other than
+  /// the address this end is sending to. See the note at the assignment site.
+  private var offPathRun = 0
 
   var peerDescription: String {
     var b = [CChar](repeating: 0, count: 32)
@@ -1096,6 +1139,32 @@ final class Wire {
     }
     for (i, b) in bytes.enumerated() { out[7 + i] = b }
     out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .ctl) }
+  }
+
+  /// The far end hung up. Fired from the receive thread, once per call: the
+  /// handler ends the process, and a second delivery of the same goodbye must not
+  /// be able to run it again while the first is still posting its final beat.
+  var onPeerBye: (() -> Void)?
+  private var byeSeen = false
+
+  /// Say goodbye and mean it. Four copies rather than one because this is UDP and
+  /// there is no second chance -- the process is about to stop existing, so a lost
+  /// datagram would leave the far end holding the call open for the whole room
+  /// lease. Four is 32 bytes of insurance against a minute and a half of somebody
+  /// waiting for a person who already left.
+  ///
+  /// Sent through `rawSend`, so it is encrypted like everything else and so the
+  /// impairment gate can drop it in a rig -- which is the arm that proves the
+  /// lease fallback actually works rather than being decoration.
+  func sendGoodbye() {
+    var out = [UInt8](repeating: 0, count: 8)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: BMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+      p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
+    }
+    for _ in 0..<4 {
+      out.withUnsafeBufferPointer { rawSend($0.baseAddress!, $0.count, .ctl) }
+    }
   }
 
   func requestKeyframe(scratch: UnsafeMutablePointer<UInt8>) {
@@ -1270,13 +1339,100 @@ final class Wire {
         magic = dbuf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
       }
 
+      // ── A GOODBYE IS NOT EVIDENCE OF LIFE ─────────────────────────────────
+      //
+      // Handled ABOVE the liveness block on purpose. Every other recognised magic
+      // refreshes `lastRecvHost`, `lastFromPeer` and `Update.lastMediaHost` --
+      // "traffic on the path" -- and a goodbye is the one packet that means the
+      // opposite. Stamping it would leave the call looking live for three seconds
+      // after the person hung up, and would tell the updater a call was in
+      // progress when it had just ended.
+      //
+      // Only from an established key. Before that, anyone who can reach this port
+      // could end a call by guessing eight bytes; after it, sending this required
+      // holding the session key.
+      if magic == BMAGIC, crypto?.established == true {
+        if !byeSeen {
+          byeSeen = true
+          fputs("bye: the other end hung up\n", stderr)
+          onPeerBye?()
+        }
+        continue
+      }
       // A recognised magic from a reachable address is enough to point media
       // there. Once encryption is up this is genuine authentication: the packet
       // decrypted, so it came from someone holding the key.
       if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
         lastRecvHost = Clock.now()
         if locked, src.sin_addr.s_addr == peer.sin_addr.s_addr, src.sin_port == peer.sin_port {
+          // ── THE TWO STAMPS THAT BOUND A SILENCE ────────────────────────────
+          //
+          // Recorded HERE, on the receive thread, at the exact packet that ends
+          // the gap. The poll loop above cannot do this: `lastFromPeer` is the
+          // MOST RECENT packet, so by the time a half-second tick reads it the
+          // stream has already moved it on, and the reported gap grows by
+          // however long the loop took to look. A gap is bounded by two
+          // packets, so it is measured by two packets and by nothing else.
+          //
+          // One comparison per packet at 1500 packets a second, on a thread that
+          // already stamps the clock on the line above -- nothing here allocates
+          // and nothing locks.
+          if lastFromPeer != 0, Clock.msSigned(lastRecvHost, lastFromPeer) > 1000 {
+            peerGoneAt = lastFromPeer
+            peerBackAt = lastRecvHost
+          }
           lastFromPeer = lastRecvHost
+          offPathRun = 0
+        } else if locked {
+          // ── A LOCK THAT CAN ONLY BE BROKEN BY SILENCE IS A ONE-WAY DOOR ──────
+          //
+          // `lastFromPeer` counts only packets arriving FROM the address this end
+          // chose to send to, and that is right -- it is what stops a stranger's
+          // probes standing in for a peer that has gone. It also assumes the two
+          // ends agree about which address the call is on, and they need not.
+          //
+          // Measured, on the rejoin rig, twice in three runs: both Macs are behind
+          // one NAT, so each end has a public candidate and a LAN candidate for
+          // the other. After a rejoin the path race runs again from scratch and the
+          // two ends settle DIFFERENTLY -- this end on the LAN address, the far end
+          // still on the public one. Media flows perfectly in both directions
+          // (recv 1500/s the whole time), and every packet arrives translated by
+          // the hairpin, so it comes from the public address while this end is
+          // locked to the LAN one. `lastFromPeer` freezes on a healthy call, the
+          // 3 s silence detector fires, and the call the person just got back
+          // drops again for four seconds. Twice, in a row, in one run.
+          //
+          // `held-is-a-one-way-door`, exactly: a recovery gate whose evidence the
+          // other side controls. The remedy is this file's own stated principle,
+          // one screen up -- "a packet that arrives carries the only address that
+          // is definitely reachable, the one it came from". So a sustained stream
+          // from somewhere else is not noise to be ignored until the timeout; it is
+          // better evidence than the address we picked, and this end moves to it.
+          //
+          // A RUN, not one packet: a single stray datagram must never be able to
+          // re-point a call. 256 audio packets is 170 ms at FPP=32, far above any
+          // reordering and far below the 3 s detector it is rescuing.
+          //
+          // Only under an established key. Before that anyone who can reach this
+          // port could steer the call by sending 256 packets; after it, doing so
+          // requires holding the session key, which is the same bar `adopt` uses.
+          if crypto?.established == true {
+            offPathRun += 1
+            if offPathRun >= 256 {
+              offPathRun = 0
+              relocks += 1
+              // READ BEFORE THE REASSIGNMENT. `peerDescription` is derived from
+              // `peer`, and `adoptFrom` is about to overwrite it -- so a line
+              // composed afterwards prints the SAME address twice and reads as a
+              // move to where we already were, which is exactly what the first
+              // run of this printed and exactly the wrong conclusion.
+              let was = peerDescription
+              adoptFrom(src)
+              lastFromPeer = lastRecvHost
+              fputs("path: their media has been arriving from \(pathKey(src)) and we were"
+                  + " sending to \(was) -- moving to theirs\n", stderr)
+            }
+          }
         }
         // The updater asks "is a call live?" before it restarts the app, and this
         // is the only evidence that answers it. Stamped here rather than exposed
