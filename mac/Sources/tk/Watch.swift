@@ -165,8 +165,12 @@ enum Watch {
     // and a "test" that rings the user's own handle. Carried through explicitly
     // rather than inherited, because inheritance is exactly what does not happen.
     var vars: [String: String] = [:]
+    // TK_CRASH_DIR rides along for the same reason as TK_KIN_DIR: an agent
+    // installed by a rig would otherwise read the machine's REAL crash folder
+    // and report its own history to whatever sink that rig is running.
     for k in ["TK_KIN_DIR", "TK_KIN_BASE", "TK_WATCH_LABEL", "TK_WATCH_ANYWHERE",
-              "TK_WATCH_OPEN_ARGS", "TK_WATCH_SELFTEST", "TK_WATCH_NO_DELEGATE"] {
+              "TK_WATCH_OPEN_ARGS", "TK_WATCH_SELFTEST", "TK_WATCH_NO_DELEGATE",
+              "TK_CRASH_DIR", "TK_CRASH_GRACE_S"] {
       if let v = env[k] { vars[k] = v }
     }
     if !vars.isEmpty { plist["EnvironmentVariables"] = vars }
