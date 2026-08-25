@@ -538,6 +538,30 @@ enum Identity {
     return room
   }
 
+  // ── AN EMPTY MAILBOX AND A DEAD NETWORK ARE THE SAME RETURN VALUE ──────────
+  //
+  // `poll()` hands back `[]` for "nobody called", for a 429, for a 403 and for a
+  // Mac with the Wi-Fi off. That is fine for a poll loop, which only ever wants
+  // the rings -- and it is the whole story for anything that has to TELL someone
+  // whether they can be reached. A menu bar that says "Ready for calls" off the
+  // back of an empty array is `blind-instruments-report-negatives`: the same
+  // green light for a quiet afternoon and for an unreachable machine, and the
+  // second one is precisely the state a person needs to be told about.
+  //
+  // So the last answer from the server is recorded, and the resident reads it.
+  // Deliberately the raw status and not a verdict: 429 means "asking too often,
+  // still reachable" and calls for a back-off, while 0 means nothing arrived at
+  // all -- a bool would have to pick one of those and be wrong about the other.
+  nonisolated(unsafe) private(set) static var lastPollStatus = 0
+  nonisolated(unsafe) private(set) static var lastPollAt = Date.distantPast
+
+  /// True when the doorbell answered recently enough that a ring placed now
+  /// would be found. Nothing here is shown as a number; it decides one word.
+  static var reachable: Bool {
+    (lastPollStatus == 200 || lastPollStatus == 429)
+      && Date().timeIntervalSince(lastPollAt) < 90
+  }
+
   /// Drain the mailbox once. Unverifiable rings are dropped here and never
   /// reach the caller of this function.
   static func poll() -> [Ring] {
@@ -561,6 +585,10 @@ enum Identity {
     URLSession.shared.dataTask(with: req) { data, resp, _ in
       defer { sem.signal() }
       let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+      // Recorded before the guard, so a failure is recorded as a failure rather
+      // than leaving the last success standing and reading as still healthy.
+      lastPollStatus = code
+      lastPollAt = Date()
       guard code == 200, let data,
             let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
       else {
