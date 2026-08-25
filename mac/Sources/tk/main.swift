@@ -4823,8 +4823,7 @@ if audio.jitAuto {
     let SHRINK_HOLD_FAST = 5
     var calm = 0
     var lastConcealed = 0
-    var lastSnaps = 0
-    var lastSnapsBehind = 0, lastSnapsPast = 0
+    var lastSnapsBehind = 0
     var lastLate = 0
     var lastNearLate = 0
     var lastStarved = 0
@@ -4937,11 +4936,10 @@ if audio.jitAuto {
           }
         }
       }
-      lastSnaps = r.snaps
       // Attribution, not just a count. Only a BACKLOG snap is evidence that a
       // bigger buffer would not have helped; a starvation snap is the opposite.
       let snappedBehind = r.snapsBehind - lastSnapsBehind
-      lastSnapsBehind = r.snapsBehind; lastSnapsPast = r.snapsPast
+      lastSnapsBehind = r.snapsBehind
       // ── What growing is FOR, and when it has finished ──────────────────────
       //
       // A buffer exists to stop starvation. So the question "should it grow?" has
@@ -5688,7 +5686,7 @@ func reportLoop() {
   // Say WHY there is no audio, in the same line as the zero. An instrument that
   // reports a zero and not its cause points investigation at the wrong end.
   if vsource != nil || vasm.fragsIn > 0 {
-    var e = venc?.encLatMs ?? Quantiles(), dl = vdec.decLatMs, g = vg2g
+    let e = venc?.encLatMs ?? Quantiles(); var dl = vdec.decLatMs, g = vg2g
     let dv = vDecoded - lastV.dec
     let sv = vSentFrames - lastV.sent
     let mbps = Double(vBytesSent - lastV.bytes) * 8 / 1e6
