@@ -113,7 +113,28 @@ sign() { # <file> -> base64 signature on stdout
   if [ -n "$SIGN" ]; then "$SIGN" "$1"; else swift "$HERE/sign.swift" "$1"; fi
 }
 command -v python3 >/dev/null || cant "python3 is needed for the fake update server"
-if nc -z 127.0.0.1 8097 2>/dev/null; then cant "something is already listening on 127.0.0.1:8097"; fi
+# ── 8380-8381, AND NOT 8097-8098 ────────────────────────────────────────────
+#
+# These were 8097 and 8098, which belong to nobody. Four agents work this machine
+# at once in separate worktrees, each with its own assigned port range, and two
+# copies of this rig on one unowned port is a `cant` at best and two pollers
+# reading each other's manifests at worst. 8380-8399 is a lane.
+if nc -z 127.0.0.1 8381 2>/dev/null; then cant "something is already listening on 127.0.0.1:8381"; fi
+
+# ── A LANE FOR THE HALF YOU ARE ACTUALLY CHANGING ───────────────────────────
+#
+# `ONLY=install` skips the second Swift build and the fourteen process arms and
+# runs just the install.sh ones, which are synchronous and take seconds. It is not
+# a way to declare a pass -- it prints its own verdict line and says which half it
+# checked -- it is so that a one-line change to install.sh does not cost a
+# 25-second compile plus two minutes of pollers on a machine with three other
+# builds running. Same reason as every other rig override here.
+UPD=1
+case "${ONLY:-all}" in
+  all) ;;
+  install) UPD=0 ;;
+  *) cant "ONLY must be 'all' or 'install' (got '${ONLY:-}')" ;;
+esac
 
 OLD="$(grep -o 'let VERSION = "[^"]*"' "$HERE/../Sources/tk/main.swift" | sed 's/.*"\(.*\)"/\1/')"
 [ -n "$OLD" ] || cant "cannot read VERSION out of Sources/tk/main.swift"
@@ -129,6 +150,7 @@ echo "== versions: installed $OLD, release $NEW, stale $OLDER =="
 # re-exec'd image would report the OLD version, see the manifest as newer again,
 # and update in a loop, which is a defect this rig would then be unable to see.
 # So the source is copied, VERSION is bumped, and it is compiled. About 25 s.
+if [ "$UPD" = 1 ]; then
 echo "== building $NEW =="
 mkdir -p "$SP/src"
 cp "$HERE/../Package.swift" "$SP/src/"
@@ -136,13 +158,21 @@ cp -R "$HERE/../Sources" "$SP/src/"
 sed -i '' "s/let VERSION = \"$OLD\"/let VERSION = \"$NEW\"/" "$SP/src/Sources/tk/main.swift"
 grep -q "let VERSION = \"$NEW\"" "$SP/src/Sources/tk/main.swift" \
   || cant "the VERSION bump in the scratch copy matched nothing"
-swift build --package-path "$SP/src" --product tk > "$SP/build.log" 2>&1 \
+# -j 2. Four agents build Swift on this Mac at once and an unbounded second
+# compile makes every one of them slower, this rig included.
+swift build -j 2 --package-path "$SP/src" --product tk > "$SP/build.log" 2>&1 \
   || { sed -n '1,25p' "$SP/build.log"; cant "the $NEW build failed -- see $SP/build.log"; }
 NEWBIN="$SP/src/.build/debug/tk"
 [ -x "$NEWBIN" ] || cant "no binary at $NEWBIN after the build"
 got="$("$NEWBIN" --version)"
 [ "$got" = "$NEW" ] || cant "the freshly built binary reports $got, not $NEW"
 [ "$("$TK" --version)" = "$OLD" ] || cant "the repo binary reports $("$TK" --version), not $OLD"
+else
+# ONLY=install: nothing here compares versions, so the payload is the repo binary
+# and the "new" release is the version it already is.
+NEW="$OLD"; NEWBIN="$TK"
+echo "== ONLY=install: skipping the $OLD -> $NEW build and every update arm =="
+fi
 
 # ── A REAL BUNDLE, BECAUSE THE PRODUCTION PATH IS THE BUNDLE PATH ───────────
 #
@@ -206,6 +236,7 @@ mkbundle "$NEW" "$NEWBIN" "$SP/pkg/Kin.app"
 # It is the tail of the bundle that goes missing, and in a REAL bundle the tail
 # is `_CodeSignature/` -- which sorts last -- so the file this models losing is
 # the signature that every camera and microphone grant is pinned to.
+if [ "$UPD" = 1 ]; then
 python3 - "$SP/pkg/Kin.app/Contents/Resources" <<'PY'
 import os, sys
 d = sys.argv[1] + "/pad"
@@ -214,6 +245,7 @@ blob = b"x" * 1024
 for i in range(6000):
     open("%s/f%05d.bin" % (d, i), "wb").write(blob)
 PY
+fi
 mkdir -p "$SP/pkg/bundle"
 cp "$HERE/../bundle/Info.plist" "$SP/pkg/bundle/Info.plist"
 [ -f "$HERE/../bundle/AppIcon.icns" ] && cp "$HERE/../bundle/AppIcon.icns" "$SP/pkg/bundle/"
@@ -242,7 +274,7 @@ mkman() { # <arm> <version> <url> <sha> [notes]
     "$2" "$3" "$4" "$GOODSIZE" "${5:-update-check rig}" > "$SP/srv/$1/manifest.json"
   sign "$SP/srv/$1/manifest.json" > "$SP/srv/$1/manifest.json.sig"
 }
-DL="http://127.0.0.1:8097/dl/$TARNAME"
+DL="http://127.0.0.1:8381/dl/$TARNAME"
 
 # The arms. Each gets its own directory under the server root so its manifest,
 # its tampering and its ENTRY IN THE ACCESS LOG belong to it alone -- the log is
@@ -253,7 +285,7 @@ mkman older   "$OLDER" "$DL?arm=older"   "$GOODSHA"
 mkman body    "$NEW"   "$DL?arm=body"    "$GOODSHA"
 mkman sig     "$NEW"   "$DL?arm=sig"     "$GOODSHA"
 mkman hash    "$NEW"   "$DL?arm=hash"    "0000000000000000000000000000000000000000000000000000000000000000"
-mkman tgz     "$NEW"   "http://127.0.0.1:8097/dl/bad.tar.gz?arm=tgz" "$GOODSHA"
+mkman tgz     "$NEW"   "http://127.0.0.1:8381/dl/bad.tar.gz?arm=tgz" "$GOODSHA"
 mkman watch   "$NEW"   "$DL?arm=watch"   "$GOODSHA"
 mkman nowatch "$NEW"   "$DL?arm=nowatch" "$GOODSHA"
 mkman ro      "$NEW"   "$DL?arm=ro"      "$GOODSHA"
@@ -261,6 +293,32 @@ mkman race    "$NEW"   "$DL?arm=race"    "$GOODSHA"
 mkman cadA    "$OLDER" "$DL?arm=cadA"    "$GOODSHA"
 mkman cadB    "$OLDER" "$DL?arm=cadB"    "$GOODSHA"
 mkman probe   "$OLDER" "$DL?arm=probe"   "$GOODSHA"
+mkman rw      "$NEW"   "$DL?arm=rw"      "$GOODSHA"
+mkman nosig   "$NEW"   "$DL?arm=nosig"   "$GOODSHA"
+mkman sigjunk "$NEW"   "$DL?arm=sigjunk" "$GOODSHA"
+# `down` gets NO directory on the server on purpose: every GET under /down/ is a
+# 404, which is what a server that is not there looks like to `Update.get`.
+
+# ── THE FOUR ENDINGS THAT USED TO BE THE SAME ENDING ────────────────────────
+#
+# `available()` had ONE guard covering five failures and a bare `return nil` under
+# it, so an unreachable server, a missing signature file, a signature that is not
+# even base64, and a manifest that does not parse were four different events with
+# one indistinguishable outcome -- and that outcome was also what "you are up to
+# date" looks like. `blind-instruments-report-negatives`, in the one mechanism
+# that can brick a Mac 15 km away.
+#
+# Each of these is silent on the build before this change, so each arm below FAILS
+# against it. That is the point of them.
+rm -f "$SP/srv/nosig/manifest.json.sig"                  # published half a release
+printf 'this is not base64 at all!!!\n' > "$SP/srv/sigjunk/manifest.json.sig"
+# A manifest that VERIFIES and still cannot be used: correctly signed with the
+# real key, and not the JSON this build knows. It separates "the signature said
+# no" from "the signature said yes and the contents were wrong", which were the
+# same silence.
+mkdir -p "$SP/srv/manjunk"
+printf '{"nope":1}' > "$SP/srv/manjunk/manifest.json"
+sign "$SP/srv/manjunk/manifest.json" > "$SP/srv/manjunk/manifest.json.sig"
 
 # ── THE THREE WAYS TO LIE TO AN UPDATER ─────────────────────────────────────
 #
@@ -301,7 +359,7 @@ h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1
 class S(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
-S(("127.0.0.1", 8097), h).serve_forever()
+S(("127.0.0.1", 8381), h).serve_forever()
 PY
 python3 "$SP/serve.py" "$SP/srv" > "$SP/srv.log" 2>&1 &
 SRV=$!
@@ -313,14 +371,147 @@ perl -e 'select undef,undef,undef,1'
 # in the access log that the verdicts then count as the app having polled -- the
 # rig proving its own claim.
 printf 'up\n' > "$SP/srv/ping"
-curl -fsS "http://127.0.0.1:8097/ping" > /dev/null 2>&1 \
+curl -fsS "http://127.0.0.1:8381/ping" > /dev/null 2>&1 \
   || cant "the fake update server never came up -- see $SP/srv.log"
 
+# ── THE OTHER HALF OF A RELEASE, AND THE HALF NOTHING COULD TEST ────────────
+#
+# Everything above this line tests the UPDATE half. `install.sh` is the other
+# one, and `updater-ships-only-what-it-can-install` says which of the two is
+# dangerous: the installer that runs is the one ALREADY on the person's Mac, so a
+# fix here reaches nobody until they install again, and whoever is furthest behind
+# is stranded the longest. It had never been driven by anything, because running
+# it wrote /Applications/Kin.app on the machine doing the testing -- so it now
+# takes TK_INSTALL_BASE, TK_DEST and TK_APPS, and every one of them points into
+# the scratch directory here.
+#
+# The defect: `mv "$TMP/tk" "$DEST/tk"` ran unconditionally and `"$DEST/tk"
+# --version` ran AFTERWARDS, so a payload that unpacked to something that does not
+# run destroyed a working install and then reported the failure. Arm `junk` below
+# is exactly that, and it fails against the previous install.sh.
+echo "== install.sh =="
+mkdir -p "$SP/ipkg" "$SP/ijunk" "$SP/inocli" "$SP/ilegacy"
+# Unpadded on purpose: the 6000-file padding above exists to widen a race between
+# two updaters, and there is no race here -- install.sh is one synchronous script.
+mkbundle "$NEW" "$NEWBIN" "$SP/ipkg/Kin.app"
+mkdir -p "$SP/ipkg/bundle"; cp "$HERE/../bundle/Info.plist" "$SP/ipkg/bundle/Info.plist"
+cp "$NEWBIN" "$SP/ipkg/tk"
+cp -R "$SP/ipkg/Kin.app" "$SP/ijunk/Kin.app"
+# What a half-written or truncated extraction leaves behind: a file called `tk`
+# that is there, is not empty, and is not a program.
+printf 'this is not a mach-o binary\n' > "$SP/ijunk/tk"
+cp -R "$SP/ipkg/Kin.app" "$SP/inocli/Kin.app"
+cp "$NEWBIN" "$SP/ilegacy/tk"
+mkdir -p "$SP/ilegacy/bundle"; cp "$HERE/../bundle/Info.plist" "$SP/ilegacy/bundle/Info.plist"
+tar -czf "$SP/srv/dl/i-full.tar.gz"   -C "$SP/ipkg"    tk bundle Kin.app
+tar -czf "$SP/srv/dl/i-junk.tar.gz"   -C "$SP/ijunk"   tk Kin.app
+tar -czf "$SP/srv/dl/i-nocli.tar.gz"  -C "$SP/inocli"  Kin.app
+tar -czf "$SP/srv/dl/i-legacy.tar.gz" -C "$SP/ilegacy" tk bundle
+for p in full junk nocli legacy; do
+  mkman "i$p" "$NEW" "http://127.0.0.1:8381/dl/i-$p.tar.gz?arm=i$p" \
+        "$(shasum -a 256 "$SP/srv/dl/i-$p.tar.gz" | awk '{print $1}')"
+done
+irun() { # <arm> <dest> <apps> -> exit status of install.sh on stdout
+  TK_INSTALL_BASE="http://127.0.0.1:8381/i$1" TK_DEST="$2" TK_APPS="$3" \
+    sh "$HERE/../../tape-app/public/macos/install.sh" > "$SP/i$1.log" 2>&1
+  echo $?
+}
+idebris() { ls -a "$1" 2>/dev/null | grep -E '^\.(tk|Kin)' | wc -l | tr -d ' '; }
+
+# 1. The ordinary case, into a machine that has never had Kin.
+mkdir -p "$SP/id-full" "$SP/ia-full"
+S_FULL="$(irun full "$SP/id-full" "$SP/ia-full")"
+# 2. THE ONE THAT USED TO DESTROY THINGS. A working install, and a payload whose
+#    `tk` is not a program. Seeded by hand rather than by arm 1, so the "it is
+#    unchanged" claim is against a byte-for-byte known input.
+mkdir -p "$SP/id-junk" "$SP/ia-junk"
+cp "$TK" "$SP/id-junk/tk"; chmod +x "$SP/id-junk/tk"
+mkbundle "$OLD" "$TK" "$SP/ia-junk/Kin.app"
+BEFORE="$(shasum -a 256 "$SP/id-junk/tk" | awk '{print $1}')"
+S_JUNK="$(irun junk "$SP/id-junk" "$SP/ia-junk")"
+AFTER="$(shasum -a 256 "$SP/id-junk/tk" | awk '{print $1}')"
+# 3. A payload with no bare `tk` at all -- the shape the archive takes the day the
+#    legacy half is finally dropped. The old script died on the missing file
+#    BEFORE it assembled Kin.app, so a new installer had to be able to meet it.
+mkdir -p "$SP/id-nocli" "$SP/ia-nocli"
+S_NOCLI="$(irun nocli "$SP/id-nocli" "$SP/ia-nocli")"
+# 4. And the other direction of the same skew: a payload from before the signed
+#    bundle shipped inside the archive, which takes the hand-assembly fallback.
+#
+#    NOTE, deliberately: that fallback writes a bundle carrying `com.tokkah.tk`
+#    and the `kin://` scheme, which is the one thing the rest of this rig avoids
+#    (`helper-sharing-bundle-id`). It cannot be avoided here -- it is the branch
+#    under test and a test must not move the thing it is testing -- so it lives in
+#    the scratch directory for about a second, is never opened or registered, and
+#    is deleted on the line after the verdict.
+mkdir -p "$SP/id-legacy" "$SP/ia-legacy"
+S_LEGACY="$(irun legacy "$SP/id-legacy" "$SP/ia-legacy")"
+
+echo
+echo "== install.sh verdicts =="
+echo "i1. a whole payload installs"
+[ "$S_FULL" = "0" ] && say "OK" "install.sh exited 0" || say "FAIL" "install.sh exited $S_FULL"
+[ "$("$SP/id-full/tk" --version 2>/dev/null)" = "$NEW" ] \
+  && say "OK" "the command-line tk is there and reports $NEW" \
+  || say "FAIL" "tk reports [$("$SP/id-full/tk" --version 2>/dev/null)]"
+[ -x "$SP/ia-full/Kin.app/Contents/MacOS/Tokkah" ] \
+  && say "OK" "and Kin.app came with it" || say "FAIL" "no Kin.app was installed"
+[ "$(idebris "$SP/id-full")$(idebris "$SP/ia-full")" = "00" ] \
+  && say "OK" "and no .incoming or .previous left behind" \
+  || say "FAIL" "staging debris left in the install directories"
+
+echo "i2. a payload whose tk does not run"
+[ "$S_JUNK" != "0" ] \
+  && say "OK" "install.sh refused, exiting $S_JUNK" \
+  || say "FAIL" "install.sh reported SUCCESS for a payload that does not run"
+[ "$AFTER" = "$BEFORE" ] \
+  && say "OK" "and the working tk is byte-for-byte the one that was there" \
+  || say "FAIL" "IT OVERWROTE A WORKING INSTALL: sha ${BEFORE:0:12} became ${AFTER:0:12}"
+[ "$("$SP/id-junk/tk" --version 2>/dev/null)" = "$OLD" ] \
+  && say "OK" "and it still runs and still reports $OLD" \
+  || say "FAIL" "the installed tk no longer runs"
+[ -x "$SP/ia-junk/Kin.app/Contents/MacOS/Tokkah" ] \
+  && say "OK" "and Kin.app was never taken apart" \
+  || say "FAIL" "the app is gone or has no executable -- rm -rf ran before the replacement existed"
+grep -q "nothing here was changed" "$SP/ijunk.log" \
+  && say "OK" "and it says so in words rather than exiting on a failed mv" \
+  || say "FAIL" "no explanation: [$(tail -1 "$SP/ijunk.log")]"
+
+echo "i3. a payload with no bare tk (the archive's future shape)"
+[ "$S_NOCLI" = "0" ] \
+  && say "OK" "install.sh exited 0 instead of dying on the missing file" \
+  || say "FAIL" "install.sh exited $S_NOCLI: [$(tail -1 "$SP/inocli.log")]"
+[ "$("$SP/id-nocli/tk" --version 2>/dev/null)" = "$NEW" ] \
+  && say "OK" "and took the command-line tk out of the bundle" \
+  || say "FAIL" "no working tk at $SP/id-nocli/tk"
+[ -x "$SP/ia-nocli/Kin.app/Contents/MacOS/Tokkah" ] \
+  && say "OK" "and Kin.app is installed" || say "FAIL" "no Kin.app"
+
+echo "i4. a payload from before the signed bundle (the fallback branch)"
+[ "$S_LEGACY" = "0" ] \
+  && say "OK" "install.sh exited 0" \
+  || say "FAIL" "install.sh exited $S_LEGACY: [$(tail -1 "$SP/ilegacy.log")]"
+[ -x "$SP/ia-legacy/Kin.app/Contents/MacOS/Tokkah" ] \
+  && say "OK" "and the hand-assembled bundle landed at the real path, not at .incoming" \
+  || say "FAIL" "the fallback assembly did not swap in"
+[ "$(idebris "$SP/ia-legacy")" = "0" ] \
+  && say "OK" "with nothing staged left beside it" \
+  || say "FAIL" "staging debris left in $SP/ia-legacy"
+rm -rf "$SP/ia-legacy/Kin.app"
+
+if [ "$UPD" = 0 ]; then
+  echo
+  [ "$fail" = 0 ] \
+    && echo "INSTALL CHECK PASSED -- install.sh never replaces a working install with a broken one" \
+    || echo "INSTALL CHECK FAILED -- see above; logs are in $SP (KEEP=1 to keep them)"
+  exit $fail
+fi
+
 export TK_KIN_DIR="$SP/id"
-# The doorbell must not reach the real server: nothing is listening on 8098, so
+# The doorbell must not reach the real server: nothing is listening on 8380, so
 # every identity poll is a refused connection and this rig cannot claim a handle,
 # squat a name, or read the mailbox of the person using this Mac.
-export TK_KIN_BASE="http://127.0.0.1:8098"
+export TK_KIN_BASE="http://127.0.0.1:8380"
 export TK_NO_IDENTITY=1
 # The watcher's front-door delegate is off. With a different bundle id it could
 # not have caught a real launch anyway, but a resident that answers reopen events
@@ -346,7 +537,7 @@ RING="--incoming astranger"
 # `silent-no-op-flags` with the no-op depending on the shell.
 run() { # <arm> <install-dir> <seconds> <grace> <poll> <args...>
   local arm="$1" dir="$2" secs="$3" g="$4" p="$5"; shift 5
-  spawn env TK_UPDATE_BASE="http://127.0.0.1:8097/$arm" \
+  spawn env TK_UPDATE_BASE="http://127.0.0.1:8381/$arm" \
             TK_UPDATE_POLL="$p" TK_UPDATE_GRACE="$g" \
             "$dir/Kin.app/Contents/MacOS/Tokkah" "$@" > "$SP/$arm.log" 2>&1
   perl -e "select undef,undef,undef,$secs"
@@ -396,10 +587,11 @@ PY
 # `blind-instruments-report-negatives` exactly: an instrument that cannot see the
 # event returns the same value as a real negative. So it is a COULD NOT RUN, and
 # it is checked before a single verdict is printed.
-for d in probe ok older body sig hash tgz watch nowatch ro race cadA cadB; do
+for d in probe ok older body sig hash tgz watch nowatch ro rw race cadA cadB \
+         down nosig sigjunk manjunk; do
   mkdir -p "$SP/$d"; mkbundle "$OLD" "$TK" "$SP/$d/Kin.app"
 done
-run probe "$SP/probe" 6 1 2 $ARGS --room "upd${$}pr" --listen 8098 --peer 127.0.0.1:8097 $RING
+run probe "$SP/probe" 6 1 2 $ARGS --room "upd${$}pr" --listen 8380 --peer 127.0.0.1:8381 $RING
 grep -q "^tk $OLD " "$SP/probe.log" \
   || { sed -n '1,12p' "$SP/probe.log"; cant "the bundled copy never started"; }
 ! grep -q "mic: asking for permission" "$SP/probe.log" \
@@ -412,16 +604,16 @@ grep -q "ring: waiting to be answered -- no microphone, no camera" "$SP/probe.lo
 echo "== running the arms =="
 
 # ── 1. A NEWER SIGNED VERSION LANDS, AND THE PROCESS COMES BACK AS IT ───────
-run ok "$SP/ok" 20 2 3 $ARGS --room "upd${$}ok" --listen 8098 --peer 127.0.0.1:8097 $RING
+run ok "$SP/ok" 20 2 3 $ARGS --room "upd${$}ok" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 3. AND A VERSION THAT IS NOT NEWER DOES NOTHING ─────────────────────────
 # The arm that makes arm 1 mean something. Same server, same signature, same
 # poller -- only the number is lower.
-run older "$SP/older" 10 2 3 $ARGS --room "upd${$}old" --listen 8098 --peer 127.0.0.1:8097 $RING
+run older "$SP/older" 10 2 3 $ARGS --room "upd${$}old" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 2. THE GATE THAT MUST NEVER WEAKEN ──────────────────────────────────────
 for a in body sig hash tgz; do
-  run "$a" "$SP/$a" 10 2 3 $ARGS --room "upd${$}$a" --listen 8098 --peer 127.0.0.1:8097 $RING
+  run "$a" "$SP/$a" 10 2 3 $ARGS --room "upd${$}$a" --listen 8380 --peer 127.0.0.1:8381 $RING
 done
 
 # ── 4. THE WATCHER UPDATES A MAC WITH NO APP OPEN ───────────────────────────
@@ -446,8 +638,8 @@ run nowatch "$SP/nowatch" 12 2 3 --watch --no-update --no-telemetry --no-rings
 # poller keeps ticking for the whole window. If TK_UPDATE_GRACE were ignored both
 # would first fetch at the built-in 10 s and the two arms would be identical --
 # which is exactly the failure this pair is shaped to catch.
-CA0=$(date +%s); run cadA "$SP/cadA" 15 2 2 $ARGS --room "upd${$}ca" --listen 8098 --peer 127.0.0.1:8097 $RING
-CB0=$(date +%s); run cadB "$SP/cadB" 15 8 8 $ARGS --room "upd${$}cb" --listen 8098 --peer 127.0.0.1:8097 $RING
+CA0=$(date +%s); run cadA "$SP/cadA" 15 2 2 $ARGS --room "upd${$}ca" --listen 8380 --peer 127.0.0.1:8381 $RING
+CB0=$(date +%s); run cadB "$SP/cadB" 15 8 8 $ARGS --room "upd${$}cb" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 6. AN INSTALL IT CANNOT WRITE TO ────────────────────────────────────────
 #
@@ -457,8 +649,44 @@ CB0=$(date +%s); run cadB "$SP/cadB" 15 8 8 $ARGS --room "upd${$}cb" --listen 80
 # that Mac. This arm is that account: the bundle and its parent lose the write
 # bit and the updater is asked to install anyway.
 chmod -R a-w "$SP/ro/Kin.app"; chmod a-w "$SP/ro"
-run ro "$SP/ro" 14 2 3 $ARGS --room "upd${$}ro" --listen 8098 --peer 127.0.0.1:8097 $RING
+run ro "$SP/ro" 14 2 3 $ARGS --room "upd${$}ro" --listen 8380 --peer 127.0.0.1:8381 $RING
 chmod u+w "$SP/ro"; chmod -R u+w "$SP/ro/Kin.app"
+
+# ── 6b. AND THE HOLD IS NOT A ONE-WAY DOOR ──────────────────────────────────
+#
+# `permanent-impairment-hides-recovery`: an arm whose impairment never lifts tests
+# only the giving-up half. A backoff that never comes back is a Mac that stops
+# updating for good the first time somebody's permissions were wrong for a minute
+# -- which is worse than the every-30-minutes download it replaces.
+#
+# So this one starts blocked, and the write bit comes back part way through, which
+# is exactly what an admin fixing the permissions looks like from inside the app.
+# TK_UPDATE_BLOCKED_RETRY=3 stands in for the six-hour production hold; the
+# override exists because a cadence no test can reach is a behaviour nobody has
+# ever seen recover.
+#
+# WALL-CLOCK ARM. It is the only one here whose verdict depends on elapsed time,
+# and this machine is running four Swift builds; the windows are deliberately far
+# wider than the cadence they contain.
+chmod -R a-w "$SP/rw/Kin.app"; chmod a-w "$SP/rw"
+spawn env TK_UPDATE_BASE="http://127.0.0.1:8381/rw" TK_UPDATE_POLL=2 TK_UPDATE_GRACE=2 \
+      TK_UPDATE_BLOCKED_RETRY=3 \
+      "$SP/rw/Kin.app/Contents/MacOS/Tokkah" $ARGS --room "upd${$}rw" --listen 8380 \
+      --peer 127.0.0.1:8381 $RING > "$SP/rw.log" 2>&1
+perl -e 'select undef,undef,undef,9'
+chmod u+w "$SP/rw"; chmod -R u+w "$SP/rw/Kin.app"
+perl -e 'select undef,undef,undef,22'
+reap
+
+# ── 8. EVERY WAY A CHECK CAN END, AND FOUR OF THEM WERE THE SAME SILENCE ────
+#
+# Each of these took the same `return nil` before this release. Short windows on
+# purpose: one poll is the whole experiment, and grace 2 with poll 3 gives at
+# least two inside eight seconds.
+run down    "$SP/down"    8 2 3 $ARGS --room "upd${$}dn" --listen 8380 --peer 127.0.0.1:8381 $RING
+run nosig   "$SP/nosig"   8 2 3 $ARGS --room "upd${$}ns" --listen 8380 --peer 127.0.0.1:8381 $RING
+run sigjunk "$SP/sigjunk" 8 2 3 $ARGS --room "upd${$}sj" --listen 8380 --peer 127.0.0.1:8381 $RING
+run manjunk "$SP/manjunk" 8 2 3 $ARGS --room "upd${$}mj" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 7. TWO UPDATERS AT ONCE ─────────────────────────────────────────────────
 #
@@ -470,12 +698,12 @@ chmod u+w "$SP/ro"; chmod -R u+w "$SP/ro/Kin.app"
 # as an installed bundle missing 3-9% of its files, four runs in six, with no
 # error printed by either process. Both are now per-process; this arm is what
 # holds that. Started together, same grace, so they tick together.
-spawn env TK_UPDATE_BASE="http://127.0.0.1:8097/race" TK_UPDATE_POLL=3 TK_UPDATE_GRACE=3 \
+spawn env TK_UPDATE_BASE="http://127.0.0.1:8381/race" TK_UPDATE_POLL=3 TK_UPDATE_GRACE=3 \
       "$SP/race/Kin.app/Contents/MacOS/Tokkah" --watch --no-telemetry --no-rings \
       > "$SP/race-w.log" 2>&1
-spawn env TK_UPDATE_BASE="http://127.0.0.1:8097/race" TK_UPDATE_POLL=3 TK_UPDATE_GRACE=3 \
-      "$SP/race/Kin.app/Contents/MacOS/Tokkah" $ARGS --room "upd${$}rc" --listen 8098 \
-      --peer 127.0.0.1:8097 $RING > "$SP/race-f.log" 2>&1
+spawn env TK_UPDATE_BASE="http://127.0.0.1:8381/race" TK_UPDATE_POLL=3 TK_UPDATE_GRACE=3 \
+      "$SP/race/Kin.app/Contents/MacOS/Tokkah" $ARGS --room "upd${$}rc" --listen 8380 \
+      --peer 127.0.0.1:8381 $RING > "$SP/race-f.log" 2>&1
 perl -e 'select undef,undef,undef,22'
 reap
 
@@ -624,31 +852,82 @@ ca=$(hits "cadA/manifest.json HTTP"); cb=$(hits "cadB/manifest.json HTTP")
 
 # ── 6. AN INSTALL THE USER CANNOT WRITE ────────────────────────────────────
 echo "6. a copy this account cannot write (the non-admin /Applications case)"
-grep -q "update: cannot stage a bundle next to" "$SP/ro.log" \
-  && say "OK" "the bundle swap refused rather than half-replacing anything" \
-  || say "FAIL" "no refusal from swapBundle: $(grep -o 'update: .*' "$SP/ro.log" | tail -1)"
+# ── THE DOWNLOAD IT NO LONGER SPENDS ────────────────────────────────────────
+#
+# This arm used to end at `swapBundle` refusing -- which is correct, and is the
+# LAST of the four things that happen. Before it came the manifest, the whole
+# tarball, the sha256 and the launch probe, and after it came `pending = nil` and
+# the identical sequence on the next tick. Measured here against the previous
+# build: the whole 2.3 MB release fetched twice in 14 seconds at a 3 s poll (the
+# note further up records three), which at the production interval is roughly 48
+# downloads a day, forever, on a Mac that can never install one.
+#
+# The question is therefore not "did it refuse" but "did it refuse BEFORE paying",
+# and the instrument is the server's access log rather than anything the app says
+# about itself.
+grep -q "cannot install it:" "$SP/ro.log" \
+  && say "OK" "it read the two permission bits and refused before downloading anything" \
+  || say "FAIL" "no preflight refusal: $(grep -o 'update: .*' "$SP/ro.log" | tail -1)"
+RD=$(hits "dl/.*arm=ro")
+[ "$RD" = "0" ] \
+  && say "OK" "MEASURED: it downloaded the release 0 times (the previous build: 2 in this same 14 s window)" \
+  || say "FAIL" "it still downloaded a release it cannot install, $RD time(s)"
+# ── A MEASUREMENT, NOT A VERDICT ────────────────────────────────────────────
+#
+# This was `[ "$RM" -le 2 ]` and the PREVIOUS build passed it: two polls in 14 s,
+# because each of its attempts spent a 2.3 MB download first. An assertion that a
+# defect satisfies BY BEING SLOWER is `green-metrics-can-hide-defects` -- it would
+# have gone on reporting OK for the exact behaviour it was written to catch. The
+# discriminating claims are the download count above and the backoff line below;
+# this one is a number and a guard against the whole arm being vacuous.
+RM=$(hits "ro/manifest.json HTTP")
+[ "$RM" -ge 1 ] \
+  && say "OK" "MEASURED: $RM manifest ask(s) and $RD payload(s) in 14 s (the previous build: 2 and 2)" \
+  || say "FAIL" "the blocked arm never polled at all, so every verdict in this section is vacuous"
+grep -q "not downloading it; asking again in" "$SP/ro.log" \
+  && say "OK" "and it says when it will try again" \
+  || say "FAIL" "nothing in the log says the retry was backed off"
 [ "$(ver_on_disk "$SP/ro")" = "$OLD" ] \
   && say "OK" "and the app is intact and still on $OLD" \
   || say "FAIL" "a read-only install ended up at $(ver_on_disk "$SP/ro")"
-# ── AND THE PART NOBODY WOULD EVER SEE ──────────────────────────────────────
+# ── AND THE PART NOBODY COULD EVER SEE ──────────────────────────────────────
 #
-# `pending` is only ever set when a call is live. A commit that FAILS drops the
-# staged copy on the floor, so the next tick fetches the whole archive again --
-# forever, at the poll interval, on a machine that can never succeed. Counted
-# rather than argued: this is the number of times a Mac that cannot update
-# downloaded a release it could not install.
-RD=$(hits "dl/.*arm=ro")
-[ "$RD" -gt 1 ] \
-  && say "OK" "MEASURED: it re-downloaded the whole release $RD times in 14 s and will not stop" \
-  || say "OK" "it downloaded the release $RD time(s)"
-grep -qE "update .* (Applications|admin|permission|administrator)" "$SP/ro.log" \
-  && say "OK" "and something explains it in words" \
-  || say "OK" "NOTE: nothing a person could see says why -- both messages are stderr, and the app's status line is never told"
+# The previous verdict here read: "NOTE: nothing a person could see says why --
+# both messages are stderr, and the app's status line is never told." It is a
+# verdict now. These arms run without a window, so what is asserted is that the
+# sentence was produced and ROUTED -- `Update.tell` prints which of the two
+# happened, so "there was nobody to tell" cannot be confused with "nothing was
+# wrong", which is the whole failure mode being fixed.
+grep -q "on screen to tell: Kin can" "$SP/ro.log" \
+  && say "OK" "and a plain sentence was put on the person's status line: \"$(grep -o 'on screen to tell: .*' "$SP/ro.log" | head -1 | sed 's/^on screen to tell: //')\"" \
+  || say "FAIL" "nothing a person could see says why -- the status line is still never told"
+[ "$(lines "$SP/ro.log" "on screen to tell: Kin can")" = "1" ] \
+  && say "OK" "once, not on every poll" \
+  || say "FAIL" "the same sentence was raised $(lines "$SP/ro.log" "on screen to tell: Kin can") times"
 # The arm that ranks the other way: the writable install fetched the payload once.
 OD=$(hits "dl/.*arm=ok")
 [ "$OD" -le 1 ] \
-  && say "OK" "OPPOSITE ARM: the writable install downloaded it $OD time and stopped" \
+  && say "OK" "OPPOSITE ARM: the writable install downloaded it $OD time and installed it" \
   || say "FAIL" "even the writable install downloaded $OD times"
+OM=$(hits "ok/manifest.json HTTP")
+[ "$OM" -ge "$RM" ] \
+  && say "OK" "OPPOSITE ARM: a healthy copy asked $OM times where the blocked one asked $RM" \
+  || say "FAIL" "the blocked copy polled MORE ($RM) than the healthy one ($OM)"
+
+echo "6b. and the hold lifts when the permission comes back"
+grep -q "cannot install it:" "$SP/rw.log" \
+  && say "OK" "it was blocked while the bundle was read-only" \
+  || say "FAIL" "the recovery arm was never blocked, so its recovery proves nothing"
+grep -q "update: installed $NEW" "$SP/rw.log" \
+  && say "OK" "and installed $NEW once the write bit came back -- the hold is not a one-way door" \
+  || say "FAIL" "it never came back after the permission was restored: $(grep -o 'update: .*' "$SP/rw.log" | tail -1)"
+[ "$(ver_on_disk "$SP/rw")" = "$NEW" ] \
+  && say "OK" "and the bundle on disk is $NEW" \
+  || say "FAIL" "the bundle on disk is $(ver_on_disk "$SP/rw") (wall-clock arm on a loaded machine -- re-run before believing this)"
+RWD=$(hits "dl/.*arm=rw")
+[ "$RWD" = "1" ] \
+  && say "OK" "and it paid for exactly one download in the whole arm" \
+  || say "OK" "NOTE: $RWD downloads in the recovery arm"
 
 # ── 7. TWO UPDATERS, ONE BUNDLE ────────────────────────────────────────────
 echo "7. the watcher and the app updating the same bundle at once"
@@ -687,13 +966,78 @@ LEFT="$(ls -d "$SP/race/".Kin.app.new* 2>/dev/null | wc -l | tr -d ' ')"
   && say "OK" "and no staging copy was left behind" \
   || say "OK" "NOTE: $LEFT staging copy left behind (this rig SIGKILLs mid-update; the next update sweeps dead-pid copies)"
 
+# ── 8. EVERY ENDING SAYS WHICH ENDING IT WAS ───────────────────────────────
+#
+# Four arms that used to produce NO OUTPUT AT ALL. Every one of them fails against
+# the build before this change, and they matter because their silence was also the
+# silence of "you are already up to date" -- so an app that had quietly stopped
+# being able to update itself looked exactly like an app that was current.
+echo "8. every way a check can end, and it says which"
+needle() { # <arm> -> the line only that arm may print
+  case "$1" in
+    down)    echo "cannot reach http://127.0.0.1:8381/down for manifest.json" ;;
+    nosig)   echo "manifest.json is there but manifest.json.sig is not" ;;
+    sigjunk) echo "manifest.json.sig is not base64" ;;
+    manjunk) echo "the manifest verified but is not the JSON this build understands" ;;
+  esac
+}
+english() {
+  case "$1" in
+    down)    echo "the update server cannot be reached" ;;
+    nosig)   echo "the manifest is published and its signature is not" ;;
+    sigjunk) echo "the signature file did not arrive intact" ;;
+    manjunk) echo "a correctly signed manifest this build cannot read" ;;
+  esac
+}
+for a in down nosig sigjunk manjunk; do
+  grep -q "$(needle "$a")" "$SP/$a.log" \
+    && say "OK" "$(english "$a") -- named on its own line" \
+    || say "FAIL" "$a said nothing of its own: [$(grep -o 'update: .*' "$SP/$a.log" | tail -1)]"
+  [ "$(ver_on_disk "$SP/$a")" = "$OLD" ] \
+    && say "OK" "  and it is still on $OLD" \
+    || say "FAIL" "  $a INSTALLED SOMETHING: $(ver_on_disk "$SP/$a")"
+done
+# DISTINCT, not merely present. Four lines that all said "update failed" would
+# pass every assertion above and would be the same defect wearing more words.
+dup=0
+for a in down nosig sigjunk manjunk; do
+  for b in down nosig sigjunk manjunk; do
+    [ "$a" = "$b" ] && continue
+    if grep -q "$(needle "$b")" "$SP/$a.log" 2>/dev/null; then
+      say "FAIL" "  $a also printed $b's line -- these two endings are not distinguishable"
+      dup=1
+    fi
+  done
+done
+[ "$dup" = 0 ] && say "OK" "and no two of the four share a line -- they are four endings, not one"
+# CONTROL, the same shape as the one under the tampering arms: a build with the
+# network unplugged prints four different complaints and installs nothing, and
+# would pass everything above.
+grep -q "update: installed $NEW" "$SP/ok.log" \
+  && say "OK" "CONTROL: the same code accepted the real release, so these are refusals and not a dead transport" \
+  || say "FAIL" "CONTROL: nothing was ever accepted, so the four lines above prove nothing"
+# ── AND WHICH OF THEM REACH THE PERSON ──────────────────────────────────────
+#
+# The rule is that a person is told what they can act on or asked for, and is not
+# told about a download that failed once in the middle of their call. A rule that
+# is never observed to say no is not a rule, so this is a PAIR: the signature
+# refusal must be raised (Kin has stopped updating and will stay stopped), and an
+# unreachable server must not be (it is nobody's business and it fixes itself).
+grep -q "on screen to tell: an update was refused because it" "$SP/sig.log" \
+  && say "OK" "a refused signature is put in front of the person" \
+  || say "FAIL" "the signature refusal never reached a surface a person can see"
+[ "$(lines "$SP/down.log" "on screen to tell")" = "0" ] \
+  && say "OK" "OPPOSITE ARM: an unreachable server is logged and NOT put on the status line" \
+  || say "FAIL" "a transient network failure is being shown to the person once a poll"
+
 echo
 if [ "$fail" = 0 ]; then
   echo "UPDATE CHECK PASSED -- a signed release lands, a tampered one never does,"
   echo "and the watcher keeps a closed Mac current by itself"
 else
   echo "UPDATE CHECK FAILED -- see above; logs copied to $OUT/update-*.log"
-  for f in probe ok older body sig hash tgz watch nowatch ro race-w race-f cadA cadB; do
+  for f in probe ok older body sig hash tgz watch nowatch ro rw race-w race-f cadA cadB \
+           down nosig sigjunk manjunk install; do
     cp "$SP/$f.log" "$OUT/update-$f.log" 2>/dev/null
   done
   cp "$SP/srv.log" "$OUT/update-server.log" 2>/dev/null

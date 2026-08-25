@@ -29,6 +29,101 @@ enum Update {
   static let base = ProcessInfo.processInfo.environment["TK_UPDATE_BASE"]
     ?? "https://room.tokkah.com/macos"
 
+  // ── AN UPDATER THAT COULD NOT REPORT ITS OWN FAILURE ───────────────────────
+  //
+  // Everything below used to end at `return nil`. Six different endings -- the
+  // server unreachable, the signature file missing, the signature not even
+  // base64, the manifest not JSON, the payload not unpacking, and the manifest
+  // simply not being newer -- arrived at the same place, in the same silence, and
+  // reached the person as nothing at all.
+  //
+  // That is `blind-instruments-report-negatives` in the one mechanism that can
+  // brick a Mac: an instrument that cannot see the event returns the same value
+  // as a real negative, so an updater that cannot say why it did nothing reports
+  // success by staying quiet. The Ed25519 refusal is the worst of them, because
+  // it is the security boundary DOING ITS JOB -- and it looked exactly like "you
+  // are already up to date".
+  //
+  // So each ending gets its own sentence. Nothing here weakens a check: a refused
+  // manifest is still refused, the key still has no override, and the change is
+  // entirely about SAYING SO.
+
+  /// Who hears about an outcome.
+  ///
+  /// Not every failure is the person's business. A download that failed mid-call
+  /// is not something they can act on, and overwriting the call's own status line
+  /// with it once a minute would be exactly the lab-instrument noise the consumer
+  /// surface is not allowed to carry. But a person who OPENED THE MENU and asked
+  /// is owed an answer whatever it is -- including "nothing".
+  private enum Reach {
+    /// Only when somebody asked. The answer to a question they just put.
+    case answer
+    /// Always. Something they can act on, or must know about: this copy cannot
+    /// install anything, or a release was refused by the signature gate.
+    case act
+  }
+
+  /// The last sentence put in front of the person, so a poller finding the same
+  /// thing wrong every minute does not repaint the status line every minute.
+  /// Cleared whenever a check completes cleanly, so a problem that comes BACK is
+  /// announced again rather than being suppressed forever by its own first
+  /// occurrence.
+  nonisolated(unsafe) private static var said: String?
+
+  /// Whether anything went wrong during the tick that is running now. The poller
+  /// clears `said` at the end of a tick that raised nothing, which is what makes
+  /// the line above true in both directions: a standing problem is stated once,
+  /// and a problem that GOES AWAY and comes back is stated again.
+  ///
+  /// It was `said = nil` on every successfully-verified manifest instead, and that
+  /// is subtly wrong: a release whose binary refuses to launch verifies its
+  /// manifest perfectly every single time, so the failure downstream of it would
+  /// have repainted the person's status line once a minute forever.
+  nonisolated(unsafe) private static var raised = false
+
+  /// True for the duration of a check somebody asked for from the menu. Set from
+  /// the poller, which is the only place that knows the difference between
+  /// `urgent` meaning "a person clicked Check for Updates" and `urgent` meaning
+  /// "the peer is on a different build".
+  nonisolated(unsafe) private static var asked = false
+
+  /// Puts a sentence where a person is looking, and says whether anything was
+  /// there to receive it.
+  ///
+  /// NOT a callback assigned in main.swift. A hook declared here and assigned
+  /// nowhere reads as finished and tells nobody -- three of those have shipped in
+  /// this app already (`dead-controls-declared-never-wired`). `Menu.controls` has
+  /// exactly one assignment site, in Display.swift where the window is built, and
+  /// it is already the surface the menu's own Check for Updates item writes
+  /// "checking for updates…" to. This is the other half of that sentence.
+  ///
+  /// False means there was no window -- the headless CLI, and `tk --watch`, which
+  /// is the process most likely to be the one that found the problem. "Nobody was
+  /// there to be told" is a different fact from "nothing was wrong", and it is
+  /// printed as one rather than being inferred from silence.
+  private static func show(_ s: String) -> Bool {
+    guard let c = Menu.controls else { return false }
+    c.setStatus(s)          // hops to main on its own
+    return true
+  }
+
+  private static func note(_ line: String) { fputs("update: \(line)\n", stderr) }
+
+  /// One outcome: a line for the log, always, and a sentence for the person when
+  /// this is one they asked for or one they can do something about.
+  private static func tell(_ line: String, _ human: String, _ reach: Reach) {
+    note(line)
+    switch reach {
+    case .answer:
+      guard asked else { return }
+    case .act:
+      raised = true
+      guard asked || human != said else { return }
+      said = human
+    }
+    note(show(human) ? "told the window: \(human)" : "nothing on screen to tell: \(human)")
+  }
+
   struct Manifest: Decodable {
     let version: String; let url: String; let sha256: String; let notes: String?
     /// The name the app should be called on disk, when that has changed.
@@ -78,22 +173,139 @@ enum Update {
     return d
   }
 
+  /// The version last offered by the server, so "nothing to install" is logged
+  /// when the answer CHANGES rather than once a minute for the life of a watcher
+  /// that runs from login to logout.
+  nonisolated(unsafe) private static var lastOffered: String?
+
   /// Returns the version that is available and verified, or nil.
+  ///
+  /// One guard used to cover the first five failures here. They are five different
+  /// events with five different meanings and only one of them is anybody's fault,
+  /// so they are now five different lines -- see the Reach comment above for why
+  /// only some of them reach the window.
   static func available(current: String) -> (Manifest, Data)? {
-    guard let mData = get("\(base)/manifest.json"),
-          let sigB64 = get("\(base)/manifest.json.sig"),
-          let sig = Data(base64Encoded: String(decoding: sigB64, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)),
-          let pkRaw = hex(publicKeyHex),
-          let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkRaw)
-    else { return nil }
+    guard let mData = get("\(base)/manifest.json") else {
+      tell("cannot reach \(base) for manifest.json", "couldn’t check for updates", .answer)
+      return nil
+    }
+    // A manifest without its signature is not a manifest we are allowed to read.
+    // Worth its own line because it is the shape a half-published release takes:
+    // the JSON is up and the .sig is not, and the app that finds it is refusing
+    // something that is genuinely ours.
+    guard let sigB64 = get("\(base)/manifest.json.sig") else {
+      tell("manifest.json is there but manifest.json.sig is not -- refusing an unsigned manifest",
+           "couldn’t check for updates", .answer)
+      return nil
+    }
+    // Refused SILENTLY before this line, and update-check.sh had a comment saying
+    // so: "a signature that is not even base64 is refused with no line on stderr
+    // at all -- the same verdict for a corrupted file as for an attack." They are
+    // not the same event and they no longer read the same.
+    guard let sig = Data(base64Encoded: String(decoding: sigB64, as: UTF8.self)
+                          .trimmingCharacters(in: .whitespacesAndNewlines)) else {
+      tell("manifest.json.sig is not base64 -- the signature file did not arrive intact",
+           "couldn’t check for updates", .answer)
+      return nil
+    }
+    guard let pkRaw = hex(publicKeyHex),
+          let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkRaw) else {
+      // Unreachable unless the constant at the top of this file is edited wrong,
+      // and precisely because of that it must not be silent: a build in this state
+      // can never accept any release again, and would look like a Mac that simply
+      // stopped receiving updates.
+      tell("the compiled-in public key does not parse -- this build can never verify a release",
+           "Kin can’t check for updates — please install it again", .act)
+      return nil
+    }
     // VERIFY BEFORE PARSE. Parsing attacker-controlled JSON is a smaller risk
     // than acting on it, but it is not zero, and the order costs nothing.
     guard pk.isValidSignature(sig, for: mData) else {
-      fputs("update: manifest signature INVALID -- ignoring\n", stderr); return nil
+      // ── THE ONE THAT MATTERS MOST ──────────────────────────────────────────
+      //
+      // This is the gate working. Either somebody is serving a manifest we did
+      // not sign, or a release went out wrong -- and in both cases Kin has
+      // STOPPED updating itself and will go on not updating itself, which the
+      // person had no way to find out. `.act`, so it reaches the window even
+      // though nobody asked.
+      tell("manifest signature INVALID -- ignoring",
+           "an update was refused because it wasn’t signed by Kin", .act)
+      return nil
     }
-    guard let m = try? JSONDecoder().decode(Manifest.self, from: mData) else { return nil }
-    guard newer(m.version, than: current) else { return nil }
+    guard let m = try? JSONDecoder().decode(Manifest.self, from: mData) else {
+      tell("the manifest verified but is not the JSON this build understands",
+           "couldn’t check for updates", .answer)
+      return nil
+    }
+    guard newer(m.version, than: current) else {
+      if asked || m.version != lastOffered {
+        lastOffered = m.version
+        tell("\(base) offers \(m.version) and this is \(current) -- nothing to install",
+             "Kin is up to date", .answer)
+      }
+      return nil
+    }
+    lastOffered = m.version
     return (m, mData)
+  }
+
+  // ── CAN THIS COPY INSTALL ANYTHING AT ALL? ──────────────────────────────────
+  //
+  // Asked BEFORE the download, which is the whole point of it.
+  //
+  // /Applications is drwxrwxr-x root:admin. On a Mac where an admin installed Kin
+  // and the person using it every day is a standard account, every poll fetched
+  // the manifest, fetched the entire release, failed at the swap, dropped the
+  // staged copy on the floor and did the same thing again on the next tick --
+  // every 30 minutes, forever, with nothing visible anywhere. Measured against
+  // the previous build by the read-only arm of update-check.sh: the whole 2.3 MB
+  // archive fetched twice inside a 14-second window at a 3 s poll (the rig's
+  // earlier note records three). At the production interval that is roughly 48
+  // downloads a day of a thing that can never install, on somebody else's battery
+  // and somebody else's data, while the app looks perfectly healthy.
+  //
+  // Two places, and either one is enough, because there are two install paths:
+  //   the .app's PARENT directory -- what `swapBundle` needs. It stages a sibling
+  //                                  and RENAME_SWAPs; it never writes inside the
+  //                                  bundle it is replacing.
+  //   Contents/MacOS              -- what the legacy binary-only path needs.
+  // So this says no only when NEITHER path could possibly work. A preflight that
+  // is stricter than the thing it guards would stop updates on installs that
+  // update perfectly well today, which is a far worse failure than the one being
+  // fixed.
+  //
+  // access(2) through FileManager, the same call Install.swift uses to choose
+  // between /Applications and ~/Applications -- so the two halves of "where can
+  // this app live" cannot disagree.
+  //
+  /// nil when this copy could install an update. Otherwise a line for the log and
+  /// a sentence for the person, in that order.
+  static func installBlocker() -> (log: String, human: String)? {
+    let fm = FileManager.default
+    let me = selfPath()
+    guard me.path.contains("/Contents/MacOS/") else {
+      // The bare CLI at ~/.local/bin/tk. `commit` writes `.tk.new` beside it and
+      // renames over itself, so the directory is what has to be writable.
+      let dir = me.deletingLastPathComponent()
+      guard !fm.isWritableFile(atPath: dir.path) else { return nil }
+      return ("\(dir.path) is not writable -- this command-line copy cannot replace itself",
+              "Kin can’t update itself where it is")
+    }
+    let macos = me.deletingLastPathComponent()
+    let appDir = macos.deletingLastPathComponent().deletingLastPathComponent()
+    let parent = appDir.deletingLastPathComponent()
+    if fm.isWritableFile(atPath: parent.path) { return nil }   // swapBundle can work
+    if fm.isWritableFile(atPath: macos.path) { return nil }    // the legacy path can work
+    // Named, because the two cases have different answers. Moving the app is the
+    // fix everywhere except /Applications, where moving it is the one thing a
+    // standard account cannot do.
+    if parent.path == "/Applications" {
+      return ("\(appDir.path) is in /Applications and this account can write neither it nor"
+            + " the bundle -- /Applications is root:admin, so this is a standard account",
+              "Kin can’t update itself in Applications — an admin needs to allow it")
+    }
+    return ("neither \(parent.path) nor \(macos.path) is writable -- this copy cannot replace itself",
+            "Kin can’t update itself where it is — move it to your Applications folder")
   }
 
 
@@ -247,7 +459,11 @@ enum Update {
     guard (try? cp.run()) != nil else { return false }
     cp.waitUntilExit()
     guard cp.terminationStatus == 0 else {
-      fputs("update: cannot stage a bundle next to \(appDir.path) -- is it writable?\n", stderr)
+      // `installBlocker` is supposed to have caught this before the download was
+      // ever spent. It is still checked here: the preflight reads a permission and
+      // this reads the outcome, and a permission can change between the two.
+      tell("cannot stage a bundle next to \(appDir.path) -- is it writable?",
+           installBlocker()?.human ?? "Kin can’t update itself where it is", .act)
       try? fm.removeItem(at: next); return false
     }
     // RENAME_SWAP exchanges the two directories in a single step. Plain rename(2)
@@ -255,7 +471,8 @@ enum Update {
     // leave a window in which the app does not exist at all, and a crash or a
     // power cut inside that window uninstalls the program.
     guard renamex_np(next.path, appDir.path, UInt32(RENAME_SWAP)) == 0 else {
-      fputs("update: bundle swap failed (errno \(errno))\n", stderr)
+      tell("bundle swap failed (errno \(errno))",
+           "Kin couldn’t install its update — the app is unchanged", .act)
       try? fm.removeItem(at: next); return false
     }
     try? fm.removeItem(at: next)   // now holds the bundle we just replaced
@@ -389,7 +606,16 @@ enum Update {
     guard m.version == current else {
       fputs("update: manifest is \(m.version); the normal update will fix both halves\n", stderr); return
     }
-    guard let tgz = get(m.url, timeout: 120) else { return }
+    // Five silent `return`s used to live between here and the untar, and this is
+    // the one path where silence is genuinely cheap -- a repair that does not
+    // happen costs a stale icon, not an update. It still gets lines: the whole
+    // reason this function exists is that a defect can hide in the half of an
+    // update nobody looks at, and "it ran and did nothing" needs to be
+    // distinguishable from "it never ran". stderr only, no `.act`: nothing here is
+    // the person's problem.
+    guard let tgz = get(m.url, timeout: 120) else {
+      note("repair: could not download \(m.url) -- leaving the bundle as it is"); return
+    }
     let got = SHA256.hash(data: tgz).map { String(format: "%02x", $0) }.joined()
     guard got == m.sha256.lowercased() else {
       fputs("update: repair sha256 mismatch -- refusing\n", stderr); return
@@ -397,14 +623,26 @@ enum Update {
     let fm = FileManager.default
     let tmp = fm.temporaryDirectory.appendingPathComponent("tk-repair-\(m.version)")
     try? fm.removeItem(at: tmp)
-    guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else { return }
+    guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else {
+      note("repair: cannot create \(tmp.path)"); return
+    }
     let tgzPath = tmp.appendingPathComponent("tk.tar.gz")
-    guard (try? tgz.write(to: tgzPath)) != nil else { return }
+    guard (try? tgz.write(to: tgzPath)) != nil else {
+      note("repair: cannot write the archive to \(tgzPath.path)"); return
+    }
     let tar = Process()
     tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
     tar.arguments = ["-xzf", tgzPath.path, "-C", tmp.path]
-    guard (try? tar.run()) != nil else { return }
+    guard (try? tar.run()) != nil else { note("repair: could not run tar"); return }
     tar.waitUntilExit()
+    // Same unread status as `stage` had. Here it matters less -- `installBundle`
+    // is per-file best-effort -- but a half-unpacked archive would silently
+    // "repair" the bundle to something incomplete, and that is the bug this
+    // function is named after.
+    guard tar.terminationStatus == 0 else {
+      note("repair: tar exited \(tar.terminationStatus) -- leaving the bundle as it is")
+      try? fm.removeItem(at: tmp); return
+    }
     let applied = installBundle(from: tmp, version: m.version)
     try? fm.removeItem(at: tmp)
     if applied.isEmpty {
@@ -437,11 +675,18 @@ enum Update {
   /// Downloads and verifies without touching the running install. Returns nil on
   /// any failure, having changed nothing.
   static func stage(_ m: Manifest) -> Staged? {
-    fputs("update: \(m.version) available (\(m.notes ?? "")) -- downloading\n", stderr)
-    guard let tgz = get(m.url, timeout: 120) else { fputs("update: download failed\n", stderr); return nil }
+    note("\(m.version) available (\(m.notes ?? "")) -- downloading")
+    guard let tgz = get(m.url, timeout: 120) else {
+      tell("download failed", "the update didn’t finish downloading", .answer); return nil
+    }
     let got = SHA256.hash(data: tgz).map { String(format: "%02x", $0) }.joined()
     guard got == m.sha256.lowercased() else {
-      fputs("update: sha256 mismatch (want \(m.sha256), got \(got)) -- refusing\n", stderr); return nil
+      // The second independent gate, and the same class of event as a bad
+      // signature: what arrived is not the release that was signed. `.act` for the
+      // same reason -- Kin has stopped updating and will keep not updating.
+      tell("sha256 mismatch (want \(m.sha256), got \(got)) -- refusing",
+           "an update was refused because it didn’t arrive intact", .act)
+      return nil
     }
     let fm = FileManager.default
     // Per process, for the same reason `swapBundle` stages under its own name:
@@ -456,15 +701,39 @@ enum Update {
     let tmp = fm.temporaryDirectory
       .appendingPathComponent("tk-upd-\(m.version)-\(getpid())")
     try? fm.removeItem(at: tmp)
-    guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else { return nil }
+    // Three silent `return nil`s lived here, and between them they covered a full
+    // disk, a TMPDIR that has been swept, and a tar that cannot run. All three
+    // look identical from outside -- and identical to "there is no update".
+    guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else {
+      tell("cannot create a staging directory at \(tmp.path)",
+           "the update couldn’t be unpacked", .answer); return nil
+    }
     let tgzPath = tmp.appendingPathComponent("tk.tar.gz")
-    guard (try? tgz.write(to: tgzPath)) != nil else { return nil }
+    guard (try? tgz.write(to: tgzPath)) != nil else {
+      tell("cannot write \(tgz.count) bytes to \(tgzPath.path) -- is the disk full?",
+           "there wasn’t room to download the update", .answer); return nil
+    }
 
     let tar = Process()
     tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
     tar.arguments = ["-xzf", tgzPath.path, "-C", tmp.path]
-    guard (try? tar.run()) != nil else { return nil }
+    guard (try? tar.run()) != nil else {
+      tell("could not run /usr/bin/tar", "the update couldn’t be unpacked", .answer); return nil
+    }
     tar.waitUntilExit()
+    // ── AND THE STATUS WAS NEVER READ ──────────────────────────────────────────
+    //
+    // A tar that fails part way leaves a HALF-EXTRACTED tree, and the checks below
+    // ask only whether an executable is present -- which it may well be, because
+    // `tk` sorts before `bundle/` and `Kin.app/`. So a partial unpack could pass
+    // the launch probe and be copied faithfully into the install, which is the
+    // same defect as the unconditional `mv` in install.sh and is why both are
+    // being fixed together.
+    guard tar.terminationStatus == 0 else {
+      tell("tar exited \(tar.terminationStatus) -- the archive did not unpack whole",
+           "the update didn’t arrive intact", .answer)
+      try? fm.removeItem(at: tmp); return nil
+    }
     // An archive may carry the bare `tk` (what every updater up to 0.45.0 needs),
     // a signed .app bundle (what this one prefers), or both, which is what the
     // transitional releases ship. Accepting either means the legacy payload can
@@ -480,7 +749,8 @@ enum Update {
       }
     }
     guard fm.fileExists(atPath: newBin.path) || bundled != nil else {
-      fputs("update: archive has neither tk nor a bundle\n", stderr); return nil
+      tell("archive has neither tk nor a bundle", "that update had nothing in it", .answer)
+      try? fm.removeItem(at: tmp); return nil
     }
     if fm.fileExists(atPath: newBin.path) {
       try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: newBin.path)
@@ -501,14 +771,17 @@ enum Update {
     probe.standardOutput = FileHandle.nullDevice
     probe.standardError = FileHandle.nullDevice
     guard (try? probe.run()) != nil else {
-      fputs("update: candidate will not launch\n", stderr); try? fm.removeItem(at: tmp); return nil
+      tell("candidate will not launch",
+           "that update wouldn’t start, so Kin kept the version you have", .act)
+      try? fm.removeItem(at: tmp); return nil
     }
     probe.waitUntilExit()
     guard probe.terminationStatus == 0 else {
-      fputs("update: candidate exited \(probe.terminationStatus) on --version -- refusing\n", stderr)
+      tell("candidate exited \(probe.terminationStatus) on --version -- refusing",
+           "that update wouldn’t start, so Kin kept the version you have", .act)
       try? fm.removeItem(at: tmp); return nil
     }
-    fputs("update: \(m.version) staged and verified\n", stderr)
+    note("\(m.version) staged and verified")
     return Staged(manifest: m, dir: tmp)
   }
 
@@ -601,14 +874,18 @@ enum Update {
     let staging = me.deletingLastPathComponent().appendingPathComponent(".tk.new")
     try? fm.removeItem(at: staging)
     guard (try? fm.copyItem(at: newBin, to: staging)) != nil else {
-      fputs("update: cannot stage next to \(me.path) -- is it writable?\n", stderr); return
+      tell("cannot stage next to \(me.path) -- is it writable?",
+           installBlocker()?.human ?? "Kin can’t update itself where it is", .act)
+      return
     }
     try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staging.path)
     // rename(2) over a RUNNING executable is safe on macOS: the current image is
     // already mapped, and the swap is atomic, so there is no window in which the
     // path holds a partial binary.
     guard rename(staging.path, me.path) == 0 else {
-      fputs("update: rename failed (errno \(errno))\n", stderr); return
+      tell("rename failed (errno \(errno))",
+           "Kin couldn’t install its update — the app is unchanged", .act)
+      return
     }
     installBundle(from: tmp, version: m.version)
 
@@ -760,6 +1037,23 @@ enum Update {
   nonisolated(unsafe) static let midCallAllowed =
     ProcessInfo.processInfo.environment["TK_UPDATE_MIDCALL"] == "1"
 
+  /// How long to wait before asking again, once this copy has been found unable to
+  /// install anything at all.
+  ///
+  /// Six hours, and deliberately not the poll interval. Nothing about the
+  /// permissions on /Applications changes on a minute's timescale, and the defect
+  /// this backoff exists to end is precisely a retry cadence that assumes the next
+  /// attempt might work. It is a hold and not a stop: an admin can fix the
+  /// permissions, and Check for Updates in the menu ignores this entirely, because
+  /// somebody asking is the likeliest moment for the answer to have changed.
+  ///
+  /// Rig override, sibling of `TK_UPDATE_POLL` -- a six-hour cadence that no test
+  /// can reach is a behaviour nobody has ever seen recover.
+  /// (No `nonisolated(unsafe)`, unlike its sibling above: the compiler says it is
+  /// unnecessary for a `Sendable` constant, and it is right about both of them.)
+  static let blockedRetry =
+    max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_BLOCKED_RETRY"] ?? "") ?? 21600)
+
   /// Called when a staged update starts waiting, so the window can say so. Wired
   /// in main.swift; unset for the headless CLI, which has no window to tell.
   nonisolated(unsafe) static var onPending: ((String) -> Void)?
@@ -798,6 +1092,11 @@ enum Update {
       var waited = 0.0
       var announced = false
       var firstTick = true
+      /// Extra seconds on top of the normal interval, set when this copy has been
+      /// found unable to install anything. Additive rather than a replacement for
+      /// `seconds` so that the first tick's grace still applies on top of it and
+      /// there is only one place that decides when a check is due.
+      var holdOff = 0.0
       while true {
         Thread.sleep(forTimeInterval: 0.5)
 
@@ -807,39 +1106,67 @@ enum Update {
         if let s = pending {
           if restartNow {
             restartNow = false
-            fputs("update: asked to restart now\n", stderr)
+            note("asked to restart now")
             commit(s)          // returns only on failure; keep waiting if so
             continue
           }
           if !callIsLive() || midCallAllowed { commit(s); continue }
           if !announced {
             announced = true
-            fputs("update: \(s.manifest.version) is ready, holding until the call ends\n", stderr)
+            note("\(s.manifest.version) is ready, holding until the call ends")
             onPending?(s.manifest.version)
           }
           continue
         }
 
         waited += 0.5
-        var due = waited >= (firstTick ? firstAfter : seconds)
+        var due = waited >= (firstTick ? firstAfter : seconds) + holdOff
         // Two different things arrive as `urgent`, and only one of them may end a
         // conversation. Read the reason, then clear both.
         var mayInterruptCall = false
+        // And a third question the reason answers: is a PERSON waiting for the
+        // result? `urgent` without `wireMismatch` is the Check for Updates menu
+        // item and nothing else, and it is the one case where every outcome --
+        // including "you are already up to date" -- has somebody owed an answer.
+        var personAsked = false
         if urgent {
           urgent = false
           due = true
           if wireMismatch {
             wireMismatch = false
             mayInterruptCall = true
-            fputs("update: peer is on a different build -- checking now rather than waiting\n", stderr)
+            note("peer is on a different build -- checking now rather than waiting")
           } else {
-            fputs("update: asked to check now\n", stderr)
+            personAsked = true
+            note("asked to check now")
           }
         }
         guard due else { continue }
         waited = 0
         firstTick = false
+        holdOff = 0
+        asked = personAsked
+        raised = false
+        defer { asked = false; if !raised { said = nil } }
         guard let (m, _) = available(current: current) else { continue }
+        // ── THE INSTALL QUESTION, BEFORE THE DOWNLOAD ──────────────────────────
+        //
+        // A copy that cannot write its own bundle used to find that out at the
+        // END: manifest, whole tarball, hash, launch probe, and only then a failed
+        // swap -- with the staged copy dropped and the entire thing repeated on
+        // the next tick, forever. `installBlocker` reads two permission bits and
+        // costs nothing, and the hold is what stops the loop.
+        //
+        // Deliberately asked HERE and not before `available()`. A Mac that cannot
+        // install anything and has nothing to install has no problem worth
+        // interrupting anybody about; this only speaks when there is a real
+        // release it is really unable to take.
+        if let b = installBlocker() {
+          tell("\(m.version) is available and this copy cannot install it: \(b.log)", b.human, .act)
+          note("not downloading it; asking again in \(Int(blockedRetry)) s")
+          holdOff = blockedRetry
+          continue
+        }
         // Download either way. Holding an UNFETCHED update would mean the restart,
         // when it finally comes, still has to wait for a download -- and on a bad
         // connection that is the difference between a blink and a minute.
