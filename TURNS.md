@@ -277,6 +277,7 @@ down cannot be decided at one end, and nothing on screen claims to know.
 | `--yield-test` | every clause and both refusals, −9.0 dB, 172 ms release, untouched before | the decision on real speech |
 | `--cue-test` | bid unmistakable in 100 ms, ledger moves it, 900 ms fade, no clipped caption line, the 30 Hz layer stops | how any of it looks |
 | `--subtitle-test` | the far end pushed far enough down to read past | the recogniser |
+| `--headphone-test` | the bid IS seen over a talking far end, silence is NOT a bid, audio bit-for-bit untouched, a coupling learned on speakers cannot deafen it | how any of it looks |
 | `--decimator-test` | ±1.5 dB from 300 Hz to 6 kHz, <−40 dB above 9 kHz, a chunk boundary is not a discontinuity | whether the recogniser agrees |
 | WER vs LibriSpeech | which engine, and what the plumbing costs | anything conversational — it is read speech |
 | `shoot.sh` | how it looks over a real face | anything that moves |
@@ -305,6 +306,6 @@ not fire is not debuggable from its output.
   interruption loses its first syllable.
 - **Text-level echo dedup.** The cleaner is spectral; words from the far end can
   still survive it and land in this person's transcript under their name.
-- **Headphones.** The gate is off there, so the cue layer and the captions are off
-  with it. Correct for the gate — there is no echo path to protect against — and
-  probably wrong for the captions.
+- ~~**Headphones.**~~ Fixed. The gate is off there and the whole feature was off
+  with it; the classifier now always runs and only the two lines that touch
+  samples ask about the route. See §1.
