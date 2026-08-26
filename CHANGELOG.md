@@ -51,6 +51,85 @@ This project measures its claims; where a change has a number, the number is her
 - Vendored MediaPipe binaries (26 MB) are no longer in the repository;
   `tape-app/public/vendor/fetch.sh` reproduces them.
 
+## Kin 0.68.0 — 2026-08-26
+
+### Added
+- **Kin notices when both people are in the same room, and stops playing you
+  out of two speakers at once.** Reported as "a lot of echo… only one mic is
+  active at a time, so that was very confusing" — and it was never a canceller
+  fault. Two Macs in one room means the far end's voice comes out of the OTHER
+  machine's loudspeaker, which no echo canceller can reach. The signature it
+  looks for cannot happen on a real call: **the microphone hears them before the
+  network delivers them.** Calibrated before it was wired
+  (`tk --sameroom-test`): a remote call scores 0.385–0.426 and one room scores
+  0.792–0.901, on two independent sources — a margin of **0.376**. It requires 8
+  agreeing estimates out of 20 to act and 2 to release, decides once, and holds
+  through people talking over each other.
+  [mac/tools/sameroom-check.sh](mac/tools/sameroom-check.sh), 33 assertions,
+  including 20 estimates AFTER the speaker goes off — a detector whose evidence
+  its own fix destroys is an oscillation, not a feature. `--no-sameroom` is the
+  control arm.
+- **A thin green line at the edge of the window while your voice is actually
+  reaching the other person.** 1.5 pt, steady, no glow — measured 4–20 pt inside
+  the stroke at −4.81 against −4.94 at rest, so nothing bleeds inward: it is a
+  line, not a light. Dark when muted, dark while the gate is holding you, and
+  dark when the OTHER person has the floor — that last one is the control arm,
+  because a border that lit for them would say the opposite of the truth. It
+  arrives at the instant the gate opens, which is the point: someone interrupting
+  is told they are through rather than guessing.
+- **A turn-end prior**, from the transcript Kin already produces for subtitles.
+  Measured against the reactive rule that ships today, at the same instant and
+  the same cost: **false handovers 52% → 12%**, catching 39% of turn ends early.
+  Biased that way deliberately — a false "they have finished" arms the gate under
+  somebody mid-sentence, and a miss costs a beat the reactive gate still
+  recovers. Not yet connected to the gate.
+  [mac/tools/predict-check.sh](mac/tools/predict-check.sh).
+
+### Fixed
+- **A first install that was refused its name gave up for good.** Asked the
+  server for a handle, got `429 {"error":"rate"}`, and stopped — for the rest of
+  that launch nobody could call that person and the app never said so. A laptop
+  opened before Wi-Fi associates did the same thing, and that is the ordinary way
+  this app starts. One condition was answering two questions: "may I take a
+  different name" and "should I ask for this one again". It retries the same name
+  now, honours the server's own hint, keeps trying for the life of the process,
+  and the People panel says which of the three things went wrong in plain words.
+- **And pressing Call between two attempts said there was no name.** The wait
+  ended the moment the ladder went idle, which after the change above means
+  "between passes" rather than "given up". It waits out the caller's budget and
+  drives an attempt itself.
+- **A warning could kill the app.** `setWarning` was the only setter on the
+  control row that did not hop to the main thread, and it touches `NSView` state
+  three ways. Every release so far has been one non-empty warning off the main
+  thread away from aborting; it survived on a guard that returns early when
+  clearing something already clear.
+- **Two sentences fought over one warning line and the controls never faded
+  again.** "their camera is off" and "you're in the same room" were written by
+  two independent owners, once a second each, overwriting each other 150 times in
+  one call — and every overwrite re-showed the control row and re-armed its
+  stillness timer. The precedence is written down once now, in one place.
+- **The breathing rim around the whole window is gone**, along with the dots that
+  swelled on the picture. Measured at the window edge, it lit up 6.4× when the
+  far end took the floor. Whose turn it is lives in the microphone button's own
+  ink instead — full, dimmer, dimmest — with no glow, ring or pulse.
+- **Subtitles appear in 33 ms instead of 400**, at full height instead of growing
+  into place, and the dead second caption line is gone.
+- **The updater failed silently in five different ways at once.** An unreachable
+  server, a missing signature, a signature that did not verify, an unparseable
+  manifest and "already up to date" were one indistinguishable `return nil`. Each
+  says what happened now, and the ones a person can act on reach the window.
+  A Mac that cannot write to its own copy of Kin stops re-downloading the release
+  forever and says why. `install.sh` no longer moves a new binary over a working
+  one before checking it runs — the old one did, **and exited 0 while doing it**.
+  [mac/tools/update-check.sh](mac/tools/update-check.sh), 44 → 79 assertions.
+- Every `--*-test` run took UDP 7001 before reaching the test, so a test on a Mac
+  with a call in progress failed on a bind. They take any free port now.
+
+### Changed
+- A rig that could only `stat` the video it needs now reads a byte of it, and a
+  turn-end verdict that could not decide a speaker says so on the verdict line
+  rather than thirty lines above it.
+
 ## Kin 0.67.0 — 2026-08-26
 
 ### Added
