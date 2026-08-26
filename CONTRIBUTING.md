@@ -18,54 +18,109 @@ Why so strict? Because this is a media product, and media products are full of
 changes that feel better and measure worse. The repo's `MEASURED.md` is a log
 of ideas that sounded great and lost to their own data. That file is the point.
 
-## Quick start
+## Which half of the repo you are in
+
+This matters more than anything else here, because the two halves have different
+toolchains and different verification.
+
+- **`mac/` — the Mac app (Kin). This is where the work goes.** Every commit
+  since the pivot has been here.
+- **`tape-app/` — the Cloudflare Worker.** Still live and still essential: it
+  does rendezvous, the doorbell, TURN credentials and the download page. Its
+  `public/` directory is the **retired browser client**, kept but not developed.
+
+## Quick start — the Mac app
 
 ```bash
 git clone https://github.com/deshmukhpatel98/tokkah.git
+cd tokkah/mac
+swift build                    # → "Build complete!"
+.build/debug/tk --version      # → the version you just built
+.build/debug/tk --gate-test    # a real check that needs no network and no mic
+```
+
+Swift 6 toolchain, macOS 14+, Apple silicon. No credentials and no signing
+identity needed — those are only required to cut an official release
+([GOVERNANCE.md](GOVERNANCE.md#releases-and-the-keys-that-gate-them)).
+
+To make an actual call, two machines, same room name:
+
+```bash
+.build/debug/tk --room our-room --video camera
+```
+
+If you are testing on one machine, **pass `--mute`** so the two processes do not
+play into each other's microphones.
+
+## Quick start — the Worker
+
+```bash
 cd tokkah/tape-app
 npm ci                 # exact versions from the lockfile
 npm test               # unit suites
 npx wrangler dev       # local dev server at http://localhost:8794
+npx wrangler deploy    # your own copy, on a free Cloudflare account
 ```
 
-To deploy your own copy (works on a **free** Cloudflare account):
-
-```bash
-npx wrangler deploy
-```
-
-That gives you `tokkah.<your-subdomain>.workers.dev`. See the README for the
-optional TURN and custom-domain steps.
+See [SELF-HOSTING.md](SELF-HOSTING.md) for running the whole thing yourself.
 
 ## Before you open a pull request
+
+**If you touched `tape-app/`:**
 
 1. **Run the tests**: `npm test` in `tape-app/`.
 2. **Check the types**: `npx tsc --noEmit`.
 3. **Verify a deploy still builds**: `npx wrangler deploy --dry-run`.
 4. **Keep it free-plan deployable**: `node testbed/freetier-audit.mjs` from the
    repo root.
-5. **Describe the measurement.** What did you run, on what, and what were the
-   numbers before and after?
 
-CI runs 1–4 automatically on every pull request. Step 5 is on you.
+**If you touched `mac/`:**
 
-### The two promises that must never break
+5. **Build it**: `swift build` in `mac/`.
+6. **Run the check scripts for what you touched.** There are 23 of them in
+   [`mac/tools/`](mac/tools), one per behaviour that has broken before —
+   `gate-check.sh`, `crash-check.sh`, `sameroom-check.sh`, `update-check.sh` and
+   so on. They are the regression suite.
+7. **Make an actual call and say what hardware you made it on.** CI builds the
+   app and runs its offline self-tests, but **no CI runner has a camera, a
+   microphone, or a second machine** — so a green badge says the code compiles
+   and the pure-computation tests pass, and says nothing about how the call
+   sounds or looks. Only you can check that.
 
-This project promises anyone can **deploy it on a free Cloudflare account** and
-**embed it in any product**. Both are easy to break by accident, so both are
-tested rather than trusted:
+**Always:**
+
+8. **Describe the measurement.** What did you run, on what, and what were the
+   numbers before and after? This step is on you, and it is the one that decides
+   whether the change lands.
+
+A note on measuring, learned the expensive way: **measure the rig's own noise
+before believing any delta**, and prefer a rig that can run both arms in one
+session. This project has had A/B results inverted by a moving average, by a
+misspelled flag that silently disabled the arm it named, and by a harness
+parameter the product actually chooses at runtime.
+
+### The promise that must never break
+
+Anyone must be able to **deploy the Worker on a free Cloudflare account**. That
+is easy to break by accident, so it is tested rather than trusted:
 
 - `node testbed/freetier-audit.mjs` — static, credential-free, runs in CI. Fails
   on paid-only bindings, key-value-backed Durable Objects, a bundle over the
   free-plan size limit, or a config that needs a custom domain or a secret.
-- `node testbed/forkdeploy-call.mjs` — the full thing, run before a release:
-  clones the public repo, installs from the lockfile, deploys it under a
-  throwaway name, then runs **real browsers with real talking-head media**
-  through that fork — a direct call, and the same call embedded by a page on a
-  different origin. It needs a Cloudflare login and deletes the fork afterwards.
 
-If your change touches `wrangler.jsonc`, the Worker's routing, the CSP, or
-`embed.js`, run the fork test too.
+If your change touches `wrangler.jsonc` or the Worker's routing, run it before
+you open the PR rather than waiting for CI.
+
+`testbed/forkdeploy-call.mjs` does the heavier version — clone the public repo,
+deploy it under a throwaway name, run real browsers through it — but it exercises
+the **retired browser client**, so it now proves the Worker deploys and serves,
+not that a call works. A Mac-app equivalent does not exist yet, and writing one
+would be a genuinely valuable contribution.
+
+**A second promise used to live here — "embed it in any product" — and it is no
+longer true.** `embed.js` still serves, but what it loads is now a hand-off page
+that opens the call in the Mac app rather than a call in the browser. It is not
+maintained. Do not add checks that assert the old behaviour.
 
 ## Sign-off: the DCO
 
@@ -100,22 +155,35 @@ that conversation early than turn away good work at the end.
 
 ## What good contributions look like
 
-- **Bug fixes with a repro.** Best of all: a rig under `testbed/` that fails
-  before your fix and passes after.
-- **Measurements that contradict us.** Genuinely welcome. If a claim in
-  `MEASURED.md` does not reproduce on your hardware, that is a finding, and it
-  gets logged with your numbers.
-- **Portability.** Browser or device combinations we do not have. Safari and
-  Android reports are especially valuable.
+- **Bug fixes with a repro.** Best of all: a check script under
+  [`mac/tools/`](mac/tools) that fails before your fix and passes after.
+- **Measurements that contradict us.** Genuinely welcome. If a claim in this
+  repo does not reproduce on your hardware, that is a finding, and it gets
+  logged with your numbers.
+- **A call between two real Macs, in two real places, with a number on it.**
+  Every media latency figure the Mac app owns is loopback or injected
+  impairment. Nobody has measured a real one. This is the single most valuable
+  thing an outside contributor could bring.
+- **Macs and audio devices we do not have.** Different Mac models, different
+  interfaces, different sample rates. A hardcoded 48 kHz once went silently deaf
+  on a machine whose default was 44.1 kHz, so this class of report is worth a
+  lot.
+- **Accessibility.** The window currently reports no accessibility elements at
+  all, which makes Kin invisible to screen readers. That is an open defect and
+  help with it is welcome.
 - **Plain-language documentation.** If a paragraph in this repo needed two
   readings, it is a bug in the paragraph.
 
 ## What is likely to be declined
 
-- Dependencies. The client ships with **zero runtime dependencies** and the
-  Worker has none either. That is a deliberate constraint, not an oversight.
-- Anything that adds latency to the audio or video path. Presence features
-  must run on idle time or the compositor, never on the media pipeline.
+- Dependencies. The shipped app has **zero runtime dependencies** and the Worker
+  has none either. That is a deliberate constraint, not an oversight.
+- Anything that adds latency to the audio or video path, or that does work on
+  the CoreAudio render callback. A lock on the audio thread is a dropout.
+- Anything that filters the microphone. Since 0.56.0 the microphone reaches the
+  wire exactly as captured, or is turned down whole — never filtered, never
+  guessed at. That is the product, not an implementation detail.
+- New work on the retired browser client in `tape-app/public/`.
 - Claims without measurements (see above).
 
 ## Security issues

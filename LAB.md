@@ -1,5 +1,17 @@
 # The far-away lab
 
+> **Status, 2026-08-26: the browser half of this no longer works as written.**
+> Kin retired browser calling, so opening `room.tokkah.com/far-away-lab` in a
+> browser now serves the download page — verified: HTTP 200,
+> `<title>Join on Kin</title>` — not a call. The room, the container fleet and
+> the `lab.tokkah.com` console are all still live and still the right way to get
+> a real peer on another continent; what changed is that the *near* side has to
+> be Kin or a testbed process rather than a tab. Everything below is accurate
+> except where it tells you to open the link and press **Start a call**. This
+> note is here rather than a rewrite because the rig has not been re-run since
+> the pivot, and a confidently rewritten procedure nobody has executed is worth
+> less than an honest warning.
+
 One permanent link, and a browser on the other side of the world to answer it.
 
 ```

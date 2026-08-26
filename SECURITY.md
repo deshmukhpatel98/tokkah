@@ -1,8 +1,73 @@
-# Security posture — measured, not asserted
+# Security
+
+## Reporting a vulnerability
+
+**Please do not open a public issue for a security problem.**
+
+Report it through **[GitHub's private vulnerability
+reporting](https://github.com/deshmukhpatel98/tokkah/security/advisories/new)** —
+it opens a private thread visible only to you and the maintainer.
+
+If that form is not accepting reports, open a **public issue containing no
+details** — just "security issue, please make contact" — and you will be
+contacted privately to take it from there. Do not put the vulnerability in that
+issue.
+
+### What to expect
+
+This is a single-maintainer project ([GOVERNANCE.md](GOVERNANCE.md)), so the
+honest version rather than a service-level agreement:
+
+| | |
+|---|---|
+| First human reply | within **7 days**. If you have not heard back by then, assume it did not arrive and ping the public issue. |
+| Assessment of whether it is real | within **14 days** of that first reply |
+| Fix for something remotely exploitable | as fast as one person can, and shipped through the normal signed release channel |
+| Credit | you will be credited in [CHANGELOG.md](CHANGELOG.md) unless you ask not to be |
+| Bounty | **none.** There is no money in this project and no bug-bounty programme. |
+
+There is no embargo policy beyond common sense: tell us, give us a reasonable
+window to ship a fix, and publish whatever you like afterwards.
+
+### What is in scope
+
+The app (`mac/`), the Worker (`tape-app/src/`), the update channel, and the
+signing and rendezvous design. Reports about the retired browser client in
+`tape-app/public/` are still welcome but are lower priority — see
+[the note on the posture section below](#a-note-on-what-follows).
+
+Out of scope: anything requiring physical access to an unlocked Mac; the
+one-time Gatekeeper prompt (there is no Apple Developer ID, by decision — see
+the README); and the man-in-the-middle case named as unfixed in
+[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift), which is already
+documented rather than unknown.
+
+---
+
+## A note on what follows
+
+Everything below was measured on **the browser product**, on 2026-08-02, and has
+not been re-measured since the project became a native macOS app. It is kept
+because it is accurate about the browser client, which is still in the
+repository, and because its final section is a list of things that are *not* yet
+true — a security document that only lists strengths is marketing.
+
+**The Mac app has a different trust model and it is documented in the source
+rather than here.** In short: X25519 + AES-256-GCM per packet over raw UDP, two
+keys (one per direction), the room code mixed into key derivation so it
+authenticates the exchange, and an eight-character code the two people can read
+aloud. What it explicitly does **not** defeat is an active man in the middle who
+already knows the room code — fixing that needs identity that outlives a call,
+which does not exist yet. The precise statement, including what happens while a
+handshake is outstanding, is at the top of
+[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift).
+
+---
+
+# Security posture (browser client) — measured, not asserted
 
 Everything below was read off a live production call or the live production
-response headers on 2026-08-02. The final section is the part that is *not* yet
-true, because a security document that only lists strengths is marketing.
+response headers on 2026-08-02.
 
 ## Measured on a live call
 

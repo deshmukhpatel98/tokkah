@@ -4,6 +4,10 @@ Short version: **if you use Tokkah, say so somewhere a person can find it.**
 A line in your About screen, credits page, or open-source notices is enough.
 That is the whole requirement, and it costs you nothing.
 
+*On the two names:* **Tokkah** is the project and the codebase; **Kin** is the
+macOS app built from it. The credit line below asks for the project name, so
+"Built with Tokkah" is correct whichever part you used.
+
 ---
 
 ## The requirement
@@ -59,10 +63,10 @@ than have you quietly strip the notice.
 
 ## Trademark
 
-"Tokkah" is the project's name. The AGPL covers the *code*, not the *name*. You
-may — and should — use the name to say truthfully that your product is built
-with Tokkah. You may not name your own product Tokkah, use the name as your
-brand, or suggest that we endorse or maintain your fork.
+"Tokkah" is the project's name and "Kin" is the app's. The AGPL covers the
+*code*, not the *names*. You may — and should — use them to say truthfully that
+your product is built with Tokkah. You may not name your own product Tokkah or
+Kin, use either as your brand, or suggest that we endorse or maintain your fork.
 
 ---
 
