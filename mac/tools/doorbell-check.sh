@@ -19,8 +19,34 @@
 # the user's actual doorbell and this script runs on the user's actual Mac.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
+# ── THE BINARY UNDER TEST MUST BE THE SOURCE UNDER TEST ──────────────────────
+#
+# This used to be `[ -x "$TK" ] || echo "build first"`, and existence is not
+# currency. On 2026-08-26 the doorbell fix was written, committed, and then
+# checked by this script against a .build/debug/tk that was NINE HOURS OLDER
+# than the sources -- built before the fix existed. Five assertions failed and
+# every one of them was about code nobody was shipping. A rig that tests a stale
+# binary does not report "stale"; it reports a verdict, and the verdict is about
+# the wrong program. It could as easily have been a PASS.
+#
+# So build it here rather than trusting whatever is lying in .build, and then
+# check the timestamp anyway, because `swift build` can succeed without relinking.
 TK="$PWD/.build/debug/tk"
-[ -x "$TK" ] || { echo "build first: swift build"; exit 2; }
+echo "== building the binary under test =="
+if ! swift build --product tk >/dev/null 2>&1; then
+  echo "BUILD FAILED -- cannot test the doorbell against a binary that does not compile"
+  swift build --product tk 2>&1 | grep -E "error:" | head -5
+  exit 2
+fi
+[ -x "$TK" ] || { echo "swift build reported success but $TK is not there"; exit 2; }
+NEWER=$(find Sources -name '*.swift' -newer "$TK" 2>/dev/null | head -3)
+if [ -n "$NEWER" ]; then
+  echo "STALE BINARY -- these sources are newer than $TK even after a build:"
+  echo "$NEWER" | sed 's/^/    /'
+  echo "  Refusing to report a verdict about a binary that is not this source."
+  exit 2
+fi
+echo "  $TK is current with Sources/"
 
 LABEL="com.tokkah.tk.doorbellrig$$"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -72,7 +98,22 @@ status() {
   cat "$out"
 }
 
-write_plist() {   # $1 = the argument that decides whether it stays alive
+# $1 = the argument that decides whether it stays alive
+# $2 = the KeepAlive policy, and it has to be a PARAMETER
+#
+# This hardcoded <true/>, which is the FIXED policy -- the one that by design
+# never leaves a job dead. The scenarios below that need a registered-but-dead
+# job were therefore asking launchd to restart the thing they wanted dead, and
+# only "passed" by catching it inside its 30 s ThrottleInterval. On 2026-08-26
+# the same rig caught it a moment earlier, read `state = running`, and failed
+# three assertions about a fix that was working. A rig whose verdict depends on
+# which side of a sleep it lands on is not measuring the product.
+#
+# The dead-job scenarios now install the OLD policy on purpose: that is the
+# historical condition being reproduced -- a job that ran, exited 0, and was
+# never restarted -- and with KeepAlive false it settles there and stays.
+write_plist() {
+  local keep="$2" throttle="${3:-30}"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -80,8 +121,8 @@ write_plist() {   # $1 = the argument that decides whether it stays alive
 <key>Label</key><string>$LABEL</string>
 <key>ProgramArguments</key><array><string>$TK</string><string>$1</string><string>--mute</string></array>
 <key>RunAtLoad</key><true/>
-<key>KeepAlive</key><true/>
-<key>ThrottleInterval</key><integer>30</integer>
+<key>KeepAlive</key><$keep/>
+<key>ThrottleInterval</key><integer>$throttle</integer>
 <key>ProcessType</key><string>Interactive</string>
 <key>StandardOutPath</key><string>$SP/rig.log</string>
 <key>StandardErrorPath</key><string>$SP/rig.log</string>
@@ -93,7 +134,7 @@ say "1. the instrument itself: does launchctl distinguish loaded from running?"
 # THE CALIBRATION. If launchctl reported a dead job as not-loaded, the original
 # code would have been correct and there would be nothing here to fix. It does
 # not, and that is the whole bug -- so assert it rather than assume it.
-write_plist --version                        # runs, prints, exits 0 at once
+write_plist --version false                  # runs, prints, exits 0, STAYS exited
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
 sleep 2
 PRINT="$SP/print.txt"
@@ -111,7 +152,10 @@ else
   ok "...and it is not running ($(grep -m1 -oE 'state = [a-z ]+' "$PRINT"))"
 fi
 
-say "2. the fix: does the app call that unreachable?"
+say "2a. a dead agent under the OLD policy: unreachable, and rewrite the plist"
+# The plist written above is the old shape, so the honest repair is not "start it
+# again" -- that would put the same policy back in charge and it would be dead
+# again by morning. It is "write the plist this build ships and then start it".
 S="$(status)"
 printf '  %s\n' "$S"
 case "$S" in
@@ -119,15 +163,42 @@ case "$S" in
   *) bad "reach() must say no here" "this is the twenty-hour bug, exactly" ;;
 esac
 case "$S" in
-  *"fix=restart"*) ok "and offers the repair the app can perform itself" ;;
-  *) bad "fix should be restart" "$S" ;;
+  *"fix=install"*) ok "and the repair replaces the policy, not just the process" ;;
+  *) bad "fix should be install for an old-shape plist" "$S" ;;
 esac
+
+say "2b. a dead agent under the NEW policy: unreachable, and just start it"
+# The case every Mac is in AFTER this release. KeepAlive is true, so launchd is
+# going to restart it -- but between the exit and the restart the job is loaded
+# and not running, and reach() must not call that reachable. Parked with a long
+# ThrottleInterval so the window is five minutes wide rather than a race: this
+# is the same "loaded, registered, nobody listening" state launchd reports as
+# `spawn scheduled`, which is the second spelling of the twenty-hour bug.
+/bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
+write_plist --version true 300
+/bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+sleep 2
+/bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
+if grep -qE '^\s*state = running' "$PRINT"; then
+  bad "could not park the job" "$(grep -m1 'state = ' "$PRINT") -- 2b proved nothing"
+else
+  S2b="$(status)"
+  printf '  %s\n' "$S2b"
+  case "$S2b" in
+    *"reachable-closed no"*) ok "a throttled agent is not reachable ($(grep -m1 -oE 'state = [a-z ]+' "$PRINT"))" ;;
+    *) bad "a throttled agent must read as unreachable" "$S2b" ;;
+  esac
+  case "$S2b" in
+    *"fix=restart"*) ok "and offers the repair the app can perform itself" ;;
+    *) bad "fix should be restart for a current-shape plist" "$S2b" ;;
+  esac
+fi
 
 say "3. the control: a LIVE agent must still read as reachable"
 # Without this arm the test passes just as well if reach() always says no, which
 # would be a different outage with the same green tick.
 /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
-write_plist --watch                          # the real thing: stays resident
+write_plist --watch true                     # the real thing: stays resident
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
 sleep 4
 S2="$(status)"
@@ -139,7 +210,7 @@ esac
 
 say "4. Watch.restart() actually restarts, and reports what it found"
 /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
-write_plist --version
+write_plist --version false
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
 sleep 2
 /bin/launchctl kickstart -k "$DOM/$LABEL" >/dev/null 2>&1
