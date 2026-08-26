@@ -1,0 +1,44 @@
+# The other half of pinning actions by commit SHA.
+#
+# `.github/workflows/ci.yml` pins every action to a 40-character commit rather
+# than to a moveable tag, which closes the hole where the owner of an action
+# repoints `v4` at new code and every workflow trusting the tag runs it. On its
+# own that trade is only half made: a SHA that nobody ever bumps is a
+# dependency frozen at whatever was current the day it was written, security
+# fixes included. This file is what keeps the pins current, so the two belong
+# together and neither should be removed without the other.
+version: 2
+updates:
+  # The workflows themselves. `directory: "/"` is not the repo root in the
+  # usual sense here — for this ecosystem it means .github/workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    # One pull request that moves all of them, rather than one per action.
+    # This repo has a single maintainer; a flood of individual bumps gets
+    # ignored, and an ignored update is the same as no update.
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The Cloudflare Worker. Everything here is a devDependency by design — the
+  # shipped app has zero runtime dependencies and CONTRIBUTING.md asks that it
+  # stay that way — so these bumps touch the build and test toolchain only.
+  #
+  # The native macOS app in mac/ has no entry because it has nothing to
+  # update: Package.swift declares no package dependencies at all, only system
+  # frameworks. Dependabot has no Swift ecosystem to point at it.
+  - package-ecosystem: npm
+    directory: "/tape-app"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+      prefix-development: deps-dev
+    groups:
+      dev-dependencies:
+        dependency-type: development

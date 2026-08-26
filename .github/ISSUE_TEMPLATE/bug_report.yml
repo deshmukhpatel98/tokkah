@@ -8,6 +8,12 @@ body:
         Thanks for reporting. Calls are hard to debug after the fact, so the
         questions below are the ones that usually make the difference.
 
+        The audio questions are not boilerplate. On this project the output
+        device has repeatedly *been* the bug: a Bluetooth headset added 175 ms
+        of mouth-to-ear on its own, and a machine whose default device was
+        44.1 kHz went silently deaf against a 48 kHz graph. Whatever you were
+        listening through is genuinely the first thing worth knowing.
+
   - type: textarea
     id: what-happened
     attributes:
@@ -25,46 +31,115 @@ body:
       required: true
 
   - type: dropdown
-    id: browser
+    id: surface
     attributes:
-      label: Browser
-      options: [Chrome, Safari, Firefox, Edge, Other]
+      label: Where did this happen?
+      description: >
+        Kin is the native macOS app and is the flagship. The rest of the
+        answers below change meaning depending on this one.
+      options:
+        - Kin, the macOS app
+        - room.tokkah.com in a browser
+        - A deployment I host myself
     validations:
       required: true
 
   - type: input
-    id: platform
+    id: kin-version
     attributes:
-      label: Device and OS
-      placeholder: MacBook Air M2, macOS 15.6 — or Pixel 7, Android 15
+      label: Kin version
+      description: >
+        In Kin: the three-dot menu, then the last row of the settings panel.
+        Kin updates itself silently, so this is worth reading off the screen
+        rather than guessing — two Macs on the same call can be on different
+        builds and look identical. From a terminal it is `tk --version`. Skip
+        if you answered "a browser" above.
+      placeholder: "0.69.0"
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac model
+      description: Apple menu → About This Mac.
+      placeholder: macOS 15.6, MacBook Air M2
     validations:
       required: true
 
   - type: dropdown
-    id: demo
+    id: audio-out
     attributes:
-      label: Does it also happen on the live demo at room.tokkah.com?
-      description: This separates "bug in Tokkah" from "bug in this deployment".
-      options: ["Yes", "No", "I didn't try"]
+      label: What were you listening through?
+      description: >
+        The output device sets a floor under end-to-end latency and decides
+        whether the echo path exists at all, so this separates whole classes
+        of bug from each other.
+      options:
+        - Built-in Mac speakers
+        - Wired headphones or earbuds
+        - Bluetooth headphones or earbuds
+        - AirPods
+        - External interface, dock, or monitor speakers
+        - Something else — described below
     validations:
       required: true
+
+  - type: input
+    id: audio-rate
+    attributes:
+      label: Sample rate of that device (optional, very useful)
+      description: >
+        Applications → Utilities → Audio MIDI Setup, then read the Format
+        column for your output device. A device running at 44.1 kHz against a
+        48 kHz call has caused real bugs here.
+      placeholder: 48000 Hz
+
+  - type: input
+    id: mic
+    attributes:
+      label: Which microphone
+      placeholder: Built-in MacBook mic — or the headset's own mic
+    validations:
+      required: true
+
+  - type: dropdown
+    id: far-end
+    attributes:
+      label: What was the other end?
+      description: >
+        Two Macs in the SAME room is a known and confusing case — Kin is
+        supposed to notice and silence one speaker — so it is worth saying.
+      options:
+        - Kin on another Mac, somewhere else
+        - Kin on another Mac in the same room as me
+        - A browser
+        - Nobody — this happened before or without a call
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      description: Only if you answered "a browser" for either question above.
+      placeholder: Safari 18.5
 
   - type: textarea
     id: evidence
     attributes:
       label: Numbers, logs, or console output
       description: >
-        Optional but valuable. The in-call stats panel, browser console output,
-        or anything you measured. This project runs on measurements.
+        Optional but valuable. Kin's own diagnostics, terminal output from
+        `tk`, browser console output, or anything you measured. This project
+        runs on measurements.
       render: shell
 
   - type: input
     id: room
     attributes:
-      label: Room code (optional)
+      label: Room code or invite code (optional)
       description: >
-        Only if it was a test room. Never paste a link to a private
-        conversation — anyone reading this issue could open it.
+        Only if it was a test room. Never paste a code for a private
+        conversation — anyone reading this issue could use it.
 
   - type: checkboxes
     id: conduct

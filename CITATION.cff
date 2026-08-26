@@ -1,0 +1,43 @@
+# Citation File Format 1.2.0 — https://citation-file-format.github.io
+#
+# GitHub reads this file and offers a "Cite this repository" button. It exists
+# because this project's output is largely measurements (MEASURED.md,
+# BENCHMARK.md, LATENCY-150.md), and a measurement people can cite is worth
+# more than one they cannot.
+#
+# `license:` below carries the SPDX identifier for the open-source half only,
+# because SPDX has no identifier for the commercial half. Tokkah is dual
+# licensed: AGPL-3.0-only for everyone, plus a separate commercial license
+# (LICENSE-COMMERCIAL.md) for closed-source use. Cite the AGPL one.
+cff-version: 1.2.0
+message: >-
+  If you use Tokkah, or reuse any of its measurements, please cite it using the
+  metadata below.
+title: Tokkah
+abstract: >-
+  Peer-to-peer video calling that sends bit-exact lossless 48 kHz PCM audio
+  rather than a lossy codec, repairs lost packets with a sliding-window FEC,
+  and paces video against the display's real refresh rate. Signaling is a
+  single Cloudflare Worker and one Durable Object; media never touches a
+  server. The flagship client is Kin, a native macOS application. Every
+  performance claim in the repository is accompanied by the measurement that
+  produced it, including the experiments that failed.
+type: software
+authors:
+  - given-names: Devesh
+    family-names: Patel
+repository-code: "https://github.com/deshmukhpatel98/tokkah"
+url: "https://room.tokkah.com"
+license: AGPL-3.0-only
+version: 0.69.0
+date-released: "2026-08-26"
+keywords:
+  - video-calling
+  - webrtc
+  - lossless-audio
+  - low-latency
+  - forward-error-correction
+  - real-time-communication
+  - macos
+  - swift
+  - cloudflare-workers

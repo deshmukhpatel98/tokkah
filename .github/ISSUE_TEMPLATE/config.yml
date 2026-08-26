@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Install Kin on a Mac
+    url: https://room.tokkah.com/macos
+    about: The download and the one-line installer. Not a bug — start here.
   - name: Report a security vulnerability (privately)
     url: https://github.com/deshmukhpatel98/tokkah/blob/main/SECURITY.md
     about: Please do not open a public issue for security problems.
@@ -9,3 +12,6 @@ contact_links:
   - name: Questions and ideas
     url: https://github.com/deshmukhpatel98/tokkah/discussions
     about: Discussions is the place for "how do I…" and "has anyone tried…".
+  - name: Getting help
+    url: https://github.com/deshmukhpatel98/tokkah/blob/main/SUPPORT.md
+    about: What this project can and cannot promise, and what to gather first.

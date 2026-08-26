@@ -8,6 +8,15 @@ on:
 permissions:
   contents: read
 
+# ── ACTIONS ARE PINNED BY COMMIT SHA, NOT BY TAG ──────────────────────────────
+#
+# `actions/checkout@v4` is a MOVEABLE pointer: whoever controls that repository
+# can repoint the tag at a different commit, and every workflow in the world
+# that trusts the tag runs the new code on its next build. A 40-character SHA
+# cannot be repointed. The trailing comment keeps the human-readable version so
+# the pin is still legible, and `.github/dependabot.yml` bumps these weekly —
+# without that half, pinning by SHA is just a slower way of never updating.
+
 jobs:
   verify:
     name: tests, types, deploy build
@@ -16,9 +25,9 @@ jobs:
       run:
         working-directory: tape-app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -47,3 +56,193 @@ jobs:
       - name: Free-tier deployability audit
         working-directory: .
         run: node testbed/freetier-audit.mjs
+
+  # ── THE FLAGSHIP HAD NO CI AT ALL ───────────────────────────────────────────
+  #
+  # Everything above tests `tape-app/`, which is signaling. The product people
+  # actually install is Kin, the native macOS app in `mac/`, and until this job
+  # existed nothing stopped a pull request that did not compile — the one thing
+  # CI is unambiguously for.
+  #
+  # Like the Worker job, this needs NO credentials and no account: a fork gets
+  # the same run the maintainer does, or the check is theatre.
+  mac:
+    name: Kin (macOS) — build and offline self-tests
+    runs-on: macos-26
+    # A clean build of ~32k lines of Swift, and every target carries
+    # `-Ounchecked` (Package.swift) so even the debug configuration is
+    # optimising. Generous on purpose: a timeout that trips on a slow runner
+    # teaches people to ignore red.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mac
+    env:
+      # None of these is a secret and none is production behaviour.
+      #
+      # TK_NO_IDENTITY stops a run claiming a handle on the real server. A
+      # `--*-test` run is already excused from that, but the variable costs
+      # nothing and covers anything added here later that is not.
+      # TK_NO_RAISE stops any window putting itself in front of a person.
+      TK_NO_IDENTITY: "1"
+      TK_NO_RAISE: "1"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # ── WHY macos-26 AND NOT macos-latest ───────────────────────────────────
+      #
+      # `mac/Sources/tk/AppleSpeech.swift` calls `SpeechAnalyzer`,
+      # `SpeechTranscriber` and `AssetInventory`. Those are macOS 26 SDK
+      # symbols, and the `#available(macOS 26.0, *)` guards around them are a
+      # RUNTIME gate, not a compile-time one — the symbols still have to exist
+      # in the SDK for the file to compile at all. An image whose default Xcode
+      # predates that SDK does not produce a tidy error; it produces a wall of
+      # "cannot find 'SpeechAnalyzer' in scope" that reads like the code is
+      # broken. `macos-latest` moves between images on GitHub's schedule rather
+      # than this project's, so it is pinned, and this step says the quiet part
+      # out loud before the build spends twenty minutes discovering it.
+      #
+      # Package.swift also declares swift-tools-version:6.0, which needs
+      # Xcode 16 or newer to be parsed at all.
+      #
+      # The `macos-26` image was checked against actions/runner-images: its
+      # default is Xcode 26.6, carrying the macosx26.5 SDK, so the floor below
+      # is met with room to spare. The check is kept anyway — the image
+      # contents move under a label that does not.
+      - name: Toolchain (and the SDK floor this project actually has)
+        run: |
+          set -euo pipefail
+          sw_vers
+          swift --version
+          xcodebuild -version
+          sdk="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK: $sdk"
+          if [ "${sdk%%.*}" -lt 26 ]; then
+            echo "::error::macOS SDK $sdk is too old. Sources/tk/AppleSpeech.swift needs the macOS 26 SDK (SpeechAnalyzer/SpeechTranscriber/AssetInventory). Use a newer runner image, or select a newer Xcode with xcode-select."
+            exit 1
+          fi
+
+      # Builds BOTH targets in the package: `tk` (the app) and `voicelab`,
+      # which is a separate binary on purpose and would otherwise rot unbuilt.
+      - name: Build
+        run: swift build
+
+      # ── WHICH TESTS RUN HERE, AND WHY THE REST DO NOT ───────────────────────
+      #
+      # `main.swift` is top-level code, so a `--*-test` flag runs only after
+      # everything above it in the file has already happened. Two consequences
+      # decide this list.
+      #
+      # First: `TEST_FLAGS` (main.swift:395) excuses a test run from the
+      # updater, the identity claim and the login item, and moves the media
+      # port to an ephemeral one — but NOT from the UDP socket bound at
+      # `Wire(listen:)`, and NOT from `Crash.begin()`, which writes
+      # `runs.json`, reads the machine's DiagnosticReports and can POST to
+      # production. `--no-telemetry` is what switches that last one off, so it
+      # is on every line below that reaches it. `TK_KIN_DIR`/`TK_CRASH_DIR`
+      # keep any remaining write inside the runner's temp directory.
+      #
+      # Second: `let audio = Audio()` sits at main.swift:3822, deliberately
+      # BELOW every test block. So none of these constructs a CoreAudio unit —
+      # which is the reason this job is safe on a runner that has no audio
+      # hardware at all.
+      #
+      # Included — all twelve together take about four seconds on an M2 debug
+      # build, every one exiting 0. The slowest by some way is --cue-test,
+      # which contains a real 1.9 s sleep; the rest are well under a second.
+      # So this list costs nothing next to the build above it:
+      #   --version           exits at main.swift:69, before anything opens
+      #   --selftest-rename   update rename, temp-dir filesystem only
+      #   --selftest-install  relocation rules, temp-dir filesystem only
+      #   --selftest-identity handle normalisation; no network, no disk
+      #   --sameroom-test     arithmetic over a synthetic buffer; hoisted above
+      #                       the socket, so no port, no device, no window
+      #   --gate-test         duplex gate: near voice bit-for-bit untouched
+      #   --ledger-test       turn-taking ledger arithmetic
+      #   --cue-test          caption layout and bid placement
+      #   --yield-test        overlap/deadlock resolution and the 9 dB duck
+      #   --decimator-test    anti-alias filter response
+      #   --headphone-test    route classifier and the cleaner it skips
+      #   --subtitle-test     near/far separation in dB
+      #
+      # Left out, with the reason:
+      #   --predict-test    exits 2 ("COULD NOT RUN"). It needs
+      #                     testbed/media/real/realA.wav and realB.wav, which
+      #                     are deliberately gitignored — only fetch.sh is
+      #                     committed, and that needs curl and ffmpeg. It also
+      #                     opens a live speech recogniser and is paced in real
+      #                     time, ten minutes per recording by default.
+      #   --cam-picker-test  needs a camera and a window, and never exits.
+      #   --vpause-test      not a test: a runtime override inside the live
+      #                      call's report loop.
+      #   tools/*-check.sh   every one drives a real call and several
+      #                      synthesise speech. Lab rigs, not a compile gate.
+      #
+      # `--mute` is on every line even though nothing here should make a sound.
+      # A rig in this project has already rung out loud at the person using the
+      # Mac, and a runner is not a reason to get sloppy about it.
+      - name: Offline self-tests
+        run: |
+          set -euo pipefail
+          export TK_KIN_DIR="$RUNNER_TEMP/kin"
+          export TK_CRASH_DIR="$RUNNER_TEMP/crash"
+          TK=.build/debug/tk
+
+          # `teeStderrToLogIfNowhere()` (main.swift:64) redirects fd 2 into
+          # ~/Library/Logs/Kin/kin.log unless it is a tty or a REGULAR FILE.
+          # A CI step's stderr is a pipe, so without this every diagnostic
+          # would silently leave the build log and land in a file nobody
+          # fetches. Verdicts go to stdout and would survive either way; the
+          # explanation of a failure would not.
+          tk_run() {
+            local name="$1"; shift
+            local log="$RUNNER_TEMP/stderr-$name.log"
+            echo "── tk --$name $*"
+            set +e
+            "$TK" "--$name" "$@" 2>"$log"
+            local rc=$?
+            set -e
+            sed 's/^/  | /' "$log"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::tk --$name exited $rc"
+              exit "$rc"
+            fi
+          }
+
+          # Never through a pipe. A run in this repo once reported success
+          # because its exit code went into `| tail`, and the exit code is the
+          # entire verdict here.
+          tk_run version --mute
+          tk_run selftest-rename --mute
+          tk_run selftest-install --mute
+          tk_run selftest-identity --mute
+          tk_run sameroom-test --mute
+
+          # Each gets its OWN --listen port rather than fighting over the
+          # default. These bind a real UDP socket on localhost; nothing leaves
+          # the machine.
+          port=8401
+          for t in gate-test ledger-test cue-test yield-test \
+                   decimator-test headphone-test subtitle-test; do
+            tk_run "$t" --listen "$port" --video off --mute \
+                   --no-telemetry --no-update --no-relocate --no-rings
+            port=$((port + 1))
+          done
+
+          echo "all offline self-tests passed"
+
+      # An unknown flag is refused with exit 2 (main.swift:415-431) rather than
+      # ignored, which is what makes the step above trustworthy: if a flag
+      # named there were silently dropped, the arm would run without the thing
+      # it is named after. This asserts the guard still works, so a future
+      # rename cannot quietly turn twelve self-tests into twelve runs of the
+      # default program.
+      - name: A misspelled flag is refused, not ignored
+        run: |
+          set -uo pipefail
+          if .build/debug/tk --this-flag-does-not-exist --mute 2>/dev/null; then
+            echo "::error::tk accepted an unknown flag. Every --*-test above could now be running the default program instead."
+            exit 1
+          fi
+          echo "unknown flags are still refused"

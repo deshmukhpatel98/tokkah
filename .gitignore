@@ -1,4 +1,8 @@
-node_modules/
+# No trailing slash, deliberately. `node_modules/` matches directories only, so a
+# SYMLINK named node_modules slipped past it -- which is exactly how
+# tape-app/node_modules and fatigue-lab/node_modules stayed committed for months,
+# dangling in every clone, after a changelog entry said they had been removed.
+node_modules
 .wrangler/
 .DS_Store
 .claude/
@@ -67,3 +71,17 @@ testbed/peer/media/
 # history: the old objects stay in the pack, but no new ones land.
 mac/.build/
 mac/tools/__pycache__/
+
+# Rig screenshots that land wherever the harness was STARTED from.
+# testbed/competitor.mjs writes `cmp-<label>-A.png` as a RELATIVE path, so the
+# normal invocation -- `node testbed/competitor.mjs` from the repo root -- drops
+# them next to the README, not under testbed/. The `testbed/*.png` rule above
+# could never catch them: the file is named by the caller's cwd, not by the
+# script's location. Fourteen of them were committed during a video-loss
+# experiment and stayed tracked, so `ls` at the repo root opened on debug
+# screenshots. Both rules below are needed -- the first names this generator,
+# the second is the class rule, because the next harness will pick another
+# prefix and nothing at the root is a PNG on purpose. A root image that IS
+# deliberate goes in with `git add -f`.
+cmp-*.png
+/*.png
