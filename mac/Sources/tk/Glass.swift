@@ -270,10 +270,12 @@ enum Type_ {
   // size a label gets. 16 is what Apple's own Live Captions uses; 13 (`row`) was
   // legible at a desk and unreadable from a sofa.
   static let said = NSFont.systemFont(ofSize: 16, weight: .medium)
-  /// The same words, but yours, on the side that is currently not audible. Second
-  /// voice, second size: it is confirmation that you are landing, not something to
-  /// read.
-  static let saidMine = NSFont.systemFont(ofSize: 13, weight: .regular)
+  // `saidMine` was here: the same words at 13 pt, for the right-aligned half of
+  // the caption band that showed you your OWN speech while you were the quiet
+  // one. That half is gone -- the subtitle rule is that a voice which cannot be
+  // heard is read on the OTHER screen, so your words never belong on yours, and
+  // the only caller left was passing "". The band is one voice now and this was
+  // the last reference to this size.
   /// "mm-hmm". One word, appears, fades. It is not a caption -- it is the sound
   /// somebody makes to tell you they are still with you, and it should feel like
   /// that: large, brief, and gone before you finish the sentence you were on.

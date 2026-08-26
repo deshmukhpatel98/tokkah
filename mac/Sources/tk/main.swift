@@ -4478,15 +4478,19 @@ if let subs = subtitles {
     if !audible { wire.sendSubtitle(text, final: final, listening: listening) }
     // ── AND NEVER ON YOUR OWN SCREEN ─────────────────────────────────────────
     //
-    // This used to show you your own sentence while you were the quiet one. The
-    // reasoning was that talking into a room which gives nothing back is
-    // uncomfortable, and that is true -- but the answer to it is the mute pill
-    // and the level the row already shows, not a second caption competing with
-    // the one carrying the other person's words. Reading your own speech back is
-    // the one caption nobody needs, and it was the reason two of them could be
-    // on screen at once. Cleared rather than merely not set, so a caption from
-    // before this rule cannot linger.
-    display?.controls?.setMyWords("", showing: false)
+    // This used to show you your own sentence while you were the quiet one, and
+    // then it used to CLEAR that -- `setMyWords("", showing: false)`, right here,
+    // the only call to it left anywhere in the app, wiping a caption that nothing
+    // could put up any more. A whole second line of the band existed to be
+    // cleared by this line. Both are gone; see the note above `CaptionBand`.
+    //
+    // The sending half of the subtitle stopwatch, paired with `sub in` on the far
+    // end's `setTheirWords`. Absolute epoch, like `cue out` below it, because the
+    // two ends of this measurement are two processes.
+    if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
+      fputs(String(format: "sub out %.3f  \"%@\"%@\n", Date().timeIntervalSince1970,
+                   text, audible ? "  (not sent -- audible)" : ""), stderr)
+    }
     if flag("subtitle-debug") {
       fputs("  \(sinceLaunch()) ms you said: \(text)\(final ? " ." : " ...")"
           + "\(listening ? "  (listening)" : "")\n", stderr)

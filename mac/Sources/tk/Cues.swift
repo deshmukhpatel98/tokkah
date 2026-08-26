@@ -10,54 +10,82 @@ import QuartzCore
 // process the voice. It decides whose turn it is.
 //
 // A rule like that is only kind if the other person is never LOST while it is in
-// force. So the quiet side keeps three ways of reaching you, and this file is all
-// three:
+// force. So the quiet side keeps two ways of reaching you, and this file is both:
 //
-//   1. THE FLOOR CUE -- wordless, and fast. The far end's classification rides in
-//      the status byte of the very next audio packet, so it lands one network hop
-//      after they open their mouth: about 5 ms on a desk, 60 ms across an ocean.
-//      Nothing that has to be recognised can be that quick. It is pre-verbal on
-//      purpose -- motion and brightness are noticed without being read, and being
-//      noticed without being read is the difference between a cue and an
-//      interruption.
-//
-//   2. THE BLOOM -- the listening noise itself, as a word, large, appearing and
+//   1. THE BLOOM -- the listening noise itself, as a word, large, appearing and
 //      fading. "mm-hmm" is not a sentence and does not belong in a running
 //      caption; it is the sound somebody makes to say they are still with you,
 //      and it should behave like one. Brief, warm, gone.
 //
-//   3. THE CAPTION BAND -- a real utterance, running, revised as the recogniser
+//   2. THE CAPTION BAND -- a real utterance, running, revised as the recogniser
 //      changes its mind. This is the slow channel, because words have to be heard
 //      before they can be written; ~260 ms of speech plus the recogniser plus a
-//      hop. Slow is fine: by the time it says anything, the cue has already told
-//      you that somebody is there.
+//      hop.
 //
-// The two speeds are the reason both exist. A cue with no words leaves you
-// guessing what they want; words with no cue arrive after you have already talked
-// over them.
+// Both of those are WORDS, which is to say they are the payload. Neither is an
+// effect over the picture, and that distinction is the whole of the next note.
 //
-// ── WHY THE CUE IS NOT A LABEL ───────────────────────────────────────────────
+// ── WHAT WAS HERE, AND WHY IT IS GONE ────────────────────────────────────────
+//
+// There used to be a third channel, and it was the fast one: a wordless FLOOR CUE
+// drawn straight onto the video. Three dots that breathed while the far end made
+// a listening noise, swelling and merging into a lit bar with a glow and a light
+// travelling along it when they wanted to speak -- and, above all of it, a
+// three-point accent stroke around the entire window with an eighteen-point glow,
+// pulsing at 0.55 Hz, under a comment that said "THE ROOM LIGHTS UP".
+//
+// Its argument was good and it is written down in `git log`: peripheral vision is
+// poor at detail and excellent at change, so an edge that brightens is noticed
+// without being looked at. The person the app is for disagreed, in these words:
+//
+//    "There should be no vignette of any kind. There should not be any effect.
+//     It should all be very natural."
+//
+// They had said, two messages later, that people must always know who has the
+// floor. Those two are not reconcilable by tuning the glow down. They are
+// reconcilable by moving the answer off the picture and onto the CONTROL that was
+// already claiming to answer it -- see `IconButton.reach` and `CallControls`
+// `micFloor` in Controls.swift. The microphone button is the honest place: it is
+// the thing that already says whether your voice is going out, a person looking
+// for "am I being heard" looks there, and a control changing state is not an
+// effect happening to the picture.
+//
+// Photographed before and after, window edge, 0-4 pt in, far end claiming the
+// floor, as a mean of (blue - max(red, green)):
+//
+//     before   quiet  +4.9    claiming  +25.5     the edge, 6.4x brighter
+//     after    quiet  +4.9    claiming   +4.9     nothing happens to the picture
+//
+// `FloorCue` below survives with no `draw` at all. That is not a dead control:
+// its eased `level` is what decides when a caption expires, what the audit line
+// reports, and what `--cue-test` measures. It stopped painting; it did not stop
+// being read.
+//
+// ── WHY THE CUE WAS NEVER A LABEL, WHICH STILL HOLDS ─────────────────────────
 //
 // The obvious build is a badge that says "wants to speak". It was not built, for
-// a reason worth writing down: reading competes with listening. Text is processed
-// by the same language machinery that is currently busy parsing the sentence
+// a reason worth keeping: reading competes with listening. Text is processed by
+// the same language machinery that is currently busy parsing the sentence
 // somebody is saying to you, so a word placed on screen DURING their speech costs
 // attention that was already spent -- which is the exact mechanism behind video
-// call fatigue this app exists to remove. Size, motion and colour are not
-// language. They are noticed by a system that is otherwise idle.
+// call fatigue this app exists to remove.
 //
-// So: no words in the cue, ever. Words only where they are the payload.
+// So: no words about turn-taking, ever. Words only where they are the payload.
 
 // ── ONE ORGAN, TWO INTENSITIES ───────────────────────────────────────────────
 //
 // A listening noise and a bid for the floor are the same event acoustically --
 // the far end's voice, arriving while yours is out -- separated by how long it
-// lasts and how hard it pushes. So they are one shape here too, at two points on
-// a single continuum, and the movement BETWEEN them is the signal. Three soft
-// dots breathing is "I am with you". The same three dots swelling, closing up
-// into a bar and lighting is "I would like to say something". Nothing blinks on;
-// nothing appears from nowhere. You watch a thing you were already half-aware of
-// change its mind.
+// lasts and how hard it pushes. So they are one number here too, at two points on
+// a single continuum: `level` eases toward 0.42 for a listening noise and toward
+// 0.82-1.0 for a bid, faster on the way up than on the way down, and faster still
+// for somebody the ledger says is owed a turn.
+//
+// Nothing draws it any more. It is read by the caption's expiry rule, by the
+// audit line, and by `--cue-test`, which measures the four properties that matter
+// and never looked at a pixel: a bid crosses 0.75 inside 120 ms, a listening
+// noise settles below it, being owed a turn arrives sooner and goes further, and
+// all of it leaves again.
 final class FloorCue: NSView {
   /// 0 quiet, 1 listening noise, 2 bid for the floor. The same three values the
   /// audio gate classifies, carried in the status byte.
@@ -69,16 +97,12 @@ final class FloorCue: NSView {
   /// the record.
   var nudge: Double = 0
 
-  /// Eased position on the continuum. Everything drawn below is a function of
-  /// this one number, which is what makes backchannel-to-claim a morph rather
-  /// than a swap.
+  /// Eased position on the continuum. Everything downstream is a function of this
+  /// one number, which is what makes backchannel-to-claim a morph rather than a
+  /// swap.
   private(set) var level: CGFloat = 0
-  private var phase: CGFloat = 0
 
-  override func hitTest(_ point: NSPoint) -> NSView? { nil }
-  override var isOpaque: Bool { false }
-
-  /// Where the shape wants to be, before easing.
+  /// Where the level wants to be, before easing.
   private var target: CGFloat {
     switch vocal {
     case 1: return 0.42
@@ -105,12 +129,10 @@ final class FloorCue: NSView {
     let tau = t > level ? riseTau : 0.34
     level += (t - level) * min(1, dt / tau)
     if abs(t - level) < 0.002 { level = t }
-    phase += dt
-    needsDisplay = true
   }
 
   var idle: Bool { level < 0.01 && target == 0 }
-  /// For `--cue-test`: how long the shape takes to get from wherever it is to
+  /// For `--cue-test`: how long the level takes to get from wherever it is to
   /// `to`, driven at a fixed frame time. Returns milliseconds, or nil if it never
   /// arrives inside `limitMs`.
   ///
@@ -129,107 +151,20 @@ final class FloorCue: NSView {
     return nil
   }
 
-  /// The shape is drawn from `level` alone, so there is no state here that can
-  /// disagree with the state above.
-  override func draw(_ dirty: NSRect) {
-    guard level > 0.01, let ctx = NSGraphicsContext.current?.cgContext else { return }
-    let t = level
-    // ── THREE DOTS AND ONE BAR ARE THE SAME DRAWING ──────────────────────────
-    //
-    // Each of the three is a horizontal capsule. Its HEIGHT grows with `t`, and
-    // its LENGTH grows only in the top half of the range -- so a listening noise
-    // is three separate dots that swell a little, and a bid is the same three
-    // shapes stretched until they overlap into one solid bar. Nothing is hidden
-    // and nothing is shown; the geometry does all of it, which is why there is no
-    // frame in the middle where it looks like neither.
-    let r = 3.0 + 4.0 * t                         // half-height
-    let spacing = 13.0 - 2.0 * t                  // centre to centre
-    let stretch = max(0, (t - 0.5) / 0.5) * 12.0  // extra half-LENGTH; merges them
-    // LEFT aligned, not centred. The shape's width changes with `t`, so centring
-    // it would slide its leading edge sideways every time the far end went from
-    // listening to bidding -- and it sits directly above the first word of the
-    // caption, where a moving edge reads as the layout twitching.
-    let cy = bounds.midY, x0 = 2 + r + stretch
-    let xs = [x0, x0 + spacing, x0 + 2 * spacing]
-
-    // Colour walks from the app's plain foreground to its accent, and gains
-    // opacity on the way. A listening noise is meant to be almost subliminal.
-    let a = 0.55 + 0.45 * t
-    let col = blend(Palette.fg, Palette.accent, t).withAlphaComponent(a)
-
-    let path = CGMutablePath()
-    for (i, x) in xs.enumerated() {
-      // Breathing, only while it is a breath. It fades out as the shape becomes a
-      // bid, because a bid that pulses reads as a notification badge and a
-      // notification badge is a thing you dismiss.
-      let breathe = max(0, 1 - t / 0.7)
-      let sc = 1 + 0.30 * breathe * sin(phase * 2 * .pi * 0.95 + CGFloat(i) * 0.7)
-      let rr = r * sc, hw = r * sc + stretch
-      path.addRoundedRect(in: CGRect(x: x - hw, y: cy - rr, width: hw * 2, height: rr * 2),
-                          cornerWidth: rr, cornerHeight: rr)
-    }
-
-    // ── LEGIBLE ON A WHITE WALL ──────────────────────────────────────────────
-    //
-    // This floats on the picture with no material under it, and the picture is
-    // somebody's office: the first version of it vanished against a bright wall.
-    // A soft dark halo costs nothing, follows the shape exactly, and is the same
-    // trick the bloom uses two hundred lines up.
-    ctx.saveGState()
-    ctx.setShadow(offset: .zero, blur: 8,
-                  color: NSColor.black.withAlphaComponent(0.55).cgColor)
-    ctx.setFillColor(col.cgColor)
-    ctx.addPath(path)
-    ctx.fillPath()
-    ctx.restoreGState()
-
-    // The glow is the part peripheral vision actually catches, so it belongs to
-    // the bid and not to the breath. Painted as a second pass over the halo,
-    // because one context can only carry one shadow.
-    if t > 0.5 {
-      let g = (t - 0.5) / 0.5
-      ctx.saveGState()
-      ctx.setShadow(offset: .zero, blur: 16 * g,
-                    color: Palette.accent.withAlphaComponent(0.75 * g).cgColor)
-      ctx.setFillColor(col.cgColor)
-      ctx.addPath(path)
-      ctx.fillPath()
-      ctx.restoreGState()
-    }
-
-    // ── AND THE PART THAT MOVES ───────────────────────────────────────────────
-    //
-    // A bar that is merely brighter than a dot is a state; a bar with something
-    // travelling along it is an event, and events are what the eye is built to
-    // catch off-axis. It sweeps left to right, once every 900 ms, only while this
-    // is a bid.
-    if t > 0.6 {
-      let g = (t - 0.6) / 0.4
-      let left = xs[0] - r - stretch, right = xs[2] + r + stretch
-      let w = right - left
-      let head = left + w * CGFloat((phase / 0.9).truncatingRemainder(dividingBy: 1))
-      ctx.saveGState()
-      ctx.addPath(path)
-      ctx.clip()
-      let cols = [NSColor.clear.cgColor,
-                  Palette.fill(0.85 * g).cgColor,
-                  NSColor.clear.cgColor] as CFArray
-      if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                               colors: cols, locations: [0, 0.5, 1]) {
-        ctx.drawLinearGradient(grad, start: CGPoint(x: head - 16, y: cy),
-                               end: CGPoint(x: head + 16, y: cy), options: [])
-      }
-      ctx.restoreGState()
-    }
-  }
-
-  private func blend(_ a: NSColor, _ b: NSColor, _ t: CGFloat) -> NSColor {
-    let x = a.usingColorSpace(.sRGB) ?? a, y = b.usingColorSpace(.sRGB) ?? b
-    return NSColor(srgbRed: x.redComponent + (y.redComponent - x.redComponent) * t,
-                   green: x.greenComponent + (y.greenComponent - x.greenComponent) * t,
-                   blue: x.blueComponent + (y.blueComponent - x.blueComponent) * t,
-                   alpha: 1)
-  }
+  // ── NO `draw`, DELIBERATELY ─────────────────────────────────────────────────
+  //
+  // There were ninety lines here: three capsules whose height and length were
+  // functions of `level`, a dark halo so they survived a bright wall, an accent
+  // glow above 0.5, and a gradient head sweeping along the bar every 900 ms above
+  // 0.6. Every one of those was doing its job. All of them were the thing the
+  // person using this app asked not to see -- see the file header.
+  //
+  // The class is not a leftover. `level` is read three times on the live path:
+  // `TurnCues.tick` uses `vocal == 0` to know the far end has actually stopped
+  // before it expires a caption, `describe` puts both on the audit line, and
+  // `--cue-test` measures the easing. Nothing draws it, and the only correct way
+  // to say that is to have no drawing code at all rather than an early return
+  // somebody will later "fix".
 }
 
 // ── "mm-hmm" ─────────────────────────────────────────────────────────────────
@@ -375,6 +310,26 @@ enum CaptionClock {
       .map { max(1.0, $0) } ?? 1.0
 }
 
+// ── ONE BAND, ONE VOICE ──────────────────────────────────────────────────────
+//
+// This used to draw two lines: theirs, left-aligned, and YOURS, right-aligned,
+// smaller and dimmer, whenever your own microphone was not the audible one. That
+// half is gone, and it is worth writing down why, because it did not stop working
+// -- it stopped being reachable.
+//
+// The rule for subtitles is now the one they were always for: if somebody's voice
+// cannot be heard, the OTHER person reads it. Which means your own words never
+// belong on your own screen, and the only surviving call to `setMyWords` in the
+// whole shipping path passed `""` -- main.swift, once, to clear a caption that
+// nothing could ever have set. Layout, fitting, fade and height arithmetic for a
+// line that could not appear.
+//
+// That is `dead-controls-declared-never-wired`, which this app has now paid for
+// four times: a control that compiles, draws, validates and is invoked, and does
+// nothing, reads as finished to everybody including the person who wrote it. The
+// choice was to remove it or to name a case that still reached it. There is no
+// such case, so it is removed, and `tools/subtitle-check.sh`'s "only once"
+// assertion is now true by construction rather than by observation.
 final class CaptionBand: NSView {
   // Clear, over the HIG's dim. The band floats in the MIDDLE of the window, where
   // neither scrim reaches, so it is on its own for contrast -- and it is two lines
@@ -382,7 +337,6 @@ final class CaptionBand: NSView {
   private let glass = Glass("caption", radius: 0)
   private let holder = NSView()
   private let theirs = NSTextField(labelWithString: "")
-  private let mine = NSTextField(labelWithString: "")
 
   static let pad: CGFloat = 12
   /// Caption width. Broadcast practice is a little under two thirds of the
@@ -396,42 +350,30 @@ final class CaptionBand: NSView {
   override init(frame: NSRect) {
     super.init(frame: frame)
     addSubview(glass)
-    for (f, font, col) in [(theirs, Type_.said, Palette.fg),
-                           (mine, Type_.saidMine, Palette.muted)] {
-      f.font = font
-      f.textColor = col
-      f.backgroundColor = .clear
-      f.isBordered = false
-      f.alignment = .left
-      // ── A LABEL DOES NOT WRAP BECAUSE YOU ASKED IT TO, AND ORDER MATTERS ───
-      //
-      // `NSTextField(labelWithString:)` builds a SINGLE-LINE cell, and
-      // `maximumNumberOfLines = 2` on a single-line cell is ignored in silence.
-      // Photographed: a 118-character caption drew ONE line, clipped mid-word at
-      // the right edge, inside a band correctly sized for two -- which reads as a
-      // bug in the fitting code and is not one.
-      //
-      // The order below is the fix and not a style. `usesSingleLineMode` owns
-      // `lineBreakMode`: assigning it stamps the cell's break mode, so setting
-      // the break mode FIRST and the flag second -- which is how this was written
-      // the first time -- puts `.byClipping` back and clips exactly the way it
-      // did before the fix. Flag, then wrapping, then the mode, then the count.
-      f.usesSingleLineMode = false
-      f.cell?.wraps = true
-      f.cell?.isScrollable = false
-      f.lineBreakMode = .byWordWrapping
-      f.maximumNumberOfLines = 2
-      holder.addSubview(f)
-    }
-    mine.maximumNumberOfLines = 1
-    // ── WHOSE WORDS ARE WHOSE, WITHOUT A LABEL ─────────────────────────────────
+    theirs.font = Type_.said
+    theirs.textColor = Palette.fg
+    theirs.backgroundColor = .clear
+    theirs.isBordered = false
+    theirs.alignment = .left
+    // ── A LABEL DOES NOT WRAP BECAUSE YOU ASKED IT TO, AND ORDER MATTERS ─────
     //
-    // Theirs left, yours right. Every messaging app on the planet has taught this
-    // and it needs no legend, no name and no colour key -- which matters because
-    // the alternative was a third line of grey text under two lines of white text
-    // that read as a continuation of the same sentence. Smaller and dimmer already
-    // said "secondary"; the side is what says "you".
-    mine.alignment = .right
+    // `NSTextField(labelWithString:)` builds a SINGLE-LINE cell, and
+    // `maximumNumberOfLines = 2` on a single-line cell is ignored in silence.
+    // Photographed: a 118-character caption drew ONE line, clipped mid-word at
+    // the right edge, inside a band correctly sized for two -- which reads as a
+    // bug in the fitting code and is not one.
+    //
+    // The order below is the fix and not a style. `usesSingleLineMode` owns
+    // `lineBreakMode`: assigning it stamps the cell's break mode, so setting
+    // the break mode FIRST and the flag second -- which is how this was written
+    // the first time -- puts `.byClipping` back and clips exactly the way it
+    // did before the fix. Flag, then wrapping, then the mode, then the count.
+    theirs.usesSingleLineMode = false
+    theirs.cell?.wraps = true
+    theirs.cell?.isScrollable = false
+    theirs.lineBreakMode = .byWordWrapping
+    theirs.maximumNumberOfLines = 2
+    holder.addSubview(theirs)
     // Handed over, not stacked. `NSGlassEffectView` guarantees nothing about the
     // z-order of arbitrary subviews and resamples the ones it catches -- which is
     // how every glyph in this app came out soft the first time it was tried.
@@ -441,7 +383,6 @@ final class CaptionBand: NSView {
   required init?(coder: NSCoder) { fatalError() }
 
   var theirText = "" { didSet { if theirText != oldValue { dirty = true } } }
-  var myText = "" { didSet { if myText != oldValue { dirty = true } } }
   private var dirty = true
 
   /// How many lines the other person's words currently need, with a floor that
@@ -461,14 +402,8 @@ final class CaptionBand: NSView {
   /// than always reserving two lines: a band with an empty half is a box waiting
   /// to be filled, and the 30 Hz ease above turns the growth into a slide.
   var wantedHeight: CGFloat {
-    guard !theirText.isEmpty || !myText.isEmpty else { return 0 }
-    let lh = CaptionBand.lineHeight(Type_.said)
-    var h = CaptionBand.pad * 2 + lh * theirLines
-    if !myText.isEmpty {
-      h += CaptionBand.lineHeight(Type_.saidMine)
-      if !theirText.isEmpty { h += Metric.s1 }
-    }
-    return ceil(h)
+    guard !theirText.isEmpty else { return 0 }
+    return ceil(CaptionBand.pad * 2 + CaptionBand.lineHeight(Type_.said) * theirLines)
   }
 
   // ── ASK THE TEXT SYSTEM, NOT THE FONT ──────────────────────────────────────
@@ -488,7 +423,6 @@ final class CaptionBand: NSView {
   /// What is actually being drawn, after head-truncation. `theirText` is what was
   /// received; this is what fits.
   var theirDrawn: String { theirs.stringValue }
-  var myDrawn: String { mine.stringValue }
   /// The height the CELL needs against the height the FIELD was given. A cell
   /// taller than its field is a clipped last line, which is the exact regression
   /// that shipped a caption cut off mid-sentence.
@@ -518,15 +452,11 @@ final class CaptionBand: NSView {
     glass.radius = Metric.captionRadius
     holder.frame = bounds
     let innerW = w - CaptionBand.pad * 2
-    let mh = myText.isEmpty ? 0
-      : CaptionBand.lineHeight(Type_.saidMine) + (theirText.isEmpty ? 0 : Metric.s1)
-    // Their two-line well sits above your one line, and the text inside it is
-    // bottom-anchored: one line of theirs sits on the floor of the well, and the
-    // second line appears ABOVE it. That is what makes a caption roll instead of
-    // jump.
-    let wellBottom = CaptionBand.pad + mh
+    // The text inside the two-line well is bottom-anchored: one line sits on the
+    // floor of the well, and the second appears ABOVE it. That is what makes a
+    // caption roll instead of jump.
     let need = heightOf(theirs, width: innerW)
-    theirs.frame = NSRect(x: CaptionBand.pad, y: wellBottom, width: innerW, height: need)
+    theirs.frame = NSRect(x: CaptionBand.pad, y: CaptionBand.pad, width: innerW, height: need)
     theirs.isHidden = theirText.isEmpty
     if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
       let cs = theirs.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: innerW, height: 1e5))
@@ -536,9 +466,6 @@ final class CaptionBand: NSView {
           + " cellSize=\(cs.map { "\(Int($0.width))x\(Int($0.height))" } ?? "-")"
           + " len=\(theirs.stringValue.count)\n", stderr)
     }
-    mine.frame = NSRect(x: CaptionBand.pad, y: CaptionBand.pad, width: innerW,
-                        height: CaptionBand.lineHeight(Type_.saidMine))
-    mine.isHidden = myText.isEmpty
     _ = h
   }
 
@@ -551,7 +478,6 @@ final class CaptionBand: NSView {
     let innerW = bounds.width - CaptionBand.pad * 2
     guard innerW > 40 else { return }
     theirs.stringValue = CaptionBand.fitTail(theirText, font: Type_.said, width: innerW, lines: 2)
-    mine.stringValue = CaptionBand.fitTail(myText, font: Type_.saidMine, width: innerW, lines: 1)
     needsLayout = true
   }
 
@@ -589,32 +515,21 @@ final class CaptionBand: NSView {
   }
 }
 
-// ── ALL THREE, PLACED ────────────────────────────────────────────────────────
+// ── THE WORDS, PLACED ────────────────────────────────────────────────────────
 //
-// One view over the whole window, holding the cue, the bloom and the band, with a
-// single 30 Hz tick that stops itself the moment there is nothing moving. It
-// passes every click through: none of this is a control, and the quickest way to
-// break a call is to put a transparent rectangle over the hang-up button.
+// One view over the whole window holding the bloom and the band, with a single
+// 30 Hz tick that stops itself the moment there is nothing moving. It passes
+// every click through: none of this is a control, and the quickest way to break a
+// call is to put a transparent rectangle over the hang-up button.
+//
+// It also owns `cue`, which draws nothing. The eased level is what tells the band
+// whether the far end has ACTUALLY stopped talking -- see the expiry rule in
+// `tick` -- and it is on the audit line so a rig can read it. It used to be a
+// third view; see the file header for the photograph of what that looked like.
 final class TurnCues: NSView {
   private let cue = FloorCue(frame: .zero)
   private let bloom = BloomLabel(frame: .zero)
   private let band = CaptionBand(frame: .zero)
-  /// ── THE ROOM LIGHTS UP ─────────────────────────────────────────────────────
-  ///
-  /// A stroke just inside the window's own rounded edge, accent coloured, that
-  /// comes up only for a BID and not for a listening noise. It exists because the
-  /// pill above the caption is a LOCAL marker -- you have to be looking near it --
-  /// and the moment somebody starts to speak is exactly the moment your eyes are
-  /// on their face, or on your own notes, or anywhere else.
-  ///
-  /// The edge of the visual field is the one place that is always in view. It is
-  /// also the only channel here that costs nothing to monitor: peripheral vision
-  /// is poor at detail and excellent at change, so a rim that brightens is
-  /// noticed without being looked at, which is the entire requirement.
-  ///
-  /// A layer rather than a `draw(_:)`, because the alternative is invalidating a
-  /// 1280x720 view thirty times a second to repaint two hundred pixels of stroke.
-  private let rim = CAShapeLayer()
   private var timer: Timer?
   private var lastTick = CACurrentMediaTime()
 
@@ -622,8 +537,8 @@ final class TurnCues: NSView {
   /// because the owner is the thing that knows how tall the button row is.
   var bottomInset: CGFloat = 110 { didSet { needsLayout = true } }
 
-  /// Eased band height, so the band growing a line for your own words slides
-  /// instead of snapping.
+  /// Eased band height, so a caption growing from one line to two slides instead
+  /// of snapping. It does NOT ease up from nothing -- see `tick`.
   private var bandH: CGFloat = 0
   private var bandA: CGFloat = 0
   /// When the other person's words last changed. The band holds for a moment
@@ -631,24 +546,13 @@ final class TurnCues: NSView {
   /// ten seconds ago is litter on somebody's face.
   private var theirsAt: CFTimeInterval = -1
   private var theirsFinal = false
-  private var mineAt: CFTimeInterval = -1
 
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
   override init(frame: NSRect) {
     super.init(frame: frame)
     wantsLayer = true
-    rim.fillColor = nil
-    rim.lineWidth = 3
-    rim.strokeColor = Palette.accent.cgColor
-    rim.shadowColor = Palette.accent.cgColor
-    rim.shadowOffset = .zero
-    rim.shadowRadius = 18
-    rim.shadowOpacity = 0
-    rim.opacity = 0
-    layer?.addSublayer(rim)
     addSubview(band)
-    addSubview(cue)
     addSubview(bloom)
     autoresizingMask = [.width, .height]
   }
@@ -675,21 +579,10 @@ final class TurnCues: NSView {
     wake()
   }
 
-  /// Your own words, shown only while your microphone is not the audible one --
-  /// which is exactly when you need to know you are still getting through. When
-  /// you have the floor you can hear yourself, so this stays empty.
-  func setMine(_ text: String, showing: Bool) {
-    let t = showing ? text.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    if t != band.myText { mineAt = CACurrentMediaTime() }
-    band.myText = t
-    wake()
-  }
-
-  /// A listening noise, as a word. Nothing happens if it did not come with one --
-  /// the cue has already carried the fact of it. Anything too long to BE a
-  /// listening noise falls through to the caption band rather than being dropped:
-  /// whatever the classifier believed, those are words somebody said and the
-  /// quiet side is not allowed to lose them.
+  /// A listening noise, as a word. Anything too long to BE a listening noise
+  /// falls through to the caption band rather than being dropped: whatever the
+  /// classifier believed, those are words somebody said and the quiet side is not
+  /// allowed to lose them.
   func setListeningNoise(_ word: String) {
     if bloom.show(word) { wake(); return }
     setTheirs(word, final: false)
@@ -709,13 +602,21 @@ final class TurnCues: NSView {
   var testBloom: BloomLabel { bloom }
   var testTicking: Bool { timer != nil }
   func testTick(_ dt: CGFloat) { lastTick -= Double(dt); tick() }
+  /// How opaque the caption actually is, and how much of the height it needs it
+  /// actually has. `--press band-rise` counts frames against these: "the app
+  /// decided to show a caption" and "a person can read it" are two claims, and
+  /// only the second one was ever the complaint.
+  var testBandAlpha: CGFloat { bandA }
+  var testBandHeightFraction: CGFloat {
+    let want = band.wantedHeight
+    return want > 0 ? bandH / want : 1
+  }
 
   var describe: String {
     "cue=\(["quiet", "listening", "claiming"][max(0, min(2, cue.vocal))])"
       + "/\(String(format: "%.2f", cue.level))"
       + " bloom=\(bloom.alive ? bloom.word : "-")"
       + " theirs=\(band.theirText.isEmpty ? "-" : "\"\(band.theirText)\"")"
-      + " mine=\(band.myText.isEmpty ? "-" : "\"\(band.myText)\"")"
       + " band=\(String(format: "%.0f", bandA * 100))%"
   }
 
@@ -724,7 +625,7 @@ final class TurnCues: NSView {
   private func wake() {
     guard timer == nil else { return }
     lastTick = CACurrentMediaTime()
-    // 30 Hz. It draws three dots and moves two text fields; the audio thread will
+    // 30 Hz. It moves one text field and eases two numbers; the audio thread will
     // never notice it, and it stops as soon as everything has settled.
     let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in self?.tick() }
     // `.common`, or it freezes solid the whole time a menu is open or a window is
@@ -732,6 +633,18 @@ final class TurnCues: NSView {
     // mid-sentence.
     RunLoop.main.add(t, forMode: .common)
     timer = t
+    // ── AND ONE FRAME NOW, NOT IN 33 ms ───────────────────────────────────────
+    //
+    // `Timer` does not fire when you create it. So every caption that arrived
+    // while the layer was asleep -- which is EVERY first caption of a turn, since
+    // the layer stops itself between turns -- waited a whole frame before the
+    // words were laid out and placed, on a channel whose brief is "real time with
+    // zero latency". A third of the receive-side budget, spent doing nothing.
+    //
+    // Last, because `tick` can invalidate the timer it has just been handed
+    // (`setTheirs("")` wakes a layer with nothing in it), and this way that is
+    // simply the correct outcome rather than a nil `timer` being overwritten.
+    tick()
   }
 
   private func tick() {
@@ -741,21 +654,6 @@ final class TurnCues: NSView {
 
     cue.step(dt)
     let rise = bloom.step()
-
-    // The rim answers to the top half of the cue's range only: a "mm-hmm" must
-    // not light the room. `nudge` raises the ceiling, so somebody who has been
-    // waiting their turn gets a brighter one -- which is the ledger being felt
-    // instead of displayed.
-    let g = max(0, (cue.level - 0.5) / 0.5)
-    // One slow breath, ±12%. Enough that the edge is alive rather than painted
-    // on; far short of a flash, which would read as an alarm and make people
-    // stop mid-word instead of finishing their sentence.
-    let breath = 1 + 0.12 * sin(CGFloat(now) * 2 * .pi * 0.55)
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)   // or every frame animates over 0.25 s
-    rim.opacity = Float(min(1, g * breath) * (0.55 + 0.45 * CGFloat(max(0, min(1, cue.nudge)))))
-    rim.shadowOpacity = Float(g * 0.7)
-    CATransaction.commit()
 
     // ── THE BAND'S LIFE IS THE SPEAKER'S, NOT THE TRANSCRIPT'S ───────────────
     //
@@ -774,13 +672,51 @@ final class TurnCues: NSView {
       if (quiet && since > (theirsFinal ? 1.6 : 2.2) * CaptionClock.scale)
           || since > 12 * CaptionClock.scale { band.theirText = "" }
     }
-    if !band.myText.isEmpty, now - mineAt > 3.0 * CaptionClock.scale { band.myText = "" }
-
+    // ── HOW WIDE, BEFORE ASKING HOW TALL ─────────────────────────────────────
+    //
+    // `wantedHeight` asks how many lines the words need, and that answer depends
+    // entirely on how wide the band is -- and the width was set in `place`, which
+    // runs at the BOTTOM of this function. So the first frame of every caption
+    // measured a two-line sentence against the previous frame's width, which for
+    // a caption arriving from nothing is zero, and reserved one line for text
+    // that needed two. Caught by `--press band-rise`, which reported the band at
+    // 79% of the height it needed on frame one -- a clipped second line for one
+    // frame, which is exactly the regression this file has shipped before at a
+    // slower speed.
+    band.setFrameSize(NSSize(width: bandWidth(), height: band.frame.height))
     band.refit()
     let wantH = band.wantedHeight
     let wantA: CGFloat = wantH > 0 ? 1 : 0
-    bandH += (wantH - bandH) * min(1, dt / 0.12)
-    bandA += (wantA - bandA) * min(1, dt / 0.18)
+
+    // ── APPEARING IS NOT THE SAME MOVE AS CHANGING ───────────────────────────
+    //
+    // Both of these used to be one symmetric ease: alpha toward its target with a
+    // 180 ms time constant, height with 120 ms, up and down alike. Measured on
+    // the real band by `--press band-rise`, driving it at a fixed 30 Hz:
+    //
+    //   before   readable (90%) after 12 frames = 400 ms, full after 27 = 900 ms
+    //            and the band was 30% of the height it needed on frame one
+    //   after    readable and full on frame ONE, 33 ms, at full height
+    //
+    // Four hundred milliseconds of a caption fading up is not a style choice on a
+    // channel whose written requirement is "optimised for easy readability and
+    // real time with zero latency" -- it is a third of the whole receive-side
+    // budget, spent making words hard to read. And for the first frames of it the
+    // text was laid out inside a well shorter than it needed.
+    //
+    // The asymmetry is the fix, and it is the same one the floor level has used
+    // all along: the cost of a caption arriving late is that somebody cannot read
+    // it, and the cost of one leaving slowly is nothing at all. Appearing from
+    // nothing is not eased at all -- broadcast captions have cut straight in for
+    // forty years -- and everything after that still slides, so a sentence that
+    // grows a second line does not jump.
+    let appearing = bandA < 0.005 && wantA > 0
+    if appearing {
+      bandA = 1; bandH = wantH
+    } else {
+      bandH += (wantH - bandH) * min(1, dt / 0.12)
+      bandA += (wantA - bandA) * min(1, dt / (wantA > bandA ? 0.04 : 0.30))
+    }
     if abs(wantH - bandH) < 0.5 { bandH = wantH }
     if abs(wantA - bandA) < 0.004 { bandA = wantA }
 
@@ -790,7 +726,7 @@ final class TurnCues: NSView {
     // nothing is the kind of thing that shows up later as "the app warms my legs".
     if cue.idle, !bloom.alive, bandA < 0.005, bandH < 0.5 {
       timer?.invalidate(); timer = nil
-      cue.isHidden = true; band.isHidden = true
+      band.isHidden = true
     }
   }
 
@@ -799,31 +735,20 @@ final class TurnCues: NSView {
     place(bloomRise: 0)
   }
 
+  /// One place that knows how wide a caption is, because `tick` has to ask
+  /// before it can know how tall, and `place` has to ask again to put it there.
+  private func bandWidth() -> CGFloat {
+    let w = bounds.width
+    return min(w - Metric.gutter * 2, CaptionBand.maxWidth,
+               max(360, w * CaptionBand.widthFraction))
+  }
+
   private func place(bloomRise: CGFloat) {
     let w = bounds.width, h = bounds.height
-    // Inset by half the stroke so the line lands INSIDE the window instead of
-    // straddling an edge the compositor is about to round away, and concentric
-    // with the window's own corner so it reads as the window glowing rather than
-    // as a rectangle drawn on top of one.
-    let ins = rim.lineWidth / 2
-    let r = max(0, Metric.windowRadius - ins)
-    rim.frame = bounds
-    rim.path = CGPath(roundedRect: bounds.insetBy(dx: ins, dy: ins),
-                      cornerWidth: r, cornerHeight: r, transform: nil)
-    let bw = min(w - Metric.gutter * 2, CaptionBand.maxWidth,
-                 max(360, w * CaptionBand.widthFraction))
+    let bw = bandWidth()
     band.isHidden = bandA < 0.005
     band.alphaValue = bandA
     band.frame = NSRect(x: (w - bw) / 2, y: bottomInset, width: bw, height: max(0, bandH))
-    // The cue sits just above the band, on the band's left edge rather than in the
-    // middle of the window: it belongs to the words underneath it, and an eye that
-    // has to travel from the centre of the screen to the start of a line has
-    // already lost the thing it was reading.
-    let cueW: CGFloat = 76, cueH: CGFloat = 24
-    let bandTop = bottomInset + max(0, bandH)
-    cue.isHidden = cue.level < 0.01
-    cue.frame = NSRect(x: (w - bw) / 2 + CaptionBand.pad - 2, y: bandTop + Metric.s2,
-                       width: cueW, height: cueH)
     // ── ABOVE THE CAPTION, NOT ON THE FACE ────────────────────────────────────
     //
     // The first version put this in the middle of the picture, which is where
