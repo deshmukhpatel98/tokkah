@@ -19,7 +19,18 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 PAT='(-----BEGIN [A-Z ]*PRIVATE KEY-----|CLOUDFLARE_API_TOKEN[[:space:]]*[=:][[:space:]]*[A-Za-z0-9_-]{20,}|MAC_DASH_KEY[[:space:]]*[=:][[:space:]]*[A-Za-z0-9_/+=-]{12,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{32,}|eyJhbGciOi[A-Za-z0-9_-]{20,}|"?private_?key"?[[:space:]]*[=:][[:space:]]*"[A-Za-z0-9+/=]{40,}"|[Aa][Ww][Ss].{0,20}[Ss][Ee][Cc][Rr][Ee][Tt].{0,20}[=:][[:space:]]*[A-Za-z0-9/+=]{40})'
 
+# THIS FILE CONTAINS THREE FAKE SECRETS ON PURPOSE -- the calibration fixtures
+# below. So it matches its own pattern, and would report itself forever. It is
+# excluded from the real scan BY PATH, narrowly, and the count of matches inside
+# it is printed rather than hidden: if that number is not exactly 3, something
+# changed in here and you should look. Excluding a file from a secret scan is
+# the kind of thing that goes wrong silently, so it is done out loud.
+SELF="tools/secret-scan.sh"
+
 scan_history() { git -C "$1" log -p --all --no-color 2>/dev/null | grep -cE "^\+.*$PAT"; }
+scan_history_excl_self() {
+  git -C "$1" log -p --all --no-color -- . ":(exclude)$SELF" 2>/dev/null | grep -cE "^\+.*$PAT"
+}
 
 # ---- calibration -----------------------------------------------------------
 ( cd "$TMP" && git init -q . \
@@ -39,11 +50,16 @@ echo "calibration: 3 planted secrets, 3 found, and 0 left in the working tree.  
 
 # ---- the real scan ---------------------------------------------------------
 COMMITS=$(git rev-list --all --count)
-WT=$(git grep -InE "$PAT" -- . 2>/dev/null | wc -l | tr -d ' ')
-HI=$(scan_history .)
+WT=$(git grep -InE "$PAT" -- . ":(exclude)$SELF" 2>/dev/null | wc -l | tr -d ' ')
+HI=$(scan_history_excl_self .)
+OWN=$(git grep -InE "$PAT" -- "$SELF" 2>/dev/null | wc -l | tr -d ' ')
 echo "scanned: $COMMITS commits across every branch"
 echo "  working tree matches: $WT"
 echo "  history matches:      $HI"
+echo "  (inside $SELF: $OWN -- its own fixtures, expected 3)"
+if [ "$OWN" -ne 3 ]; then
+  echo "  ^^ that is not 3. The fixtures in this file changed; read them."
+fi
 
 if [ "$WT" -eq 0 ] && [ "$HI" -eq 0 ]; then
   echo
@@ -61,5 +77,5 @@ if [ "$WT" -eq 0 ] && [ "$HI" -eq 0 ]; then
   exit 0
 fi
 echo; echo "*** MATCHES FOUND -- look at every one before pushing ***"
-git grep -InE "$PAT" -- . 2>/dev/null | head -40
+git grep -InE "$PAT" -- . ":(exclude)$SELF" 2>/dev/null | head -40
 exit 1
