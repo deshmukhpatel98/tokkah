@@ -2669,7 +2669,26 @@ if let room = arg("room") {
     /// Consecutive rendezvous polls that did not list the peer at all.
     var gone = 0
     /// Ticks since the transport locked, for the deadline below.
-    var sinceLocked = 0
+    /// When the transport locked, as a CLOCK and not a tick count.
+    ///
+    /// This was `var sinceLocked = 0`, incremented once per pass, and the
+    /// deadline below read `sinceLocked > 20` with a comment reading "TWENTY
+    /// TICKS, TEN SECONDS". Ten seconds only for as long as nobody touched the
+    /// loop's sleep -- and the sleep is the obvious thing to touch, because this
+    /// is the loop a person watches as "connecting".
+    ///
+    /// Proven, not hypothesised: an experiment here that took the tick from
+    /// 500 ms to 25 ms turned that ten-second fallback into half a second, and
+    /// the rig read the result as a 482 ms improvement in connect time. It was
+    /// not one. The app was announcing "connected" on a TIMEOUT half a second
+    /// after locking, without ever having heard the other end's status byte --
+    /// declaring a call answered on a threshold rather than on evidence, which
+    /// is the exact hazard the comment at the deadline itself warns about.
+    ///
+    /// The unit is seconds now, so the deadline means what it says whatever the
+    /// cadence becomes. Same class as the join loop thirty lines up, which was
+    /// converted from `for attempt in 1...60` for the same reason.
+    var lockedAt = Date.distantFuture
     // ── HOLDING A CALL WHOSE OTHER END IS RESTARTING ──────────────────────────
     //
     // `gapBegan` is host time at the moment media stopped arriving, and it is the
@@ -2707,9 +2726,9 @@ if let room = arg("room") {
         display?.controls?.setHolding(false)
         display?.controls?.setStatus("connected")
       }
-      if !wire.locked { sinceLocked = 0 }
+      if !wire.locked { lockedAt = Date.distantFuture }
       if wire.locked {
-        sinceLocked += 1
+        if lockedAt == Date.distantFuture { lockedAt = Date() }
         // ── LOCKED IS NOT ANSWERED ANY MORE ─────────────────────────────────
         //
         // A Mac that is only being ASKED joins the room and punches a hole, so
@@ -2730,7 +2749,7 @@ if let room = arg("room") {
         // seconds would have declared a ringing phone answered, which is an
         // absolute threshold deciding a safety property: exactly the shape this
         // project keeps finding (see RTT-blind timeouts).
-        let heard = wire.peerStatusSeen || sinceLocked > 20
+        let heard = wire.peerStatusSeen || Date().timeIntervalSince(lockedAt) > 10
         if heard, wire.peerRinging {
           if announcedFor != "ringing" {
             announcedFor = "ringing"
