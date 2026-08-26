@@ -5,7 +5,7 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
-## Unreleased
+## Kin 0.70.0 — 2026-08-26
 
 ### Fixed — a Mac that stopped answering calls, and never said so
 
@@ -57,12 +57,64 @@ Kin shows it on the outgoing card, carried across the re-exec as a flag: a statu
 line written immediately before `execv` is drawn by a process that is about to
 stop existing, which is a message nobody can read.
 
-New: [mac/tools/doorbell-check.sh](mac/tools/doorbell-check.sh), 8 assertions, in
-CI. It asserts the calibration itself — that `launchctl print` really does exit 0
-for a dead job, because if it did not, the original code would have been correct
-— and it has a live-agent control, so it cannot pass by always answering "not
-reachable". Restoring the bug makes it fail 2 of 8. Where there is no launchd
-session it prints a SKIP that says plainly that nothing was checked.
+New: [mac/tools/doorbell-check.sh](mac/tools/doorbell-check.sh), 10 assertions,
+in CI. It asserts the calibration itself — that `launchctl print` really does
+exit 0 for a dead job, because if it did not, the original code would have been
+correct — and it has a live-agent control, so it cannot pass by always answering
+"not reachable". Where there is no launchd session it prints a SKIP that says
+plainly that nothing was checked.
+
+### Fixed — three defects in the rig that was supposed to prove the above
+
+Found by running it against the tree it was written to protect, which is the
+only way any of this surfaced.
+
+It **tested whatever was lying in `.build`**: the gate was `[ -x "$TK" ]`, and
+existence is not currency. The debug binary was nine hours older than the fix,
+so the rig reported FAILED (5 of 8) about a program nobody is shipping — and it
+could as easily have reported PASSED. It builds the binary itself now, then
+checks the timestamp anyway (`swift build` can succeed without relinking) and
+refuses to print a verdict if any source is newer, naming the files. Calibrated
+by backdating the binary: exit 2, sources named.
+
+It **built its dead job with the fixed policy**. `write_plist` hardcoded
+`KeepAlive true`, so the scenarios needing a registered-but-dead job were asking
+launchd to restart the thing they wanted dead; they had only ever passed by
+landing inside a 30 s `ThrottleInterval`. The policy is a parameter now.
+
+And it **asserted the wrong repair**: for an old-shape plist `fix=install` is
+right and `fix=restart` is not, because restarting puts the same policy back in
+charge and the Mac is deaf again by morning. Now split into 2a (old policy →
+rewrite the plist) and 2b (new policy, parked in `spawn scheduled` behind a 300 s
+throttle → just start it). 2b is the state every Mac is in after this release,
+and nothing covered it before.
+
+### Fixed — the download page named no macOS version, and no licence
+
+The OS floor is written down in four places. `Package.swift` builds
+`.macOS(.v14)`, the binary's `LC_BUILD_VERSION` says `minos 14.0`, and both
+plists say `14.0`; `release.sh` already proved those three agree **with the
+binary** rather than merely with each other. The fourth copy is the web page and
+nothing checked it. `/kin` advertised "macOS 13+" for weeks after the build moved
+to 14, and `/macos` — the page the install instructions actually link, seven
+references to `/kin`'s one — named no floor at all. That is the same failure with
+nothing to read: a Mac on 13 downloads the .dmg, launches it, and dyld refuses
+the binary. That page also carried no licence anywhere, on an AGPL project, at
+the exact spot where the download happens.
+
+`release.sh` now checks every page that tells a human the number, against the
+binary, and a page that stops mentioning the floor fails too — silence is the
+failure that just happened. Calibrated on four inputs: correct pages pass, a page
+regressed to 13 fails, a page gone silent fails, an unreadable binary refuses to
+report.
+
+### Fixed — the embed loaded the download page instead of the call
+
+`embed.js` pointed its iframe at the bare room URL, which now answers with "Join
+on Kin" — a 14 KB page whose job is to send a visitor to the app. So every site
+embedding a call got a download prompt in the frame. It appends `web=1`, the
+escape hatch the worker already documents, and the frame loads the 55 KB call
+again. Verified against production, not against the deploy log.
 
 Also fixed while here: the source-reading gate in `contacts.test.mjs` counted
 `queued:` inside comments, so documenting this outage above the code failed the
