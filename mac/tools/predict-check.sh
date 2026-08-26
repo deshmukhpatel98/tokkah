@@ -153,9 +153,24 @@ PIDS=""
 grep -vE "^install:|^tk [0-9]|^pid |^packet=|^telemetry:|^mic:|^bind:" "$SP/run.log"
 
 echo
+# ── A PASS THAT NAMES WHAT IT DID NOT DECIDE ────────────────────────────────
+#
+# The scorer prints TOO FEW TO DECIDE for a speaker that did not supply enough
+# turn ends to resolve anything, and then, correctly, does not let that speaker
+# vote. But the LAST line of this script is what a person and a suite tabulator
+# read, and an unqualified "PASSED" over a section whose own text says "it would
+# otherwise have failed" is `green-metrics-can-hide-defects` in one line.
+#
+# So the verdict carries it. The exit code is unchanged -- an undecided speaker
+# is genuinely not a failure -- but nobody can read the last line and believe
+# more was settled than was.
+UNDECIDED="$(grep -c 'TOO FEW TO DECIDE' "$SP/run.log")"
 case $rc in
   0) echo "PREDICT CHECK PASSED -- a turn end is called before the silence that would"
-     echo "  have proved it, and a hesitation is not";;
+     echo "  have proved it, and a hesitation is not"
+     [ "$UNDECIDED" -gt 0 ] && echo "  ... on the speakers that had enough turn ends. $UNDECIDED did NOT" \
+                            && echo "  and voted on nothing -- see TOO FEW TO DECIDE above."
+     :;;
   2) echo "PREDICT CHECK COULD NOT RUN -- see above. This is not a pass and not a"
      echo "  failure: the rig could not reach the thing it tests."
      echo "  logs in $SP (KEEP=1 to keep them)";;
