@@ -268,6 +268,9 @@ if flag("watch") {
 if flag("watch-install") { fputs(Watch.install() + "\n", stderr); exit(0) }
 if flag("watch-remove") { fputs(Watch.uninstall() + "\n", stderr); exit(0) }
 if flag("watch-status") { fputs(Watch.status() + "\n", stderr); exit(0) }
+
+
+
 if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-h") {
   print("""
   tk \(VERSION) -- a video call that tries to be as fast as light allows.
@@ -370,7 +373,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc",
+  "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
@@ -454,6 +457,62 @@ for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
       + "a misspelled flag would otherwise be ignored in silence, and an arm running"
       + " without the thing it is named after is worse than no arm at all.\n", stderr)
   exit(2)
+}
+
+if let io = arg("io") {
+  guard io == "vp" || io == "hal" else {
+    fputs("--io takes vp or hal, not \(io)\n", stderr); exit(2)
+  }
+  Audio.ioKind = io
+  Audio.ioPinned = true
+}
+
+// ── THE ROUTE DECIDES, BECAUSE THE ROUTE IS WHAT MAKES THE ECHO ─────────────
+//
+// `hal` was the default for every call this app has ever made, and the comment
+// above `ioKind` says exactly what that costs: the duplex gate "only ever acts
+// while the near end is NOT speaking", so "echo during double talk is not
+// solved by this and is the honest gap."
+//
+// The field closed that gap the hard way. Over 23 reported calls, `aec_on` was
+// 0 on every single one and `output_route` was `speakers` on every single one:
+// nobody was ever wearing headphones, so the acoustic path from speaker to mic
+// was open on both ends of every call ever made, with no canceller behind it.
+// What that sounds like to the person on the call is "ear deafening" echo.
+//
+// So it is not a taste question and it is not one default for everybody. On
+// HEADPHONES there is no path from the speaker to the microphone, the gap does
+// not exist, and pure HAL is right -- nothing between the mic and the wire.
+// On SPEAKERS the path exists and cannot be wished away, so use the canceller
+// Apple ships and FaceTime uses. The cost is latency and a little of the "on a
+// call" colour; the alternative is a call nobody can hold.
+//
+// Read here, before the units are built, because the buffer size is a device
+// property and the unit type cannot change underneath a running engine.
+// `--io hal` still pins the old behaviour, and `--io vp` pins the new one.
+if !Audio.ioPinned {
+  let (name, speakers) = Audio.outputDevice()
+  Audio.ioKind = speakers ? "vp" : "hal"
+  let why = speakers ? "speakers, so the echo canceller is on"
+                     : "headphones, so nothing is between the mic and the wire"
+  fputs("audio: out is \(name) -- \(why)\n", stderr)
+}
+Metrics.fact("io_reason", Audio.ioPinned ? "pinned" : "route")
+
+// ── WHAT THE AUDIO WOULD DO, WITHOUT DOING IT ──────────────────────────────
+//
+// Every other way to find out which IO path a call will take was to START a
+// call: with no --room this app joins a loopback peer and opens the microphone,
+// which is not a thing to do on somebody's Mac to answer a question. Reads the
+// route, prints the decision and the reason, exits. No mic, no peer, no sound.
+if flag("audio-route") {
+  let (name, speakers) = Audio.outputDevice()
+  let kind = Audio.ioPinned ? Audio.ioKind : (speakers ? "vp" : "hal")
+  fputs("output: \(name)\n", stderr)
+  fputs("route:  \(speakers ? "speakers -- sound leaves into the room" : "headphones -- no path back to the mic")\n", stderr)
+  fputs("io:     \(kind)\(Audio.ioPinned ? " (pinned by --io)" : " (chosen from the route)")\n", stderr)
+  fputs("echo:   \(kind == "vp" ? "cancelled by VoiceProcessingIO" : "no canceller -- the duplex gate only")\n", stderr)
+  exit(0)
 }
 
 // ── WHICH SERVER THIS COPY TALKS TO ────────────────────────────────────────
@@ -3126,12 +3185,6 @@ let fecAllowed = !flag("no-fec")
 // Must be set before the units are built: the buffer size is a device property.
 // `--io hal` is the control arm: the old two-unit raw-hardware path, no echo
 // cancellation, exactly as every call before this shipped.
-if let io = arg("io") {
-  guard io == "vp" || io == "hal" else {
-    fputs("--io takes vp or hal, not \(io)\n", stderr); exit(2)
-  }
-  Audio.ioKind = io
-}
 if flag("no-agc") { Audio.agcOn = false }
 if flag("no-auto-gain") { Audio.autoGain = false }
 if flag("gain-debug") { Audio.gainDebug = true }

@@ -2896,6 +2896,10 @@ final class Audio {
   // test asserts that a talking near end comes out bit-for-bit as captured.
   // Echo during double talk is not solved by this and is the honest gap.
   static var ioKind = "hal"
+  /// True when `--io` named it explicitly. Without this the route-derived
+  /// default below would quietly overwrite what the operator asked for, which
+  /// is how a control arm stops being a control arm.
+  static var ioPinned = false
   static var agcOn = true
   /// Device-level input gain staging. On by default because the failure it fixes
   /// is silent, common, and unfixable anywhere else; `--no-auto-gain` is the
@@ -3149,6 +3153,14 @@ final class Audio {
     } else {
       iu = try makeUnit(input: true)
       ou = try makeUnit(input: false)
+      // The control arm announces itself as loudly as the other one.
+      //
+      // Only the VPIO branch printed an `[io]` line, so "which unit is this
+      // call running" was answerable by the PRESENCE of a line and never by
+      // its absence -- and an A/B rig that reads a missing line as "the other
+      // arm" cannot tell a HAL run from a run that failed before it got here.
+      fputs("[io] HAL -- two raw hardware units, no echo cancellation,"
+          + " no gain control, nothing between the microphone and the wire\n", stderr)
     }
     inUnit = iu; outUnit = ou
     let me = Unmanaged.passUnretained(self).toOpaque()
