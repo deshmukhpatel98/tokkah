@@ -52,20 +52,44 @@ function eq(got, want, what) {
 }
 
 const { Miniflare } = await import('miniflare');
+// Miniflare 5 (hard-pinned by wrangler as a direct dependency) replaced the flat
+// single-worker options with `workers: [{ config }]`: the script moved into
+// `config.manifest`, every binding into `config.env`, and how a Durable Object
+// stores into `config.exports`. See the long note over the same construction in
+// contacts.test.mjs (k) for why each piece is shaped this way. Note
+// `compatibilityDate` is camelCase here, unlike wrangler.jsonc.
+const WORKER = 'tokkah-routing-test';
 const mf = new Miniflare({
-  modules: true,
-  script: readFileSync(bundle, 'utf8'),
-  compatibilityDate: '2026-05-01',
-  durableObjects: { ROOM: { className: 'Room', useSQLite: true }, HEALTH: { className: 'Health', useSQLite: true } },
-  r2Buckets: ['MACREL'],
-  // ASSETS reports the path the router handed it. `x-served` survives the
-  // header re-wrap the worker does on the way out; the body would too, but a
-  // header cannot be mistaken for page content by a later reader of this file.
-  serviceBindings: {
-    ASSETS: (req) => new Response('stub', {
-      headers: { 'content-type': 'text/html;charset=utf-8', 'x-served': new URL(req.url).pathname },
-    }),
-  },
+  workers: [{
+    config: {
+      name: WORKER,
+      type: 'worker',
+      compatibilityDate: '2026-05-01',
+      manifest: {
+        mainModule: 'worker.mjs',
+        modules: { 'worker.mjs': { type: 'esm', contents: readFileSync(bundle, 'utf8') } },
+      },
+      env: {
+        ROOM: { type: 'durable-object', workerName: WORKER, exportName: 'Room' },
+        HEALTH: { type: 'durable-object', workerName: WORKER, exportName: 'Health' },
+        MACREL: { type: 'r2', name: 'MACREL' },
+        // ASSETS reports the path the router handed it. `x-served` survives the
+        // header re-wrap the worker does on the way out; the body would too, but a
+        // header cannot be mistaken for page content by a later reader of this file.
+        // (A `fetcher` binding is what `serviceBindings` became.)
+        ASSETS: {
+          type: 'fetcher',
+          handler: (req) => new Response('stub', {
+            headers: { 'content-type': 'text/html;charset=utf-8', 'x-served': new URL(req.url).pathname },
+          }),
+        },
+      },
+      exports: {
+        Room: { type: 'durable-object', storage: 'sqlite' },
+        Health: { type: 'durable-object', storage: 'sqlite' },
+      },
+    },
+  }],
 });
 
 /** The path ASSETS was asked for, i.e. the page this URL opens. */

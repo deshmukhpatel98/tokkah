@@ -2003,15 +2003,47 @@ const DEV2 = await device('dev2');
 {
   sec('(k) end to end in real workerd: edge route -> DO -> durable storage');
   const { Miniflare } = await import('miniflare');
+  // Miniflare 5 — which wrangler 4.121 hard-pins as a DIRECT dependency, so this
+  // is not a resolution accident and cannot be dodged by a version bump —
+  // dropped the flat single-worker options this section used to pass. The shape
+  // below is the same three things declared the new way:
+  //
+  //   • the script    -> config.manifest, one ESM module, still read from the
+  //                      esbuild bundle above so this can never run against a
+  //                      frozen artifact.
+  //   • the two DOs   -> a binding in config.env (which worker exports it) plus
+  //                      an entry in config.exports (how it stores). `storage`
+  //                      is REQUIRED there, so the SQLite backend cannot be
+  //                      quietly lost the way the old optional `useSQLite: true`
+  //                      could have been — dropping it is a startup error, not a
+  //                      silent downgrade to the key-value backend.
+  //   • the R2 bucket -> a `type: 'r2'` binding in config.env.
+  //
+  // `compatibilityDate` is camelCase here and snake_case in wrangler.jsonc; the
+  // schema in node_modules/miniflare/dist/src/index.d.ts is the authority, and
+  // an unexpected key is a hard validation error rather than a warning.
+  const WORKER = 'tokkah-contacts-test';
   const mf = new Miniflare({
-    modules: true,
-    script: readFileSync(bundle, 'utf8'),
-    compatibilityDate: '2026-05-01',
-    durableObjects: {
-      ROOM: { className: 'Room', useSQLite: true },
-      HEALTH: { className: 'Health', useSQLite: true },
-    },
-    r2Buckets: ['MACREL'],
+    workers: [{
+      config: {
+        name: WORKER,
+        type: 'worker',
+        compatibilityDate: '2026-05-01',
+        manifest: {
+          mainModule: 'worker.mjs',
+          modules: { 'worker.mjs': { type: 'esm', contents: readFileSync(bundle, 'utf8') } },
+        },
+        env: {
+          ROOM: { type: 'durable-object', workerName: WORKER, exportName: 'Room' },
+          HEALTH: { type: 'durable-object', workerName: WORKER, exportName: 'Health' },
+          MACREL: { type: 'r2', name: 'MACREL' },
+        },
+        exports: {
+          Room: { type: 'durable-object', storage: 'sqlite' },
+          Health: { type: 'durable-object', storage: 'sqlite' },
+        },
+      },
+    }],
   });
   try {
     const hit = async (label, method, path, body) => {
@@ -2028,6 +2060,17 @@ const DEV2 = await device('dev2');
     const A = DEV, B = DEV2;
     const TOK1 = '1'.repeat(64), TOK2 = '2'.repeat(64), TOK3 = '3'.repeat(64);
     const H = 'devesh';
+
+    // THE R2 BUCKET IS THE ONE BINDING NOTHING ELSE IN HERE WOULD MISS. Both
+    // Durable Objects are exercised by every assertion below, so losing one is
+    // loud; drop MACREL and this whole file stays green while /macos/dl — the
+    // route every install and every self-update comes down — is dead in prod.
+    // The worker answers 503 "releases not configured" when the binding is
+    // absent and 404 "no such release" when it is bound and the key is missing,
+    // so the two are distinguishable. Measured both ways against this bundle
+    // before this line was written: bound -> 404, binding removed -> 503.
+    eq((await hit('macos/dl: is MACREL really bound?', 'GET', '/macos/dl/Kin.dmg')).status, 404,
+      '(k) the R2 bucket binding is live — a 503 here means MACREL never bound at all');
 
     eq((await hit('register: owner A claims `devesh`', 'POST', `/api/kin/${H}/register`,
       await reg(A, { to: H, tok: TOK1, t: now }))).status, 200, '(k) A claims the handle');
