@@ -152,6 +152,44 @@ if v(said) < v(real):
 print(f"  plist says {said}, binary needs {real}")
 PYMIN
 
+# ── AND SO MUST EVERY PAGE THAT TELLS A HUMAN THE FLOOR ──────────────────────
+#
+# The floor is written down in four places: Package.swift, the binary's
+# LC_BUILD_VERSION, the two plists, and the download pages. The block above
+# proved the first three agree. The pages were the fourth copy and nothing
+# checked them: /kin advertised "macOS 13+" for weeks after the build moved to
+# 14, and /macos -- the page the install instructions actually send people to --
+# named no floor at all, which is the same failure with nothing to read.
+#
+# A page is also allowed to be wrong by SILENCE, so a page that stops mentioning
+# the floor fails here too.
+echo "== os floor, as advertised =="
+python3 - "$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')" \
+         "$REPO/tape-app/public/kin.html" \
+         "$REPO/tape-app/public/join.html" \
+         "$REPO/tape-app/public/macos/index.html" <<'PYWEB'
+import io, re, sys
+real = int((sys.argv[1] or "0").split(".")[0])
+if not real:
+    print("  COULD NOT READ minos from the binary -- not proven"); sys.exit(1)
+bad = 0
+for path in sys.argv[2:]:
+    name = path.split("/public/")[-1]
+    try:
+        text = io.open(path, encoding="utf-8").read()
+    except OSError as e:
+        print(f"  UNREADABLE {name}: {e}"); bad = 1; continue
+    said = sorted({int(n) for n in re.findall(r"macOS\s+(\d+)", text)})
+    if not said:
+        print(f"  SILENT {name}: states no macOS version, so a Mac below "
+              f"{real} has nothing to read before downloading"); bad = 1
+    elif said != [real]:
+        print(f"  MISMATCH {name}: says macOS {said}, binary needs {real}"); bad = 1
+    else:
+        print(f"  {name} says macOS {real}")
+sys.exit(bad)
+PYWEB
+
 echo "== icon =="
 # Regenerated every release from the Material Symbols path, so the icon in the
 # repo can never drift from the source it claims to come from.

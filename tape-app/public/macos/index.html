@@ -26,9 +26,12 @@
   .tag { display:inline-block; font-size:.72rem; letter-spacing:.09em; text-transform:uppercase;
          border:1px solid var(--line); color:var(--dim); border-radius:99px; padding:3px 10px; margin-bottom:1.6em; }
   .sub2 { color: var(--dim, #8b93a3); font-size: 11px; font-weight: 400; }
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line, #232833); }
+  footer .links { color: var(--dim, #8b93a3); font-size: 12px; }
+  footer .links a { color: var(--dim, #8b93a3); }
 </style>
 <main>
-  <div class=tag>early build · apple silicon · audio + video</div>
+  <div class=tag>early build · macOS 14+ · apple silicon · audio + video</div>
   <h1>Kin for macOS</h1>
   <p class=lede>A video call that should feel like the other person is in the room. It is a
      native app and nothing else — built that way because a browser will not give you the
@@ -180,5 +183,12 @@
      .dmg costs you one click through a macOS warning the first time; the <code>curl</code>
      install skips even that. And it is an early build being changed several
      times a day &mdash; it updates itself, so it will not stay this one for long.</p>
+  <footer>
+    <nav class=links>
+      <a href="/kin">Download page</a> &middot;
+      <a href="https://github.com/deshmukhpatel98/tokkah">Source</a> &middot;
+      <a href="https://github.com/deshmukhpatel98/tokkah/blob/main/LICENSE">AGPL-3.0</a>
+    </nav>
+  </footer>
 </main>
 <script src="/macos/dl.js" defer></script>
