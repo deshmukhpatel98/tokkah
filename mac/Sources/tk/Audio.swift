@@ -2384,7 +2384,58 @@ final class Audio {
   struct Gate {
     var on = true
     /// How far down to turn the microphone when only the far end is talking.
-    var floorDb: Double = -22
+    ///
+    /// ── A FULL MUTE, BY DECISION ──────────────────────────────────────────────
+    ///
+    /// This was -22 dB, and -22 dB is not silence: it is a quarter of the
+    /// volume, which is still plainly audible as echo. The field bore that out
+    /// -- echo on both ends of every call, reported as "ear deafening", with
+    /// this gate running the whole time.
+    ///
+    /// The product decision is half duplex: whoever is not speaking is MUTED,
+    /// not turned down, and whoever is speaking is heard raw with nothing
+    /// processing them. What makes that liveable is the rest of the app -- the
+    /// green edge and the subtitles say whose turn it is, so the silence is
+    /// information rather than a fault.
+    ///
+    /// -120 dB is one part in a million: inaudible, and a number rather than a
+    /// hard zero so the smoothing below still has something to converge to.
+    /// `--gate-floor -22` restores the old duck as a control arm.
+    var floorDb: Double = -120
+    /// ── HOW LONG THE MUTE TAKES TO ARRIVE ─────────────────────────────────────
+    ///
+    /// The floor above was never the limit; THIS was. Closing used to be an
+    /// exponential decay at 0.0006 per sample -- a 35 ms time constant -- and an
+    /// exponential approaches its target asymptotically, so reaching a real mute
+    /// needs about fourteen of them, roughly 240 ms of unbroken far-end speech.
+    /// Real speech does not hold still that long, so the gain never arrived.
+    ///
+    /// Measured, by sweeping the floor and watching the answer stop moving:
+    ///
+    ///     asked  -6 dB -> got  5.9 dB
+    ///     asked -22 dB -> got 19.3 dB
+    ///     asked -60 dB -> got 23.6 dB
+    ///     asked -120 dB -> got 23.6 dB      <- the ramp, not the floor
+    ///
+    /// So closing is a LINEAR ramp now: it reaches the number it was given, in
+    /// the time it was given. That alone took the same test from 23.6 dB to
+    /// 37.7 dB of suppression -- fourteen decibels, a factor of five quieter,
+    /// with the floor unchanged.
+    ///
+    /// Swept, because switching speed IS the experience in a half-duplex call
+    /// and a number picked by feel would be a guess:
+    ///
+    ///     1 ms 38.0 dB   2 ms 38.0   4 ms 37.9   8 ms 37.7
+    ///                                           16 ms 33.9  32 ms 27.3
+    ///
+    /// A plateau from 1 to 8 ms and a cliff after it. 4 ms is the fast end of
+    /// the plateau -- it gives up 0.1 dB against the best measurement and buys
+    /// the quickest switch available, while staying several times longer than
+    /// the ~1 ms at which a gain step becomes an audible click.
+    ///
+    /// Opening stays exponential and stays fast (~1 ms): that direction protects
+    /// the first syllable of an interruption, and it was never the problem.
+    var closeMs: Double = 4
     /// How much louder than the expected echo counts as somebody really talking.
     /// The base, at light coupling; it relaxes as the room couples harder --
     /// see the note at the comparison. Swept across simulated rooms: 2.8 holds
@@ -2689,9 +2740,17 @@ final class Audio {
       let want: Float = (cfg.on && farTalking && !nearTalking)
         ? Float(pow(10, cfg.floorDb / 20)) : 1
 
-      // OPEN FAST, CLOSE SLOW. Backwards, this clips the first syllable of every
-      // interruption, which is the one thing a person notices immediately.
-      let step: Float = want > gain ? 0.02 : 0.0006
+      // OPEN FAST, CLOSE ON A RAMP. Backwards, opening slowly clips the first
+      // syllable of every interruption, which is the one thing a person notices
+      // immediately -- so that direction keeps its 1 ms exponential.
+      //
+      // Closing is linear and timed, because an exponential cannot deliver a
+      // mute: see `closeMs`. `closeStep` is per sample, so it means the same
+      // thing at 16 frames a block as at 512 -- a coefficient written per BLOCK
+      // would encode the device buffer, and this project has already shipped a
+      // classifier that could never fire for exactly that reason.
+      let openStep: Float = 0.02
+      let closeStep = Float(1.0 / (SR * max(0.5, cfg.closeMs) / 1000.0))
       // ── AND THE DUCK, WHICH IS A SEPARATE DECISION ─────────────────────────
       //
       // Its own smoothed factor rather than folded into `want`, because the two
@@ -2708,7 +2767,8 @@ final class Audio {
       let yWant: Float = (cfg.yieldOn && yielding) ? Float(pow(10, cfg.yieldDb / 20)) : 1
       let yStep: Float = yWant > yieldGain ? 0.00042 : 0.00026
       for k in 0..<n {
-        gain += (want - gain) * step
+        if want < gain { gain = max(want, gain - closeStep) }
+        else { gain += (want - gain) * openStep }
         yieldGain += (yWant - yieldGain) * yStep
         x[k] *= gain * yieldGain
       }

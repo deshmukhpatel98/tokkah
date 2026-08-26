@@ -5,6 +5,54 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.72.0 — 2026-08-26
+
+### Changed — one at a time, properly this time
+
+0.71.0 answered the echo with Apple's canceller. The decision is the other way:
+**whoever is not speaking is muted outright, and whoever is speaking is heard
+raw** — plain hardware path, no cancellation, no noise suppression, no automatic
+gain. The green edge and the subtitles are what make that liveable: they say
+whose turn it is, so a quiet moment reads as "they are listening" rather than as
+a fault.
+
+That is what the duplex gate was always for. It was just never doing it.
+
+**The floor was never the limit — the ramp was.** Closing was an exponential
+decay with a 35 ms time constant, and an exponential approaches its target
+asymptotically: reaching a real mute needed about fourteen of them, roughly
+240 ms of unbroken far-end speech. Speech does not hold still that long, so the
+gain never arrived. Proved by sweeping the floor and watching the answer stop
+moving:
+
+| asked | −6 dB | −22 dB | −60 dB | −120 dB |
+|---|---|---|---|---|
+| achieved | 5.9 dB | 19.3 dB | **23.6 dB** | **23.6 dB** |
+
+Closing is a **timed linear ramp** now, so it reaches the number it was given in
+the time it was given. Same test, same room, floor unchanged: **23.6 dB →
+37.9 dB**. Fourteen decibels, a factor of five quieter.
+
+**And the switch time was swept, not guessed**, because in a half-duplex call
+the switching speed is the whole experience:
+
+| close | 1 ms | 2 ms | 4 ms | 8 ms | 16 ms | 32 ms |
+|---|---|---|---|---|---|---|
+| suppression | 38.0 dB | 38.0 | 37.9 | 37.7 | 33.9 | 27.3 |
+
+A plateau to 8 ms and a cliff after it. The default is **4 ms** — the fast end
+of the plateau, giving up 0.1 dB for the quickest switch available, and still
+several times longer than the ~1 ms at which a gain step becomes an audible
+click. Opening keeps its 1 ms exponential: that direction protects the first
+syllable of an interruption and was never the problem.
+
+Your own voice is still bit-for-bit what the microphone heard (worst sample
+differs by 0.0001%), and the deadlock duck is untouched at −9 dB.
+
+`--io vp` still runs the full VoiceProcessingIO path, `--gate-floor` and
+`--gate-close-ms` tune this one, so the two are A/B-able on a real call rather
+than argued about.
+
 ## Kin 0.71.0 — 2026-08-26
 
 ### Fixed — the echo, which every call has had since the first one

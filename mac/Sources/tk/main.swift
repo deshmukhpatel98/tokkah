@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.71.0"
+let VERSION = "0.72.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -383,7 +383,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route",
+  "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
@@ -499,12 +499,26 @@ if let io = arg("io") {
 // Read here, before the units are built, because the buffer size is a device
 // property and the unit type cannot change underneath a running engine.
 // `--io hal` still pins the old behaviour, and `--io vp` pins the new one.
+// ── AND THE ANSWER TO THE ECHO IS NOT A CANCELLER ──────────────────────────
+//
+// This briefly chose VoiceProcessingIO whenever the sound left into a room.
+// That does remove the echo, and it costs a measured +7.61 ms plus Apple's
+// noise suppression and automatic gain -- "the sound of being on a call rather
+// than in a room", which is the thing this app exists not to be.
+//
+// The decision is half duplex instead: the gate mutes whoever is not speaking
+// outright (see `floorDb`), and whoever IS speaking is heard raw, through the
+// plain hardware path, with nothing between the microphone and the wire. The
+// green edge and the subtitles are what make that work -- they say whose turn
+// it is, so a quiet moment reads as "they are listening" rather than "it broke".
+//
+// `--io vp` is still here and still does the whole VPIO path, so the two are
+// A/B-able on a real call rather than argued about.
 if !Audio.ioPinned {
   let (name, speakers) = Audio.outputDevice()
-  Audio.ioKind = speakers ? "vp" : "hal"
-  let why = speakers ? "speakers, so the echo canceller is on"
-                     : "headphones, so nothing is between the mic and the wire"
-  fputs("audio: out is \(name) -- \(why)\n", stderr)
+  Audio.ioKind = "hal"
+  fputs("audio: out is \(name) -- \(speakers ? "speakers" : "headphones")"
+      + ", raw mic, one at a time\n", stderr)
 }
 Metrics.fact("io_reason", Audio.ioPinned ? "pinned" : "route")
 
@@ -3705,6 +3719,7 @@ func applyGateFlags() {
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
   if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
+  if let v = arg("gate-close-ms"), let d = Double(v) { Audio.gate.closeMs = d }
   if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
 }
 applyGateFlags()

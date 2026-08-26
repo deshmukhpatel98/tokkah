@@ -117,6 +117,33 @@ say()  { printf '\n%s\n' "$1"; }
 # "running" is not presence of settled.
 SETTLED='^[[:space:]]*state = (not running|spawn scheduled)'
 
+# ── bootout IS ASYNCHRONOUS ──────────────────────────────────────────────────
+#
+# It returns before the job is actually gone, so a `bootstrap` on the next line
+# races it and silently loses -- leaving no job at all, which reads downstream as
+# "kickstart did not start another run" with no `runs` line to explain it. This
+# rig lost that race about one run in four, and the same race once left the
+# user's real doorbell DOWN after a live plist patch.
+#
+# So: bootstrap through here, never directly.
+rebootstrap() {
+  local waited=0
+  /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
+  while [ "$waited" -lt 20 ]; do
+    /bin/launchctl print "$DOM/$LABEL" >/dev/null 2>&1 || break
+    sleep 1; waited=$((waited+1))
+  done
+  /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+  # And prove it took, rather than assuming: a failed bootstrap is silent.
+  waited=0
+  while [ "$waited" -lt 20 ]; do
+    /bin/launchctl print "$DOM/$LABEL" >/dev/null 2>&1 && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  echo "  BOOTSTRAP DID NOT TAKE for $LABEL -- nothing below this can mean anything"
+  return 1
+}
+
 wait_settled() {       # $1 = seconds to allow
   local limit="$1" waited=0
   while [ "$waited" -lt "$limit" ]; do
@@ -185,7 +212,7 @@ say "1. the instrument itself: does launchctl distinguish loaded from running?"
 # code would have been correct and there would be nothing here to fix. It does
 # not, and that is the whole bug -- so assert it rather than assume it.
 write_plist --version false                  # runs, prints, exits 0, STAYS exited
-/bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
 wait_settled 40 || echo "  NOTE: the job never settled in 40 s"
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 RC=$?
@@ -223,9 +250,8 @@ say "2b. a dead agent under the NEW policy: unreachable, and just start it"
 # ThrottleInterval so the window is five minutes wide rather than a race: this
 # is the same "loaded, registered, nobody listening" state launchd reports as
 # `spawn scheduled`, which is the second spelling of the twenty-hour bug.
-/bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --version true 300
-/bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
 wait_settled 40 || true
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 if grep -qE '^\s*state = running' "$PRINT"; then
@@ -246,9 +272,8 @@ fi
 say "3. the control: a LIVE agent must still read as reachable"
 # Without this arm the test passes just as well if reach() always says no, which
 # would be a different outage with the same green tick.
-/bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --watch true                     # the real thing: stays resident
-/bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
 wait_running 30 || bad "the live agent never came up" "the control arm proves nothing without it"
 S2="$(status)"
 printf '  %s\n' "$S2"
@@ -258,14 +283,25 @@ case "$S2" in
 esac
 
 say "4. Watch.restart() actually restarts, and reports what it found"
-/bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --version false
-/bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
+rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
 wait_settled 40 || true
 /bin/launchctl kickstart -k "$DOM/$LABEL" >/dev/null 2>&1
-/bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
-if grep -qE 'runs = [2-9]' "$PRINT"; then ok "kickstart ran it again (runs > 1)"
-else bad "kickstart should have started another run" "$(grep -m1 'runs' "$PRINT")"; fi
+# ── WAIT FOR THE RUN, DO NOT READ FOR IT ─────────────────────────────────────
+#
+# `kickstart` returns as soon as launchd has ACCEPTED the request, not when the
+# job has run, so reading `runs` on the next line is a race -- and one this rig
+# lost 2 times in 3. It is the same fault as the fixed sleeps above it, wearing
+# "no sleep at all" instead of "a sleep of the wrong length": both decide from a
+# moment rather than from a state.
+waited=0
+while [ "$waited" -lt 20 ]; do
+  /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
+  grep -qE 'runs = [2-9]' "$PRINT" && break
+  sleep 1; waited=$((waited+1))
+done
+if grep -qE 'runs = [2-9]' "$PRINT"; then ok "kickstart ran it again (runs > 1, after ${waited}s)"
+else bad "kickstart should have started another run" "$(grep -m1 'runs' "$PRINT") after ${waited}s"; fi
 
 say "5. the plist this build writes carries the fixed policy"
 # The outage was a POLICY, and a policy only reaches a Mac that already has a
