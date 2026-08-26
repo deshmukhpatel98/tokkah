@@ -1,10 +1,105 @@
 # Changelog
 
-Notable changes to Tokkah. Dates are the day the change landed on `main`.
+Notable changes to Kin, and to the Tokkah worker behind it. Dates are the day
+the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
 ## Unreleased
+
+### The open-source audit, 2026-08-26
+
+The previous [OPENNESS.md](OPENNESS.md) scored this project **100 / 100** against
+commit `HEAD` — which is not a commit, and by then described a product that had
+been replaced. Re-audited properly against `13b85b3`. **The honest score is
+88 / 100**, and the twelve missing points are named individually in that file.
+
+What the audit found, in the order of how much it cost a real person:
+
+- **The app could not be pointed at anyone else's server.**
+  `https://room.tokkah.com` was written out seven times across six files, so you
+  could clone Kin, build it, and the app you built still phoned ours. Now one
+  `Server` type with three origins — signalling, updates, invite links — resolved
+  from `--server`, the existing environment variables, a `server.json` beside the
+  app, or the shipped defaults, in that order. With none of them set, every
+  origin resolves to the byte-identical string 0.69.0 compiled in.
+  [SELF-HOSTING.md](SELF-HOSTING.md) is the walkthrough.
+- **The one-line browser embed had been silently rendering a download page
+  instead of a call.** `embed.js` builds an iframe pointing at the room, and the
+  invite funnel could not tell that frame apart from a person following a link,
+  so it handed the frame the "Join on Kin" page. HTTP 200, a real page, no error
+  anywhere. Fixed with `web=1` — the escape hatch `worker.ts` already served —
+  on the *frame* and deliberately not on the shareable link. This is the third
+  thing that funnel has silently eaten; the first two were the cross-planet lab
+  room and all five testbed call sites.
+- **The download page promised macOS 13.** `Package.swift` says `.macOS(.v14)`
+  and `Info.plist` says `14.0`, so anyone on 13 downloaded 1.5 MB of app that
+  could not launch. Three places corrected.
+- **CI was red on `main`** and had been since the 0.69.0 push. `main` had gone
+  thirteen days without a push, so the first one carried the verdict on ~380
+  commits. The failing test — the only one that runs the real Worker in real
+  `workerd` against real durable storage — had been written the day before
+  against a Miniflare API that the pinned version does not accept. **It had never
+  passed once.** Ported to Miniflare 5 and then mutation-tested: delete the
+  durable write and it fails, restore it and it passes.
+- **The flagship had no CI at all.** `ci.yml` ran on Linux and tested only the
+  Worker. There is now a macOS job that builds `mac/` and runs twelve offline,
+  credential-free self-tests, calibrated by rigging a test to fail and confirming
+  the job fails with it.
+- **`testbed/freetier-audit.mjs`, cited here as a live guard, had been dead** —
+  dying on `JSON.parse` of a JSONC file. Revived, and it was also reporting the
+  worker bundle **3.6× too large** by gzipping a 392 KB sourcemap along with it.
+  The real figure is 42.3 KiB, 1.4% of the free-plan limit.
+- **Two committed `node_modules` symlinks were still in `HEAD`**, dangling in
+  every clone since the first commit — after this changelog said they had been
+  removed. They survived because `.gitignore` said `node_modules/`, and a
+  trailing slash matches directories only, so a *symlink* by that name was never
+  ignored. Both removed; the rule no longer has the slash.
+- **Zero git tags and zero GitHub releases**, for sixty-nine shipped versions,
+  while the scorecard claimed "tagged releases". 17 annotated tags created, one
+  for each commit that is genuinely a release.
+- **`SECURITY.md` had no reporting instructions**, while the scorecard scored it
+  full marks for "private reporting".
+- 14 debug screenshots were sitting in the repository root, tracked.
+
+### Added
+- **A way to check that a Kin download is really ours.**
+  `python3 tools/verify-release.py` verifies the Ed25519 signature over the
+  release manifest and the sha256 of the archive. Zero dependencies on purpose:
+  macOS ships LibreSSL 3.3.6, which cannot do Ed25519 at all, and the stock
+  Command Line Tools `python3` has no CA bundle, so `urllib` fails on a machine
+  nobody has set up. `tools/verify-release-selftest.sh` calibrates it first and
+  requires a refusal for each of the five ways a release can be wrong.
+  The public key is published in [tools/README.md](tools/README.md).
+- **`tools/secret-scan.sh`** — scans every commit on every branch, and **plants
+  three secrets in a throwaway repository and requires that it finds all three
+  before it will scan anything real**. A blind scanner and a clean repository
+  produce identical output.
+- **`tools/link-check.sh`**, **`tools/reuse-check.sh`**.
+- **REUSE 3.3 compliance** — [REUSE.toml](REUSE.toml) and `LICENSES/`, declaring
+  every one of 434 distributed files. Declared centrally rather than as a header
+  in each file: the opening comment of a source file here is the most-read part
+  of this codebase, and two lines of boilerplate above 266 of them buys identical
+  rights for a worse read. The identifier is `AGPL-3.0-only`.
+- **[GOVERNANCE.md](GOVERNANCE.md)** — one maintainer, said plainly, including
+  what happens if he disappears.
+- **[CITATION.cff](CITATION.cff)**, **`.github/dependabot.yml`**, and GitHub
+  Actions pinned by commit SHA rather than by a movable tag.
+- The licence is now named beside the "Source" link on every public page. The
+  AGPL §13 source offer was already there; what it did not do was tell a visitor
+  what they were allowed to do with it.
+
+### Changed
+- **[README.md](README.md) rewritten for Kin.** It had opened with "Live demo:
+  room.tokkah.com — open it in two tabs, that's a call" and a `<script>` tag
+  described as "the entire integration", roughly 380 commits and one pivot after
+  that stopped being true.
+- `SUPPORT.md`, `CONTRIBUTING.md`, `SECURITY.md` and `ATTRIBUTION.md` brought to
+  the current product; `LAB.md` carries a status note rather than a rewrite,
+  because the rig has not been re-run since the pivot and a confidently rewritten
+  procedure nobody has executed is worth less than an honest warning.
+- Issue and PR templates rebuilt around the Mac app. The bug form had been asking
+  which browser.
 
 ### Licensing and openness
 - **Relicensed to GNU AGPL v3** with a commercial license alongside it
@@ -17,8 +112,17 @@ This project measures its claims; where a change has a number, the number is her
   `CODEOWNERS`, `.editorconfig`, and CI.
 
 ### Fixed — the documented install was broken for everyone
-- `tape-app/node_modules` was a **committed symlink** pointing outside the repo;
-  it landed broken in every clone. Removed (same for `fatigue-lab/node_modules`).
+- `tape-app/node_modules` was a **committed symlink** pointing outside the repo
+  (`../phase1-transport/node_modules`); it landed dangling in every clone, as did
+  `fatigue-lab/node_modules`. **This entry previously said both were removed. They
+  were not** — both were still in `HEAD` two weeks later, and a fresh
+  `git clone` still produced two broken links. Actually removed now, and the
+  reason they survived a deliberate removal is worth keeping: `.gitignore` said
+  `node_modules/`, and a trailing slash matches directories only, so a *symlink*
+  named `node_modules` was never ignored and could be re-added at any time. The
+  rule is now `node_modules` with no slash. The two remaining tracked symlinks,
+  `tape-app/public/core` and `fatigue-lab/public/core`, are deliberate and
+  resolve in a fresh clone — verified.
 - `npm install` failed with `ERESOLVE` on a clean clone: `@cloudflare/workers-types`
   was pinned to `^4` while wrangler required `^5`. Dependencies aligned.
 - Added `tape-app/package-lock.json` so `npm ci` installs exact, reproducible
@@ -50,6 +154,22 @@ This project measures its claims; where a change has a number, the number is her
   (WebAssembly only; the binaries still must come from `'self'`).
 - Vendored MediaPipe binaries (26 MB) are no longer in the repository;
   `tape-app/public/vendor/fetch.sh` reproduces them.
+
+## Kin 0.69.0 — 2026-08-26
+
+### Added
+- **The settings panel says which Kin you are running.** Asked for directly, and
+  the reason is not vanity: this app updates itself silently, so the person
+  testing it has no way to know which build is in front of them. Two Macs side
+  by side on different versions look identical, behave differently, and make
+  every conclusion drawn from the pair worthless. It is the first thing to check
+  before any comparison and it was on no screen anywhere. Inert, like the
+  encryption code above it — a fact about this copy, with nothing to press — and
+  last in the panel, because it is the thing you go looking for rather than the
+  thing you came here to do. `describeTree` prints the sheet's rows, so
+  [mac/tools/watch-check.sh](mac/tools/watch-check.sh) asserts the version on
+  screen IS `VERSION` rather than trusting that it is.
+  [mac/Sources/tk/Controls.swift](mac/Sources/tk/Controls.swift)
 
 ## Kin 0.68.0 — 2026-08-26
 
