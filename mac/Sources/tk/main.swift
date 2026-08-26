@@ -2425,6 +2425,13 @@ if let room = arg("room") {
   Thread {
     mapped = Stun.discoverAny(fd: wire.fd,
                               servers: arg("stunserver").map { [$0] })
+    // ── WHERE THE SECONDS BEFORE "CONNECTED" ACTUALLY GO ────────────────────
+    //
+    // `connected_ms` was the only mark on this whole path, so a 3.1 s p50 was a
+    // number with no parts. These four split it into the phases that can each
+    // be fixed separately: STUN, the rendezvous exchange that finds the peer,
+    // the TURN allocate the connect then BLOCKS on, and the candidate race.
+    Metrics.mark("stun_ms", sinceLaunch())
     stunDone.signal()
     // TURN on the same socket, after STUN and before the media loop exists.
     // Fail-open: a missing relay still leaves STUN + LAN, which is how every call
@@ -2446,6 +2453,7 @@ if let room = arg("room") {
       fputs("turn: no credentials (or /api/mac/turn unreachable or still fetching after 8 s)"
           + " -- racing STUN and LAN only\n", stderr)
     }
+    Metrics.mark("turn_ms", sinceLaunch())
     turnDone.signal()
   }.start()
 
@@ -2556,6 +2564,8 @@ if let room = arg("room") {
       // an address known to work.
       wire.setPeer(ip: p.ip, port: p.port)
       fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
+      Metrics.mark("peer_found_ms", sinceLaunch())
+      Metrics.count("join_polls", attempt)
       setWindowTitle("Kin — connecting")
       found = true
       break
@@ -2599,6 +2609,7 @@ if let room = arg("room") {
   // else. A zero-timeout wait in a pumping loop is the same memory barrier as a
   // blocking one, so `wire.turn` is still read only after a wait that SUCCEEDED.
   let turnDeadline = Date().addingTimeInterval(20)
+  let turnWaitBegan = Date()
   var turnJoined = false
   while Date() < turnDeadline {
     if display != nil || mdisplay != nil {
@@ -2608,6 +2619,12 @@ if let room = arg("room") {
     }
     if turnDone.wait(timeout: .now()) == .success { turnJoined = true; break }
   }
+  // How long the CONNECT stood still for the relay. Distinct from `turn_ms`,
+  // which says when the allocate finished: this says how much of that the
+  // person waited through after their peer was already found and reachable.
+  // A direct call does not need the relay at all, and this is the number that
+  // says what asking for it anyway costs.
+  Metrics.mark("turn_blocked_ms", Int(Date().timeIntervalSince(turnWaitBegan) * 1000))
   if turnJoined {
     if let t = wire.turn, let b = bindTarget, t.bindPeer(fd: wire.fd, ip: b.0, port: b.1) {
       fputs("turn: channel bound to \(b.0):\(b.1)\n", stderr)
@@ -5584,6 +5601,10 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "floor_claims": audio.floorClaims,
     "dec_luma": gDecLuma,
     "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,
+    // Zero on every build so far. A non-zero number here is a telemetry
+    // call that landed on the real-time audio thread and was refused --
+    // a latency bug reported as a number instead of as a mystery stall.
+    "tel_hot_refused": Metrics.refusedOnAudioThread,
     "agc_on": Audio.agcOn ? 1 : 0, "devbuf": Audio.devBuf,
     "in_rate": Int(audio.hwInRate), "out_rate": Int(audio.hwOutRate),
     "in_lat_ms": audio.inLatencyMs, "out_lat_ms": audio.outLatencyMs,

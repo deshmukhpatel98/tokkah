@@ -3946,6 +3946,10 @@ private func renderProc(refCon: UnsafeMutableRawPointer, flags: UnsafeMutablePoi
                         ts: UnsafePointer<AudioTimeStamp>, bus: UInt32, frames: UInt32,
                         io: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
   guard let io else { return noErr }
+  // Identify this thread ONCE, so Metrics can refuse to lock on it. Two loads
+  // and a compare in the steady state; the assignment happens on the first
+  // render callback of the process and never again.
+  Metrics.claimAudioThread()
   Unmanaged<Audio>.fromOpaque(refCon).takeUnretainedValue().onRender(ts, frames, io)
   return noErr
 }

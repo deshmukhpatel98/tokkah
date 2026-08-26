@@ -155,6 +155,22 @@ enum Update {
 
   private static func note(_ line: String) { fputs("update: \(line)\n", stderr) }
 
+  // ── THE UPDATER HAD NO TELEMETRY AT ALL ────────────────────────────────────
+  //
+  // Reported as "the Mac mini would not update itself, I closed and opened it a
+  // few times". The analytics could not answer it, and not because the answer
+  // was hidden: this file recorded NOTHING. No check, no outcome, no refusal --
+  // 0 `Metrics.` calls in 1200 lines, while every other subsystem reports. The
+  // one machine-readable trace of an update was the version number changing on
+  // the NEXT call somebody happened to make, so a Mac that updated late and a
+  // Mac that simply did not call looked identical.
+  //
+  // `stage` is the furthest point this copy reached, last writer wins, so one
+  // short string says where it stopped. The counters say how often. Both are
+  // one dictionary write on a thread that is already doing HTTPS, which is the
+  // cheapest thing in the function by several orders of magnitude.
+  private static func atStage(_ s: String) { Metrics.fact("update_stage", s) }
+
   /// One outcome: a line for the log, always, and a sentence for the person when
   /// this is one they asked for or one they can do something about.
   private static func tell(_ line: String, _ human: String, _ reach: Reach) {
@@ -232,10 +248,12 @@ enum Update {
   /// only some of them reach the window.
   static func available(current: String) -> (Manifest, Data)? {
     if let why = cannotVerifyReason {
+      atStage("no-key"); Metrics.count("update_fail")
       tell(why, "Kin isn’t set up to install updates from your own server", .act)
       return nil
     }
     guard let mData = get("\(base)/manifest.json") else {
+      atStage("unreachable"); Metrics.count("update_unreachable")
       tell("cannot reach \(base) for manifest.json", "couldn’t check for updates", .answer)
       return nil
     }
@@ -281,6 +299,7 @@ enum Update {
       // STOPPED updating itself and will go on not updating itself, which the
       // person had no way to find out. `.act`, so it reaches the window even
       // though nobody asked.
+      atStage("bad-signature"); Metrics.count("update_fail")
       tell("manifest signature INVALID -- ignoring",
            "an update was refused because it wasn’t signed by Kin", .act)
       return nil
@@ -293,6 +312,7 @@ enum Update {
     guard newer(m.version, than: current) else {
       if asked || m.version != lastOffered {
         lastOffered = m.version
+        atStage("current")
         tell("\(base) offers \(m.version) and this is \(current) -- nothing to install",
              "Kin is up to date", .answer)
       }
@@ -730,8 +750,10 @@ enum Update {
   /// Downloads and verifies without touching the running install. Returns nil on
   /// any failure, having changed nothing.
   static func stage(_ m: Manifest) -> Staged? {
+    atStage("downloading"); Metrics.fact("update_offered", m.version); Metrics.count("update_offered_n")
     note("\(m.version) available (\(m.notes ?? "")) -- downloading")
     guard let tgz = get(m.url, timeout: 120) else {
+      atStage("download-failed"); Metrics.count("update_fail")
       tell("download failed", "the update didn’t finish downloading", .answer); return nil
     }
     let got = SHA256.hash(data: tgz).map { String(format: "%02x", $0) }.joined()
@@ -836,6 +858,7 @@ enum Update {
            "that update wouldn’t start, so Kin kept the version you have", .act)
       try? fm.removeItem(at: tmp); return nil
     }
+    atStage("staged")
     note("\(m.version) staged and verified")
     return Staged(manifest: m, dir: tmp)
   }
@@ -906,7 +929,8 @@ enum Update {
     // in place -- only replacing it whole, and never running codesign here.
     if swapBundle(from: tmp, at: me) {
       pending = nil
-      fputs("update: installed \(m.version) -- restarting\n", stderr)
+      atStage("installed"); Metrics.fact("update_installed", m.version)
+    fputs("update: installed \(m.version) -- restarting\n", stderr)
       var argv = restartArgv(me.path).map { strdup($0) }
       argv.append(nil)
       execv(me.path, &argv)
@@ -957,6 +981,7 @@ enum Update {
                       .deletingLastPathComponent()
              : nil)
     pending = nil
+    atStage("installed"); Metrics.fact("update_installed", m.version)
     fputs("update: installed \(m.version) -- restarting\n", stderr)
     var argv = restartArgv(restart.path).map { strdup($0) }
     argv.append(nil)
@@ -1168,6 +1193,7 @@ enum Update {
           if !callIsLive() || midCallAllowed { commit(s); continue }
           if !announced {
             announced = true
+            atStage("held-for-call"); Metrics.count("update_held_n")
             note("\(s.manifest.version) is ready, holding until the call ends")
             onPending?(s.manifest.version)
           }
@@ -1217,6 +1243,11 @@ enum Update {
         // interrupting anybody about; this only speaks when there is a real
         // release it is really unable to take.
         if let b = installBlocker() {
+          // The likeliest silent cause of "it would not update itself", and
+          // until now it was reported to a log nobody reads on a Mac nobody
+          // is sitting at. The reason goes on the wire, trimmed to 64 chars
+          // by `fact` itself.
+          atStage("blocked"); Metrics.count("update_blocked_n"); Metrics.fact("update_blocked", b.log)
           tell("\(m.version) is available and this copy cannot install it: \(b.log)", b.human, .act)
           note("not downloading it; asking again in \(Int(blockedRetry)) s")
           holdOff = blockedRetry
