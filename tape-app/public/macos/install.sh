@@ -11,7 +11,16 @@
 # The download is checked against the sha256 in the signed manifest. After that,
 # tk updates itself and verifies an Ed25519 signature on every update it applies.
 set -eu
-BASE="https://room.tokkah.com/macos"
+# Overridable for the install-path arms of mac/tools/update-check.sh ONLY, which
+# point them at its own signed fake server and its own scratch directories. The
+# defaults are the production ones and are what every real install uses.
+#
+# It needed an override to be tested at all: until it had one, the only way to
+# exercise this script was to run it, and running it writes /Applications/Kin.app
+# on the machine doing the testing. So the install half -- the half that is
+# ALREADY on somebody's Mac when a fix ships, and therefore the half that takes
+# two releases to correct -- was the one half nothing could check.
+BASE="${TK_INSTALL_BASE:-https://room.tokkah.com/macos}"
 DEST="${TK_DEST:-$HOME/.local/bin}"
 
 case "$(uname -s)-$(uname -m)" in
@@ -27,16 +36,71 @@ WANT=$(printf '%s' "$MAN" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
 [ -n "$VER" ] && [ -n "$URL" ] && [ -n "$WANT" ] || { echo "manifest at $BASE looks wrong" >&2; exit 1; }
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# The two staging names below are swept too. They are siblings of the real thing
+# in directories the user keeps, so an interrupted install must not leave a
+# half-written bundle sitting in Applications forever.
+trap 'rm -rf "$TMP" "${DEST:-$TMP}/.tk.incoming" "${APPS:-$TMP}/.Kin.app.incoming" 2>/dev/null || true' EXIT
 echo "downloading Kin $VER"
 curl -fsSL "$URL" -o "$TMP/tk.tar.gz"
 GOT=$(shasum -a 256 "$TMP/tk.tar.gz" | awk '{print $1}')
 [ "$GOT" = "$WANT" ] || { echo "checksum mismatch: expected $WANT, got $GOT" >&2; exit 1; }
 
-tar -xzf "$TMP/tk.tar.gz" -C "$TMP"
+tar -xzf "$TMP/tk.tar.gz" -C "$TMP" \
+  || { echo "the archive did not unpack -- nothing here was changed" >&2; exit 1; }
+
+# ── NOTHING IS REPLACED UNTIL ITS REPLACEMENT HAS RUN ────────────────────────
+#
+# This was three lines: `mv "$TMP/tk" "$DEST/tk"`, chmod, and then -- AFTERWARDS
+# -- `"$DEST/tk" --version` to print what had been installed. So the working
+# binary was destroyed first and asked to prove itself second, and a payload that
+# unpacked to something that does not run left the person with no working tk and
+# no way back except finding this URL again. `set -e` does not save it: the mv
+# had already happened.
+#
+# It is the same shape as the bug the Swift updater was built around -- it
+# executes the candidate once, in a subprocess, before it is allowed to replace
+# anything -- so the install half now does what the update half does:
+#
+#   1. find the executable, in the archive or in the bundle it carries
+#   2. run it, from the temp directory, where failing costs nothing
+#   3. copy it to a sibling of the real path and rename over it. Same directory,
+#      so that last step is rename(2) and cannot be seen half done. `mv` across
+#      filesystems is copy-then-unlink, and $TMPDIR is not always the same volume
+#      as $HOME.
+#
+# ── AND BOTH DIRECTIONS OF THE VERSION SKEW ─────────────────────────────────
+#
+# `updater-ships-only-what-it-can-install`: this file is the half that is already
+# on the person's Mac, so a fix here reaches nobody until they install again, and
+# the pair that has to keep working is an OLD installer meeting a NEW payload and
+# a NEW installer meeting an OLD payload.
+#
+#   new installer, old payload (tk + bundle/, no Kin.app)  -- takes tk, assembles
+#     the bundle in the fallback below. Unchanged behaviour.
+#   new installer, future payload (Kin.app, no bare tk)    -- takes the bundle's
+#     own executable as the command-line tk instead of dying on a missing file.
+#   old installer, future payload                          -- `mv` fails and the
+#     script exits before touching Kin.app. It cannot be fixed from here, and it
+#     is why the archive must keep carrying a bare `tk` until installers this old
+#     are gone. Written down rather than assumed.
+CLI="$TMP/tk"
+if [ ! -f "$CLI" ]; then
+  CLI=""
+  for exe in "$TMP"/Kin.app/Contents/MacOS/*; do
+    if [ -f "$exe" ]; then CLI="$exe"; break; fi
+  done
+  [ -z "$CLI" ] || echo "note: this release carries no bare tk; taking it from the bundle"
+fi
+[ -n "$CLI" ] && [ -s "$CLI" ] \
+  || { echo "the archive contained no runnable tk -- nothing here was changed" >&2; exit 1; }
+chmod +x "$CLI" 2>/dev/null || true
+"$CLI" --version >/dev/null 2>&1 \
+  || { echo "the downloaded tk does not run -- nothing here was changed" >&2; exit 1; }
+
 mkdir -p "$DEST"
-mv "$TMP/tk" "$DEST/tk"
-chmod +x "$DEST/tk"
+cp "$CLI" "$DEST/.tk.incoming"
+chmod +x "$DEST/.tk.incoming"
+mv "$DEST/.tk.incoming" "$DEST/tk"
 
 echo "installed $DEST/tk ($("$DEST/tk" --version))"
 
@@ -50,11 +114,26 @@ echo "installed $DEST/tk ($("$DEST/tk" --version))"
 # identity of its own, so macOS attributes its microphone and camera grants to
 # whichever terminal launched it -- they cannot be reviewed in System Settings and
 # they do not follow the program. A bundle owns its permissions.
-APPS="/Applications"
-[ -w "$APPS" ] || APPS="$HOME/Applications"
+APPS="${TK_APPS:-}"
+if [ -z "$APPS" ]; then
+  APPS="/Applications"
+  [ -w "$APPS" ] || APPS="$HOME/Applications"
+fi
 mkdir -p "$APPS"
 APP="$APPS/Kin.app"
-rm -rf "$APP"
+# ── ASSEMBLED BESIDE THE REAL ONE, NOT OVER IT ──────────────────────────────
+#
+# This was `rm -rf "$APP"` here, and everything below wrote straight into the
+# live path -- so from that line until the last `codesign`, the person had no
+# Kin.app at all, and any failure in between (a `ditto` that ran out of disk, a
+# Ctrl-C, a closed lid) left them with none permanently. Their working app was
+# deleted to make room for one that had not been built yet.
+#
+# The whole bundle is assembled at a sibling path and swapped in at the end. The
+# swap is a rename within one directory, which cannot be observed half done, and
+# the copy being replaced stays intact and launchable until the moment it works.
+STAGE="$APPS/.Kin.app.incoming"
+rm -rf "$STAGE"
 
 # ── PREFER THE SIGNED BUNDLE THE ARCHIVE ALREADY CARRIES ─────────────────────
 #
@@ -71,19 +150,19 @@ rm -rf "$APP"
 # right thing to do is copy it and change nothing. `ditto` preserves the
 # extended attributes parts of a signature live in.
 if [ -d "$TMP/Kin.app" ]; then
-  ditto "$TMP/Kin.app" "$APP"
-  codesign --verify --deep --strict "$APP" 2>/dev/null \
+  ditto "$TMP/Kin.app" "$STAGE"
+  codesign --verify --deep --strict "$STAGE" 2>/dev/null \
     || echo "warning: the downloaded bundle does not verify"
 else
 # Fallback for an archive built before the bundle shipped inside it. Still
 # ad-hoc, so permissions will be re-asked on each update until a release with
 # the signed bundle arrives -- which is the bug, not the design.
 echo "note: this release predates signed bundles; permissions may be re-asked"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$DEST/tk" "$APP/Contents/MacOS/Tokkah"
-chmod +x "$APP/Contents/MacOS/Tokkah"
-printf 'APPL????' > "$APP/Contents/PkgInfo"
-cat > "$APP/Contents/Info.plist" <<PLIST
+mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
+cp "$DEST/tk" "$STAGE/Contents/MacOS/Tokkah"
+chmod +x "$STAGE/Contents/MacOS/Tokkah"
+printf 'APPL????' > "$STAGE/Contents/PkgInfo"
+cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -123,8 +202,31 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 # Best-effort: a missing icon is a generic app tile, not a broken install.
-curl -fsSL "$BASE/AppIcon.icns" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null || true
-codesign -s - -f --deep "$APP" >/dev/null 2>&1 || true
+curl -fsSL "$BASE/AppIcon.icns" -o "$STAGE/Contents/Resources/AppIcon.icns" 2>/dev/null || true
+codesign -s - -f --deep "$STAGE" >/dev/null 2>&1 || true
+fi
+
+# ── AND ONLY NOW DOES THE REAL PATH CHANGE ──────────────────────────────────
+#
+# Checked, not assumed: `ditto` and the fallback are both best-effort in places,
+# and swapping in a bundle with no executable would replace a working Kin with
+# one that cannot launch. The old copy is moved aside rather than deleted, so a
+# failed rename can be undone; it is removed only once the new one is in place.
+if [ ! -x "$STAGE/Contents/MacOS/Tokkah" ]; then
+  rm -rf "$STAGE"
+  echo "the new bundle did not assemble -- $APP was left as it is" >&2
+  exit 1
+fi
+PREV="$APPS/.Kin.app.previous"
+rm -rf "$PREV"
+if [ -d "$APP" ]; then mv "$APP" "$PREV"; fi
+if mv "$STAGE" "$APP"; then
+  rm -rf "$PREV"
+else
+  echo "could not put the bundle at $APP" >&2
+  if [ -d "$PREV" ]; then mv "$PREV" "$APP"; fi
+  rm -rf "$STAGE"
+  exit 1
 fi
 # Tell the Finder to notice the new icon straight away.
 touch "$APP"
