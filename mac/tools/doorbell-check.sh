@@ -19,38 +19,12 @@
 # the user's actual doorbell and this script runs on the user's actual Mac.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
-# ── THE BINARY UNDER TEST MUST BE THE SOURCE UNDER TEST ──────────────────────
-#
-# This used to be `[ -x "$TK" ] || echo "build first"`, and existence is not
-# currency. On 2026-08-26 the doorbell fix was written, committed, and then
-# checked by this script against a .build/debug/tk that was NINE HOURS OLDER
-# than the sources -- built before the fix existed. Five assertions failed and
-# every one of them was about code nobody was shipping. A rig that tests a stale
-# binary does not report "stale"; it reports a verdict, and the verdict is about
-# the wrong program. It could as easily have been a PASS.
-#
-# So build it here rather than trusting whatever is lying in .build, and then
-# check the timestamp anyway, because `swift build` can succeed without relinking.
-TK="$PWD/.build/debug/tk"
-echo "== building the binary under test =="
-if ! swift build --product tk >/dev/null 2>&1; then
-  echo "BUILD FAILED -- cannot test the doorbell against a binary that does not compile"
-  swift build --product tk 2>&1 | grep -E "error:" | head -5
-  exit 2
-fi
-[ -x "$TK" ] || { echo "swift build reported success but $TK is not there"; exit 2; }
-NEWER=$(find Sources -name '*.swift' -newer "$TK" 2>/dev/null | head -3)
-if [ -n "$NEWER" ]; then
-  echo "STALE BINARY -- these sources are newer than $TK even after a build:"
-  echo "$NEWER" | sed 's/^/    /'
-  echo "  Refusing to report a verdict about a binary that is not this source."
-  exit 2
-fi
-echo "  $TK is current with Sources/"
 
+TK="$PWD/.build/debug/tk"
 LABEL="com.tokkah.tk.doorbellrig$$"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SP="$(mktemp -d)"
+PRINT="$SP/print.txt"
 UID_="$(id -u)"
 
 # ── WHICH launchd DOMAIN THIS MACHINE HAS ────────────────────────────────────
@@ -71,6 +45,37 @@ if [ -z "$DOM" ]; then
   exit 0
 fi
 echo "launchd domain: $DOM"
+
+# ── THE BINARY UNDER TEST MUST BE THE SOURCE UNDER TEST ──────────────────────
+#
+# This used to be `[ -x "$TK" ] || echo "build first"`, and existence is not
+# currency. On 2026-08-26 the doorbell fix was written, committed, and then
+# checked by this script against a .build/debug/tk that was NINE HOURS OLDER
+# than the sources -- built before the fix existed. Five assertions failed and
+# every one of them was about code nobody was shipping. A rig that tests a stale
+# binary does not report "stale"; it reports a verdict, and the verdict is about
+# the wrong program. It could as easily have been a PASS.
+#
+# So build it here rather than trusting whatever is lying in .build, and then
+# check the timestamp anyway, because `swift build` can succeed without relinking.
+#
+# After the domain check, not before it: on a runner with no launchd session
+# there is nothing to test, and a skip should not cost a Swift build first.
+echo "== building the binary under test =="
+if ! swift build --product tk >/dev/null 2>&1; then
+  echo "BUILD FAILED -- cannot test the doorbell against a binary that does not compile"
+  swift build --product tk 2>&1 | grep -E "error:" | head -5
+  exit 2
+fi
+[ -x "$TK" ] || { echo "swift build reported success but $TK is not there"; exit 2; }
+NEWER=$(find Sources -name '*.swift' -newer "$TK" 2>/dev/null | head -3)
+if [ -n "$NEWER" ]; then
+  echo "STALE BINARY -- these sources are newer than $TK even after a build:"
+  echo "$NEWER" | sed 's/^/    /'
+  echo "  Refusing to report a verdict about a binary that is not this source."
+  exit 2
+fi
+echo "  $TK is current with Sources/"
 pass=0; fail=0
 cleanup() {
   /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
@@ -87,6 +92,51 @@ esac
 ok()   { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; }
 say()  { printf '\n%s\n' "$1"; }
+
+# ── WAIT FOR THE JOB TO SETTLE, DO NOT SLEEP AT IT ───────────────────────────
+#
+# These were `sleep 2`, on the assumption that `tk --version` starts and exits
+# inside two seconds. It usually does. This is a DEBUG build of a whole app, and
+# on a slower run it does not -- scenario 1 read `state = running`, called it a
+# failure, and the thing it was reporting was the sleep. A rig whose verdict
+# depends on which side of a fixed delay it lands on is measuring the delay.
+#
+# Poll for the state instead, with a bound, and say plainly when the bound is
+# hit rather than carrying on and blaming the product for it.
+# The settled states, named. `state` has at least four spellings here and only
+# two of them mean "nobody is listening and launchd is not mid-launch":
+#
+#   running          -- alive
+#   xpcproxy         -- launchd's stub, about to exec: NOT running, NOT settled
+#   not running      -- ran, exited, given up on
+#   spawn scheduled  -- waiting out ThrottleInterval
+#
+# The first version of this waited for "not `running`" and returned during
+# xpcproxy, which is how scenario 1 came to report `state = xpcproxy` as proof
+# the job was dead and 2b came to find it running a moment later. Absence of
+# "running" is not presence of settled.
+SETTLED='^[[:space:]]*state = (not running|spawn scheduled)'
+
+wait_settled() {       # $1 = seconds to allow
+  local limit="$1" waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
+    grep -qE "$SETTLED" "$PRINT" && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  return 1
+}
+
+wait_running() {       # $1 = seconds to allow
+  local limit="$1" waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    if /bin/launchctl print "$DOM/$LABEL" 2>/dev/null | grep -qE '^\s*state = running'; then
+      return 0
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  return 1
+}
 
 # `--watch-status` writes to stderr, and the app reroutes stderr into
 # ~/Library/Logs/Kin when it is a PIPE. A regular file is the one shape it
@@ -136,8 +186,7 @@ say "1. the instrument itself: does launchctl distinguish loaded from running?"
 # not, and that is the whole bug -- so assert it rather than assume it.
 write_plist --version false                  # runs, prints, exits 0, STAYS exited
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
-sleep 2
-PRINT="$SP/print.txt"
+wait_settled 40 || echo "  NOTE: the job never settled in 40 s"
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 RC=$?
 if [ "$RC" -eq 0 ]; then ok "launchctl print exits 0 for this job"
@@ -177,7 +226,7 @@ say "2b. a dead agent under the NEW policy: unreachable, and just start it"
 /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --version true 300
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
-sleep 2
+wait_settled 40 || true
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 if grep -qE '^\s*state = running' "$PRINT"; then
   bad "could not park the job" "$(grep -m1 'state = ' "$PRINT") -- 2b proved nothing"
@@ -200,7 +249,7 @@ say "3. the control: a LIVE agent must still read as reachable"
 /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --watch true                     # the real thing: stays resident
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
-sleep 4
+wait_running 30 || bad "the live agent never came up" "the control arm proves nothing without it"
 S2="$(status)"
 printf '  %s\n' "$S2"
 case "$S2" in
@@ -212,7 +261,7 @@ say "4. Watch.restart() actually restarts, and reports what it found"
 /bin/launchctl bootout "$DOM/$LABEL" 2>/dev/null
 write_plist --version false
 /bin/launchctl bootstrap "$DOM" "$PLIST" 2>/dev/null
-sleep 2
+wait_settled 40 || true
 /bin/launchctl kickstart -k "$DOM/$LABEL" >/dev/null 2>&1
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 if grep -qE 'runs = [2-9]' "$PRINT"; then ok "kickstart ran it again (runs > 1)"
