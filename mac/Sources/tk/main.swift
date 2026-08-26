@@ -181,7 +181,17 @@ if flag("rings") || arg("rings-for") != nil {
   exit(seen > 0 ? 0 : 1)
 }
 // The headless watcher, and the three commands that manage it.
+/// Rigs only: never touch the real identity directory. Declared HERE, above
+/// the `--watch` block, because `Watch.run` returns `Never` -- read from
+/// further down the file this guard is unreachable from the one process that
+/// exists to claim a handle, and a watcher rig walked @devesh through
+/// @devesh9 against the production directory every time it ran.
+let noIdentity = ProcessInfo.processInfo.environment["TK_NO_IDENTITY"] == "1"
+
 if flag("watch") {
+  // And it is the one process that never REPORTED anything either, which is
+  // why a Mac that stopped calling also stopped being visible at all.
+  Update.reportsAsWatcher = true
   // ── THE ONE PROCESS THAT IS ALWAYS RUNNING NEVER LOOKED FOR AN UPDATE ──────
   //
   // `Update.startPolling` is called ~350 lines below this. `Watch.run` returns
@@ -439,7 +449,6 @@ let isTestRun = CommandLine.arguments.dropFirst().contains { a in
 /// 5 to 8 seconds of network, and these scripts time their presses in seconds.
 /// Not claiming at all is both correct and free. Sibling of TK_KIN_DIR and
 /// TK_UPDATE_POLL; production never sets it.
-let noIdentity = ProcessInfo.processInfo.environment["TK_NO_IDENTITY"] == "1"
 
 for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
   let name = String(a.dropFirst(2))

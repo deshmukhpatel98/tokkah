@@ -388,8 +388,20 @@ enum Watch {
     // entry, but a process that may own a status item. `.prohibited` may not, and
     // that one word was the difference between a feature and a rumour.
     app.setActivationPolicy(.accessory)
-    Identity.ensure()
-    fputs("watch: resident for @\(Identity.handle), checking every \(gapMs) ms\n", stderr)
+    // ── A RIG MUST BE ABLE TO RUN THIS WITHOUT TOUCHING THE REAL DIRECTORY ────
+    //
+    // `TK_NO_IDENTITY` is how every rig in mac/tools avoids claiming a name on
+    // the production server, and this call ignored it -- so a watcher rig walked
+    // @devesh, @deveshp, @deveshpatel, @devesh2 ... @devesh9 against the live
+    // directory on every run, which is the exact squatting mute-check.sh sets
+    // the variable to prevent. The guard existed; it was declared 260 lines
+    // below a function that never returns, so the watcher could not see it.
+    if !noIdentity {
+      Identity.ensure()
+      fputs("watch: resident for @\(Identity.handle), checking every \(gapMs) ms\n", stderr)
+    } else {
+      fputs("watch: TK_NO_IDENTITY -- no handle claimed, this copy cannot be rung\n", stderr)
+    }
     Resident.install()
     if ProcessInfo.processInfo.environment["TK_WATCH_SELFTEST"] == "1" { Resident.selftest() }
     Thread {

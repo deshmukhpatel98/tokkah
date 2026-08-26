@@ -80,7 +80,33 @@ enum Telemetry {
   /// informational: the mark that stops a crash being sent twice is written only
   /// when this says the server took it, and reading the shared `sent` counter
   /// instead would race with whatever beat the live call posted in the meantime.
+  /// One small beat from the background watcher: this Mac is alive, on this
+  /// version, and here is what it last did about updating itself.
+  ///
+  /// The watcher never posted ANYTHING, and that is the whole reason "why did
+  /// the Mac mini not update" was unanswerable: every row in the dashboard is
+  /// written by a call, so a Mac is visible only while somebody is talking on
+  /// it -- and the machine being asked about was exactly the one that had
+  /// stopped calling. A Mac that updated late and a Mac that made no calls
+  /// produced identical evidence: none.
+  ///
+  /// Cheap on purpose. It rides the update check, so it is one small POST every
+  /// 30 minutes -- 48 a day from a machine that is idle anyway -- and it carries
+  /// only what a fleet view needs. `phase: "watch"` keeps it out of the call
+  /// listings, which group by `call` and would otherwise show a zero-length call
+  /// per heartbeat.
+  static func watchBeat(_ extra: [String: Any] = [:]) {
+    guard enabled else { return }
+    var f: [String: Any] = ["uptime_s": sinceLaunch() / 1000]
+    for (k, v) in extra { f[k] = v }
+    let m = Metrics.snapshot()
+    if !m.facts.isEmpty { f["facts"] = m.facts }
+    if !m.counts.isEmpty { f["events"] = m.counts }
+    post(f, phase: "watch")
+  }
+
   static func post(_ fields: [String: Any], to url0: String? = nil, final: Bool = false,
+                   phase: String? = nil,
                    done: (@Sendable (Bool) -> Void)? = nil) {
     guard enabled else { done?(false); return }
     var f = fields
@@ -91,7 +117,7 @@ enum Telemetry {
     if let prev = arg("prev-call") { f["prev_call"] = prev }
     f["version"] = VERSION
     f["model"] = model
-    f["phase"] = final ? "final" : "live"
+    f["phase"] = phase ?? (final ? "final" : "live")
     guard let body = try? JSONSerialization.data(withJSONObject: f) else { done?(false); return }
     guard let url = URL(string: url0 ?? endpoint) else { done?(false); return }
     var req = URLRequest(url: url)

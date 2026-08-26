@@ -171,6 +171,11 @@ enum Update {
   // cheapest thing in the function by several orders of magnitude.
   private static func atStage(_ s: String) { Metrics.fact("update_stage", s) }
 
+  /// Set by the `--watch` image only. The app in a call already beats every few
+  /// seconds and does not need a second channel; the background watcher is the
+  /// one that never said anything.
+  nonisolated(unsafe) static var reportsAsWatcher = false
+
   /// One outcome: a line for the log, always, and a sentence for the person when
   /// this is one they asked for or one they can do something about.
   private static func tell(_ line: String, _ human: String, _ reach: Reach) {
@@ -1229,6 +1234,19 @@ enum Update {
         asked = personAsked
         raised = false
         defer { asked = false; if !raised { said = nil } }
+        // ── REPORT THE CHECK, WHATEVER IT DECIDED ──────────────────────────────
+        //
+        // In a `defer` and above the `guard`, so it fires on every path out of
+        // this iteration. Below the guard it would only ever report checks that
+        // FOUND something, and "offers 0.70.0 and this is 0.70.0 -- nothing to
+        // install" is both the most common outcome and the one that proves a Mac
+        // is checking at all. That distinction -- checking and current, versus
+        // not checking -- is the entire question this was added to answer.
+        //
+        // Watcher only. The app posts beats of its own during a call, and this
+        // exists for the Mac that is not on one.
+        Metrics.count("update_checks")
+        defer { if reportsAsWatcher { Telemetry.watchBeat() } }
         guard let (m, _) = available(current: current) else { continue }
         // ── THE INSTALL QUESTION, BEFORE THE DOWNLOAD ──────────────────────────
         //

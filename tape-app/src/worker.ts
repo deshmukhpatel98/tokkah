@@ -4049,7 +4049,15 @@ export class Health implements DurableObject {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         Date.now() / 1000, String(install).slice(0, 40), String(call).slice(0, 40),
         String(version ?? '').slice(0, 20), String(model ?? '').slice(0, 40),
-        phase === 'final' ? 'final' : 'live', pair, packFields(rest));
+        // ── A THIRD PHASE, BECAUSE A WATCHER IS NOT A CALL ──────────────────
+        //
+        // 'watch' is the background agent reporting that it is alive and what it
+        // did about updates. It has to be storable and it must NOT read as a
+        // call: every listing below groups by `call` and would otherwise show a
+        // zero-length call for every heartbeat. Anything unrecognised still
+        // becomes 'live', so an older client cannot invent a phase.
+        phase === 'final' ? 'final' : phase === 'watch' ? 'watch' : 'live',
+        pair, packFields(rest));
       // Keep a week. Long enough for "the call on Tuesday was bad", short enough
       // that the DO stays small without a scheduled job to remember.
       this.sql.exec(`DELETE FROM mac_beats WHERE wall < ?`, Date.now() / 1000 - 7 * 86400);
@@ -4155,11 +4163,59 @@ export class Health implements DurableObject {
       const rows = [...this.sql.exec(
         `SELECT call, install, version, model, phase, MAX(wall) AS wall, fields
            FROM mac_beats
-          WHERE wall > ?
+          WHERE wall > ? AND phase != 'watch'
             AND call NOT IN (SELECT call FROM mac_beats WHERE phase = 'final')
           GROUP BY call ORDER BY wall DESC LIMIT 40`,
         Date.now() / 1000 - 90)];
       return json({ now: Date.now() / 1000, calls: rows.map(shapeMacRow) });
+    }
+
+    // ── ONE ROW PER MAC, NOT PER CALL ───────────────────────────────────────
+    //
+    // "Which of my Macs is on which version, and why is that one stuck?" could
+    // not be answered at all. Every view here groups by CALL, so a Mac was
+    // visible only while somebody was talking on it -- and the machine being
+    // asked about was precisely the one that had stopped calling. A Mac that
+    // updated late and a Mac that simply made no calls produced identical
+    // evidence: nothing.
+    //
+    // Reads every phase, so a Mac that called counts as seen just as much as one
+    // that only sent a watcher heartbeat, and reports the newest update state it
+    // has said anything about. `update_stage` on the newest beat can be absent
+    // (a call beat carries it only if that copy checked during the call), so the
+    // stage is taken from the newest beat that HAS one rather than from the
+    // newest beat.
+    if (url.pathname === '/mac/macs') {
+      const rows = [...this.sql.exec(
+        `SELECT install, version, model, phase, wall, fields
+           FROM mac_beats WHERE wall > ? ORDER BY wall ASC`,
+        Date.now() / 1000 - 7 * 86400)] as any[];
+      const byMac = new Map<string, Record<string, unknown>>();
+      for (const r of rows) {
+        const f = safeParse(r.fields) as Record<string, unknown>;
+        const cur: Record<string, any> = byMac.get(r.install)
+          ?? { install: r.install, calls: 0, watches: 0 };
+        // ASC order, so plain assignment leaves the newest value in place.
+        cur.lastSeen = r.wall;
+        cur.version = r.version || cur.version;
+        cur.model = r.model || cur.model;
+        cur.lastPhase = r.phase;
+        if (r.phase === 'watch') cur.watches++;
+        else if (r.phase === 'final') cur.calls++;
+        for (const k of ['update_stage', 'update_blocked', 'update_offered',
+                         'update_installed', 'reachable_closed', 'io', 'output_route']) {
+          if (f[k] !== undefined && f[k] !== null && f[k] !== '') {
+            cur[k] = f[k];
+            if (k === 'update_stage') cur.update_stage_at = r.wall;
+          }
+        }
+        byMac.set(r.install, cur);
+      }
+      const now = Date.now() / 1000;
+      const macs = [...byMac.values()]
+        .map((m: any) => ({ ...m, seenAgoS: Math.round(now - (m.lastSeen ?? 0)) }))
+        .sort((a: any, b: any) => b.lastSeen - a.lastSeen);
+      return json({ now, macs });
     }
 
     // One row per call, most recent first, with how long it ran.
@@ -4168,7 +4224,8 @@ export class Health implements DurableObject {
       const rows = [...this.sql.exec(
         `SELECT call, install, version, model,
                 MIN(wall) AS first_wall, MAX(wall) AS wall, COUNT(*) AS beats
-           FROM mac_beats GROUP BY call ORDER BY wall DESC LIMIT ?`, n)];
+           FROM mac_beats WHERE phase != 'watch'
+          GROUP BY call ORDER BY wall DESC LIMIT ?`, n)];
       const out = [];
       for (const r of rows as any[]) {
         // The last beat is the one worth showing: a final beat if there was one,
@@ -4708,9 +4765,18 @@ export default {
     // cookie and redirects to a clean URL so the key stops appearing in the
     // address bar, in history, or in a screenshot.
     const dashKey = env.MAC_DASH_KEY;
+    // LOG_ADMIN_TOKEN opens this too. Not a second door: it is the SAME operator
+    // credential that already dumps any room's full telemetry, which is strictly
+    // more than these anonymous call beats -- so accepting it here widens
+    // nothing, and the alternative was rotating MAC_DASH_KEY (which lives only
+    // in a browser cookie on one Mac) every time somebody needs to read a
+    // dashboard from a machine that is not that one.
+    const adminTok = env.LOG_ADMIN_TOKEN;
     const dashOK = (): boolean => {
       if (!dashKey) return true;                        // unset: open, as before
-      if (url.searchParams.get('key') === dashKey) return true;
+      const k = url.searchParams.get('key');
+      if (k === dashKey) return true;
+      if (adminTok && k === adminTok) return true;
       const c = request.headers.get('cookie') ?? '';
       return c.split(';').some((p) => p.trim() === `tk_dash=${dashKey}`);
     };
@@ -4781,7 +4847,7 @@ export default {
     }
     if (url.pathname.startsWith('/api/mac/') && request.method === 'GET') {
       const tail = url.pathname.slice('/api/mac/'.length);
-      if (!['live', 'recent', 'call', 'diagnose', 'crashes'].includes(tail)) return json({ error: 'no' }, 404);
+      if (!['live', 'recent', 'call', 'diagnose', 'crashes', 'macs'].includes(tail)) return json({ error: 'no' }, 404);
       if (!dashOK()) return json({ error: 'private' }, 403);
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/mac/${tail}${url.search}`),

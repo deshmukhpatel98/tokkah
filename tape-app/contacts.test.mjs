@@ -2422,6 +2422,43 @@ const DEV2 = await device('dev2');
       ok(ghostMs < 4000,
         `(k4) and was evicted when the live poll ARRIVED (${ghostMs} ms), not left until its own 9 s deadline`);
     }
+
+    // ── (k5) a watcher heartbeat is storable and is NOT a call ──────────────
+    //
+    // The background agent now reports what it did about updates, because a Mac
+    // that stops calling is exactly the Mac somebody asks about and it had no
+    // way to say anything. Every listing here groups by `call`, so the danger is
+    // the opposite of silence: a heartbeat every half hour showing up as a
+    // zero-length call and burying the real ones.
+    {
+      const beat = (phase, extra) => JSON.stringify({
+        install: 'testmac000001', call: 'wbeat' + phase, version: '0.70.0',
+        model: 'Mac16,10', phase, ...extra,
+      });
+      eq((await hit('mac beat: a watcher heartbeat', 'POST', '/api/mac/beat',
+        beat('watch', { update_stage: 'blocked', update_blocked: 'not writable' }))).status, 200,
+        '(k5) a watch beat is accepted');
+      eq((await hit('mac beat: a real call', 'POST', '/api/mac/beat',
+        beat('final', { durationS: 12 }))).status, 200, '(k5) a call beat is accepted');
+
+      const recent = await hit('mac: recent calls', 'GET', '/api/mac/recent?n=50');
+      eq(recent.status, 200, '(k5) recent reads');
+      const calls = (recent.body?.calls ?? []).map((c) => c.call);
+      ok(!calls.includes('wbeatwatch'),
+        '(k5) the watcher heartbeat is NOT listed as a call — this is 1 zero-length call per Mac per half hour when it breaks');
+      ok(calls.includes('wbeatfinal'),
+        '(k5) and the real call still is — a filter that hid both would pass the line above and lose the dashboard');
+
+      const macs = await hit('mac: one row per Mac', 'GET', '/api/mac/macs');
+      eq(macs.status, 200, '(k5) /api/mac/macs reads');
+      const mine = (macs.body?.macs ?? []).find((m) => m.install === 'testmac000001');
+      ok(!!mine, '(k5) the Mac appears once, by install');
+      eq(mine?.version, '0.70.0', '(k5) carrying the version it last reported');
+      eq(mine?.update_stage, 'blocked', '(k5) and WHY it is not updating, which is the whole question');
+      eq(mine?.update_blocked, 'not writable', '(k5) with the reason, not just the verdict');
+      eq(mine?.watches, 1, '(k5) heartbeats counted');
+      eq(mine?.calls, 1, '(k5) and calls counted separately');
+    }
   } finally {
     await mf.dispose();
   }

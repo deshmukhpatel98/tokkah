@@ -517,6 +517,23 @@ enum Identity {
   }
 
   static func claim() {
+    // ── ONE GUARD, AT THE SOURCE ──────────────────────────────────────────────
+    //
+    // `TK_NO_IDENTITY` is how every rig avoids claiming a name on the PRODUCTION
+    // directory, and it was checked at the CALL SITES -- so it covered the ones
+    // somebody remembered and missed the rest. A watcher rig with the variable
+    // set, and with the watcher's own call site correctly skipped, still walked
+    // @devesh, @deveshp, @deveshpatel, @devesh2 ... @devesh9 against the live
+    // server, because a different path reached the ladder.
+    //
+    // A guard that has to be repeated at every caller is a guard that is one new
+    // caller away from being wrong. This is the ladder itself: nothing gets past
+    // it, whoever calls, and the call sites keep their checks for the messages
+    // they print rather than for the protection.
+    guard ProcessInfo.processInfo.environment["TK_NO_IDENTITY"] != "1" else {
+      fputs("identity: TK_NO_IDENTITY -- not claiming a handle\n", stderr)
+      return
+    }
     claimGate.lock()
     if claiming { claimGate.unlock(); return }   // one ladder at a time
     claiming = true
