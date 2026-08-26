@@ -5579,13 +5579,16 @@ func reportLoop() {
     // long time without crashing, and only because of its `guard line !=
     // warnText`: clearing something already clear returns before it touches
     // anything. It is one non-empty warning away from the same abort.
-    let room = audio.roomSpeakerOff
-    let mine = c.warnText.hasPrefix("You're in the same room")
-    if room || mine {
-      DispatchQueue.main.async {
-        c.setWarning(room ? "You're in the same room, so Kin turned this speaker off." : "")
-      }
-    }
+    //
+    // Its OWN slot, not the shared one. Written every second into the same pill
+    // `Display.setPaused` writes, these two sentences overwrote each other 150
+    // times in one rig run -- and because a new warning shows the control row,
+    // the row could never fade again. `setRoomWarning` states the fact and lets
+    // `CallControls` decide which sentence wins; stating it unconditionally is
+    // also what makes it clear itself, with no read-back of the pill to work out
+    // whether the last thing in it was ours.
+    c.setRoomWarning(audio.roomSpeakerOff
+                     ? "You're in the same room, so Kin turned this speaker off." : "")
     // The code both people read aloud. Only exists once the key exchange has
     // happened, and it is stable for the rest of the call.
     if let code = wire.crypto?.safetyCode { c.setSafetyCode(code) }

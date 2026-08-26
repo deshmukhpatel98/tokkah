@@ -2947,7 +2947,40 @@ final class CallControls: NSView {
   /// The guard and the log stay on the CALLING thread on purpose: `warnText` is
   /// the de-duplication and belongs with the caller's ordering, and a log line
   /// deferred to a main-queue hop would timestamp the wrong moment.
-  func setWarning(_ line: String) {
+  /// ── TWO WRITERS, ONE PILL, AND A ROW THAT NEVER FADED ────────────────────
+  ///
+  /// There is one warning pill and there were two independent writers for it:
+  /// `Display.setPaused` says what the far end's microphone, camera and link are
+  /// doing, and the report loop says whether the two of you are in one room. Each
+  /// republishes once a second, so with both true they overwrote each other
+  /// forever:
+  ///
+  ///     76  warning: their camera is off
+  ///     74  warning: You're in the same room, so Kin turned this speaker off.
+  ///
+  /// Every one of those 150 flips is a `showBar()`, and `showBar` re-arms the
+  /// 2.6 s stillness timer -- so the control row could never fade for the rest of
+  /// the call. Six of immersive-check's assertions failed and every one of them
+  /// named the fade, which is the symptom and not the fault. It took `--no-sameroom`
+  /// ranking 0 failures against 5 in three paired runs to place it here at all.
+  ///
+  /// Neither writer was wrong. A single-valued sink with two owners and no
+  /// precedence has no correct writer -- so the precedence is written down, once,
+  /// here. The room sentence wins: it explains something KIN has just done to the
+  /// sound, and in one room you can hear the other person with your own ears
+  /// whatever their microphone is doing.
+  ///
+  /// The pill only moves when the WINNER changes, so a slot updating underneath a
+  /// higher one costs nothing and cannot re-show the row.
+  private var warnPeer = ""
+  private var warnRoom = ""
+  /// What the far end's devices and link are doing. Every existing caller.
+  func setWarning(_ line: String) { warnPeer = line; renderWarning() }
+  /// Kin's own action on the sound. Outranks the above while it is non-empty.
+  func setRoomWarning(_ line: String) { warnRoom = line; renderWarning() }
+
+  private func renderWarning() {
+    let line = warnRoom.isEmpty ? warnPeer : warnRoom
     guard line != warnText else { return }
     warnText = line
     fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
