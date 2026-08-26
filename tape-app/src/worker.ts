@@ -4202,13 +4202,24 @@ export class Health implements DurableObject {
         cur.lastPhase = r.phase;
         if (r.phase === 'watch') cur.watches++;
         else if (r.phase === 'final') cur.calls++;
+        // ── FACTS ARE NESTED, AND READING THEM FLAT FOUND NOTHING ───────────
+        //
+        // Every beat carries `facts` and `events` as their own objects, so a
+        // flat `f['update_stage']` was always undefined and this view reported
+        // `stage: null` for every Mac -- while the beats it was reading had the
+        // stage in them the whole time. Read both: nested is where they live,
+        // and top level costs nothing to allow.
+        const facts = (f.facts ?? {}) as Record<string, unknown>;
+        const events = (f.events ?? {}) as Record<string, unknown>;
         for (const k of ['update_stage', 'update_blocked', 'update_offered',
                          'update_installed', 'reachable_closed', 'io', 'output_route']) {
-          if (f[k] !== undefined && f[k] !== null && f[k] !== '') {
-            cur[k] = f[k];
+          const v = facts[k] ?? f[k];
+          if (v !== undefined && v !== null && v !== '') {
+            cur[k] = v;
             if (k === 'update_stage') cur.update_stage_at = r.wall;
           }
         }
+        if (typeof events.update_checks === 'number') cur.update_checks = events.update_checks;
         byMac.set(r.install, cur);
       }
       const now = Date.now() / 1000;

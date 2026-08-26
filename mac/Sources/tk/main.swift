@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.72.0"
+let VERSION = "0.73.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -530,11 +530,26 @@ Metrics.fact("io_reason", Audio.ioPinned ? "pinned" : "route")
 // route, prints the decision and the reason, exits. No mic, no peer, no sound.
 if flag("audio-route") {
   let (name, speakers) = Audio.outputDevice()
-  let kind = Audio.ioPinned ? Audio.ioKind : (speakers ? "vp" : "hal")
+  // ── READ THE DECISION, DO NOT RECOMPUTE IT ────────────────────────────────
+  //
+  // This said `Audio.ioPinned ? Audio.ioKind : (speakers ? "vp" : "hal")` -- its
+  // own copy of the rule, next to the block that actually makes it. When the
+  // default changed from VoiceProcessingIO to the plain path, calls changed and
+  // this did not: the tool built to verify which path a call takes reported the
+  // OPPOSITE of what the app would do, on a machine already running the new
+  // build. Two places answering one question is how `reach()` and `status()`
+  // disagreed for twenty hours, in this same codebase.
+  //
+  // `Audio.ioKind` is the value the audio engine reads. So this reads it.
+  let kind = Audio.ioKind
   fputs("output: \(name)\n", stderr)
   fputs("route:  \(speakers ? "speakers -- sound leaves into the room" : "headphones -- no path back to the mic")\n", stderr)
-  fputs("io:     \(kind)\(Audio.ioPinned ? " (pinned by --io)" : " (chosen from the route)")\n", stderr)
-  fputs("echo:   \(kind == "vp" ? "cancelled by VoiceProcessingIO" : "no canceller -- the duplex gate only")\n", stderr)
+  fputs("io:     \(kind)\(Audio.ioPinned ? " (pinned by --io)" : " (the default)")\n", stderr)
+  let how = kind == "vp"
+    ? "cancelled by VoiceProcessingIO"
+    : "one at a time -- the non-speaker's mic is muted, floor "
+      + "\(Int(Audio.gate.floorDb)) dB reached in \(Int(Audio.gate.closeMs)) ms"
+  fputs("echo:   \(how)\n", stderr)
   exit(0)
 }
 

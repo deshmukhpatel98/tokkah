@@ -2435,8 +2435,20 @@ const DEV2 = await device('dev2');
         install: 'testmac000001', call: 'wbeat' + phase, version: '0.70.0',
         model: 'Mac16,10', phase, ...extra,
       });
+      // ── THE SHAPE THE APP ACTUALLY SENDS ──────────────────────────────────
+      //
+      // `facts` and `events` are their OWN objects on every beat this client
+      // has ever posted. The first version of this test invented a flat beat
+      // with `update_stage` at the top level, so it passed against a reader
+      // that only looked flat -- and the live view then reported `stage: null`
+      // for every Mac while the beats it was reading carried the stage the
+      // whole time. A fixture that is not the real shape tests the fixture.
       eq((await hit('mac beat: a watcher heartbeat', 'POST', '/api/mac/beat',
-        beat('watch', { update_stage: 'blocked', update_blocked: 'not writable' }))).status, 200,
+        beat('watch', {
+          uptime_s: 12,
+          facts: { update_stage: 'blocked', update_blocked: 'not writable' },
+          events: { update_checks: 4 },
+        }))).status, 200,
         '(k5) a watch beat is accepted');
       eq((await hit('mac beat: a real call', 'POST', '/api/mac/beat',
         beat('final', { durationS: 12 }))).status, 200, '(k5) a call beat is accepted');
@@ -2454,8 +2466,10 @@ const DEV2 = await device('dev2');
       const mine = (macs.body?.macs ?? []).find((m) => m.install === 'testmac000001');
       ok(!!mine, '(k5) the Mac appears once, by install');
       eq(mine?.version, '0.70.0', '(k5) carrying the version it last reported');
-      eq(mine?.update_stage, 'blocked', '(k5) and WHY it is not updating, which is the whole question');
+      eq(mine?.update_stage, 'blocked',
+        '(k5) and WHY it is not updating, which is the whole question — null here means facts were read flat');
       eq(mine?.update_blocked, 'not writable', '(k5) with the reason, not just the verdict');
+      eq(mine?.update_checks, 4, '(k5) and how many checks it has managed, from events');
       eq(mine?.watches, 1, '(k5) heartbeats counted');
       eq(mine?.calls, 1, '(k5) and calls counted separately');
     }

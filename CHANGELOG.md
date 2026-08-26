@@ -5,6 +5,39 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.73.0 — 2026-08-26
+
+### Fixed — two instruments that reported the opposite of the truth
+
+Both found by checking a shipped build rather than trusting it, and both are
+the same fault: a second copy of something, which then drifted.
+
+**`--audio-route` said `vp` on a build that runs `hal`.** It recomputed the
+rule -- `ioPinned ? ioKind : (speakers ? "vp" : "hal")` -- right next to the
+block that actually decides it. When 0.72.0 changed the default from
+VoiceProcessingIO to the plain path, calls changed and this did not, so the
+tool built to answer "which path will this call take" answered the opposite,
+on a machine already running the new build. It reads `Audio.ioKind` now, the
+same value the audio engine reads, and it names the floor and the switch time
+so the answer is checkable rather than just reassuring.
+
+Two functions answering one question is how `reach()` and `status()` disagreed
+for twenty hours in this same codebase.
+
+**`/api/mac/macs` reported `stage: null` for every Mac.** Every beat carries
+`facts` and `events` as their own objects; the view read `update_stage` flat,
+so it was always `undefined` — while the beats it was reading had the stage in
+them the whole time.
+
+The test did not catch it because the test invented its own beat, flat, and so
+tested the reader against a shape no client sends. It uses the real nested
+shape now, and restoring the flat reader fails exactly those two assertions.
+
+With both fixed, the fleet view answers the original question on sight: the
+MacBook Air on 0.72.0 heard from 3 minutes ago, the Mac mini still on 0.71.0
+and not heard from in 72 — two missed check-ins, which is asleep or a stopped
+watcher, and either way now visible instead of invisible.
+
 ## Kin 0.72.0 — 2026-08-26
 
 ### Changed — one at a time, properly this time
