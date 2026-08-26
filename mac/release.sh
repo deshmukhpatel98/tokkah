@@ -341,4 +341,39 @@ have="$(shasum -a 256 "$tmp" | awk '{print $1}')"
 rm -f "$tmp"
 [ "$want" = "$have" ] || { echo "FAILED: served tarball hashes $have, manifest promises $want"; exit 1; }
 echo "  manifest $VER, tarball fetched and hash matches"
+
+# ── AND TAG IT, BECAUSE FOR SIXTY-NINE VERSIONS NOTHING DID ─────────────────
+#
+# This script had no git in it at all. It built, signed, deployed and verified a
+# release and then left no mark in the history, so `git tag` returned nothing and
+# the releases API returned [] while OPENNESS.md scored the project full marks
+# for "tagged releases". Nobody was skipping a step; there was no step.
+#
+# It runs LAST, after the edge has served the manifest and the tarball has been
+# fetched back and hashed, so a tag means "this shipped and was verified" rather
+# than "somebody started a release". Nothing below can fail the release: it has
+# already happened, and a script that succeeds at shipping and then exits
+# non-zero teaches the operator to ignore its exit code.
+if [ "${NO_TAG:-}" = 1 ]; then
+  echo "  NO_TAG=1, not tagging"
+elif git rev-parse "v$VER" >/dev/null 2>&1; then
+  echo "  tag v$VER already exists, leaving it alone"
+else
+  if git tag -a "v$VER" -m "Kin $VER
+
+The release commit for $VER. What changed is in CHANGELOG.md under
+\"Kin $VER\"; the shipped binary can be checked against its signature
+with tools/verify-release.py." 2>/dev/null; then
+    echo "  tagged v$VER"
+    if git push origin "v$VER" >/dev/null 2>&1; then
+      echo "  pushed tag v$VER"
+    else
+      echo "  NOTE: could not push v$VER (wrong account? try: gh auth switch)."
+      echo "        The tag exists locally: git push origin v$VER"
+    fi
+  else
+    echo "  NOTE: could not create tag v$VER -- release is fine, tag it by hand"
+  fi
+fi
+
 echo "released $VER"
