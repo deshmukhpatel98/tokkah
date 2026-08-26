@@ -115,5 +115,27 @@ esac
   && say "FAIL" "the login item was left behind after turning it off" \
   || say "OK" "and nothing is left behind on disk"
 
+# ── AND WHICH KIN THIS IS, ON THE SCREEN ────────────────────────────────────
+#
+# Asked for because this app updates itself silently and the person testing it
+# had no way to tell which build was in front of them. Two Macs side by side
+# running different versions look identical and behave differently, and every
+# comparison drawn from that pair is worthless.
+#
+# Asserted against `--version`, not against a literal. A version printed in the
+# panel is only worth having if it is the version of the BINARY DRAWING IT; a
+# hardcoded string that has drifted is worse than no row at all, because it is
+# believed. This is the one assertion that has to compare two independent
+# readings of the same fact.
+SAYS="$(printf '%s' "$LAST" | grep -oE 'Version = [0-9][^]|]*' | sed 's/Version = //' | tr -d '[:space:]')"
+IS="$("$TK" --version 2>/dev/null | tr -d '[:space:]')"
+if [ -z "$SAYS" ]; then
+  say "FAIL" "no Version row in the panel -- there is no way to tell builds apart"
+elif [ "$SAYS" = "$IS" ]; then
+  say "OK" "the panel names this build, and it is the one running ($SAYS)"
+else
+  say "FAIL" "the panel says $SAYS and the binary is $IS -- a drifted version is believed"
+fi
+
 [ "$fail" = "0" ] && echo "WATCH CHECK: PASS" || echo "WATCH CHECK: FAIL"
 exit "$fail"

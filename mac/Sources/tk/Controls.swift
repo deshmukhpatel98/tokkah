@@ -4201,6 +4201,23 @@ final class CallControls: NSView {
     items.append(SheetHint(silent
       ? "Silent: nobody can ring you. To them you simply look away."
       : "Read it aloud. Same code on both screens means nobody is in the middle."))
+    // ── WHICH KIN THIS IS ─────────────────────────────────────────────────────
+    //
+    // Asked for directly, and the reason is worth writing down because it is not
+    // vanity: this app updates itself silently, so the person testing it has no
+    // way to know which build is in front of them. Two Macs side by side running
+    // different versions look identical and behave differently, and every
+    // conclusion drawn from that pair is worthless. It is the first thing to
+    // check before any comparison and it was not on the screen anywhere.
+    //
+    // Inert, like the encryption code above it: a fact about this copy, with
+    // nothing to press. Last in the panel because it is the thing you go looking
+    // for rather than the thing you come here to do. `describeTree` prints the
+    // sheet's rows, so a rig can assert the version on screen IS `VERSION`.
+    let ver = SheetRow("Version", glyph: Glyph.more)
+    ver.inert = true
+    ver.value = VERSION
+    items.append(ver)
     sheet.setItems(items)
   }
 
