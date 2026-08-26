@@ -33,8 +33,38 @@ def anchors(path):
         h = m.group(1).lower()
         h = re.sub(r"[`*_~\[\]()]", "", h)
         h = re.sub(r"[^\w\s-]", "", h)
-        out.add(re.sub(r"\s+", "-", h.strip()))
+        # ONE hyphen per whitespace CHARACTER, not per run. GitHub does not
+        # collapse them, and the difference is invisible until a heading
+        # contains punctuation between two spaces:
+        #   "Copyright and dual licensing — please read this part"
+        # loses the em-dash and keeps both spaces, so the real anchor is
+        # ...licensing--please... with two hyphens. Collapsing produced one,
+        # and this checker reported a perfectly good link as broken -- a
+        # false alarm being exactly as useless as a missed one.
+        out.add(re.sub(r"\s", "-", h.strip()))
     return out
+
+# ── CALIBRATE THE ANCHOR RULE BEFORE USING IT ────────────────────────────────
+# Two inputs it must rank DIFFERENTLY, and one it must get exactly right. A
+# slugger that is wrong in either direction turns this tool into noise.
+_probe = {
+    "Copyright and dual licensing \u2014 please read this part":
+        "copyright-and-dual-licensing--please-read-this-part",
+    "How a change gets accepted": "how-a-change-gets-accepted",
+    "`code` in a heading (and parens)": "code-in-a-heading-and-parens",
+}
+def _slug(t):
+    t = t.lower()
+    t = re.sub(r"[`*_~\[\]()]", "", t)
+    t = re.sub(r"[^\w\s-]", "", t)
+    return re.sub(r"\s", "-", t.strip())
+_wrong = {k: (_slug(k), v) for k, v in _probe.items() if _slug(k) != v}
+if _wrong:
+    for k, (got, want) in _wrong.items():
+        print("  CALIBRATION FAILED: %r -> %r, GitHub makes %r" % (k, got, want))
+    print("\nthe anchor rule is wrong; refusing to report on links")
+    sys.exit(2)
+print("anchor rule calibrated on %d known headings" % len(_probe))
 
 bad, ext_urls, checked = [], set(), 0
 for f in files:
