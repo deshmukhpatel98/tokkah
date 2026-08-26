@@ -32,9 +32,13 @@ import CryptoKit
 // silent to the person, because a handle they have not tried to use yet failing
 // to register is not news.
 enum Identity {
-  /// Rig override. Same shape as `Update.base` so there is one idiom for this.
-  static let base = ProcessInfo.processInfo.environment["TK_KIN_BASE"]
-    ?? "https://room.tokkah.com"
+  /// The signalling/API origin, resolved once in Server.swift.
+  ///
+  /// `TK_KIN_BASE` still does exactly what it always did -- it is layer 2 of the
+  /// order documented there, and every rig that sets it is unaffected. What is
+  /// new is that `--server` sits above it, so one flag moves this, the update
+  /// feed and the invite links together rather than three that can disagree.
+  static let base = Server.base
 
   // ── FORCING THE ANSWER THE SERVER ONLY GIVES WHEN IT FEELS LIKE IT ─────────
   //

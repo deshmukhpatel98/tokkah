@@ -4218,6 +4218,27 @@ final class CallControls: NSView {
     ver.inert = true
     ver.value = VERSION
     items.append(ver)
+    // ── AND WHAT IT IS ────────────────────────────────────────────────────────
+    //
+    // Kin is AGPL-3.0, and that gives the person running it rights: to the
+    // source, to change it, to run their own copy of the server it talks to.
+    // Until this row the only places that was said were a website they may never
+    // have visited and a line in `--help` they will never type. An app whose
+    // users cannot tell from inside it that it is free software is failing the
+    // standard that costs the least to meet.
+    //
+    // Inert, and directly under the version, because both are the same kind of
+    // thing: a fact about this copy with nothing to press. The repository goes in
+    // a hint rather than in the value slot -- that slot is one short
+    // right-aligned token, and a URL put there would be truncated into something
+    // nobody could type back in. `describeTree` prints rows AND hints, so a rig
+    // can assert both halves are actually on screen.
+    let lic = SheetRow("Licence", glyph: Glyph.more)
+    lic.inert = true
+    lic.value = "AGPL-3.0"
+    items.append(lic)
+    items.append(SheetHint("Free software. The source, and your right to run your own: "
+                         + "github.com/deshmukhpatel98/tokkah"))
     sheet.setItems(items)
   }
 

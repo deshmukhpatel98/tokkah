@@ -35,7 +35,7 @@ final class TurnClient {
     a.sin_addr.s_addr == turnAddr.sin_addr.s_addr && a.sin_port == turnAddr.sin_port
   }
 
-  static func fetch(base: String = "https://room.tokkah.com") -> TurnClient? {
+  static func fetch(base: String = Server.base) -> TurnClient? {
     guard let url = URL(string: "\(base)/api/mac/turn") else { return nil }
     var req = URLRequest(url: url)
     req.timeoutInterval = 4

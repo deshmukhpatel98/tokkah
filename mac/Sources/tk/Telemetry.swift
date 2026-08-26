@@ -21,7 +21,7 @@ import Foundation
 //     "six Macs, one call each".
 enum Telemetry {
   nonisolated(unsafe) static var enabled = true
-  nonisolated(unsafe) static var endpoint = "https://room.tokkah.com/api/mac/beat"
+  nonisolated(unsafe) static var endpoint = Server.base + "/api/mac/beat"
   /// Where a crash goes. Its own route because a crash is not a beat: it belongs
   /// to a PREVIOUS process, it is stored in its own table, and it must not be
   /// rate limited into oblivion by a machine that is also making calls.
@@ -30,7 +30,7 @@ enum Telemetry {
   /// the single control and a rig pointing beats at a local sink cannot
   /// accidentally leave crashes going to production -- which is the shape of
   /// mistake that has sent rig traffic to the real server before.
-  nonisolated(unsafe) static var crashEndpoint = "https://room.tokkah.com/api/mac/crash"
+  nonisolated(unsafe) static var crashEndpoint = Server.base + "/api/mac/crash"
   static func aimAt(_ beat: String) {
     endpoint = beat
     crashEndpoint = beat.hasSuffix("/beat") ? String(beat.dropLast(4)) + "crash" : beat

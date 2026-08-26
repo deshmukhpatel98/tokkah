@@ -236,6 +236,15 @@ if flag("watch") {
   // The telemetry settings have to be applied here too. They live several
   // hundred lines below as well, so `--no-telemetry` was already inert on this
   // path -- a rig watcher would have posted to the production endpoint.
+  // And the server config has to be validated here too, for the same reason and
+  // it is the same shape of bug: `Watch.run` never comes back, so the check that
+  // main.swift does below the unknown-flag guard is unreachable from this path.
+  // The watcher is the process that rings, so a `server.json` this build cannot
+  // read would make a self-hoster's Mac silently stop receiving calls -- which is
+  // indistinguishable from nobody calling.
+  for problem in Server.check() { fputs("server: \(problem)\n", stderr) }
+  if !Server.check().isEmpty { exit(2) }
+  if Server.selfHosted { fputs("server: \(Server.describe())\n", stderr) }
   if flag("no-telemetry") { Telemetry.enabled = false }
   if let e = arg("tel-endpoint") { Telemetry.aimAt(e) }
   if Telemetry.enabled { Thread { Crash.begin() }.start() }
@@ -275,6 +284,17 @@ if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-
     --no-update        do not check for a newer version
     --version          print the version and exit
     --help             print this and exit
+
+  Your own server, instead of ours -- SELF-HOSTING.md is the walkthrough:
+
+    --server <url>     signalling, updates and invite links, all from your deployment
+    --update-key <b64> the Ed25519 public key that signs YOUR releases. Without it
+                       Kin installs nothing from your server: it will not run code
+                       it cannot check the signature of, and there is no flag for
+                       that. Base64 or hex, 32 bytes.
+    --save-server      remember those on this Mac, and exit (for a double-clicked app)
+    --forget-server    go back to the built-in server, and exit
+    --server-print     print which server this copy would use, and exit
 
   Everything else is a measurement or impairment switch; the source is the reference
   and an unknown option is refused rather than ignored. AGPL-3.0, tokkah.com.
@@ -373,6 +393,11 @@ let KNOWN_FLAGS: Set<String> = [
   "headphone-test", "route", "contacts-fake",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
+  // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
+  // `update-key` is registered here rather than being read straight out of the
+  // environment for the usual reason: a security control whose flag is a silent
+  // no-op is worse than no flag, because it reads as configured.
+  "server", "update-key", "save-server", "forget-server", "server-print",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -429,6 +454,35 @@ for a in CommandLine.arguments.dropFirst() where a.hasPrefix("--") {
       + " without the thing it is named after is worse than no arm at all.\n", stderr)
   exit(2)
 }
+
+// ── WHICH SERVER THIS COPY TALKS TO ────────────────────────────────────────
+//
+// Below the unknown-flag guard, so `--sever` is refused rather than ignored, and
+// above everything that opens a device, a socket, a window or the identity --
+// the same placement, for the same reason, as `--permissions`.
+//
+// The exit matters more than it looks. `--server kin.example.com`, with the
+// scheme forgotten, makes every `URL(string:)` in Stun, Turn, Telemetry and
+// Update return nil, and every one of those is a `return nil` that is
+// indistinguishable from a network that is simply down. Without this, a typo
+// would present as an outage -- an app that starts, connects to nothing, and
+// says nothing about why. So it is a sentence, at startup, and exit 2.
+let serverProblems = Server.check()
+if !serverProblems.isEmpty {
+  for p in serverProblems { fputs("server: \(p)\n", stderr) }
+  fputs("refusing to start against a server address this build cannot use.\n", stderr)
+  exit(2)
+}
+// A switch that changes where the app sends everything must not be silent. Gated
+// on `selfHosted` rather than on "differs from the default" on purpose: every rig
+// in mac/tools sets TK_KIN_BASE or TK_UPDATE_BASE, and none of them needs a new
+// line in a log some other script is reading.
+if Server.selfHosted { fputs("server: \(Server.describe())\n", stderr) }
+// Same contract as --version: print, exit, touch nothing. This is also the
+// command that proves the default is still the default -- see SELF-HOSTING.md.
+if flag("server-print") { print(Server.report()); exit(0) }
+if flag("save-server") { fputs(Server.save() + "\n", stderr); exit(0) }
+if flag("forget-server") { fputs(Server.forget() + "\n", stderr); exit(0) }
 
 // ── ARE YOU TWO IN THE SAME ROOM? THE RULER, BEFORE ANY OF THE PRODUCT ─────
 //
@@ -857,7 +911,18 @@ if let e = arg("tel-endpoint") { Telemetry.aimAt(e) }
 // machine that has not crashed, and the common case reads no files at all. See
 // Crash.swift for how it stays that cheap, and for why it never asks what the
 // process was called.
-if Telemetry.enabled { Thread { Crash.begin() }.start() }
+//
+// ── AND NOT ON A TEST RUN ──────────────────────────────────────────────────
+//
+// `isTestRun` already excuses `--*-test` from the updater, the identity claim,
+// the login item and the media port, for one reason: a unit test must not touch
+// the machine it is measured on. This was the hole left in that -- every
+// `tk --gate-test` opened the crash ledger in the user's Application Support,
+// read the machine's DiagnosticReports, and could post to the PRODUCTION
+// telemetry endpoint. `--no-telemetry` was the only thing standing in front of
+// it, which makes staying off production the caller's job to remember, and a
+// safety property that depends on a second flag is one that is off by default.
+if Telemetry.enabled, !isTestRun { Thread { Crash.begin() }.start() }
 // EVERY ORDINARY ENDING CLOSES THE BOOKS, not just the ones that file a beat.
 // `postFinalBeat` covers Leave, Ctrl-C, SIGTERM and a re-exec; this covers the
 // rest of the `exit()` calls in this file -- a bind that failed, a rendezvous
@@ -978,9 +1043,9 @@ func roomURL(_ room: String) -> String {
     // is meant to be read by a person before it is followed by a browser.
     var ok = CharacterSet.alphanumerics; ok.insert(charactersIn: "-_")
     let esc = room.addingPercentEncoding(withAllowedCharacters: ok) ?? room
-    return "https://kin.tokkah.com/?r=\(esc)"
+    return "\(Server.invite)/?r=\(esc)"
   }
-  return "https://kin.tokkah.com/\(room)"
+  return "\(Server.invite)/\(room)"
 }
 func inviteText(room: String) -> String { roomURL(room) }
 
@@ -3408,15 +3473,29 @@ if flag("decimator-test") {
 }
 
 if flag("yield-test") {
+  // BEFORE anything reads `Audio.gate`. See `applyGateFlags` for what ran the
+  // wrong arm for how long.
+  applyGateFlags()
   var bad = false
   func show(_ what: String, _ got: String, _ want: String, _ ok: Bool) {
     print("  \(what.padding(toLength: 46, withPad: " ", startingAt: 0)) \(got.padding(toLength: 14, withPad: " ", startingAt: 0)) (want \(want))  \(ok ? "ok" : "WRONG")")
     if !bad { bad = !ok }
   }
+  // Was a hardcoded 450, which is the default -- so `--yield-after` moved the
+  // duck's config and not the threshold these assertions actually exercise, and
+  // half the arm was still the control. Reads the same 450 when nothing is
+  // passed, and the line below now prints which number it used.
   func y(_ ms: Double, _ gap: Double?, _ owed: Double) -> Bool {
-    Audio.Yield.shouldYield(collisionMs: ms, gapMs: gap, owed: owed, afterMs: 450)
+    Audio.Yield.shouldYield(collisionMs: ms, gapMs: gap, owed: owed,
+                            afterMs: Audio.gate.yieldAfterMs)
   }
   func yn(_ b: Bool) -> String { b ? "ducks" : "left alone" }
+
+  // THE NUMBER ON THE LINE. The defect above was invisible for exactly one
+  // reason: a -9 run and a -12 run printed the same page. An arm that does not
+  // state what it is cannot be caught being something else.
+  print("  yield config: yieldDb=\(Audio.gate.yieldDb) yieldAfterMs=\(Audio.gate.yieldAfterMs)"
+      + " yieldOn=\(Audio.gate.yieldOn)")
 
   // Brief overlap is what conversation sounds like.
   show("200 ms of overlap, they were first", yn(y(200, -400, 0)), "left alone", !y(200, -400, 0))
@@ -3492,11 +3571,30 @@ if flag("yield-test") {
 // things that touch it. The duck is not part of the gate -- it survives on
 // headphones, where the gate does not -- so leaving it on here would make
 // "no gate" a measurement of audio that something else was still attenuating.
-if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false; Audio.gate.yieldOn = false }
-if flag("no-yield") { Audio.gate.yieldOn = false }
-if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
-if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
-if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
+// ── A FLAG APPLIED AFTER THE TEST THAT READS IT IS NOT A FLAG ──────────────
+//
+// These were seven straight-line statements here, and `--yield-test` lives
+// ninety lines ABOVE them and exits before reaching any of it. So
+// `tk --yield-test --yield-db -12` ran the -9 duck, printed PASSED, and was
+// labelled the -12 arm -- an arm compared against itself, which is the exact
+// class that has already cost this project three A/Bs and has its own law.
+//
+// A function called from here AND from the top of the test, rather than the
+// block moved: this file is top-level code whose ordering has caught me twice,
+// and moving it would change when `--route` is validated relative to everything
+// between. Every line is a pure assignment read out of argv, so calling it twice
+// is the same as calling it once, and a run passing none of these flags does
+// exactly what it did before.
+func applyGateFlags() {
+  if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false; Audio.gate.yieldOn = false }
+  if flag("no-yield") { Audio.gate.yieldOn = false }
+  if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
+  if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
+  if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
+  if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
+  if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
+}
+applyGateFlags()
 // `--route headphones` on a machine with no headphones. The route decides the
 // classifier, the cues, the captions and the cleaner, so it has to be reachable
 // from a rig or half the product is only ever unit-tested.
@@ -3506,8 +3604,9 @@ if let r = arg("route") {
   }
   Audio.routeForced = (r == "speakers")
 }
-if let v = arg("gate-floor"), let d = Double(v) { Audio.gate.floorDb = d }
-if let v = arg("gate-margin"), let d = Double(v) { Audio.gate.margin = Float(d) }
+// (`--gate-floor` and `--gate-margin` moved up into `applyGateFlags` above.
+// Nothing between here and there reads `Audio.gate`, and `--route` does not
+// touch it, so the state this file ends up in is unchanged.)
 
 // ── THE SAME CALL, WITH HEADPHONES ON ─────────────────────────────────────
 //

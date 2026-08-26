@@ -184,7 +184,7 @@ enum Rendezvous {
   /// event returns the same value as a real negative. So the two answers are two
   /// values, and the caller that only wants to keep waiting still writes `?? []`.
   static func exchange(room: String, me: String, addr: String?, local: String? = nil,
-                       relay: String? = nil, base: String = "https://room.tokkah.com") -> [Peer]? {
+                       relay: String? = nil, base: String = Server.base) -> [Peer]? {
     var u = "\(base)/api/room/\(room)/rv?me=\(me)"
     if let a = addr { u += "&addr=\(a)" }
     if let l = local { u += "&local=\(l)" }

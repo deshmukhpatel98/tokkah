@@ -137,5 +137,34 @@ else
   say "FAIL" "the panel says $SAYS and the binary is $IS -- a drifted version is believed"
 fi
 
+# ── AND THAT THE APP SAYS WHAT IT IS ────────────────────────────────────────
+#
+# One step further out than the row above, and the same failure mode. Kin is
+# AGPL software: the person running it may read the source, change it, and run
+# their own copy of the server it talks to. Rights nobody can tell they have are
+# rights nobody uses, and until this row the only places that was said were a
+# website they may never have opened and a line in `--help` they will never type.
+#
+# Read out of the same `describeTree` dump as the version, because "it is in the
+# source" and "it reached the screen" are two claims and only the second one is
+# worth anything -- this file exists because a control that was declared and
+# never wired passed every check that read the code.
+LIC="$(printf '%s' "$LAST" | grep -oE 'Licence = [^]|]*' | sed 's/Licence = //' | tr -d '[:space:]')"
+if [ -z "$LIC" ]; then
+  say "FAIL" "no Licence row in the panel -- nothing in the app says it is free software"
+elif [ "$LIC" = "AGPL-3.0" ]; then
+  say "OK" "the panel names the licence ($LIC)"
+else
+  say "FAIL" "the panel says the licence is $LIC"
+fi
+# The repository, which is the half the licence is useless without. It lives in
+# the sheet's HINTS, outside the bracket `sheets()` captures, so it is read from
+# the log directly rather than from $LAST.
+if grep -qE 'hints=\[[^]]*github\.com/deshmukhpatel98/tokkah' "$SP/b.log"; then
+  say "OK" "and where to get the source"
+else
+  say "FAIL" "the licence row names no source -- an AGPL right nobody can act on"
+fi
+
 [ "$fail" = "0" ] && echo "WATCH CHECK: PASS" || echo "WATCH CHECK: FAIL"
 exit "$fail"

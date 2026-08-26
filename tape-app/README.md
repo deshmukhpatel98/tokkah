@@ -17,6 +17,53 @@ If that's right, a call that keeps those cues should show a human response time 
 
 ---
 
+## This Worker is also Kin's backend
+
+Read this before following anything below it: the sections after this one describe
+the **browser** call app, and they were written before the macOS app existed. The
+same `src/worker.ts` now serves both.
+
+**If you want to run your own copy of Kin, the walkthrough is
+[`SELF-HOSTING.md`](../SELF-HOSTING.md) at the repo root.** It covers the app side
+too — the `--server` flag, the update signing key, and what is genuinely not
+self-hostable. This file is the browser app's own README and is kept for that.
+
+Two corrections to what follows, both from `wrangler.jsonc`:
+
+- the Worker is named **`tokkah`**, so `npx wrangler deploy` gives you
+  `https://tokkah.<your-subdomain>.workers.dev`, not `tape-app.<...>`;
+- there are now **two** Durable Objects — `ROOM` → class `Room` (per-room
+  signalling and logs, as described below) and `HEALTH` → class `Health` (the
+  telemetry store) — plus an R2 bucket binding `MACREL` → `tokkah-mac`, which
+  serves macOS release downloads. Create the bucket yourself
+  (`npx wrangler r2 bucket create tokkah-mac`) or the `/macos/dl/...` route
+  answers `503 {"error":"releases not configured"}`. Nothing else needs it.
+
+### The routes the macOS app uses
+
+| Route | What it does |
+|---|---|
+| `GET /api/room/<room>/rv` | Rendezvous. Publishes this Mac's address and returns the other peer's. In-memory in the `Room` DO, 90-second lease, never persisted. |
+| `GET /api/mac/turn` | Mints Cloudflare TURN credentials. Returns `{"ok":false,"p2pOnly":true}` when `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` are unset — the app then goes peer-to-peer only. |
+| `POST /api/mac/beat` | Call-quality telemetry → `Health` DO SQLite (`mac_beats`, 7-day retention). Never carries the room name. |
+| `POST /api/mac/crash` | Crash reports → `mac_crashes`, 30-day retention. Its own rate budget. |
+| `/macos/manifest.json`, `.sig` | The signed update feed. **Static assets** in `public/macos/`, so they ship with `wrangler deploy`, not with an R2 upload. |
+| `/macos/dl/<file>` | The release tarball/DMG, streamed from the `MACREL` R2 bucket. |
+| `/macos/calls` | The telemetry dashboard. **Public unless `MAC_DASH_KEY` is set** — see the warning in `SELF-HOSTING.md`. |
+
+### Secrets, beyond the two TURN ones below
+
+`MAC_DASH_KEY` (gates the dashboard — set it), `LOG_ADMIN_TOKEN` (operator reads),
+`LAB_KEY` (the live-lab channel), and `GEMINI_API_KEY` / `ELEVENLABS_API_KEY` /
+`ANTHROPIC_API_KEY` for the translation paths. All optional; a deploy with none of
+them set still does rendezvous, invites and telemetry ingest.
+
+> `npm run deploy:prod` and `mac/release.sh` both pass `-c wrangler.prod.jsonc`.
+> That file is **not in this repo** — it is the same shape plus a custom-domain
+> route for `room.tokkah.com`. Use plain `npx wrangler deploy`.
+
+---
+
 ## Before the call
 
 ### 1. Deploy it. Localhost will not work.

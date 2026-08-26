@@ -207,7 +207,7 @@ enum Menu {
         .applicationVersion: v,
         .credits: NSAttributedString(
           string: "A video call that tries to be as fast as light allows.\n"
-                + "kin.tokkah.com",
+                + Server.inviteHost,
           attributes: [.font: NSFont.systemFont(ofSize: 11)]),
       ])
     }

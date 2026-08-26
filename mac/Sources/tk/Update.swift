@@ -20,14 +20,60 @@ import Foundation
 // so an install and an update over curl never meet Gatekeeper and need no Apple
 // Developer ID. The signature above is ours and does the job Apple's would.
 enum Update {
+  /// The key this app SHIPS with, and the trust root for every release ever
+  /// installed by a copy of it. Still compiled in, still the default, and still
+  /// the only key in play unless this run was launched with `--update-key`.
   static let publicKeyHex = "d07822edb36c8692c83f3478c26683102cd3cf6fb1d0c263496404c15fd95b2a"
-  /// Overridable for the update-path test rig ONLY. Safe to expose: everything
-  /// fetched from here is Ed25519-verified against the compiled-in key before a
-  /// byte of it is trusted, so pointing base somewhere else cannot inject code --
-  /// it can only offer updates the real key signed. An attacker who can set our
-  /// environment can already run code as us.
-  static let base = ProcessInfo.processInfo.environment["TK_UPDATE_BASE"]
-    ?? "https://room.tokkah.com/macos"
+
+  /// The key THIS RUN verifies with: a self-hoster's, if they supplied one, and
+  /// the shipped one otherwise.
+  ///
+  /// Optional, and nothing below is allowed to proceed without it. There is no
+  /// branch here that treats "no usable key" as "skip the check" -- that is the
+  /// single bug in an updater that ends with somebody else's code running as the
+  /// user, so it fails closed, loudly, and with no flag that changes its mind.
+  static let publicKey: Curve25519.Signing.PublicKey? = {
+    guard let raw = Server.updateKeyRaw ?? hex(publicKeyHex) else { return nil }
+    return try? Curve25519.Signing.PublicKey(rawRepresentation: raw)
+  }()
+
+  /// Where releases are fetched from. Resolved once, in Server.swift.
+  ///
+  /// `TK_UPDATE_BASE` is unchanged and still means exactly what it meant: the
+  /// update-path rig's override. Safe to expose for the reason it always was --
+  /// everything fetched from here is Ed25519-verified before a byte of it is
+  /// trusted, so pointing it elsewhere cannot inject code, only offer releases
+  /// the key already trusted signed. `mac/tools/update-check.sh` depends on that
+  /// and signs its own manifests with the real key; moving it would delete the
+  /// only end-to-end proof this updater has.
+  static let base = Server.updates
+
+  // ── A SERVER WE CANNOT CHECK IS A SERVER WE DO NOT INSTALL FROM ───────────
+  //
+  // `--server https://kin.example.com` points a self-hoster's copy at their own
+  // release feed. Their releases are signed with THEIR key, which this build does
+  // not have -- so every manifest they serve fails the signature check below, and
+  // fails it correctly.
+  //
+  // What was wrong was the SENTENCE. The refusal that came out was "an update was
+  // refused because it wasn't signed by Kin" -- the wording for an attack in
+  // progress, put in front of somebody whose only mistake was not passing a
+  // second flag. So the case is NAMED, before the fetch, instead of being
+  // discovered after it.
+  //
+  // This is not a way past the gate and it does not make verification
+  // conditional. It is an extra refusal in FRONT of a check that still runs,
+  // unchanged, on every byte that gets past it. It can only ever turn an install
+  // into a no-op, never a no-op into an install. There is still no flag that
+  // skips a signature and there is still no unsigned path.
+  private static var cannotVerifyReason: String? {
+    guard Server.updatesSelfHosted, Server.updateKeyRaw == nil else { return nil }
+    return "pointed at \(base) for updates with no key to check it against"
+         + " -- this build has only Kin's own update key, which did not sign that"
+         + " server's releases. Pass --update-key <base64> (or set TK_UPDATE_KEY)"
+         + " with the public half of the key that signs \(base)/manifest.json."
+         + " Nothing will be installed until then."
+  }
 
   // ── AN UPDATER THAT COULD NOT REPORT ITS OWN FAILURE ───────────────────────
   //
@@ -185,6 +231,10 @@ enum Update {
   /// so they are now five different lines -- see the Reach comment above for why
   /// only some of them reach the window.
   static func available(current: String) -> (Manifest, Data)? {
+    if let why = cannotVerifyReason {
+      tell(why, "Kin isn’t set up to install updates from your own server", .act)
+      return nil
+    }
     guard let mData = get("\(base)/manifest.json") else {
       tell("cannot reach \(base) for manifest.json", "couldn’t check for updates", .answer)
       return nil
@@ -208,12 +258,15 @@ enum Update {
            "couldn’t check for updates", .answer)
       return nil
     }
-    guard let pkRaw = hex(publicKeyHex),
-          let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkRaw) else {
-      // Unreachable unless the constant at the top of this file is edited wrong,
-      // and precisely because of that it must not be silent: a build in this state
-      // can never accept any release again, and would look like a Mac that simply
-      // stopped receiving updates.
+    guard let pk = publicKey else {
+      // Unreachable unless the constant at the top of this file is edited wrong.
+      // A bad `--update-key` cannot land here either: a value that is not 32 bytes
+      // is refused by Server.check() at startup, before anything opens a socket,
+      // because "the key did not parse" must never quietly become "use the shipped
+      // key instead" -- that would restore the exact trust root the person was
+      // replacing. And precisely because this is unreachable it must not be
+      // silent: a build in this state can never accept any release again, and
+      // would look like a Mac that simply stopped receiving updates.
       tell("the compiled-in public key does not parse -- this build can never verify a release",
            "Kin can’t check for updates — please install it again", .act)
       return nil
@@ -591,12 +644,14 @@ enum Update {
           + " microphone; the next release brings both halves at once\n", stderr)
       return
     }
+    if let why = cannotVerifyReason {
+      fputs("update: \(why)\n", stderr); return
+    }
     guard let mData = get("\(base)/manifest.json"),
           let sigB64 = get("\(base)/manifest.json.sig"),
           let sig = Data(base64Encoded: String(decoding: sigB64, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)),
-          let pkRaw = hex(publicKeyHex),
-          let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkRaw),
+          let pk = publicKey,
           pk.isValidSignature(sig, for: mData),
           let m = try? JSONDecoder().decode(Manifest.self, from: mData)
     else { fputs("update: cannot verify manifest -- leaving the bundle alone\n", stderr); return }
