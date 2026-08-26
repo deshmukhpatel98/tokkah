@@ -1,0 +1,44 @@
+version = 1
+SPDX-PackageName = "Kin"
+SPDX-PackageSupplier = "Devesh Patel <devesh.patel0922@gmail.com>"
+SPDX-PackageDownloadLocation = "https://github.com/deshmukhpatel98/tokkah"
+
+# Licensing declared centrally rather than as a header in every file.
+#
+# REUSE (https://reuse.software) accepts either. This project chose the central
+# form on purpose: nearly every source file here opens with a long comment
+# explaining why the code below it exists and what measurement forced it, and
+# those first lines are the most-read part of the codebase. Two lines of legal
+# boilerplate above each one would push the actual reason down the screen 266
+# times over. The rights are identical either way; only the reading is worse.
+#
+# Why AGPL-3.0-only and not -or-later: the project has never written "or any
+# later version" anywhere. LICENSE is the AGPL v3 text and NOTICE names v3.0
+# specifically, so -only is the transcription of what is actually stated. If a
+# later AGPL is ever adopted, adding it is a grant and can be done at any time;
+# it is the other direction that cannot.
+#
+# ATTRIBUTION.md carries additional terms under AGPL section 7 (credit the
+# project in your legal-notices screen). Section 7 terms live inside AGPL-3.0
+# rather than beside it, so the SPDX identifier is unchanged -- but read that
+# file, because it is a real obligation and it is a short one.
+#
+# A commercial license is available as an alternative to the AGPL entirely:
+# LICENSE-COMMERCIAL.md.
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Devesh Patel"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# The license text is the FSF's work, not ours, so the copyright line has to say
+# so. Files under LICENSES/ are exempt from needing licensing info at all under
+# the REUSE spec; this block exists for the root LICENSE, which is the copy
+# GitHub reads to detect the license, and which would otherwise be swept up by
+# the "**" rule above and credited to the wrong author.
+[[annotations]]
+path = "LICENSE"
+precedence = "override"
+SPDX-FileCopyrightText = "2007 Free Software Foundation, Inc. <https://fsf.org/>"
+SPDX-License-Identifier = "AGPL-3.0-only"

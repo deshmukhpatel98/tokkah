@@ -2,8 +2,9 @@
   "name": "tokkah",
   "private": true,
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
-  "description": "1:1 video calls with bit-exact lossless audio, visually lossless video, and sub-10ms packet repair \u2014 on a single Cloudflare Worker.",
+  "description": "1:1 video calls with bit-exact lossless audio, visually lossless video, and sub-10ms packet repair — on a single Cloudflare Worker.",
   "scripts": {
     "dev": "wrangler dev --port 8794",
     "deploy": "wrangler deploy",

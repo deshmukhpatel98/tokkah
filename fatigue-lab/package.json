@@ -2,6 +2,7 @@
   "name": "tape-fatigue-lab",
   "private": true,
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "description": "A/B lab for the six causes of Zoom fatigue (DESIGN.md §1.1), on ordinary WebRTC transport.",
   "scripts": {
     "dev": "wrangler dev --port 8793",

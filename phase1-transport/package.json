@@ -2,6 +2,7 @@
   "name": "tape-phase1-transport",
   "private": true,
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "description": "Phase 1 decision gate: can an unordered/unreliable RTCDataChannel sustain 12 Mbps at realistic RTT?",
   "scripts": {
     "dev": "wrangler dev",

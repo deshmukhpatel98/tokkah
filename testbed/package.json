@@ -1,6 +1,7 @@
 {
   "name": "testbed",
   "version": "1.0.0",
+  "license": "AGPL-3.0-only",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -8,7 +9,6 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "node-turn": "^0.0.6",
