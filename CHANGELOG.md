@@ -5,6 +5,90 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.71.0 — 2026-08-26
+
+### Fixed — the echo, which every call has had since the first one
+
+Reported as echo on both ends, "ear deafening". The telemetry had been saying
+so all along and nobody had asked it: across every reported call `aec_on` was
+**0** and `output_route` was **speakers**. Nobody has ever been on headphones,
+so the acoustic path from speaker to microphone was open on both ends of every
+call this app has ever made, with nothing behind it.
+
+The duplex gate was what stood in for a canceller, and the comment above
+`ioKind` already admitted the hole: it "only ever acts while the near end is
+NOT speaking", so "echo during double talk is not solved by this and is the
+honest gap". Two people on speakers is that gap. And in the field the gate was
+not even winning the easy half — `floor_held_pct` is **85–99.7% on both ends**
+of every call over 15 s, so neither side was ever gated, with `turn_collisions`
+reaching 39 in a four-minute call.
+
+The route decides now, because the route is what makes the echo:
+
+| output | audio path | why |
+|---|---|---|
+| speakers | `VoiceProcessingIO` | the unit FaceTime uses; real cancellation |
+| headphones | `HAL`, unchanged | no path back to the mic, so nothing in the way |
+
+**Measured, not argued.** New [mac/tools/io-ab.sh](mac/tools/io-ab.sh) runs both
+ends locally, four arms in alternating order so machine drift cannot read as an
+effect, and asserts each arm ran the unit it is named after. The canceller costs
+**+7.61 ms** mouth-to-ear against **4.23 ms** of rig noise — 1.8× the noise, so
+real — landing in device latency (mic 1.88 → 4.21 ms, speaker 2.58 → 4.92 ms).
+Against a 150 ms budget and calls currently at 19 ms, that is the cheapest fix
+available for a call nobody can hold.
+
+`--io hal` still pins the old behaviour; `--io vp` pins the new one. New
+`--audio-route` answers which way a call will go **without starting one** —
+every previous way to find out ran `tk` with no `--room`, which joins a loopback
+peer and opens the microphone.
+
+### Added — telemetry for the stages that had none
+
+The updater recorded **nothing**: 0 `Metrics.` calls in 1200 lines. The only
+machine-readable trace of an update was the version changing on the next call
+somebody happened to make, so a Mac that updated late and a Mac that made no
+calls looked identical — the exact pair that had to be told apart. There is now
+an `update_stage` fact (current, offered, downloading, staged, held-for-call,
+blocked, installed, unreachable, bad-signature, download-failed), counters, and
+`installBlocker`'s reason on the wire.
+
+The background watcher now files a **210-byte** beat on every update check, so a
+Mac reports 48 times a day whether or not anybody calls on it. `phase: "watch"`
+is a real third phase server-side, kept out of the call listings. New
+`/api/mac/macs` gives one row per Mac: last seen, version, update stage, blocked
+reason.
+
+The join had one mark for five phases, so a 2.5 s p50 was a total with no parts.
+Now `stun_ms`, `peer_found_ms`, `turn_ms`, `turn_blocked_ms`, `join_polls` — and
+they immediately refuted the first theory they were built to test. The 20 s TURN
+barrier above the media loop looked like the cause; measured, `turn_blocked_ms`
+is **6 ms** (TURN finishes at 323 ms, the peer is not found until 336 ms). They
+also showed `connected_ms` is two numbers wearing one name: split by role, the
+callee is **p50 2482 ms** — the reported "2–3 seconds" — while the mixed figure
+of 3127 ms was inflated by callers counting the seconds the other person took to
+pick up.
+
+### Fixed — analytics that cost latency would be a defect, so it is enforced now
+
+`Metrics.swift` has always said nothing there may lock on the audio path — the
+SIGSEGV that ended live calls came from a Swift collection touched by the audio
+thread. What kept it true was everybody remembering, which is a habit and not a
+property. The render callback identifies its thread once, and `tap`/`mark`/
+`count`/`fact` now return **without taking the lock** when called on it.
+`tel_hot_refused` rides out on the beat, so a mark added to a hot path in future
+is a number rather than an unexplained stall. Zero on every build today.
+
+### Fixed — a rig could not be isolated from the production directory
+
+`TK_NO_IDENTITY` was declared 260 lines below the `--watch` block, and
+`Watch.run` returns `Never` — so the guard was unreachable from the one process
+whose job is claiming a handle. A watcher rig walked @devesh through @devesh9
+against the live server on every run. Guarding the call sites was not enough
+either: the watcher's own site was correctly skipped and a different path still
+reached the ladder. The guard is now inside `Identity.claim()`, where nothing
+gets past it.
+
 ## Kin 0.70.0 — 2026-08-26
 
 ### Fixed — a Mac that stopped answering calls, and never said so
