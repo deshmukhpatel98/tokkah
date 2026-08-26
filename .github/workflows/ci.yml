@@ -238,6 +238,18 @@ jobs:
       # it is named after. This asserts the guard still works, so a future
       # rename cannot quietly turn twelve self-tests into twelve runs of the
       # default program.
+      # The doorbell: can this Mac still be rung once Kin is closed, and does
+      # the app KNOW when it cannot? Two outages came out of that pair, and the
+      # second one was invisible for twenty hours because `Watch.reach()` read
+      # an exit code that says "registered" and called it "running".
+      #
+      # It installs a real LaunchAgent under its own throwaway label, so it
+      # needs a launchd session. If the runner has none it says so and exits 0 --
+      # printed, never silent, because a skip that reads like a pass is how this
+      # class survives in the first place.
+      - name: The doorbell still answers when Kin is closed
+        run: bash tools/doorbell-check.sh
+
       - name: A misspelled flag is refused, not ignored
         run: |
           set -uo pipefail

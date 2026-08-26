@@ -376,6 +376,7 @@ let KNOWN_FLAGS: Set<String> = [
   // to kill the app. Same family as silent-no-op-flags, one worse.
   "no-ring-preview", "incoming-key",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
+  "callee-away",
   // A call that outlives its process is on by default and has to be switchable
   // off, because the negative arm of its own rig is "the same crash, and it does
   // NOT come back" -- a rig that cannot run the control is measuring nothing.
@@ -1916,7 +1917,8 @@ if let from = arg("incoming"), let r = arg("room") {
 // rung, was the one thing the re-exec threw away.
 if let who = arg("calling") {
   gCalling = (who, arg("room") ?? "")
-  DispatchQueue.main.async { display?.controls?.showOutgoing(to: who) }
+  let away = flag("callee-away")
+  DispatchQueue.main.async { display?.controls?.showOutgoing(to: who, away: away) }
 }
 startRingingOnce()
 display?.controls?.onCall = { who in
@@ -1940,10 +1942,23 @@ display?.controls?.onCall = { who in
     }
     Metrics.count("ring_sent_ok")
     Metrics.mark("ring_sent_ms", sinceLaunch())
+    // The ring landed in their mailbox. Whether anybody is there to take it out
+    // is a different question, and now one the server answers. nil means it had
+    // no basis to say, which is NOT the same as no -- so only an explicit false
+    // changes a word on screen.
+    let listening = Identity.lastRingListening
+    Metrics.fact("callee_listening", listening.map { $0 ? "yes" : "no" } ?? "unknown")
     DispatchQueue.main.async {
       display?.controls?.setStatus("ringing \(Identity.display(who))…")
-      Launcher.reexec(room: got, extra: ["--video", "camera", "--window", "--calling", who],
-                      why: "call placed")
+      // Carried as a FLAG rather than said here. `reexec` replaces this process
+      // within the same run loop turn, so anything written to the screen on this
+      // line is drawn by a process that is about to stop existing -- a status
+      // nobody can read is the same as no status, and this project has shipped
+      // that shape before. The window that actually waits for them is in the
+      // NEXT process, so the news has to travel with it.
+      var extra = ["--video", "camera", "--window", "--calling", who]
+      if listening == false { extra.append("--callee-away") }
+      Launcher.reexec(room: got, extra: extra, why: "call placed")
     }
   }.start()
 }

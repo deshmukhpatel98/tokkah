@@ -112,6 +112,13 @@ enum Watch {
     if dict["ProcessType"] as? String != "Interactive" {
       return "written by an older build, throttled priority"
     }
+    // The KeepAlive fix above is worth nothing to anybody who already has a
+    // login item -- which is everybody it happened to -- unless this line is
+    // here. `true` is a Bool; the old value was a dictionary, so the cast is
+    // also the test.
+    if dict["KeepAlive"] as? Bool != true {
+      return "written by an older build, a clean exit would leave it dead"
+    }
     return nil
   }
 
@@ -146,8 +153,28 @@ enum Watch {
       "Label": label,
       "ProgramArguments": [exe, "--watch"],
       "RunAtLoad": true,
-      // Restart it if it dies, but not in a tight loop if it dies instantly.
-      "KeepAlive": ["SuccessfulExit": false] as [String: Any],
+      // ── A CLEAN EXIT IS STILL A DEAD DOORBELL ──────────────────────────────
+      //
+      // This was `["SuccessfulExit": false]` -- restart it only if it died
+      // badly. That policy has now cost two outages. The comment above
+      // `ringLoop` records the first: a race let the agent exit 0 before the
+      // handle claim landed, "and the Mac was then uncallable until the next
+      // login, on the very first launch, silently." That instance was fixed by
+      // removing THAT exit. The policy was left alone, so the class survived.
+      //
+      // The second, 2026-08-26: the agent exited 0 at 20:03 the previous
+      // evening, moments after handing a real incoming call to a fresh Kin,
+      // and launchd did exactly what it was told -- nothing. Twenty hours
+      // later a call from another Mac rang into an empty house.
+      //
+      // The asymmetry is the whole argument. A clean exit we did not intend
+      // costs every incoming call until the next login, silently. An extra
+      // restart we did not need costs one process. So: restart it whatever
+      // happened, and let the ONE exit that genuinely means "stop" say so by
+      // booting itself out of launchd rather than by picking an exit code --
+      // see `quit()`. ThrottleInterval keeps a binary that dies instantly from
+      // spinning.
+      "KeepAlive": true,
       "ThrottleInterval": 30,
       // NOT "Background". That band is for work the user is unaware of, and it
       // carries throttled I/O and a low scheduling priority -- neither of which
@@ -210,6 +237,12 @@ enum Watch {
   }
 
   @discardableResult
+  /// Stop the agent for this login session without removing it. `RunAtLoad`
+  /// brings it back at the next login, which is the promise the menu makes.
+  static func bootoutSelf() {
+    _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+  }
+
   static func uninstall() -> String {
     _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
     try? FileManager.default.removeItem(at: plistURL)
@@ -223,7 +256,7 @@ enum Watch {
   // question answered in the words the person actually has -- and, crucially,
   // with the ONE thing that would fix it, because a setting that reports itself
   // broken and leaves you to work out the rest is a diagnostic, not a feature.
-  enum Fix { case none, install, moveToApplications, openLoginItems }
+  enum Fix { case none, install, moveToApplications, openLoginItems, restart }
   struct Reach {
     let on: Bool
     /// One sentence, plain, no paths and no launchd.
@@ -241,9 +274,37 @@ enum Watch {
                    says: "Kin has to be in your Applications folder to answer while it\u{2019}s closed.",
                    fix: .moveToApplications)
     }
-    let loaded = run("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"]).ok
-    if installed, loaded, staleReason() == nil {
+    // ── "LOADED" IS NOT "RUNNING", AND launchctl WILL NOT VOLUNTEER THE ──────
+    // ── DIFFERENCE ───────────────────────────────────────────────────────────
+    //
+    // This used to be `run(...).ok` alone. `launchctl print` exits 0 for a job
+    // that is merely REGISTERED -- including one that ran, exited, and was never
+    // restarted. Calibrated on a purpose-built control: a throwaway agent
+    // running /usr/bin/true reports `state = not running`, `runs = 1`,
+    // `last exit code = 0`, and `launchctl print` still exits 0.
+    //
+    // So on 2026-08-26 this function returned `on: true` -- "people can reach
+    // you with Kin closed" -- for twenty hours during which nothing on this Mac
+    // was listening. Every surface that asks got the same wrong answer: the
+    // settings row, the permissions check, and the startup line. `status()`
+    // twenty lines below had it right all along by reading `state = running`
+    // out of the output; the function everybody actually calls did not.
+    //
+    // An instrument that returns "fine" for the broken case is worse than no
+    // instrument, because it is what stops anybody looking.
+    let printed = run("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"])
+    let loaded = printed.ok
+    let running = printed.out.contains("state = running")
+    if installed, loaded, running, staleReason() == nil {
       return Reach(on: true, says: "", fix: .none)
+    }
+    // Registered, and not running. Unlike every other case here, this one the
+    // app can repair by itself and without asking anybody for permission, so
+    // the sentence promises exactly that and nothing more.
+    if installed, loaded, !running, staleReason() == nil {
+      return Reach(on: false,
+                   says: "Kin stopped listening for calls in the background. Turn it back on.",
+                   fix: .restart)
     }
     // The plist is on disk and launchd is not running it. On macOS 13 and later
     // that is nearly always the person having switched Kin off under Login Items,
@@ -256,12 +317,33 @@ enum Watch {
     return Reach(on: false, says: "Right now Kin only rings while it\u{2019}s open.", fix: .install)
   }
 
+  /// Start the agent again after it has stopped. `kickstart -k` kills any
+  /// lingering instance first, so this is also the way out of a wedged one, and
+  /// it needs no consent from anybody -- the login item is already approved.
+  /// Returns whether the job is running afterwards, read back rather than
+  /// assumed: this project has shipped a live setting that reported itself
+  /// applied and was not.
+  @discardableResult
+  static func restart() -> Bool {
+    _ = run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+    return run("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"])
+      .out.contains("state = running")
+  }
+
   static func status() -> String {
     let r = run("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"])
     let running = r.out.contains("state = running")
+    let w = reach()
     return "watch: plist \(installed ? "present" : "absent")"
          + (installed ? (staleReason().map { " (STALE -- \($0))" } ?? "") : "")
          + ", launchd \(r.ok ? (running ? "running" : "loaded") : "not loaded")"
+         // The verdict the app itself acts on, printed from the same call the
+         // app makes. A status command that computes its own similar answer is
+         // a second implementation to drift, and this one drifted silently for
+         // twenty hours: `status()` read `state = running` and was right, while
+         // `reach()` read only the exit code and told every screen "reachable".
+         + ", reachable-closed \(w.on ? "yes" : "no")"
+         + (w.on ? "" : " (\(w.says) fix=\(w.fix))")
   }
 
   /// `~/Library/Logs/Kin`, created on demand. Console.app already knows to look
@@ -757,6 +839,16 @@ enum Resident {
     /// remember. Somebody who wants it gone for good uses --watch-remove.
     @objc func quit() {
       fputs("watch: quit from the menu bar -- back at the next login\n", stderr)
+      // KeepAlive is unconditional now, so exiting is no longer a way to stop:
+      // launchd would have this back within the throttle interval. Booting the
+      // job out of the login session is what "until the next login" actually
+      // means, and it says it in launchd's own terms rather than by choosing an
+      // exit code and hoping the policy still reads it that way.
+      //
+      // If bootout fails, exit anyway and let launchd bring it back. Of the two
+      // ways to be wrong -- a menu item that does not appear to work, and a Mac
+      // that silently stops answering calls -- only one of them loses calls.
+      Watch.bootoutSelf()
       exit(0)
     }
   }

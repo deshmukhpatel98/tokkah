@@ -1007,9 +1007,36 @@ enum Identity {
       fputs("\(noun): @\(to) -> \(status) \(payload)\n", stderr)
       return nil
     }
+    // ── WAS ANYBODY ACTUALLY THERE ────────────────────────────────────────────
+    //
+    // The comment above says silence and "away" are indistinguishable by design.
+    // That was true of the CLIENT, and it was read as true of the system, and on
+    // 2026-08-26 it cost a whole day of calls: this Mac's login agent had been
+    // dead since the previous evening, every ring came back `ok: true,
+    // queued: 1`, and the caller showed a ringing screen with nobody on the
+    // other end. The server knew -- it is the only party that can know -- and
+    // was not asked to say.
+    //
+    // `listening` is ABSENT when the server has no basis for an answer, and that
+    // is deliberately not the same as false. nil here means "no idea", and no
+    // idea must never be shown to anybody as "they are offline".
+    lastRingListening = nil
+    if let d = payload.data(using: .utf8),
+       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+       let live = o["listening"] as? Bool {
+      lastRingListening = live
+      if !live {
+        fputs("\(noun): @\(to) has not been heard from -- their Mac is not listening\n", stderr)
+      }
+    }
     fputs("\(noun): @\(to) in room \(room)\n", stderr)
     return room
   }
+
+  /// Whether the last `ring()` found anybody listening, or nil if the server had
+  /// no basis to say. Read once, right after the call that set it; this is a
+  /// report on one ring, not a standing fact about a person.
+  nonisolated(unsafe) static var lastRingListening: Bool?
 
   // ── AN EMPTY MAILBOX AND A DEAD NETWORK ARE THE SAME RETURN VALUE ──────────
   //

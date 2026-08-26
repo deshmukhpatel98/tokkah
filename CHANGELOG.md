@@ -7,6 +7,72 @@ This project measures its claims; where a change has a number, the number is her
 
 ## Unreleased
 
+### Fixed — a Mac that stopped answering calls, and never said so
+
+Reported as "I was calling from the Mac mini and this MacBook Air did not show
+the call, both on the latest version". It was neither the versions nor the
+network. Three separate faults, and the second is the one that made it last
+twenty hours.
+
+**The doorbell had been dead since the previous evening.** Kin's login agent is
+what answers a call while the app is closed. It exited cleanly at 20:03, moments
+after handing a real incoming call to a fresh Kin, and `KeepAlive
+{ SuccessfulExit: false }` told launchd that a clean exit meant it had finished
+on purpose. So launchd did nothing, and every call after that rang into an empty
+house. This is the SECOND outage from that one policy — the comment above
+`ringLoop` records the first, where a startup race let the agent exit 0 before
+the handle claim landed and "the Mac was then uncallable until the next login, on
+the very first launch, silently". That instance was fixed by deleting that exit.
+The policy was left alone, so the class survived. It is fixed at the policy now:
+launchd restarts the agent whatever happened, and the one exit that genuinely
+means stop — **Quit Kin** in the menu bar — boots the job out of the login
+session rather than picking an exit code and hoping the policy still reads it
+that way. The asymmetry is the argument: an unintended clean exit costs every
+incoming call until the next login, and an unnecessary restart costs one process.
+
+**The app kept telling itself it was fine.** `Watch.reach()` — the single
+function behind "can people reach you with Kin closed", read by the settings row,
+the permissions check and the startup line — decided that from whether
+`launchctl print` EXITED 0. It exits 0 for a job that is merely registered,
+including one that ran, exited and was never restarted. Calibrated on a
+purpose-built control: an agent running `/usr/bin/true` reports `state = not
+running`, `runs = 1`, `last exit code = 0`, and `launchctl print` still exits 0.
+So every screen said "reachable" for twenty hours, and the telemetry fact
+`reachable_closed` recorded **yes** throughout. `status()` twenty lines below had
+it right all along by reading `state = running`; the function everybody actually
+calls did not. It now reads the same line, offers a repair the app can perform
+by itself (`launchctl kickstart`, no consent needed — the login item is already
+approved), and `--watch-status` prints the verdict the app itself acts on rather
+than computing a second, similar answer that can drift.
+
+**And the caller was told nothing.** `/api/kin/<who>/ring` answered
+`{ok: true, queued: 1}` whether the callee's Mac was waiting or had stopped
+listening the night before, so the Mac mini showed a ringing screen with nobody
+on the other end. The server is the only party that can know this. It now says
+so, from **last-heard-from** rather than from whether a socket is held — this
+project already learned that ghost sockets outlive their processes — and with
+three states, not two: `listening` is **omitted** when a freshly woken Durable
+Object has heard from nobody, because "they are offline" is not a thing to guess.
+Kin shows it on the outgoing card, carried across the re-exec as a flag: a status
+line written immediately before `execv` is drawn by a process that is about to
+stop existing, which is a message nobody can read.
+
+New: [mac/tools/doorbell-check.sh](mac/tools/doorbell-check.sh), 8 assertions, in
+CI. It asserts the calibration itself — that `launchctl print` really does exit 0
+for a dead job, because if it did not, the original code would have been correct
+— and it has a live-agent control, so it cannot pass by always answering "not
+reachable". Restoring the bug makes it fail 2 of 8. Where there is no launchd
+session it prints a SKIP that says plainly that nothing was checked.
+
+Also fixed while here: the source-reading gate in `contacts.test.mjs` counted
+`queued:` inside comments, so documenting this outage above the code failed the
+test that documents it — comments are stripped before counting now. And the
+guard on exported constants only knew about strings: `export const
+KIN_LISTEN_MS = 90_000` made workerd refuse to boot outright ("not of type
+'function or ExportedHandler'"), caught only by the real-workerd section. It
+refuses every primitive now, in a fast test.
+
+
 ### The open-source audit, 2026-08-26
 
 The previous [OPENNESS.md](OPENNESS.md) scored this project **100 / 100** against

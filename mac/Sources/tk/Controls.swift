@@ -3542,11 +3542,24 @@ final class CallControls: NSView {
 
   /// This Mac is ringing somebody. The mirror of `showIncoming`, and the reason
   /// the caller no longer stares at an invite link wondering if it worked.
-  func showOutgoing(to who: String) {
+  /// `away` is the server's answer to "was anybody listening when we rang",
+  /// carried across the re-exec by `--callee-away`. It is only ever true when
+  /// the server said so outright -- it has a third answer, "no idea", and that
+  /// one must never reach a person as "they are offline".
+  func showOutgoing(to who: String, away: Bool = false) {
     onMain { [weak self] in
       guard let self, !self.sawPeer else { return }
       self.waiting.setOutgoing(to: who)
-      self.setStatus("calling \(Identity.display(who))…")
+      // Still calling, and still worth calling: the ring is in their mailbox and
+      // keeps for a minute, so a Mac that wakes up in time still rings. What
+      // changes is that the person waiting is told why nothing is happening
+      // instead of watching a ringing screen and drawing their own conclusion.
+      self.setStatus(away ? "\(Identity.display(who)) isn\u{2019}t listening right now"
+                          : "calling \(Identity.display(who))…")
+      if away {
+        self.showCallFailed("\(Identity.display(who)) isn\u{2019}t listening for calls",
+                            because: "their Mac hasn\u{2019}t checked in \u{2014} it will ring if it wakes up soon")
+      }
       self.nudgeBar()
     }
   }
@@ -3626,6 +3639,21 @@ final class CallControls: NSView {
         NSWorkspace.shared.open(u)
       }
       setStatus("switch Kin on under Login Items")
+    case .restart:
+      // The one repair on this row that needs nothing from the person and no
+      // panel in System Settings: the login item is already approved, it simply
+      // is not running. Off the main thread because `launchctl` is a process.
+      Metrics.count("watch_fix_restart")
+      setStatus("turning it back on\u{2026}")
+      Thread {
+        let ok = Watch.restart()
+        Metrics.count(ok ? "watch_restarted" : "watch_restart_fail")
+        DispatchQueue.main.async { [weak self] in
+          self?.setStatus(ok ? "Kin is listening for calls again"
+                             : "couldn\u{2019}t turn it back on \u{2014} open Kin again")
+          self?.refreshSheet()
+        }
+      }.start()
     case .install, .none:
       setStatus("setting up\u{2026}")
       Thread {

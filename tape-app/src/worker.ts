@@ -295,6 +295,21 @@ export class Room implements DurableObject {
   // drained. Storing a bare `() => finish(true)` here would make eviction
   // impossible to express: every way of ending a hold would be a delivery.
   private kinWaiters = new Map<string, Set<(woke: boolean) => void>>();
+
+  /**
+   * When each handle was last HEARD FROM. Not "does it hold a socket" — this
+   * project has a rule about that, learned from ghost sockets holding room
+   * slots: liveness is last-heard-from, never readyState. A resident that polls
+   * plainly every four seconds holds nothing between polls and is perfectly
+   * alive; a held poll that a killed process left behind holds a socket and is
+   * not.
+   *
+   * In memory only, and that is why the answer below has THREE states rather
+   * than two. A Durable Object that has just woken has never heard from
+   * anybody, and reporting that as "they are offline" would be a confident lie
+   * told to every caller after every eviction.
+   */
+  private kinLastPoll = new Map<string, number>();
   // How many are held right now, across every handle this object serves (one).
   // Read by kinPollDecide as the concurrency cap; see KIN_WAIT_MAX_PARKED.
   private kinParked = 0;
@@ -351,7 +366,14 @@ export class Room implements DurableObject {
     // shipped three times.
     const quiet = await this.kinQuietLoad();
     const to = url.searchParams.get('to') ?? '';
-    const d = kinRingDecide(raw, to, this.kinBox, this.kinHits, Date.now(), quiet);
+    // A held poll in flight is proof on its own -- the client is on the other
+    // end of a socket we are holding open right now -- and otherwise fall back
+    // to when we last heard from it. Either is evidence; neither is a guess.
+    const nowMs = Date.now();
+    const held = (this.kinWaiters.get(to)?.size ?? 0) > 0;
+    const last = this.kinLastPoll.get(to);
+    const heardMs = held ? 0 : (last === undefined ? null : nowMs - last);
+    const d = kinRingDecide(raw, to, this.kinBox, this.kinHits, nowMs, quiet, heardMs);
     // Counted here and NOWHERE IN THE RESPONSE. `d.muted` must never reach the
     // caller; only the owner's poll sees this number.
     if (d.muted) this.kinMuted++;
@@ -383,6 +405,10 @@ export class Room implements DurableObject {
     // unauthenticated way to make somebody's doorbell slow: anyone who knew a
     // handle could keep evicting its waiter.
     //
+    // The arriving request is proof of life, so bank it before doing anything
+    // else with it: this is the only fact that can later tell a caller their
+    // ring went nowhere.
+    if (d.status === 200) this.kinLastPoll.set(to, Date.now());
     // The request that just arrived is the only client we have PROOF is alive
     // right now. Anything still parked is a client we merely have not heard
     // from, and one of those is exactly what loses a call: a killed app's waiter
@@ -2475,9 +2501,29 @@ export function kinBoxHas(box: Map<string, KinStored[]>, to: string, now: number
  * silence locally, so failing open here costs an unwanted ring and failing
  * closed would cost every call.
  */
+/**
+ * How long after a poll a handle is still considered to be listening.
+ *
+ * The resident polls every 4 s when the server will not hold, and holds for
+ * ~25 s when it will, so a healthy Mac can be silent for half a minute at a
+ * time through no fault of its own. 90 s is generous on purpose: the cost of
+ * saying "not listening" about a Mac that is fine is a caller who does not
+ * bother ringing, and that is worse than the ring taking a moment.
+ */
+// NOT exported. worker.ts is the worker ENTRY module, so workerd reads every
+// named export as an entrypoint and refuses to start on anything that is not a
+// function or an ExportedHandler -- "Incorrect type for map entry
+// 'KIN_LISTEN_MS'". Measured: exporting it made the whole runtime fail to boot,
+// which would have been a dead deploy rather than a failed test if the workerd
+// section of contacts.test.mjs did not exist. The test reads the number out of
+// this line instead, so there is still exactly one place it is written.
+const KIN_LISTEN_MS = 90_000;
+
 export function kinRingDecide(
   raw: string, to: string, box: Map<string, KinStored[]>, hits: Map<string, number[]>, now: number,
   quiet: KinQuiet | null = null,
+  /** ms since this handle last polled, or null if this instance has never seen it. */
+  heardMs: number | null = null,
 ): KinDecision {
   if (!KIN_HANDLE_RE.test(to)) return { status: 400, body: { error: 'bad handle' } };
   if (raw.length > KIN_RING_MAX_BODY) return { status: 413, body: { error: 'too big' } };
@@ -2580,9 +2626,25 @@ export function kinRingDecide(
   // ONE return, ONE body, shared by both paths. There is deliberately no
   // early return for the silent case: two return sites are two literals that
   // drift, and the first thing that drifts is `queued`.
+  // ── WHETHER ANYBODY WAS ACTUALLY THERE ────────────────────────────────────
+  //
+  // `ok: true` used to be the whole answer, and it was returned identically
+  // whether the callee's Mac was waiting or had stopped listening the previous
+  // evening. On 2026-08-26 exactly that happened: a Mac's login agent had been
+  // dead for twenty hours, every ring was accepted with `ok: true, queued: 1`,
+  // and the caller sat watching a ringing screen with nothing on the other end.
+  //
+  // The server is the only party that can know this, so it is the server's job
+  // to say it. Omitted rather than false when unknown -- see kinLastPoll: a
+  // freshly woken instance has heard from nobody, and "offline" is not a thing
+  // to guess.
+  const listening = heardMs === null ? undefined : heardMs <= KIN_LISTEN_MS;
   return {
     status: 200,
-    body: { ok: true, queued: r.queued, evicted: r.evicted, leaseMs: KIN_LEASE_MS },
+    body: {
+      ok: true, queued: r.queued, evicted: r.evicted, leaseMs: KIN_LEASE_MS,
+      ...(listening === undefined ? {} : { listening }),
+    },
     ...(muted ? { muted: true } : {}),
   };
 }

@@ -1843,14 +1843,35 @@ const DEV2 = await device('dev2');
   // seventeen-ring script. It cannot prove there is no SECOND response site that
   // some future script would reach. That is a source fact, so it is checked here.
   sec('(j4) silent mode: one response site, and the toggle read from the stored key');
-  const ring200 = ringFn.match(/status: 200/g) ?? [];
+  // Comments stripped FIRST. These are counts of code, and a comment that
+  // quotes a response body is not a second response site -- the block above the
+  // 200 in kinRingDecide quotes `{ok: true, queued: 1}` to explain the outage it
+  // was written for, and without this line that quotation fails the test it is
+  // documenting. Same trap as (j3) above, which matches call syntax rather than
+  // prose for exactly this reason.
+  const ringCode = ringFn
+    .replace(/\/\*[\s\S]*?\*\//g, '')      // block comments
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');  // line comments, sparing `://` in a URL
+  const ring200 = ringCode.match(/status: 200/g) ?? [];
   eq(ring200.length, 1,
     '(j4) kinRingDecide has exactly ONE 200 response site — an early return for the silent case is how `queued` starts lying');
-  const queuedLit = ringFn.match(/queued:/g) ?? [];
+  const queuedLit = ringCode.match(/queued:/g) ?? [];
   eq(queuedLit.length, 1, '(j4) and `queued` is built in exactly one place');
   // The body at the ONE 200 site, not the first `body:` in the function (which is
   // a 400). Anchored on the status so it cannot drift onto an error path.
-  const bodyLit = (ringFn.slice(ringFn.indexOf('status: 200')).match(/body: \{[^}]*\}/) ?? [''])[0];
+  const bodyLit = (() => {
+    const from = ringCode.slice(ringCode.indexOf('status: 200'));
+    const at = from.indexOf('body: {');
+    if (at < 0) return '';
+    // Brace-balanced, because the body now contains a nested spread and a regex
+    // that stops at the first `}` would print half of it and look complete.
+    let depth = 0;
+    for (let i = at + 6; i < from.length; i++) {
+      if (from[i] === '{') depth++;
+      else if (from[i] === '}' && --depth === 0) return from.slice(at, i + 1).replace(/\s+/g, ' ');
+    }
+    return '';
+  })();
   console.log(`  the single ring body: ${bodyLit}`);
   ok(bodyLit.includes('r.queued'), '(j4) and it comes from the store, not from a literal');
   ok(!bodyLit.includes('muted'), '(j4) and the silenced flag is NOT in it — that flag is the toggle, in the clear');
@@ -1982,8 +2003,67 @@ const DEV2 = await device('dev2');
   // it cheap to catch again.
   ok(/^const KIN_REG_CONTEXT/m.test(src), '(j4) KIN_REG_CONTEXT is not exported — a string export stops workerd from starting');
   ok(/^const KIN_QUIET_CONTEXT/m.test(src), '(j4) nor is KIN_QUIET_CONTEXT');
-  const strExports = src.match(/^export const [A-Z_]+ = '/gm) ?? [];
-  eq(strExports.length, 0, `(j4) and no top-level string constant is exported at all${strExports.length ? ': ' + strExports.join(', ') : ''}`);
+  // ── A PRIMITIVE EXPORT IS A DEAD DEPLOY, NOT A FAILED TEST ───────────────
+  //
+  // This guarded single-quoted strings only, and a NUMBER walked straight past
+  // it: `export const KIN_LISTEN_MS = 90_000` made the whole runtime refuse to
+  // boot -- "Incorrect type for map entry 'KIN_LISTEN_MS': the provided value
+  // is not of type 'function or ExportedHandler'". The workerd section below
+  // caught it, which is the only reason it was a red test rather than a
+  // production outage; a change that skipped that section would have shipped.
+  //
+  // So: refuse every primitive, not the one spelling that bit us first.
+  // Regexes and objects stay allowed -- KIN_HANDLE_RE is exported and works,
+  // because workerd only objects to values it cannot treat as an entrypoint.
+  const badExports = src.match(/^export const [A-Z_][A-Z0-9_]* = (?:['"`]|-?\d|true\b|false\b)/gm) ?? [];
+  eq(badExports.length, 0,
+    `(j4) and no top-level PRIMITIVE is exported -- workerd will not start${badExports.length ? ': ' + badExports.join(', ') : ''}`);
+}
+
+// ── (l) a ring that goes nowhere should say so ──────────────────────────────
+//
+// The bug this is here for: on 2026-08-26 a Mac's login agent had been dead
+// since the previous evening, and every ring aimed at it came back
+// `{ok: true, queued: 1}` — the same bytes a ring at a wide-awake Mac returns.
+// The caller had no way to tell "it is ringing" from "there is nobody there",
+// so it showed a ringing screen for twenty hours' worth of calls into a house
+// with nobody in it. Only the server can know this, so only the server can say.
+{
+  sec('(l) a ring reports whether the callee was still listening');
+  const s = fresh();
+
+  // UNKNOWN IS NOT NO. A Durable Object that has just woken has heard from
+  // nobody at all, and answering "they are offline" there would be a confident
+  // lie told to every caller after every eviction. The key must be ABSENT.
+  const cold = kinRingDecide(ring(), TO, s.box, s.hits, NOW, null, null);
+  eq(cold.status, 200, '(l) a ring is still accepted when liveness is unknown');
+  eq('listening' in cold.body, false, '(l) unknown liveness omits the key entirely');
+
+  const live = kinRingDecide(ring(), TO, fresh().box, fresh().hits, NOW, null, 0);
+  eq(live.body.listening, true, '(l) a poll in flight reads as listening');
+
+  const recent = kinRingDecide(ring(), TO, fresh().box, fresh().hits, NOW, null, 89_999);
+  eq(recent.body.listening, true, '(l) heard from just inside the window: listening');
+
+  // The arm that matters, and its neighbour one millisecond away. A threshold
+  // tested only from the comfortable side is a threshold nobody has tested.
+  const gone = kinRingDecide(ring(), TO, fresh().box, fresh().hits, NOW, null, 90_001);
+  eq(gone.body.listening, false, '(l) heard from just outside it: NOT listening');
+
+  const longGone = kinRingDecide(ring(), TO, fresh().box, fresh().hits, NOW, null, 20 * 3600 * 1000);
+  eq(longGone.body.listening, false, '(l) twenty hours later: NOT listening — the real case');
+
+  // A window that a resident cannot stay inside would mark healthy Macs dead.
+  // The resident polls every 4 s, and holds for ~25 s when the server holds.
+  const LISTEN_MS = Number((srcText
+    .match(/const KIN_LISTEN_MS = ([0-9_]+)/) ?? [, '0'])[1].replace(/_/g, ''));
+  eq(LISTEN_MS, 90_000, '(l) the window is the one written in worker.ts');
+  ok(LISTEN_MS >= 60_000,
+     `(l) the window (${LISTEN_MS} ms) is wider than a held poll plus a retry`);
+
+  // And it must not change what a ring DOES. `listening` is a report, not a gate.
+  eq(gone.body.ok, true, '(l) a ring at a silent Mac is still accepted and queued');
+  eq(gone.body.queued >= 1, true, '(l) ...and still lands in the mailbox for when they return');
 }
 
 // ── (k) THE WHOLE THING, IN THE REAL RUNTIME ──────────────────────────────
