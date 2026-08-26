@@ -57,8 +57,23 @@
     if (opts.translate) {
       url += (url.includes('?') ? '&' : '?') + 'xlate=' + encodeURIComponent(String(opts.translate).slice(0, 8));
     }
+    // ── AN EMBED IS NOT AN INVITE, AND THE DIFFERENCE IS ONE PARAMETER ──────
+    //
+    // Kin retired browser calling for people who FOLLOW A LINK: worker.ts sends
+    // an invite path or `?r=` to the download page instead. That funnel caught
+    // this iframe too, so `<script src=embed.js data-room=standup>` quietly
+    // rendered a "Join on Kin" download page inside the frame -- a call that
+    // never started, with no error anywhere. Measured on production:
+    //   /?r=standup          -> 200 <title>Join on Kin</title>
+    //   /?r=standup&web=1    -> 200 <title>Kin</title>
+    //
+    // `web=1` is the escape hatch worker.ts already documents and already
+    // serves. It belongs on the FRAME and not on the shareable link: a person
+    // who is sent a link may well want the app, and deciding that for them is
+    // the funnel's whole job. A page that embedded a call has already decided.
+    const frameUrl = url + (url.includes('?') ? '&' : '?') + 'web=1';
     const f = document.createElement('iframe');
-    f.src = url;
+    f.src = frameUrl;
     // The call needs the camera and mic INSIDE the frame; fullscreen and PiP
     // are quality-of-life. `display-capture` is deliberately absent.
     f.allow = 'camera; microphone; autoplay; fullscreen; picture-in-picture';
@@ -66,14 +81,17 @@
       `width:${opts.width || '100%'};height:${opts.height || '560px'};` +
       'border:0;border-radius:12px;background:#000;display:block;max-width:100%;';
     f.title = 'Tokkah call';
-    return { frame: f, url, room };
+    return { frame: f, url, frameUrl, room };
   };
 
   const api = {
     join(opts = {}) {
-      const { frame, url, room } = build(opts);
+      const { frame, url, frameUrl, room } = build(opts);
       (opts.container || document.body).appendChild(frame);
-      return { frame, url, room, leave: () => frame.remove() };
+      // `url` stays the invite you would send a person; `frameUrl` is what the
+      // iframe is actually showing. Both, because they are genuinely different
+      // things and code that assumed they were the same is what broke here.
+      return { frame, url, frameUrl, room, leave: () => frame.remove() };
     },
     link(opts = {}) { return build(opts).url; },
   };
