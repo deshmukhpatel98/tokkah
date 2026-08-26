@@ -88,9 +88,23 @@ python3 -c "import numpy, PIL" 2>/dev/null \
 trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
 fail=0
+skipped=""
 say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 note() { printf "       %s\n" "$1"; }
 cant() { echo "  COULD NOT RUN: $1"; exit 2; }
+# ── AN ARM WITH NO STIMULUS IS NOT AN ARM THAT FAILED ───────────────────────
+#
+# The live arms need somebody's voice in the room -- there is no way to inject
+# audio here, because every copy runs `--mute` and the speakers belong to whoever
+# is sitting at this Mac. Run at five in the morning in a silent room, the far
+# end never vocalises, nothing can hold this end, and the assertions below
+# reported the feature broken. That is the rig describing the room.
+#
+# So a missing stimulus is neither a pass nor a failure: it is named, it is
+# carried to the last line so a green verdict can never hide it, and it says what
+# to do about it.
+skip() { printf "  %-4s %s\n" "SKIP" "$1"; skipped="$skipped
+       - $1"; }
 # `--mute` is the RIG's speaker flag: the speakers belong to whoever is sitting at
 # this Mac, and a rig that plays audio at them is a defect. `--press mic` is the
 # app's own microphone button, which is a different thing entirely.
@@ -414,16 +428,26 @@ grep -q "connected via" "$SP/gate-a.log" || cant "the live pair never connected"
 grep -qE "^\[in\] " "$SP/gate-a.log" \
   || cant "no microphone opened on the live arm -- silence here is not evidence"
 SEEN="$(seen "$SP/gate-a.log")"
-note "live transitions on A: [$SEEN]  ($(grep -cE '^mic floor ' "$SP/gate-a.log") changes)"
-echo " $SEEN" | grep -qE "held|bidding" \
-  && say "OK" "on a live call with a real gate the microphone button actually leaves 'through': [$SEEN]" \
-  || say "FAIL" "the gate never reached the button on a live call -- arm 4 proved a drawing and nothing else"
-# The border on the same live evidence. Arms 9 and 10 pin the state to photograph
-# it; this is the one that says a real gate on a real call puts the border out.
+# THE STIMULUS, CHECKED BEFORE THE RESULT. Nothing can hold this end unless the
+# far end actually made a sound, and the only source of sound here is the room.
+SPOKE="$(grep -cE '^cue in +[0-9.]+ +peer -> [12]' "$SP/gate-a.log")"
+note "live transitions on A: [$SEEN]  ($(grep -cE '^mic floor ' "$SP/gate-a.log") changes,"\
+"from $SPOKE far-end vocalisations)"
 GOFF="$(grep -cE '^mic floor .* edge off' "$SP/gate-a.log")"
-[ "$GOFF" -gt 0 ] \
-  && say "OK" "and the green border really goes dark on a live call ($GOFF times), not only under a pin" \
-  || say "FAIL" "the border never went dark on a live call -- arms 9-10 proved a drawing and nothing else"
+if [ "$SPOKE" -lt 2 ]; then
+  skip "the live arms had no stimulus: the far end vocalised $SPOKE times, so nothing"
+  skip "  could hold this end. Speak near the Mac while this runs, then believe it."
+else
+  echo " $SEEN" | grep -qE "held|bidding" \
+    && say "OK" "on a live call with a real gate the microphone button actually leaves 'through': [$SEEN]" \
+    || say "FAIL" "the gate never reached the button on a live call -- arm 4 proved a drawing and nothing else"
+  # The border on the same live evidence. Arms 9 and 10 pin the state to
+  # photograph it; this is the one that says a real gate on a real call puts the
+  # border out.
+  [ "$GOFF" -gt 0 ] \
+    && say "OK" "and the green border really goes dark on a live call ($GOFF times), not only under a pin" \
+    || say "FAIL" "the border never went dark on a live call -- arms 9-10 proved a drawing and nothing else"
+fi
 
 live nogate "--no-gate --gate-margin 20" 8332 8333
 grep -q "connected via" "$SP/nogate-a.log" || cant "the control pair never connected"
@@ -436,21 +460,27 @@ SEEN2="$(seen "$SP/nogate-a.log")"
 # instrument that never looked returns exactly the same absence. What runs the
 # floor ticker is a far-end vocal edge (`cue in`), so if there were none of those
 # this arm proves nothing at all and has to say so rather than pass.
-CUEIN="$(grep -cE '^cue in' "$SP/nogate-a.log")"
-[ "$CUEIN" -gt 0 ] \
-  || cant "the control arm saw no far-end vocal edges at all ($CUEIN), so nothing ever woke the thing it is supposed to be watching"
-note "control arm was awake: $CUEIN far-end vocal edges arrived"
-echo " $SEEN2" | grep -qE "held|bidding" \
-  && say "FAIL" "CONTROL: with the gate OFF the button still claimed to be held: [$SEEN2]" \
-  || say "OK" "CONTROL: same room, same margin, gate off -- which is what headphones do -- and it never leaves 'through' [${SEEN2:-no transitions at all}]"
+# The same stimulus test, and for a sharper reason: this arm's whole evidence is
+# an ABSENCE, and a silent room produces that absence for free. `peer -> [12]`
+# and not any `cue in`, because a transition to QUIET is not somebody speaking.
+CUEIN="$(grep -cE '^cue in +[0-9.]+ +peer -> [12]' "$SP/nogate-a.log")"
+NOFF="$(grep -cE '^mic floor .* edge off' "$SP/nogate-a.log")"
+if [ "$CUEIN" -lt 2 ]; then
+  skip "the control arm had no stimulus either ($CUEIN far-end vocalisations) -- its"
+  skip "  silence is what a silent room looks like, not what a working control looks like."
+else
+  note "control arm was awake: $CUEIN far-end vocalisations arrived"
+  echo " $SEEN2" | grep -qE "held|bidding" \
+    && say "FAIL" "CONTROL: with the gate OFF the button still claimed to be held: [$SEEN2]" \
+    || say "OK" "CONTROL: same room, same margin, gate off -- which is what headphones do -- and it never leaves 'through' [${SEEN2:-no transitions at all}]"
 # On headphones there is nothing to hold this end back, so a person is always
 # audible and the border should never once go out. The mirror of the arm above,
 # off the same log, and the pair is what says the border tracks the GATE rather
 # than tracking a timer or the far end.
-NOFF="$(grep -cE '^mic floor .* edge off' "$SP/nogate-a.log")"
-[ "$NOFF" -eq 0 ] \
-  && say "OK" "CONTROL: and the green border never goes dark there either -- with no gate you are always through" \
-  || say "FAIL" "CONTROL: the border went dark $NOFF times on a call with no gate to hold anybody"
+  [ "$NOFF" -eq 0 ] \
+    && say "OK" "CONTROL: and the green border never goes dark there either -- with no gate you are always through" \
+    || say "FAIL" "CONTROL: the border went dark $NOFF times on a call with no gate to hold anybody"
+fi
 
 echo "── 8. the caption is readable in one frame"
 reap
@@ -618,6 +648,9 @@ if [ "$fail" = 0 ]; then
   echo "FLOOR CHECK PASSED -- nothing is painted on the picture, the microphone button"
   echo "  carries the three states, the green edge is up exactly when this end is"
   echo "  audible, a finger still reaches the button, and a real gate gets to both"
+  # A skipped arm rides on the verdict line, never under it. The point of naming
+  # a missing stimulus is lost if the last thing printed is an unqualified PASSED.
+  [ -n "$skipped" ] && echo "  ... but NOT everything ran:$skipped"
 else
   echo "FLOOR CHECK FAILED -- see above; logs and photographs in $SP (KEEP=1 to keep them)"
 fi

@@ -3151,11 +3151,21 @@ final class CallControls: NSView {
   /// main.swift already reads exactly this pair the same way, and a display that
   /// reads a stale float for one frame at 30 Hz is not a defect anybody can see.
   private func floorNow() -> (MicFloor, Bool) {
-    if let p = floorPin { return (p, p == .through) }
-    // MUTED IS NEVER AUDIBLE, and that is the case the edge exists to be honest
-    // about: the glyph stays at full ink because the slash is already saying it,
-    // and the edge goes dark because the words are not arriving.
+    // ── MUTED OUTRANKS THE TEST PIN, AND THAT ORDER IS LOAD-BEARING ─────────
+    //
+    // The pin was first and the rig caught it: `floor-held` then a real click on
+    // the microphone reported `micfloor=held/0.89` -- muted, and still claiming
+    // a floor state, with the glyph easing back DOWN toward held while the slash
+    // said otherwise. Two writers disagreeing about one value, because
+    // `toggleMic` sets `.muted` directly and the next tick put the pin back.
+    //
+    // A pin exists to hold a DRAWING still for a photograph. It must never
+    // outrank something the person actually did, and it must never be able to
+    // photograph a state the product cannot be in -- a muted microphone that is
+    // audible does not exist, and a rig able to depict one is a rig that can
+    // certify a lie.
     if micMuted { return (.muted, false) }
+    if let p = floorPin { return (p, p == .through) }
     // NOBODY TO REACH. Before the other person arrives there is no such thing as
     // being audible to them, so the edge stays dark rather than promising a
     // through-line to an empty room.
