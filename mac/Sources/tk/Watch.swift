@@ -660,6 +660,32 @@ enum Resident {
     refresh()
   }
 
+  /// ── AND IT DOES NOT STAY INVISIBLE BY ITSELF ──────────────────────────────
+  ///
+  /// `.accessory` is set once at startup, and answering a reopen UNDOES IT.
+  /// Measured: the resident reads `.accessory` before a Dock click and
+  /// `.regular` after one, so from the first click onward there were two Kin
+  /// icons in the Dock -- the app, and a watcher that is supposed to have no
+  /// icon at all. That is the duplicate the report was about; the copy counts
+  /// were right the whole time.
+  ///
+  /// Re-asserted on every tick rather than only after a reopen, because "what
+  /// else promotes this process" is not a list anybody can be sure they have
+  /// finished, and a state that repairs itself does not need the list. It costs
+  /// one comparison per tick, and it only ever runs `setActivationPolicy` when
+  /// the answer has actually drifted.
+  private static var saidVisible = false
+  static func stayInvisible() {
+    guard NSApp?.activationPolicy() != .accessory else { return }
+    let ok = NSApp?.setActivationPolicy(.accessory) ?? false
+    if !saidVisible {
+      saidVisible = true
+      fputs("watch: this resident had become a Dock app -- put back out of sight"
+          + (ok ? "" : ", AND THE CALL FAILED: there is a second Kin in the Dock")
+          + "\n", stderr)
+    }
+  }
+
   /// What one word is true right now. Order matters: paused outranks reachable,
   /// because somebody who has silenced their calls is not waiting to be told
   /// their network is fine.
@@ -692,6 +718,7 @@ enum Resident {
   /// Safe from any thread. The poll loop calls it after every round trip.
   static func refresh() {
     if !Thread.isMainThread { DispatchQueue.main.async { refresh() }; return }
+    stayInvisible()
     let s = state()
     guard s.rawValue != shownState else { return }
     shownState = s.rawValue

@@ -149,7 +149,18 @@ fi
 # execv. The resident now says so, and this reads it.
 grep -q "could not go invisible" "$SP/ghost.log" \
   && say "FAIL" "the resident kept a Dock icon -- that is a second Kin in the Dock" \
-  || say "OK" "the resident went invisible, so the only Dock icon is the app's"
+  || say "OK" "the resident went invisible at startup"
+# ── AND IT MUST STILL BE INVISIBLE AFTER A CLICK ───────────────────────────
+#
+# Answering a reopen PROMOTES this process: measured `.accessory` before a Dock
+# click and `.regular` after one. Startup is therefore the wrong and only place
+# this was ever checked, and every copy-counting claim above passes either way.
+POL=$("$HERE/../.build/debug/tk" --watch-policy "$(pgrep -f "$SP/Kin.app/Contents/MacOS/Tokkah --watch" | head -1)" 2>&1)
+echo "  the resident is now: $POL"
+case "$POL" in
+  *accessory*) say "OK" "and it is still invisible after the click" ;;
+  *) say "FAIL" "the click gave the resident a Dock icon -- a second Kin in the Dock" ;;
+esac
 
 # ── A HANDLER NOBODY REACHES IS NOT A HANDLER ──────────────────────────────
 #

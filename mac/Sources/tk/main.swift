@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.80.0"
+let VERSION = "0.81.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -278,6 +278,23 @@ if flag("watch") {
 if flag("watch-install") { fputs(Watch.install() + "\n", stderr); exit(0) }
 if flag("watch-remove") { fputs(Watch.uninstall() + "\n", stderr); exit(0) }
 if flag("watch-status") { fputs(Watch.status() + "\n", stderr); exit(0) }
+// What macOS thinks a running Kin is: `regular` means it has a Dock icon, and a
+// RESIDENT with one is a second Kin sitting next to the real app. Read from
+// outside the process under test, because the question is what the system
+// believes, not what that process last asked for.
+if let p = arg("watch-policy") {
+  let pid = pid_t(p) ?? -1
+  guard let a = NSRunningApplication(processIdentifier: pid) else {
+    print("no such running application (\(pid))"); exit(1)
+  }
+  switch a.activationPolicy {
+  case .regular:    print("regular -- HAS A DOCK ICON")
+  case .accessory:  print("accessory -- no Dock icon")
+  case .prohibited: print("prohibited")
+  @unknown default: print("unknown")
+  }
+  exit(0)
+}
 
 
 
@@ -413,6 +430,7 @@ let KNOWN_FLAGS: Set<String> = [
   // environment for the usual reason: a security control whose flag is a silent
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
+  "watch-policy",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
