@@ -140,6 +140,17 @@ else
   sed -n '1,8p' "$RING" 2>/dev/null | sed 's/^/      /'
 fi
 
+# ── A HANDLER NOBODY REACHES IS NOT A HANDLER ──────────────────────────────
+#
+# The raise is a signal handler, and the first version of it was installed at
+# the foot of main.swift -- which a call with a window never reaches. It
+# compiled, it read as finished, and it ran zero times. Nothing above would have
+# noticed: the copy-counting claims pass either way. So the app is required to
+# SAY the handler is armed, in the same log this rig already reads.
+grep -q "raise: ready" "$RING" \
+  && say "OK" "and that Kin can be asked to come forward" \
+  || say "FAIL" "no raise handler was armed -- a click on an open Kin can only do nothing"
+
 # ── 2. AND THE HALF 0.75.2 IS MADE OF, WITH THE REAL KIN FROM PART ONE ─────
 #
 # No injection here: the Kin that part one started is still running, so this is

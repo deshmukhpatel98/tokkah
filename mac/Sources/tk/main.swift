@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.77.0"
+let VERSION = "0.78.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -1617,6 +1617,50 @@ if flag("window") {
           + " (\(urlAtOpen.isEmpty ? "NO URL SET" : urlAtOpen))\n", stderr)
     }
   }
+}
+
+
+// ── SOMEBODY CLICKED KIN WHILE THIS ONE WAS ALREADY OPEN ────────────────────
+//
+// The resident answers every Dock click, Finder double-click and Spotlight hit
+// for this bundle, and when Kin is already open the right answer is to bring
+// THIS window forward. It could not: `Launcher.reexec` is an `execv`, and after
+// one, LaunchServices' record for this process reads `pid -1` forever --
+// `activate` on it returns true and does nothing. The person saw a click that
+// did nothing, and then, once -1 was read as "not running", a new Kin on every
+// click.
+//
+// So the raise is done from the inside, where no LaunchServices handle is
+// needed. SIGWINCH because a resident that has just updated itself routinely
+// faces an OLD Kin with no handler for this, and SIGWINCH is the one signal
+// whose default action is to do nothing: an older copy ignores it. SIGUSR1
+// would have HUNG UP on whoever was on the call.
+//
+// ── AND IT IS INSTALLED HERE, NEXT TO THE WINDOW ───────────────────────────
+//
+// It was first written at the foot of this file, beside the SIGINT handler, and
+// it never ran once: a call with a window does not reach the end of main.swift,
+// it blocks in the rendezvous long before. The debug line that proved it printed
+// nothing at all, which is the same evidence a handler that runs and does
+// nothing would leave -- so it is installed at the point where the window it
+// raises is known to exist.
+//
+// `.main` queue, because everything it touches is AppKit.
+nonisolated(unsafe) var raiseSource: DispatchSourceSignal?
+if display != nil || mdisplay != nil {
+  signal(SIGWINCH, SIG_IGN)
+  let r = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
+  r.setEventHandler {
+    fputs("raise: asked to come forward\n", stderr)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    // `orderFrontRegardless` and not `makeKeyAndOrderFront`: this window may be
+    // behind a full-screen app on another Space, and that is exactly the case
+    // somebody is clicking the Dock icon to get out of.
+    (mdisplay?.callWindow ?? display?.callWindow)?.orderFrontRegardless()
+  }
+  r.resume()
+  raiseSource = r
+  fputs("raise: ready -- a Dock click on an open Kin brings this window forward\n", stderr)
 }
 
 // The camera, started before there is anywhere to send it, so the preview is live
@@ -6560,38 +6604,6 @@ for sig in [SIGINT, SIGTERM] {
   }
   src.resume()
   signalSources.append(src)
-}
-
-// ── SOMEBODY CLICKED KIN WHILE THIS ONE WAS ALREADY OPEN ────────────────────
-//
-// The resident answers every Dock click, Finder double-click and Spotlight hit
-// for this bundle, and when Kin is already open the right answer is to bring
-// THIS window forward. It could not: `Launcher.reexec` is an `execv`, and after
-// one, LaunchServices' record for this process reads `pid -1` forever --
-// `activate` on it returns true and does nothing. The user saw a click that did
-// nothing, and then, once -1 was read as "not running", a new Kin every click.
-//
-// So the raise is done from the inside, where no LaunchServices handle is
-// needed. SIGWINCH because a resident that has just updated itself routinely
-// faces an OLD Kin with no handler for this, and SIGWINCH is the one signal
-// whose default action is to do nothing: an older copy ignores it. SIGUSR1
-// would have HUNG UP on whoever was on the call.
-//
-// `.main` queue, because everything it touches is AppKit.
-nonisolated(unsafe) var raiseSource: DispatchSourceSignal?
-if display != nil || mdisplay != nil {
-  signal(SIGWINCH, SIG_IGN)
-  let r = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
-  r.setEventHandler {
-    fputs("raise: asked to come forward\n", stderr)
-    NSApplication.shared.activate(ignoringOtherApps: true)
-    // `orderFrontRegardless` and not `makeKeyAndOrderFront`: this window may be
-    // behind a full-screen app on another Space, and that is exactly the case
-    // somebody is clicking the Dock icon to get out of.
-    (mdisplay?.callWindow ?? display?.callWindow)?.orderFrontRegardless()
-  }
-  r.resume()
-  raiseSource = r
 }
 
 if display != nil || mdisplay != nil {
