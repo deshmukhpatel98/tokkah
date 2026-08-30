@@ -402,6 +402,7 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
+  "floor-test", "floor-owd",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -433,7 +434,7 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
-                  "sameroom-test", "predict-test"]
+                  "sameroom-test", "predict-test", "floor-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -3944,6 +3945,16 @@ if flag("headphone-test") {
 // both, then require the samples where the near end is speaking to come out
 // EXACTLY as they went in, and the stretches where only the far end is speaking
 // to come out quiet.
+// ── WHOSE TURN IT IS, WITH A REAL DELAY BETWEEN THE TWO OPINIONS ────────────
+//
+// `--floor-owd` sweeps the one-way delay, because every bug this design can have
+// is two ends disagreeing about the present, and a rig with no delay cannot
+// produce one. Default 40 ms; try 100 for Delhi-NL.
+if flag("floor-test") {
+  let owd = Double(arg("floor-owd") ?? "40") ?? 40
+  exit(Floor.selfTest(owdMs: owd) ? 0 : 1)
+}
+
 if flag("gate-test") {
   let n = Int(SR * 12)
   var seed: UInt64 = 0x51ED
