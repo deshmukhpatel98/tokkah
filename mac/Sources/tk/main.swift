@@ -419,7 +419,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
-  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -453,7 +453,7 @@ let KNOWN_FLAGS: Set<String> = [
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
-                  "corr-test", "quantile-test", "reopen-test"]
+                  "corr-test", "quantile-test", "reopen-test", "gain-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -611,6 +611,12 @@ if flag("forget-server") { fputs(Server.forget() + "\n", stderr); exit(0) }
 // arithmetic and above the media socket: this is a table of pids, and it needs
 // no port, no device and no window.
 if flag("reopen-test") { exit(Resident.Target.selfTestLive() ? 0 : 1) }
+
+// ── A MICROPHONE FIVE TIMES TOO HOT, AND A LOOP THAT GAVE UP ON IT ─────────
+//
+// Driven with the peaks a real call delivered. Pure arithmetic over one struct:
+// no device, no port, no window, so it sits up here with the other rulers.
+if flag("gain-test") { exit(Audio.gainSelfTest() ? 0 : 1) }
 
 // ── ARE YOU TWO IN THE SAME ROOM? THE RULER, BEFORE ANY OF THE PRODUCT ─────
 //
@@ -5728,6 +5734,29 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
     "a_quality_s": audio.qualityTicks,
     "floor_held_pct": audio.floorHeldPct, "mic_access": gMicAccess,
+    // ── THE FLOOR'S OWN NUMBERS, WHICH NOTHING PUBLISHED ────────────────────
+    //
+    // `floor_held_pct` above is named for the floor and does not measure it: it
+    // counts the local voice gate and ignores `floorGain` entirely. So a call
+    // could be investigated end to end -- both ends, every beat -- without ever
+    // learning whether the floor muted a microphone once. It could not.
+    //
+    // These three are the fractions that answer it, and they existed already;
+    // they were printed under `--floor-debug`, which no real call passes.
+    "floor_blocks": audio.turns.floorBlocks,
+    "floor_muted_pct": audio.turns.floorBlocks > 0
+      ? Double(audio.turns.floorHeldBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    // The share of the call this end had stopped believing the far end's cues
+    // and was running on the local gate alone. An instrument that cannot see its
+    // own fallback reports the fallback as health.
+    "floor_fallback_pct": audio.turns.floorBlocks > 0
+      ? Double(audio.turns.floorFallbackBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────
+    //
+    // `mic_gain_end` was a fact and said 0.15 -- the floor of a loop that had
+    // given up. Whether it was STUCK there is the thing worth knowing.
+    "mic_trim": Double(audio.inputTrim), "mic_trim_moves": audio.trimMoves,
+    "mic_gain_rail": audio.gainAtRail ? 1 : 0,
     // Turn-taking is the product now, so it reports like the product.
     "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
     "turn_to_floor_p50": audio.timeToFloorP50,
@@ -5748,7 +5777,10 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "route": wire.lockedFrom.hasPrefix("relay") ? 2 : (wire.lockedFrom.isEmpty ? 0 : 1),
     "turn_ok": wire.turn != nil ? 1 : 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
-    "echo_corr": audio.echoCorr, "backchannels": audio.backchannels,
+    // The INSTANT, kept for continuity, and the PEAK beside it -- the final beat
+    // of a call that reached 0.71 reported 0.04, so every summary built on the
+    // last value said "no echo" about a call with a measured one.
+    "echo_corr": audio.echoCorr, "echo_corr_peak": audio.echoCorrPeak, "backchannels": audio.backchannels,
     // ── WHAT THIS CALL COSTS THE BATTERY ──────────────────────────────────
     //
     // A RATE: CPU seconds per wall second since the previous beat, so 0.15 is
@@ -6122,6 +6154,21 @@ func reportLoop() {
   // the share of the call during which this end had stopped believing the far
   // end's cues and was running on the local gate alone, and an instrument that
   // cannot see its own fallback reports the fallback as health.
+  // ── AND ON EVERY CALL, NOT ONLY A DEBUG ONE ───────────────────────────────
+  //
+  // The line above is named `floor:` and does not measure the floor. This one
+  // does, and it prints unconditionally: the whole point of a readout is to be
+  // there on the call somebody is complaining about.
+  if t.floorBlocks > 0 {
+    let n = Double(t.floorBlocks)
+    let muted = Double(t.floorHeldBlocks) / n * 100
+    let fb = Double(t.floorFallbackBlocks) / n * 100
+    fputs(String(format: "  one-at-a-time: mic muted for the other person %.1f%% of the call"
+               + "  (running on the local gate alone %.1f%%)", muted, fb)
+        + (audio.gainAtRail
+           ? String(format: "  MIC AT THE RAIL, trim %.2f", audio.inputTrim) : "")
+        + String(format: "  echo peak %.2f", audio.echoCorrPeak) + "\n", stderr)
+  }
   if flag("floor-debug"), t.floorBlocks > 0 {
     let n = Double(t.floorBlocks)
     fputs(String(format: "  floor: %@  held %.1f%%  fallback %.1f%%  ear %@  owd %.0f ms\n",

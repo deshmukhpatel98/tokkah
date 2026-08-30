@@ -385,6 +385,7 @@ final class Audio {
   private var capHistW = 0
   private(set) var echoDelayMs: Double = -1
   private(set) var echoCorr: Double = 0
+  private(set) var echoCorrPeak: Double = 0
   private(set) var echoErleDb: Double = 0
 
   /// What the speaker actually does. THIS is the one the render callback reads.
@@ -449,6 +450,21 @@ final class Audio {
   /// "did this call ever clip"; the tuner needs "how loud is it RIGHT NOW", and
   /// a lifetime maximum can never come back down.
   private(set) var micPeakWin: Float = 0
+  /// The microphone before `inputTrim`, which is what the trim has to be chosen
+  /// from: reading the trimmed signal would be a loop steering on its own output.
+  nonisolated(unsafe) var rawPeakWin: Float = 0
+  /// Software attenuation applied at capture when the device's own volume has
+  /// reached its floor and the signal is still too hot. 1 = untouched, which is
+  /// every machine that does not need it.
+  private(set) var inputTrim: Float = 1
+  private(set) var trimMoves = 0
+  /// True while the device knob is at its limit and the signal is STILL hot --
+  /// the state the old loop sat in silently for a whole call.
+  private(set) var gainAtRail = false
+  /// The lowest the device's own input volume is ever asked to go. Not zero: a
+  /// scalar of 0 is a dead microphone, and a loop that can reach it will find a
+  /// way to. Below this the attenuation is done in software instead.
+  private static let MIN_INPUT: Float32 = 0.05
   private var micSumSq: Double = 0
   var micRms: Double { micSamples > 0 ? (micSumSq / Double(micSamples)).squareRoot() : 0 }
   /// Seconds the report thread has been ticking. Kept because it is the
@@ -1118,6 +1134,15 @@ final class Audio {
           + " speaking \(speaking) run \(speechRun) ticks \(gainTicks)\n", stderr)
     }
     guard gainTicks > 3, speechRun >= 3 else { return }
+    // ── THE SOFTWARE TRIM IS DECIDED FIRST, AND WITHOUT A DEVICE ───────────
+    //
+    // Everything below can bail: no device, a volume property that cannot be
+    // read, a microphone whose volume is not settable at all (most USB mics).
+    // The trim used to live below all of those guards, so the machines with no
+    // knob to turn -- the ones that need it MOST -- were the ones it could
+    // never reach. Decided here, from the raw microphone, on every tick.
+    let knob: Float32 = micGainNow
+    trimStep(deviceAtFloor: knob <= Audio.MIN_INPUT + 1e-4, knob: knob)
     guard let dev = inDev as AudioDeviceID?, dev != 0 else { return }
     var cur: Float32 = 0
     var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
@@ -1134,7 +1159,20 @@ final class Audio {
     // not move the knob at all.
     var want = cur
     if peak < 0.18 { want = min(cur + 0.06, 0.95) }        // too quiet, climb
-    else if peak > 0.92 { want = max(cur - 0.08, 0.15) }   // clipping, back off
+    else if peak > 0.92 {
+      // ── BACK OFF BY WHAT IT IS OVER BY, NOT BY A FIXED STEP ────────────────
+      //
+      // The old rule subtracted 0.08 a tick. A microphone delivering peak 1.40
+      // needed the knob at roughly half of where it was, which is four ticks --
+      // and the floor below stopped it after two. Scaling by the overshoot gets
+      // there in one, and asks for exactly the level that puts speech at the
+      // -8 dBFS this function is already aiming for.
+      //
+      // 0.5 the smallest single step, so a device with a coarse or non-linear
+      // volume scalar cannot be walked to silence by one loud cough.
+      want = max(cur * max(0.5, 0.55 / peak), Audio.MIN_INPUT)
+    }
+    trimStep(deviceAtFloor: want <= Audio.MIN_INPUT + 1e-4, knob: cur)
     guard abs(want - cur) > 0.001 else { return }
     var v = want
     guard AudioObjectSetPropertyData(dev, &addr, 0, nil,
@@ -1150,6 +1188,97 @@ final class Audio {
     Metrics.fact("mic_gain_end", String(format: "%.2f", got))
     fputs("mic gain: peak was \(String(format: "%.2f", peak)) -- input \(Int(cur * 100))%"
         + " -> \(Int(got * 100))% (move \(gainMoves))\n", stderr)
+  }
+
+  /// ── ONE KNOB THE HARDWARE CANNOT REFUSE ──────────────────────────────────
+  ///
+  /// Chosen from the RAW microphone, never the trimmed one: a loop that reads
+  /// its own output is not measuring the room. Samples above 1.0 are not
+  /// clipped -- the float path carries them intact -- so this recovers the
+  /// signal exactly rather than limiting it.
+  ///
+  /// `deviceAtFloor` only decides what gets SAID. The trim itself applies
+  /// whenever the microphone is too hot, because a device with no settable
+  /// volume is at its floor in every sense that matters.
+  func trimStep(deviceAtFloor: Bool, knob: Float32) {
+    let raw = rawPeakWin
+    rawPeakWin = 0
+    guard raw > 0 else { return }
+    if raw > 0.92 {
+      let wantTrim = min(1, max(0.02, 0.55 / raw))
+      if wantTrim < inputTrim - 0.02 {
+        inputTrim = wantTrim
+        trimMoves += 1
+        Metrics.count("mic_trim_moved")
+        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+        fputs("mic gain: the microphone peaks at \(String(format: "%.2f", raw))"
+            + (deviceAtFloor ? " and the input knob is at its floor (\(Int(knob * 100))%)" : "")
+            + " -- trimming \(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB"
+            + " in software\n", stderr)
+      }
+      if !gainAtRail { gainAtRail = true; Metrics.fact("mic_gain_rail", "yes") }
+    } else if raw < 0.5, inputTrim < 1 {
+      // Let it back up slowly when the room quietens, so a single shout does not
+      // leave somebody permanently faint. Slower than it came down on purpose:
+      // the cost of being 3 dB quiet is nothing, and the cost of being hot is
+      // this whole bug.
+      inputTrim = min(1, inputTrim * 1.05)
+      if inputTrim > 0.98 { inputTrim = 1; gainAtRail = false }
+    }
+  }
+
+  // ── THE RULER, ON THE CALL THAT CAUSED THIS ──────────────────────────────
+  //
+  // Driven with the peaks the field actually delivered (1.40, 1.03, 5.24) and
+  // with the ones that must change nothing, because a trim that fires on a
+  // healthy microphone is the same bug pointing the other way.
+  //
+  // The first row is the whole complaint: the old loop reached 0.15, could not
+  // ask for less, and went quiet for the rest of the call. Here the trim has to
+  // move on a knob that is stuck.
+  static func gainSelfTest() -> Bool {
+    var ok = true
+    func say(_ good: Bool, _ what: String) {
+      if !good { ok = false }
+      fputs("gain: \(good ? "OK  " : "FAIL") \(what)\n", stderr)
+    }
+    // 1. the field case: knob on the floor, microphone still five times hot
+    let a = Audio()
+    a.rawPeakWin = 5.24
+    a.trimStep(deviceAtFloor: true, knob: 0.15)
+    say(a.inputTrim < 0.2, "peak 5.24 with the knob at its floor -> trim \(String(format: "%.3f", a.inputTrim))")
+    say(a.gainAtRail, "and it is on the record as being at the rail")
+    let after = 5.24 * a.inputTrim
+    say(after > 0.3 && after < 0.9,
+        "which lands the microphone at \(String(format: "%.2f", after)), inside the headroom it aims for")
+    // 2. the peaks that walked the knob down: still hot, still trimmed
+    let b = Audio()
+    b.rawPeakWin = 1.40
+    b.trimStep(deviceAtFloor: false, knob: 0.27)
+    say(b.inputTrim < 1, "peak 1.40 is trimmed even while the knob still has room")
+    // 3. A MICROPHONE THAT IS FINE MUST BE LEFT ALONE. The far end of that call
+    //    peaked well under full scale, and a trim there would be this bug
+    //    inverted -- an app quietly making somebody inaudible.
+    let c = Audio()
+    c.rawPeakWin = 0.85
+    c.trimStep(deviceAtFloor: true, knob: 0.05)
+    say(c.inputTrim == 1, "a healthy peak of 0.85 is left completely alone")
+    say(!c.gainAtRail, "and is not reported as being at the rail")
+    // 4. a silent tick decides nothing: with no evidence the answer is not zero
+    let d = Audio()
+    d.rawPeakWin = 0
+    d.trimStep(deviceAtFloor: true, knob: 0.05)
+    say(d.inputTrim == 1, "a silent window changes nothing")
+    // 5. and it comes back up when the room quietens, or one shout is permanent
+    let e = Audio()
+    e.rawPeakWin = 5.24
+    e.trimStep(deviceAtFloor: true, knob: 0.05)
+    let low = e.inputTrim
+    for _ in 0..<200 { e.rawPeakWin = 0.2; e.trimStep(deviceAtFloor: true, knob: 0.05) }
+    say(e.inputTrim > low, "it recovers when the room goes quiet (\(String(format: "%.2f", low)) -> \(String(format: "%.2f", e.inputTrim)))")
+    say(e.inputTrim <= 1, "and never climbs past unity, which would be a gain")
+    fputs("GAIN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
+    return ok
   }
 
   func sampleQuality() {
@@ -1317,6 +1446,9 @@ final class Audio {
                                 fixE: micE, minOff: 1)
       guard scan.best >= 0 else { continue }
       echoCorr = Double(scan.bestScore)
+      // A call is judged on whether the speaker EVER reached the microphone, not
+      // on whether it was doing so at the moment a beat happened to be built.
+      if echoCorr > echoCorrPeak { echoCorrPeak = echoCorr }
       echoDelayMs = Double((maxLag - scan.best) * D) / SR * 1000.0
 
       // The second search that used to run here -- the same 400 ms slid the other
@@ -3194,9 +3326,40 @@ final class Audio {
       }
     }
 
+    // ── THE KNOB HAS A FLOOR. THE SIGNAL DOES NOT. ──────────────────────────
+    //
+    // Measured on a real call: this Mac's microphone delivered samples peaking
+    // at 5.24 -- five times full scale -- with 1.6% of every sample at or past
+    // the clip point and an RMS of 0.26, eighteen decibels hotter than the far
+    // end. `tuneInputGain` did its job and walked the device from 27% to 15%,
+    // and then STOPPED, because 15% is the floor written into it. It moved
+    // twice in a two-minute call and never said it had given up.
+    //
+    // Everything else followed from that. A microphone that hot hears this
+    // machine's own speaker easily (echo correlation reached 0.71), and it
+    // holds the local voice gate open -- 98% of that call -- so the near mic
+    // was live while the far person was talking, and their end chopped its way
+    // through 409 gate flaps trying to take a turn against it.
+    //
+    // A scalar, and deliberately nothing cleverer. Samples ABOVE 1.0 are not
+    // clipped, they are merely large: the float path carries them intact, so
+    // dividing recovers the signal exactly, with no compression, no limiter and
+    // no colour. That matters here more than usual -- the whole audio design is
+    // that the microphone is not processed.
+    if inputTrim != 1 {
+      for k in 0..<Int(n) { inScratch[k] *= inputTrim }
+    }
+
     // What the microphone actually delivered. Placed HERE deliberately: after the
     // file substitution so a rig measures its own input, and before the simulated
     // echo below, so a rig's echo injection cannot be mistaken for a room's.
+    // AFTER the trim, so every number below describes what the rest of the
+    // pipeline actually gets; `rawPeakWin` keeps the untrimmed truth for the
+    // loop that sets the trim.
+    for k in 0..<Int(n) {
+      let r = abs(inScratch[k]) / inputTrim
+      if r > rawPeakWin { rawPeakWin = r }
+    }
     for k in 0..<Int(n) {
       let a = abs(inScratch[k])
       micSumSq += Double(a) * Double(a)
