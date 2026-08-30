@@ -403,7 +403,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
-  "turn-test", "turn-owd", "turn-coupling", "turn-wav",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -435,7 +435,8 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
-                  "sameroom-test", "predict-test", "floor-test", "turn-test"]
+                  "sameroom-test", "predict-test", "floor-test", "turn-test",
+                  "corr-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -3956,6 +3957,8 @@ if flag("headphone-test") {
 // `--floor-owd` sweeps the one-way delay, because every bug this design can have
 // is two ends disagreeing about the present, and a rig with no delay cannot
 // produce one. Default 40 ms; try 100 for Delhi-NL.
+if flag("corr-test") { exit(Audio.corrSelfTest() ? 0 : 1) }
+
 if flag("turn-test") {
   let w = arg("turn-wav") ?? "testbed/media/real/realA.wav,testbed/media/real/realB.wav"
   exit(TurnRig.selfTest(paths: w.split(separator: ",").map(String.init),
@@ -5600,6 +5603,10 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   }
   let r = audio.ring
   let mSnap = Metrics.snapshot()
+  // Sampled exactly once per beat, and read many times below: two calls would
+  // be two DIFFERENT windows sharing one name, and the second would report the
+  // microseconds between them rather than the beat.
+  let pwr = Power.sample()
   var f: [String: Any] = [
     "uptime_s": uptime,
     "up_mbps": up, "down_mbps": down,
@@ -5699,6 +5706,18 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // that loudspeaker at all" against `ROOM_ON`, and `room_lag_ms` against
     // `room_pipe_ms` is "was it one crossing away (the same room) or two (a
     // loop at the far end)". A single "it did not fire" cannot tell those apart.
+    // ── WHAT THIS CALL COSTS THE BATTERY ──────────────────────────────────
+    //
+    // A RATE: CPU seconds per wall second since the previous beat, so 0.15 is
+    // one seventh of a core. `usr` and `sys` stay apart because they move for
+    // unrelated reasons -- a hot loop shows in one, the audio device and the
+    // socket in the other -- and a single number cannot tell them apart.
+    // `cpu_valid` is 0 on the first beat of a call: one reading cannot be a
+    // rate, and publishing a zero for a thing not measured is exactly the
+    // shape that makes a blind instrument read like a healthy one.
+    "cpu": pwr.cpu, "cpu_usr": pwr.usr, "cpu_sys": pwr.sys,
+    "cpu_valid": pwr.valid ? 1 : 0,
+    "threads": pwr.threads, "rss_peak_mb": pwr.rssPeakMb,
     "room_on": audio.roomConfirmed ? 1 : 0,
     "room_verdict": audio.roomVerdict.rawValue,
     "room_corr": audio.roomCorr,

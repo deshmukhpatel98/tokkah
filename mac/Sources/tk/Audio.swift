@@ -1381,24 +1381,15 @@ final class Audio {
       for v in mic { micE += v * v }
       guard micE > 1e-6 else { continue }       // a silent mic has no echo to find
 
-      var best = -1, bestScore: Float = 0
-      for lag in 0..<maxLag {
-        var num: Float = 0, den: Float = 0
-        let off = maxLag - lag
-        for i in 0..<win {
-          let sv = spk[i + off]
-          num += mic[i] * sv
-          den += sv * sv
-        }
-        guard den > 1e-9 else { continue }
-        // Normalised by BOTH energies, so the score is a correlation coefficient
-        // rather than a number that grows with how loud the speaker happens to be.
-        let r = abs(num) / (den * micE).squareRoot()
-        if r > bestScore { bestScore = r; best = lag }
-      }
-      guard best >= 0 else { continue }
-      echoCorr = Double(bestScore)
-      echoDelayMs = Double(best * D) / SR * 1000.0
+      // Normalised by BOTH energies, so the score is a correlation coefficient
+      // rather than a number that grows with how loud the speaker happens to be.
+      // The scan runs over OFFSETS; lag is maxLag - off, the same mapping the
+      // loop this replaced did inside itself.
+      let scan = Audio.corrScan(fix: mic, slide: spk, win: win, maxOff: maxLag,
+                                fixE: micE, minOff: 1)
+      guard scan.best >= 0 else { continue }
+      echoCorr = Double(scan.bestScore)
+      echoDelayMs = Double((maxLag - scan.best) * D) / SR * 1000.0
 
       // ── AND NOW THE SAME 400 ms, SLID THE OTHER WAY ─────────────────────────
       //
@@ -1477,6 +1468,180 @@ final class Audio {
     var scored = false
   }
 
+
+  // ── ONE CORRELATION SCAN, VECTORISED, FOR BOTH SEARCHES ────────────────────
+  //
+  // The echo estimator and the same-room scorer were the two most expensive
+  // things this app does with its own CPU -- top of the self-time profile on a
+  // live call, above the render callback. Both were the same brute force:
+  //
+  //     for each of ~1200 offsets:            <- 1800 for the room search
+  //         for each of 2400 samples:         <- 400 ms of evidence
+  //             num += fix[i] * slide[i+off]
+  //             den += slide[i+off] * slide[i+off]
+  //
+  // That is ~2.9 MILLION multiply-accumulates every half second, per search, to
+  // answer a question about acoustics that changes on the scale of seconds.
+  //
+  // Two changes, and NEITHER of them changes the answer:
+  //
+  //   `den` is a sliding sum of squares over one fixed array. Recomputing it
+  //   inside the offset loop makes an O(n) quantity cost O(n*m). A prefix sum
+  //   gives every offset's energy by subtraction -- the whole den term stops
+  //   being work at all.
+  //
+  //   `num` over all offsets IS a cross-correlation, which is what `vDSP_conv`
+  //   computes: C[n] = sum_p A[n+p] * F[p], the same sum in the same order,
+  //   hand-vectorised by Accelerate (already linked, already used by the FFT
+  //   above and by Subtitles).
+  //
+  // The arithmetic is identical; only the order and the instruction width
+  // change. `--corr-test` asserts this against the brute force it replaces,
+  // because "I rewrote the hot loop and it still runs" is not a measurement --
+  // `validate-the-ruler-against-known-inputs`.
+  //
+  // The prefix sum accumulates in Double where the original accumulated in
+  // Float. That is a difference, and it is in the direction of being MORE
+  // right: 2400 squared floats summed in Float32 drift, and this quantity sits
+  // under a square root inside a threshold comparison.
+  struct CorrScan { var best = -1; var bestScore: Float = 0; var meanScore: Double = 0; var nLags = 0 }
+
+  /// `fix` is the stationary window (length `win`), `slide` is the one searched
+  /// across (length `win + maxOff`), `fixE` the energy of `fix`.
+  /// `minOff` exists because the two callers do NOT search the same range, and
+  /// assuming they did was an off-by-one on the first attempt: the echo
+  /// estimator's loop ran `lag in 0..<maxLag` with `off = maxLag - lag`, so its
+  /// offsets are 1...maxLag and never include zero, while the room scorer's are
+  /// 0...maxBack. Handing both the same bounds silently searched a window one
+  /// sample away from the one the shipped code searched.
+  /// The control arm, so the saving can be MEASURED on a live call rather than
+  /// inferred from a microbenchmark. A function that is 21x faster in isolation
+  /// may be 0% of the thing a battery notices, and the only way to know which is
+  /// to run the call both ways with the same ruler.
+  nonisolated(unsafe) static var corrSlowArm =
+    ProcessInfo.processInfo.environment["TK_CORR_SLOW"] == "1"
+
+  static func corrScan(fix: [Float], slide: [Float], win: Int, maxOff: Int,
+                       fixE: Float, minOff: Int = 0) -> CorrScan {
+    if corrSlowArm {
+      return corrScanSlow(fix: fix, slide: slide, win: win, maxOff: maxOff,
+                          fixE: fixE, minOff: minOff)
+    }
+    var out = CorrScan()
+    guard win > 0, maxOff >= 0, fix.count >= win, slide.count >= win + maxOff,
+          fixE > 0 else { return out }
+    let n = maxOff + 1
+    var num = [Float](repeating: 0, count: n)
+    // A[n+p]*F[p]: correlation, not convolution -- vDSP_conv does not flip the
+    // filter, which is why this is a drop-in for the loop above and not its
+    // mirror image.
+    slide.withUnsafeBufferPointer { a in
+      fix.withUnsafeBufferPointer { f in
+        vDSP_conv(a.baseAddress!, 1, f.baseAddress!, 1, &num, 1,
+                  vDSP_Length(n), vDSP_Length(win))
+      }
+    }
+    // Energy of every window of `slide`, by subtraction.
+    var pre = [Double](repeating: 0, count: slide.count + 1)
+    for i in 0..<slide.count { pre[i + 1] = pre[i] + Double(slide[i]) * Double(slide[i]) }
+    var sum = 0.0
+    for off in max(0, minOff)..<n {
+      let den = pre[off + win] - pre[off]
+      guard den > 1e-9 else { continue }
+      let r = Float(abs(Double(num[off])) / (den * Double(fixE)).squareRoot())
+      sum += Double(r); out.nLags += 1
+      if r > out.bestScore { out.bestScore = r; out.best = off }
+    }
+    out.meanScore = out.nLags > 0 ? sum / Double(out.nLags) : 0
+    return out
+  }
+
+  /// The loop this replaced, kept so the replacement can be checked against it
+  /// rather than against a memory of it.
+  static func corrScanSlow(fix: [Float], slide: [Float], win: Int, maxOff: Int,
+                           fixE: Float, minOff: Int = 0) -> CorrScan {
+    var out = CorrScan()
+    var sum = 0.0
+    for off in max(0, minOff)...maxOff {
+      var num: Float = 0, den: Float = 0
+      for i in 0..<win {
+        let sv = slide[i + off]
+        num += fix[i] * sv
+        den += sv * sv
+      }
+      guard den > 1e-9 else { continue }
+      let r = abs(num) / (den * fixE).squareRoot()
+      sum += Double(r); out.nLags += 1
+      if r > out.bestScore { out.bestScore = r; out.best = off }
+    }
+    out.meanScore = out.nLags > 0 ? sum / Double(out.nLags) : 0
+    return out
+  }
+
+
+  /// ── THE FAST SCAN AGAINST THE ONE IT REPLACED ─────────────────────────────
+  ///
+  /// Two signals with a KNOWN echo at a KNOWN lag, so the test can fail in both
+  /// directions: the two implementations must agree with each other AND both
+  /// must find the lag that was planted. An agreement test alone would pass two
+  /// identically broken scans.
+  static func corrSelfTest() -> Bool {
+    var fails = 0
+    func check(_ ok: Bool, _ what: String) {
+      if !ok { fails += 1 }
+      print("  \(ok ? "ok  " : "FAIL") \(what)")
+    }
+    var seed: UInt64 = 0xC0FFEE
+    func rnd() -> Float {
+      seed = seed &* 6364136223846793005 &+ 1442695040888963407
+      return Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+    }
+    let win = 2400, maxOff = 1200
+    for (name, plant) in [("a planted echo", 375), ("a different lag", 40)] {
+      var slide = [Float](repeating: 0, count: win + maxOff)
+      for i in 0..<slide.count { slide[i] = rnd() * 0.5 }
+      // fix[i] is slide delayed by `plant`, plus noise, so the true offset is
+      // maxOff - plant... expressed directly: fix matches slide at off = plant.
+      var fix = [Float](repeating: 0, count: win)
+      for i in 0..<win { fix[i] = slide[i + plant] * 0.8 + rnd() * 0.05 }
+      var fixE: Float = 0
+      for v in fix { fixE += v * v }
+      let t0 = Clock.now()
+      let fast = corrScan(fix: fix, slide: slide, win: win, maxOff: maxOff, fixE: fixE)
+      let tFast = Clock.ms(Clock.now() - t0)
+      let t1 = Clock.now()
+      let slow = corrScanSlow(fix: fix, slide: slide, win: win, maxOff: maxOff, fixE: fixE)
+      let tSlow = Clock.ms(Clock.now() - t1)
+      check(fast.best == plant, "\(name): the fast scan finds the planted offset "
+                              + "(\(fast.best), planted \(plant))")
+      check(slow.best == plant, "\(name): CONTROL, the brute force finds it too (\(slow.best))")
+      check(abs(fast.bestScore - slow.bestScore) < 1e-3,
+            String(format: "%@: same peak score (%.6f vs %.6f)", name,
+                   fast.bestScore, slow.bestScore))
+      check(abs(fast.meanScore - slow.meanScore) < 1e-3,
+            String(format: "%@: same mean score (%.6f vs %.6f)", name,
+                   fast.meanScore, slow.meanScore))
+      check(fast.nLags == slow.nLags, "\(name): same number of offsets scored "
+                                    + "(\(fast.nLags) vs \(slow.nLags))")
+      print(String(format: "       %.2f ms fast, %.2f ms brute force -- %.1fx",
+                   tFast, tSlow, tSlow / max(tFast, 0.0001)))
+    }
+    // And the range bound, which was wrong on the first attempt and is the one
+    // thing an agreement test on full ranges cannot see.
+    var slide = [Float](repeating: 0, count: win + maxOff)
+    for i in 0..<slide.count { slide[i] = rnd() }
+    var fix = [Float](repeating: 0, count: win)
+    for i in 0..<win { fix[i] = slide[i] }          // a perfect match AT OFFSET ZERO
+    var fixE: Float = 0
+    for v in fix { fixE += v * v }
+    let with0 = corrScan(fix: fix, slide: slide, win: win, maxOff: maxOff, fixE: fixE, minOff: 0)
+    let no0 = corrScan(fix: fix, slide: slide, win: win, maxOff: maxOff, fixE: fixE, minOff: 1)
+    check(with0.best == 0, "minOff 0 can win at offset zero")
+    check(no0.best != 0, "minOff 1 excludes offset zero, which the echo search needs")
+    print(fails == 0 ? "CORR TEST PASSED" : "CORR TEST FAILED (\(fails))")
+    return fails == 0
+  }
+
   static func scoreSameRoom(mic: UnsafeMutablePointer<Float>, micW: Int,
                             spk: UnsafeMutablePointer<Float>, spkW: Int,
                             micWin: inout [Float], refWin: inout [Float]) -> RoomHit {
@@ -1510,32 +1675,18 @@ final class Audio {
     guard out.refRms > RFAR_VOCAL, refE > 1e-6 else { return out }
     out.scored = true
 
-    var best = -1, bestScore: Float = 0
-    var sum: Double = 0, nLags = 0
-    for lag in 0...maxBack {
-      var num: Float = 0, den: Float = 0
-      // ref[i] sits at playout time (spkW - (win-i)*D); the mic sample lag*D
-      // EARLIER than it is micWin[maxBack + i - lag]. Derived once, here, rather
-      // than tuned until the numbers looked right.
-      let off = maxBack - lag
-      for i in 0..<win {
-        let mv = micWin[i + off]
-        num += refWin[i] * mv
-        den += mv * mv
-      }
-      guard den > 1e-9 else { continue }
-      // Normalised by BOTH energies -- the same coefficient the forward search
-      // reports, with the fixed and sliding sides swapped.
-      let r = abs(num) / (den * refE).squareRoot()
-      sum += Double(r); nLags += 1
-      if r > bestScore { bestScore = r; best = lag }
-    }
-    guard best >= 0, nLags > 0 else { out.scored = false; return out }
-    out.corr = Double(bestScore)
-    out.lagMs = Double(best * D) / SR * 1000.0
+    // ref[i] sits at playout time (spkW - (win-i)*D); the mic sample lag*D
+    // EARLIER than it is micWin[maxBack + i - lag]. Derived once, here, rather
+    // than tuned until the numbers looked right -- so the scan runs over
+    // OFFSETS and the lag is read back out of the winning offset.
+    let scan = corrScan(fix: refWin, slide: micWin, win: win, maxOff: maxBack, fixE: refE)
+    guard scan.best >= 0, scan.nLags > 0 else { out.scored = false; return out }
+    let bestLag = maxBack - scan.best
+    out.corr = Double(scan.bestScore)
+    out.lagMs = Double(bestLag * D) / SR * 1000.0
     // One lag out of eighteen hundred cannot move the mean enough to matter, so
     // it is not excluded -- which keeps this a single pass with no second buffer.
-    let floorScore = sum / Double(nLags)
+    let floorScore = scan.meanScore
     out.snr = floorScore > 1e-9 ? out.corr / floorScore : 0
     return out
   }
