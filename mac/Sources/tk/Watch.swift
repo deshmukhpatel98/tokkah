@@ -399,7 +399,19 @@ enum Watch {
     // `.accessory`, not `.prohibited`: same absence of a Dock icon and a ⌘-Tab
     // entry, but a process that may own a status item. `.prohibited` may not, and
     // that one word was the difference between a feature and a rumour.
-    app.setActivationPolicy(.accessory)
+    // ── AND IT MUST SAY SO WHEN IT CANNOT ─────────────────────────────────
+    //
+    // The return value was thrown away, and the call FAILS after an execv: the
+    // new image inherits the LaunchServices registration of the one it replaced,
+    // already checked in as Foreground. Every self-update therefore left a
+    // resident with a Dock icon -- a second Kin sitting in the Dock next to the
+    // real one, which is what "the dual app opening has not been fixed" was.
+    // A silent no-op in the one line that makes this process invisible.
+    if !app.setActivationPolicy(.accessory) {
+      fputs("watch: WARNING -- could not go invisible, this resident will show a"
+          + " Dock icon. An execv'd resident cannot; it has to be restarted by"
+          + " launchd (see Update.restart).\n", stderr)
+    }
     // ── A RIG MUST BE ABLE TO RUN THIS WITHOUT TOUCHING THE REAL DIRECTORY ────
     //
     // `TK_NO_IDENTITY` is how every rig in mac/tools avoids claiming a name on

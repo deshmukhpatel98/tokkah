@@ -140,6 +140,17 @@ else
   sed -n '1,8p' "$RING" 2>/dev/null | sed 's/^/      /'
 fi
 
+# ── THE RESIDENT MUST BE INVISIBLE ─────────────────────────────────────────
+#
+# It holds the bundle's registration all day and has no window, so a Dock icon
+# for it is a second Kin sitting next to the real one -- which is exactly what
+# the duplicate-icon report turned out to be. `setActivationPolicy` returns a
+# Bool that was being thrown away, and it FAILS in a process that got here by
+# execv. The resident now says so, and this reads it.
+grep -q "could not go invisible" "$SP/ghost.log" \
+  && say "FAIL" "the resident kept a Dock icon -- that is a second Kin in the Dock" \
+  || say "OK" "the resident went invisible, so the only Dock icon is the app's"
+
 # ── A HANDLER NOBODY REACHES IS NOT A HANDLER ──────────────────────────────
 #
 # The raise is a signal handler, and the first version of it was installed at

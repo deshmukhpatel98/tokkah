@@ -936,11 +936,7 @@ enum Update {
       pending = nil
       atStage("installed"); Metrics.fact("update_installed", m.version)
     fputs("update: installed \(m.version) -- restarting\n", stderr)
-      var argv = restartArgv(me.path).map { strdup($0) }
-      argv.append(nil)
-      execv(me.path, &argv)
-      fputs("update: execv failed (errno \(errno)) -- exiting so a supervisor can restart\n", stderr)
-      exit(0)
+      restart(into: me)
     }
 
     // Checked HERE and not at the top of this function, because only the legacy
@@ -988,12 +984,39 @@ enum Update {
     pending = nil
     atStage("installed"); Metrics.fact("update_installed", m.version)
     fputs("update: installed \(m.version) -- restarting\n", stderr)
-    var argv = restartArgv(restart.path).map { strdup($0) }
+    Update.restart(into: restart)
+  }
+
+  /// ── A RESIDENT RESTARTS THROUGH launchd, NOT THROUGH execv ────────────────
+  ///
+  /// The watcher is invisible on purpose: `Watch.run` sets `.accessory`, so no
+  /// Dock icon and no cmd-Tab entry. After an `execv` that call SILENTLY FAILS --
+  /// the new image inherits the LaunchServices registration of the one it
+  /// replaced, which is already checked in as Foreground -- so every self-update
+  /// left a SECOND Kin in the Dock, beside the real app. That is the two icons
+  /// in the report, and they had nothing to do with two apps being opened.
+  ///
+  /// Measured on this Mac: a re-exec'd resident reports `.regular`, a
+  /// launchd-started one reports `.accessory`.
+  ///
+  /// `getppid() == 1` is the test for "something is supervising this". A
+  /// resident started by hand from a shell has no launchd to come back through
+  /// and must still execv; the installed one has KeepAlive set unconditionally,
+  /// so exiting is a restart. `Watch.run` already ends this way when it notices
+  /// the binary change underneath it.
+  static func restart(into path: URL) -> Never {
+    if CommandLine.arguments.contains("--watch"), getppid() == 1 {
+      fputs("update: restarting through launchd -- an execv'd resident cannot go"
+          + " invisible and would leave a second Kin in the Dock\n", stderr)
+      exit(3)
+    }
+    var argv = restartArgv(path.path).map { strdup($0) }
     argv.append(nil)
-    execv(restart.path, &argv)
+    execv(path.path, &argv)
     fputs("update: execv failed (errno \(errno)) -- exiting so a supervisor can restart\n", stderr)
     exit(0)
   }
+
 
   /// Fetch and install in one step, for the launch-time check -- nothing is live
   /// at launch, so there is no reason to defer.
