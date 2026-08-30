@@ -5680,6 +5680,38 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "turn_ok": wire.turn != nil ? 1 : 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
     "echo_corr": audio.echoCorr, "backchannels": audio.backchannels,
+    // ── THE SAME-ROOM DETECTOR, WHICH KNEW EVERYTHING AND SAID NOTHING ───────
+    //
+    // Reported as echo on a real call: "the echo is pretty much there... even if
+    // both the devices are in the same room." There is a whole detector for
+    // exactly that case -- it turns this Mac's speaker off when it can prove the
+    // two of you share a room -- and every number it forms went to a stderr on
+    // somebody else's machine and nowhere else. So the question "did it fire,
+    // and if not, which of its two conditions failed" could not be answered from
+    // the server at all, and the only honest reply was that we could not see.
+    //
+    // `telemetry-must-self-diagnose` and `invisible-when-it-matters`: the path
+    // that stops working is exactly the path that stops reporting, and a
+    // detector with no field is indistinguishable from a detector that is off.
+    //
+    // Both halves of its test are published, because they fail for opposite
+    // reasons and need opposite fixes: `room_corr` is "did this microphone hear
+    // that loudspeaker at all" against `ROOM_ON`, and `room_lag_ms` against
+    // `room_pipe_ms` is "was it one crossing away (the same room) or two (a
+    // loop at the far end)". A single "it did not fire" cannot tell those apart.
+    "room_on": audio.roomConfirmed ? 1 : 0,
+    "room_verdict": audio.roomVerdict.rawValue,
+    "room_corr": audio.roomCorr,
+    "room_lag_ms": audio.roomLagMs,
+    "room_pipe_ms": audio.roomPipeMsNow ?? -1,
+    "room_ref_rms": audio.roomRefRms, "room_mic_rms": audio.roomMicRms,
+    // WITH ITS DENOMINATOR. `room_hits` alone cannot say whether the detector
+    // disagreed or simply never got a scoreable moment -- and "the far end was
+    // never loud enough to score" is the likeliest way this quietly does
+    // nothing. `counted-without-a-denominator`.
+    "room_hits": audio.roomHits, "room_scored": audio.roomScored,
+    "room_enters": audio.roomEnters, "room_loopback_hits": audio.loopbackHits,
+    "room_thresh": Audio.ROOM_ON,
     "floor_claims": audio.floorClaims,
     "dec_luma": gDecLuma,
     "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,

@@ -1569,6 +1569,13 @@ final class Audio {
 
   /// The expected same-room lag for THIS call, in ms, or nil while the call has
   /// no honest mouth-to-ear. Nil is a refusal to attribute, not a verdict.
+  /// What `roomPipeMs` currently is, for the beat. The detector's whole verdict
+  /// turns on comparing the measured lag against this, so publishing the lag
+  /// without it would be publishing half of a comparison -- and nil is itself
+  /// the answer sometimes: a call with no honest mouth-to-ear cannot attribute
+  /// an echo to a room at all, which is a REASON the detector never fired.
+  var roomPipeMsNow: Double? { roomPipeMs }
+
   private var roomPipeMs: Double? {
     guard thetaValid, m2e.count > 20, let p50 = m2e.p(0.50), p50 > 0 else { return Audio.roomPipeOverride }
     let pipe = p50 - outLatencyMs - inLatencyMs

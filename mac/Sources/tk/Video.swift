@@ -478,8 +478,38 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       return
     }
     dev.activeFormat = f
-    let best = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 30
-    dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(best))
+    // ── THIS LINE ABORTED THE APP EIGHT TIMES ON A REAL MAC ──────────────────
+    //
+    // It was `CMTime(value: 1, timescale: CMTimeScale(best))`, building a frame
+    // duration out of a Double frame RATE. `CMTimeScale` is an Int32, so that
+    // conversion TRUNCATES: a device advertising 29.97 asks for 1/29 s, which is
+    // outside the range it just advertised, and `setActiveVideoMinFrameDuration:`
+    // answers an out-of-range duration by raising an Objective-C exception.
+    // Nothing in a Swift process catches those, so it goes objc_terminate ->
+    // abort, on the camera queue, with the whole app.
+    //
+    // Reported as "picking up the call just unexpectedly quit the app", and that
+    // is exactly what it is: answering brings the camera up, and the camera
+    // killed the process before the call could start. Eight crashes in one day on
+    // 0.75.0, every one of them this frame.
+    //
+    // The fix is to stop CONSTRUCTING the duration at all. Each range already
+    // carries `minFrameDuration` -- the exact CMTime for its own maximum rate,
+    // in whatever timescale that device actually uses -- so the value handed
+    // back is one the device has already said it accepts. Nothing to round.
+    //
+    // And it is read off `dev.activeFormat` rather than off `f`: those are the
+    // same object when the assignment above took, and when it did not, the ranges
+    // that matter are the ones now in force. `readback-is-not-in-effect`.
+    let ranges = dev.activeFormat.videoSupportedFrameRateRanges
+    if let fastest = ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+      dev.activeVideoMinFrameDuration = fastest.minFrameDuration
+    } else {
+      fputs("camera: \(dev.localizedName) advertises no frame-rate range for "
+          + "\(CameraSource.describe(dev.activeFormat)) -- leaving its own pacing alone\n",
+            stderr)
+    }
+    let best = ranges.map { $0.maxFrameRate }.max() ?? 30
     dev.unlockForConfiguration()
     // Which mode the sensor is actually in, and how many others matched. `.last`
     // is list order, not a preference -- if this ever prints more than one
