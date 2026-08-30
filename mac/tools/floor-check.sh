@@ -34,8 +34,17 @@
 #      the hit-test audit still reaches the button
 #   6. LIVE, with no pin and a real gate on a real call, the state actually
 #      leaves `through`
-#   7. CONTROL for 6: with the gate off (`--no-gate`, which is what headphones
-#      do), it never leaves `through` at all
+#   7. CONTROL for 6: with NOTHING able to hold anybody, it never leaves
+#      `through` at all.
+#
+#      This arm was `--no-gate` alone, and that stopped being the same sentence
+#      the day the turn layer shipped. `--no-gate` switches off the ECHO gate --
+#      the thing headphones switch off -- and the floor is a second, independent
+#      mechanism that can hold a microphone for a reason that has nothing to do
+#      with acoustics. So the arm failed honestly: the button still said `held`
+#      and the border still went dark, because something really was still
+#      holding people. A control arm has to turn off EVERY mechanism that can
+#      produce the effect, and there are two now: `--no-gate --no-floor`.
 #   8. the caption is readable in ONE frame, not in twelve
 #   9. the green edge is up exactly when this end is audible, and dark when it is
 #      muted, held, or merely bidding -- with no glow bleeding inward from it
@@ -157,12 +166,37 @@ shoot() {   # $1 = press tokens, $2 = name; $VIDEO = picture, default off
 #           ruler would have reported it as nearly invisible at +1.4:1 against
 #           white while a person can see it perfectly well.
 #
-#   ink     mean of the brightest tenth of the pixels inside a button's own
+#   ink     mean of the brightest 2% of the pixels inside a button's own
 #           rectangle: the glyph, and not the disc it sits on. Reported as a RATIO
 #           against the camera button beside it, because that is what a person
 #           actually judges -- the row is the reference, nobody reads a glyph's
 #           opacity in the absolute -- and because a ratio cancels the window's
 #           exposure, its scale and the material underneath.
+#
+# ── THE TENTH THAT WAS NOT THE GLYPH ────────────────────────────────────────
+#
+# This pool was the brightest TENTH, and a tenth of a 58 pt button is roughly
+# four times the glyph's own stroke -- so three quarters of every sample was the
+# disc, the hairline and the material, none of which the microphone's state
+# moves at all. That is a ruler measuring mostly things that cannot change, and
+# it compressed the whole scale into its top quarter: photographed, the three
+# states came out 0.9245 / 0.8066 / 0.6953, so `held` -- drawn at alpha 0.34,
+# which is a two-thirds cut a person sees instantly -- reported 0.752x of
+# `through` and missed the 0.75 bar below by 0.3%. The DRAWING was never the
+# problem: `MicFloor.held` has been 0.34 since the state was introduced, in the
+# same commit as this rig (a65eb2f), and `git log -S` shows neither the constant
+# nor the glyph's alpha path touched since. The threshold was written against
+# what the alpha does and then read through a ruler that could not see it.
+#
+# At the brightest 2% -- 269 px of a 13456 px button, comfortably inside the
+# stroke -- the same photographs read 0.9997 / 0.7717 / 0.5561, which is the
+# alpha ladder itself. Calibration, on the arms this rig already shoots:
+# `through`, `quiet` and `claim` all come back 0.9997 (three states that must be
+# identical, and are), and the CAMERA button lands on 233.97 in every single arm
+# to the last digit, so the control ranks flat by measurement and not by luck.
+# `muted` reads 0.4756 -- full ink, but drawn in red, which is the one arm this
+# ruler deliberately ranks the other way and the reason nothing asserts ink for
+# it. The 0.75 bar now clears by 26 points instead of failing by 0.3.
 measure() {  # $1 = name -> "blue green micink camink ratio"
   python3 - "$SP/$1.png" "$SP/$1.rects" <<'PY'
 import sys, re, numpy as np
@@ -193,7 +227,7 @@ def ink(rect):
     sx, sy, sw, sh = (int(round(v * s)) for v in (x, y, w, h))
     crop = a[sy:sy+sh, sx:sx+sw]
     L = 0.2126*crop[...,0] + 0.7152*crop[...,1] + 0.0722*crop[...,2]
-    return float(np.mean(np.sort(L.ravel())[-max(1, int(L.size*0.10)):]))
+    return float(np.mean(np.sort(L.ravel())[-max(1, int(L.size*0.02)):]))
 mi, ca = ink(rc["microphone"]), ink(rc["camera"])
 print(f"{blue:.3f} {green:.3f} {mi:.2f} {ca:.2f} {mi/ca if ca else float('nan'):.4f}")
 PY
@@ -247,7 +281,10 @@ grep -qE "micfloor=held/0\.3[0-9]" "$SP/held.state" \
   || say "FAIL" "the app did not reach the held state: $(grep -oE 'micfloor=[^ ]+' "$SP/held.state")"
 
 # 2. THE CONTROL SAYS IT. A quarter of the contrast is a large step; the old
-# build cannot move this at all, because it has no such state.
+# build cannot move this at all, because it has no such state. 0.75 is the bar
+# the glyph's own alpha ladder (1.00 / 0.66 / 0.34) was designed against, and it
+# is asserted through a ruler that can actually see that ladder -- see THE TENTH
+# THAT WAS NOT THE GLYPH above. Measured margin: 0.556 against a 0.75 bar.
 f "$R_H < 0.75 * $R_T" \
   && say "OK" "held: the microphone glyph falls to $(r "$R_H/$R_T")x its own through-state, against the button next door" \
   || say "FAIL" "the microphone button says nothing about being held ($R_H vs $R_T)"
@@ -405,8 +442,7 @@ echo "── 6-7. LIVE: a real gate on a real call, and the arm that must not mo
 # `--gate-margin 20` restores the asymmetry a real call has for free, and it
 # changes a THRESHOLD and not a decision -- the same class of rig override as
 # TK_CAPTION_SCALE. The control arm below gets the identical margin and differs
-# only in `--no-gate`, so the two arms are separated by one boolean and nothing
-# else.
+# only in the two switches that can hold a microphone, and nothing else.
 live() {   # $1 = name, $2 = extra flags, $3/$4 = ports
   reap
   spawn "$TK" $C $2 --room "flr$$$1" --listen "$3" --peer "127.0.0.1:$4" \
@@ -449,7 +485,7 @@ else
     || say "FAIL" "the border never went dark on a live call -- arms 9-10 proved a drawing and nothing else"
 fi
 
-live nogate "--no-gate --gate-margin 20" 8332 8333
+live nogate "--no-gate --no-floor --gate-margin 20" 8332 8333
 grep -q "connected via" "$SP/nogate-a.log" || cant "the control pair never connected"
 grep -qE "^\[in\] " "$SP/nogate-a.log" \
   || cant "no microphone opened on the control arm -- it cannot rank anything"

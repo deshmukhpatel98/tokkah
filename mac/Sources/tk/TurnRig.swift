@@ -110,8 +110,8 @@ enum TurnRig {
       e.gate.cfg = Audio.Gate()
       e.floor.noteFar(.quiet, transitMs: owdMs)
     }
-    a.voice = (Predict.readWav(paths[0])?.pcm) ?? []
-    b.voice = (Predict.readWav(paths[1])?.pcm) ?? []
+    a.voice = (Predict.readWav(Self.locate(paths[0]))?.pcm) ?? []
+    b.voice = (Predict.readWav(Self.locate(paths[1]))?.pcm) ?? []
     envelope(&a.voice, mine: true, turnS: turnS, overlapS: overlapS)
     envelope(&b.voice, mine: false, turnS: turnS, overlapS: overlapS)
     let n = min(a.voice.count, b.voice.count)
@@ -169,6 +169,25 @@ enum TurnRig {
     }
     return ((a.lostMs, a.speechMs, a.worstRunMs, a.duckedMs),
             (b.lostMs, b.speechMs, b.worstRunMs, b.duckedMs))
+  }
+
+  /// ── A RIG WHOSE ANSWER DEPENDS ON THE WORKING DIRECTORY IS A TRAP ─────────
+  ///
+  /// The media paths are relative to the repository, so running this from `mac/`
+  /// found nothing and the rig refused -- correctly, because a rig that cannot
+  /// see its subject must never report a pass. But "correct" and "usable" are
+  /// different: the same command passed from one directory and failed from
+  /// another, with the reason two lines up the output. So it looks upward for
+  /// the file instead of demanding a cwd.
+  private static func locate(_ p: String) -> String {
+    let fm = FileManager.default
+    if fm.fileExists(atPath: p) { return p }
+    var up = ""
+    for _ in 0..<4 {
+      up += "../"
+      if fm.fileExists(atPath: up + p) { return up + p }
+    }
+    return p
   }
 
   private static func rms(_ x: [Float]) -> Float {

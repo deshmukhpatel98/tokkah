@@ -426,7 +426,43 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     }
     // The encoder is hardcoded to 1280x720 (main.swift), so a camera with no 720p
     // mode is fed mismatched buffers. That used to be a silent no-op; say it.
-    guard let f = cands.last else {
+    // ── RANK THEM. `.last` IS NOT A CHOICE ────────────────────────────────────
+    //
+    // This was `cands.last` under a comment admitting it was list order and that
+    // a real preference was needed if more than one mode ever matched. More than
+    // one matched, on the Mac mini, and the telemetry says what it cost: that
+    // machine's C270 offers 720p as YUY2 at 10 fps and MJPEG at 30, and list
+    // order picked TEN.
+    //
+    // A third of the frame rate is three times the motion between frames, so
+    // every frame is three times bigger: measured at 30-38 kB against the
+    // laptop's 3-7 kB on the same call. At ~1.4 kB a fragment that is twenty-five
+    // fragments per frame, all of which must arrive, and losing any ONE destroys
+    // the whole frame -- the far end logged 47 frames lost and 24 partial drops
+    // and asked this end for a keyframe once a second for the length of the call.
+    // That is the "colourful pixelation when he moves" in the bug report: motion
+    // makes the frames bigger, bigger frames have more fragments, and more
+    // fragments is more whole frames destroyed.
+    //
+    // `last-match-wins-unpinned-selection`, exactly: a selection with no ranking
+    // is a bug waiting for the list to change under it.
+    //
+    // FRAME RATE FIRST, and only then the pixel format. The note below is right
+    // that MJPEG is already-thrown-away frames we then re-encode -- but 10 fps is
+    // worse on both counts at once, because it is fewer frames AND more loss. At
+    // EQUAL frame rate the uncompressed mode wins, which is what that note was
+    // actually asking for.
+    func rank(_ f: AVCaptureDevice.Format) -> (Double, Int) {
+      let fps = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+      let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+      // 'dmb1' is Motion JPEG. Anything else here is raw.
+      let raw = CameraSource.fourCC(sub) == "dmb1" ? 0 : 1
+      return (fps, raw)
+    }
+    let ranked = cands.sorted {
+      rank($0).0 != rank($1).0 ? rank($0).0 < rank($1).0 : rank($0).1 < rank($1).1
+    }
+    guard let f = ranked.last else {
       fputs("camera: no 1280x720 mode on \(dev.localizedName) -- staying in "
           + "\(CameraSource.describe(dev.activeFormat)) while the encoder expects 1280x720\n", stderr)
       return
@@ -466,6 +502,20 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     Metrics.fact("cam_kind", CameraSource.kindOf(dev))
     Metrics.fact("cam_mode", "\(dims.width)x\(dims.height)@\(Int(best))")
     Metrics.fact("cam_pixfmt", CameraSource.fourCC(sub))
+    // ── AND WHAT WE DID NOT PICK ─────────────────────────────────────────────
+    //
+    // The mode we chose was already reported; the modes we passed over were only
+    // ever printed to a stderr on somebody else's Mac. So diagnosing the 10 fps
+    // choice meant INFERRING from a webcam's spec sheet what its alternatives
+    // were, and an inference is not a lookup. A telemetry field that records the
+    // chosen value but not the rejected ones cannot answer "was this the right
+    // choice" -- only "what was the choice".
+    Metrics.fact("cam_modes", ranked.map {
+      let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+      let r = Int($0.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0)
+      return "\(d.width)x\(d.height)@\(r)"
+        + CameraSource.fourCC(CMFormatDescriptionGetMediaSubType($0.formatDescription))
+    }.joined(separator: ","))
   }
 
   /// Built in, plugged in, or an iPhone across the room. Three very different

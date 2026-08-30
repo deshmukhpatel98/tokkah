@@ -3193,6 +3193,25 @@ final class CallControls: NSView {
   /// 0...1, eased. Not a bool, because a gate transition every few hundred
   /// milliseconds would otherwise strobe the whole window edge.
   private var edgeOn: CGFloat = 0
+  /// 1 green (this end speaking), 0 blue (listening). Eased, so a handover is a
+  /// colour moving rather than a colour cutting.
+  private var edgeHue: CGFloat = 0
+  /// 0...1 phase of the six-second drift. Not wall-clock, so it cannot jump when
+  /// the timer sleeps and wakes.
+  private var breath: CGFloat = 0
+
+  /// Blue at 0, green at 1, in sRGB. Both are already in the palette: `ok` is
+  /// what this app means by "clear" and `accent` is its calm blue, so the edge
+  /// borrows the two words the rest of the interface already uses rather than
+  /// inventing a third.
+  static func edgeTint(_ t: CGFloat) -> NSColor {
+    let a = Palette.accent, b = Palette.ok
+    let k = max(0, min(1, t))
+    return NSColor(srgbRed: a.redComponent + (b.redComponent - a.redComponent) * k,
+                   green: a.greenComponent + (b.greenComponent - a.greenComponent) * k,
+                   blue: a.blueComponent + (b.blueComponent - a.blueComponent) * k,
+                   alpha: 1)
+  }
   /// Very thin, and 1.5 rather than 1 so it is three whole pixels on a 2x screen
   /// rather than two -- a 1 pt stroke inset by 0.5 lands on a half-pixel boundary
   /// and comes out as two grey rows instead of one green one.
@@ -3236,11 +3255,15 @@ final class CallControls: NSView {
     // through-line to an empty room.
     guard startedAt != nil else { return (.through, false) }
     let g = Audio.sharedGate
-    // The same test main.swift uses to decide whether a sentence needs
-    // subtitling: "is my voice reaching them". Written once there and once here
-    // is once too many, but the alternative is a cross-file dependency for a
-    // threshold, and this comment is the link.
-    if g.gain * g.yieldGainNow > 0.5 { return (.through, true) }
+    // ── AND IT HAS TO INCLUDE THE FLOOR ──────────────────────────────────────
+    //
+    // `gain * yieldGainNow` was the whole product of what the gate does to a
+    // microphone until the turn layer added a third factor. Left alone, the edge
+    // would light green while the floor held this end silent -- the app
+    // contradicting itself about the only thing this indicator is for.
+    // `appliedGainNow` is that product, computed once inside the gate, so a
+    // fourth factor can never be forgotten here again.
+    if g.appliedGainNow > 0.5 { return (.through, true) }
     return (g.vocal == .claim ? .bidding : .held, false)
   }
 
@@ -3314,21 +3337,91 @@ final class CallControls: NSView {
     // go ahead" and a person mid-interruption is waiting for exactly that;
     // slower off because a gate that ticks shut around one syllable of theirs
     // must not strobe the window.
-    let eTarget: CGFloat = audible ? 1 : 0
+    // ── GREEN IS SPEAKING. BLUE IS LISTENING. ────────────────────────────────
+    //
+    // The bug this replaces: the edge lit whenever this microphone was OPEN, and
+    // with nobody talking both microphones are open -- so both people sat looking
+    // at a green window, which says "you are being heard" to two people at once
+    // when at most one of them is saying anything. Reported in exactly those
+    // words: "I see the green thing glowing on both sides, which should not be
+    // the case."
+    //
+    // Open is not the same as speaking. So the edge now reports which of the two
+    // of you has the floor, and it can only ever be one:
+    //
+    //   green  this end is making sound AND it is reaching them
+    //   blue   the other person has it -- you are listening
+    //   dark   neither, which is most of a call and should look like nothing
+    //
+    // Blue is not a warning and must not read as one: it is the colour of the
+    // room being someone else's for a moment.
+    // A pin exists to hold a DRAWING still for a photograph, so it has to be able
+    // to produce every drawing -- otherwise the rig can only photograph the
+    // states that happen to need no audio, which is the dark one. `.through`
+    // pinned means "this end has the floor and is using it", which is the green
+    // the pin was added to capture.
+    let speaking: Bool
+    let listening: Bool
+    if let p = floorPin {
+      speaking = p == .through
+      listening = false
+    } else {
+      speaking = audible && Audio.sharedGate.vocal != .quiet
+      listening = !speaking && Audio.peerVoiceNow != .quiet
+    }
+    let eTarget: CGFloat = (speaking || listening) ? 1 : 0
     edgeOn += (eTarget - edgeOn) * min(1, dt / (eTarget > edgeOn ? 0.06 : 0.30))
     if abs(eTarget - edgeOn) < 0.004 { edgeOn = eTarget }
+    // 1 is green, 0 is blue. Eased at the same rate in both directions, because
+    // neither of these is news the other one outranks -- a hard cut between two
+    // saturated colours at a handover is the opposite of soothing.
+    let hTarget: CGFloat = speaking ? 1 : (listening ? 0 : edgeHue)
+    edgeHue += (hTarget - edgeHue) * min(1, dt / 0.22)
+
+    // ── THE BREATH, WHICH WAS REFUSED ONCE AND IS NOW ASKED FOR ──────────────
+    //
+    // The note on `edge` forbids a pulse, and it was right for what it was
+    // describing: a three-point rim with an eighteen-point glow breathing at
+    // 0.55 Hz over the picture. That was refused as an EFFECT.
+    //
+    // What is asked for now is a different thing and the words matter: "it should
+    // be a kind of an animation, at the edges, a very soothing one, which makes
+    // you feel like you're in the same room." So: no glow, no shadow, no
+    // gradient, no change of width, and nothing over the picture. One and a half
+    // points of stroke whose opacity drifts by a tenth, once every six seconds --
+    // slower than breathing and far below the rate at which motion pulls the eye.
+    // If this ever gets faster, wider, or grows a shadow it has become the thing
+    // that was refused.
+    breath += dt / 6.0
+    if breath > 1 { breath -= 1 }
+    let sway = 1 - 0.10 * (1 - cos(2 * .pi * breath)) / 2
+
     CATransaction.begin()
     CATransaction.setDisableActions(true)   // or every frame animates over 0.25 s
-    // NO shadow, NO gradient, NO breath -- see the note on `edge`. Opacity is the
-    // only property that moves and it moves only because the gate did.
-    edge.opacity = Float(edgeOn)
+    edge.opacity = Float(edgeOn * sway)
+    edge.strokeColor = CallControls.edgeTint(edgeHue).cgColor
     CATransaction.commit()
 
     // Stop when there is nothing to watch: fully through, settled, and a second
     // of that. It cannot miss the START of a hold -- see `setFloor` above for why
     // there is exactly one thing that can begin one and why it wakes this.
+    // ── AND IT MAY NOT SLEEP DURING A CALL ANY MORE ──────────────────────────
+    //
+    // It used to stop after a second of "through and settled", which was right
+    // when the edge only ever reported a fact about THIS end: nothing but this
+    // person's own microphone could change it, and `setFloor` woke it.
+    //
+    // Both halves of that are now false. The edge turns blue when the FAR end
+    // speaks, and nothing local happens when they do -- so a sleeping timer would
+    // simply never show blue, which is the larger half of the feature. And the
+    // breath is a continuous animation: a timer that stops freezes it mid-drift.
+    //
+    // So during a call it runs, and between calls it sleeps as before. Thirty
+    // ticks a second setting two properties on one shape layer is not a cost
+    // worth a class of bug that presents as "the other person never lights up".
     let still = micReach >= 0.999 && abs(eTarget - edgeOn) < 0.004
-    floorSettled = (want == .through && still) ? floorSettled + 1 : 0
+    let inCall = startedAt != nil
+    floorSettled = (!inCall && want == .through && still) ? floorSettled + 1 : 0
     if floorSettled > 30 {
       floorTimer?.invalidate(); floorTimer = nil
     }
