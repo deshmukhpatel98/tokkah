@@ -100,10 +100,12 @@ fail=0
 say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 
 # $1 = the pid the resident is told is "the open Kin", $2 = log name
+# $1 = the pid to inject, or "" for no injection at all (the honest path)
 run_reopen() {
   reap
   sweep
-  TK_WATCH_FAKE_OPEN_PID="$1" "$APP/Contents/MacOS/Tokkah" --watch \
+  if [ -z "$1" ]; then unset TK_WATCH_FAKE_OPEN_PID; else export TK_WATCH_FAKE_OPEN_PID="$1"; fi
+  "$APP/Contents/MacOS/Tokkah" --watch \
     > "$SP/$2.log" 2>&1 &
   PIDS="$PIDS $!"
   perl -e 'select undef,undef,undef,4'
@@ -117,16 +119,11 @@ run_reopen() {
 }
 
 # ── 1. THE FIELD CASE: THE RECORD IS A GHOST ───────────────────────────────
-echo "reopen with a sentinel pid (-1), which is what 0.76.0 saw:"
-run_reopen -1 ghost || { echo "REOPEN CHECK COULD NOT RUN -- resident never started:"; sed -n '1,6p' "$SP/ghost.log" | sed 's/^/  /'; exit 2; }
+echo "a reopen with no Kin running at all:"
+run_reopen "" ghost || { echo "REOPEN CHECK COULD NOT RUN -- resident never started:"; sed -n '1,6p' "$SP/ghost.log" | sed 's/^/  /'; exit 2; }
 grep -q "somebody opened Kin" "$SP/ghost.log" \
   || { echo "REOPEN CHECK COULD NOT RUN -- the reopen never reached the resident"; exit 2; }
 echo "  processes for this bundle: $BEFORE before the click, $AFTER after"
-if grep -q "already open (pid -1)" "$SP/ghost.log"; then
-  say "FAIL" "a sentinel pid satisfied the is-it-running check -- the click did nothing"
-else
-  say "OK" "the sentinel was refused"
-fi
 [ "$AFTER" -gt "$BEFORE" ] \
   && say "OK" "and a real Kin came up ($BEFORE -> $AFTER)" \
   || say "FAIL" "the click opened nothing at all ($BEFORE -> $AFTER)"
@@ -143,11 +140,40 @@ else
   sed -n '1,8p' "$RING" 2>/dev/null | sed 's/^/      /'
 fi
 
-# ── 2. AND THE HALF 0.75.2 IS MADE OF ──────────────────────────────────────
+# ── 2. AND THE HALF 0.75.2 IS MADE OF, WITH THE REAL KIN FROM PART ONE ─────
 #
+# No injection here: the Kin that part one started is still running, so this is
+# the actual question a second Dock click asks. It is the half that broke when
+# `pid -1` was read as "nothing is running" -- every click became another copy.
+echo "a second reopen while that Kin is still up:"
+B2="$AFTER"
+/usr/bin/open -a "$APP"
+perl -e 'select undef,undef,undef,6'
+A2=$(pgrep -f "$SP/Kin.app/Contents/MacOS/Tokkah" | wc -l | tr -d ' ')
+echo "  processes for this bundle: $B2 before the second click, $A2 after"
+[ "$A2" -le "$B2" ] \
+  && say "OK" "no second copy" \
+  || say "FAIL" "it opened another Kin -- this is the duplicate-app report"
+grep -qE "watch: Kin is already open \(pid [0-9]+" "$SP/ghost.log" \
+  && say "OK" "and it named the copy it found: $(grep -oE 'Kin is already open \(pid [0-9]+[^)]*\)' "$SP/ghost.log" | tail -1)" \
+  || say "FAIL" "it did not recognise the Kin that was already running"
+
+# ── 3. THE TWO INJECTED PIDS ───────────────────────────────────────────────
+#
+# `-1` is the sentinel the field reported and the one thing the process table
+# can never produce, so it is injected. It must NOT be read as a running Kin --
+# and `kill(-1, 0)` answers yes for it, which is how a liveness check written on
+# kill(2) alone would pass this by signalling every process the user owns.
+echo "a reopen told the open Kin is at pid -1, with no Kin running:"
+run_reopen -1 sentinel || { echo "REOPEN CHECK COULD NOT RUN -- resident never started"; exit 2; }
+echo "  processes for this bundle: $BEFORE before the click, $AFTER after"
+[ "$AFTER" -gt "$BEFORE" ] \
+  && say "OK" "the sentinel was not mistaken for a running Kin" \
+  || say "FAIL" "a sentinel pid satisfied the is-it-running check -- the click did nothing"
+
 # `$$` is this shell: a pid that is certainly alive and certainly not the
 # resident. A build that answered "start one" to everything would pass part 1.
-echo "reopen while a live pid is open, which must NOT start a second Kin:"
+echo "a reopen while a live pid is open, which must NOT start a second Kin:"
 run_reopen "$$" live || { echo "REOPEN CHECK COULD NOT RUN -- resident never started"; exit 2; }
 echo "  processes for this bundle: $BEFORE before the click, $AFTER after"
 if [ "$AFTER" -gt "$BEFORE" ]; then
@@ -155,8 +181,12 @@ if [ "$AFTER" -gt "$BEFORE" ]; then
 else
   say "OK" "no second copy was started"
 fi
-grep -q "already open (pid $$)" "$SP/live.log" \
-  && say "OK" "and it says so: $(grep -o 'Kin is already open (pid [0-9]*)' "$SP/live.log" | tail -1)" \
+# Either answer is correct and which one appears depends on whether macOS still
+# has an addressable record: `brought it forward` when it does, `asked it to
+# come forward` (SIGWINCH, from the inside) when the app has re-exec'd. What
+# must never appear is neither.
+grep -qE "Kin is already open \(pid $$[,)]" "$SP/live.log" \
+  && say "OK" "and it says so: $(grep -oE 'Kin is already open \(pid [0-9]+[^)]*\) -- [a-z ]*' "$SP/live.log" | tail -1)" \
   || say "FAIL" "a live pid was not recognised as the app being open"
 
 [ "$fail" = "0" ] && echo "REOPEN CHECK: PASS" || echo "REOPEN CHECK: FAIL"

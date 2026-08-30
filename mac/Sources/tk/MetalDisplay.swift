@@ -32,6 +32,9 @@ import QuartzCore
 // numbers below decide it rather than my opinion.
 final class MetalDisplay {
   private var win: NSWindow?
+  /// The window itself, for the one caller that has to act on the WINDOW rather
+  /// than on what is drawn in it: a Dock click on an app that is already open.
+  var callWindow: NSWindow? { win }
   private let layer = CAMetalLayer()
   private let dev: MTLDevice
   private let queue: MTLCommandQueue

@@ -6562,6 +6562,38 @@ for sig in [SIGINT, SIGTERM] {
   signalSources.append(src)
 }
 
+// ── SOMEBODY CLICKED KIN WHILE THIS ONE WAS ALREADY OPEN ────────────────────
+//
+// The resident answers every Dock click, Finder double-click and Spotlight hit
+// for this bundle, and when Kin is already open the right answer is to bring
+// THIS window forward. It could not: `Launcher.reexec` is an `execv`, and after
+// one, LaunchServices' record for this process reads `pid -1` forever --
+// `activate` on it returns true and does nothing. The user saw a click that did
+// nothing, and then, once -1 was read as "not running", a new Kin every click.
+//
+// So the raise is done from the inside, where no LaunchServices handle is
+// needed. SIGWINCH because a resident that has just updated itself routinely
+// faces an OLD Kin with no handler for this, and SIGWINCH is the one signal
+// whose default action is to do nothing: an older copy ignores it. SIGUSR1
+// would have HUNG UP on whoever was on the call.
+//
+// `.main` queue, because everything it touches is AppKit.
+nonisolated(unsafe) var raiseSource: DispatchSourceSignal?
+if display != nil || mdisplay != nil {
+  signal(SIGWINCH, SIG_IGN)
+  let r = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
+  r.setEventHandler {
+    fputs("raise: asked to come forward\n", stderr)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    // `orderFrontRegardless` and not `makeKeyAndOrderFront`: this window may be
+    // behind a full-screen app on another Space, and that is exactly the case
+    // somebody is clicking the Dock icon to get out of.
+    (mdisplay?.callWindow ?? display?.callWindow)?.orderFrontRegardless()
+  }
+  r.resume()
+  raiseSource = r
+}
+
 if display != nil || mdisplay != nil {
   Thread { reportLoop() }.start()
   // Third and last activation site. The ring-preview image no longer stops at

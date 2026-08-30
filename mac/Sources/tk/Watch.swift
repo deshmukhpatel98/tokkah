@@ -806,35 +806,38 @@ enum Resident {
     /// when Kin is already showing, is to bring it forward. Only a reopen that
     /// finds nothing running is a launch.
     ///
-    /// ── A SENTINEL IS NOT A PID ────────────────────────────────────────────
+    /// ── THE PID IS -1 BECAUSE THE APP RE-EXEC'D, NOT BECAUSE IT DIED ──────
     ///
-    /// Reported as six clicks in a row that did nothing at all, and the log said
-    /// exactly why:
+    /// Reported first as six clicks that did nothing ("already open (pid -1)"),
+    /// and then, after a fix that read -1 as "nothing is running", as a NEW COPY
+    /// OF KIN ON EVERY CLICK. Both are the same misreading of the same number.
     ///
-    ///     watch: Kin is already open (pid -1) -- brought it forward instead of
+    /// Measured on this Mac, polling `runningApplications` every 15 ms through a
+    /// launch:
     ///
-    /// `NSRunningApplication.processIdentifier` returns **-1** when the record
-    /// has no process behind it -- an app that has gone, or one LaunchServices
-    /// still lists and cannot address. `isTerminated` did not catch it: the two
-    /// are separate facts, and a record can carry the sentinel while still
-    /// answering `false` to "have you terminated". So the filter accepted it,
-    /// `activate` was sent to nothing, and the reopen was answered by doing
-    /// nothing -- a Dock click with no window and no second copy either. Six of
-    /// them, because the stale record never went away.
+    ///        0 ms  70032                  <- just the resident
+    ///       40 ms  70032,72721            <- the new Kin, with a real pid
+    ///      256 ms  -1,70032               <- and from here on, forever
     ///
-    /// The rule the filter was missing, and the reason it is written out rather
-    /// than folded into the `first`: a pid that is not a pid must never satisfy
-    /// an is-it-running question. `kill(pid, 0)` is the second half -- the record
-    /// may name a plausible pid that has already exited, and only the kernel
-    /// knows. `EPERM` counts as alive: the process exists and is somebody else's.
+    /// 256 ms is `Launcher.reexec`. Kin opens, mints a room and `execv`s itself
+    /// into it -- and execv keeps the pid, the window and the Dock icon while
+    /// LaunchServices loses the process behind its record. So `-1` does not mean
+    /// "gone". It means "open, and macOS can no longer address it": `activate`
+    /// returns true and does nothing, and `NSRunningApplication(processIdentifier:)`
+    /// built from the app's REAL pid hands back a record that still says -1.
     ///
-    /// Sibling of `open-socket-is-not-a-live-peer`, one layer up: a registration
-    /// outliving the thing it registers.
+    /// A record, then, is not evidence either way, and no reading of one can be.
+    /// The question "is Kin open" is answered from the process table instead --
+    /// `siblings()` -- and the answer is used for the only thing that matters
+    /// here: never starting a second copy.
+    ///
+    /// `live` survives as the rule for records that DO carry a pid, because a
+    /// record that names a pid must still name a running one.
     static func live(pid: pid_t, terminated: Bool, me: pid_t,
                      alive: (pid_t) -> Bool = Target.running) -> Bool {
       if terminated { return false }
       // -1 is the documented sentinel, 0 is "every process in my group" to
-      // `kill` and has never been a running app: neither is evidence of anything.
+      // `kill` and has never been a running app: neither is a pid.
       if pid <= 0 { return false }
       // The resident is itself a running instance of this bundle -- that
       // registration is the whole reason we are here -- and it must never count
@@ -843,40 +846,208 @@ enum Resident {
       return alive(pid)
     }
 
+    /// ── kill(2) TAKES A PID AND A TARGET SET ────────────────────────────────
+    ///
+    /// The guard is not defensive tidiness. `kill(-1, 0)` does not ask about pid
+    /// -1: it asks about EVERY process this user can signal, and answers yes. So
+    /// the sentinel that started all of this reads as "running" here -- and the
+    /// raise that follows, `kill(-1, SIGWINCH)`, would have gone to every process
+    /// the user owns. Found by the rig, on the -1 arm, before it shipped.
+    ///
+    /// 0 is the same shape one step smaller: to `kill` it means this process's
+    /// whole group.
     static func running(_ pid: pid_t) -> Bool {
-      kill(pid, 0) == 0 || errno == EPERM
+      guard pid > 0 else { return false }
+      return kill(pid, 0) == 0 || errno == EPERM
     }
+
+    /// The path the kernel would report for this file: symlinks resolved, `/tmp`
+    /// expanded to `/private/tmp`, `.` and `..` gone. `realpath(3)` because it is
+    /// the same resolution `proc_pidpath` returns, and a comparison between two
+    /// different resolutions of one path is a comparison that fails on a machine
+    /// nobody tested on.
+    static func realPath(_ p: String) -> String? {
+      guard let r = realpath(p, nil) else { return nil }
+      defer { free(r) }
+      return String(cString: r)
+    }
+
+    /// Every live process running this bundle's executable, except this one.
+    /// The process table, because it is the only place that still knows: a
+    /// re-exec'd Kin is missing from LaunchServices' answer and present here.
+    static func siblings() -> [pid_t] {
+      // ── BOTH SIDES THROUGH realpath(3), OR NEITHER ─────────────────────────
+      //
+      // `proc_pidpath` always returns a fully resolved path. `URL.resolvingSymlinksInPath`
+      // does not: measured here, it left `/tmp/.../Kin.app/Contents/MacOS/Tokkah`
+      // as it found it while the kernel reported `/private/tmp/...` for the very
+      // same process. The comparison failed, the scan came back empty, and the
+      // resident opened a second Kin -- the exact bug this function exists to
+      // stop, hiding inside the fix for it. Caught by the rig.
+      guard let raw = Bundle.main.executableURL?.path,
+            let exe = Target.realPath(raw) else { return [] }
+      let me = ProcessInfo.processInfo.processIdentifier
+      var n = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+      guard n > 0 else { return [] }
+      // Room to spare: processes can start between the sizing call and the read,
+      // and a short buffer silently truncates the answer -- which here would read
+      // as "no Kin is open" and start another one.
+      var pids = [pid_t](repeating: 0, count: Int(n) / MemoryLayout<pid_t>.size + 128)
+      n = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids,
+                        Int32(pids.count * MemoryLayout<pid_t>.size))
+      guard n > 0 else { return [] }
+      var buf = [CChar](repeating: 0, count: 4096)
+      var out: [pid_t] = []
+      for p in pids where p > 0 && p != me {
+        guard proc_pidpath(p, &buf, UInt32(buf.count)) > 0 else { continue }
+        guard String(cString: buf) == exe else { continue }
+        // ── THE SAME BINARY IS NOT THE SAME JOB ────────────────────────────
+        //
+        // The resident IS this executable, and so is the ring watcher, and so
+        // is every `--*-test`. Counting those as "Kin is open" would answer a
+        // Dock click by bringing forward a process with no window -- which is a
+        // click that does nothing, the report this all started with. What the
+        // person wants is a window, so a window is what is looked for.
+        let a = argv(p)
+        if a.contains("--watch") { continue }
+        if !a.contains("--window") { continue }
+        out.append(p)
+      }
+      return out
+    }
+
+    /// One process's argv, via KERN_PROCARGS2. Empty when it cannot be read --
+    /// which is the safe direction here: an unreadable process is not counted as
+    /// an open Kin, so the click starts one rather than silently doing nothing.
+    static func argv(_ pid: pid_t) -> [String] {
+      var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+      var size = 0
+      guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+      var buf = [CChar](repeating: 0, count: size)
+      guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size
+      else { return [] }
+      // Layout: argc (4 bytes), the executable path, then NUL-padded argv.
+      let bytes = buf.prefix(size).map { UInt8(bitPattern: $0) }
+      let argc = bytes.prefix(4).enumerated().reduce(Int32(0)) { $0 | (Int32($1.element) << (8 * Int32($1.offset))) }
+      var parts: [String] = []
+      var cur: [UInt8] = []
+      for b in bytes.dropFirst(MemoryLayout<Int32>.size) {
+        if b == 0 {
+          if !cur.isEmpty { parts.append(String(decoding: cur, as: UTF8.self)); cur = [] }
+        } else {
+          cur.append(b)
+        }
+      }
+      if !cur.isEmpty { parts.append(String(decoding: cur, as: UTF8.self)) }
+      // The first entry is the executable path, not argv[0]; drop it, then keep
+      // argc entries.
+      return Array(parts.dropFirst().prefix(Int(max(argc, 0))))
+    }
+
+    // ── THE SIGNAL A COPY THAT PREDATES IT WILL SURVIVE ───────────────────────
+    //
+    // An open Kin that macOS cannot activate can still raise itself, from the
+    // inside, if something asks it to -- and a signal is the one channel that
+    // needs no port, no permission and no handle.
+    //
+    // SIGWINCH and not SIGUSR1 because of the update window: the resident
+    // updates itself and restarts, so a NEW resident routinely faces an OLD Kin
+    // that has no handler for this. SIGUSR1's default action is to TERMINATE --
+    // a click would have killed the call somebody was on. SIGWINCH's default
+    // action is to do nothing at all, so the worst an old copy does is ignore it.
+    static let raiseSignal = SIGWINCH
 
     // ── THE RULER, ON ANSWERS ALREADY KNOWN ────────────────────────────────
     //
     // Table-driven and deliberately full of cases it MUST REJECT, because a
     // predicate that answers `false` to everything would pass a table of only
-    // positives -- and `false` is the safe answer here, so that is the exact
-    // shape a broken fix would take. Four rejects and two accepts, and the two
-    // accepts are what stop this from degenerating into "never bring anything
-    // forward", which would put back the ten-copies bug 0.75.2 fixed.
+    // positives -- and `false` is the safe answer for a record, so that is the
+    // exact shape a broken fix would take. The two accept rows are what stop it
+    // degenerating into "no record is ever usable".
     //
-    // `-1` is the field case, verbatim, and it is the first row.
+    // `-1` is the field case, verbatim, and it is the first row. It is REJECTED
+    // here and that is still right: a record carrying the sentinel cannot be
+    // activated. What changed after the second report is that rejecting it is no
+    // longer the whole answer -- `siblings()` decides whether Kin is open, and
+    // the last two checks are the ones that would have caught the copies.
     static func selfTestLive() -> Bool {
       let me: pid_t = 4242
       let dead: pid_t = 999_999   // above the kernel's pid ceiling: never running
       let cases: [(String, pid_t, Bool, Bool)] = [
-        ("the sentinel: no process behind the record", -1, false, false),
-        ("a sentinel that also admits it is gone",     -1, true,  false),
-        ("pid 0 -- to kill(2) that is a whole group",   0, false, false),
-        ("the resident, seeing its own registration",  me, false, false),
-        ("a plausible pid that has already exited",  dead, false, false),
+        ("the sentinel: a record macOS cannot address", -1, false, false),
+        ("a sentinel that also admits it is gone",      -1, true,  false),
+        ("pid 0 -- to kill(2) that is a whole group",    0, false, false),
+        ("the resident, seeing its own registration",   me, false, false),
+        ("a plausible pid that has already exited",   dead, false, false),
         ("a real, live, other Kin",
          ProcessInfo.processInfo.processIdentifier, false, true),
-        ("pid 1 -- launchd is always running",          1, false, true),
+        ("pid 1 -- launchd is always running",           1, false, true),
       ]
+      // kill(-1, 0) asks about EVERY process this user can signal and answers
+      // yes, so a liveness check written on `kill` alone calls the sentinel
+      // alive. Asserted separately from the table because it is a property of
+      // `running`, which the table reaches only through `live`.
       var ok = true
+      for bad: pid_t in [-1, 0, -999] where running(bad) {
+        ok = false
+        fputs("reopen: FAIL running(\(bad)) says yes -- kill(2) reads a"
+            + " non-positive pid as a SET of processes, not as one\n", stderr)
+      }
+      if ok { fputs("reopen: OK   running() refuses non-positive pids\n", stderr) }
       for (what, pid, term, want) in cases {
         let got = live(pid: pid, terminated: term, me: me)
         if got != want { ok = false }
         fputs("reopen: \(got == want ? "OK  " : "FAIL") pid=\(pid)"
-            + " terminated=\(term) -> \(got ? "already open" : "start one")"
+            + " terminated=\(term) -> \(got ? "usable record" : "no")"
             + "  \(what)\n", stderr)
+      }
+      // ── AND THE HALF A RECORD CANNOT ANSWER ─────────────────────────────────
+      //
+      // This process IS a running copy of this executable, so a sibling scan run
+      // from a second process must find it. Proving that here needs no second
+      // process: `siblings()` excludes only `me`, so pointing it at our own pid
+      // is the same question asked from the outside.
+      let mine = ProcessInfo.processInfo.processIdentifier
+      let sibs = siblings()
+      if sibs.contains(mine) {
+        ok = false
+        fputs("reopen: FAIL siblings() returned our own pid -- the resident would"
+            + " read itself as the app being open and never launch anything\n", stderr)
+      } else {
+        fputs("reopen: OK   siblings() excludes this process (\(sibs.count) other"
+            + " cop\(sibs.count == 1 ? "y" : "ies") of this binary)\n", stderr)
+      }
+      // ── argv, READ BACK ON A PROCESS WHOSE ARGV WE KNOW ────────────────────
+      //
+      // `siblings()` now filters on argv, so a reader that silently returns
+      // nothing would exclude every candidate and open a second Kin on every
+      // click -- the failure looks exactly like the bug. This process's own argv
+      // is the one answer available for free, and it must come back containing
+      // the flag that put us in this function.
+      let mineArgv = argv(mine)
+      if mineArgv.contains("--reopen-test") {
+        fputs("reopen: OK   argv() reads a known process (\(mineArgv.count) args)\n", stderr)
+      } else {
+        ok = false
+        fputs("reopen: FAIL argv() could not read our own --reopen-test argv"
+            + " (got \(mineArgv)) -- with argv unreadable, no running Kin is ever"
+            + " recognised and every click opens another\n", stderr)
+      }
+      // The scan must agree with the kernel about every pid it returns: a stale
+      // or truncated read here reads as "no Kin is open" and opens another one.
+      for p in sibs where !running(p) {
+        ok = false
+        fputs("reopen: FAIL siblings() returned pid \(p), which is not running\n", stderr)
+      }
+      // A signal whose default action kills the process would turn a Dock click
+      // into a hang-up on any copy of Kin older than the handler.
+      if raiseSignal != SIGWINCH {
+        ok = false
+        fputs("reopen: FAIL the raise signal is not SIGWINCH -- an older Kin would"
+            + " take its DEFAULT action for it, and only SIGWINCH's is to do"
+            + " nothing\n", stderr)
+      } else {
+        fputs("reopen: OK   the raise signal is one an older Kin ignores\n", stderr)
       }
       fputs("REOPEN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
       return ok
@@ -896,32 +1067,43 @@ enum Resident {
       // reported rather than guessing at the other one.
       // ── THE RIG ARM ────────────────────────────────────────────────────────
       //
-      // There is no way to ask LaunchServices for a record that carries the -1
-      // sentinel, so the only honest way to hold this fix down is to hand the
-      // decision the pid the field reported and drive a real reopen through the
-      // real delegate. This is that door, and it opens ONE thing: the pid the
-      // question is asked about. Everything after it -- the predicate, the
-      // activate, the log line, the `open -n` -- is production code, so a rig
-      // run reproduces the reported failure exactly rather than a model of it.
+      // There is no way to ask the process table for a Kin that is not there, so
+      // the pid the question is asked about is the one thing this door opens.
+      // Everything after it -- the decision, the raise, the log line and the
+      // `open -n` -- is production code, so a rig run reproduces the reported
+      // behaviour rather than a model of it.
       //
       // Production never sets it, and it is deliberately absent from the
-      // allow-list `install` carries into the launchd plist -- so even a rig
-      // that sets it cannot leave it behind on a real installed watcher.
+      // allow-list `install` carries into the launchd plist, so even a rig that
+      // sets it cannot leave it behind on a real installed watcher.
       let fake = ProcessInfo.processInfo.environment["TK_WATCH_FAKE_OPEN_PID"]
                    .flatMap { pid_t($0) }
-      if url == nil, let f = fake {
-        if Target.live(pid: f, terminated: false,
-                       me: ProcessInfo.processInfo.processIdentifier) {
-          fputs("watch: Kin is already open (pid \(f))"
-              + " -- brought it forward instead of starting another\n", stderr)
+      if url == nil {
+        // The process table first and the LaunchServices record second, because
+        // only the first one can see a Kin that has re-exec'd. `existing()` is
+        // still consulted: when there IS an addressable record, `activate` is
+        // what puts the window in front of the person, and asking the app to
+        // raise itself is the fallback for when there is not.
+        let open: [pid_t] = fake.map { Target.running($0) ? [$0] : [] } ?? Target.siblings()
+        if let pid = open.first {
+          let record = fake == nil ? existing() : nil
+          if let r = record {
+            r.activate(options: [.activateAllWindows])
+            fputs("watch: Kin is already open (pid \(r.processIdentifier))"
+                + " -- brought it forward instead of starting another\n", stderr)
+          } else {
+            // macOS has no usable handle on this one (see `live` above), so the
+            // app is asked to come forward from the inside.
+            // `pid > 0` is guaranteed by both sources above and asserted here
+            // anyway, because the failure mode is not a no-op: a negative pid
+            // signals every process this user owns.
+            if pid > 0 { kill(pid, Target.raiseSignal) }
+            fputs("watch: Kin is already open (pid \(pid), which macOS cannot"
+                + " address) -- asked it to come forward instead of starting"
+                + " another\n", stderr)
+          }
           return
         }
-        fputs("watch: pid \(f) is not a running Kin -- starting one\n", stderr)
-      } else if url == nil, let open = existing() {
-        open.activate(options: [.activateAllWindows])
-        fputs("watch: Kin is already open (pid \(open.processIdentifier))"
-            + " -- brought it forward instead of starting another\n", stderr)
-        return
       }
       let p = Process()
       p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
