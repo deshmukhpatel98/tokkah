@@ -185,7 +185,7 @@ enum Menu {
     /// poll interval"; the menu already has a separate, correctly-gated "Restart to
     /// Update" for a person who does want it to land immediately.
     @objc func update() {
-      Update.urgent = true
+      Update.checkNowForPerson()
       Menu.controls?.setStatus("checking for updates…")
     }
     /// The poller restarts on its own as soon as the call ends. This is for

@@ -239,7 +239,16 @@ if flag("watch") {
     // INSTALL while somebody is talking, so a shorter poll cannot interrupt a
     // call -- it only shortens the wait before a quiet moment is found.
     let every = max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_POLL"] ?? "") ?? 300)
-    let first = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "") ?? 60)
+    // ── ON EVERY RESTART ────────────────────────────────────────────────────
+    //
+    // Was 60 s, on the reasoning that launchd starts this at login alongside
+    // everything else a Mac does at login and there is no hurry. True at login,
+    // and wrong every other time this process starts: it also restarts after an
+    // update, after a crash, and whenever the binary changes underneath it --
+    // and in all of those the first question worth asking is whether this Mac
+    // is current. This process has no window and no call, so nothing it does
+    // can interrupt anybody.
+    let first = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "") ?? 2)
     fputs("watch: checking for a newer Kin every \(Int(every)) seconds"
         + " -- this Mac stays current whether or not anybody opens the app\n", stderr)
     Update.startPolling(current: VERSION, every: every, firstAfter: first)
@@ -954,6 +963,15 @@ if !flag("no-update"), !isTestRun {
   let firstAfter = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "")
                             ?? UPDATE_FIRST_CHECK_GRACE)
   Update.startPolling(current: VERSION, every: pollEvery, firstAfter: firstAfter)
+  // ── ON EVERY OPEN ────────────────────────────────────────────────────────
+  //
+  // The grace above used to be the whole answer to "when does an open check?",
+  // and it answered it with a ten-second wait. It is now only the fallback
+  // cadence; the check itself happens at once. The ten seconds moved to the
+  // COMMIT (`Update.armSettle`), which is what they were always protecting: a
+  // window that re-execs while somebody is still reading their invite link.
+  Update.armSettle(UPDATE_FIRST_CHECK_GRACE)
+  Update.checkNow("Kin opened")
 }
 
 // ── THESE ARE NOT PART OF UPDATING, AND THEY USED TO BE ───────────────────────
@@ -3035,7 +3053,22 @@ if let room = arg("room") {
           // `setPeerPresent(false)` -> `clearIncoming()` -> mode back to invite,
           // which hides the answer and decline buttons while the ringtone is
           // still going. A phone ringing with nothing to press.
-          if !ringPreview { peerHere = true }
+          if !ringPreview {
+            // ── ON EVERY CALL ──────────────────────────────────────────────
+            //
+            // The moment somebody is actually on the other end. Asked for, and
+            // it is the moment a stale build matters most: two Macs in one
+            // conversation running different versions is where every difference
+            // between them turns into a bug report that cannot be reproduced.
+            //
+            // Not a demand to restart. `callIsLive()` is true from here, so the
+            // poller holds anything it finds until the call ends and says so on
+            // screen -- which is the behaviour that already existed for a mid-call
+            // discovery. Only a peer on a DIFFERENT WIRE FORMAT may interrupt a
+            // conversation, and that is `wireMismatch`, decided elsewhere.
+            if !peerHere { Update.checkNow("a call started") }
+            peerHere = true
+          }
           // Their picture, if any, takes the window; yours stops filling it.
           // Idempotent -- the first-frame path below does the same thing, and
           // whichever happens first is right.

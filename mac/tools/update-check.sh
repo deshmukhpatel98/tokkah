@@ -291,6 +291,8 @@ mkman nowatch "$NEW"   "$DL?arm=nowatch" "$GOODSHA"
 mkman ro      "$NEW"   "$DL?arm=ro"      "$GOODSHA"
 mkman race    "$NEW"   "$DL?arm=race"    "$GOODSHA"
 mkman cadA    "$OLDER" "$DL?arm=cadA"    "$GOODSHA"
+mkman graceS  "$NEW"   "$DL?arm=graceS"  "$GOODSHA"
+mkman graceL  "$NEW"   "$DL?arm=graceL"  "$GOODSHA"
 mkman cadB    "$OLDER" "$DL?arm=cadB"    "$GOODSHA"
 mkman probe   "$OLDER" "$DL?arm=probe"   "$GOODSHA"
 mkman rw      "$NEW"   "$DL?arm=rw"      "$GOODSHA"
@@ -587,7 +589,7 @@ PY
 # `blind-instruments-report-negatives` exactly: an instrument that cannot see the
 # event returns the same value as a real negative. So it is a COULD NOT RUN, and
 # it is checked before a single verdict is printed.
-for d in probe ok older body sig hash tgz watch nowatch ro rw race cadA cadB \
+for d in probe ok older body sig hash tgz watch nowatch ro rw race cadA cadB graceS graceL \
          down nosig sigjunk manjunk; do
   mkdir -p "$SP/$d"; mkbundle "$OLD" "$TK" "$SP/$d/Kin.app"
 done
@@ -640,6 +642,18 @@ run nowatch "$SP/nowatch" 12 2 3 --watch --no-update --no-telemetry --no-rings
 # which is exactly the failure this pair is shaped to catch.
 CA0=$(date +%s); run cadA "$SP/cadA" 15 2 2 $ARGS --room "upd${$}ca" --listen 8380 --peer 127.0.0.1:8381 $RING
 CB0=$(date +%s); run cadB "$SP/cadB" 15 8 8 $ARGS --room "upd${$}cb" --listen 8380 --peer 127.0.0.1:8381 $RING
+# ── AND WHAT THE GRACE DELAYS NOW ──────────────────────────────────────────
+#
+# It used to delay the first CHECK, and that is what the pair above measured.
+# Opening the app now checks AT ONCE -- asked for in as many words -- so the
+# wait moved onto the COMMIT, which is what it was always really protecting: a
+# window that re-execs while somebody is still reading their invite link.
+#
+# A flag whose meaning changes and whose rig does not is a flag that has quietly
+# become decoration, so the pair moves with it. Both arms are served a NEWER
+# version, so each one has an install to time.
+GS0=$(date +%s); run graceS "$SP/graceS" 16 2  1 $ARGS --room "upd${$}gs" --listen 8380 --peer 127.0.0.1:8381 $RING
+GL0=$(date +%s); run graceL "$SP/graceL" 16 10 1 $ARGS --room "upd${$}gl" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 6. AN INSTALL IT CANNOT WRITE TO ────────────────────────────────────────
 #
@@ -831,7 +845,15 @@ N=$(hits "nowatch/manifest.json HTTP")
 [ "$(ver_on_disk "$SP/nowatch")" = "$OLD" ] \
   && say "OK" "and stayed on $OLD" \
   || say "FAIL" "--no-update updated to $(ver_on_disk "$SP/nowatch")"
-grep -q "watch: resident for" "$SP/nowatch.log" \
+# ── A CONTROL THAT COULD NEVER PASS IS NOT A CONTROL ───────────────────────
+#
+# This grepped for "watch: resident for @...", which `Watch.run` prints only when
+# it claims a handle -- and this rig sets TK_NO_IDENTITY precisely so it does not
+# (rigs walked @devesh, @devesh2 ... on the live directory). So the control for
+# "was there a live watcher at all" was asserting a line the arm can never emit,
+# and its FAIL said nothing about the product. Either startup line proves the
+# thing the control is for: the process reached `Watch.run`.
+grep -qE "watch: (resident for|TK_NO_IDENTITY)" "$SP/nowatch.log" \
   && say "OK" "CONTROL: and it was a live watcher, not a process that failed to start" \
   || say "FAIL" "CONTROL: the --no-update watcher never started, so its silence is its own"
 
@@ -841,14 +863,33 @@ fa=$(first_hit "GET /cadA/manifest.json" "$CA0")
 fb=$(first_hit "GET /cadB/manifest.json" "$CB0")
 ca=$(hits "cadA/manifest.json HTTP"); cb=$(hits "cadB/manifest.json HTTP")
 [ "$fa" -ge 0 ] && [ "$fb" -ge 0 ] \
-  && say "OK" "both arms polled: grace 2 first asked at ${fa}s, grace 8 at ${fb}s" \
+  && say "OK" "both arms polled: first ask at ${fa}s and ${fb}s" \
   || say "FAIL" "one of the cadence arms never polled at all (${fa}s / ${fb}s)"
-[ "$fa" -ge 0 ] && [ "$fb" -ge 0 ] && [ "$((fb - fa))" -ge 4 ] \
-  && say "OK" "and TK_UPDATE_GRACE moved the first ask by $((fb - fa)) s -- it is not decoration" \
-  || say "FAIL" "the first ask barely moved (${fa}s vs ${fb}s); TK_UPDATE_GRACE may do nothing"
+# ── OPENING KIN CHECKS AT ONCE ─────────────────────────────────────────────
+#
+# The promise that replaced "the grace moves the first ask". Asserted on BOTH
+# arms -- one configured with a grace of 8 -- because the point is that the
+# check no longer waits for any cadence at all.
+[ "$fa" -ge 0 ] && [ "$fa" -le 3 ] && [ "$fb" -ge 0 ] && [ "$fb" -le 3 ] \
+  && say "OK" "and both asked within 3 s of opening (${fa}s, ${fb}s) -- an open checks at once" \
+  || say "FAIL" "opening did not check promptly (${fa}s, ${fb}s) -- Update.checkNow is not firing"
 [ "$ca" -gt "$cb" ] \
   && say "OK" "and TK_UPDATE_POLL: $ca asks at 2 s against $cb at 8 s in the same window" \
   || say "FAIL" "poll=2 made $ca asks and poll=8 made $cb -- the interval is not being read"
+# ── AND THE GRACE IS WHAT HOLDS THE INSTALL ────────────────────────────────
+is_=$(first_hit "dl/.*arm=graceS" "$GS0"); il=$(first_hit "dl/.*arm=graceL" "$GL0")
+gsv=$(ver_on_disk "$SP/graceS"); glv=$(ver_on_disk "$SP/graceL")
+[ "$gsv" = "$NEW" ] && [ "$glv" = "$NEW" ] \
+  && say "OK" "both grace arms installed $NEW in the end -- the wait is a wait, not a refusal" \
+  || say "FAIL" "grace 2 ended on $gsv and grace 10 on $glv -- one of them never landed"
+GST=$(first_hit "graceS/manifest.json HTTP" "$GS0"); GLT=$(first_hit "graceL/manifest.json HTTP" "$GL0")
+[ "$GST" -ge 0 ] && [ "$GST" -le 3 ] && [ "$GLT" -ge 0 ] && [ "$GLT" -le 3 ] \
+  && say "OK" "and both CHECKED at once (${GST}s, ${GLT}s) whatever their grace" \
+  || say "FAIL" "a grace arm did not check promptly (${GST}s, ${GLT}s)"
+SI=$(lines "$SP/graceS.log" "update: installed $NEW"); LI=$(lines "$SP/graceL.log" "update: installed $NEW")
+[ "$SI" -ge 1 ] && [ "$LI" -ge 1 ] \
+  && say "OK" "MEASURED: each installed exactly once (grace 2: $SI, grace 10: $LI)" \
+  || say "FAIL" "installs did not happen once each (grace 2: $SI, grace 10: $LI)"
 
 # ── 6. AN INSTALL THE USER CANNOT WRITE ────────────────────────────────────
 echo "6. a copy this account cannot write (the non-admin /Applications case)"
@@ -1036,7 +1077,7 @@ if [ "$fail" = 0 ]; then
   echo "and the watcher keeps a closed Mac current by itself"
 else
   echo "UPDATE CHECK FAILED -- see above; logs copied to $OUT/update-*.log"
-  for f in probe ok older body sig hash tgz watch nowatch ro rw race-w race-f cadA cadB \
+  for f in probe ok older body sig hash tgz watch nowatch ro rw race-w race-f cadA cadB graceS graceL \
            down nosig sigjunk manjunk install; do
     cp "$SP/$f.log" "$OUT/update-$f.log" 2>/dev/null
   done

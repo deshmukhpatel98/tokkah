@@ -1195,6 +1195,64 @@ enum Update {
   // seconds. (Not a "setup in flight" flag instead: the far lab machine sits solo
   // for hours, and a flag that only clears on peer arrival would strand it
   // un-updateable.)
+  /// ── CHECK WHEN SOMETHING HAPPENS, NOT ONLY WHEN A TIMER SAYS SO ──────────
+  ///
+  /// Asked for in as many words: check on every restart, every open, and every
+  /// call. A cadence -- any cadence -- is a guess about when a person will next
+  /// care, and the moments they actually care about are knowable: they just
+  /// opened the app, they just started talking to somebody, they just finished.
+  /// Those are also the moments a stale build is most visible, because the other
+  /// end of the call is running a different one.
+  ///
+  /// Routed through the same `urgent` flag the Check for Updates menu item uses,
+  /// so there is one path that decides what a check does. It does NOT set
+  /// `wireMismatch`: that is the separate permission to interrupt a live call,
+  /// and "the app just opened" is not a reason to end a conversation.
+  ///
+  /// Cheap by construction: the check is a conditional GET of a small manifest.
+  /// What is not cheap is COMMITTING at a bad moment, and that is decided
+  /// elsewhere -- see `settling` below.
+  static func checkNow(_ why: String) {
+    guard !urgent else { return }          // one is already queued
+    lastReason = why
+    urgent = true
+  }
+  nonisolated(unsafe) static var lastReason = ""
+  /// ── WHO ASKED ─────────────────────────────────────────────────────────────
+  ///
+  /// `urgent` used to mean two things at once, and the second one is about a
+  /// PERSON: the Check for Updates menu item is owed an answer whatever happens,
+  /// including "you are already up to date" and "I could not reach the server".
+  /// An automatic check is owed nothing -- nobody is looking, and a download that
+  /// failed once in the middle of somebody's call is not their business.
+  ///
+  /// Reading "a person asked" off `urgent && !wireMismatch` was true while the
+  /// menu was the only thing that set it. The moment opening the app checked too,
+  /// every launch on a flaky network put "couldn't check for updates" on somebody's
+  /// status line. Caught by update-check's paired arm, which exists for exactly
+  /// this: the refusal that must be raised, beside the one that must not.
+  nonisolated(unsafe) static var urgentPerson = false
+  /// The Check for Updates menu item, and nothing else.
+  static func checkNowForPerson() {
+    lastReason = "asked from the menu"
+    urgentPerson = true
+    urgent = true
+  }
+
+  /// ── AND A CHECK IS NOT A LICENCE TO RESTART IN SOMEBODY'S FACE ───────────
+  ///
+  /// The launch check used to be deferred by ten seconds, and the reason was
+  /// never the network -- it was that `callIsLive()` is false for the whole of
+  /// call setup, so an update found immediately would re-exec while somebody was
+  /// still reading their invite link. Checking on open is what was asked for;
+  /// re-execing the window somebody just opened is not.
+  ///
+  /// So the wait moved off the CHECK and onto the COMMIT, which is where it
+  /// belonged: find out at once, land it once the app has settled.
+  nonisolated(unsafe) static var settleUntil = Date.distantPast
+  static func armSettle(_ s: Double) { settleUntil = Date().addingTimeInterval(s) }
+  static var settling: Bool { Date() < settleUntil }
+
   static func startPolling(current: String, every seconds: Double, firstAfter: Double) {
     Thread {
       var waited = 0.0
@@ -1216,6 +1274,12 @@ enum Update {
             restartNow = false
             note("asked to restart now")
             commit(s)          // returns only on failure; keep waiting if so
+            continue
+          }
+          if settling && !midCallAllowed && !restartNow {
+            // Found, verified, waiting for the window to stop being new. Not a
+            // stall: the same loop lands it a few seconds later without anybody
+            // asking again.
             continue
           }
           if !callIsLive() || midCallAllowed { commit(s); continue }
@@ -1245,9 +1309,13 @@ enum Update {
             wireMismatch = false
             mayInterruptCall = true
             note("peer is on a different build -- checking now rather than waiting")
-          } else {
+          } else if urgentPerson {
+            urgentPerson = false
             personAsked = true
             note("asked to check now")
+          } else {
+            // Automatic: opened, restarted, a call started. Logged, never raised.
+            note("checking now -- \(lastReason)")
           }
         }
         guard due else { continue }
