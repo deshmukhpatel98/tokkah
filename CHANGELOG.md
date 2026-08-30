@@ -9,7 +9,7 @@ This project measures its claims; where a change has a number, the number is her
 
 ### Changed — the repository catches up with the app
 
-Seventy-six tags, no releases page, and a changelog that ended fifteen releases
+Thirty-nine tags, no releases page, and a changelog that ended fifteen releases
 before anything anybody is running. `release.sh` publishes the GitHub release
 now, not only the tag, with notes lifted from this file's section for that
 version so there is one place the story of a release is written. It can never

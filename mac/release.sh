@@ -421,7 +421,7 @@ with tools/verify-release.py." 2>/dev/null; then
       echo "  pushed tag v$VER"
       # ── AND A TAG IS NOT A RELEASE ──────────────────────────────────────────
       #
-      # Seventy-six tags and ZERO published releases: the repository is public,
+      # Thirty-nine tags and ZERO published releases: the repository is public,
       # AGPL, and had nothing on its releases page, so the only way to get the
       # app was a curl command in the README. A tag is a pointer for people who
       # already have the repository; a release is the page everybody else lands
