@@ -398,12 +398,11 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
-  "sameroom-test", "sameroom-audio", "no-sameroom",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
-  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -435,8 +434,8 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
-                  "sameroom-test", "predict-test", "floor-test", "turn-test",
-                  "corr-test"]
+                  "predict-test", "floor-test", "turn-test",
+                  "corr-test", "quantile-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -595,7 +594,6 @@ if flag("forget-server") { fputs(Server.forget() + "\n", stderr); exit(0) }
 // spent 30 seconds retrying port 7001 against another agent's process and then
 // exited 1, having computed nothing. This is pure arithmetic over a synthetic
 // buffer; it needs no port, no device and no window.
-if flag("sameroom-test") { exit(Audio.sameRoomSelfTest(arg("sameroom-audio")) ? 0 : 1) }
 
 // ── WHAT MACOS HAS DECIDED, AND THE ONE CLICK THAT CHANGES IT ──────────────
 //
@@ -1652,11 +1650,6 @@ func pressControl(_ name: String) {
   // worse than not having the action at all. `audio` is a global created after
   // the rendezvous and touching it before that traps, so it is reached through a
   // hook that is nil until it exists.
-  if name == "speaker" {
-    let back = gRoomSpeaker?() ?? false
-    fputs("pressed speaker: this speaker is now \(back ? "on" : "off")\n", stderr)
-    return
-  }
   display?.controls?.simulate(name)
   // Read the CONTROL's state, not `audio`'s. `audio` is a global created after the
   // rendezvous, and touching it from a timer that fires while still waiting traps
@@ -3205,7 +3198,6 @@ var gThetaValid = false
 /// `pressControl` is defined a thousand lines above and only ever RUNS from a
 /// timer, but a global assigned above its own declaration is silently undone by
 /// the declaration's initialiser (`top-level-code-runs-in-order`).
-nonisolated(unsafe) var gRoomSpeaker: (() -> Bool)?
 // TK_MUTE=1 in the environment silences playout as surely as --mute does.
 // This exists because a flag you have to remember on every one of forty test
 // commands is a flag you will forget on the forty-first, and here the cost of
@@ -3957,6 +3949,8 @@ if flag("headphone-test") {
 // `--floor-owd` sweeps the one-way delay, because every bug this design can have
 // is two ends disagreeing about the present, and a rig with no delay cannot
 // produce one. Default 40 ms; try 100 for Delhi-NL.
+if flag("quantile-test") { exit(Quantiles.selfTest() ? 0 : 1) }
+
 if flag("corr-test") { exit(Audio.corrSelfTest() ? 0 : 1) }
 
 if flag("turn-test") {
@@ -4090,7 +4084,6 @@ if flag("gate-test") {
 // and no test reads `Audio.sharedGate`.
 let audio = Audio()
 audio.wire = wire
-gRoomSpeaker = { audio.roomOverride.toggle(); return !audio.roomSpeakerOff }
 
 if let m = arg("presence") {
   guard let p = Audio.Presence.named(m) else {
@@ -4163,10 +4156,6 @@ if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
-// The control arm for tools/sameroom-check.sh: the same binary with the room
-// detector's ACTION disabled. It keeps measuring and keeps reporting, so the
-// control run still prints the correlation it would have acted on.
-if flag("no-sameroom") { audio.sameRoomEnabled = false }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if let ed = arg("echo-sim") {
   // "18" or "18:0.3" -- delay in ms, optional linear gain.
@@ -5687,50 +5676,32 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "turn_ok": wire.turn != nil ? 1 : 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
     "echo_corr": audio.echoCorr, "backchannels": audio.backchannels,
-    // ── THE SAME-ROOM DETECTOR, WHICH KNEW EVERYTHING AND SAID NOTHING ───────
-    //
-    // Reported as echo on a real call: "the echo is pretty much there... even if
-    // both the devices are in the same room." There is a whole detector for
-    // exactly that case -- it turns this Mac's speaker off when it can prove the
-    // two of you share a room -- and every number it forms went to a stderr on
-    // somebody else's machine and nowhere else. So the question "did it fire,
-    // and if not, which of its two conditions failed" could not be answered from
-    // the server at all, and the only honest reply was that we could not see.
-    //
-    // `telemetry-must-self-diagnose` and `invisible-when-it-matters`: the path
-    // that stops working is exactly the path that stops reporting, and a
-    // detector with no field is indistinguishable from a detector that is off.
-    //
-    // Both halves of its test are published, because they fail for opposite
-    // reasons and need opposite fixes: `room_corr` is "did this microphone hear
-    // that loudspeaker at all" against `ROOM_ON`, and `room_lag_ms` against
-    // `room_pipe_ms` is "was it one crossing away (the same room) or two (a
-    // loop at the far end)". A single "it did not fire" cannot tell those apart.
     // ── WHAT THIS CALL COSTS THE BATTERY ──────────────────────────────────
     //
     // A RATE: CPU seconds per wall second since the previous beat, so 0.15 is
     // one seventh of a core. `usr` and `sys` stay apart because they move for
-    // unrelated reasons -- a hot loop shows in one, the audio device and the
-    // socket in the other -- and a single number cannot tell them apart.
+    // unrelated reasons -- a hot loop in one, the audio device and the socket
+    // in the other -- and a single number cannot tell them apart.
+    //
     // `cpu_valid` is 0 on the first beat of a call: one reading cannot be a
     // rate, and publishing a zero for a thing not measured is exactly the
     // shape that makes a blind instrument read like a healthy one.
+    //
+    // THESE WERE DELETED BY ACCIDENT AND THE RIG CAUGHT IT. Removing the eight
+    // room_* fields took a slice of this dictionary, and the slice began at a
+    // comment that sat ABOVE these lines rather than below them -- so the
+    // battery telemetry added an hour earlier went out with the feature being
+    // retired. Nothing failed to compile; the beats simply arrived with `cpu`
+    // absent, which is why the measurement rig checks the FIELD and not the
+    // exit code.
     "cpu": pwr.cpu, "cpu_usr": pwr.usr, "cpu_sys": pwr.sys,
     "cpu_valid": pwr.valid ? 1 : 0,
     "threads": pwr.threads, "rss_peak_mb": pwr.rssPeakMb,
-    "room_on": audio.roomConfirmed ? 1 : 0,
-    "room_verdict": audio.roomVerdict.rawValue,
-    "room_corr": audio.roomCorr,
-    "room_lag_ms": audio.roomLagMs,
-    "room_pipe_ms": audio.roomPipeMsNow ?? -1,
-    "room_ref_rms": audio.roomRefRms, "room_mic_rms": audio.roomMicRms,
-    // WITH ITS DENOMINATOR. `room_hits` alone cannot say whether the detector
-    // disagreed or simply never got a scoreable moment -- and "the far end was
-    // never loud enough to score" is the likeliest way this quietly does
-    // nothing. `counted-without-a-denominator`.
-    "room_hits": audio.roomHits, "room_scored": audio.roomScored,
-    "room_enters": audio.roomEnters, "room_loopback_hits": audio.loopbackHits,
-    "room_thresh": Audio.ROOM_ON,
+    // The eight room_* fields that were here are gone with the detector they
+    // reported. They were added and removed the same day: added because the
+    // same-room case could not be diagnosed from the server, removed because
+    // the case itself was retired as a test artifact. Reporting a feature
+    // nobody needs is still something somebody has to read past.
     "floor_claims": audio.floorClaims,
     "dec_luma": gDecLuma,
     "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,
@@ -5840,21 +5811,6 @@ func reportLoop() {
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
 
-  // Whether the microphone is hearing the far voice EARLY, which no remote call
-  // can produce. Printed only once there is something to attribute, so a normal
-  // call does not carry a line about a room it is not in.
-  if audio.roomScored > 0 {
-    let names = ["still deciding", "a remote call", "THE SAME ROOM", "THEIR room looping us back"]
-    let said = names[audio.roomVerdict.rawValue]
-    let act = audio.roomSpeakerOff ? ", this speaker is OFF"
-            : (audio.roomConfirmed ? ", but the person turned the speaker back on" : "")
-    fputs(String(format: "  room: backward %.2f at %.0f ms -- %@%@ (%d/%d same-room, %d their-loop,"
-                       + " far %.4f near %.4f)\n",
-                 audio.roomCorr, audio.roomLagMs, said, act,
-                 audio.roomHits, audio.roomScored, audio.loopbackHits,
-                 audio.roomRefRms, audio.roomMicRms), stderr)
-  }
-
   // ── AND TELL THE PERSON ON THE CALL ─────────────────────────────────────────
   //
   // Same numbers, same second, one place. The bar reads from what the report line
@@ -5930,8 +5886,10 @@ func reportLoop() {
     // `CallControls` decide which sentence wins; stating it unconditionally is
     // also what makes it clear itself, with no read-back of the pill to work out
     // whether the last thing in it was ours.
-    c.setRoomWarning(audio.roomSpeakerOff
-                     ? "You're in the same room, so Kin turned this speaker off." : "")
+    // The same-room warning was here. Both it and the condition that raised it
+    // are gone; the pill still clears itself unconditionally, which is what made
+    // stating it every tick the right shape in the first place.
+    c.setRoomWarning("")
     // The code both people read aloud. Only exists once the key exchange has
     // happened, and it is stable for the rest of the call.
     if let code = wire.crypto?.safetyCode { c.setSafetyCode(code) }
@@ -6064,15 +6022,6 @@ func reportLoop() {
       ? "  -- this machine's speaker reaches its own microphone" : ""
     let sim = audio.echoSim ? "  [SIMULATED echo path armed]" : ""
     fputs("  room: \(corr) correlation at \(at) ms\(sim)\(verdict)\n", stderr)
-  }
-  // And the same search run backwards: did this microphone hear the far voice
-  // BEFORE the speaker played it? A denominator with it, because a bare count of
-  // defects is decoration (`counted-without-a-denominator`).
-  if audio.roomScored > 0 {
-    fputs(String(format: "  same room: %d of %d estimates, %d looked like THEIR room;"
-                       + " decided %d time(s), speaker %@\n",
-                 audio.roomHits, audio.roomScored, audio.loopbackHits, audio.roomEnters,
-                 audio.roomSpeakerOff ? "off" : "on"), stderr)
   }
   // Reported on every call, not only the gated ones: these are turns taken, and
   // a headphone call has those too.

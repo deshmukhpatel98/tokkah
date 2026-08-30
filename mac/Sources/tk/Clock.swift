@@ -1,4 +1,6 @@
+import Foundation
 import Darwin
+import Foundation
 
 // ONE CLOCK.
 //
@@ -109,16 +111,125 @@ struct Quantiles {
   // reporter and leaveCall used to sort it in place, and hang-up was a
   // SIGSEGV at 0xe8 in Quantiles.p — 20+ crash reports on 0.41.0. A torn
   // snapshot is a slightly wrong percentile. A shared sort is a dead app.
+  /// ── SELECT, DO NOT SORT ───────────────────────────────────────────────────
+  ///
+  /// This sorted the whole buffer to read ONE element out of it, and the report
+  /// asks the same object for p50, p95 and p99 -- three copies and three full
+  /// sorts of identical, unchanged data. Across the beat and the second-by-second
+  /// line that is 47 sorts of up to 4096 doubles per tick, and it was the last of
+  /// our own code left in the CPU profile after the correlation work
+  /// (`_merge<A>`, top of the self-time list).
+  ///
+  /// A percentile does not need the array ordered. It needs ONE element in its
+  /// final position, which is quickselect: partition, recurse into the side that
+  /// contains the index, and stop. O(m) instead of O(m log m), and the element
+  /// returned is by construction the same one `sort()` would have put there.
+  ///
+  /// The copy-out STAYS, and it is not the slow part. The audio thread writes
+  /// this buffer while the reporter reads it; sorting in place is what made
+  /// hang-up a SIGSEGV at 0xe8 with 20+ crash reports on 0.41.0. A torn snapshot
+  /// is a slightly wrong percentile. A shared sort is a dead app.
+  ///
+  /// Median-of-three pivot, so ordered and reverse-ordered input -- which is
+  /// exactly what a latency series often is -- cannot hit the quadratic case.
+  /// `--quantile-test` checks it against `sort()` on both, plus all-equal and
+  /// single-element buffers.
   func p(_ q: Double) -> Double? {
     if Int(bitPattern: v) < 4096 { return nil }
     let m = min(cap, wrapped ? cap : n)
     guard m > 0 else { return nil }
     var tmp = [Double](repeating: 0, count: m)
     for i in 0..<m { tmp[i] = v[i] }
-    tmp.sort()
     let i = min(m - 1, max(0, Int((Double(m) * q).rounded(.down))))
-    return tmp[i]
+    return Quantiles.select(&tmp, i)
+  }
+
+  /// The element that would sit at `k` if `a` were sorted. Rearranges `a`.
+  /// Control arm, so the saving is measured on a live call rather than assumed
+  /// from a complexity argument. O(m) beating O(m log m) is a fact about the
+  /// operation, not about the battery.
+  nonisolated(unsafe) static let sortArm =
+    ProcessInfo.processInfo.environment["TK_QUANT_SORT"] == "1"
+
+  static func select(_ a: inout [Double], _ k: Int) -> Double {
+    if sortArm { a.sort(); return a[k] }
+    var lo = 0, hi = a.count - 1
+    while lo < hi {
+      // Median of three, placed at `lo` as the pivot.
+      let mid = lo + (hi - lo) / 2
+      if a[mid] < a[lo] { a.swapAt(mid, lo) }
+      if a[hi] < a[lo] { a.swapAt(hi, lo) }
+      if a[hi] < a[mid] { a.swapAt(hi, mid) }
+      a.swapAt(mid, lo)
+      let pivot = a[lo]
+      var i = lo, j = hi
+      // Hoare partition. `i <= j` with the two inner loops bounded by the pivot
+      // value rather than by an index is what keeps all-equal input linear
+      // instead of quadratic -- both scans still advance on an equal element.
+      while i <= j {
+        while a[i] < pivot { i += 1 }
+        while a[j] > pivot { j -= 1 }
+        if i <= j {
+          a.swapAt(i, j)
+          i += 1; j -= 1
+        }
+      }
+      if k <= j { hi = j } else if k >= i { lo = i } else { return a[k] }
+    }
+    return a[k]
   }
 
   mutating func reset() { n = 0; wrapped = false }
+}
+
+extension Quantiles {
+  /// ── AGAINST THE SORT IT REPLACED ──────────────────────────────────────────
+  ///
+  /// Every case that breaks a naive quickselect, plus the two that a latency
+  /// series actually produces. An agreement test on random data alone would pass
+  /// an implementation that goes quadratic on sorted input -- which is the shape
+  /// this buffer holds most often.
+  static func selfTest() -> Bool {
+    var fails = 0
+    func check(_ ok: Bool, _ what: String) {
+      if !ok { fails += 1 }
+      print("  \(ok ? "ok  " : "FAIL") \(what)")
+    }
+    var seed: UInt64 = 0x5EED
+    func rnd() -> Double {
+      seed = seed &* 6364136223846793005 &+ 1442695040888963407
+      return Double(seed >> 40) / Double(1 << 24)
+    }
+    let cases: [(String, [Double])] = [
+      ("random 4096", (0..<4096).map { _ in rnd() }),
+      ("already sorted", (0..<2000).map { Double($0) }),
+      ("reverse sorted", (0..<2000).map { Double(2000 - $0) }),
+      ("all equal", [Double](repeating: 7, count: 1500)),
+      ("two values", (0..<1000).map { $0 % 2 == 0 ? 1.0 : 2.0 }),
+      ("single", [42.0]),
+      ("pair", [9.0, -3.0]),
+      ("with negatives", (0..<777).map { _ in rnd() * 2 - 1 }),
+    ]
+    for (name, data) in cases {
+      let sorted = data.sorted()
+      var wrong = 0
+      // Every index, not a sample of them: an off-by-one at one end is exactly
+      // the bug this can have, and p99 lives at one end.
+      for k in 0..<data.count {
+        var copy = data
+        if Quantiles.select(&copy, k) != sorted[k] { wrong += 1 }
+      }
+      check(wrong == 0, "\(name): all \(data.count) indices match sort() (\(wrong) wrong)")
+    }
+    // And through the real API, wrapped, the way the app uses it.
+    var q = Quantiles(cap: 256)
+    for i in 0..<1000 { q.add(Double((i * 37) % 1000)) }
+    let ref = (0..<256).map { Double((($0 + 744) * 37) % 1000) }.sorted()
+    let got = q.p(0.50)
+    check(got == ref[128], "through add()/p(0.50) on a wrapped buffer "
+                         + "(\(got.map { String($0) } ?? "nil") vs \(ref[128]))")
+    check(Quantiles(cap: 16).p(0.5) == nil, "an empty buffer is nil, not zero")
+    print(fails == 0 ? "QUANTILE TEST PASSED" : "QUANTILE TEST FAILED (\(fails))")
+    return fails == 0
+  }
 }
