@@ -119,6 +119,7 @@ enum Telemetry {
     f["model"] = model
     f["phase"] = phase ?? (final ? "final" : "live")
     guard let body = try? JSONSerialization.data(withJSONObject: f) else { done?(false); return }
+    keep(body)
     guard let url = URL(string: url0 ?? endpoint) else { done?(false); return }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
@@ -142,4 +143,54 @@ enum Telemetry {
       done?(ok)
     }.resume()
   }
+
+  // ── AND A COPY ON THIS MACHINE ─────────────────────────────────────────────
+  //
+  // Every beat used to exist in exactly one place: a Durable Object behind a key
+  // that lives in a browser cookie on one Mac and a `wrangler secret` nothing can
+  // read back. So a real complaint about a real call was investigated out of a
+  // STDERR LOG, because the telemetry built to answer exactly that question could
+  // not be opened -- not from this Mac, not from anywhere.
+  //
+  // The same JSON that goes to the server is appended here first. It costs one
+  // append per beat, it survives the network being down and the server refusing,
+  // and it is the copy that is still there when somebody asks "what happened on
+  // that call" an hour later.
+  //
+  // Written BEFORE the request, deliberately: a beat that fails to send is
+  // exactly the one worth having on disk.
+  nonisolated(unsafe) private static var beatFile: FileHandle?
+  nonisolated(unsafe) private static var beatBytes = 0
+  // A call is ~24 beats of ~3 KB. 32 MB is months of them, and the oldest are
+  // dropped whole-file rather than truncated: a half-written JSON line read by a
+  // tolerant parser is worse than no line, because it reads as a beat that was
+  // BLIND rather than one that is missing.
+  private static let BEAT_MAX = 32 * 1024 * 1024
+  static func beatLogURL() -> URL {
+    Watch.logDir().appendingPathComponent("beats.ndjson")
+  }
+  private static func keep(_ body: Data) {
+    queue.sync {
+      if beatFile == nil {
+        let u = beatLogURL()
+        if !FileManager.default.fileExists(atPath: u.path) {
+          FileManager.default.createFile(atPath: u.path, contents: nil)
+        }
+        beatFile = try? FileHandle(forWritingTo: u)
+        beatBytes = (try? FileManager.default
+          .attributesOfItem(atPath: u.path)[.size] as? Int) as? Int ?? 0
+        try? beatFile?.seekToEnd()
+      }
+      guard let h = beatFile else { return }
+      if beatBytes > BEAT_MAX {
+        try? h.truncate(atOffset: 0)
+        beatBytes = 0
+      }
+      var line = body
+      line.append(0x0a)
+      try? h.write(contentsOf: line)
+      beatBytes += line.count
+    }
+  }
+  private static let queue = DispatchQueue(label: "tk.beatlog")
 }

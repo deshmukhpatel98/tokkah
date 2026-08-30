@@ -45,6 +45,18 @@ interface Env {
   // 7200; explicit '0' disables metering.
   XLATE_DAY_SECONDS?: string;
   LOG_ADMIN_TOKEN?: string;
+  // ── A READ CREDENTIAL THAT LIVES ON DISK, NOT ONLY IN A BROWSER ───────────
+  //
+  // MAC_DASH_KEY lives in a cookie on one Mac and LOG_ADMIN_TOKEN is a secret
+  // nothing can read back, so the telemetry this app works hard to collect was
+  // unreadable to anyone debugging a live complaint -- including from the very
+  // machine that produced it. A call was investigated from a stderr log because
+  // the dashboard could not be opened at all.
+  //
+  // AGENT_KEY is the same operator read, held in a file (~/.config/tokkah/dash.env)
+  // rather than in a browser. It is a SECOND accepted value, never a rotation:
+  // rotating either of the other two silently breaks a link somebody already has.
+  AGENT_KEY?: string;
   ELEVENLABS_API_KEY?: string;
   // MT backend. Absent → passthrough (captions/TTS in the source language),
   // which keeps the whole pipeline measurable before the key exists.
@@ -650,11 +662,20 @@ export class Room implements DurableObject {
   // The room code is user-chosen and can be a single character, so it is not a
   // read credential. The token is. Plain === on a 122-bit UUID: a timing side
   // channel over a network hop is not a practical oracle at this entropy.
+  /// Either operator credential. AGENT_KEY is the one that lives in a file, so
+  /// a session debugging a complaint can actually read what was collected.
+  private adminOk(t: string | null): boolean {
+    if (t === null) return false;
+    if (this.env.LOG_ADMIN_TOKEN && t === this.env.LOG_ADMIN_TOKEN) return true;
+    return !!this.env.AGENT_KEY && t === this.env.AGENT_KEY;
+  }
+
   private tokenOk(url: URL): boolean {
     const t = url.searchParams.get('token');
     // LOG_ADMIN_TOKEN (wrangler secret): operator read across rooms, for
     // debugging live complaints without asking the caller for their token.
     if (t !== null && this.env.LOG_ADMIN_TOKEN && t === this.env.LOG_ADMIN_TOKEN) return true;
+    if (t !== null && this.env.AGENT_KEY && t === this.env.AGENT_KEY) return true;
     return t !== null && t === this.logToken;
   }
 
@@ -4467,7 +4488,7 @@ export class Health implements DurableObject {
     }
     if (url.pathname === '/rooms' && request.method === 'GET') {
       const t = url.searchParams.get('token');
-      if (!this.env.LOG_ADMIN_TOKEN || t !== this.env.LOG_ADMIN_TOKEN) return json({ error: 'admin token required' }, 403);
+      if (!this.adminOk(t)) return json({ error: 'admin token required' }, 403);
       const rows = this.sql.exec(
         `SELECT code, first_wall, last_wall, joins FROM rooms ORDER BY last_wall DESC LIMIT 100`,
       ).toArray() as Array<{ code: string; first_wall: number; last_wall: number; joins: number }>;
@@ -4483,7 +4504,7 @@ export class Health implements DurableObject {
     // needs rows, not aggregates. Same token that reads any room log.
     if (url.pathname === '/recent' && request.method === 'GET') {
       const t = url.searchParams.get('token');
-      if (!this.env.LOG_ADMIN_TOKEN || t !== this.env.LOG_ADMIN_TOKEN) return json({ error: 'admin token required' }, 403);
+      if (!this.adminOk(t)) return json({ error: 'admin token required' }, 403);
       const n = Math.max(1, Math.min(50, Number(url.searchParams.get('n')) || 20));
       const rows = this.sql.exec(`SELECT * FROM beats ORDER BY id DESC LIMIT ?`, n)
         .toArray() as Array<Record<string, unknown>>;
@@ -4788,6 +4809,7 @@ export default {
       const k = url.searchParams.get('key');
       if (k === dashKey) return true;
       if (adminTok && k === adminTok) return true;
+      if (env.AGENT_KEY && k === env.AGENT_KEY) return true;
       const c = request.headers.get('cookie') ?? '';
       return c.split(';').some((p) => p.trim() === `tk_dash=${dashKey}`);
     };
