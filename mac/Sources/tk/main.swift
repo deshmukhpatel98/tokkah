@@ -402,7 +402,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
-  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -435,7 +435,7 @@ let KNOWN_FLAGS: Set<String> = [
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
-                  "corr-test", "quantile-test"]
+                  "corr-test", "quantile-test", "reopen-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -583,6 +583,16 @@ if Server.selfHosted { fputs("server: \(Server.describe())\n", stderr) }
 if flag("server-print") { print(Server.report()); exit(0) }
 if flag("save-server") { fputs(Server.save() + "\n", stderr); exit(0) }
 if flag("forget-server") { fputs(Server.forget() + "\n", stderr); exit(0) }
+
+// ── A SENTINEL PID MUST NEVER SATISFY AN IS-IT-RUNNING CHECK ───────────────
+//
+// `Watch.Resident.Target.live` decides whether a Dock click is answered by
+// bringing an open Kin forward or by starting one, and 0.76.0 answered six
+// clicks in a row with "already open (pid -1)" -- activating a record with no
+// process behind it, so nothing came up at all. Up here with the other pure
+// arithmetic and above the media socket: this is a table of pids, and it needs
+// no port, no device and no window.
+if flag("reopen-test") { exit(Resident.Target.selfTestLive() ? 0 : 1) }
 
 // ── ARE YOU TWO IN THE SAME ROOM? THE RULER, BEFORE ANY OF THE PRODUCT ─────
 //
@@ -3952,6 +3962,7 @@ if flag("headphone-test") {
 if flag("quantile-test") { exit(Quantiles.selfTest() ? 0 : 1) }
 
 if flag("corr-test") { exit(Audio.corrSelfTest() ? 0 : 1) }
+
 
 if flag("turn-test") {
   let w = arg("turn-wav") ?? "testbed/media/real/realA.wav,testbed/media/real/realB.wav"

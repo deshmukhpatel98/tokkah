@@ -348,7 +348,19 @@ enum Watch {
 
   /// `~/Library/Logs/Kin`, created on demand. Console.app already knows to look
   /// here, so a user can be asked for it by name without being asked for a path.
+  /// ── A RIG MUST NOT WRITE INTO THE USER'S LOG ─────────────────────────────
+  ///
+  /// `open --stderr` TRUNCATES the file it is given, so a rig launching Kin
+  /// through the resident wiped ~/Library/Logs/Kin/ring.log -- the record of
+  /// the last real call on this Mac -- and then read its own output out of the
+  /// user's log. TK_KIN_DIR already gives a rig its own identity; the logs the
+  /// same run writes belong in the same lane.
   static func logDir() -> URL {
+    if let d = ProcessInfo.processInfo.environment["TK_KIN_DIR"] {
+      let u = URL(fileURLWithPath: d).appendingPathComponent("logs", isDirectory: true)
+      try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+      return u
+    }
     let d = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Logs/Kin", isDirectory: true)
     try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
@@ -793,14 +805,88 @@ enum Resident {
     /// A reopen with no URL means "show me Kin", and the honest answer to that,
     /// when Kin is already showing, is to bring it forward. Only a reopen that
     /// finds nothing running is a launch.
+    ///
+    /// ── A SENTINEL IS NOT A PID ────────────────────────────────────────────
+    ///
+    /// Reported as six clicks in a row that did nothing at all, and the log said
+    /// exactly why:
+    ///
+    ///     watch: Kin is already open (pid -1) -- brought it forward instead of
+    ///
+    /// `NSRunningApplication.processIdentifier` returns **-1** when the record
+    /// has no process behind it -- an app that has gone, or one LaunchServices
+    /// still lists and cannot address. `isTerminated` did not catch it: the two
+    /// are separate facts, and a record can carry the sentinel while still
+    /// answering `false` to "have you terminated". So the filter accepted it,
+    /// `activate` was sent to nothing, and the reopen was answered by doing
+    /// nothing -- a Dock click with no window and no second copy either. Six of
+    /// them, because the stale record never went away.
+    ///
+    /// The rule the filter was missing, and the reason it is written out rather
+    /// than folded into the `first`: a pid that is not a pid must never satisfy
+    /// an is-it-running question. `kill(pid, 0)` is the second half -- the record
+    /// may name a plausible pid that has already exited, and only the kernel
+    /// knows. `EPERM` counts as alive: the process exists and is somebody else's.
+    ///
+    /// Sibling of `open-socket-is-not-a-live-peer`, one layer up: a registration
+    /// outliving the thing it registers.
+    static func live(pid: pid_t, terminated: Bool, me: pid_t,
+                     alive: (pid_t) -> Bool = Target.running) -> Bool {
+      if terminated { return false }
+      // -1 is the documented sentinel, 0 is "every process in my group" to
+      // `kill` and has never been a running app: neither is evidence of anything.
+      if pid <= 0 { return false }
+      // The resident is itself a running instance of this bundle -- that
+      // registration is the whole reason we are here -- and it must never count
+      // as the app being open.
+      if pid == me { return false }
+      return alive(pid)
+    }
+
+    static func running(_ pid: pid_t) -> Bool {
+      kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    // ── THE RULER, ON ANSWERS ALREADY KNOWN ────────────────────────────────
+    //
+    // Table-driven and deliberately full of cases it MUST REJECT, because a
+    // predicate that answers `false` to everything would pass a table of only
+    // positives -- and `false` is the safe answer here, so that is the exact
+    // shape a broken fix would take. Four rejects and two accepts, and the two
+    // accepts are what stop this from degenerating into "never bring anything
+    // forward", which would put back the ten-copies bug 0.75.2 fixed.
+    //
+    // `-1` is the field case, verbatim, and it is the first row.
+    static func selfTestLive() -> Bool {
+      let me: pid_t = 4242
+      let dead: pid_t = 999_999   // above the kernel's pid ceiling: never running
+      let cases: [(String, pid_t, Bool, Bool)] = [
+        ("the sentinel: no process behind the record", -1, false, false),
+        ("a sentinel that also admits it is gone",     -1, true,  false),
+        ("pid 0 -- to kill(2) that is a whole group",   0, false, false),
+        ("the resident, seeing its own registration",  me, false, false),
+        ("a plausible pid that has already exited",  dead, false, false),
+        ("a real, live, other Kin",
+         ProcessInfo.processInfo.processIdentifier, false, true),
+        ("pid 1 -- launchd is always running",          1, false, true),
+      ]
+      var ok = true
+      for (what, pid, term, want) in cases {
+        let got = live(pid: pid, terminated: term, me: me)
+        if got != want { ok = false }
+        fputs("reopen: \(got == want ? "OK  " : "FAIL") pid=\(pid)"
+            + " terminated=\(term) -> \(got ? "already open" : "start one")"
+            + "  \(what)\n", stderr)
+      }
+      fputs("REOPEN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
+      return ok
+    }
+
     private func existing() -> NSRunningApplication? {
       guard let id = Bundle.main.bundleIdentifier else { return nil }
-      // Excluded by pid, not by name: the resident is itself a running instance
-      // of this bundle -- that registration is the whole reason we are here --
-      // and it must never count as the app being open.
       let me = ProcessInfo.processInfo.processIdentifier
       return NSRunningApplication.runningApplications(withBundleIdentifier: id)
-        .first { $0.processIdentifier != me && !$0.isTerminated }
+        .first { Target.live(pid: $0.processIdentifier, terminated: $0.isTerminated, me: me) }
     }
 
     private func launch(url: URL? = nil) {
@@ -808,7 +894,30 @@ enum Resident {
       // URL and there is no channel to hand one to a process already running, so
       // that path still starts a copy -- narrowing this to the case actually
       // reported rather than guessing at the other one.
-      if url == nil, let open = existing() {
+      // ── THE RIG ARM ────────────────────────────────────────────────────────
+      //
+      // There is no way to ask LaunchServices for a record that carries the -1
+      // sentinel, so the only honest way to hold this fix down is to hand the
+      // decision the pid the field reported and drive a real reopen through the
+      // real delegate. This is that door, and it opens ONE thing: the pid the
+      // question is asked about. Everything after it -- the predicate, the
+      // activate, the log line, the `open -n` -- is production code, so a rig
+      // run reproduces the reported failure exactly rather than a model of it.
+      //
+      // Production never sets it, and it is deliberately absent from the
+      // allow-list `install` carries into the launchd plist -- so even a rig
+      // that sets it cannot leave it behind on a real installed watcher.
+      let fake = ProcessInfo.processInfo.environment["TK_WATCH_FAKE_OPEN_PID"]
+                   .flatMap { pid_t($0) }
+      if url == nil, let f = fake {
+        if Target.live(pid: f, terminated: false,
+                       me: ProcessInfo.processInfo.processIdentifier) {
+          fputs("watch: Kin is already open (pid \(f))"
+              + " -- brought it forward instead of starting another\n", stderr)
+          return
+        }
+        fputs("watch: pid \(f) is not a running Kin -- starting one\n", stderr)
+      } else if url == nil, let open = existing() {
         open.activate(options: [.activateAllWindows])
         fputs("watch: Kin is already open (pid \(open.processIdentifier))"
             + " -- brought it forward instead of starting another\n", stderr)
@@ -818,7 +927,18 @@ enum Resident {
       p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
       var args = ["-n", "-a", Bundle.main.bundleURL.path,
                   "--stderr", Watch.logDir().appendingPathComponent("ring.log").path]
+      // The same rig override the ring path takes (`watchForever`), for the same
+      // reason and then one more. A rig bundle is by definition not in
+      // /Applications, so a Kin started from here with production args would
+      // relocate ITSELF over the user's working copy -- and a reopen is the one
+      // launch a person triggers by hand, so this was the half of the door with
+      // no lock on it. Empty in production.
+      let extra = (ProcessInfo.processInfo.environment["TK_WATCH_OPEN_ARGS"] ?? "")
+        .split(separator: " ").map(String.init)
+      // `--args` ends `open`'s own option list, so a URL -- which is a document
+      // for `open`, not an argument for the app -- has to go in before it.
       if let url { args.append(url.absoluteString) }
+      if !extra.isEmpty { args.append(contentsOf: ["--args"] + extra) }
       p.arguments = args
       do { try p.run() } catch {
         fputs("watch: could not open Kin: \(error)\n", stderr)
