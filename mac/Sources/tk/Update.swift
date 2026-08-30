@@ -1004,10 +1004,77 @@ enum Update {
   /// and must still execv; the installed one has KeepAlive set unconditionally,
   /// so exiting is a restart. `Watch.run` already ends this way when it notices
   /// the binary change underneath it.
+  /// ── THE NEW BINARY MUST BE LAUNCHABLE BEFORE THIS ONE LETS GO ────────────
+  ///
+  /// Every self-update filed a crash report:
+  ///
+  ///     Process: Tokkah   Parent: launchd   Coalition: com.tokkah.tk.watch
+  ///     EXC_CRASH (SIGKILL (Code Signature Invalid))
+  ///     Termination: CODESIGNING, Launch Constraint Violation
+  ///
+  /// 67 ms after launch, before anything but dyld. The staged payload IS probed
+  /// -- `stage()` runs it with `--version` and refuses a candidate that will not
+  /// start -- but it probes the copy in /tmp, BEFORE the swap. What macOS refuses
+  /// here is the binary at its new path, moments after a different file with a
+  /// different cdhash occupied it, and nothing had ever asked whether THAT would
+  /// launch.
+  ///
+  /// It self-heals: KeepAlive tries again and the second one works, so the Mac
+  /// ends up current and the only lasting trace is a crash report per release.
+  /// That is precisely why it survived four of them -- "recovers on its own" and
+  /// "nobody has looked" produce the same graph.
+  ///
+  /// So the process holding the job does not exit until it has watched the new
+  /// binary start. `--version` costs a few milliseconds, touches no device and
+  /// opens no port. If it never becomes launchable, exiting anyway is still
+  /// right: launchd retrying forever is a better failure than a resident that
+  /// stays on the old build and reports itself healthy.
+  static func launchable(_ path: URL, within: Double = 10) -> Int {
+    let deadline = Date().addingTimeInterval(within)
+    var tries = 0
+    while Date() < deadline {
+      tries += 1
+      let p = Process()
+      p.executableURL = path
+      p.arguments = ["--version"]
+      p.standardOutput = FileHandle.nullDevice
+      p.standardError = FileHandle.nullDevice
+      if (try? p.run()) != nil {
+        p.waitUntilExit()
+        // Exit 0 is the answer. A SIGKILL from the code-signing monitor arrives
+        // as an uncaught signal, which is what this is waiting out.
+        if p.terminationStatus == 0 { return tries }
+      }
+      Thread.sleep(forTimeInterval: 0.25)
+    }
+    return -tries
+  }
+
   static func restart(into path: URL) -> Never {
+    // Both restart routes go through this, because both hand the path to
+    // something that will exec it: launchd below, execv further down.
+    let tries = launchable(path)
+    if tries < 0 {
+      fputs("update: the installed binary at \(path.path) still will not launch after"
+          + " \(-tries) tries -- restarting anyway and letting the supervisor retry\n", stderr)
+      Metrics.count("update_relaunch_unproven")
+    } else if tries > 1 {
+      fputs("update: the installed binary needed \(tries) tries before macOS would"
+          + " launch it -- waited rather than leaving a crash report behind\n", stderr)
+      Metrics.count("update_relaunch_waited")
+      Metrics.fact("update_relaunch_tries", String(tries))
+    }
     if CommandLine.arguments.contains("--watch"), getppid() == 1 {
       fputs("update: restarting through launchd -- an execv'd resident cannot go"
           + " invisible and would leave a second Kin in the Dock\n", stderr)
+      // ── AND launchd HAS TO BE TOLD THE CODE CHANGED ────────────────────────
+      //
+      // Otherwise it relaunches a job pinned to the previous build's cdhash and
+      // macOS refuses that launch once -- see `Watch.reregister`, which has the
+      // reproduction. The helper boots this job out, which is what ends this
+      // process; the sleep below is only there so that the ordinary exit does
+      // not beat it to the punch and hand launchd the refused launch anyway.
+      if Watch.reregister() { Thread.sleep(forTimeInterval: 5) }
       exit(3)
     }
     var argv = restartArgv(path.path).map { strdup($0) }

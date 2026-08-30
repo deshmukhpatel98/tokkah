@@ -59,6 +59,72 @@ enum Watch {
 
   static var installed: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
 
+  /// ── launchd PINS THE JOB TO THE CODE IT BOOTSTRAPPED ─────────────────────
+  ///
+  /// Every self-update filed one crash report, and only one:
+  ///
+  ///     Parent: launchd   Coalition: com.tokkah.tk.watch
+  ///     EXC_CRASH (SIGKILL (Code Signature Invalid))
+  ///     Termination: CODESIGNING, Launch Constraint Violation
+  ///
+  /// 67 ms in, before anything but dyld, and then KeepAlive tried again and the
+  /// second one worked. Four releases lived with it, because "recovers on its
+  /// own" and "nobody has looked" draw the same graph.
+  ///
+  /// REPRODUCED on this Mac, and it took three attempts to find the ingredient:
+  ///   * kill the resident, no swap                       -> relaunches cleanly
+  ///   * swap in a BYTE-IDENTICAL copy, then kill         -> relaunches cleanly
+  ///   * swap in a validly signed copy with a DIFFERENT
+  ///     cdhash, then kill                                -> REFUSED, once
+  ///
+  /// So it is not the swap and not a race: launchd holds the job to the code
+  /// identity it was bootstrapped with, and the first launch of a different one
+  /// at that path is refused. The designated requirement is unchanged and
+  /// correct -- `identifier "com.tokkah.tk" and certificate root = H"..."` -- the
+  /// cdhash is what moved, and every release moves it.
+  ///
+  /// The answer is to tell launchd, rather than to let it find out. Ordering is
+  /// the whole risk: this process IS the job, so a bootout kills us before we
+  /// could bootstrap, and a bootout that is never followed by one leaves this Mac
+  /// unable to answer a call until the next login -- the one failure this project
+  /// treats as unacceptable. So the work is handed to a detached `sh` that
+  /// outlives us, it re-writes the plist first (so a bootstrap cannot fail for
+  /// want of one), and it retries.
+  @discardableResult
+  static func reregister() -> Bool {
+    guard installed else { return false }
+    let uid = getuid()
+    let l = label
+    let plist = plistURL.path
+    // `bootout` alone is never the last thing this can do: every path through the
+    // script ends in a bootstrap attempt, and the loop tries again if the job is
+    // not there afterwards.
+    let script = """
+    /bin/launchctl bootout gui/\(uid)/\(l) 2>/dev/null
+    for i in 1 2 3 4 5; do
+      sleep 1
+      /bin/launchctl bootstrap gui/\(uid) '\(plist)' 2>/dev/null
+      if /bin/launchctl print gui/\(uid)/\(l) >/dev/null 2>&1; then exit 0; fi
+    done
+    # Last resort: kickstart whatever is there, so a Mac is never left with no job.
+    /bin/launchctl kickstart -k gui/\(uid)/\(l) 2>/dev/null
+    """
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", script]
+    // Detached: the whole point is that it runs after this process is gone.
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch {
+      fputs("watch: could not re-register the login item: \(error)\n", stderr)
+      return false
+    }
+    fputs("watch: re-registering the login item so launchd takes the new build's"
+        + " code identity -- without this the first relaunch after an update is"
+        + " refused and files a crash report\n", stderr)
+    return true
+  }
+
   /// ── A FILE ON DISK IS NOT A RUNNING AGENT ──────────────────────────────────
   ///
   /// The startup check used to be `installed || stale` -- does the plist exist,
