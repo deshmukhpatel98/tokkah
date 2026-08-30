@@ -433,9 +433,13 @@ with tools/verify-release.py." 2>/dev/null; then
       # that succeeds at shipping and then exits non-zero teaches the operator
       # to ignore its exit code.
       if command -v gh >/dev/null 2>&1; then
+        # `^## ` and not `^#+ `: a section's own `### Fixed` subheadings are
+        # headings too, so the looser pattern exited on the first line of the
+        # body and lifted NOTHING -- falling back to the one-line summary while
+        # looking like it worked.
         NOTES="$(awk -v v="$VER" '''
           $0 ~ "^#+ .*Kin " v "([^0-9.]|$)" {on=1; next}
-          on && /^#+ / {exit}
+          on && /^## / {exit}
           on {print}
         ''' "$REPO/CHANGELOG.md" 2>/dev/null | sed '''/^$/d''' | head -40)"
         [ -n "$NOTES" ] || NOTES="$NOTES_TEXT"

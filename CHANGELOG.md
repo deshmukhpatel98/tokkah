@@ -5,6 +5,20 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.89.0 — 2026-08-31
+
+### Changed — the repository catches up with the app
+
+Seventy-six tags, no releases page, and a changelog that ended fifteen releases
+before anything anybody is running. `release.sh` publishes the GitHub release
+now, not only the tag, with notes lifted from this file's section for that
+version so there is one place the story of a release is written. It can never
+fail a release: by the time it runs the release has shipped and been verified.
+
+The secret scanner also learned about `AGENT_KEY`, the operator read credential
+added in 0.83.0 — a scanner is only evidence for the patterns it carries, so it
+is in the calibration fixtures too, planted and required to be found.
+
 ## Kin 0.88.0 — 2026-08-31
 
 ### Fixed — macOS killed the background watcher once after every update
