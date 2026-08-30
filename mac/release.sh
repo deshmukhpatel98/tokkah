@@ -18,6 +18,19 @@ NOTES="${2:-}"
 REPO="$(cd .. && pwd)"
 [ -f "$HOME/.config/tokkah/cf.env" ] && . "$HOME/.config/tokkah/cf.env"
 
+# ── THE ONE FILE A WORKTREE NEVER HAS ───────────────────────────────────────
+#
+# wrangler.prod.jsonc is gitignored, so it exists in the main checkout and in NO
+# worktree -- and a release cut from a worktree therefore uploaded the tarball,
+# wrote the manifest, bumped three pages, and then died at the deploy with an
+# ENOENT from wrangler. Said here, before any of that work, with the fix.
+if [ ! -f "$REPO/tape-app/wrangler.prod.jsonc" ]; then
+  echo "FAILED: no tape-app/wrangler.prod.jsonc -- it is gitignored, so this is"
+  echo "  almost certainly a worktree. Copy it from the main checkout:"
+  echo "    cp <main-checkout>/tape-app/wrangler.prod.jsonc $REPO/tape-app/"
+  exit 1
+fi
+
 # The version in the source is the authority; a manifest that advertises a
 # version the binary does not report would make every client update forever.
 SRCVER=$(grep -o 'let VERSION = "[^"]*"' Sources/tk/main.swift | sed 's/.*"\(.*\)"/\1/')
