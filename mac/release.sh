@@ -14,7 +14,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 VER="${1:?usage: release.sh <version> [notes]}"
-NOTES="${2:-}"
+NOTES_TEXT="${2:-}"
+NOTES="$NOTES_TEXT"
 REPO="$(cd .. && pwd)"
 [ -f "$HOME/.config/tokkah/cf.env" ] && . "$HOME/.config/tokkah/cf.env"
 
@@ -418,6 +419,39 @@ with tools/verify-release.py." 2>/dev/null; then
     echo "  tagged v$VER"
     if git push origin "v$VER" >/dev/null 2>&1; then
       echo "  pushed tag v$VER"
+      # ── AND A TAG IS NOT A RELEASE ──────────────────────────────────────────
+      #
+      # Seventy-six tags and ZERO published releases: the repository is public,
+      # AGPL, and had nothing on its releases page, so the only way to get the
+      # app was a curl command in the README. A tag is a pointer for people who
+      # already have the repository; a release is the page everybody else lands
+      # on. Nothing was skipped -- as with the tagging above, there was no step.
+      #
+      # Notes come from the CHANGELOG section for this version, so there is ONE
+      # place the story of a release is written. Never fails the release: it has
+      # already shipped and been verified by the time this runs, and a script
+      # that succeeds at shipping and then exits non-zero teaches the operator
+      # to ignore its exit code.
+      if command -v gh >/dev/null 2>&1; then
+        NOTES="$(awk -v v="$VER" '''
+          $0 ~ "^#+ .*Kin " v "([^0-9.]|$)" {on=1; next}
+          on && /^#+ / {exit}
+          on {print}
+        ''' "$REPO/CHANGELOG.md" 2>/dev/null | sed '''/^$/d''' | head -40)"
+        [ -n "$NOTES" ] || NOTES="$NOTES_TEXT"
+        if gh release create "v$VER" --repo "$(git config --get remote.origin.url               | sed -E '''s#.*github.com[:/]##; s#\.git$##''')"               --title "Kin $VER"               --notes "$NOTES
+
+Install: \`curl -fsSL https://room.tokkah.com/macos/install.sh | sh\`
+Or download [Kin-$VER.dmg](https://room.tokkah.com/macos/dl/Kin-$VER.dmg).
+
+Kin keeps itself up to date after that. The shipped binary can be checked
+against its signature with \`tools/verify-release.py\`." >/dev/null 2>&1; then
+          echo "  published the GitHub release for v$VER"
+        else
+          echo "  NOTE: no GitHub release published (gh auth? already exists?)."
+          echo "        By hand: gh release create v$VER"
+        fi
+      fi
     else
       echo "  NOTE: could not push v$VER (wrong account? try: gh auth switch)."
       echo "        The tag exists locally: git push origin v$VER"

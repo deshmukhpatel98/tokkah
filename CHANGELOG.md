@@ -5,6 +5,193 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.88.0 — 2026-08-31
+
+### Fixed — macOS killed the background watcher once after every update
+
+Every self-update filed exactly one crash report: `EXC_CRASH (SIGKILL (Code
+Signature Invalid))`, `Termination: CODESIGNING, Launch Constraint Violation`,
+67 ms after launch, parent `launchd`. KeepAlive retried and the second attempt
+worked, so the Mac always ended up current — which is why it survived four
+releases. "Recovers on its own" and "nobody has looked" draw the same graph.
+
+Reproduced on a real machine, and the first two theories were both wrong:
+
+| what was done | result |
+| --- | --- |
+| kill the watcher, no swap | relaunches cleanly |
+| swap in a **byte-identical** copy, then kill | relaunches cleanly |
+| swap in a validly signed copy with a **different cdhash**, then kill | **refused, once** |
+
+So it is neither a race nor the swap. launchd holds a job to the code identity
+it was *bootstrapped* with, and the first launch of a different one at that path
+is refused. The designated requirement never changes — `identifier
+"com.tokkah.tk" and certificate root = H"…"` — but the cdhash moves every
+release, and that is what is pinned.
+
+`Watch.reregister()` now tells launchd rather than letting it find out. The
+ordering is the whole risk: the updating process *is* the job, so a bootout
+kills it before it could bootstrap, and a bootout never followed by one leaves a
+Mac unable to answer a call until the next login. The work is handed to a
+detached `sh` that outlives it; every path through that script ends in a
+bootstrap attempt, verified with `launchctl print`, retried five times, with
+`kickstart -k` as a last resort so no Mac is left with no job at all.
+
+## Kin 0.86.0 — 2026-08-31
+
+### Changed — Kin checks for a new version when you open it, restart, or start a call
+
+A cadence is a guess about when somebody will next care. The moments they
+actually care about are knowable, and they are also the moments a stale build
+shows, because the far end of the call is running a different one.
+
+- **on open** — at once, rather than ten seconds later
+- **on restart** — the watcher's first check was 60 s ("no hurry at login"),
+  true at login and wrong every other time it starts: after an update, after a
+  crash, whenever the binary moves underneath it. Two seconds now
+- **on a call** — when the far end actually arrives. Not a licence to restart:
+  anything found is held until the call ends and said on screen
+
+The ten-second launch grace was never about the network. It existed because a
+call is not "live" during setup, so an update found immediately would restart
+the app while somebody was still reading their invite link. That wait moved onto
+the *install*, which is what it was always protecting.
+
+**And one thing this broke, caught by the rig.** "Urgent" meant two things, and
+the second is about a person: the Check for Updates menu item is owed an answer
+whatever happens, including "could not reach the server". Reading "a person
+asked" off that flag was true while the menu was the only thing setting it — and
+the moment opening the app checked too, every launch on a flaky network put
+"couldn't check for updates" on somebody's status line.
+
+## Kin 0.85.0 — 2026-08-31
+
+### Fixed — hanging up ended the call *and* closed Kin
+
+`leaveCall` was `exit(0)`, from when a call and a process were the same thing.
+Closing the window had already stopped meaning "hang up"; this was the other
+half of that correction, left behind. What stays on screen afterwards is the
+screen Kin opens with — a fresh room, waiting, with its link — because that is
+this app's idle state; a double-click starts a call.
+
+### Changed — Macs pick up a new version in five minutes, not thirty
+
+The update poll was 1800 s. The second Mac in the house sat on 0.82.0 while the
+first ran 0.84.0, reported as "the update mechanism is not working". It was
+working, half an hour behind — and half an hour behind is indistinguishable from
+broken to the person waiting, especially when two Macs on one call disagree
+about what the app does. Note that the poller doing the work is the version
+already installed, so a cadence change takes effect one release later.
+
+## Kin 0.84.0 — 2026-08-30
+
+### Fixed — a microphone five times too loud, which was causing the echo *and* the cut-off voices
+
+Reported as two problems — an echo across different rooms, and one person's
+continuous speech being chopped up. One fault. From the call's own telemetry,
+both ends:
+
+| | mic peak | clipping | RMS | echo peak | mic open | gate flaps |
+| --- | --- | --- | --- | --- | --- | --- |
+| one end | **5.24** | 1.6% | 0.263 | 0.71 | 98% | 56 |
+| other end | 0.85 | 0% | 0.031 | 0.52 | 90% | **409** |
+
+Full scale is 1.0. `tuneInputGain` saw peaks of 1.40 and 1.03, walked the device
+from 27% to 15%, and stopped: 15% was the floor written into it. It moved twice
+in two minutes and never said it had given up.
+
+A microphone that hot hears its own speaker — the loop is inside one laptop,
+speaker about 15 cm from microphone, so being in different rooms does not help —
+and it holds the local voice gate open, so the near mic is live while the far
+person is talking, and their end chops its way through hundreds of gate flaps
+trying to take a turn against it.
+
+- the back-off is proportional to the overshoot now, not a fixed step
+- a software trim at capture, which no hardware floor can block, decided
+  *before* every device guard — it used to sit below them, so a microphone with
+  no settable volume, the case that needs it most, could never reach it
+- samples above 1.0 are not clipped: the float path carries them intact, so
+  dividing recovers the signal exactly, with no limiter and no colour
+- it comes back up when the room quietens, or one shout would be permanent
+
+### Added — the floor's own numbers, and echo as a peak
+
+`floor: yours N%` is named for the floor and does not measure it: it counts the
+local voice gate. `one-at-a-time:` now prints on every call what share of it the
+floor actually muted the microphone, and what share it had fallen back to the
+local gate. Echo is recorded as a **peak** — the final beat of a call that
+reached 0.71 read 0.04, so every summary built on the last value said "no echo"
+about a call with a measured one.
+
+## Kin 0.83.0 — 2026-08-30
+
+### Added — every call keeps a copy of its own numbers on the Mac
+
+The beats existed in exactly one place: a server behind a key that lives in a
+browser cookie on one machine. So a real complaint about a real call was
+investigated out of a stderr log, because the telemetry built to answer exactly
+that question could not be opened. Every beat is now appended to
+`~/Library/Logs/Kin/beats.ndjson` *before* it is posted — a beat that fails to
+send is exactly the one worth having — and `mac/tools/telemetry.sh` reads either
+the local copy or the server.
+
+## Kin 0.82.0 — 2026-08-30
+
+### Fixed — two Kin icons in the Dock, and clicking Kin opening another copy
+
+Three faults, one after another, all in how a Dock click is answered.
+
+**`pid -1` is a live Kin, not a dead one.** Kin re-launches itself a quarter of a
+second after opening (`execv`), which keeps the window but makes macOS lose track
+of the process: its record reads `pid -1` for the rest of the call. Reading that
+as "still running" meant clicks did nothing; reading it as "gone" meant a new
+copy on every click. Neither reading is right, so the question is answered from
+the process table now, filtered by argv — the watcher and the ring watcher are
+the same binary, and bringing forward a process with no window is a click that
+does nothing. To raise it, the app is asked to raise *itself* (SIGWINCH, whose
+default action is to do nothing, so a copy older than the handler ignores it;
+SIGUSR1 would have hung up on a live call).
+
+**The second icon was the watcher.** It is meant to be invisible, and two things
+undid that silently: after an `execv` the call that hides it fails, and answering
+a reopen promotes the process. It is re-asserted every tick now — a state that
+repairs itself needs no list of everything that might break it.
+
+Three traps found on the way, all worth reusing: `kill(-1, 0)` returns 0 because
+it asks about *every* process the user can signal; `URL.resolvingSymlinksInPath`
+left `/tmp/…` where the kernel reports `/private/tmp/…`, so the scan matched
+nothing; and the raise handler was first installed at the foot of a file that a
+call with a window never reaches — it compiled, read as finished, and ran zero
+times.
+
+## Kin 0.76.0 — 2026-08-30
+
+### Changed — 12% less CPU for the same call, and a way to see the cost at all
+
+## Kin 0.75.2 — 2026-08-30
+
+### Fixed — a Dock click opened *another* Kin
+
+The watcher registers as `com.tokkah.tk`, so every Dock click, Finder
+double-click and Spotlight hit resolves to it and arrives as a reopen. Its answer
+was an unconditional new instance, so ten clicks were ten copies of the app, each
+with its own window, camera and microphone. Nothing asked whether Kin was already
+open. (Answered incompletely here; finished in 0.82.0 above.)
+
+## Kin 0.75.1 — 2026-08-30
+
+### Fixed — the camera aborted the app when a call was answered
+
+## Kin 0.75.0 — 2026-08-30
+
+### Changed — green is speaking, blue is listening
+
+Also: the Mac mini's camera was choosing 10 fps.
+
+## Kin 0.74.0 — 2026-08-30
+
+### Added — the floor, wired: a mute for a microphone nobody is talking into
+
 ## Kin 0.73.0 — 2026-08-26
 
 ### Fixed — two instruments that reported the opposite of the truth
