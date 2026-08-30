@@ -775,7 +775,45 @@ enum Resident {
     /// `-n`, and it is the whole point: without it LaunchServices resolves the
     /// bundle to this very process and the launch turns back into the reopen we
     /// are answering, forever.
+    /// ── A REOPEN IS NOT ALWAYS A LAUNCH ───────────────────────────────────────
+    ///
+    /// Reported as "a lot of apps are opening... every time I single click on the
+    /// app, it opens a new app."
+    ///
+    /// Both halves above are correct and together they made this: the resident
+    /// registers as com.tokkah.tk, so EVERY Dock click, Finder double-click and
+    /// Spotlight hit resolves here and arrives as a reopen; and `-n` is genuinely
+    /// required, because without it LaunchServices resolves the bundle straight
+    /// back to this process and the launch becomes the reopen we are answering.
+    ///
+    /// What was missing is the question in between. Nothing asked whether Kin was
+    /// ALREADY OPEN. `-n` means "new instance" unconditionally, so ten clicks are
+    /// ten copies of the app, each with its own window, camera and microphone.
+    ///
+    /// A reopen with no URL means "show me Kin", and the honest answer to that,
+    /// when Kin is already showing, is to bring it forward. Only a reopen that
+    /// finds nothing running is a launch.
+    private func existing() -> NSRunningApplication? {
+      guard let id = Bundle.main.bundleIdentifier else { return nil }
+      // Excluded by pid, not by name: the resident is itself a running instance
+      // of this bundle -- that registration is the whole reason we are here --
+      // and it must never count as the app being open.
+      let me = ProcessInfo.processInfo.processIdentifier
+      return NSRunningApplication.runningApplications(withBundleIdentifier: id)
+        .first { $0.processIdentifier != me && !$0.isTerminated }
+    }
+
     private func launch(url: URL? = nil) {
+      // Only the plain "show me Kin" reopen is answered this way. A ring carries a
+      // URL and there is no channel to hand one to a process already running, so
+      // that path still starts a copy -- narrowing this to the case actually
+      // reported rather than guessing at the other one.
+      if url == nil, let open = existing() {
+        open.activate(options: [.activateAllWindows])
+        fputs("watch: Kin is already open (pid \(open.processIdentifier))"
+            + " -- brought it forward instead of starting another\n", stderr)
+        return
+      }
       let p = Process()
       p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
       var args = ["-n", "-a", Bundle.main.bundleURL.path,
