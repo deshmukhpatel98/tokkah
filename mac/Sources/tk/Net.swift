@@ -939,6 +939,14 @@ final class Wire {
   /// waiting on it needs a deadline as well.
   private(set) var peerStatusSeen = false
   var peerVocal: Bool { peerStatus & (Wire.ST_BACKCHAN | Wire.ST_CLAIM) != 0 }
+  /// The same byte as the turn layer's tri-state. A bid outranks a listening
+  /// noise if a build ever sets both, because mistaking a bid for a continuer
+  /// costs somebody their turn and the other way round costs a cue.
+  var peerVoice: Floor.Voice {
+    if peerStatus & Wire.ST_CLAIM != 0 { return .claim }
+    if peerStatus & Wire.ST_BACKCHAN != 0 { return .backchannel }
+    return .quiet
+  }
   /// 0 quiet, 1 listening noise, 2 bid for the floor. Fires only when it changes.
   var onPeerVocal: ((Int) -> Void)?
   private var lastVocalSent = -1
@@ -1530,6 +1538,16 @@ final class Wire {
           // them apart before it decides a call has been answered.
           peerStatusSeen = true
           Audio.peerVocalNow = peerVocal
+          // ── AND THE TURN LAYER HEARS IT HERE ──────────────────────────────
+          //
+          // On the receive thread, the instant the byte lands, rather than
+          // waiting for the next capture block to poll it. The cue's whole
+          // promise is that it arrives one hop after somebody opens their
+          // mouth, and `transitMs` is what stops that hop being counted as
+          // zero -- an age measured from arrival says news that crossed the
+          // planet is brand new, which was a hidden distance limit.
+          Audio.peerVoiceNow = peerVoice
+          Audio.sharedFloor.noteFar(peerVoice, transitMs: Audio.owdMsNow)
           // ── THE FAST HALF OF THE TURN LAYER ─────────────────────────────────
           //
           // Fired on CHANGE, from the receive thread, rather than polled by the
@@ -1564,7 +1582,14 @@ final class Wire {
           // One-way is not observable. Round trip of THIS packet on THIS address
           // is, and that is how we pick the path.
           let rtt = Clock.msSigned(t4, t1) - Clock.msSigned(t3, t2)
-          if rtt > 0, rtt < 5000 { notePath(src, rttMs: rtt) }
+          if rtt > 0, rtt < 5000 {
+            notePath(src, rttMs: rtt)
+            // Half a round trip is the age of every cue the moment it lands.
+            // Smoothed, because a single probe's RTT carries one queue's worth
+            // of noise and the turn layer wants the PATH, not this packet.
+            Audio.owdMsNow = Audio.owdMsNow == 0 ? rtt / 2
+                                                 : Audio.owdMsNow * 0.9 + rtt / 2 * 0.1
+          }
         }
         continue
       }

@@ -909,6 +909,16 @@ final class Audio {
     var peerYielded = 0            // the far end went quiet and this end kept going
     var ambiguousYields = 0        // too close to call from one side
     var gateFlaps = 0              // open/close inside 300 ms: choppy, and audible
+    // ── THE TURN LAYER, WITH A DENOMINATOR ────────────────────────────────────
+    //
+    // `floorBlocks` exists so the other two mean something. A bare count of held
+    // blocks is decoration -- `counted-without-a-denominator` -- and the number
+    // anybody actually wants is the FRACTION of a call during which this end was
+    // not allowed to speak, plus the fraction during which the turn layer had
+    // stopped believing the far end and fallen back to the local gate.
+    var floorBlocks = 0            // capture blocks the floor decided at all
+    var floorHeldBlocks = 0        // ... in which this end could not transmit
+    var floorFallbackBlocks = 0    // ... in which it was running on the local gate
     /// Deadlocks this end gave up. Published rather than shown: the far end
     /// publishes the same number for its own side, and the two together say
     /// whether the rule is splitting them evenly or picking on somebody.
@@ -930,7 +940,7 @@ final class Audio {
 
   /// Called once per capture block, which is the only place that sees this end's
   /// state and the far end's in the same instant.
-  func accountTurn(peerVocal: Bool, audible: Bool) {
+  func accountTurn(peerVocal: Bool, audible: Bool, blockN: Int) {
     let now = Clock.now()
     let mine = dgate.vocal
 
@@ -1032,6 +1042,32 @@ final class Audio {
       if wantYield { turns.yields += 1 }
     }
 
+    // ── AND THE FLOOR ────────────────────────────────────────────────────────
+    //
+    // Stepped here because this is already the one place that sees both ends at
+    // the same instant, and because the tiebreak it needs is a decision this
+    // function has ALREADY made. `Yield.shouldYield` runs on mirrored ledgers
+    // that `--ledger-test` asserts sum to zero, so the two ends never both
+    // yield -- which is exactly the property the floor's deadlock break
+    // requires. Reusing it means there is one answer to "who gives" in this
+    // product rather than two that can disagree.
+    let fl = Audio.sharedFloor
+    fl.yieldsOnTie = wantYield
+    fl.speakers = Audio.outputIsSpeakers
+    fl.noteEndProb(Audio.turnEndProb)
+    let d = fl.step(dt: Double(blockN) / SR,
+                    near: Floor.Voice(rawValue: mine.rawValue) ?? .quiet)
+    // Applied to the NEXT block, one block late by construction -- 0.67 ms on
+    // this machine. The alternative is stepping the floor before the classifier
+    // that feeds it, which would be a block stale in the other direction and
+    // stale about this end rather than the far one.
+    dgate.floorMuted = Audio.floorOn && !d.mayTransmit && !d.duckOnly
+    dgate.floorDucked = Audio.floorOn && d.duckOnly
+    Audio.earOpen = !Audio.floorOn || d.playoutOpen
+    if d.fallback { turns.floorFallbackBlocks += 1 }
+    turns.floorHeldBlocks += d.mayTransmit ? 0 : 1
+    turns.floorBlocks += 1
+
     // Choppiness. A gate that opens and shuts inside a third of a second is
     // audible as chopping, and no amount of good intent excuses it.
     if audible != wasOpen {
@@ -1080,6 +1116,11 @@ final class Audio {
     let firstLook = outputName.isEmpty
     outputName = name
     onSpeakers = speakers
+    // The turn layer needs the route too, and needs it as a fact rather than a
+    // decision: `Audio.gate.on` is what the ECHO gate concluded, and reading a
+    // conclusion as a fact is what once put the whole turn-taking layer behind a
+    // pair of headphones (`one-condition-two-concerns`).
+    Audio.outputIsSpeakers = speakers
     if Audio.gateAuto {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
@@ -2240,6 +2281,12 @@ final class Audio {
   /// a peer sends anything, `onRender` zero-fills and returns early, so a healthy
   /// output unit ticks this and leaves `renderTicks` at zero -- see the watchdog.
   var renderCallbacks = 0
+  /// Where the ear's ramp has reached. Lives on the render side because that is
+  /// the thread that owns `out`, and it is per SAMPLE for the same reason the
+  /// gate's close step is: a coefficient written per block encodes the device
+  /// buffer, and this project has already shipped a classifier that could never
+  /// fire because of exactly that.
+  private var earGain: Float = 1
   // ── PRESENCE: how far away the person sounds ─────────────────────────────
   //
   // Direction cannot be delivered on a laptop speaker. It lives entirely in the
@@ -2463,6 +2510,12 @@ final class Audio {
     var yieldDb: Double = -9
     var yieldAfterMs: Double = 450
     var yieldOn = true
+    /// How far down a microphone goes when its owner is talking out of turn.
+    /// Deeper than the 9 dB collision duck, because this is not "you both
+    /// started together" -- it is "somebody else has the floor" -- and the
+    /// listener should plainly hear one voice. Still a duck: carrying on works,
+    /// and nothing is unrecoverable.
+    var floorDuckDb: Double = -20
   }
   /// Standalone, like the presence filter, so the claim that a talking near end
   /// passes through untouched can be checked without opening a device.
@@ -2518,6 +2571,31 @@ final class Audio {
     /// sees this end's state and the far end's at the same instant. The gate does
     /// not decide this -- it applies it.
     var yielding = false
+    /// ── THE TURN LAYER'S VERDICT, APPLIED HERE ────────────────────────────────
+    ///
+    /// Set once per block from `Floor`, which is the only thing that sees both
+    /// ends at once. It is a THIRD factor and not folded into `want`, for the
+    /// same reason the duck is not: the gate is an echo judgement made every
+    /// block from this room's acoustics, and this is a turn judgement made from
+    /// what the other person is doing. They move for different reasons.
+    ///
+    /// It rides the gate's own ramp rather than carrying its own. A second copy
+    /// of the 4 ms close would be `second-copy-of-a-rule`, and the copy that
+    /// drifts is always the one you end up verifying with.
+    var floorMuted = false
+    /// Talking, but not this end's turn. A duck, never a cut -- see `duckOnly`
+    /// in Floor.swift for the 35% regression that made the distinction.
+    var floorDucked = false
+    private var floorGain: Float = 1
+    /// Where the floor's mute has actually reached, for a test that wants the
+    /// bound rather than the intent.
+    var floorGainNow: Float { floorGain }
+    /// Everything this class is currently doing to the microphone, as one
+    /// number. A rig that infers this from the OUTPUT LEVEL cannot tell a duck
+    /// from a silence -- it reads a quiet syllable at -20 dB as a lost one --
+    /// and that is exactly the false positive that made the first honest
+    /// measurement of this feature unreadable.
+    var appliedGainNow: Float { gain * yieldGain * floorGain }
     private var yieldGain: Float = 1
     private(set) var yieldSamples = 0
     /// Where the duck has actually got to, so a test can assert the bound rather
@@ -2766,11 +2844,18 @@ final class Audio {
       // `--no-yield` alone.
       let yWant: Float = (cfg.yieldOn && yielding) ? Float(pow(10, cfg.yieldDb / 20)) : 1
       let yStep: Float = yWant > yieldGain ? 0.00042 : 0.00026
+      // The floor's own target, on the gate's ramp. A full mute, because "one
+      // microphone at a time" is not a duck -- but it reaches zero on the same
+      // timed linear close, because an exponential cannot deliver a mute and
+      // that cost this project fourteen decibels once already.
+      let fWant: Float = floorMuted ? 0 : (floorDucked ? Float(pow(10, cfg.floorDuckDb / 20)) : 1)
       for k in 0..<n {
         if want < gain { gain = max(want, gain - closeStep) }
         else { gain += (want - gain) * openStep }
+        if fWant < floorGain { floorGain = max(fWant, floorGain - closeStep) }
+        else { floorGain += (fWant - floorGain) * openStep }
         yieldGain += (yWant - yieldGain) * yStep
-        x[k] *= gain * yieldGain
+        x[k] *= gain * yieldGain * floorGain
       }
       if yWant < 1 { yieldSamples += n }
       if want < 1 { closedFrames += n } else { openFrames += n }
@@ -2800,6 +2885,33 @@ final class Audio {
   }
   static var gate = Gate() { didSet { sharedGate.cfg = gate } }
   nonisolated(unsafe) static let sharedGate = DuplexGate()
+  /// Whose turn it is. Stepped once per capture block from `accountTurn`, which
+  /// is the only place that sees this end's state and the far end's in the same
+  /// instant. See `Floor.swift` and `mac/FLOOR.md`.
+  nonisolated(unsafe) static let sharedFloor = Floor()
+  /// What the far end's status byte last said about its voice, as the turn
+  /// layer's tri-state. Written by the receive thread, read by the capture
+  /// thread; a scalar, so it crosses safely.
+  nonisolated(unsafe) static var peerVoiceNow = Floor.Voice.quiet
+  /// Half the measured round trip, in ms. The age of any cue the moment it
+  /// lands -- see `noteFar(transitMs:)`, which exists because assuming this was
+  /// zero was a hidden distance limit.
+  nonisolated(unsafe) static var owdMsNow: Double = 0
+  /// The route, as a fact and not as the echo gate's conclusion about it.
+  nonisolated(unsafe) static var outputIsSpeakers = true
+  /// Whether the turn layer is in force. `--no-floor` is the control arm.
+  nonisolated(unsafe) static var floorOn = true
+  /// Whether the far end reaches this ear. Written by the capture thread, read
+  /// by the render callback; a Bool, so it crosses safely, and the render side
+  /// ramps rather than stepping.
+  nonisolated(unsafe) static var earOpen = true
+  /// `Predict.probability` that this end's turn is ending, 0-1. Written by the
+  /// subtitle thread. Zero until the predictor is fed, and zero is the value
+  /// that changes nothing.
+  nonisolated(unsafe) static var turnEndProb: Double = 0
+  /// The ear's close, per sample, from the same 4 ms the microphone side uses.
+  /// Derived from `Gate.closeMs` rather than typed, so the two cannot drift.
+  static let EAR_STEP = Float(1.0 / (SR * 4.0 / 1000.0))
   private let dgate = Audio.sharedGate
   var gateClosedFrames: Int { dgate.closedFrames }
   var gateOpenFrames: Int { dgate.openFrames }
@@ -3533,7 +3645,7 @@ final class Audio {
     // as it was captured, or turned down whole -- never filtered, never guessed
     // at. Whose turn it is is the only thing between the room and the far end.
     duplexGate(inScratch, Int(n))
-    accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5)
+    accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5, blockN: Int(n))
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.
@@ -3868,7 +3980,15 @@ final class Audio {
         // exact shape (`held-is-a-one-way-door`,
         // `control-loops-steer-on-flattering-signals`), and both were a recovery
         // gate reading a signal its own action had switched off.
-        out[i] = (mute || roomSpeakerOff) ? 0 : played
+        // THE EAR. `Floor` decides it; this ramps it, because a step to zero
+        // on a live speaker is a click. Down on the same 4 ms linear close the
+        // microphone side uses -- an exponential cannot deliver a mute -- and
+        // back up fast, because the direction that restores hearing is never
+        // allowed to be the slow one.
+        let eWant: Float = Audio.earOpen ? 1 : 0
+        if eWant < earGain { earGain = max(eWant, earGain - Audio.EAR_STEP) }
+        else { earGain += (eWant - earGain) * 0.02 }
+        out[i] = (mute || roomSpeakerOff) ? 0 : played * earGain
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
@@ -3958,7 +4078,15 @@ final class Audio {
         // The concealment path silences too, or a room that has been detected
         // still leaks every invented sample out of the speaker. Same placement,
         // same reason: `echoHist` below is written either way.
-        out[i] = (mute || roomSpeakerOff) ? 0 : played
+        // THE EAR. `Floor` decides it; this ramps it, because a step to zero
+        // on a live speaker is a click. Down on the same 4 ms linear close the
+        // microphone side uses -- an exponential cannot deliver a mute -- and
+        // back up fast, because the direction that restores hearing is never
+        // allowed to be the slow one.
+        let eWant: Float = Audio.earOpen ? 1 : 0
+        if eWant < earGain { earGain = max(eWant, earGain - Audio.EAR_STEP) }
+        else { earGain += (eWant - earGain) * 0.02 }
+        out[i] = (mute || roomSpeakerOff) ? 0 : played * earGain
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }

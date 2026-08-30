@@ -115,9 +115,10 @@ final class Floor {
   /// fallback.
   private(set) var farAgeMs: Double = 1e9
   private var farVoice = Voice.quiet
-  /// How long the far end says IT has been quiet, on its own clock, as of the
-  /// cue that carried it.
+  /// How long the far end has been quiet, on ITS clock: seeded to one transit
+  /// when the first quiet cue lands, then counted here.
   private var farQuietMs: Double = 0
+  private var farTransitMs: Double = 0
   /// How long the far end has been claiming, by its own report.
   private var farClaimMs: Double = 0
   private var nearClaimMs: Double = 0
@@ -153,6 +154,25 @@ final class Floor {
     /// applied to audio that was already recorded and a handover need not happen
     /// before the words it carries.
     var mayTransmit: Bool
+    /// ── WHAT "NOT YOUR TURN" DOES TO A MICROPHONE SOMEBODY IS TALKING INTO ────
+    ///
+    /// Not the same thing as to one they are not, and conflating the two was
+    /// measured as a 35% regression on real conversation before this existed.
+    ///
+    ///   - The far end is talking and this person is NOT: mute, all the way.
+    ///     Nothing is lost, because there is nothing there but the far end's own
+    ///     voice coming back off this speaker. THIS is the echo case, and it is
+    ///     the overwhelming majority of the time the floor is held elsewhere.
+    ///
+    ///   - This person IS talking and it is not their turn: DUCK. A mute here
+    ///     costs somebody a word, and until the retroactive buffer exists there
+    ///     is nothing to give it back with. Deep enough that the listener plainly
+    ///     hears one voice, shallow enough that carrying on works.
+    ///
+    /// The rule the app is for -- one voice at a time -- is delivered by the
+    /// first case, because the second one only happens during the half-second of
+    /// genuine overlap at a handover, which is what conversation sounds like.
+    var duckOnly: Bool
     /// Whether the far end's audio reaches this ear.
     var playoutOpen: Bool
     /// True when this end has stopped believing the far end and is running on
@@ -171,6 +191,7 @@ final class Floor {
 
     nearClaimMs = near == .claim ? nearClaimMs + ms : 0
     farClaimMs = farVoice == .claim ? farClaimMs + ms : 0
+    if farVoice == .quiet { farQuietMs += ms }
 
     // ── THE FALLBACK, FIRST, BECAUSE IT OUTRANKS EVERYTHING ─────────────────
     //
@@ -183,7 +204,8 @@ final class Floor {
       state = .idle
       wasState = .idle
       nearClaimMs = 0; farClaimMs = 0; holderQuietMs = 0
-      return Decision(mayTransmit: true, playoutOpen: true, fallback: true, state: .idle)
+      return Decision(mayTransmit: true, duckOnly: false, playoutOpen: true,
+                      fallback: true, state: .idle)
     }
 
     // ── THE HOLDER GOING QUIET RELEASES IT ───────────────────────────────────
@@ -208,7 +230,7 @@ final class Floor {
     // the age of the news. Distance cancels.
     let holderVoice: Voice = state == .mine ? near : (state == .theirs ? farVoice : .quiet)
     if state == .theirs {
-      holderQuietMs = farVoice == .quiet ? farQuietMs + farAgeMs : 0
+      holderQuietMs = farVoice == .quiet ? farQuietMs : 0
     } else {
       holderQuietMs = holderVoice == .quiet ? holderQuietMs + ms : 0
     }
@@ -273,6 +295,7 @@ final class Floor {
     let earClosed = state == .mine && speakers && playoutHold <= 0
 
     return Decision(mayTransmit: state != .theirs,
+                    duckOnly: state == .theirs && near != .quiet,
                     playoutOpen: !earClosed,
                     fallback: false, state: state)
   }
@@ -285,8 +308,21 @@ final class Floor {
   /// distance limit alive through the first fix: news that has crossed the
   /// planet is already 120 ms old when it lands, and an age measured from
   /// ARRIVAL says it is brand new. The same mistake in a second place.
-  func noteFar(_ v: Voice, quietMs: Double = 0, transitMs: Double = 0) {
-    farVoice = v; farQuietMs = quietMs; farAgeMs = transitMs
+  ///
+  /// ── AND THE FAR QUIET CLOCK IS DERIVED, NOT SENT ──────────────────────────
+  ///
+  /// The first version took the far end's own quiet duration as a parameter,
+  /// which would have meant a new field on the wire. It does not need one. The
+  /// moment their FIRST quiet cue lands, they have already been quiet for
+  /// exactly one transit -- that is what it means for the news to have travelled
+  /// -- and from there this end can simply count. Same distance-invariance, no
+  /// protocol change, and nothing to negotiate with an older build.
+  func noteFar(_ v: Voice, transitMs: Double = 0) {
+    if v == .quiet, farVoice != .quiet { farQuietMs = transitMs }
+    if v != .quiet { farQuietMs = 0 }
+    farVoice = v
+    farAgeMs = 0
+    farTransitMs = transitMs
   }
   /// `Predict.probability`, 0-1, that this end's current turn is ending.
   func noteEndProb(_ p: Double) { endProb = p }
@@ -305,10 +341,7 @@ extension Floor {
   /// One end's script: what its own classifier says, block by block.
   private struct Sim {
     var floor = Floor()
-    var pending: [(due: Double, v: Voice, quietMs: Double)] = []
-    /// This end's own quiet clock, which is what it publishes. The rig has to
-    /// model it or it cannot see the distance fix at all.
-    var quietMs: Double = 0
+    var pending: [(due: Double, v: Voice)] = []
     /// Every block where this end was producing a claim and was NOT allowed to
     /// transmit. This is the number that matters -- it is speech that a listener
     /// would have to be given back out of the retroactive buffer, and past the
@@ -350,15 +383,14 @@ extension Floor {
           let mine = i == 0 ? a : b
           var me = mine
           // Deliver anything whose hop has landed.
-          var still: [(due: Double, v: Voice, quietMs: Double)] = []
+          var still: [(due: Double, v: Voice)] = []
           for p in me.pending {
             if p.due <= t {
-              me.floor.noteFar(p.v, quietMs: p.quietMs, transitMs: owdMs)
+              me.floor.noteFar(p.v, transitMs: owdMs)
             } else { still.append(p) }
           }
           me.pending = still
           let v = voice(i, t)
-          me.quietMs = v == .quiet ? me.quietMs + dt * 1000 : 0
           let d = me.floor.step(dt: dt, near: v)
           if v == .claim && !d.mayTransmit {
             me.blockedMs += dt * 1000
@@ -372,7 +404,7 @@ extension Floor {
           // My cue crosses to the other end, one hop from now -- unless the
           // channel is cut.
           if t < cutAt {
-            let hop = (due: t + owdMs / 1000, v: v, quietMs: me.quietMs)
+            let hop = (due: t + owdMs / 1000, v: v)
             if i == 0 { b.pending.append(hop) } else { a.pending.append(hop) }
           }
         }

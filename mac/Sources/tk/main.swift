@@ -402,7 +402,8 @@ let KNOWN_FLAGS: Set<String> = [
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
-  "floor-test", "floor-owd",
+  "floor-test", "floor-owd", "no-floor", "floor-debug",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -434,7 +435,7 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
-                  "sameroom-test", "predict-test", "floor-test"]
+                  "sameroom-test", "predict-test", "floor-test", "turn-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -3730,6 +3731,11 @@ if flag("yield-test") {
 // exactly what it did before.
 func applyGateFlags() {
   if flag("no-gate") { Audio.gate.on = false; Audio.gateAuto = false; Audio.gate.yieldOn = false }
+  // The turn layer ships ON, with this as the control arm. `--no-gate` must NOT
+  // also switch it off: the echo gate and the turn layer answer two different
+  // questions, and one flag answering two of those is a bug this project has
+  // shipped four times (`one-condition-two-concerns`).
+  if flag("no-floor") { Audio.floorOn = false }
   if flag("no-yield") { Audio.gate.yieldOn = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
@@ -3950,6 +3956,13 @@ if flag("headphone-test") {
 // `--floor-owd` sweeps the one-way delay, because every bug this design can have
 // is two ends disagreeing about the present, and a rig with no delay cannot
 // produce one. Default 40 ms; try 100 for Delhi-NL.
+if flag("turn-test") {
+  let w = arg("turn-wav") ?? "testbed/media/real/realA.wav,testbed/media/real/realB.wav"
+  exit(TurnRig.selfTest(paths: w.split(separator: ",").map(String.init),
+                        owdMs: Double(arg("turn-owd") ?? "40") ?? 40,
+                        coupling: Float(Double(arg("turn-coupling") ?? "0.25") ?? 0.25)) ? 0 : 1)
+}
+
 if flag("floor-test") {
   let owd = Double(arg("floor-owd") ?? "40") ?? 40
   exit(Floor.selfTest(owdMs: owd) ? 0 : 1)
@@ -6027,6 +6040,22 @@ func reportLoop() {
       + "\n", stderr)
   if ProcessInfo.processInfo.environment["KIN_GATE_DEBUG"] != nil {
     fputs("  gate: \(Audio.sharedGate.innards)\n", stderr)
+  }
+  // ── THE TURN LAYER, WITH ITS DENOMINATOR ──────────────────────────────────
+  //
+  // Printed whenever it decided anything, and printed as FRACTIONS, because a
+  // bare count of held blocks says nothing without the number of blocks
+  // (`counted-without-a-denominator`). `fallback` is the important one: it is
+  // the share of the call during which this end had stopped believing the far
+  // end's cues and was running on the local gate alone, and an instrument that
+  // cannot see its own fallback reports the fallback as health.
+  if flag("floor-debug"), t.floorBlocks > 0 {
+    let n = Double(t.floorBlocks)
+    fputs(String(format: "  floor: %@  held %.1f%%  fallback %.1f%%  ear %@  owd %.0f ms\n",
+                 ["idle", "MINE", "theirs"][Audio.sharedFloor.state.rawValue],
+                 Double(t.floorHeldBlocks) / n * 100,
+                 Double(t.floorFallbackBlocks) / n * 100,
+                 Audio.earOpen ? "open" : "SHUT", Audio.owdMsNow), stderr)
   }
   if t.collisions > 0 || t.gateFlaps > 0 {
     let avg = t.collisions > 0 ? String(format: "%.0f ms", t.collisionMs / Double(t.collisions)) : "-"
