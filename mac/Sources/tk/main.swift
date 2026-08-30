@@ -224,7 +224,21 @@ if flag("watch") {
   // That half is already proven in the field; it just never had anything to
   // react to unless the person happened to open the app for long enough.
   if !flag("no-update") {
-    let every = max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_POLL"] ?? "") ?? 1800)
+    // ── HALF AN HOUR IS A LONG TIME TO BE ON THE WRONG BUILD ────────────────
+    //
+    // 1800 seconds. Measured against a real release: the second Mac in this
+    // house was still on 0.82.0 while this one ran 0.84.0, and the report was
+    // "the update mechanism is not working". It WAS working -- it was thirty
+    // minutes behind, and thirty minutes behind is indistinguishable from broken
+    // to the person waiting, especially when two Macs on one call disagree about
+    // what the app does.
+    //
+    // 300 s. The check is a conditional GET of a small JSON manifest against an
+    // edge cache: at this cadence it is roughly a megabyte a month, which is not
+    // a cost worth thirty minutes of skew. `held-for-call` still defers the
+    // INSTALL while somebody is talking, so a shorter poll cannot interrupt a
+    // call -- it only shortens the wait before a quiet moment is found.
+    let every = max(1, Double(ProcessInfo.processInfo.environment["TK_UPDATE_POLL"] ?? "") ?? 300)
     let first = max(0.5, Double(ProcessInfo.processInfo.environment["TK_UPDATE_GRACE"] ?? "") ?? 60)
     fputs("watch: checking for a newer Kin every \(Int(every)) seconds"
         + " -- this Mac stays current whether or not anybody opens the app\n", stderr)
@@ -399,7 +413,7 @@ let KNOWN_FLAGS: Set<String> = [
   "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
-  "no-relocate", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
+  "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
@@ -1241,6 +1255,32 @@ func postFinalBeat(why: String) -> Bool {
 // it has to leave before `exit(0)`, because after that there is no process to
 // send it. `execv-discards-unsent-analytics` is the same lesson with a different
 // payload: an ending has to finish its business while it still exists.
+/// ── HANGING UP ENDS THE CALL. IT DOES NOT CLOSE KIN. ──────────────────────
+///
+/// Reported in as many words: "the app gets closed when I disconnect the call,
+/// which should not be happening. Only the call should get disconnected."
+///
+/// It was `exit(0)`, from back when a call and a process were the same thing.
+/// Closing the window already stopped meaning "hang up" (`closeWindowKeepingCall`
+/// above); this is the other half of that same correction, and it was left
+/// behind: the button that ends a call was still ending the app.
+///
+/// What stays on screen afterwards is the screen Kin opens with -- a fresh room,
+/// waiting, with its link -- because that IS this app's idle state. There is no
+/// lobby to go back to: a double-click starts a call.
+///
+/// Done by re-exec rather than by tearing the call down in place. Every other
+/// change of room in this app goes through `Launcher.reexec` (a placed call, an
+/// answered ring, a followed link, a rejoin) and that path is proven; unwinding
+/// the sockets, the audio graph and the resume record in-process would be a
+/// second way to do it, and the second way is the one that is never tested.
+/// `--calling` and `--incoming` are already dropped on the way through, so the
+/// new image cannot re-ring anybody.
+///
+/// `--leave-exits` keeps the old behaviour for the rigs that measure a departure
+/// by watching a process end, and a plain CLI run keeps it too: `tk --room x`
+/// from a terminal is not somebody's app, and re-arming it into a fresh room
+/// would leave a stray call running after a test.
 func leaveCall() -> Never {
   shuttingDown = true
   // Guarded the same way `hangUpAndExit` is, and for the same reason: leaving
@@ -1250,6 +1290,13 @@ func leaveCall() -> Never {
   if Resume.holding { wire.sendGoodbye() }
   Resume.end(why: "left")
   postFinalBeat(why: "leave")
+  let bundled = (Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
+    .contains("/Contents/MacOS/")
+  if bundled, !flag("leave-exits") {
+    fputs("left the call -- Kin stays open\n", stderr)
+    Launcher.reexec(room: Launcher.mintRoom(),
+                    extra: ["--video", "camera", "--window"], why: "hung up")
+  }
   fputs("left the call\n", stderr)
   exit(0)
 }
