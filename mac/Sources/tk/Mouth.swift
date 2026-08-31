@@ -60,21 +60,30 @@ final class Mouth {
   /// every frame. A call already spends ~0.16 CPU-s/s; this is not the place to
   /// spend the rest of it.
   static let hz: Double = 12
-  /// Aperture change per second, in face-heights, above which the mouth is
-  /// doing what speech does.
+  /// How fast the mouth's openness is changing, above which it is doing what
+  /// speech does. Units: aperture-RATIO per second, where the ratio is mouth
+  /// opening over mouth width (see `aperture`).
   ///
-  /// MEASURED, and the first guess was wrong by 4x -- which is the entire
-  /// reason `--mouth-test` exists. On real talking-head footage at 12 Hz:
+  /// MEASURED, twice, and wrong both times before it was measured.
   ///
-  ///   talking   rate p10 0.04  p50 0.09  p90 0.19
-  ///   same face p10 0.00  p50 0.01  p90 0.02      (one frame of it, held)
+  ///   1. A guessed 0.35 sat above the talking p90 of the original
+  ///      face-height measure and called a speaking face silent 100% of the
+  ///      time, while passing every other arm in this rig.
+  ///   2. Then the measure itself changed -- from vertical extent to the lip
+  ///      cloud's own axes, to survive rotation -- and that is a CHANGE OF
+  ///      UNITS, which is its own trap (`stale-constants-after-a-codec-win`).
+  ///      The old 0.03 was suddenly far too low: it called a face held
+  ///      perfectly still "moving" 31% of the time.
   ///
-  /// A guessed 0.35 sat above the talking p90 and called a speaking face
-  /// silent 100% of the time, while passing every other arm in the rig --
-  /// `green-metrics-can-hide-defects` in one constant. 0.03 sits between the
-  /// still p90 and the talking p10, and the rig sweeps neighbours on every run
-  /// so the choice stays visible rather than becoming folklore.
-  nonisolated(unsafe) static var moveThreshold: Double = 0.03
+  /// On real talking-head footage at 12 Hz, in the current units:
+  ///
+  ///   talking   rate p10 0.30  p50 0.63  p90 1.30
+  ///   same face p10 0.01  p50 0.02  p90 0.08      (one frame of it, held)
+  ///
+  /// 7.9x apart, against 4.4x for the measure this replaced -- the invariance
+  /// came with a better signal, not a worse one. 0.15 sits between the still
+  /// p90 and the talking p10; the rig sweeps neighbours on every run.
+  nonisolated(unsafe) static var moveThreshold: Double = 0.15
   /// Speech pauses between words and inside them, and a detector that drops on
   /// every closed consonant would flap. Held this long past the last sample
   /// that cleared the bar. Shorter than the audio VAD's 560 ms hangover on
@@ -83,6 +92,44 @@ final class Mouth {
   static let hangoverMs: Double = 250
   /// No face for this long and the detector says so rather than remembering.
   static let blindAfterMs: Double = 400
+
+  /// ── THE ORIENTATION IS DISCOVERED, NOT ASSUMED ────────────────────────────
+  ///
+  /// Vision needs to be told which way up a buffer is, and getting it wrong
+  /// does not fail loudly: it finds NO FACES, which this detector correctly
+  /// reports as `unknown` -- so a wrong constant here is a feature that ships,
+  /// runs, costs CPU and does nothing, forever, with every self-test passing.
+  /// `feature-behind-a-flag-nobody-runs`, except the flag is a rotation.
+  ///
+  /// It cannot be settled by testing on this machine: a rig binary is refused
+  /// the camera because TCC binds a grant to code identity
+  /// (`tcc-identity-is-a-content-hash`), and the file-based rig carries its own
+  /// orientation. So the code does not guess. It tries the plausible ones, one
+  /// per look, until a face appears -- about 0.4 s at 12 Hz -- and latches onto
+  /// the one that worked. Whichever a Mac, an iPhone Continuity camera or an
+  /// external webcam actually delivers, this finds it.
+  ///
+  /// It never un-latches. A latched orientation that stops finding faces means
+  /// somebody left the room, which is the common case, and re-searching on
+  /// absence would thrash between rotations every time a person looked away.
+  static let orientations: [CGImagePropertyOrientation] =
+    [.up, .leftMirrored, .rightMirrored, .right, .left, .upMirrored]
+  private var orientIdx = 0
+  private(set) var orientLatched: CGImagePropertyOrientation?
+  /// Which rotation won, for the beat. The first real call answers a question
+  /// no rig on this machine can.
+  var orientName: String {
+    guard let o = orientLatched else { return "searching" }
+    switch o {
+    case .up: return "up"
+    case .upMirrored: return "upMirrored"
+    case .left: return "left"
+    case .leftMirrored: return "leftMirrored"
+    case .right: return "right"
+    case .rightMirrored: return "rightMirrored"
+    default: return "other"
+    }
+  }
 
   private let q = DispatchQueue(label: "kin.mouth", qos: .userInitiated)
   private var inFlight = false
@@ -121,23 +168,50 @@ final class Mouth {
     }
   }
 
-  private func look(_ pb: CVPixelBuffer, at t: UInt64) {
-    defer { inFlight = false }
-    looks += 1
+  /// The one place a face is looked for. Shared by the live camera path and by
+  /// the file rig, so the orientation search the rig proves is the same code a
+  /// real call runs -- a second copy of it would be the copy that drifts, and
+  /// this is precisely the mechanism no rig on this Mac can check against a
+  /// real sensor.
+  func detect(_ pb: CVPixelBuffer) -> VNFaceObservation? {
     let req = VNDetectFaceLandmarksRequest()
-    // `.leftMirrored` is what a Mac's front camera delivers to Vision for an
-    // upright sitter. Getting this wrong does not fail loudly -- it finds
-    // fewer faces -- which is why `faces` is counted and reported.
-    let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .leftMirrored, options: [:])
+    let orient = orientLatched ?? Mouth.orientations[orientIdx % Mouth.orientations.count]
+    let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: orient, options: [:])
     do { try h.perform([req]) } catch {
       Metrics.count("mouth_request_failed")
-      return
+      return nil
     }
     // The LARGEST face, not the first. With two people in shot the one filling
     // the frame is the one holding this microphone.
     guard let f = (req.results ?? []).max(by: {
       $0.boundingBox.height * $0.boundingBox.width < $1.boundingBox.height * $1.boundingBox.width
     }) else {
+      // While nothing has ever been found, advance the search: one candidate
+      // per look, so all six are tried in about half a second at 12 Hz.
+      if orientLatched == nil { orientIdx += 1 }
+      return nil
+    }
+    if orientLatched == nil {
+      orientLatched = orient
+      Metrics.fact("mouth_orient", orientName)
+      fputs("mouth: faces found with the camera read as \(orientName)"
+          + " -- latched after \(looks) looks\n", stderr)
+    }
+    return f
+  }
+
+  /// Reset, so one process can scan several clips independently. Rig only.
+  func forgetForTest() {
+    orientLatched = nil; orientIdx = 0
+    lastAperture = -1; lastSampleAt = 0; movingUntil = 0; lastFaceAt = 0
+    rateNow = 0; looks = 0; faces = 0; movingSamples = 0; stillSamples = 0; dropped = 0
+    Mouth.visualKnown = false; Mouth.visualVoice = false
+  }
+
+  private func look(_ pb: CVPixelBuffer, at t: UInt64) {
+    defer { inFlight = false }
+    looks += 1
+    guard let f = detect(pb) else {
       // No face. Not "not talking" -- see the three states above.
       if lastFaceAt == 0 || Clock.ms(t - lastFaceAt) > Mouth.blindAfterMs {
         Mouth.visualKnown = false
@@ -148,7 +222,8 @@ final class Mouth {
     }
     faces += 1
     lastFaceAt = t
-    guard let ap = Mouth.aperture(f) else {
+    let sz = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
+    guard let ap = Mouth.aperture(f, imageSize: sz) else {
       Mouth.visualKnown = false
       return
     }
@@ -175,25 +250,76 @@ final class Mouth {
     lastSampleAt = t
   }
 
-  /// Lip aperture in face-heights: the vertical extent of the inner lips,
-  /// divided by the face's own bounding-box height.
+  /// ── APERTURE, MEASURED WITHOUT KNOWING WHICH WAY UP ANYTHING IS ──────────
   ///
-  /// `normalizedPoints` are already relative to the bounding box, so the ratio
-  /// is scale-free -- but the box is in IMAGE units and a 16:9 frame is not
-  /// square, so the vertical extent is multiplied back by the box height to get
-  /// a fraction of the face rather than a fraction of the frame.
-  static func aperture(_ f: VNFaceObservation) -> Double? {
+  /// The first version took the VERTICAL extent of the inner lips in
+  /// bounding-box units, and the rig caught what that costs: the same talking
+  /// clip turned 90 degrees still had its face found in 100% of frames -- Vision
+  /// does not need the orientation hint to DETECT a face -- but the talking
+  /// verdict fell from 100% to 86%, because the landmark frame turned with the
+  /// image and "vertical extent" had become partly mouth WIDTH.
+  ///
+  /// That is a bug no orientation search can find, precisely because nothing
+  /// fails: faces are found, numbers come out, and the signal is quietly worse.
+  /// So the measurement stops depending on the answer.
+  ///
+  /// The lip contour has its own two axes: a long one across the mouth and a
+  /// short one across the opening. Their ratio -- how open the mouth is
+  /// relative to how wide it is -- is dimensionless and identical under any
+  /// rotation, any scale, and any distance from the camera. It also needs no
+  /// face-height normalisation, because the mouth normalises itself.
+  ///
+  /// Taken in IMAGE pixels rather than bounding-box units: a box is
+  /// axis-aligned, so box-relative coordinates are stretched differently in x
+  /// and y as a head turns, and a ratio built on them would wobble with the
+  /// box rather than with the mouth.
+  static func aperture(_ f: VNFaceObservation, imageSize: CGSize) -> Double? {
     guard let lips = f.landmarks?.innerLips ?? f.landmarks?.outerLips,
           lips.pointCount >= 4 else { return nil }
-    let pts = lips.normalizedPoints
-    var lo = Double.greatestFiniteMagnitude, hi = -Double.greatestFiniteMagnitude
+    let pts = lips.pointsInImage(imageSize: imageSize)
+    // Mean-centre.
+    var mx = 0.0, my = 0.0
+    for p in pts { mx += Double(p.x); my += Double(p.y) }
+    mx /= Double(pts.count); my /= Double(pts.count)
+    // 2x2 covariance of the point cloud.
+    var sxx = 0.0, syy = 0.0, sxy = 0.0
     for p in pts {
-      let y = Double(p.y)
-      if y < lo { lo = y }
-      if y > hi { hi = y }
+      let dx = Double(p.x) - mx, dy = Double(p.y) - my
+      sxx += dx * dx; syy += dy * dy; sxy += dx * dy
     }
-    guard hi > lo else { return 0 }
-    return hi - lo
+    let n = Double(pts.count)
+    sxx /= n; syy /= n; sxy /= n
+    // Principal axis: the eigenvector of the larger eigenvalue. Closed form for
+    // a symmetric 2x2 -- no iteration, no library, ~20 flops.
+    let tr = sxx + syy
+    let det = sxx * syy - sxy * sxy
+    let disc = max(0, tr * tr / 4 - det)
+    let l1 = tr / 2 + disc.squareRoot()            // larger
+    // The major axis direction. When the cloud is near-circular the axes are
+    // arbitrary, but so is the answer, and a mouth is never near-circular.
+    var ax = 1.0, ay = 0.0
+    if abs(sxy) > 1e-12 {
+      ax = l1 - syy; ay = sxy
+      let m = (ax * ax + ay * ay).squareRoot()
+      if m > 1e-12 { ax /= m; ay /= m } else { ax = 1; ay = 0 }
+    } else if syy > sxx {
+      ax = 0; ay = 1
+    }
+    // Extents along both axes, from the actual points rather than from the
+    // eigenvalues: a real extent is what a mouth opening is, and it is robust
+    // to the handful of points a lip contour has.
+    var majLo = Double.greatestFiniteMagnitude, majHi = -Double.greatestFiniteMagnitude
+    var minLo = Double.greatestFiniteMagnitude, minHi = -Double.greatestFiniteMagnitude
+    for p in pts {
+      let dx = Double(p.x) - mx, dy = Double(p.y) - my
+      let maj = dx * ax + dy * ay
+      let mnr = -dx * ay + dy * ax                 // perpendicular
+      majLo = min(majLo, maj); majHi = max(majHi, maj)
+      minLo = min(minLo, mnr); minHi = max(minHi, mnr)
+    }
+    let width = majHi - majLo
+    guard width > 1e-9 else { return nil }
+    return (minHi - minLo) / width
   }
 
   /// What a beat reports. Zero looks means the detector never ran, which is a
@@ -233,6 +359,9 @@ extension Mouth {
   static func scan(path: String, seconds: Double = 20) -> (frames: Int, faces: Int,
                                                            moving: Int, still: Int,
                                                            rates: [Double])? {
+    // Each clip is its own discovery: the rotated arm must find its own
+    // orientation rather than inherit the upright arm's.
+    shared.forgetForTest()
     let asset = AVURLAsset(url: URL(fileURLWithPath: path))
     guard let reader = try? AVAssetReader(asset: asset),
           let track = asset.tracks(withMediaType: .video).first else { return nil }
@@ -259,16 +388,12 @@ extension Mouth {
       if idx % step != 0 { continue }
       guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
       frames += 1
-      let req = VNDetectFaceLandmarksRequest()
-      // UPRIGHT here, not `.leftMirrored`: a file already carries the
-      // orientation a camera has to be told about. A rig that applied the
-      // camera's rotation to a file would find no faces and report a detector
-      // that cannot see -- measuring the harness.
-      let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
-      try? h.perform([req])
-      guard let f = (req.results ?? []).max(by: {
-              $0.boundingBox.height * $0.boundingBox.width < $1.boundingBox.height * $1.boundingBox.width
-            }), let ap = aperture(f) else {
+      shared.looks += 1
+      // THE SHARED DETECTOR, orientation search and all. An upright clip
+      // latches `.up` on its first look at no cost, and a rotated one has to
+      // find its own -- which is the arm that proves the search.
+      let sz = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
+      guard let f = shared.detect(pb), let ap = aperture(f, imageSize: sz) else {
         lastAp = -1                       // blind: the next sample re-baselines
         continue
       }
@@ -287,7 +412,8 @@ extension Mouth {
     return (frames, faces, moving, still, rates)
   }
 
-  static func selfTest(talking: String, stillPath: String, blind: String) -> Bool {
+  static func selfTest(talking: String, stillPath: String, blind: String,
+                       rotated: String? = nil) -> Bool {
     var ok = true
     func say(_ good: Bool, _ what: String) {
       if !good { ok = false }
@@ -300,7 +426,7 @@ extension Mouth {
       return s[min(s.count - 1, max(0, Int(Double(s.count - 1) * q)))]
     }
 
-    print("MOUTH TEST  \(Int(hz)) Hz, threshold \(String(format: "%.2f", moveThreshold)) face-heights/s")
+    print("MOUTH TEST  \(Int(hz)) Hz, threshold \(String(format: "%.2f", moveThreshold)) aperture-ratio/s")
 
     guard let t = scan(path: talking) else {
       print("MOUTH TEST COULD NOT RUN -- no readable video at \(talking)"); return false
@@ -332,13 +458,13 @@ extension Mouth {
       guard !rates.isEmpty else { return 0 }
       return Double(rates.filter { $0 >= th }.count) * 100 / Double(rates.count)
     }
-    print("  sweep    threshold:  " + [0.01, 0.02, 0.03, 0.05, 0.10, 0.20].map {
+    print("  sweep    threshold:  " + [0.05, 0.10, 0.15, 0.20, 0.30, 0.50].map {
       String(format: "%.2f", $0)
     }.joined(separator: "   "))
-    print("           talking %:  " + [0.01, 0.02, 0.03, 0.05, 0.10, 0.20].map {
+    print("           talking %:  " + [0.05, 0.10, 0.15, 0.20, 0.30, 0.50].map {
       String(format: "%4.0f  ", movingPct(t.rates, $0))
     }.joined(separator: " "))
-    print("           still   %:  " + [0.01, 0.02, 0.03, 0.05, 0.10, 0.20].map {
+    print("           still   %:  " + [0.05, 0.10, 0.15, 0.20, 0.30, 0.50].map {
       String(format: "%4.0f  ", movingPct(s.rates, $0))
     }.joined(separator: " "))
 
@@ -364,6 +490,42 @@ extension Mouth {
     say(pct(b.faces, b.frames) < 5,
         String(format: "REJECT: no face is found in the blind clip (%.0f%%), so it says unknown rather than still",
                pct(b.faces, b.frames)))
+
+    // ── 6. THE ORIENTATION SEARCH, WHICH NOTHING ELSE HERE CAN PROVE ────────
+    //
+    // Vision must be told which way up a buffer is, a Mac camera does not
+    // deliver `.up`, and a rig binary on this machine is refused the camera
+    // outright (TCC binds the grant to code identity), so the live rotation is
+    // untestable here. What IS testable is that the code does not depend on
+    // knowing it: the same clip turned 90 degrees must still be found, by the
+    // same search a real call runs.
+    if let r = rotated, let rs = scan(path: r) {
+      let orient = shared.orientName
+      print(String(format: "  ROTATED  %d samples, face in %.0f%%, moving %.0f%%  (latched \"%@\")",
+                   rs.frames, pct(rs.faces, rs.frames),
+                   pct(rs.moving, rs.moving + rs.still), orient))
+      say(pct(rs.faces, rs.frames) > 80,
+          String(format: "the search finds the same face turned 90 degrees (%.0f%%, read as \"%@\")",
+                 pct(rs.faces, rs.frames), orient))
+      // The row that used to be here asserted the search had to SEARCH -- that a
+      // rotated clip could only be found by trying another orientation. It
+      // cannot: Vision detects faces without the hint, so `.up` latches on the
+      // first look even at 90 degrees. That is why the aperture is measured on
+      // the lip cloud's own axes instead (see `aperture`): the thing rotation
+      // actually broke was the MEASUREMENT, silently, while every face was
+      // still being found. This row is now the one that matters -- the verdict
+      // has to survive the rotation, and before the axis change it fell to 86%.
+      say(orient == "up",
+          "and Vision needed no orientation hint to find it -- so the search is a"
+          + " safety net, and the invariance had to come from the maths")
+      let up = pct(t.moving, t.moving + t.still)
+      let rot = pct(rs.moving, rs.moving + rs.still)
+      say(abs(up - rot) <= 6,
+          String(format: "the talking verdict is the SAME rotated as upright (%.0f%% vs %.0f%%)",
+                 rot, up))
+    } else if rotated != nil {
+      say(false, "the rotated clip could not be read -- the search is unproven")
+    }
 
     print(ok ? "MOUTH TEST PASSED -- a moving mouth is distinguishable from a still one, and from no mouth"
              : "MOUTH TEST FAILED")

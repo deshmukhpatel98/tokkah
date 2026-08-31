@@ -440,7 +440,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft",
   "no-mouth", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
-  "mouth-threshold",
+  "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
@@ -4226,7 +4226,8 @@ if flag("mouth-test") {
   let media = arg("mouth-media") ?? "../testbed/media/real"
   exit(Mouth.selfTest(talking: arg("mouth-talking") ?? "\(media)/talkingheadA.mov",
                       stillPath: arg("mouth-still") ?? "\(media)/mouth-still.mov",
-                      blind: arg("mouth-blind") ?? "\(media)/mouth-blind.mov") ? 0 : 1)
+                      blind: arg("mouth-blind") ?? "\(media)/mouth-blind.mov",
+                      rotated: arg("mouth-rotated") ?? "\(media)/mouth-rot.mov") ? 0 : 1)
 }
 
 if flag("gate-test") {

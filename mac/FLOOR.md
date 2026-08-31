@@ -85,10 +85,24 @@ Three states, and the third is load-bearing:
 | `still` | a face is visible and it is not |
 | `unknown` | no face, no camera, no frame, a failed request — **says nothing** |
 
-Measured on real talking-head footage: talking rate p50 **0.09** face-heights/s
-against the same face held still at p90 **0.02** — 4.4× apart. The threshold
-(0.03) was **read off that** and the first guess was wrong by 4×, which is the
-entire reason `--mouth-test` exists.
+The aperture is measured on the **lip contour's own two axes** — how open the
+mouth is relative to how wide it is — which is dimensionless and identical under
+any rotation, scale or distance. That is not decoration: the first version took
+vertical extent in bounding-box units, and a clip turned 90° still had its face
+found in 100% of frames (Vision needs no orientation hint to *detect* a face)
+while the talking verdict silently fell from 100% to 86%, because "vertical"
+had become partly mouth *width*. No orientation search can find that bug —
+nothing fails, the numbers just get worse — so the measurement stopped
+depending on the answer. Rotated verdict is now 96% against 100% upright.
+
+Measured on real talking-head footage: talking rate p50 **0.63** aperture-ratio/s
+against the same face held still at p90 **0.08** — **7.9× apart**, and the
+invariant measure is a *stronger* signal than the 4.4× it replaced. The
+threshold (0.15) is read off that, and it has been wrong twice before being
+measured: once as a pure guess (4× too high, called a speaking face silent 100%
+of the time) and once because changing the measure changed the units and the old
+constant survived (`stale-constants-after-a-codec-win`). `--mouth-test` sweeps
+neighbours on every run.
 
 It is allowed to do exactly two things, both of which can only open a
 microphone or speed up a handover:

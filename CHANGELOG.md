@@ -5,6 +5,48 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.101.0 — 2026-08-31
+
+### Fixed — the visual signal was measured in a frame that turns with the camera
+
+0.100.0 took the **vertical extent** of the inner lips. The rig arm added
+straight afterwards found what that costs: the same talking clip turned 90°
+still had its face detected in **100%** of frames — Vision does not need the
+orientation hint to *find* a face — while the talking verdict fell from 100% to
+**86%**, because "vertical extent" had quietly become partly mouth *width*.
+
+That is a defect no orientation search can catch, which is why the search built
+for it was the wrong answer: nothing fails, every face is still found, and the
+signal simply gets worse. A Mac camera does not deliver `.up`, and a rig binary
+on this machine is refused the camera outright (TCC binds the grant to code
+identity), so the live rotation is not testable here at all — the code had to
+stop depending on knowing it.
+
+Aperture is now measured on the **lip contour's own two axes**: mouth opening
+over mouth width, from a closed-form 2×2 eigen-decomposition of the point
+cloud in image pixels. Dimensionless, and identical under any rotation, scale,
+or distance from the camera. The mouth normalises itself, so no face-height
+term is needed either.
+
+It is also a **better** signal, not merely a safer one:
+
+| | talking p50 | still p90 | separation | rotated verdict |
+|---|---|---|---|---|
+| 0.100.0 (vertical extent) | 0.09 | 0.02 | 4.4× | 86% |
+| 0.101.0 (own axes) | 0.63 | 0.08 | **7.9×** | **96%** |
+
+Talking now reads as moving 100% of the time and the same face held still 0%.
+
+The threshold moved 0.03 → **0.15**, and the reason is worth naming: changing
+the measure changed the **units** (aperture-ratio per second, not face-heights
+per second), and the old constant survived the change looking perfectly
+reasonable — it called a face sitting perfectly still "moving" 31% of the time.
+That is `stale-constants-after-a-codec-win`, one release later.
+
+The orientation search stays as a cheap safety net, and the rig now records
+that Vision needed no hint rather than asserting it must have searched — the
+row that claimed otherwise was asserting something false.
+
 ## Kin 0.100.0 — 2026-08-31
 
 ### Added — the app can see who is talking
