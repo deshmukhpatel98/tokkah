@@ -9,23 +9,44 @@ def num(b, k, d=None):
 def series(bs, k):
     return [v for v in (num(b, k) for b in bs) if v is not None]
 
+def last(bs, k, d=0):
+    s = series(bs, k)
+    return s[-1] if s else d
+
 def call_summary(bs, label=""):
+    """Three lines, grouped by the question each one answers, because a single
+    run-on line of eleven numbers is a line nobody reads twice."""
     if not bs:
         print("  no beats"); return
-    ec, fp = series(bs, "echo_corr"), series(bs, "floor_held_pct")
-    out = []
+    ec = series(bs, "echo_corr")
+    peak = series(bs, "echo_corr_peak")
     # The PEAK, not the last value. echo_corr is an instant: the final beat of a
-    # call that reached 0.71 read 0.04, so the summary said "no echo" about a
-    # call with a measured one.
-    if ec:
-        over = sum(1 for x in ec if x > 0.45)
-        out.append(f"echo peak {max(ec):.2f} (over 0.45 in {over}/{len(ec)} beats, last {ec[-1]:.2f})")
-    if fp: out.append(f"mic open {sorted(fp)[len(fp)//2]:.0f}%")
-    for k, name in (("turn_collisions", "both talking"), ("turn_flaps", "choppy"),
-                    ("turn_yields", "gave way")):
-        s = series(bs, k)
-        if s: out.append(f"{name} {max(s)}")
-    print("  " + "  ·  ".join(out))
+    # call that reached 0.71 read 0.04, so a summary built on the last value said
+    # "no echo" about a call with a measured one.
+    top = max(peak) if peak else (max(ec) if ec else 0)
+    over = sum(1 for x in ec if x > 0.45)
+    print(f"  ECHO      peak {top:.2f}  ·  over 0.45 in {over}/{len(ec)} beats"
+          f"  ·  speaker fed the mic on {'YES' if top > 0.45 else 'no'}")
+    # Whether the fix under test fired at all. "It fired and did not help" and
+    # "it never fired" are different bugs and used to look identical.
+    gp, ip = last(bs, "echo_guard_pct", -1), last(bs, "echo_guard_idle_pct", -1)
+    guard = (f"idle-guard muted {gp:.0f}% of the call (idle was {ip:.0f}%)"
+             if gp >= 0 else "idle-guard: not in this build")
+    print(f"  MIC       floor muted {last(bs,'floor_muted_pct'):.0f}%"
+          f"  ·  {guard}"
+          f"  ·  local gate open {last(bs,'floor_held_pct'):.0f}%")
+    trim, rail = last(bs, "mic_trim", 1), last(bs, "mic_gain_rail", 0)
+    pr, ps = last(bs, "predict_releases", -1), last(bs, "predict_saved_ms", 0)
+    early = f"handed over early {pr:.0f}x saving {ps:.0f} ms" if pr >= 0 else "predictor: not in this build"
+    print(f"  TURNS     both talking {last(bs,'turn_collisions'):.0f}"
+          f"  ·  choppy {last(bs,'turn_flaps'):.0f}"
+          f"  ·  gave way {last(bs,'turn_yields'):.0f}"
+          f"  ·  to-audible p50 {last(bs,'turn_to_floor_p50'):.0f} ms"
+          f"  ·  {early}")
+    print(f"  MIC LEVEL trim {trim:.2f}{' (AT THE RAIL)' if rail else ''}"
+          f"  ·  peak {last(bs,'a_mic_peak'):.2f}  ·  rms {last(bs,'a_mic_rms'):.3f}"
+          f"  ·  clipping {last(bs,'a_clip_pct'):.2f}%"
+          f"  ·  fallback {last(bs,'floor_fallback_pct'):.1f}%")
 
 mode = sys.argv[1]
 if mode == "local":

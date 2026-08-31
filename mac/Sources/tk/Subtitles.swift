@@ -329,6 +329,25 @@ final class Subtitles {
     private func predictNow() -> Double {
         let p = predict.probability(nowMs: fedMs)
         turnEndingSoon = p
+        // ── AND HERE IS WHERE IT GOES ────────────────────────────────────────
+        //
+        // `Audio.turnEndProb` is read by `Floor.step` on every capture block and
+        // was assigned NOWHERE, so `predictedEnd` was always false and the floor
+        // always waited the full 450 ms of silence before a turn could change
+        // hands. A measured value with a stated consumer and no wire between
+        // them is the shape this project keeps getting caught by.
+        //
+        // This is the LOCAL half, and it is the half that needs no protocol: my
+        // own transcript predicts MY OWN turn ending, and `predictedEnd` is
+        // guarded by `state == .mine`, so the only thing it can do is let go of
+        // the floor early on behalf of the person who already has it. It can
+        // never take a turn from anybody.
+        //
+        // The other half -- knowing the FAR end's turn is ending, so this
+        // microphone is already open when this person starts -- is the bigger
+        // win and needs the number to cross the wire beside the vocal byte. It
+        // is not done, and the comment above this property says why.
+        Audio.turnEndProb = p
         if ProcessInfo.processInfo.environment["KIN_PREDICT_DEBUG"] != nil {
             fputs(String(format: "predict %.2f  words %.2f  falling %.1f dB  going %.0f ms  quiet %.0f ms\n",
                          p, predict.lastSyntax, predict.lastFall,

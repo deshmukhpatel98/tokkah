@@ -124,6 +124,15 @@ final class Floor {
   private(set) var farAgeMs: Double = 1e9
   /// Milliseconds of loudspeaker tail still to run. See `notePlayout`.
   private(set) var playoutTail: Double = 0
+  /// Turns this end let go of early because its own sentence was ending, and the
+  /// milliseconds of the 450 ms silence rule that saved.
+  private(set) var predictedReleases = 0
+  private(set) var predictedSavedMs: Double = 0
+  /// Blocks the idle echo guard muted, and blocks where it COULD have (idle, on
+  /// speakers). The second is the denominator: a count with nothing to divide by
+  /// says nothing about a call's length.
+  private(set) var echoGuardBlocks = 0
+  private(set) var guardableBlocks = 0
   private var farVoice = Voice.quiet
   /// How long the far end has been quiet, on ITS clock: seeded to one transit
   /// when the first quiet cue lands, then counted here.
@@ -249,7 +258,16 @@ final class Floor {
       // A prediction cannot take the floor from anybody. It can only let go of
       // it early, at a pause, on behalf of the person who already has it.
       let predictedEnd = state == .mine && endProb >= cfg.predictP && holderQuietMs > 0
-      if holderQuietMs >= cfg.releaseMs || predictedEnd { state = .idle; holderQuietMs = 0 }
+      if holderQuietMs >= cfg.releaseMs || predictedEnd {
+        // Counted, because "the predictor is wired" and "the predictor fires"
+        // are two claims and only the second one is worth anything. This is the
+        // number that says how much of the 450 ms wait it is actually saving.
+        if predictedEnd {
+          predictedReleases += 1
+          predictedSavedMs += max(0, cfg.releaseMs - holderQuietMs)
+        }
+        state = .idle; holderQuietMs = 0
+      }
     }
 
     // ── TAKING IT ────────────────────────────────────────────────────────────
@@ -342,6 +360,12 @@ final class Floor {
     // A backchannel is left alone too. "mm-hm" is the thing the other person is
     // listening for, and it does not take the floor.
     let echoRisk = state == .idle && speakers && playoutTail > 0 && near == .quiet
+    // COUNTED, because this is the fix under test and the whole call is about
+    // whether it fires. Without a counter the only evidence would be the echo
+    // number going down, and "it fired and did not help" and "it never fired"
+    // would look identical -- which is how the last two echo theories survived.
+    if echoRisk { echoGuardBlocks += 1 }
+    guardableBlocks += state == .idle && speakers ? 1 : 0
     return Decision(mayTransmit: state != .theirs && !echoRisk,
                     duckOnly: state == .theirs && near != .quiet,
                     playoutOpen: !earClosed,

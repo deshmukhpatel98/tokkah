@@ -5,6 +5,40 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.92.0 — 2026-08-31
+
+### Fixed — the turn-end predictor was read by the floor and assigned nowhere
+
+`Audio.turnEndProb` is read on every capture block by `Floor.step`, which uses it
+to let go of the floor early at a pause instead of waiting out the full 450 ms of
+silence that ends a turn. Nothing ever wrote to it. It was `0` for the life of
+the app, so `predictedEnd` was always false and every turn cost the full 450 ms.
+
+The predictor itself was finished, measured and running — `Subtitles.predictNow`
+computes it on every block while somebody is speaking. There was simply no wire
+between the value and its stated consumer.
+
+This is the LOCAL half, and it needs no protocol: my own transcript predicts my
+own turn ending, and `predictedEnd` is guarded by `state == .mine`, so all it can
+do is release the floor early on behalf of whoever already holds it. It can never
+take a turn from anybody. The other half — knowing the FAR end's turn is ending,
+so this microphone is already open when this person starts — is the larger win
+and needs the number to cross the wire beside the vocal byte.
+
+### Added — telemetry that can answer "is the echo gone" without guessing
+
+Every fix of the last two days is now countable on a live call, because the last
+three echo theories all survived by being unmeasurable:
+
+- `echo_guard_pct` / `echo_guard_idle_pct` — how much of the call the new idle
+  guard muted a microphone, and how much of the call it could have. "It fired and
+  did not help" and "it never fired" are different bugs and used to look the same
+- `predict_releases` / `predict_saved_ms` — turns handed over early, and the
+  milliseconds of the 450 ms rule that saved
+- `playout_rms` — whether this machine's loudspeaker was actually making sound
+- and `tools/telemetry.sh` prints them grouped by question, saying plainly when a
+  field is missing because the call ran on an older build
+
 ## Kin 0.91.0 — 2026-08-31
 
 ### Fixed — 0.90.0's echo guard could re-gag the person it had just rescued

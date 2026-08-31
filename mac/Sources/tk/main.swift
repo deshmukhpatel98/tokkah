@@ -5828,6 +5828,20 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // These three are the fractions that answer it, and they existed already;
     // they were printed under `--floor-debug`, which no real call passes.
     "floor_blocks": audio.turns.floorBlocks,
+    // What the turn-end predictor is actually saving. It was read by the floor
+    // and assigned nowhere until 0.92.0, so these start at the first release
+    // where the number means anything.
+    // The idle echo guard: how much of the call it muted a mic that would
+    // otherwise have sat live next to a playing loudspeaker, and how much of the
+    // call it could have. Both, because a bare count has no denominator.
+    "echo_guard_pct": audio.turns.floorBlocks > 0
+      ? Double(Audio.sharedFloor.echoGuardBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    "echo_guard_idle_pct": audio.turns.floorBlocks > 0
+      ? Double(Audio.sharedFloor.guardableBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    "playout_rms": audio.playoutRmsNow,
+    "predict_releases": Audio.sharedFloor.predictedReleases,
+    "predict_saved_ms": Audio.sharedFloor.predictedSavedMs,
+    "predict_p_now": Audio.turnEndProb,
     "floor_muted_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.floorHeldBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // The share of the call this end had stopped believing the far end's cues
@@ -6251,7 +6265,18 @@ func reportLoop() {
                + "  (running on the local gate alone %.1f%%)", muted, fb)
         + (audio.gainAtRail
            ? String(format: "  MIC AT THE RAIL, trim %.2f", audio.inputTrim) : "")
-        + String(format: "  echo peak %.2f", audio.echoCorrPeak) + "\n", stderr)
+        + String(format: "  echo peak %.2f", audio.echoCorrPeak)
+        // The predictor, as a saving rather than as a score. `0 turns` here on a
+        // call where somebody talked means it is not firing, which is the state
+        // this line was added to make impossible to miss.
+        + String(format: "  idle-echo guard muted %.0f%% of the call (idle was %.0f%%)",
+                 audio.turns.floorBlocks > 0
+                   ? Double(Audio.sharedFloor.echoGuardBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+                 audio.turns.floorBlocks > 0
+                   ? Double(Audio.sharedFloor.guardableBlocks) / Double(audio.turns.floorBlocks) * 100 : 0)
+        + String(format: "  handed over early %d time(s), saving %.0f ms",
+                 Audio.sharedFloor.predictedReleases,
+                 Audio.sharedFloor.predictedSavedMs) + "\n", stderr)
   }
   if flag("floor-debug"), t.floorBlocks > 0 {
     let n = Double(t.floorBlocks)
