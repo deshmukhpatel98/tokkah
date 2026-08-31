@@ -5,6 +5,57 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.96.0 — 2026-08-31
+
+### Fixed — a cancelled call rang on at the other end
+
+Measured live (calls `odfvn792xwxx` → `jqgqxwt6jn6l`): the caller cancelled,
+the mailbox was told instantly, and the callee rang on — the cancel landed
+**6.8 s after the ring**, and an earlier one was drained by a copy of Kin that
+was not showing that ring and dropped ("hung up on a call this Mac is not on —
+ignored", in this repo's own logs). Four fixes, one per hole:
+
+- **A second app copy no longer polls the mailbox.** The drain is destructive;
+  two copies ate each other's messages, spent the shared arming budget, and
+  crowded the four held-poll slots. A copy that does not win the line now
+  waits behind the holder exactly like the watcher does, and inherits it
+  within a second of the holder dying.
+- **A drained bye that this copy cannot use is written as a cancel note, never
+  dropped** — the app-side twin of the watcher bug `cancelrace-check` exists
+  for. And **every ringing copy now watches for notes**: the 4 Hz note timer
+  only existed on the watcher-launched path before, so the resident path had
+  a writer and no reader.
+- **The line lock is close-on-exec.** Placing and answering calls re-exec, and
+  execv inherits plain fds — the new image carried the old image's flock as an
+  orphan it could not see and then waited behind itself.
+- **While a ring card is up, the fallback poll cadence is 1 s, not 5.** A
+  cancel is only ever sent during a ring; bounded (rings last ≤ 45 s) and rare
+  (held polls remain instant when the server holds). `ring_poll_slow` /
+  `ring_poll_fail` now count the fallback itself — a Mac answering cancels
+  late is no longer indistinguishable from a healthy one.
+
+### Fixed — a ring at an open Kin showed a name, never the caller's face
+
+The `--incoming` image the watcher launches shows the caller's live video on
+the ring card before anybody answers (`ringpicture-check`, still green). A
+ring that arrived at an **already-open, idle** Kin drew its own card in-process
+— no preview join, no face, and none of the cancel-note machinery. An idle,
+room-less copy now re-execs into exactly the image the watcher would have
+launched: same argv, same rig coverage. A copy in a room, in a call, or
+already ringing keeps the in-process card — consent must not tear down what a
+person is looking at.
+
+### Added — one location fix per connected call
+
+For the launch phase: calls will happen from other people's Macs, and latency
+numbers mean nothing without the distance they crossed. When the transport
+locks on a real call — never at launch, never for a ring preview — Kin asks
+CoreLocation once, at kilometre accuracy, and writes `geo_lat`/`geo_lon`
+(2 decimals ≈ 1.1 km) and `geo_acc_km` to the beat; a denial writes `geo_err`
+instead, so "no number" and "never asked" stay distinguishable. The telemetry
+summary gains a `WHERE` line per end and a `RING` line that names what stopped
+a ring and how late the cancel landed.
+
 ## Kin 0.95.0 — 2026-08-31
 
 ### Changed — the floor is strict: one microphone, one loudspeaker, never the same end

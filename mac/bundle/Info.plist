@@ -41,6 +41,10 @@
        actually says. -->
   <key>NSMicrophoneUsageDescription</key>
   <string>Kin needs the microphone to carry your voice on a call.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>Kin records an approximate location once when a call connects, so call quality can be read against the distance it crossed.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Kin records an approximate location once when a call connects, so call quality can be read against the distance it crossed.</string>
   <key>NSCameraUsageDescription</key>
   <string>Kin needs the camera to send your picture on a call.</string>
   <key>NSLocalNetworkUsageDescription</key>

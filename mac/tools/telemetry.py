@@ -13,6 +13,14 @@ def last(bs, k, d=0):
     s = series(bs, k)
     return s[-1] if s else d
 
+def sub(bs, group, k, d=None):
+    """Newest value of beats[i][group][k] -- counters and facts ride nested."""
+    for b in reversed(bs):
+        g = b.get(group)
+        if isinstance(g, dict) and k in g:
+            return g[k]
+    return d
+
 def call_summary(bs, label=""):
     """Three lines, grouped by the question each one answers, because a single
     run-on line of eleven numbers is a line nobody reads twice."""
@@ -72,6 +80,34 @@ def call_summary(bs, label=""):
           f"  ·  clipping {last(bs,'a_clip_pct'):.2f}%"
           f"  ·  fallback {last(bs,'floor_fallback_pct'):.1f}%"
           f"  ·  {veto}")
+    # The ring story (0.96.0): who rang, what stopped it, and how late the
+    # cancel landed. "It kept ringing" was undiagnosable from a beat before.
+    rr = (sub(bs, "events", "ring_recv", 0) or 0) + (sub(bs, "events", "ring_recv_watch", 0) or 0)
+    if rr:
+        stops = []
+        for k, word in (("bye_recv_ringing", "stopped by bye"),
+                        ("bye_note_ringing", "stopped by note"),
+                        ("bye_note_prering", "cancelled before it rang"),
+                        ("ring_declined", "declined"),
+                        ("ring_reexec", "handed to a face-card image")):
+            n = sub(bs, "events", k, 0) or 0
+            if n:
+                stops.append(f"{word} {n}x")
+        rms, bms = sub(bs, "marks", "ring_recv_ms"), sub(bs, "marks", "bye_recv_ms")
+        lag = (f"  ·  cancel landed {bms - rms:.0f} ms after the ring"
+               if isinstance(rms, (int, float)) and isinstance(bms, (int, float)) and bms >= rms else "")
+        slow = (sub(bs, "events", "ring_poll_slow", 0) or 0) > 0
+        out = sub(bs, "facts", "outcome")
+        print(f"  RING      rang {rr}x  ·  " + (" · ".join(stops) if stops else "no stop recorded")
+              + lag + ("  ·  POLL WENT SLOW (server stopped holding)" if slow else "")
+              + (f"  ·  {out}" if out else ""))
+    # Where this end was, once per connected call (0.96.0) -- ~1 km grain.
+    la, lo = sub(bs, "facts", "geo_lat"), sub(bs, "facts", "geo_lon")
+    ge = sub(bs, "facts", "geo_err")
+    if la and lo:
+        print(f"  WHERE     {la}, {lo}  (±{sub(bs, 'facts', 'geo_acc_km', '?')} km)")
+    elif ge:
+        print(f"  WHERE     no location ({ge})")
 
 mode = sys.argv[1]
 if mode == "local":

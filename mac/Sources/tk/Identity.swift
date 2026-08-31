@@ -1330,6 +1330,11 @@ enum Identity {
   nonisolated(unsafe) private static var saidSlow = false
   nonisolated(unsafe) private static var saidBusy = false
   nonisolated(unsafe) private static var saidStandDown = false
+  nonisolated(unsafe) private static var saidYield = false
+  /// True while this process is showing a ring card. Read by the poll loop:
+  /// a non-holding fallback that checks every 5 s is fine for an idle Mac and
+  /// is 5 s of phantom ringing when the caller has already hung up.
+  nonisolated(unsafe) static var ringShowing = false
   /// One line per poll, off by default. A ring loop that stops working stops
   /// PRINTING, and silence is what an idle doorbell looks like too -- so without
   /// this, "nobody called" and "this loop is wedged" are not distinguishable
@@ -1368,6 +1373,12 @@ enum Identity {
                                              attributes: [.posixPermissions: 0o700])
     let fd = open(lockFile.path, O_CREAT | O_RDWR, 0o600)
     guard fd >= 0 else { return }
+    // CLOEXEC, because placing a call and answering one both RE-EXEC. execv
+    // inherits plain fds (`self-update-must-not-brick-the-far-machine`), so
+    // without this the new image carries the old image's flock as an orphan it
+    // cannot see: its own claim then fails against itself, it waits behind a
+    // holder that no longer exists as a process, and nobody polls the mailbox.
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
     if flock(fd, LOCK_EX | LOCK_NB) == 0 { lockFd = fd } else { close(fd) }
   }
 
@@ -1577,6 +1588,9 @@ enum Identity {
     func slow(_ why: String) {
       guard !saidSlow else { return }
       saidSlow = true
+      // Counted, because a Mac in this mode answers cancels late (the phantom
+      // ring), and "the server stopped holding" was invisible in the beats.
+      Metrics.count("ring_poll_slow")
       fputs("ring: \(why) -- checking for calls every \(Int(gap)) seconds instead\n", stderr)
     }
     /// Say it once, from either of the two answers that can carry the news: a
@@ -1610,6 +1624,29 @@ enum Identity {
         // again straight away, and it costs one uncontended flock.
         Thread.sleep(forTimeInterval: 1)
         continue
+      }
+      // ── AND A SECOND APP COPY WAITS EXACTLY LIKE THE WATCHER ───────────────
+      //
+      // `claimLine` used to be advisory for the app: a copy that lost the flock
+      // polled anyway. Two app copies on one mailbox eat each other's messages
+      // (the drain is destructive), spend the shared arming budget, and crowd
+      // the four held slots -- measured live as a cancel that a second copy
+      // drained, could not use, and dropped, while the ringing copy rang on.
+      // So a copy that does not hold the line does not poll. It retries the
+      // claim every second (it inherits the line within one of the holder
+      // dying), and any bye the holder drains for a ring THIS copy is showing
+      // arrives as a cancel note, which every ringing copy now watches.
+      if !standDown, lockFd < 0 {
+        claimLine()
+        if lockFd < 0, lineHeldByApp() {
+          if !saidYield {
+            saidYield = true
+            Metrics.count("ring_line_yield")
+            fputs("ring: another Kin on this Mac holds the line -- waiting behind it\n", stderr)
+          }
+          Thread.sleep(forTimeInterval: 1)
+          continue
+        }
       }
       // ── WHICH POLLS ARE PLAIN, AND WHY ANY OF THEM STILL ARE ───────────────
       //
@@ -1684,7 +1721,12 @@ enum Identity {
           // budget on the server precisely so this line is free, and the gap it
           // closes is where a second ring would otherwise sit.
         } else if !holds {
-          Thread.sleep(forTimeInterval: gap)          // the cadence that always worked
+          // The cadence that always worked -- except while a ring card is up.
+          // A cancel is only ever sent during a ring, and on the fallback
+          // cadence it sat in the mailbox for up to 5 s of phantom ringing
+          // (measured 6.8 s ring-to-stop on a live cancel). A ring lasts 45 s
+          // at most, so the faster ask is bounded and rare.
+          Thread.sleep(forTimeInterval: ringShowing ? 1 : gap)
         } else if wait > 0 {
           // An empty answer to a poll that ASKED to be held means the server
           // declined to hold it -- it is at its concurrency cap. Re-arming at
@@ -1722,6 +1764,7 @@ enum Identity {
         // same shape as a rate that was never converted to events per second.
         // One failure is a hiccup; three consecutive is a server or a path that
         // cannot do this, and the answer is the cadence that has always worked.
+        Metrics.count("ring_poll_fail")
         let pause = backoff()
         if trouble >= 3, holds { holds = false; since = 0; slow("calls are not coming through quickly") }
         Thread.sleep(forTimeInterval: pause)

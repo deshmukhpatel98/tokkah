@@ -748,6 +748,9 @@ let ringPending = arg("incoming") != nil
 // a button that works or does nothing depending on how the call arrived -- and
 // the watcher route is precisely the one nobody would test by hand.
 nonisolated(unsafe) var gOffered: Identity.Ring?
+// Mirrors `gOffered != nil` for the poll loop's cadence (Identity.ringShowing).
+// Set beside EVERY gOffered write; a missed clear costs battery (1 s polls),
+// never correctness.
 // gCalling: WHO AND WHICH ROOM, not just who. A bye is matched on both, and the
 // room is the half a stranger cannot guess -- it was minted for this call minutes
 // ago and only the two ends have ever seen it.
@@ -2095,6 +2098,7 @@ if let from = arg("incoming"), let r = arg("room") {
   gOffered = Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
                            known: !ik.isEmpty && Identity.contacts()[from] == ik,
                            keyChanged: false, kind: nil)
+  Identity.ringShowing = true
   Metrics.count("ring_recv_watch")
   // ── THEY MAY ALREADY HAVE CANCELLED, AND ONLY THE WATCHER KNOWS ───────────
   //
@@ -2118,39 +2122,35 @@ if let from = arg("incoming"), let r = arg("room") {
     handleBye(Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
                             known: false, keyChanged: false, kind: "bye"))
   }
-  // ── AND IT CAN ALSO LAND A MOMENT AFTER THAT LINE ─────────────────────────
-  //
-  // The read above is one sample of a file another process writes, so it answers
-  // only for the instant it ran. A cancel that lands between it and this copy's
-  // own first poll would be taken by the watcher, written after we looked, and
-  // waited out in full -- the original bug moved a few hundred milliseconds to
-  // the right. `once-fired-probes-record-transients`: a state read once at
-  // startup is a birth certificate, not a subscription.
-  //
-  // Four times a second, for as long as this copy has something to ask about. It
-  // is one open() of a path that is usually not there, against a window that has
-  // a person looking at it, and it stops mattering the moment `gOffered` is
-  // cleared -- by an answer, a decline, or by the note itself. `.common` mode so
-  // it keeps firing while a menu or a drag is tracking.
-  //
-  // Handed straight to the run loop and not kept in a `let` of its own: a
-  // top-level variable in this file is initialised in file order, and this file
-  // has twice had one silently undone by its own initialiser after a thread had
-  // already written to it. There is nothing here that needs a name.
-  RunLoop.main.add(Timer(timeInterval: 0.25, repeats: true) { _ in
-    guard let o = gOffered, o.kind == nil,
-          Identity.takeCancelNote(from: o.from, room: o.room) else { return }
-    fputs("cancel: @\(o.from) called it off -- the watcher took the message"
-        + " while this copy was still starting up\n", stderr)
-    Metrics.count("bye_note_ringing")
-    handleBye(Identity.Ring(from: o.from, room: o.room, t: 0, k: o.k, ageMs: 0,
-                            known: o.known, keyChanged: false, kind: "bye"))
-  }, forMode: .common)
   DispatchQueue.main.async {
     display?.controls?.showIncoming(from: from, room: r)
     Ringer.start(raising: display?.callWindow)
   }
 }
+// ── EVERY RINGING COPY WATCHES FOR THE NOTE, WHATEVER LAUNCHED IT ────────────
+//
+// This timer lived inside the `--incoming` branch above, which quietly meant
+// the note dance only worked for a watcher-launched card. A resident copy that
+// drew its own card never looked, so a bye drained by any OTHER process --
+// which handleBye now writes as a note instead of dropping -- had a writer and
+// no reader on exactly the path the user hits most. Installed unconditionally:
+// the body is one nil check on a Mac that is not ringing, and one open() of a
+// path that is usually not there on one that is.
+//
+// Four times a second, `.common` mode so it keeps firing while a menu or a
+// drag is tracking; handed straight to the run loop and not kept in a `let` of
+// its own -- a top-level variable in this file is initialised in file order,
+// and this file has twice had one silently undone by its own initialiser after
+// a thread had already written to it.
+RunLoop.main.add(Timer(timeInterval: 0.25, repeats: true) { _ in
+  guard let o = gOffered, o.kind == nil,
+        Identity.takeCancelNote(from: o.from, room: o.room) else { return }
+  fputs("cancel: @\(o.from) called it off -- another copy took the message"
+      + " and left it here\n", stderr)
+  Metrics.count("bye_note_ringing")
+  handleBye(Identity.Ring(from: o.from, room: o.room, t: 0, k: o.k, ageMs: 0,
+                          known: o.known, keyChanged: false, kind: "bye"))
+}, forMode: .common)
 // ── WHO THIS IMAGE IS RINGING ──────────────────────────────────────────────
 //
 // The mirror of `--incoming`, and it exists because placing a call RE-EXECS. The
@@ -2261,6 +2261,7 @@ display?.controls?.onDeclineRing = {
   let who = gOffered?.from ?? ""
   let room = gOffered?.room ?? ""
   gOffered = nil
+  Identity.ringShowing = false
   // ── A PROCESS THAT EXISTS ONLY TO ASK IS DONE WHEN THE ANSWER IS NO ───────
   //
   // The watcher opens a whole new copy of Kin for each ring, precisely so that
@@ -2440,6 +2441,7 @@ func handleBye(_ r: Identity.Ring) {
     Metrics.fact("outcome", "they hung up before this Mac answered")
     Ringer.stop()
     gOffered = nil
+    Identity.ringShowing = false
     display?.controls?.hideIncoming()
     display?.controls?.setStatus("\(Identity.display(r.from)) hung up")
     fputs("bye: @\(r.from) stopped calling\n", stderr)
@@ -2454,7 +2456,18 @@ func handleBye(_ r: Identity.Ring) {
   // from a call that already ended -- ordinary -- or the two ends disagreeing
   // about which room they are in, which is not.
   Metrics.count("bye_recv_stale")
-  fputs("bye: @\(r.from) hung up on a call this Mac is not on -- ignored\n", stderr)
+  // ── AND NEVER DROPPED. THE DRAIN IS DESTRUCTIVE. ──────────────────────────
+  //
+  // This branch is the app-side twin of the watcher bug cancelrace-check exists
+  // for: whichever process polls first TAKES the message, and a bye taken by a
+  // copy that is not showing that ring used to die right here -- seen live as
+  // "ignored" in this Mac's own log while the other copy rang out a cancelled
+  // call. The note is how it reaches the copy that can use it; `noteCancelled`
+  // already refuses anything but a fresh bye, and the ringing copy's own timer
+  // consumes it under the caller/room/lease guards.
+  Identity.noteCancelled(r)
+  fputs("bye: @\(r.from) hung up on a call this Mac is not on"
+      + " -- left as a note for whichever copy is ringing it\n", stderr)
 }
 
 func startRingingOnce() {
@@ -2483,6 +2496,30 @@ func startRingingOnce() {
     // reaching a reused room could otherwise end a call that had just started.
     guard r.ageMs < 60_000 else { return }
     if r.kind == "bye" { handleBye(r); return }
+    // ── AN IDLE COPY HANDS THE RING TO THE IMAGE THAT CAN SHOW A FACE ───────
+    //
+    // The in-process card below rings with a NAME only. The `--incoming` image
+    // the watcher launches is the one with the caller's live picture on the
+    // card (ringpicture-check) and the cancel-note dance (cancelrace-check) --
+    // and a ring at an app that is already open was the one arrival that
+    // missed it. So an idle, room-less copy re-execs into exactly the image
+    // the watcher would have launched: same argv, same rig coverage, and the
+    // execv drops this copy's mailbox line (CLOEXEC) for the successor to
+    // claim. A bye that lands during the handoff waits in the mailbox -- the
+    // drain is destructive but nothing is draining, which for once is the
+    // safe direction.
+    //
+    // Only when idle. A copy in a room, in a call, or already ringing keeps
+    // the card in-process: consent must never tear down what a person is
+    // already looking at.
+    if r.kind == nil, arg("room") == nil, gCalling == nil, gOffered == nil,
+       !Resume.holding {
+      Metrics.count("ring_reexec")
+      Launcher.reexec(room: r.room,
+                      extra: ["--incoming", r.from, "--incoming-key", r.k,
+                              "--video", "camera", "--window"],
+                      why: "ring from @\(r.from) -- the card with a face on it")
+    }
     if r.keyChanged {
       // The name is one we know and the key is not. Say the name is in doubt
       // rather than dropping it: a reinstall looks exactly like this, and so
@@ -2490,6 +2527,7 @@ func startRingingOnce() {
       fputs("ring: @\(r.from) rang with a DIFFERENT key than we remember\n", stderr)
     }
     gOffered = r
+    Identity.ringShowing = true
     Metrics.count("ring_recv")
     Metrics.mark("ring_recv_ms", sinceLaunch())
     if r.keyChanged { Metrics.count("ring_key_changed") }
@@ -3042,6 +3080,10 @@ if let room = arg("room") {
             Resume.begin(room: room, port: Int(listenPort), peer: peerSpec,
                          video: videoArg, who: arg("calling") ?? arg("incoming") ?? "",
                          call: Telemetry.call, path: wire.lockedFrom)
+            // One location fix per connected call, and this gate is the same
+            // one that makes the call real: a ring preview must never prompt
+            // for anything -- nobody has agreed to talk yet.
+            Geo.shared.noteCallConnected()
           }
           // ── AND THE GAP, IF THIS LOCK IS A RETURN ───────────────────────────
           //
