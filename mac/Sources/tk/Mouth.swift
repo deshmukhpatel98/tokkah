@@ -145,6 +145,14 @@ final class Mouth {
   /// It never un-latches. A latched orientation that stops finding faces means
   /// somebody left the room, which is the common case, and re-searching on
   /// absence would thrash between rotations every time a person looked away.
+  ///
+  /// MEASURED ON A REAL SENSOR, which no rig on this Mac can do: the shipped
+  /// build latches `leftMirrored` after TWO looks -- `.up` finds no face on a
+  /// real camera buffer and `.leftMirrored` does. So this search is not a
+  /// safety net, it is required, and it costs ~170 ms of a call at 12 Hz to
+  /// settle. The file-based rig arm reaches the opposite conclusion because a
+  /// 90-degree file rotation is not the rotate-and-mirror a camera applies;
+  /// that arm's own note says so rather than generalising.
   static let orientations: [CGImagePropertyOrientation] =
     [.up, .leftMirrored, .rightMirrored, .right, .left, .upMirrored]
   private var orientIdx = 0
@@ -564,17 +572,29 @@ extension Mouth {
       say(pct(rs.faces, rs.frames) > 80,
           String(format: "the search finds the same face turned 90 degrees (%.0f%%, read as \"%@\")",
                  pct(rs.faces, rs.frames), orient))
-      // The row that used to be here asserted the search had to SEARCH -- that a
-      // rotated clip could only be found by trying another orientation. It
-      // cannot: Vision detects faces without the hint, so `.up` latches on the
-      // first look even at 90 degrees. That is why the aperture is measured on
-      // the lip cloud's own axes instead (see `aperture`): the thing rotation
-      // actually broke was the MEASUREMENT, silently, while every face was
-      // still being found. This row is now the one that matters -- the verdict
-      // has to survive the rotation, and before the axis change it fell to 86%.
+      // ── WHAT THIS FILE ARM CAN AND CANNOT CONCLUDE ────────────────────────
+      //
+      // A rotated FILE is still found with `.up`, so on this evidence the
+      // search looked like a mere safety net. A real Mac camera says otherwise:
+      // on the shipped build, through LaunchServices, it logs
+      //
+      //     mouth: faces found with the camera read as leftMirrored
+      //            -- latched after 2 looks
+      //
+      // Two looks means candidate one (`.up`) found NO FACE and `.leftMirrored`
+      // did. So on real camera buffers the hint IS load-bearing, and the
+      // conclusion this row used to draw -- "Vision needs no orientation hint"
+      // -- was true of a 90-degree file rotation and false of the device. A
+      // camera frame is rotated AND mirrored, which is not the transformation
+      // this clip applies.
+      //
+      // Kept as the file-arm observation it honestly is, no longer generalised
+      // to production. `no-camera-route-from-this-mac`: a rig binary here is
+      // refused the sensor, so this is the boundary of what any local rig can
+      // settle, and the real answer came from a live call's own log.
       say(orient == "up",
-          "and Vision needed no orientation hint to find it -- so the search is a"
-          + " safety net, and the invariance had to come from the maths")
+          "the file arm is found with no hint (a real CAMERA needs leftMirrored --"
+          + " see the note: the search is load-bearing on a device)")
       let up = pct(t.moving, t.moving + t.still)
       let rot = pct(rs.moving, rs.moving + rs.still)
       say(abs(up - rot) <= 6,
