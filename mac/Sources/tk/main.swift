@@ -482,12 +482,19 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft", "no-headphone-duplex",
+  "speaker-duplex", "speaker-duplex-path",
   "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
+  // The linear echo canceller (0.107.0) and its arms. `--no-aec` is the control
+  // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
+  // correlation alone.
+  "no-aec", "aec-test", "aec-sweep", "aec-taps", "aec-mu", "aec-media", "aec-block",
+  "aec-trace",
+  "no-overload-guard",
   "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-far-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
@@ -524,7 +531,7 @@ let TEST_FLAGS = ["gate-test", "mouth-test", "ledger-test", "cue-test", "yield-t
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
                   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
-                  "predict-far-test"]
+                  "predict-far-test", "aec-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -4199,6 +4206,21 @@ func applyGateFlags() {
   // this is the reference experience -- the only way to hear what echo costs the
   // feel of a call is to be able to turn the compensation for it off and on.
   if flag("no-headphone-duplex") { Audio.sharedFloor.cfg.headphoneDuplex = false }
+  // Full duplex on LOUDSPEAKERS, while the canceller is measurably delivering.
+  // Ships off -- see `Floor.Cfg.speakerDuplex` for why this one is the exception
+  // to "new audio features go out on by default".
+  if flag("speaker-duplex") { Audio.sharedFloor.cfg.speakerDuplex = true }
+  if let v = arg("speaker-duplex-path"), let d = Float(v) {
+    Audio.sharedFloor.cfg.speakerDuplexPath = d
+  }
+  // The control arm for the linear canceller (0.107.0). Off means the microphone
+  // reaches the wire exactly as captured and the echo veto runs on the 500 ms
+  // correlation alone, which is 0.106.0.
+  if flag("no-aec") { Audio.aecOn = false }
+  if let v = arg("aec-taps"), let d = Int(v) { Audio.aecTaps = d }
+  if let v = arg("aec-mu"), let d = Float(v) { Audio.aecMu = d }
+  // The arm for the overload cut. See `Audio.overloadGuard`.
+  if flag("no-overload-guard") { Audio.overloadGuard = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
@@ -4428,6 +4450,13 @@ if flag("turn-test") {
   exit(TurnRig.selfTest(paths: w.split(separator: ",").map(String.init),
                         owdMs: Double(arg("turn-owd") ?? "40") ?? 40,
                         coupling: Float(Double(arg("turn-coupling") ?? "0.25") ?? 0.25)) ? 0 : 1)
+}
+
+if flag("aec-test") {
+  if flag("aec-trace") { Aec.trace = true }
+  exit(Aec.selfTest(media: arg("aec-media") ?? "testbed/media/real",
+                    sweep: flag("aec-sweep"),
+                    blockN: Int(arg("aec-block") ?? "16") ?? 16) ? 0 : 1)
 }
 
 if flag("floor-test") {
@@ -6268,7 +6297,80 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // headphones.
     "floor_duplex_pct": Audio.sharedFloor.askedBlocks > 0
       ? Double(Audio.sharedFloor.duplexBlocks) / Double(Audio.sharedFloor.askedBlocks) * 100 : 0,
+    // And the share of THAT which the canceller bought rather than a pair of
+    // headphones. Two mechanisms, two claims: a single total could not say which
+    // one a call actually used, and they need completely different follow-up.
+    "floor_aec_duplex_pct": Audio.sharedFloor.askedBlocks > 0
+      ? Double(Audio.sharedFloor.aecDuplexBlocks) / Double(Audio.sharedFloor.askedBlocks) * 100 : 0,
     "floor_hp_duplex": Audio.sharedFloor.cfg.headphoneDuplex ? 1 : 0,
+    "floor_spk_duplex": Audio.sharedFloor.cfg.speakerDuplex ? 1 : 0,
+    // ── THE CANCELLER (0.107.0) ──────────────────────────────────────────────
+    //
+    // `erle_db` is what it is doing NOW, on the blocks where the echo is what the
+    // microphone contains. `erle_life_db` is what this whole call got, cold start
+    // included. Both, because quoting only the first flatters a filter that took
+    // ten seconds to arrive and quoting only the second hides one that is working.
+    //
+    // `mix` is the fraction of the filter's output actually being subtracted, and
+    // it is the honest "is this feature on right now": a canceller that measured
+    // itself as unhelpful and ramped out reports a real 0 here rather than an ERLE
+    // nobody applied. `off_pct` is the share of the call it stood down for.
+    "aec_on": Audio.aecOn ? 1 : 0,
+    "aec_erle_db": audio.aec.erleDb,
+    "aec_erle_life_db": audio.aec.erleLifetimeDb,
+    "aec_erle_all_db": audio.aec.erleAllDb,
+    "aec_mix": Double(audio.aec.mixNow),
+    "aec_residual": Double(audio.aec.residual),
+    "aec_off_pct": audio.aec.blocks > 0
+      ? Double(audio.aec.offBlocks) * 100 / Double(audio.aec.blocks) : 100,
+    "aec_delay_ms": Double(audio.aec.delayNow) / SR * 1000,
+    // The two-path rule's own numbers: how often a measurably better filter took
+    // over the audio, how often the adapting copy had to be restarted, and how
+    // often the backstop had to zero the one on the audio. The last should be 0 --
+    // it is published so that "should be" is a reading.
+    "aec_transfers": audio.aec.transfers,
+    "aec_bg_resets": audio.aec.bgResets,
+    "aec_diverges": audio.aec.diverges,
+    "aec_reaims": audio.aec.reaims,
+    "aec_cost_us_p99": audio.aec.cost.p(0.99) ?? -1,
+    // ── AND THE DENOMINATORS THAT MADE THE VETO UNREADABLE ───────────────────
+    //
+    // One live call reported `a_corr_veto_pct` 6.9% while the correlation was over
+    // threshold in 23 of 69 beats -- a third of the call -- and there was no way
+    // to tell "it is catching only the wrong moments" from "the level test was
+    // already right for the other 26%, so there was nothing left to catch". Those
+    // two need completely different work.
+    //
+    //   armed_pct  how much of the call the correlation CLAIMED this microphone
+    //   level_pct  how much of it the level test called a voice
+    //   veto_pct   the intersection -- the only part where the veto changed a
+    //              verdict (`a_corr_veto_pct`, above)
+    //
+    // And on the estimator's own side: `echo_ticks` is how many computations
+    // actually happened against `echo_skips` that could not (no history, a silent
+    // microphone, no best lag) -- a computation that did not happen has always
+    // reported the same as one that found no echo.
+    "a_veto_armed_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.vetoArmedFrames) * 100.0 / Double(audio.micSamples) : 0,
+    "a_level_voice_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.levelVoiceFrames) * 100.0 / Double(audio.micSamples) : 0,
+    "echo_ticks": audio.echoTicks,
+    "echo_skips": audio.echoSkips,
+    "echo_high_pct": audio.echoTicks > 0
+      ? Double(audio.echoHighTicks) * 100.0 / Double(audio.echoTicks) : -1,
+    "aec_unveto_ticks": audio.aecUnvetoTicks,
+    // ── AND "IS THE MICROPHONE HOT" AS A QUESTION WITH AN ANSWER ─────────────
+    //
+    // `a_mic_peak` beside these is a LIFETIME maximum and is never reset, so a
+    // call whose first sentence hit 2.58 before the trim converged reports 2.58 in
+    // every beat for the rest of its life. These are per-tick with a denominator:
+    // the level at the last tick before and after the trim, and the share of ticks
+    // the output was over full scale.
+    "a_mic_peak_now": Double(audio.micPeakNow),
+    "a_mic_raw_peak_now": Double(audio.micRawPeakNow),
+    "a_mic_hot_pct": audio.gainTicksAll > 0
+      ? Double(audio.hotTicks) * 100.0 / Double(audio.gainTicksAll) : 0,
+    "mic_overload_cuts": audio.overloadCuts,
     // ── THE INTERJECTION RESCUE, COUNTED (0.99.0) ───────────────────────────
     //
     // `turn_onset_lost` is the defect: whole utterances that never reached the
@@ -6758,6 +6860,23 @@ func reportLoop() {
                  Audio.sharedFloor.farPredictedReleases,
                  Audio.sharedFloor.farPredictedSavedMs,
                  Audio.sharedFloor.farEndProbPeak) + "\n", stderr)
+  }
+  // ── THE CANCELLER, ON EVERY CALL, IN THE ORDINARY REPORT ─────────────────
+  //
+  // Not behind a debug flag. The last canceller this project had was diagnosed
+  // out of a stderr log because nothing else could see it, and the reason the
+  // echo veto's 6.9% was unreadable for a whole release is that the numbers
+  // beside it did not exist. This prints only when the thing has actually run,
+  // so a headphone call and a call with no echo path say nothing.
+  if Audio.aecOn, audio.aec.ranBlocks > 0 {
+    let path = Double(audio.aec.echoPathNow)
+    fputs(String(format: "  echo: %.0f dB removed (call %.0f dB), %.0f dB of the path left"
+               + " -- aimed %.0f ms, subtracting %.0f%%, %d handovers%@\n",
+                 audio.aec.erleDb, audio.aec.erleLifetimeDb,
+                 20 * log10(max(1e-4, path)),
+                 Double(audio.aec.delayNow) / SR * 1000,
+                 Double(audio.aec.mixNow) * 100, audio.aec.transfers,
+                 audio.aec.diverges > 0 ? "  \(audio.aec.diverges) RESETS" : ""), stderr)
   }
   if flag("floor-debug"), t.floorBlocks > 0 {
     let n = Double(t.floorBlocks)

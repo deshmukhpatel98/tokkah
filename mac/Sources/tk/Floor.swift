@@ -271,6 +271,65 @@ final class Floor {
     /// `--no-headphone-duplex` is the control arm and restores 0.106.0: strict
     /// applied to every route.
     var headphoneDuplex = true
+    /// ── AND THE SAME THING ON LOUDSPEAKERS, WHEN THE ECHO IS GONE (0.107.0) ───
+    ///
+    /// Headphones get full duplex because there is no acoustic path. A loudspeaker
+    /// with a converged linear canceller in front of it has a path with 19 dB
+    /// taken out of it, which is not the same thing as no path -- but it is the
+    /// same argument with a number in it, and the number is measured on every
+    /// block (`Aec.erleDb`, fed in as `aecErleDb`).
+    ///
+    /// So this is a floor that stands down on the EVIDENCE rather than on the
+    /// route: while the canceller is delivering `speakerDuplexErleDb`, both
+    /// microphones may be open; the moment it is not, the floor re-engages, and
+    /// the ERLE it reads collapses back within about 40 ms because the measurement
+    /// is a leaky average and not a latch. Nothing here can be entombed by its own
+    /// action -- the canceller keeps measuring whether the floor is standing down
+    /// or not.
+    ///
+    /// ── AND IT SHIPS OFF, WHICH IS A DELIBERATE EXCEPTION ─────────────────────
+    ///
+    /// New audio features go out ON by default in this project. This one does not,
+    /// and the reason is that no rig on this machine can measure the thing it
+    /// depends on: both ends of any local rig share one speaker and one microphone
+    /// (`same-room-is-a-test-artifact`), so 19 dB against a SIMULATED room is the
+    /// only evidence that exists, and a simulated room has no loudspeaker
+    /// nonlinearity in it -- which is precisely the part a linear filter cannot
+    /// cancel. Turning this on without a real two-room call is asking somebody to
+    /// find out mid-conversation whether their call is full of echo, and echo is
+    /// the single thing this user has reported most.
+    ///
+    /// `--speaker-duplex` turns it on for exactly that call. The beat then carries
+    /// `aec_erle_db` and `floor_duplex_pct`, so one real two-room call answers it.
+    var speakerDuplex = false
+    /// ── AND THE BAR IS WHAT IS LEFT, NOT WHAT WAS REMOVED ────────────────────
+    ///
+    /// The first version of this gated on the canceller's ERLE, and ERLE is the
+    /// wrong quantity. It is a report card on the filter, and what decides whether
+    /// two live microphones can sit next to two live loudspeakers is how much of
+    /// the far end's voice comes BACK to them -- the room's coupling with the
+    /// cancellation taken out of it. Measured in `--turn-test`: the same filter in
+    /// the same room scored 6.8 dB on one end and 15.6 on the other, because one
+    /// end simply had less echo to remove. Gating on ERLE would have refused the
+    /// end with less echo and admitted the end with more.
+    ///
+    /// 0.05 is -26 dB: the far end gets back at most 5% of what they sent, under
+    /// the near person's voice. It is a demanding bar and it is meant to be --
+    /// this is the one switch in the product that can put two open microphones in
+    /// two live rooms, and the cost of being generous is the worst sound this
+    /// thing makes.
+    ///
+    /// The honest number beside it, because it is the reason this ships off:
+    /// linear subtraction measured 19 dB in a simulated conversation and 25 in
+    /// far-only stretches, which against a laptop's 0.5-0.8 coupling leaves an
+    /// effective path around -20 to -25 dB. Telephony wants -40 dB before echo
+    /// stops being perceptible, and the missing 15-20 dB is exactly the part every
+    /// other product buys with SPECTRAL SUPPRESSION -- which is what makes voices
+    /// sound underwater and is the thing this user rejected, correctly. So a
+    /// linear canceller alone is a large win for the CLASSIFIER (a voice under
+    /// echo is no longer mistaken for the echo) and is not on its own a licence to
+    /// open both microphones. That is what this threshold encodes.
+    var speakerDuplexPath: Float = 0.05
   }
 
   var cfg = Cfg()
@@ -314,6 +373,10 @@ final class Floor {
   /// in halfway through a sentence, so the answer is a fraction and not a flag
   /// (`counted-without-a-denominator`).
   private(set) var duplexBlocks = 0
+  /// The share of the stand-down that was bought by the canceller rather than by
+  /// a pair of headphones. Separate, because they are different claims and a
+  /// single total could not say which one a call used.
+  private(set) var aecDuplexBlocks = 0
   private(set) var askedBlocks = 0
   /// Rig-only window into the release decision. Never read in production.
   var dbg: String {
@@ -386,6 +449,14 @@ final class Floor {
   /// call is fully duplex in the ear. Applying a route's property to a route
   /// that does not have it is `directional-property-measured-at-wrong-end`.
   var speakers = true
+  /// What the linear canceller is currently achieving, in dB, on the blocks where
+  /// the echo is what the microphone contains. Fed from `Aec.erleDb` as a scalar,
+  /// like every other input this file takes. 0 when there is no canceller.
+  var aecErleDb: Double = 0
+  /// What is LEFT of this room's echo path after the canceller, as a linear
+  /// fraction of the loudspeaker's output. 1 means "no canceller, or it is not
+  /// working" -- the value that opens nothing.
+  var aecEchoPath: Float = 1
   /// ── A CAMERA SAYS THIS PERSON IS TALKING (0.100.0) ──────────────────────────
   ///
   /// Fed from `Mouth`, and true only when a face is actually visible and its
@@ -509,13 +580,22 @@ final class Floor {
     // the machine must never do at that instant is resume from a stale belief
     // formed a minute ago about who was talking. `.idle` is this file's OPEN
     // state and re-entering from it can only ever open a microphone.
-    if cfg.headphoneDuplex, !speakers {
+    // Headphones have no path. Loudspeakers have one with the canceller's
+    // measured ERLE taken out of it, and `speakerDuplex` says how much is enough.
+    // Two conditions, one consequence, and they are kept separate because they
+    // are different claims about the world: one is a fact about hardware and the
+    // other is a live measurement (`one-condition-two-concerns`).
+    let noPath = !speakers && cfg.headphoneDuplex
+    let pathCancelled = speakers && cfg.speakerDuplex
+      && aecEchoPath <= cfg.speakerDuplexPath
+    if noPath || pathCancelled {
       state = .idle
       wasState = .idle
       nearClaimMs = 0; farClaimMs = 0; holderQuietMs = 0; heldDownMs = 0
       nearVoiceMs = 0; farVoiceMs = 0; playoutHold = 0
       inGrace = false; farWrapping = false
       duplexBlocks += 1
+      if pathCancelled { aecDuplexBlocks += 1 }
       // NOT reported as `fallback`. That field means "this end stopped
       // believing the far end and is running blind", which is a degradation;
       // this is the opposite, and one flag answering both questions is
@@ -1789,6 +1869,59 @@ extension Floor {
     let d5 = h5.step(dt: 0.02, near: .backchannel)
     say(d5.mayTransmit,
         "and a word spoken the block after they come off is out at once, not held by a stale hold")
+
+    // ── 19. LOUDSPEAKERS, ON THE CANCELLER'S EVIDENCE ───────────────────────
+    //
+    // Four rows, and the fourth is the one that matters: this must NEVER stand
+    // down on a speaker whose echo is still there. A floor that opened on a hope
+    // is worse than no floor at all, because the person finds out by hearing
+    // themselves.
+    func spk(_ path: Float, on: Bool) -> Floor {
+      let f = Floor()
+      f.cfg.strict = true
+      f.cfg.speakerDuplex = on
+      f.speakers = true
+      f.aecEchoPath = path
+      f.yieldsOnTie = true
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      f.noteFar(.claim)
+      _ = f.step(dt: 0.02, near: .quiet)
+      return f
+    }
+    let p1 = bothTalk(spk(0.02, on: true))            // -34 dB left
+    say(p1.lostMs == 0,
+        "speakers with the echo path down to -34 dB: 2 s of overlap loses nothing"
+        + " (\(Int(p1.lostMs)) ms)")
+    let p2 = bothTalk(spk(0.20, on: true))            // -14 dB left: not enough
+    say(p2.lostMs > 800,
+        "speakers with -14 dB still left: the floor stays in force (\(Int(p2.lostMs)) ms lost)")
+    let p3 = bothTalk(spk(0.02, on: false))
+    say(p3.lostMs > 800,
+        "REJECT: without --speaker-duplex -34 dB changes nothing (\(Int(p3.lostMs)) ms lost)"
+        + " -- it ships off")
+    // AND IT FOLLOWS THE MEASUREMENT DOWN. A canceller that stops working
+    // mid-sentence must put the floor back, not keep a stale permission.
+    let p4 = spk(0.02, on: true)
+    say(p4.step(dt: 0.02, near: .claim).mayTransmit, "an open speaker floor transmits")
+    p4.aecEchoPath = 0.4                        // the canceller loses the path
+    // NOT in the next block, and expecting that was the row's first mistake. The
+    // stand-down leaves the machine in `idle`, which is this file's OPEN state, so
+    // an end that is mid-sentence legitimately takes the empty floor back and is
+    // heard while the contest resolves -- the ordinary 180 ms plus the 400 ms
+    // grace window, exactly as it would be at any other barge-in. What must
+    // happen is that the floor comes back at all, on its normal timescale, rather
+    // than a stale permission outliving the measurement that granted it.
+    var reengagedMs = -1.0
+    for i in 0..<60 {                           // 1.2 s
+      p4.noteFar(.claim)
+      if !p4.step(dt: 0.02, near: .claim).mayTransmit {
+        reengagedMs = Double(i) * 20; break
+      }
+    }
+    say(reengagedMs >= 0 && reengagedMs < 700,
+        "and the floor comes back \(Int(reengagedMs)) ms after the cancellation does"
+        + " -- a stale permission cannot outlive its measurement")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

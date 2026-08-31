@@ -30,6 +30,9 @@ harder:
 - **The holder's speaker is closed on every route,** headphones included. The
   rule is a product statement now, not an echo measure — and with the far
   microphone muted there is nothing real for a talker's speaker to carry.
+  **Retired for headphones in 0.107.0** — see the next section. That argument is
+  circular: the far microphone is only muted *because of echo*, so on a route
+  with no echo path the premise is gone and the conclusion goes with it.
 
 What strict cannot remove is the speed of light: two people who start inside
 one hop of each other both take an empty floor, and the deadlock break then
@@ -41,6 +44,72 @@ last window is counted on every live call as `strict_overlap_pct`.
 `--floor-soft` is the control arm and restores the 0.94.0 behaviour described
 below. The soft rules remain documented because they are the fallback arm and
 the self-tests keep both honest.
+
+## Headphones have no floor at all (0.107.0)
+
+On headphones there is no acoustic path from the earcup to the microphone. Not a
+weak one — none. Every single thing the floor does exists to pay for that path,
+so on headphones the whole layer stands down:
+
+> **Both microphones open, both ears open, for the entire call. No contest, no
+> handover, no grace window to bound, no deadlock to break.**
+
+Zero turn latency, by construction rather than by tuning. What that is worth, from
+`--floor-test`, measuring the end that *loses* — two people talking over each
+other for two seconds, this end's ordering says it gives:
+
+| | speech lost |
+|---|---|
+| loudspeakers (unchanged) | **1600 ms** of 2000 |
+| headphones, 0.106.0 | 1600 ms |
+| headphones, 0.107.0 | **0 ms** |
+
+And a holder's own ear, which 0.106.0 closed for 940 ms of every second on
+headphones, never closes.
+
+Every row is paired with its control arm (`--no-headphone-duplex`) *and* with the
+loudspeaker arm, because "headphones are full duplex now" is trivially passed by a
+floor that stopped working. The loudspeaker arm loses the same 1600 ms as the
+control, to within 60 ms: the route is the only thing this changed.
+
+Two properties are load-bearing:
+
+- **It is decided per END, from that end's own route.** My earcups say nothing
+  about whether their laptop speaker feeds their microphone, and their floor
+  answers that locally exactly as mine does
+  (`directional-property-measured-at-wrong-end`).
+- **The stand-down leaves the machine in `idle`, not in a frozen hold.**
+  Headphones come out mid-sentence. What the floor must never do at that instant
+  is resume from a belief formed a minute ago about whose turn it was — `idle` is
+  this file's OPEN state, and re-entering from it can only ever open a
+  microphone. Asserted: a word spoken the block after the headphones come off is
+  on the wire at once.
+
+Counted on every call as `floor_duplex_pct`, because a route can change halfway
+through a sentence and the answer is a fraction, not a flag.
+
+**And it is the reference experience.** A call where none of this machinery runs is
+the only honest measurement of what echo costs the *feel* of this product, which
+no rig on one machine can produce (`same-room-is-a-test-artifact`). If headphone
+calls feel like a conversation and speaker calls do not, the gap is echo, in
+milliseconds, not in theory.
+
+## Loudspeakers, on evidence rather than on a route (0.107.0, off by default)
+
+`--speaker-duplex` applies the same stand-down to loudspeakers, but only while a
+linear canceller (`mac/Sources/tk/Aec.swift`) has the remaining echo path measured
+below `speakerDuplexPath` (−26 dB). The floor re-engages within one contest window
+of the measurement going away, and nothing here can be entombed by its own action:
+the canceller keeps measuring whether the floor is standing down or not.
+
+**It ships off, and that is a deliberate exception** to this project's rule that
+new audio features go out on by default. The reason is that the evidence does not
+exist yet: both ends of any rig on this machine share one speaker and one
+microphone, so ~19 dB against a *simulated* room is all there is, and a simulated
+room has no loudspeaker nonlinearity in it — precisely the part a linear filter
+cannot cancel. Measured in `--turn-test`, the honest number is that linear
+subtraction leaves the echo path at **−18.5 dB p50**, and −40 dB is where echo
+stops being perceptible. See `ECHO.md`.
 
 ## Interrupting, and the 1150 ms nobody could see (0.99.0)
 

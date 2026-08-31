@@ -31,12 +31,57 @@ import Foundation
 // two-room call does that, and this rig does not claim otherwise.
 enum TurnRig {
 
+  /// One end's results. A struct rather than the eleven-field tuple this used to
+  /// be: 0.107.0 needed four more numbers on it, and a fifteen-field tuple is a
+  /// place where two of them get swapped without anything failing.
+  struct RigEnd {
+    var lost: Double = 0, speech: Double = 0, worst: Double = 0, ducked: Double = 0
+    var onsetP50: Double = -1, onsetMax: Double = -1
+    var onsetsLost = 0
+    var hP50: Double = -1, hMax: Double = -1
+    var hN = 0, hLost = 0
+    /// What the canceller achieved on this end, and how much of the call the
+    /// floor stood down for. Zero in every arm that does not run one.
+    var erle: Double = 0, erleLife: Double = 0, mix: Double = 0
+    /// The echo path that is LEFT after cancelling, which is what decides whether
+    /// the floor may stand down. 1 when no canceller ran.
+    var echoPath: Double = 1
+    var echoPathBest: Double = 1
+    var pathN = 0
+    var duplexPct: Double = 0
+  }
+
   /// One end: its own voice, the room's copy of the far end, and the two things
   /// that decide whether it is heard.
   private final class End {
     let gate = Audio.DuplexGate()
     let floor = Floor()
+    /// ── AND A CANCELLER, AND A ROOM WITH A DELAY IN IT (0.107.0) ─────────────
+    ///
+    /// The room used to be `coupling * farPlayed[k]` -- the far end's block added
+    /// to this microphone with no delay at all. That is enough to make the
+    /// classifier face the ambiguity it exists for, which is what this rig was
+    /// built to measure, and it is NOT enough to test anything that subtracts: a
+    /// zero-delay single-tap echo is the one echo path both a real room and a real
+    /// canceller never meet, and a filter aimed at a delay of zero would pass a
+    /// test it would fail on a desk (`fixture-is-not-the-real-shape`).
+    ///
+    /// So the room is now the same one `Audio.armEchoSim` and `--aec-test` build:
+    /// a measured delay plus four reflections out to 13 ms, fed from a history of
+    /// what this end's SPEAKER emitted -- which is what the product's `emitHist`
+    /// holds and what the canceller subtracts.
+    let aec = Aec()
+    var ring = [Float](repeating: 0, count: 48000)
+    var ringW = 0
     var voice: [Float] = []
+    /// Every block's remaining echo path while the canceller was actually
+    /// subtracting. A LIST and not a last value: the first version of this
+    /// reported `echoPathNow` at the end of the run, which is a block where the
+    /// far end had stopped talking and the measurement had reverted to its "no
+    /// evidence" default of 1.0 -- so a canceller doing real work reported
+    /// 0.0 dB of echo removed. A birth certificate, again
+    /// (`once-fired-probes-record-transients`).
+    var pathSamples: [Double] = []
     /// What the floor last said about this end's speaker. The echo the room
     /// returns depends on it, so the rig has to carry it block to block.
     var lastPlayoutOpen = true
@@ -154,7 +199,7 @@ enum TurnRig {
   /// stops -- which is the only genuinely hard moment and the reason any of this
   /// exists. The pathological version is still run, as a named stress arm, and
   /// judged on a different bar.
-  private static func envelope(_ x: inout [Float], mine: Bool,
+  static func envelope(_ x: inout [Float], mine: Bool,
                                turnS: Double, overlapS: Double) {
     guard turnS > 0 else { return }
     let period = turnS * 2
@@ -173,8 +218,9 @@ enum TurnRig {
   static func run(paths: [String], owdMs: Double, coupling: Float,
                   floorOn: Bool, blockN: Int,
                   turnS: Double, overlapS: Double, strict: Bool = true,
-                  idleTakesAnyVoice: Bool = true) -> (a: (lost: Double, speech: Double, worst: Double, ducked: Double, onsetP50: Double, onsetMax: Double, onsetsLost: Int, hP50: Double, hMax: Double, hN: Int, hLost: Int),
-                                                  b: (lost: Double, speech: Double, worst: Double, ducked: Double, onsetP50: Double, onsetMax: Double, onsetsLost: Int, hP50: Double, hMax: Double, hN: Int, hLost: Int)) {
+                  idleTakesAnyVoice: Bool = true,
+                  aecOn: Bool = false, spkDuplex: Bool = false,
+                  echoDelayMs: Double = 31) -> (a: RigEnd, b: RigEnd) {
     let a = End(), b = End()
     a.floor.yieldsOnTie = true
     b.floor.yieldsOnTie = false
@@ -182,15 +228,24 @@ enum TurnRig {
       e.floor.speakers = true
       e.floor.cfg.strict = strict
       e.floor.cfg.idleTakesAnyVoice = idleTakesAnyVoice
+      e.floor.cfg.speakerDuplex = spkDuplex
       e.gate.cfg = Audio.Gate()
+      e.aec.cfg.on = aecOn
+      // The rig supplies the aim the estimator would: it knows the delay it
+      // built, and the estimator's job -- finding it -- is proven separately in
+      // `--corr-test`. A rig that re-tested the estimator here would be testing
+      // two things and able to say which one failed for neither.
+      e.aec.aim(delaySamples: Int(echoDelayMs / 1000 * SR), corr: 0.8)
       e.floor.noteFar(.quiet, transitMs: owdMs)
     }
+    let roomTaps = Aec.roomTaps()
+    let echoD = max(1, Int(echoDelayMs / 1000 * SR))
     a.voice = (Predict.readWav(Self.locate(paths[0]))?.pcm) ?? []
     b.voice = (Predict.readWav(Self.locate(paths[1]))?.pcm) ?? []
     envelope(&a.voice, mine: true, turnS: turnS, overlapS: overlapS)
     envelope(&b.voice, mine: false, turnS: turnS, overlapS: overlapS)
     let n = min(a.voice.count, b.voice.count)
-    guard n > blockN * 4 else { return ((0, 0, 0, 0, -1, -1, 0, -1, -1, 0, 0), (0, 0, 0, 0, -1, -1, 0, -1, -1, 0, 0)) }
+    guard n > blockN * 4 else { return (RigEnd(), RigEnd()) }
 
     let dtMs = Double(blockN) / SR * 1000
     let hop = max(1, Int((owdMs / 1000 * SR).rounded()) / blockN)   // in blocks
@@ -231,9 +286,22 @@ enum TurnRig {
         // and the other person waited on a cue that never came. The room has to
         // be the room the product builds.
         let earOpen = me.lastPlayoutOpen
+        // What this end's SPEAKER emitted, into its own history -- the ear mute is
+        // applied here because a closed speaker emits nothing, and the canceller
+        // must subtract what was emitted rather than what was decoded. Same
+        // distinction as `emitHist` against `echoHist` in Audio.swift.
+        for k in 0..<blockN {
+          me.ring[(me.ringW + k) % me.ring.count] = earOpen ? farPlayed[k] : 0
+        }
+        me.ringW += blockN
         var peak: Float = 0
         for k in 0..<blockN {
-          mic[k] = src[i + k] + (earOpen ? coupling * farPlayed[k] : 0)
+          var e: Float = 0
+          for (t, g) in roomTaps {
+            let idx = me.ringW - blockN + k - echoD - t
+            if idx >= 0 { e += g * me.ring[((idx % me.ring.count) + me.ring.count) % me.ring.count] }
+          }
+          mic[k] = src[i + k] + coupling * e
           peak = max(peak, abs(src[i + k]))
         }
         // Ground truth: was this person REALLY speaking in this block? Taken
@@ -252,6 +320,33 @@ enum TurnRig {
         // the whole of A's turn: 35% of A silenced by a rig artefact that looked
         // exactly like a product defect. `fixture-is-not-the-real-shape`.
         for k in 0..<blockN { me.gate.noteFar(farPlayed[k]) }
+        // ── SUBTRACT, THEN CLASSIFY ────────────────────────────────────────────
+        //
+        // The same order as the capture callback: the raw microphone's peak is
+        // taken first (the coupling tracker needs the room, not the cleaned
+        // signal), then the canceller runs, then the gate sees what is left and
+        // its echo bar is scaled by what was actually removed.
+        var rawPk: Float = 0
+        for k in 0..<blockN { rawPk = max(rawPk, abs(mic[k])) }
+        if aecOn {
+          mic.withUnsafeMutableBufferPointer { m in
+            me.ring.withUnsafeMutableBufferPointer { r in
+              me.aec.process(m.baseAddress!, blockN, ref: r.baseAddress!,
+                             refW: me.ringW, refCap: r.count)
+            }
+          }
+        }
+        me.gate.rawPeakIn = rawPk
+        me.gate.echoResidual = aecOn ? me.aec.residual : 1
+        me.floor.aecErleDb = aecOn ? me.aec.erleDb : 0
+        let pathNow = aecOn ? me.aec.echoPathNow : 1
+        me.floor.aecEchoPath = pathNow
+        // Only while it is actually subtracting: a block where the canceller has
+        // stood down has no opinion about the echo path, and recording its
+        // default as a measurement is how the number read 0.0 dB.
+        if aecOn, me.aec.mixNow > 0.05, me.pathSamples.count < 200_000 {
+          me.pathSamples.append(Double(pathNow))
+        }
         // The floor's fastest witness that the holder stopped is the far
         // stream going silent in this speaker, and a rig that never fed it
         // could not measure the release it drives -- it would sit inert and
@@ -292,10 +387,24 @@ enum TurnRig {
       }
       i += blockN; blk += 1
     }
-    return ((a.lostMs, a.speechMs, a.worstRunMs, a.duckedMs, a.onsetP50, a.onsetMax, a.onsetsLost,
-             a.handoverP50, a.handoverMax, a.handoverN, a.handoversLost),
-            (b.lostMs, b.speechMs, b.worstRunMs, b.duckedMs, b.onsetP50, b.onsetMax, b.onsetsLost,
-             b.handoverP50, b.handoverMax, b.handoverN, b.handoversLost))
+    func pack(_ e: End) -> RigEnd {
+      var r = RigEnd()
+      r.lost = e.lostMs; r.speech = e.speechMs; r.worst = e.worstRunMs; r.ducked = e.duckedMs
+      r.onsetP50 = e.onsetP50; r.onsetMax = e.onsetMax; r.onsetsLost = e.onsetsLost
+      r.hP50 = e.handoverP50; r.hMax = e.handoverMax; r.hN = e.handoverN
+      r.hLost = e.handoversLost
+      r.erle = e.aec.erleDb
+      r.erleLife = e.aec.erleLifetimeDb
+      r.mix = Double(e.aec.mixNow)
+      let ps = e.pathSamples.sorted()
+      r.echoPath = ps.isEmpty ? 1 : ps[ps.count / 2]
+      r.echoPathBest = ps.first ?? 1
+      r.pathN = ps.count
+      r.duplexPct = e.floor.askedBlocks > 0
+        ? Double(e.floor.duplexBlocks) * 100 / Double(e.floor.askedBlocks) : 0
+      return r
+    }
+    return (pack(a), pack(b))
   }
 
   /// ── A RIG WHOSE ANSWER DEPENDS ON THE WORKING DIRECTORY IS A TRAP ─────────
@@ -360,18 +469,42 @@ enum TurnRig {
       let old = run(paths: paths, owdMs: owdMs, coupling: coupling, floorOn: true,
                     blockN: bn, turnS: turnS, overlapS: overlapS, strict: true,
                     idleTakesAnyVoice: false)
+      // ── THE TWO 0.107.0 ARMS ───────────────────────────────────────────────
+      //
+      // `aec` is strict WITH the canceller: the floor is unchanged and the only
+      // difference is that the microphone reaching the classifier has the
+      // loudspeaker subtracted out of it. `dup` is the canceller PLUS the floor
+      // standing down on speakers while the cancellation is measurably there --
+      // which is the whole point of building the canceller, and the number this
+      // rig exists to produce.
+      let aecArm = run(paths: paths, owdMs: owdMs, coupling: coupling, floorOn: true,
+                       blockN: bn, turnS: turnS, overlapS: overlapS, strict: true,
+                       aecOn: true)
+      let dup = run(paths: paths, owdMs: owdMs, coupling: coupling, floorOn: true,
+                    blockN: bn, turnS: turnS, overlapS: overlapS, strict: true,
+                    aecOn: true, spkDuplex: true)
       guard off.a.speech > 500 else {
         print("  no speech loaded from \(paths) -- rig cannot see anything"); return false
       }
       print("  --- block \(bn) samples ---")
-      for (name, o, sf, f, ol) in [("A", off.a, soft.a, on.a, old.a),
-                                   ("B", off.b, soft.b, on.b, old.b)] {
+      for (name, o, sf, f, ol, ae, du) in
+          [("A", off.a, soft.a, on.a, old.a, aecArm.a, dup.a),
+           ("B", off.b, soft.b, on.b, old.b, aecArm.b, dup.b)] {
         print(String(format: "  floor off  %@  %7.0f ms  %7.0f ms  %7.0f ms  %7.0f ms",
                      name, o.speech, o.lost, o.worst, o.ducked))
         print(String(format: "  soft       %@  %7.0f ms  %7.0f ms  %7.0f ms  %7.0f ms",
                      name, sf.speech, sf.lost, sf.worst, sf.ducked))
         print(String(format: "  STRICT     %@  %7.0f ms  %7.0f ms  %7.0f ms  %7.0f ms",
                      name, f.speech, f.lost, f.worst, f.ducked))
+        print(String(format: "  +aec       %@  %7.0f ms  %7.0f ms  %7.0f ms  %7.0f ms"
+                   + "   erle %.1f dB, echo left p50 %.1f dB best %.1f dB (n=%d)",
+                     name, ae.speech, ae.lost, ae.worst, ae.ducked, ae.erle,
+                     20 * log10(max(1e-4, ae.echoPath)),
+                     20 * log10(max(1e-4, ae.echoPathBest)), ae.pathN))
+        print(String(format: "  +aec+dup   %@  %7.0f ms  %7.0f ms  %7.0f ms  %7.0f ms"
+                   + "   echo left p50 %.1f dB  floor stood down %.0f%% of the call",
+                     name, du.speech, du.lost, du.worst, du.ducked,
+                     20 * log10(max(1e-4, du.echoPath)), du.duplexPct))
         // ── THE BAR ────────────────────────────────────────────────────────────
         //
         // The turn layer may not eat more of somebody's real speech than the
@@ -454,6 +587,36 @@ enum TurnRig {
       ok = false
     }
 
+    // ── WHAT THE CANCELLER BOUGHT, AND WHAT IT DID NOT (0.107.0) ────────────
+    //
+    // Said here in full because the two halves get quoted separately otherwise,
+    // and the second half is the one that decides a product question.
+    //
+    // Measured above, block 16, coupling 0.25, 4 s turns with 300 ms of overlap:
+    //
+    //   STRICT                A silenced for 12862 ms of 19201 (67%)
+    //   + the canceller       10463 ms  -- 19% less, from the classifier alone:
+    //                         a voice under an echo is no longer mistaken for
+    //                         the echo, because the echo is 18 dB smaller
+    //   + speakers full duplex 9745 ms  -- the floor stands down for the 11% of
+    //                         the call where the remaining path is under -26 dB
+    //
+    // And the number that matters more than any of them: the echo path LEFT after
+    // linear subtraction is **-18.5 dB at p50**, best case -33. The bar for
+    // opening two microphones in two live rooms is -26 dB here, and telephony
+    // practice says -40 dB before echo stops being perceptible at all.
+    //
+    // So linear subtraction is a large, real win for the classifier and it is NOT
+    // on its own a licence for full duplex on loudspeakers. The missing 15-20 dB
+    // is exactly what every other product buys with spectral suppression -- the
+    // thing that makes voices sound underwater, and the thing this user rejected.
+    // That is why `--speaker-duplex` ships OFF and why its threshold is the
+    // remaining path rather than the canceller's ERLE.
+    //
+    // The A-silenced FAIL below is pre-existing (it fails identically at 0.106.0)
+    // and is not made to pass here. It is the cost of the strict floor on
+    // loudspeakers, in milliseconds of real speech, and it is the thing the next
+    // release has to remove rather than re-label.
     print(ok ? "TURN RIG PASSED" : "TURN RIG FAILED")
     return ok
   }

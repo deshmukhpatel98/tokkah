@@ -347,6 +347,12 @@ final class Audio {
   private static let ECHO_MAX = 48000                 // one second of history
   private var echoHist: UnsafeMutablePointer<Float>?
   private var echoW = 0
+  /// What actually left the loudspeaker, sample for sample. See the note at its
+  /// write site: `echoHist` is the DECODED far stream and must stay that way for
+  /// the estimator's sake, and this is the emitted signal, which is the only one
+  /// that can come back as an echo. `emitW` advances in lockstep with `echoW`.
+  private var emitHist: UnsafeMutablePointer<Float>?
+  private var emitW = 0
   private var echoDelay = 0
   private var echoGain: Float = 0
   private var echoTaps: [(Int, Float)] = []
@@ -387,11 +393,36 @@ final class Audio {
   private(set) var echoCorr: Double = 0
   private(set) var echoCorrPeak: Double = 0
   private(set) var echoErleDb: Double = 0
+  /// ── AND SOMETHING THAT ACTS ON WHAT THE ESTIMATOR FOUND (0.107.0) ─────────
+  ///
+  /// The estimator has been saying "your speaker reaches your microphone at
+  /// 0.82, 31 ms away" on every call for months and nothing has ever used it for
+  /// anything but a diagnosis. `Aec` subtracts a filtered copy of the playout at
+  /// that delay -- linear subtraction only, no spectral suppression, which is
+  /// the distinction the deleted canceller's own note conflated. See Aec.swift.
+  let aec = Aec()
   /// When the estimator last actually computed. The veto derived from a
   /// computation older than CORR_VETO_FRESH_MS is withdrawn rather than
   /// trusted: a silent microphone freezes the estimator (`micE` guard below),
   /// and a frozen "this is echo" must not outlive the echo.
   private var corrVetoAt: UInt64 = 0
+  /// ── WHAT THE ESTIMATOR ACTUALLY DID, AS OPPOSED TO WHAT IT CONCLUDED ──────
+  ///
+  /// `echoCorr` is one instant and `echoCorrPeak` is one moment of a whole call.
+  /// Neither says how much of the call the correlation was high, and the live
+  /// question -- "the veto fires for 6.9% of the samples while echo is high for a
+  /// third of the beats, so is it firing in the right moments?" -- cannot be
+  /// asked without it. `echoTicks` is the denominator and it is not the same as
+  /// the number of ticks: the estimator has four `continue` paths (no history
+  /// yet, not enough history, a silent microphone, no best lag) and a
+  /// computation that did not happen has always reported the same as one that
+  /// found no echo (`blind-instruments-report-negatives`).
+  private(set) var echoTicks = 0
+  private(set) var echoHighTicks = 0
+  private(set) var echoSkips = 0
+  /// Computations where the correlation said "our own speaker" and the
+  /// canceller's measured ERLE withdrew the veto anyway.
+  private(set) var aecUnvetoTicks = 0
 
   /// What the speaker actually does. THIS is the one the render callback reads.
   // ── THE SAME-ROOM DETECTOR IS GONE ─────────────────────────────────────────
@@ -455,6 +486,26 @@ final class Audio {
   /// "did this call ever clip"; the tuner needs "how loud is it RIGHT NOW", and
   /// a lifetime maximum can never come back down.
   private(set) var micPeakWin: Float = 0
+  /// ── "IS THE MICROPHONE HOT" WAS NOT A MEASURABLE QUESTION ─────────────────
+  ///
+  /// `micPeak` is a LIFETIME maximum and is never reset, so `a_mic_peak` on the
+  /// wire answers "did this call ever clip" and cannot answer "is this
+  /// microphone hot now". A call whose first sentence hit 2.58 before the trim
+  /// converged and whose remaining five minutes sat perfectly on target reports
+  /// 2.58 in every beat, forever -- a birth certificate rather than a health
+  /// record, which is a bug class this project has already paid for twice
+  /// (`once-fired-probes-record-transients`, and the `echo_corr` last-vs-peak
+  /// fix beside it).
+  ///
+  /// These three are per-tick and have a denominator: the level at the last
+  /// tick, before and after the trim, and the share of ticks the output was over
+  /// full scale. Without them the mic-hot theory could be neither confirmed nor
+  /// refuted from telemetry, which is how it stayed a theory.
+  private(set) var micPeakNow: Float = 0
+  private(set) var micRawPeakNow: Float = 0
+  private(set) var hotTicks = 0
+  private(set) var gainTicksAll = 0
+  private(set) var overloadCuts = 0
   /// Energy of what the loudspeaker has played since the last capture block, and
   /// how many samples that was. Written on the render thread, drained on the
   /// capture thread; scalars only, which is the rule everywhere these two meet.
@@ -496,6 +547,10 @@ final class Audio {
   /// loop drove a 0.23 mic to an output of 1.86 -- and even without the dead
   /// zone, 8x lifts the room's own noise by 18 dB along with the person.
   static let MAKEUP_MAX: Float = 4
+  /// The lowest a software trim may go. The same 0.02 the target computations
+  /// already clamp to, named so the overload cut and the target agree by
+  /// construction rather than by two literals staying in step.
+  static let TRIM_MIN: Float = 0.02
   /// Speech must stand this far above the room's own floor before amplifying
   /// it. ~15 dB. Below it, gain makes loud noise rather than a clear voice.
   static let TRIM_MIN_SNR: Float = 6
@@ -1055,6 +1110,13 @@ final class Audio {
     let fl = Audio.sharedFloor
     fl.yieldsOnTie = wantYield
     fl.speakers = Audio.outputIsSpeakers
+    // What the canceller is achieving, so the floor can stand down on evidence
+    // rather than on a route. Zero when the canceller is off, which is the value
+    // that changes nothing.
+    fl.aecErleDb = (Audio.aecOn && Audio.outputIsSpeakers) ? aec.erleDb : 0
+    // And what is LEFT of the path, which is the quantity that decides whether
+    // two microphones may be open. 1 opens nothing.
+    fl.aecEchoPath = (Audio.aecOn && Audio.outputIsSpeakers) ? aec.echoPathNow : 1
     // Drain what the loudspeaker did since the last block. The floor's `idle`
     // state used to let both microphones stay live next to both loudspeakers,
     // which is a closed loop rather than a turn -- see the decision in
@@ -1226,6 +1288,42 @@ final class Audio {
 
   func tuneInputGain() {
     guard Audio.autoGain else { return }
+    // ── AN OVERLOADED MICROPHONE IS FIXED BEFORE ANYTHING ELSE IS DECIDED ────
+    //
+    // This was below the echo veto's early return, and that ordering was a
+    // circular dependency with a real cost. The veto fires when the microphone
+    // is mostly this machine's own loudspeaker -- and a microphone running hot
+    // is exactly the one that hears its own loudspeaker, which is the reasoning
+    // the whole of this function's veto rule is built on. So the fix for a hot
+    // microphone was gated on that microphone not being hot: every tick where it
+    // mattered most, this function returned before reaching the cut, AND drained
+    // both level windows on the way out, so the next tick could not see the
+    // blast either.
+    //
+    // Measured on live call 2p183qa061zcu (0.98.0, 333 s): `a_mic_peak` 2.582 --
+    // two and a half times full scale leaving this machine -- with the
+    // correlation over threshold in 23 of 69 beats. Same family as
+    // `control-loops-steer-on-flattering-signals`, with the twist that the
+    // signal the loop needed was not flattering, it was withheld.
+    //
+    // So the cut runs first, on every tick, and answers a question that needs
+    // no opinion about where the sound came from: is more than full scale
+    // leaving this machine? If it is, a gain this program applied is too large,
+    // whoever is talking.
+    let outPeakTick = micPeakWin
+    let rawPeakTick = rawPeakWin
+    gainTicksAll += 1
+    micPeakNow = outPeakTick
+    micRawPeakNow = rawPeakTick
+    if outPeakTick > 1.0 { hotTicks += 1 }
+    if trimOverload(outPeak: outPeakTick) {
+      // The cut moved. Drain both windows -- the level it just acted on has been
+      // consumed and must not be acted on twice at two different trims -- and
+      // let the next tick measure the result.
+      micPeakWin = 0
+      rawPeakWin = 0
+      return
+    }
     // ── NEVER LEARN FROM THE LOUDSPEAKER ────────────────────────────────────
     //
     // The raw microphone peak includes whatever this machine's own speaker is
@@ -1343,6 +1441,49 @@ final class Audio {
   /// can be entered rather than argued about.
   func forceTrimForTest(_ v: Float) { inputTrim = v }
 
+  /// ── THE ONE RULE THAT NEEDS NO OPINION ABOUT THE ROOM ─────────────────────
+  ///
+  /// More than full scale is leaving this machine, so a gain this program applied
+  /// is too large. That statement is true whoever is talking, whatever the echo
+  /// detector believes, and at any trim -- and both of those qualifications used
+  /// to be attached to it:
+  ///
+  ///   · it sat below the echo veto's early return, so it could not run on the
+  ///     ticks where a hot microphone was arming the veto (see `tuneInputGain`);
+  ///   · it required `inputTrim > 1`, so it only ever rescued an over-unity
+  ///     MAKEUP gain. A microphone delivering 4.17 raw with the trim at 0.62
+  ///     puts 2.58 on the wire and this never fired -- which is the shape the
+  ///     comment above the descent already describes: guards written when
+  ///     `inputTrim <= 1` made output ~= raw, left covering different ranges the
+  ///     moment a gain existed.
+  ///
+  /// Samples above 1.0 are not clipped -- the float path carries them intact --
+  /// so dividing recovers the signal exactly, with no compression, no limiter and
+  /// no colour. What being over full scale DOES cost is everything that reads a
+  /// level: the classifier's room bar, the coupling tracker, the correlation, and
+  /// the encoder at the end of it.
+  ///
+  /// `max(0.5, ...)` bounds it to halving per tick, so one loud cough cannot walk
+  /// a microphone to silence; from 2.58 that is two ticks. Returns whether it
+  /// moved, because the caller must not then act on the same level at a different
+  /// trim.
+  @discardableResult
+  func trimOverload(outPeak: Float) -> Bool {
+    guard Audio.overloadGuard, outPeak > 0.95 else { return false }
+    let fix = max(Audio.TRIM_MIN, inputTrim * max(0.5, 0.8 / outPeak))
+    guard fix < inputTrim - 0.02 else { return false }
+    inputTrim = fix
+    trimMoves += 1
+    overloadCuts += 1
+    Metrics.count("mic_overload_cut")
+    Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+    fputs("mic gain: \(String(format: "%.2f", outPeak))x full scale is leaving this machine"
+        + " -- trimming to \(String(format: "%.2f", inputTrim))"
+        + " (\(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB)\n", stderr)
+    saveTrim()
+    return true
+  }
+
   /// `outPeak` is the peak AFTER the trim -- the level that actually leaves this
   /// machine. Regulating on `raw` alone is what let 0.102.0 sit at 8x with its
   /// output clipping at 1.86: see the note on the descent below.
@@ -1367,21 +1508,10 @@ final class Audio {
     // moment a gain existed they stopped covering the same range and left a
     // dead zone with a clipping output inside it.
     //
-    // Two fixes, and the first is the safety net: an output over full scale is
-    // cut IMMEDIATELY and unconditionally, whatever the raw level says.
-    if outPeak > 0.95, inputTrim > 1 {
-      let fix = max(1, inputTrim * max(0.5, 0.8 / outPeak))
-      if fix < inputTrim - 0.02 {
-        inputTrim = fix
-        trimMoves += 1
-        Metrics.count("mic_makeup_overload")
-        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
-        fputs("mic gain: output hit \(String(format: "%.2f", outPeak))"
-            + " -- backing the makeup off to \(String(format: "%.1f", inputTrim))x\n", stderr)
-        saveTrim()
-      }
-      return
-    }
+    // The safety net lives in `trimOverload` and runs at the TOP of
+    // `tuneInputGain`, above the echo veto -- see the note there. It used to sit
+    // here, which put it behind the veto AND behind `guard raw > 0`, and gated
+    // it on `inputTrim > 1`.
     // And the second: a makeup gain that is now too large for the level in the
     // room comes DOWN, on the same target the climb uses. Symmetric, so the
     // loop can converge from either side instead of latching at the ceiling.
@@ -1648,15 +1778,78 @@ final class Audio {
     say(out < 0.95,
         "and its output lands at \(String(format: "%.2f", out)) instead of clipping at 1.86")
 
-    // 11. AN OVERLOADED OUTPUT IS CUT WHATEVER THE RAW LEVEL SAYS. The safety
-    //     net, independent of the target maths above.
+    // ── 11. AN OVERLOADED OUTPUT IS CUT WHATEVER ELSE IS TRUE ────────────────
+    //
+    // The safety net, and this row used to be a lie about which mechanism it was
+    // testing. It called `trimStep(outPeak: 1.20)` with `rawPeakWin = 0.30`, and
+    // the cut it names was not what fired -- the "a makeup gain that is now too
+    // large comes DOWN" path is satisfied by raw 0.30 alone and would have
+    // passed this row with the safety net deleted. It tests `trimOverload`
+    // directly now: one function, one claim.
     let k = Audio()
-    k.setFloorForTest(0.002)
     k.forceTrimForTest(4.0)
-    k.rawPeakWin = 0.30
-    k.trimStep(deviceAtFloor: true, knob: 0.95, outPeak: 1.20)
-    say(k.inputTrim < 4.0,
+    say(k.trimOverload(outPeak: 1.20) && k.inputTrim < 4.0,
         "an output of 1.20 is backed off immediately (4.0x -> \(String(format: "%.2f", k.inputTrim))x)")
+
+    // ── 11b. AND AT A TRIM BELOW UNITY, WHICH IS THE LIVE FAILURE ────────────
+    //
+    // Call 2p183qa061zcu: raw peak 4.17, trim 0.62, so 2.58 times full scale left
+    // this machine. Every path that could have fixed it required `inputTrim > 1`
+    // -- they were written when a trim was only ever a cut, so `output ~= raw`
+    // and the raw tests covered the same ground. The moment a makeup gain existed
+    // they stopped overlapping and left a clipping output in the gap.
+    let k2 = Audio()
+    k2.forceTrimForTest(0.6187)
+    var k2steps = 0
+    while k2.trimOverload(outPeak: 4.17 * k2.inputTrim), k2steps < 6 { k2steps += 1 }
+    let k2out = 4.17 * k2.inputTrim
+    say(k2out < 0.95,
+        "the live 2.58x overload comes down to \(String(format: "%.2f", k2out))"
+        + " in \(k2steps) tick(s), from a trim that was already a cut")
+    // REJECT: with the guard off nothing happens at all, so the row above is
+    // measuring the guard and not the arithmetic around it.
+    Audio.overloadGuard = false
+    let k3 = Audio()
+    k3.forceTrimForTest(0.6187)
+    let k3moved = k3.trimOverload(outPeak: 2.58)
+    Audio.overloadGuard = true
+    say(!k3moved && abs(k3.inputTrim - 0.6187) < 1e-6,
+        "REJECT: with --no-overload-guard the same 2.58x is left alone -- the meter can see")
+
+    // ── 11c. AND THE ECHO VETO CANNOT HIDE IT ────────────────────────────────
+    //
+    // The circular dependency: the veto fires because the microphone is hot, and
+    // the fix for a hot microphone sat below the veto's early return. This drives
+    // `tuneInputGain` -- the whole tick, not the cut in isolation -- with the veto
+    // armed, which is the state a third of that live call was in.
+    let k4 = Audio()
+    k4.forceTrimForTest(1.0)
+    k4.micPeakWin = 2.58
+    k4.rawPeakWin = 2.58
+    let vetoWas = Audio.corrVeto
+    Audio.corrVeto = true
+    k4.tuneInputGain()
+    Audio.corrVeto = vetoWas
+    say(k4.inputTrim < 0.98,
+        "a vetoed tick still cuts an overloaded microphone (1.00x -> "
+        + "\(String(format: "%.2f", k4.inputTrim))x)")
+    say(k4.overloadCuts == 1 && k4.hotTicks == 1,
+        "and the tick is on the record as hot (\(k4.hotTicks) hot, \(k4.overloadCuts) cut)")
+    // REJECT: a HEALTHY vetoed tick must still teach nothing. The veto's own
+    // rule -- never learn the room from the loudspeaker -- is why the early
+    // return exists, and hoisting the cut above it must not have removed it.
+    let k5 = Audio()
+    k5.setFloorForTest(0.002)
+    k5.forceTrimForTest(1.0)
+    for _ in 0..<10 {
+      k5.micPeakWin = 0.20; k5.rawPeakWin = 0.20
+      Audio.corrVeto = true
+      k5.tuneInputGain()
+    }
+    Audio.corrVeto = vetoWas
+    say(abs(k5.inputTrim - 1.0) < 1e-6,
+        "REJECT: a vetoed tick still teaches the makeup path nothing (trim "
+        + "\(String(format: "%.2f", k5.inputTrim))x) -- the loudspeaker is not the room")
 
     // 12. REJECT: and a healthy makeup is NOT dismantled. Without this the two
     //     rows above are satisfied by a loop that simply refuses to amplify.
@@ -1818,9 +2011,11 @@ final class Audio {
       if corrVetoAt == 0 || Clock.ms(Clock.now() - corrVetoAt) > Audio.CORR_VETO_FRESH_MS {
         Audio.corrVeto = false
       }
-      guard let ch = capHist, let eh = echoHist else { continue }
+      guard let ch = capHist, let eh = echoHist else { echoSkips += 1; continue }
       let cw = capHistW, ew = echoW
-      guard cw > win * D + 2000, ew > (win + maxLag) * D + 2000 else { continue }
+      guard cw > win * D + 2000, ew > (win + maxLag) * D + 2000 else {
+        echoSkips += 1; continue
+      }
       // Decimate by averaging, not by dropping: dropping aliases everything above
       // 3 kHz down into the band the correlation is computed in.
       for i in 0..<win {
@@ -1835,7 +2030,7 @@ final class Audio {
       }
       var micE: Float = 0
       for v in mic { micE += v * v }
-      guard micE > 1e-6 else { continue }       // a silent mic has no echo to find
+      guard micE > 1e-6 else { echoSkips += 1; continue }  // a silent mic has no echo to find
 
       // Normalised by BOTH energies, so the score is a correlation coefficient
       // rather than a number that grows with how loud the speaker happens to be.
@@ -1843,7 +2038,7 @@ final class Audio {
       // loop this replaced did inside itself.
       let scan = Audio.corrScan(fix: mic, slide: spk, win: win, maxOff: maxLag,
                                 fixE: micE, minOff: 1)
-      guard scan.best >= 0 else { continue }
+      guard scan.best >= 0 else { echoSkips += 1; continue }
       echoCorr = Double(scan.bestScore)
       // A call is judged on whether the speaker EVER reached the microphone, not
       // on whether it was doing so at the moment a beat happened to be built.
@@ -1853,8 +2048,39 @@ final class Audio {
       // moment a computation says the mic is NOT mostly our speaker, so a real
       // voice wins it back within one tick of starting to dominate.
       corrVetoAt = Clock.now()
+      // ── AND THE SAME ANSWER AIMS THE FILTER ────────────────────────────────
+      //
+      // Scalars across the thread boundary, like every other cross-thread
+      // signal in this class. The filter decides on the AUDIO thread whether the
+      // move is worth taking (`Aec.reaimHits`), so a twitching estimate cannot
+      // zero a converged filter and the two can never tear.
+      aec.aim(delaySamples: Int(echoDelayMs / 1000.0 * SR), corr: echoCorr)
+      // ── THE VETO IS A STATEMENT ABOUT THE SIGNAL THAT LEAVES, NOT THE ONE
+      //    THAT ARRIVED ───────────────────────────────────────────────────────
+      //
+      // `echoCorr` is computed on `capHist`, which is the RAW microphone, and it
+      // has to be -- an estimator reading the cancelled signal destroys the
+      // measurement that aims it, which is the recorded 46-re-aims failure. So
+      // after cancellation the correlation is still high and still correct, and
+      // it no longer describes what the classifier is looking at.
+      //
+      // The veto's claim is "this sound is our own loudspeaker, so it is not a
+      // voice". Ten decibels of measured ERLE means it is no longer mostly our
+      // loudspeaker, so the claim is withdrawn -- and only withdrawn, exactly
+      // like the camera's unveto beside it. It can never add a veto, and the
+      // moment the filter stops earning its keep `residual` returns to 1 within
+      // about 40 ms and the veto is back to what it was in 0.106.0.
+      let res = Audio.aecOn ? aec.residual : 1
+      Audio.aecResidual = res
+      Audio.aecErleDb = aec.erleDb
+      let cancelled = res <= Audio.AEC_VETO_RELIEF
       Audio.corrVeto = Audio.corrVetoOn && Audio.outputIsSpeakers
-        && echoCorr >= Audio.CORR_VETO
+        && echoCorr >= Audio.CORR_VETO && !cancelled
+      if Audio.corrVetoOn, Audio.outputIsSpeakers, echoCorr >= Audio.CORR_VETO, cancelled {
+        aecUnvetoTicks += 1
+      }
+      echoTicks += 1
+      if echoCorr >= Audio.CORR_VETO { echoHighTicks += 1 }
 
       // The second search that used to run here -- the same 400 ms slid the other
       // way, to decide whether the two of you shared a room -- is gone with the
@@ -2702,6 +2928,30 @@ final class Audio {
     /// veto beside it). This only stops the gate attenuating audio the floor
     /// has already decided belongs on the wire.
     var floorGranted = false
+    /// ── THE RAW MICROPHONE'S PEAK, WHEN A CANCELLER SITS UPSTREAM (0.107.0) ───
+    ///
+    /// `coupling` below is a slow MINIMUM of near/far level and it is the gate's
+    /// entire model of the room: how much of what this speaker plays comes back
+    /// into this microphone. That is a property of the ROOM. Learning it from a
+    /// signal the canceller has already cleaned would teach the gate that the
+    /// room has no echo in it -- and then the instant the canceller stopped
+    /// working (a route change, a device change, somebody picking the laptop up)
+    /// the gate would have unlearned its own defence and the far end's voice
+    /// would classify as this person talking.
+    ///
+    /// The same shape as the estimator having to read the raw history:
+    /// `control-loops-steer-on-flattering-signals`, where the flattering signal
+    /// is the loop's own success. So the coupling tracker reads THIS and
+    /// everything else reads the block it was handed.
+    ///
+    /// -1 means nothing is upstream and the block's own peak is the raw peak,
+    /// which is what every caller before 0.107.0 meant.
+    var rawPeakIn: Float = -1
+    /// What fraction of the echo survived the canceller, in amplitude. 1 is "no
+    /// canceller, or it is not helping", and at 1 every number below is
+    /// bit-identical to 0.106.0.
+    var echoResidual: Float = 1
+    private var rawEnv: Float = 0
     private var floorGain: Float = 1
     /// Where the floor's mute has actually reached, for a test that wants the
     /// bound rather than the intent.
@@ -2745,6 +2995,20 @@ final class Audio {
     /// stream before the ear, so it reads what the far end is SENDING even
     /// while this end's speaker is closed.
     var farEnvNow: Float { farEnv }
+    /// ── WHAT THIS ROOM RETURNS, AND WHAT IS LEFT OF IT ───────────────────────
+    ///
+    /// `coupling` is the fraction of the loudspeaker's output that comes back
+    /// into this microphone -- a property of the room and the desk, learned as a
+    /// slow minimum. `echoPathNow` is that AFTER the canceller, which is the only
+    /// quantity that says whether the far end will hear themselves.
+    ///
+    /// It is not the same question as "how much did the canceller remove", and
+    /// the difference is not academic: at a coupling of 0.25 there is only so much
+    /// TO remove, so a canceller doing everything possible reports a modest ERLE
+    /// -- measured in `--turn-test` as 6.8 dB on one end and 15.6 on the other,
+    /// with the same filter and the same room. ERLE is a report card on the
+    /// canceller; this is a statement about the call.
+    var couplingNow: Float { coupling }
     private static func loud(_ env: Float, over noise: Float) -> Float {
       // Never divide by the raw floor: it tracks DOWN into a silent room, and a
       // reference that approaches zero turns room tone into a shout.
@@ -2781,6 +3045,8 @@ final class Audio {
     /// said it was this machine's own speaker. The number that separates "the
     /// veto never fired" from "it fired and did not help" on a live call.
     private(set) var vetoFrames = 0
+    private(set) var vetoArmedFrames = 0
+    private(set) var levelVoiceFrames = 0
     /// Samples the visual signal rescued from the echo veto -- a real voice the
     /// correlation had mistaken for this machine's own loudspeaker. The number
     /// that says whether the camera is earning its CPU.
@@ -2862,6 +3128,10 @@ final class Audio {
       // "0.93 per block", which was 4.6 ms on this machine.
       let envA = Float(exp(-dt / 0.035))
       nearEnv = peak > nearEnv ? peak : nearEnv * envA
+      // The same envelope on the untouched microphone, for the coupling tracker
+      // alone. Identical to `nearEnv` when nothing is upstream.
+      let rawPk = rawPeakIn >= 0 ? rawPeakIn : peak
+      rawEnv = rawPk > rawEnv ? rawPk : rawEnv * envA
       // ── A FLOOR THAT RISES DURING SPEECH IS NOT A FLOOR ─────────────────────
       //
       // It falls fast, so it settles into a quiet room in a moment, and it rises
@@ -2881,8 +3151,8 @@ final class Audio {
       // the microphone is honestly silent while the playout is loud. A minimum
       // tracker fed that moment learns "there is no echo here" and never closes
       // again. One transient, latched forever.
-      if farTalking, farRun > Int(SR * 0.08), nearEnv > 0.0008 {
-        let r = min(max(nearEnv / max(far, 1e-6), 0.002), 4)
+      if farTalking, farRun > Int(SR * 0.08), rawEnv > 0.0008 {
+        let r = min(max(rawEnv / max(far, 1e-6), 0.002), 4)
         // 3% a second of upward creep, so a room that gets more reflective is
         // followed, expressed as a rate rather than as "1.00002 per block" --
         // which was 6% a second on this machine and 0.75% on the rig.
@@ -2902,7 +3172,27 @@ final class Audio {
       // keyboard from reading as a voice, and it only matters to the classifier.
       // Rolled into one bar they interfere: the floor sits far below the echo
       // during far-end speech, so the floor term alone declares the echo voiced.
-      let expected = coupling * far
+      // ── HOW MUCH ECHO IS STILL THERE, WHICH IS NOT THE SAME AS HOW MUCH THE
+      //    ROOM MAKES (0.107.0) ────────────────────────────────────────────────
+      //
+      // `coupling` is what the room returns. `echoResidual` is what survived the
+      // canceller. The bar has to be built from the product, because the bar's
+      // job is to answer "could the echo alone explain this microphone" and the
+      // echo in question is the one still present in the signal being judged.
+      //
+      // This is the single line that converts cancellation into duplex. A person
+      // sitting under an echo 20 dB louder than their own voice was, at the
+      // instant of decision, indistinguishable from that echo -- the note above
+      // says so and it was true. With 20 dB of the echo subtracted they are 20 dB
+      // ABOVE what is left, and the same comparison that used to gag them now
+      // passes them.
+      //
+      // And it degrades in the safe direction by construction: `echoResidual` is
+      // MEASURED, so a filter that stops working takes the bar straight back to
+      // where it was. Writing a constant here instead would be the exact shape of
+      // `stale-constants-after-a-codec-win`.
+      let effCoupling = coupling * max(0.02, min(1, echoResidual))
+      let expected = effCoupling * far
       // THE MARGIN CANNOT BE A CONSTANT, BECAUSE THE MISTAKE IT GUARDS IS NOT
       // SYMMETRIC. A generous margin suppresses echo well and, in a room where
       // the microphone sits inches from the speaker, sits ABOVE an ordinary
@@ -2912,7 +3202,11 @@ final class Audio {
       // the near voice once the microphone hears the speaker at 80% of playout,
       // which a laptop does. So it relaxes as the coupling rises: there is less
       // room to be clever exactly where being clever is dangerous.
-      let effMargin = max(1.35, cfg.margin - 1.5 * coupling)
+      // On the EFFECTIVE coupling, not the room's: the margin relaxes because a
+      // hard room leaves no room to be clever, and a hard room whose echo has
+      // been subtracted is not a hard room any more. Identical when the residual
+      // is 1.
+      let effMargin = max(1.35, cfg.margin - 1.5 * effCoupling)
       // ── AND ON HEADPHONES THERE IS NOTHING TO EXPLAIN AWAY ─────────────────
       //
       // No acoustic path from the earcup to the microphone means no near-mic
@@ -2964,6 +3258,24 @@ final class Audio {
       let veto = Audio.corrVeto && !mouthSays && aboveEcho && aboveRoom
       if veto { vetoFrames += n }
       if Audio.corrVeto && mouthSays && aboveEcho && aboveRoom { unvetoFrames += n }
+      // ── THE TWO DENOMINATORS THAT MADE `a_corr_veto_pct` UNREADABLE ─────────
+      //
+      // One live call reported the veto firing for 6.9% of its samples while the
+      // correlation was over threshold in 23 of 69 beats -- a third of the call
+      // -- and there was no way to tell whether that meant "it is catching only
+      // the wrong moments" or "the level test was already right for the other
+      // 26%, so there was nothing to catch". Those two need completely different
+      // work and the beat could not distinguish them.
+      //
+      //   vetoArmedFrames  how much of the call the correlation CLAIMED this
+      //                    microphone, whatever the level test thought
+      //   levelVoiceFrames how much of it the level test called a voice
+      //
+      // `vetoFrames` is the intersection -- the only part where the veto changed
+      // a verdict. Three numbers, and the pair of them is what turns the third
+      // into a measurement (`counted-without-a-denominator`).
+      if Audio.corrVeto { vetoArmedFrames += n }
+      if aboveEcho && aboveRoom { levelVoiceFrames += n }
       let voiced = aboveEcho && aboveRoom && !veto
       if voiced { run += 1 } else { run = 0 }
       let confirmed = run >= needed
@@ -3134,6 +3446,39 @@ final class Audio {
   /// on YES" -- one number meaning one thing (`second-copy-of-a-rule`).
   static let CORR_VETO = 0.45
   static let CORR_VETO_FRESH_MS: Double = 1500
+  /// ── HOW MUCH CANCELLATION WITHDRAWS THE ECHO VETO ─────────────────────────
+  ///
+  /// 0.32 in amplitude is -10 dB of ERLE. Below that the canceller has removed
+  /// most of the echo, so "this microphone is mostly our own loudspeaker" has
+  /// stopped being a true description of what leaves this machine and the veto
+  /// is withdrawn. Above it the veto stands exactly as it did in 0.106.0.
+  ///
+  /// 10 dB and not 3: the veto exists to stop a listening end's own speaker
+  /// being classified as a voice (measured: a gate open 97% of a call spent
+  /// alone), and giving that up needs the echo to be genuinely gone rather than
+  /// merely reduced.
+  static let AEC_VETO_RELIEF: Float = 0.32
+  /// The canceller's measured residual, as an amplitude ratio. 1 means nothing
+  /// was removed. Written by the estimator thread and by the capture thread,
+  /// read by both -- a Float scalar, like `owdMsNow` beside it.
+  nonisolated(unsafe) static var aecResidual: Float = 1
+  nonisolated(unsafe) static var aecErleDb: Double = 0
+  /// Off restores 0.106.0 exactly: no subtraction, and the echo veto back on the
+  /// correlation alone. `--no-aec`.
+  nonisolated(unsafe) static var aecOn = true
+  /// ── THE CONTROL ARM FOR THE OVERLOAD CUT (0.107.0) ────────────────────────
+  ///
+  /// Off means nothing stops an output over full scale, which is close to what
+  /// 0.106.0 actually did in the case that mattered: the cut was reachable only
+  /// on ticks the echo veto was quiet AND only when a makeup gain was in force,
+  /// and the live failure had neither. Kept as a switch so "the microphone was
+  /// running hot" can be measured against its absence rather than argued about
+  /// (`a_mic_hot_pct` is the ruler).
+  nonisolated(unsafe) static var overloadGuard = true
+  /// Rig overrides for the canceller's two swept constants, applied to the
+  /// shared instance at start. Read once; nothing on the call path reads them.
+  nonisolated(unsafe) static var aecTaps = -1
+  nonisolated(unsafe) static var aecMu: Float = -1
   /// Whether the turn layer is in force. `--no-floor` is the control arm.
   nonisolated(unsafe) static var floorOn = true
   /// Whether the far end reaches this ear. Written by the capture thread, read
@@ -3178,6 +3523,10 @@ final class Audio {
     // always: "is my speaker feeding my microphone" is a question worth answering
     // on every call, not only when a canceller is being tested.
     echoHist = {
+      let b = UnsafeMutablePointer<Float>.allocate(capacity: Audio.ECHO_MAX)
+      b.initialize(repeating: 0, count: Audio.ECHO_MAX); return b
+    }()
+    emitHist = {
       let b = UnsafeMutablePointer<Float>.allocate(capacity: Audio.ECHO_MAX)
       b.initialize(repeating: 0, count: Audio.ECHO_MAX); return b
     }()
@@ -3551,6 +3900,11 @@ final class Audio {
   }
 
   func start() throws {
+    // The rig's overrides for the canceller, applied before a sample moves.
+    // Every production cadence gets a rig override (`compress-waits-in-test-rigs`);
+    // these two are the ones `--aec-sweep` reads the defaults off.
+    if Audio.aecTaps > 0 { aec.cfg.taps = Audio.aecTaps }
+    if Audio.aecMu > 0 { aec.cfg.mu = Audio.aecMu }
     // ONE unit in `vp`, two in `hal`. `inUnit` and `outUnit` point at the same
     // instance in duplex, so every existing stop/start/property path keeps
     // working -- but init and start must then happen ONCE, which is what the
@@ -3918,9 +4272,47 @@ final class Audio {
       capHistW += Int(n)
     }
 
-    // NOTHING SUBTRACTS HERE ANY MORE. The microphone reaches the wire exactly
-    // as it was captured, or turned down whole -- never filtered, never guessed
-    // at. Whose turn it is is the only thing between the room and the far end.
+    // ── AND HERE, AFTER THE HISTORY, THE SPEAKER IS SUBTRACTED (0.107.0) ──────
+    //
+    // AFTER `capHist`, which is the whole reason the order of this function is
+    // written down: the estimator that aims this filter correlates that history
+    // against the playout, so the history must stay RAW. Recording the cancelled
+    // signal instead is what collapsed the old canceller's own aim to 0.08 and
+    // made it re-aim 46 times in 90 seconds.
+    //
+    // BEFORE the gate, because the gate's echo bar is the thing the echo was
+    // costing. A person talking under their own loudspeaker used to be
+    // indistinguishable from that loudspeaker at the instant of decision -- the
+    // file says so, and it is true of the RAW microphone. It is not true of a
+    // microphone with 20 dB of the loudspeaker taken out of it, and `Aec` hands
+    // the gate the measured residual so the bar moves by exactly what was
+    // actually removed and by nothing that was not.
+    //
+    // Linear subtraction only. Nothing here decides anything about the voice:
+    // see the head of Aec.swift.
+    //
+    // Speakers only -- on headphones there is no path to cancel, `echoCorr` sits
+    // at the null floor and the filter would never arm anyway, so this is CPU
+    // rather than behaviour. Stated as the route, not as the gate's conclusion
+    // about the route (`one-condition-two-concerns`).
+    var rawBlockPeak: Float = 0
+    for k in 0..<Int(n) { let a = abs(inScratch[k]); if a > rawBlockPeak { rawBlockPeak = a } }
+    if Audio.aecOn, Audio.outputIsSpeakers, let mh = emitHist {
+      aec.process(inScratch, Int(n), ref: mh, refW: emitW, refCap: Audio.ECHO_MAX)
+      Audio.aecResidual = aec.residual
+    }
+    // The RAW peak, for the one estimator inside the gate that must not see the
+    // cancelled signal: `coupling` is a property of the ROOM, and a room whose
+    // echo has been subtracted still has the same room in it. See
+    // `DuplexGate.rawPeakIn`.
+    dgate.rawPeakIn = rawBlockPeak
+    dgate.echoResidual = (Audio.aecOn && Audio.outputIsSpeakers) ? aec.residual : 1
+
+    // NOTHING GUESSES HERE. The microphone reaches the wire as it was captured
+    // minus an exact copy of what this machine played, or turned down whole --
+    // never spectrally masked, never guessed at. Whose turn it is and what this
+    // speaker put into this room are the only two things between the room and
+    // the far end.
     duplexGate(inScratch, Int(n))
     accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5, blockN: Int(n))
 
@@ -4265,11 +4657,24 @@ final class Audio {
         let eWant: Float = Audio.earOpen ? 1 : 0
         if eWant < earGain { earGain = max(eWant, earGain - Audio.EAR_STEP) }
         else { earGain += (eWant - earGain) * 0.02 }
-        out[i] = (mute || roomSpeakerOff) ? 0 : played * earGain
+        // TWO HISTORIES OF THE SAME SAMPLE, AND THEY ARE NOT THE SAME SIGNAL.
+        // `echoHist` below is `played` -- what the far end SENT, before this
+        // machine's ear mute -- and that is deliberate and load-bearing: the
+        // estimator correlates it against the microphone, and keying it off the
+        // speaker's actual OUTPUT means the detector loses its evidence exactly
+        // when the fix works, a shape this codebase has already shipped twice.
+        // `emitHist` is what LEFT THE SPEAKER, which is the only thing that can
+        // become an echo, and it is what the canceller must subtract. Written on
+        // the same line as its twin so `emitW == echoW` always holds -- the delay
+        // the estimator measures between `capHist` and `echoHist` is then the
+        // same index mapping for both, by construction rather than by agreement.
+        let emitted = (mute || roomSpeakerOff) ? 0 : played * earGain
+        out[i] = emitted
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
+        if let m = emitHist { m[emitW % Audio.ECHO_MAX] = emitted; emitW += 1 }
         // ── THE FACT THE FLOOR NEEDS, TAKEN WHERE IT IS TRUE ──────────────────
         //
         // Whether this machine's loudspeaker is emitting anything right now.
@@ -4371,11 +4776,24 @@ final class Audio {
         let eWant: Float = Audio.earOpen ? 1 : 0
         if eWant < earGain { earGain = max(eWant, earGain - Audio.EAR_STEP) }
         else { earGain += (eWant - earGain) * 0.02 }
-        out[i] = (mute || roomSpeakerOff) ? 0 : played * earGain
+        // TWO HISTORIES OF THE SAME SAMPLE, AND THEY ARE NOT THE SAME SIGNAL.
+        // `echoHist` below is `played` -- what the far end SENT, before this
+        // machine's ear mute -- and that is deliberate and load-bearing: the
+        // estimator correlates it against the microphone, and keying it off the
+        // speaker's actual OUTPUT means the detector loses its evidence exactly
+        // when the fix works, a shape this codebase has already shipped twice.
+        // `emitHist` is what LEFT THE SPEAKER, which is the only thing that can
+        // become an echo, and it is what the canceller must subtract. Written on
+        // the same line as its twin so `emitW == echoW` always holds -- the delay
+        // the estimator measures between `capHist` and `echoHist` is then the
+        // same index mapping for both, by construction rather than by agreement.
+        let emitted = (mute || roomSpeakerOff) ? 0 : played * earGain
+        out[i] = emitted
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
+        if let m = emitHist { m[emitW % Audio.ECHO_MAX] = emitted; emitW += 1 }
         // ── THE FACT THE FLOOR NEEDS, TAKEN WHERE IT IS TRUE ──────────────────
         //
         // Whether this machine's loudspeaker is emitting anything right now.
