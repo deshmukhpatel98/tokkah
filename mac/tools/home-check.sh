@@ -87,6 +87,18 @@ grep -q "contacts: --contacts-fake is on" "$SP/home.log" && say OK "fake contact
   || { say FAIL "fake contacts never armed"; fail=1; }
 [ -s "$SP/home.png" ] && say OK "screenshot captured: $SP/home.png" \
   || { say FAIL "no screenshot"; fail=1; }
+# ── THE CAMERA SENTENCE MUST RESOLVE ─────────────────────────────────────────
+# From 0.103.0 to 0.110.0 the front door said "Starting camera…" forever,
+# because the rebuild deleted startPreview() and kept the pill: a hint narrating
+# work no code performs. Every launch must now end that sentence one of four
+# recorded ways -- running, denied, restricted, none found -- and a log with no
+# resolution line IS that bug, whatever the screenshot happens to show.
+if grep -qE "camera: (preview running|access DENIED|access restricted|none found|session refused)" "$SP/home.log"; then
+  say OK "camera resolved: $(grep -oE 'camera: [^-]*' "$SP/home.log" | head -1)"
+else
+  say FAIL "the camera sentence never resolved -- the 0.103 regression is back"
+  fail=1
+fi
 # Recency order is computed by the same function the app uses; assert it here
 # against the planted times by asking the binary itself.
 ORDER=$(TK_KIN_DIR="$TK_KIN_DIR" "$TK" --contacts-fake "arjun,meera,dad" --order-audit 2>/dev/null)

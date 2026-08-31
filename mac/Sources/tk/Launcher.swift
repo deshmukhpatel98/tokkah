@@ -76,6 +76,14 @@ enum Launcher {
       andEventID: AEEventID(kAEGetURL))
   }
 
+  /// The one thing a denied camera can offer: the pane that undoes it. A class
+  /// because a gesture recognizer needs an objc target that outlives the closure
+  /// it was born in.
+  final class RevealCamera: NSObject {
+    static let shared = RevealCamera()
+    @objc func go() { Permissions.reveal(.camera) }
+  }
+
   final class Handler: NSObject {
     static let shared = Handler()
     @objc func handle(event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
@@ -447,6 +455,89 @@ enum Launcher {
 
     let session = AVCaptureSession()
     setHint("Starting camera…")
+
+    // ── THE CAMERA, WHICH THIS SENTENCE STOPPED BEING TRUE ABOUT ─────────────
+    //
+    // The 0.103.0 home-screen rebuild deleted `startPreview()` and the access
+    // request while KEEPING the session object, its teardown, and the pill above
+    // -- so from 0.103 to 0.110 every front door in the field said "Starting
+    // camera…" over black, forever, and nothing looked broken because the
+    // sentence claims work is in progress. `dead-controls-declared-never-wired`,
+    // except the dead thing was the narration: a hint describing work no code
+    // performs is worse than no hint, because it converts "the camera is
+    // missing" into "the camera is coming".
+    //
+    // Restored from the pre-0.103 join screen, verbatim where possible. The
+    // preview is the CONTENT of this window -- your own face, instantly, which
+    // is both the proof the camera works and the thing that makes this a video
+    // app rather than a settings dialog. Everything else floats above it.
+    func startPreview() {
+      guard let dev = AVCaptureDevice.default(for: .video) ?? CameraSource.available().first,
+            let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) else {
+        setHint("No camera found — this call will be audio only.")
+        fputs("camera: none found\n", stderr)
+        return
+      }
+      session.addInput(input)
+      let pl = AVCaptureVideoPreviewLayer(session: session)
+      pl.videoGravity = .resizeAspectFill
+      pl.frame = CGRect(x: 0, y: 0, width: W, height: H)
+      pl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+      // At index 0: everything else in the window floats above the picture.
+      host.insertSublayer(pl, at: 0)
+      // The pill goes quiet the moment the session actually delivers -- not when
+      // startRunning is CALLED, which returns before the first frame. A KVO on
+      // `running` would still be early; the first video frame is the only honest
+      // "started". `isRunning` polled once after start is the cheap version that
+      // cannot hang the main thread.
+      DispatchQueue.global(qos: .userInitiated).async {
+        session.startRunning()
+        DispatchQueue.main.async {
+          if session.isRunning {
+            setHint("")
+            // The resolution line the rig asserts on: every launch must end the
+            // "Starting camera…" sentence in one of four recorded ways, because
+            // the 0.103 regression was precisely a launch that never did.
+            fputs("camera: preview running (\(dev.localizedName))\n", stderr)
+          } else {
+            setHint("The camera did not start — this call will be audio only.")
+            fputs("camera: session refused to run\n", stderr)
+          }
+        }
+      }
+    }
+
+    // ── ASK FOR THE CAMERA, HERE, AND SAY WHAT HAPPENED ───────────────────────
+    //
+    // Starting a capture session prompts implicitly, and if the person does not
+    // answer -- clicks away, misses it behind another window -- the session
+    // simply never delivers a frame and the app shows black forever with no
+    // explanation. So it is requested explicitly, at the moment the person is
+    // looking at the window it is about, and each outcome says something
+    // different. A denial also OPENS the pane that can fix it, one click, via
+    // the same reveal every other permission uses.
+    CameraSource.requestAccess { access in
+      DispatchQueue.main.async {
+        switch access {
+        case .granted:
+          startPreview()
+        case .denied:
+          // The sentence claims a click works, so a click MUST work -- the first
+          // draft of this line said "click here" with nothing wired to the
+          // click, in the same commit that diagnosed five releases of a pill
+          // narrating work no code performed. The recognizer rides the pill
+          // itself, so wherever `setHint` moves it, the target moves with it.
+          setHint("Camera access is off — click here to turn it on.")
+          let click = NSClickGestureRecognizer(target: Launcher.RevealCamera.shared,
+                                               action: #selector(Launcher.RevealCamera.go))
+          hintPill.addGestureRecognizer(click)
+          fputs("camera: access DENIED -- the front door shows no preview\n", stderr)
+        case .restricted:
+          setHint("Camera use is restricted on this Mac — audio only.")
+          fputs("camera: access restricted by policy\n", stderr)
+        }
+      }
+    }
 
     w.contentView = v
 
