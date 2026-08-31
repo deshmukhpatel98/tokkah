@@ -340,6 +340,22 @@ final class Floor {
   var nearVisualVoice = false
   /// Floors won early because a camera confirmed the voice.
   private(set) var visualTakes = 0
+  /// ── AND WHAT THEIR CAMERA SEES, WHICH CAN BEAT THEIR VOICE (0.102.0) ──────
+  ///
+  /// `nil` when they cannot say: a build without the bit, no camera, a dark
+  /// room. Never read as "they are not talking" -- that is the wire's version
+  /// of `blind-instruments-report-negatives`, and the whole point of the
+  /// three-state rule.
+  ///
+  /// A mouth opens for a vowel some tens of milliseconds before sound leaves
+  /// it, so this cue can land BEFORE the audio of the same word — the network
+  /// hop is paid out of that lead instead of added to it. What it is allowed to
+  /// do is exactly one thing: let a holder who is already finishing LET GO
+  /// sooner. It cannot grant a floor, cannot mute anybody, and cannot make a
+  /// holder who is still talking stop.
+  var farSeenTalking: Bool?
+  /// Releases that happened sooner because their camera got here first.
+  private(set) var seenReleases = 0
 
   struct Decision {
     /// Whether this end's captured audio goes on the wire. NOT whether the
@@ -497,8 +513,15 @@ final class Floor {
       // still somebody making sound, and releasing to `idle` does not grant
       // them anything (the contest below needs a voice, and `farWrapping`
       // stops a wrapping claim taking it straight back).
+      // Their camera counts as contention on MY hold, and it is the earliest
+      // evidence available anywhere in this system: it is why the release can
+      // start before their first syllable has been transmitted, let alone
+      // arrived. Only `== true` -- `nil` (they cannot say) must read as no
+      // contention rather than as silence.
+      let seenContending = state == .mine && farSeenTalking == true
       let contended = state == .theirs ? near != .quiet
-                                       : (farVoicingKnown ? farVoicing : farVoice != .quiet)
+                                       : ((farVoicingKnown ? farVoicing : farVoice != .quiet)
+                                          || seenContending)
       // ── AND THE SAME SILENCE IS NOT CHARGED FOR TWICE ────────────────────
       //
       // `ST_VOICING` only goes false after 120 ms of no sound at the holder's
@@ -518,7 +541,15 @@ final class Floor {
       let proven = (farVoicingKnown && !farVoicing) || playoutSilentMs >= cfg.playoutQuietMs
       let contendedWait = proven && state == .theirs ? 0 : cfg.contendedReleaseMs
       let waitMs = contended ? min(contendedWait, cfg.releaseMs) : cfg.releaseMs
-      if holderQuietMs >= waitMs || predictedEnd {
+      // ── AND A HOLDER WHO IS ALREADY DONE LETS GO ON SIGHT ────────────────
+      //
+      // Only while this end has stopped making sound (`holderQuietMs > 0`), so
+      // it can never cut a sentence short: it collapses the remaining wait, it
+      // does not create one. This is the "dance" -- you see somebody draw
+      // breath and you stop, rather than finishing your pause first.
+      let seenRelease = state == .mine && farSeenTalking == true && holderQuietMs > 0
+      if holderQuietMs >= waitMs || predictedEnd || seenRelease {
+        if seenRelease, holderQuietMs < waitMs { seenReleases += 1 }
         // Counted, because "the predictor is wired" and "the predictor fires"
         // are two claims and only the second one is worth anything. This is the
         // number that says how much of the 450 ms wait it is actually saving.
@@ -1423,6 +1454,59 @@ extension Floor {
     let dv3 = v3.step(dt: 0.02, near: .claim)
     say(dv3.state == .mine && dv3.mayTransmit,
         "a blind camera never takes the floor from the person holding it")
+
+    // ── 15. THEIR CAMERA CROSSES THE WIRE AND SHORTENS MY RELEASE ───────────
+    //
+    // The cue that can beat its own audio. Three rows: it works, it cannot cut
+    // a sentence, and a peer who cannot say changes nothing.
+    func holdingWithFarQuiet() -> Floor {
+      let f = Floor()
+      f.cfg.strict = true
+      f.speakers = true
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      _ = f.step(dt: 0.02, near: .claim)          // I take the floor
+      return f
+    }
+    // I have stopped talking; their camera says they have started. The release
+    // must not wait out the rest of the contended window.
+    let w1 = holdingWithFarQuiet()
+    w1.farSeenTalking = true
+    var wq = 0.0
+    var dw1 = w1.step(dt: 0.02, near: .quiet)     // first quiet block
+    while wq < 1000, dw1.state == .mine {
+      wq += 20
+      w1.noteFar(.quiet)
+      dw1 = w1.step(dt: 0.02, near: .quiet)
+    }
+    say(dw1.state != .mine && wq <= 60,
+        "their camera releases my finished turn in \(Int(wq)) ms")
+    say(w1.seenReleases >= 1, "and it is counted as a seen-release")
+
+    // REJECT: a peer that cannot say (nil) waits the ordinary window.
+    let w2 = holdingWithFarQuiet()
+    w2.farSeenTalking = nil
+    var wq2 = 0.0
+    var dw2 = w2.step(dt: 0.02, near: .quiet)
+    while wq2 < 1000, dw2.state == .mine {
+      wq2 += 20
+      w2.noteFar(.quiet)
+      dw2 = w2.step(dt: 0.02, near: .quiet)
+    }
+    say(wq2 > 60,
+        "REJECT: a peer that cannot say waits the ordinary \(Int(wq2)) ms -- nil is not silence")
+    say(w2.seenReleases == 0, "and nothing is booked to a camera that said nothing")
+
+    // AND IT CANNOT CUT A SENTENCE. Their camera says they are talking while I
+    // am still mid-word: I keep the floor.
+    let w3 = holdingWithFarQuiet()
+    w3.farSeenTalking = true
+    var heldOn = true
+    for _ in 0..<25 {
+      w3.noteFar(.quiet)
+      if w3.step(dt: 0.02, near: .claim).state != .mine { heldOn = false; break }
+    }
+    say(heldOn, "a talking holder keeps the floor however loudly their camera disagrees")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

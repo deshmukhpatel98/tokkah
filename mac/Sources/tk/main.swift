@@ -866,6 +866,20 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
 }
 
+// ── THE FIRST THING THIS IMAGE DOES WITH THE ROOM'S NAME ─────────────────────
+//
+// Everything above this line either re-execs or exits, so reaching here means
+// this process IS the call. The room object may still not exist -- the caller
+// warms it when they place a call, but a joiner off a pasted link, a typed name
+// or a resumed call has nobody warming for them, and that first touch is ~1108
+// ms of cold start (CONTACTS.md).
+//
+// As early as the room name is knowable and long before the socket, so the
+// object is being created while this image is still opening the camera. Costs
+// nothing when somebody already warmed it: the route is idempotent and `Warm`
+// asks once per room per process.
+if let r = arg("room") { Warm.room(r, why: "joining") }
+
 // ── A LINK CLICKED WHILE A CALL IS ALREADY UP ────────────────────────────────
 //
 // The launch path reads the URL mailbox exactly once, and this process is long
@@ -2195,6 +2209,18 @@ display?.controls?.onCall = { who in
   // Off main: signing and an HTTPS round trip, on the thread that draws.
   Thread {
     let room = Launcher.mintRoom()
+    // ── WARM THE ROOM WHILE THEIR MAC IS RINGING ──────────────────────────
+    //
+    // A freshly minted room has never been touched, and the first request that
+    // touches it pays ~1108 ms of cold start (CONTACTS.md). That cost used to
+    // land on whichever of the two of us joined first -- i.e. on the caller,
+    // one line after this, in the middle of the moment the product is about.
+    //
+    // Fired HERE and not awaited: `Identity.ring` on the next line is an HTTPS
+    // round trip of its own, so the warm runs underneath it for free and the
+    // object exists by the time either Mac opens a socket. Deliberately not
+    // before the ring -- see rule two in `Warm`.
+    Warm.room(room, why: "call placed")
     Metrics.count("ring_sent_try")
     guard let got = Identity.ring(to: who, room: room) else {
       Metrics.count("ring_sent_fail")
@@ -5313,7 +5339,7 @@ Thread {
     let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 0.3)
     while Date() < until {
       Thread.sleep(forTimeInterval: 0.02)
-      if wire.vocalChanged() || wire.predictCrossed() {
+      if wire.vocalChanged() || wire.predictCrossed() || wire.seenTalkingCrossed() {
         if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
           fputs(String(format: "cue out %.3f  me -> %d\n", Date().timeIntervalSince1970,
                        Audio.sharedGate.vocal.rawValue), stderr)
@@ -6076,6 +6102,14 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "mouth_unveto_pct": audio.micSamples > 0
       ? Double(Audio.sharedGate.unvetoFrames) * 100.0 / Double(audio.micSamples) : 0,
     "turn_visual_takes": Audio.sharedFloor.visualTakes,
+    // Their camera, arriving over the wire (0.102.0). `seen_releases` is the
+    // number of times this end let go of a finished turn because it SAW them
+    // start, rather than waiting the release window out.
+    "turn_seen_releases": Audio.sharedFloor.seenReleases,
+    "peer_seen_talking": wire.peerSeenTalking == nil ? -1 : (wire.peerSeenTalking! ? 1 : 0),
+    // Makeup gain: how far a distant talker had to be lifted, and the ticks
+    // refused because the room was too noisy to lift anything.
+    "mic_makeup": Double(audio.inputTrim > 1 ? audio.inputTrim : 1),
     "strict_overlap_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.strictOverlapBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────

@@ -5,6 +5,84 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.102.0 — 2026-08-31
+
+### Added — the camera signal now crosses the wire, and it can beat its own audio
+
+0.100/0.101 were local-only: each Mac watched its own camera and the far end
+learnt nothing. `ST_SEEN_TALKING` (status bit 64) carries it, with its own
+edge-triggered flush so it never waits on a periodic carrier.
+
+The point is not that it is fast. **A mouth opens for a vowel some tens of
+milliseconds before sound leaves it**, so the cue can arrive at the far end
+*before the audio of the same word would have* — one network hop paid out of
+the pre-speech lead instead of added on top. It is the only mechanism in this
+project that can make a handover cost nothing rather than merely cost little.
+
+What the receiver may do with it is deliberately one thing: a holder who has
+already stopped talking lets go **on sight**. Measured in the two-end rig:
+their camera releases a finished turn in **0 ms**, against 400 ms waiting the
+window out. Three rows guard the rest, all passing:
+
+- a peer that *cannot* say (older build, no camera, dark room) reads as `nil`
+  and waits the ordinary 400 ms — absence of evidence is never silence
+- nothing is booked to a camera that said nothing
+- **a talking holder keeps the floor however loudly their camera disagrees** —
+  the signal can collapse a wait, never cut a sentence
+
+### Added — a distant talker can finally be heard
+
+Reported as *"if the mic is far away, it is failing to capture the speaking
+person"*, and the cause was not tuning: **every path in the level loop was
+`min(1, …)`**. The trim could only ever turn a microphone *down*. A talker
+peaking at 0.06 got no help, because the device volume knob is the only makeup
+path, most microphones do not expose one, and it caps at 0.95 regardless. The
+old rig even asserted the ceiling — *"never climbs past unity, which would be a
+gain"* — which was right while the only failure was a mic five times over full
+scale, and exactly wrong for this one.
+
+One target now (speech peaking at −5 dBFS), sought from either side, with a
+dead band between so a healthy microphone is never touched. Measured: a mic
+peaking at **0.06 is lifted 8× (+18 dB) to land speech at 0.48** — the level a
+near talker gets. Three guards, each with a REJECT row that fails when removed:
+
+- **speech only** — the loop already required 3 s of confirmed voice, so room
+  tone is never amplified
+- **not while the echo veto is claiming the mic** — a gain on our own
+  loudspeaker is the last thing anybody needs
+- **15 dB SNR minimum** — a voice only 6 dB over a noisy room is *not*
+  amplified, because that produces loud noise rather than a clear voice
+
+Bounded at +18 dB, and it comes back down: leaning in again takes 8.0× → 0.34×.
+The learned value persists per device, so a habitually distant mic starts the
+next call already lifted.
+
+### Measured — video latency is already at its floor, and a CPU "optimisation" was a pessimisation
+
+Video was checked before being touched, and there is nothing to win: **g2g p50
+14.6 ms** on a real call (encode 4.7, decode 1.6), 0 freezes over 150 ms, 30 fps
+solid, 3 frames lost in 10,194, jitter-queue depth 1–2. The dominant remaining
+term is the 33 ms frame interval itself, so the only real lever is frame rate,
+not the pipeline.
+
+CPU on a two-way 720p30 call measures **0.162 CPU-s/s**, and the lip detector
+adds **0.028–0.034 (≈20%)**. The obvious saving — hand Vision a small luma-only
+copy instead of a 720p frame — was built, measured, and **reverted**:
+
+| Vision input | cost |
+|---|---|
+| native 420v, no scaling | **2.90 ms/look** |
+| grayscale 1280 wide | 4.58 ms/look |
+| grayscale 320 wide | 7.17 ms/look |
+| grayscale 240 wide | 10.65 ms/look |
+
+Monotonically worse the smaller it got — the cost is not proportional to pixels.
+Vision has a fast path for the biplanar format the camera already produces, and
+a single-plane grayscale buffer leaves it. Recorded in `Mouth.swift` because it
+is the first thing anybody will try. Also noted: the rig's own run-to-run noise
+is ~8% of total CPU, which is why the per-look measurement was used to decide
+rather than the A/B.
+
 ## Kin 0.101.0 — 2026-08-31
 
 ### Fixed — the visual signal was measured in a frame that turns with the camera

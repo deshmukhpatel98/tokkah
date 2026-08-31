@@ -227,3 +227,70 @@ enum Rendezvous {
     return out
   }
 }
+
+// ── PAYING THE COLD START BEFORE ANYBODY IS WAITING ─────────────────────────
+//
+// A room's durable object costs **1108 ms** on the first request that touches it
+// (median, n=27, range 883-2604 -- the measurement is in CONTACTS.md). Every
+// call this app places mints a brand new room name, so almost every call pays
+// that cost by construction, on the one path that is supposed to feel instant.
+//
+// The fix has been deployed on the server since before this app existed:
+// `GET /api/room/<code>/warm` creates the object and returns `{warm:true}`. The
+// web client has fired it for months and records the same figure in its own
+// comment. `grep -rn "/warm" mac/Sources/tk` returned NOTHING until this file --
+// a shipped, measured, free 1.1 s that the flagship client never asked for.
+//
+// Three rules, and each one is a bug that would otherwise be written here:
+//
+//   * FIRE AND FORGET. This is a prefetch. It must never be something the join
+//     path waits on -- a warm that hangs would then be strictly worse than no
+//     warm at all, which is the shape of `composed-threshold-hides-latency`.
+//   * CONCURRENTLY WITH THE RING, not before it. Warming is itself a stateful
+//     hop and costs ~127 ms; spending it in front of the ring would move the
+//     delay onto the callee's phone instead of removing it.
+//   * ONCE PER ROOM PER PROCESS. The front door fires this on focus, on hover
+//     and on click, and three round trips for one room is two wasted.
+enum Warm {
+  private static let lock = NSLock()
+  nonisolated(unsafe) private static var asked = Set<String>()
+
+  /// Touch a room so its object exists by the time somebody joins it. Returns
+  /// immediately, always. `room` is trusted to be a sanitised room name -- every
+  /// caller has already validated it, because an unvalidated one would not be
+  /// joinable either.
+  static func room(_ room: String, why: String = "") {
+    guard !room.isEmpty else { return }
+    lock.lock()
+    let fresh = asked.insert(room).inserted
+    lock.unlock()
+    guard fresh else { return }
+    guard let url = URL(string: "\(Server.base)/api/room/\(room)/warm") else { return }
+    var req = URLRequest(url: url)
+    // Shorter than the rendezvous timeout on purpose. Nothing waits for this, so
+    // a request still outstanding when the call connects is pure waste holding a
+    // connection open.
+    req.timeoutInterval = 5
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    let began = Date()
+    URLSession.shared.dataTask(with: req) { d, resp, err in
+      let ms = Int(Date().timeIntervalSince(began) * 1000)
+      let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+      // On stderr and not silent: a warm that has started failing is invisible
+      // in every other signal this app has -- the call still works, it is just
+      // slow again, which is exactly the regression nobody would find.
+      if let err {
+        fputs("warm: \(room) failed after \(ms) ms -- \(err.localizedDescription)\n", stderr)
+        Metrics.count("warm_fail")
+        return
+      }
+      fputs("warm: \(room) \(code) in \(ms) ms\(why.isEmpty ? "" : " -- " + why)\n", stderr)
+      Metrics.count(code == 200 ? "warm_ok" : "warm_odd")
+      Metrics.mark("warm_ms", ms)
+      _ = d
+    }.resume()
+  }
+
+  /// For the tests: forget what this process has already warmed.
+  static func forgetForTests() { lock.lock(); asked.removeAll(); lock.unlock() }
+}

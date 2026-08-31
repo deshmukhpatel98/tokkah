@@ -131,6 +131,30 @@ final class Mouth {
     }
   }
 
+  /// ── DOWNSCALING WAS TRIED AND IS SLOWER. DO NOT RETRY IT. ─────────────────
+  ///
+  /// The obvious optimisation: face landmarks do not need 720p, so hand Vision
+  /// a small luma-only copy. Built it with `vImageScale_Planar8` into a reused
+  /// `OneComponent8` buffer, and measured 800 looks over the same footage:
+  ///
+  ///   native 420v, no scaling   2.90 ms/look     <- what ships
+  ///   grayscale, 1280 wide      4.58 ms/look
+  ///   grayscale,  320 wide      7.17 ms/look
+  ///   grayscale,  240 wide     10.65 ms/look
+  ///
+  /// Monotonically WORSE the smaller it got, which is the giveaway: the cost is
+  /// not proportional to pixels. Vision has a fast path for the biplanar format
+  /// the camera and the decoder already produce, and a single-plane grayscale
+  /// buffer leaves it -- so the scaling work was pure addition and the slow
+  /// route cost more than the pixels saved.
+  ///
+  /// Reverted. Recorded here because it is the first thing anybody will think of.
+
+  /// The size Vision scanned, stamped in `detect`. Callers use this rather than
+  /// measuring the source buffer themselves, so the two can never disagree
+  /// about which image a set of landmarks belongs to.
+  private(set) var lastScanSize = CGSize(width: 0, height: 0)
+
   private let q = DispatchQueue(label: "kin.mouth", qos: .userInitiated)
   private var inFlight = false
   private var lastLookAt: UInt64 = 0
@@ -175,6 +199,7 @@ final class Mouth {
   /// real sensor.
   func detect(_ pb: CVPixelBuffer) -> VNFaceObservation? {
     let req = VNDetectFaceLandmarksRequest()
+    lastScanSize = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
     let orient = orientLatched ?? Mouth.orientations[orientIdx % Mouth.orientations.count]
     let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: orient, options: [:])
     do { try h.perform([req]) } catch {
@@ -211,7 +236,7 @@ final class Mouth {
   private func look(_ pb: CVPixelBuffer, at t: UInt64) {
     defer { inFlight = false }
     looks += 1
-    guard let f = detect(pb) else {
+    guard let f = detect(pb) else {          // sets lastScanSize
       // No face. Not "not talking" -- see the three states above.
       if lastFaceAt == 0 || Clock.ms(t - lastFaceAt) > Mouth.blindAfterMs {
         Mouth.visualKnown = false
@@ -222,8 +247,7 @@ final class Mouth {
     }
     faces += 1
     lastFaceAt = t
-    let sz = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
-    guard let ap = Mouth.aperture(f, imageSize: sz) else {
+    guard let ap = Mouth.aperture(f, imageSize: lastScanSize) else {
       Mouth.visualKnown = false
       return
     }
@@ -392,8 +416,8 @@ extension Mouth {
       // THE SHARED DETECTOR, orientation search and all. An upright clip
       // latches `.up` on its first look at no cost, and a rotated one has to
       // find its own -- which is the arm that proves the search.
-      let sz = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
-      guard let f = shared.detect(pb), let ap = aperture(f, imageSize: sz) else {
+      guard let f = shared.detect(pb),
+            let ap = aperture(f, imageSize: shared.lastScanSize) else {
         lastAp = -1                       // blind: the next sample re-baselines
         continue
       }

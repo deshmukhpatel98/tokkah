@@ -934,6 +934,25 @@ final class Wire {
   // it clear, and a peer that never sets it is read as "cannot say", which
   // falls back to the claim-based release -- today's behaviour exactly.
   static let ST_VOICING  = 32      // a voice is leaving this microphone now
+  // ── AND WHAT THE CAMERA AT THIS END CAN SEE (0.102.0) ─────────────────────
+  //
+  // The lip-motion detector was local-only in 0.100/0.101: each Mac watched its
+  // own camera and used it for its own decisions, and the far end learnt
+  // nothing. This bit is the other half, and it is the one that can beat the
+  // network.
+  //
+  // A mouth starts moving BEFORE sound comes out of it -- the jaw and lips open
+  // for a vowel some tens of milliseconds ahead of voicing. So a cue sent the
+  // instant the mouth moves can arrive at the far end BEFORE the first audio of
+  // that same word would have. One hop of propagation is paid out of the
+  // pre-speech lead rather than added on top, which is the only mechanism in
+  // this project that can make a handover feel like it cost nothing.
+  //
+  // What the receiver may do with it is deliberately narrow: a holder may LET GO
+  // sooner. It may never mute anybody, never grant a floor, and a build that
+  // does not set the bit reads as "cannot say" rather than "not talking" --
+  // `blind-instruments-report-negatives`, and this is the wire's version of it.
+  static let ST_SEEN_TALKING = 64  // a camera here sees this end's mouth moving
   // MUTE IS NOT IN THIS BYTE. It rides at TPKTX+4 as its own byte and has since
   // before this one existed -- see `selfMuted`/`peerMuted` above. Noted here
   // because "the status byte" reads like the complete list of what one end tells
@@ -970,6 +989,19 @@ final class Wire {
     guard peerStatusSeen, peerVocalSeen else { return nil }
     return peerStatus & Wire.ST_VOICING != 0
   }
+  /// Does a camera at the FAR end see their mouth moving? `nil` when they
+  /// cannot say -- a build older than the bit, a peer with no camera, a dark
+  /// room, or nothing heard yet. Same three-state rule as the local detector:
+  /// absence of evidence is never evidence of silence.
+  var peerSeenTalking: Bool? {
+    guard peerStatusSeen, peerSeenTalkingSeen else { return nil }
+    return peerStatus & Wire.ST_SEEN_TALKING != 0
+  }
+  /// Has a peer that sets the seen-talking bit ever been observed setting it?
+  /// The bit being CLEAR only means something from a build (and a camera) that
+  /// would have set it, and the sole evidence of that is having seen it once.
+  private(set) var peerSeenTalkingSeen = false
+
   /// Has a peer that sets the voicing bit ever been seen? The bit being CLEAR
   /// is meaningful only from a build that would have set it, and the only
   /// evidence of that is having seen it set once.
@@ -1029,6 +1061,21 @@ final class Wire {
   /// a prior that only rides the 1 Hz probe is a prior that arrives a second
   /// late (`fast-signal-on-a-slow-carrier`), which is longer than the 450 ms
   /// wait it exists to skip.
+  /// True when the camera's verdict about this end has flipped since the last
+  /// flush. Its own edge trigger, for the same reason `predictCrossed` has one:
+  /// a signal whose entire worth is arriving BEFORE the voice must not wait for
+  /// a periodic carrier (`fast-signal-on-a-slow-carrier`). Same 15 ms floor.
+  private var lastSeenTalking = false
+  func seenTalkingCrossed() -> Bool {
+    let now2 = Mouth.on && Mouth.visualKnown && Mouth.visualVoice
+    guard now2 != lastSeenTalking else { return false }
+    let now = Clock.now()
+    guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
+    lastSeenTalking = now2
+    lastStateFlush = now
+    return true
+  }
+
   func predictCrossed() -> Bool {
     let above = Audio.turnEndProb >= Audio.sharedFloor.cfg.predictP
     guard above != lastPredictAbove else { return false }
@@ -1084,7 +1131,10 @@ final class Wire {
     case .claim:       vocalBits = Wire.ST_CLAIM
     }
     if Audio.sharedGate.voicingNow { vocalBits |= Wire.ST_VOICING }
-    p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus | vocalBits),
+    // The camera's verdict about THIS end, beside the voice cue it belongs with.
+    let seenBits = (Mouth.on && Mouth.visualKnown && Mouth.visualVoice)
+      ? Wire.ST_SEEN_TALKING : 0
+    p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus | vocalBits | seenBits),
                  toByteOffset: TPKTX + 6, as: UInt8.self)
     // ── THE PRIOR RIDES BESIDE THE VOCAL BYTE ────────────────────────────────
     //
@@ -1123,6 +1173,7 @@ final class Wire {
     peerStatus = 0
     peerStatusSeen = false
     peerVocalSeen = false
+    peerSeenTalkingSeen = false
     Audio.peerTurnEndProb = 0
     Audio.sharedFloor.noteFarEndProb(0)
     // Not nested inside `pathLock` below: nothing takes both, and keeping them
@@ -1618,8 +1669,12 @@ final class Wire {
           // Latched the first time a peer sets it, so a CLEAR bit can be told
           // from a build that never sets one (`blind-instruments-report-negatives`).
           if peerStatus & Wire.ST_VOICING != 0 { peerVocalSeen = true }
+          if peerStatus & Wire.ST_SEEN_TALKING != 0 { peerSeenTalkingSeen = true }
           Audio.sharedFloor.noteFar(peerVoice, transitMs: Audio.owdMsNow,
                                     voicing: peerVoicing)
+          // Their camera's verdict, three-state. Level-triggered like the
+          // voicing bit, plus its own edge flush at the sender.
+          Audio.sharedFloor.farSeenTalking = peerSeenTalking
           // The prior belongs to THIS floor, computed on THEIR transcript.
           // Level-triggered: every TPKTY packet carries the standing value, so a
           // dropped crossing costs a second of staleness rather than a prior

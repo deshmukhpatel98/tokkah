@@ -483,6 +483,22 @@ final class Audio {
   /// scalar of 0 is a dead microphone, and a loop that can reach it will find a
   /// way to. Below this the attenuation is done in software instead.
   private static let MIN_INPUT: Float32 = 0.05
+  /// Where speech should peak: -5 dBFS. The same 0.55 the attenuation path has
+  /// always aimed at, named once now that two directions share it.
+  static let TRIM_TARGET: Float = 0.55
+  /// Below this the microphone is too quiet and makeup gain is allowed. Chosen
+  /// so the dead band (here..0.92) covers every healthy microphone: a normal
+  /// talker at a normal distance peaks 0.3-0.8 and must never be touched.
+  static let TRIM_QUIET: Float = 0.30
+  /// The most a microphone may be amplified: +18 dB. Beyond this the room is
+  /// louder than the person and a level control is the wrong tool.
+  static let MAKEUP_MAX: Float = 8
+  /// Speech must stand this far above the room's own floor before amplifying
+  /// it. ~15 dB. Below it, gain makes loud noise rather than a clear voice.
+  static let TRIM_MIN_SNR: Float = 6
+  /// Per-tick climb, at the 1 Hz gain tick: about 4 s to reach full makeup.
+  /// Slower than the way down on purpose -- see the note in `trimStep`.
+  static let TRIM_UP_RATE: Float = 1.6
   private var micSumSq: Double = 0
   var micRms: Double { micSamples > 0 ? (micSumSq / Double(micSamples)).squareRoot() : 0 }
   /// Seconds the report thread has been ticking. Kept because it is the
@@ -1310,14 +1326,35 @@ final class Audio {
   /// `deviceAtFloor` only decides what gets SAID. The trim itself applies
   /// whenever the microphone is too hot, because a device with no settable
   /// volume is at its floor in every sense that matters.
+  /// Rig only: plant this room's noise floor so the SNR guard in `trimStep`
+  /// can be tested against a room that is too loud to amplify.
+  func setFloorForTest(_ v: Float) { micFloor = v }
+
   func trimStep(deviceAtFloor: Bool, knob: Float32) {
     let raw = rawPeakWin
     rawPeakWin = 0
     guard raw > 0 else { return }
+    // ── ONE TARGET, BOTH DIRECTIONS ─────────────────────────────────────────
+    //
+    // This loop could only ever turn a microphone DOWN. Every path was
+    // `min(1, ...)`, and the old rig asserted it: "never climbs past unity,
+    // which would be a gain". That was right while the only failure was a mic
+    // five times over full scale — and it is exactly wrong for the failure the
+    // user reported next: *"if the mic is far away, it is failing to capture
+    // the speaking person"*. A distant talker delivers peak 0.05, the device
+    // volume knob is the only makeup path, most microphones do not expose one,
+    // and it caps at 0.95 anyway. So the app had no way to make a quiet person
+    // audible. It was not tuned wrong; the capability was absent.
+    //
+    // Now there is one target — speech peaking near `TRIM_TARGET` — and the
+    // trim seeks it from either side, with a dead band between so an ordinary
+    // conversation never moves it at all.
+    let want = min(Audio.MAKEUP_MAX, max(0.02, Audio.TRIM_TARGET / raw))
     if raw > 0.92 {
-      let wantTrim = min(1, max(0.02, 0.55 / raw))
-      if wantTrim < inputTrim - 0.02 {
-        inputTrim = wantTrim
+      // TOO HOT: go straight there. A clipping microphone is urgent, and this
+      // is the path that fixed the 5.24 field case.
+      if want < inputTrim - 0.02 {
+        inputTrim = want
         trimMoves += 1
         Metrics.count("mic_trim_moved")
         Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
@@ -1328,18 +1365,40 @@ final class Audio {
         saveTrim()
       }
       if !gainAtRail { gainAtRail = true; Metrics.fact("mic_gain_rail", "yes") }
-    } else if raw < 0.5, inputTrim < 1 {
-      // Let it back up when the room quietens, so a single shout does not
-      // leave somebody permanently faint. Slower than it came down on purpose
-      // -- but not TOO slow: a raw peak under 0.25 through a trim already deep
-      // is a distant, quiet voice being thrown away, and at 5% a tick the walk
-      // back from 0.06 took minutes. 15% a tick clears a wrong deep cut in
-      // about fifteen seconds and still cannot oscillate: the hot direction
-      // cuts proportionally in one tick, and there is a dead band between.
-      inputTrim = min(1, inputTrim * (raw < 0.25 ? 1.15 : 1.05))
-      if inputTrim > 0.98 { inputTrim = 1; gainAtRail = false }
-      saveTrim()
+    } else if raw < Audio.TRIM_QUIET, want > inputTrim + 0.02 {
+      // TOO QUIET: climb, but only under three conditions, because a gain
+      // amplifies whatever is there and not only the person.
+      //
+      //   · the caller has already established that somebody is SPEAKING
+      //     (`speechRun >= 3` in tuneInputGain) — never room tone;
+      //   · the echo veto is not claiming this microphone (tuneInputGain
+      //     returns before this on a vetoed tick), so we cannot amplify our
+      //     own loudspeaker;
+      //   · and speech stands clearly above this room's own floor. Amplifying
+      //     a signal 10 dB over its noise just makes loud noise, and the one
+      //     thing worse than a quiet caller is a roaring one.
+      let snrOK = micFloor * Audio.TRIM_MIN_SNR < raw
+      if snrOK {
+        // Rate-limited, and deliberately slower than the way down: being 3 dB
+        // quiet for a second costs nothing, and jumping the level inside a
+        // syllable is audible pumping on every pause.
+        inputTrim = min(want, inputTrim * Audio.TRIM_UP_RATE)
+        trimMoves += 1
+        Metrics.count("mic_makeup_moved")
+        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+        if inputTrim > 1.02 {
+          fputs("mic gain: this microphone is far away (peaks at"
+              + " \(String(format: "%.2f", raw))) -- adding"
+              + " \(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB\n", stderr)
+        }
+        saveTrim()
+      } else {
+        Metrics.count("mic_makeup_refused_noise")
+      }
+      if inputTrim >= 1, gainAtRail { gainAtRail = false }
     }
+    // Between TRIM_QUIET and 0.92 is the dead band: a healthy microphone is
+    // left completely alone, which is the property the third rig row protects.
   }
 
   // ── THE TRIM IS A FACT ABOUT A MICROPHONE, NOT ABOUT A CALL ────────────────
@@ -1365,7 +1424,7 @@ final class Audio {
     // is inaudible for the whole walk back up. 0.3 still takes 10 dB off a
     // genuinely hot mic's first sentence, and the cut path re-learns the rest
     // within two ticks of real speech.
-    inputTrim = Float(min(1, max(0.3, v)))
+    inputTrim = Float(min(Double(Audio.MAKEUP_MAX), max(0.3, v)))
     trimSaved = inputTrim
     Metrics.count("mic_trim_loaded")
     Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
@@ -1375,11 +1434,12 @@ final class Audio {
   /// Called from the gain tick, never the render thread. Debounced: the relax
   /// path moves 5% a tick and a file write per tick is a diary, not a record.
   private func saveTrim() {
-    guard abs(inputTrim - trimSaved) > 0.02 || (inputTrim == 1 && trimSaved != 1),
-          let uid = Audio.deviceUID(inDev) else { return }
+    guard abs(inputTrim - trimSaved) > 0.02, let uid = Audio.deviceUID(inDev) else { return }
     var map = (try? Data(contentsOf: Audio.trimFile()))
       .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Double] } ?? [:]
-    if inputTrim >= 0.98 { map.removeValue(forKey: uid) } else { map[uid] = Double(inputTrim) }
+    // Unity is "nothing learned about this device" and is not worth a row.
+    if abs(inputTrim - 1) < 0.02 { map.removeValue(forKey: uid) }
+    else { map[uid] = Double(inputTrim) }
     if let out = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]) {
       try? out.write(to: Audio.trimFile(), options: .atomic)
       trimSaved = inputTrim
@@ -1441,12 +1501,68 @@ final class Audio {
     say(d.inputTrim == 1, "a silent window changes nothing")
     // 5. and it comes back up when the room quietens, or one shout is permanent
     let e = Audio()
+    // Recovery now runs through the same SNR guard the makeup path uses -- a
+    // shout is only walked back in a room quiet enough to hear the person. That
+    // is deliberate, and it means this row must plant a floor like the others or
+    // it measures the harness's 1.0 default instead of the loop.
+    e.setFloorForTest(0.002)
     e.rawPeakWin = 5.24
     e.trimStep(deviceAtFloor: true, knob: 0.05)
     let low = e.inputTrim
     for _ in 0..<200 { e.rawPeakWin = 0.2; e.trimStep(deviceAtFloor: true, knob: 0.05) }
     say(e.inputTrim > low, "it recovers when the room goes quiet (\(String(format: "%.2f", low)) -> \(String(format: "%.2f", e.inputTrim)))")
-    say(e.inputTrim <= 1, "and never climbs past unity, which would be a gain")
+
+    // ── 6. A DISTANT TALKER IS MADE AUDIBLE ─────────────────────────────────
+    //
+    // The row that used to be here asserted the opposite: "never climbs past
+    // unity, which would be a gain". That was the right invariant while the
+    // only failure was a microphone five times over full scale. It is exactly
+    // wrong for the failure reported next -- a far-away talker is inaudible and
+    // the app had no mechanism to help, because every path was `min(1, ...)`.
+    // Deliberately reversed, with the three guards the old comment was worried
+    // about proven in the rows below.
+    let f = Audio()
+    // `micFloor` starts at 1.0 and is walked down by `tuneInputGain`, which this
+    // rig bypasses by calling `trimStep` directly. Left alone it refuses every
+    // makeup step on the SNR guard, and these rows would measure the harness
+    // rather than the loop. A quiet room, planted explicitly.
+    f.setFloorForTest(0.002)
+    for _ in 0..<20 { f.rawPeakWin = 0.06; f.trimStep(deviceAtFloor: true, knob: 0.95) }
+    let landed = 0.06 * f.inputTrim
+    say(f.inputTrim > 3,
+        "a microphone peaking at 0.06 is amplified \(String(format: "%.1f", f.inputTrim))x"
+        + " (+\(String(format: "%.0f", 20 * log10(Double(f.inputTrim)))) dB)")
+    say(landed > 0.3 && landed < 0.8,
+        "which lands speech at \(String(format: "%.2f", landed)), the level a near talker gets")
+    say(f.inputTrim <= Audio.MAKEUP_MAX + 0.01,
+        "and it is bounded at \(Int(Audio.MAKEUP_MAX))x rather than chasing silence")
+
+    // 7. REJECT: A HEALTHY MICROPHONE IS STILL LEFT ALONE. Without this the row
+    //    above is satisfied by an app that simply amplifies everybody.
+    let g = Audio()
+    g.setFloorForTest(0.002)                // a quiet room, so only the dead band can refuse
+    for _ in 0..<20 { g.rawPeakWin = 0.45; g.trimStep(deviceAtFloor: false, knob: 0.5) }
+    say(g.inputTrim == 1,
+        "REJECT: a healthy 0.45 peak is untouched -- the dead band is real")
+
+    // 8. REJECT: A NOISY ROOM IS NOT AMPLIFIED. Gain on a signal barely above
+    //    its own noise floor produces loud noise, which is worse than quiet.
+    let h = Audio()
+    h.setFloorForTest(0.05)                 // room floor close to the speech peak
+    for _ in 0..<20 { h.rawPeakWin = 0.10; h.trimStep(deviceAtFloor: true, knob: 0.95) }
+    say(h.inputTrim == 1,
+        "REJECT: a voice only 6 dB over a noisy room is NOT amplified")
+
+    // 9. AND IT COMES BACK DOWN. Somebody who leaned away and returned must not
+    //    stay 18 dB hot -- that is the original bug, re-created by the fix.
+    let i = Audio()
+    i.setFloorForTest(0.002)
+    for _ in 0..<20 { i.rawPeakWin = 0.06; i.trimStep(deviceAtFloor: true, knob: 0.95) }
+    let up = i.inputTrim
+    for _ in 0..<20 { i.rawPeakWin = 1.6; i.trimStep(deviceAtFloor: true, knob: 0.95) }
+    say(i.inputTrim < 1 && i.inputTrim < up,
+        "leaning back in brings it down again (\(String(format: "%.1f", up))x ->"
+        + " \(String(format: "%.2f", i.inputTrim))x)")
     fputs("GAIN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok
   }

@@ -100,6 +100,16 @@ def call_summary(bs, label=""):
               f"  ·  rescued from echo-veto {last(bs,'mouth_unveto_pct'):.1f}% of samples"
               f"  ·  visual floor takes {last(bs,'turn_visual_takes'):.0f}"
               f"  ·  dropped {last(bs,'mouth_dropped'):.0f}")
+        # Their camera, over the wire (0.102.0). -1 = they cannot say.
+        pk = last(bs, "peer_seen_talking", -2)
+        theirs = ("their camera: not in their build / no face" if pk < 0
+                  else "their camera reported" if pk >= 0 else "")
+        print(f"  THEIR CAM {theirs}"
+              f"  ·  released my finished turn on sight {last(bs,'turn_seen_releases'):.0f}x")
+    mk = last(bs, "mic_makeup", 1)
+    if mk > 1.02:
+        print(f"  DISTANT   makeup gain +{20 * __import__('math').log10(mk):.0f} dB"
+              f"  ({mk:.1f}x) -- a far-away talker was lifted to a normal level")
     elif lk == 0:
         print("  CAMERA    the detector never ran (no camera frames)")
     # corr-veto: how much of the call the classifier refused to call the
