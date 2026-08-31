@@ -250,6 +250,48 @@ Only a real two-room call can move any of this from theory. `--speaker-duplex` o
 one such call, with `aec_erle_db`, `aec_residual` and `floor_duplex_pct` in the
 beat, answers it.
 
+## Through the real audio device
+
+`tools/aec-check.sh` runs two real ends of a real call with the echo path in
+software, and reads the number the product itself prints. It exists because
+`--aec-test` cannot see anything that only happens in the product: the real
+CoreAudio callback and its sixteen-sample blocks, the real `emitHist`/`echoHist`
+pair, and the real estimator aiming the filter from a real correlation rather than
+from a number the rig handed it.
+
+It found a bug the synthetic rig could not, on its first run:
+
+> `emitW` is advanced by the **render thread**, and the capture callback read it
+> twice — once for the simulated room and once for the canceller. Between the two
+> reads the render thread could advance it, so the echo was injected at one
+> alignment and cancelled at another, jittering by up to a render block every
+> single block. A canceller cannot converge on a target that moves under it.
+>
+> **1–2 dB became 16 dB** when the cursor was read once per callback.
+>
+> `--aec-test` supplies `refW` itself, so it is exact there by construction and
+> only the product has two readers. This is what `rig-picks-a-parameter-the-product-does-not`
+> looks like when the parameter is a clock.
+
+Two more things it caught, both rigs lying rather than code failing: `--mute` is a
+rig flag meaning "do not put this in the room I am sitting in", and folding it into
+the emitted history left the simulated room with nothing to reflect and the
+canceller with a silent reference — so the rig measured 0 dB and reported the
+canceller as never having run. And the echo simulator itself was reading the
+*decoded* stream rather than the emitted one, which is a room that keeps reflecting
+out of a switched-off speaker.
+
+Current reading, listener end, 22 ms path at 0.55, 26 s:
+
+    echo: 16 dB removed, -21 dB of the path left -- aimed 20 ms, subtracting 100%
+
+The estimator found 20 ms against a path built at 22, which `leadMs` absorbs.
+
+What this cannot do, said here rather than discovered later: both ends share this
+machine's one speaker and one microphone, so the path is simulated and has no
+loudspeaker nonlinearity in it — exactly the part a linear filter cannot cancel.
+This proves the code path and the arithmetic. Only a two-room call proves the sound.
+
 ## Reading it on a live call
 
 Every call prints one line a second when the canceller has run:

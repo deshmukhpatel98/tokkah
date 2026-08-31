@@ -4242,8 +4242,25 @@ final class Audio {
     // Add the simulated echo to what the microphone "heard". After the file
     // substitution, because the echo is added to whatever the near end is saying,
     // which is exactly the relationship a room has.
-    if echoArmed, let e = echoHist, echoW > echoDelay {
-      let w = echoW
+    // ── FROM WHAT THE SPEAKER EMITTED, NOT FROM WHAT ARRIVED ─────────────────
+    //
+    // `emitHist`, not `echoHist`. A closed speaker emits nothing, so it returns
+    // nothing, and a simulated room that keeps injecting an echo through the ear
+    // mute is a room no desk can be -- it would hand the canceller a reference
+    // that disagreed with the microphone exactly when the floor closed the ear,
+    // and then blame the canceller. `fixture-is-not-the-real-shape`.
+    // ── ONE READ OF THE RENDER THREAD'S CURSOR, FOR THE WHOLE CALLBACK ───────
+    //
+    // `emitW` is advanced by the render thread and this function reads it twice
+    // -- once for the simulated room and once for the canceller. Between the two
+    // reads the render thread can advance it, so the echo was injected at one
+    // alignment and cancelled at another, jittering by up to a render block every
+    // single block. A canceller cannot converge on a target that moves under it,
+    // and the two rigs could not see it: `--aec-test` supplies `refW` itself, so
+    // it is exact there by construction and only the product has two readers.
+    let emitNow = emitW
+    if echoArmed, let e = emitHist, emitNow > echoDelay {
+      let w = emitNow
       for k in 0..<Int(n) {
         var acc: Float = 0
         for (t, a) in echoTaps {
@@ -4298,7 +4315,7 @@ final class Audio {
     var rawBlockPeak: Float = 0
     for k in 0..<Int(n) { let a = abs(inScratch[k]); if a > rawBlockPeak { rawBlockPeak = a } }
     if Audio.aecOn, Audio.outputIsSpeakers, let mh = emitHist {
-      aec.process(inScratch, Int(n), ref: mh, refW: emitW, refCap: Audio.ECHO_MAX)
+      aec.process(inScratch, Int(n), ref: mh, refW: emitNow, refCap: Audio.ECHO_MAX)
       Audio.aecResidual = aec.residual
     }
     // The RAW peak, for the one estimator inside the gate that must not see the
@@ -4668,8 +4685,19 @@ final class Audio {
         // the same line as its twin so `emitW == echoW` always holds -- the delay
         // the estimator measures between `capHist` and `echoHist` is then the
         // same index mapping for both, by construction rather than by agreement.
-        let emitted = (mute || roomSpeakerOff) ? 0 : played * earGain
-        out[i] = emitted
+        // ── AND `mute` IS NOT A PROPERTY OF THE SPEAKER ──────────────────────
+        //
+        // `earGain` is a PRODUCT state -- the floor closing this end's ear -- and
+        // a closed ear emits nothing, so the history must follow it. `mute` is a
+        // RIG flag meaning "do not put this in the room I am sitting in", and the
+        // room it is standing in for is `--echo-sim`. Folding it into the history
+        // meant the simulated room had nothing to reflect and the canceller had a
+        // silent reference, so `tools/aec-check.sh` measured 0 dB and reported the
+        // canceller as never having run -- a rig blind to the thing it tests,
+        // reporting the blindness as a negative
+        // (`blind-instruments-report-negatives`).
+        let emitted = played * earGain
+        out[i] = (mute || roomSpeakerOff) ? 0 : emitted
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
@@ -4787,8 +4815,19 @@ final class Audio {
         // the same line as its twin so `emitW == echoW` always holds -- the delay
         // the estimator measures between `capHist` and `echoHist` is then the
         // same index mapping for both, by construction rather than by agreement.
-        let emitted = (mute || roomSpeakerOff) ? 0 : played * earGain
-        out[i] = emitted
+        // ── AND `mute` IS NOT A PROPERTY OF THE SPEAKER ──────────────────────
+        //
+        // `earGain` is a PRODUCT state -- the floor closing this end's ear -- and
+        // a closed ear emits nothing, so the history must follow it. `mute` is a
+        // RIG flag meaning "do not put this in the room I am sitting in", and the
+        // room it is standing in for is `--echo-sim`. Folding it into the history
+        // meant the simulated room had nothing to reflect and the canceller had a
+        // silent reference, so `tools/aec-check.sh` measured 0 dB and reported the
+        // canceller as never having run -- a rig blind to the thing it tests,
+        // reporting the blindness as a negative
+        // (`blind-instruments-report-negatives`).
+        let emitted = played * earGain
+        out[i] = (mute || roomSpeakerOff) ? 0 : emitted
         noteEdge(val)
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
