@@ -471,7 +471,7 @@ let KNOWN_FLAGS: Set<String> = [
   // to kill the app. Same family as silent-no-op-flags, one worse.
   "no-ring-preview", "incoming-key", "with",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
-  "in-process", "no-in-process",
+  "in-process", "no-in-process", "launch-path",
   "callee-away",
   // A call that outlives its process is on by default and has to be switchable
   // off, because the negative arm of its own rig is "the same crash, and it does
@@ -973,6 +973,17 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
       Args.decide("calling", who)
       if away { Args.decide("callee-away", nil) }
     }
+    // ── WHICH PATH THIS CALL TOOK, ON THE RECORD ─────────────────────────
+    //
+    // Two changes land on the user's next call at once -- this launch path and a
+    // set of audio fixes from another lane -- and a compound failure that has to
+    // be bisected by asking somebody to retype a command with a flag is a
+    // diagnosis nobody gets. A call should say what it did.
+    //
+    // Recorded on BOTH arms and read from one place below, so "in-process" and
+    // "we could not tell" are different answers: an instrument that cannot see
+    // the event must not return the same value as a real negative.
+    Args.decide("launch-path", "in-process")
     fputs("launch: in-process, no re-exec -- " + Args.described + "\n", stderr)
     // And it must be said out loud that the camera the front door was using is
     // gone before anything below asks for it. `Launcher.home` stops and unwires
@@ -983,9 +994,13 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   } else {
     switch intent {
     case .room(let room):
-      Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+      // The marker travels in argv because `execv` is an ending: this image is
+      // about to stop existing, and a fact recorded here would die with it.
+      Launcher.reexec(room: room,
+                      extra: ["--video", "camera", "--window", "--launch-path", "reexec"],
+                      why: "gui prompt")
     case .calling(let room, let who, let away):
-      var extra = ["--video", "camera", "--window", "--calling", who]
+      var extra = ["--video", "camera", "--window", "--launch-path", "reexec", "--calling", who]
       // Only an explicit false changes a word on screen. nil means the server had
       // no basis to say, which is NOT the same as "they are away".
       if away { extra.append("--callee-away") }
@@ -1007,6 +1022,10 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
 // nothing when somebody already warmed it: the route is idempotent and `Warm`
 // asks once per room per process.
 if let r = arg("room") { Warm.room(r, why: "joining") }
+
+// One reader for both arms. "direct" is a real third answer -- a link, a ring, a
+// resumed call -- and not a stand-in for "unknown".
+Metrics.fact("launch_path", arg("launch-path") ?? "direct")
 
 // ── DECLARED BELOW THE FRONT DOOR, WHICH IS WHY IT IS DOWN HERE ─────────────
 //
