@@ -281,11 +281,40 @@ canceller as never having run. And the echo simulator itself was reading the
 *decoded* stream rather than the emitted one, which is a room that keeps reflecting
 out of a switched-off speaker.
 
-Current reading, listener end, 22 ms path at 0.55, 26 s:
+And a third, in the rig's own ruler: it read the **last** `echo:` line, which is
+the leaky ERLE at the instant the process was killed, and the same binary scored
+16 dB on one run and 5 dB on the next depending on which syllable the kill landed
+on. Three runs of one unchanged build (`measure-the-rigs-noise-first`, done before
+believing any of it):
 
-    echo: 16 dB removed, -21 dB of the path left -- aimed 20 ms, subtracting 100%
+| | peak | p50 |
+|---|---|---|
+| run 1 | 9 dB | 6 dB |
+| run 2 | 36 dB | 9 dB |
+| run 3 | 32 dB | 10 dB |
+
+The peak swings by a factor of four and the median barely moves, so the bar is the
+median. Current reading on the **shipped** binary, listener end, 22 ms path at
+0.55, twice in a row:
+
+    p50 14 dB, peak 27 dB      p50 13 dB, peak 28 dB
 
 The estimator found 20 ms against a path built at 22, which `leadMs` absorbs.
+
+**And the gap is the interesting part, and it is not the filter.** `--aec-test`
+gets 19 dB *steadily* on the same room; here the filter reaches 27–36 dB and then
+falls back to single digits, over and over. That shape is not a filter failing to
+converge — it is a filter converging and then losing its target. The capture and
+render streams are two independent device clocks, and the echo arrives at an offset
+that drifts between them while the filter is aimed at a fixed integer delay. Tens
+of parts per million is tens of samples over twenty seconds, and the render cursor
+jitters by up to a block on top of that.
+
+So **the next thing worth doing to this canceller is not more taps or a different
+step size — it is tracking that alignment**: a fractional delay, re-estimated
+continuously, instead of an integer one assumed to hold. That is where the missing
+15 dB between −18 dB and full duplex most plausibly is, and it costs nothing in
+voice quality because it is still subtraction.
 
 What this cannot do, said here rather than discovered later: both ends share this
 machine's one speaker and one microphone, so the path is simulated and has no
