@@ -313,14 +313,38 @@ enum Launcher {
   // new idea; it is the same three parts the waiting card already uses, which is
   // the point -- the join window should look like the thing it is the front door
   // to.
-  static func askRoom() -> String? {
+  /// What somebody decided at the front door. Three answers, and a `String?`
+  /// could only carry two of them: "the room is called meera" and "we are ringing
+  /// meera" are different facts and must not be able to become the same value.
+  enum Intent {
+    /// Join this room. Nobody has been told; whoever else turns up, turns up.
+    case room(String)
+    /// The ring has ALREADY BEEN SENT to `who`, and it named `room`. `away` is the
+    /// server saying their Mac had stopped polling -- not a no, just the only
+    /// thing anybody can honestly say about whether they are there.
+    case calling(room: String, who: String, away: Bool)
+  }
+
+  /// Which of the three things this card is currently for. One value, because two
+  /// booleans that have to agree are a state that can be both -- the bug
+  /// `WaitingCard.Mode` was extracted to fix, in the same shape, one screen away.
+  enum Mode { case people, word, name }
+
+  static func home() -> Intent? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
     // then behave as though the window belongs to nothing.
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
-    let W: CGFloat = 560, H: CGFloat = 520
+    // ── TALLER, BECAUSE THE CARD GREW A LIST ─────────────────────────────────
+    //
+    // 520 was right for a card holding one field and a row of chips. The card now
+    // holds up to five faces and, photographed at 520, it stood 390 points tall in
+    // a 520 point window -- so the camera preview it floats over was a 110 point
+    // strip showing the top of somebody's head. A pane of glass over a face is the
+    // composition; a pane of glass with a face peeking out above it is a dialog.
+    let W: CGFloat = 560, H: CGFloat = 660
     let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                      styleMask: [.titled, .closable, .fullSizeContentView],
                      backing: .buffered, defer: false)
@@ -375,6 +399,15 @@ enum Launcher {
     // It sits at the TOP edge of the gradient above, where the gradient is still
     // transparent, so it gets no help from it and carries its own dim.
     let hintPill = Glass("hintPill", radius: Metric.capsule(Metric.pillHeight))
+    // ── WHERE THE PILL SITS DEPENDS ON HOW TALL THE CARD IS ──────────────────
+    //
+    // This was `H * 0.62`, a fraction of the window, chosen when the card below it
+    // had one fixed height. The card has three heights now, and the tallest of
+    // them reached past 0.62 -- so the sentence about the camera would have been
+    // read through the pane of glass in front of it. Set from the card's own
+    // `maxY` in `relayout` instead; a constant here is a constant that has to be
+    // re-checked every time a row is added below.
+    var hintY = H * 0.62
     let hint = NSTextField(labelWithString: "")
     hint.font = Type_.status
     hint.textColor = Palette.fg
@@ -388,8 +421,8 @@ enum Launcher {
       guard !s.isEmpty else { return }
       let tw = ceil((s as NSString).size(withAttributes: [.font: Type_.status]).width)
       let pw = tw + Metric.s8
-      hintPill.frame = NSRect(x: (W - pw) / 2, y: H * 0.62, width: pw, height: Metric.pillHeight)
-      hint.frame = NSRect(x: (W - pw) / 2, y: H * 0.62 + (Metric.pillHeight - 16) / 2,
+      hintPill.frame = NSRect(x: (W - pw) / 2, y: hintY, width: pw, height: Metric.pillHeight)
+      hint.frame = NSRect(x: (W - pw) / 2, y: hintY + (Metric.pillHeight - 16) / 2,
                           width: pw, height: 16)
     }
     v.addSubview(hintPill)
@@ -398,175 +431,177 @@ enum Launcher {
     let session = AVCaptureSession()
     setHint("Starting camera…")
 
-    // ── ONE PANE OF GLASS, HOLDING EVERYTHING YOU CAN DO ──────────────────────
-    let recents = Array(recentRooms.prefix(4))
+    w.contentView = v
+
+    // ── ONE PANE OF GLASS, AND ON IT THE PEOPLE ───────────────────────────────
+    //
+    // What was here was a room name. A text field reading "a word you both know",
+    // a Suggest button, a Join button, and under them four chips of rooms you had
+    // been in -- and that was the whole front door of an app whose stated goal is
+    // "tap a name to call someone you have called before".
+    //
+    // The people were not missing. `Identity.contactHandles()` had them, and
+    // `ContactRow` drew them, and tapping one already placed a call. They were
+    // just somewhere nobody would ever look: INSIDE a call, behind the peek
+    // button, on the second page of the more sheet. To ring somebody you had
+    // spoken to yesterday you opened the app, typed a room name at it, waited for
+    // a call to start with nobody in it, opened a sheet, went to a second page,
+    // and tapped their face. Every one of those steps worked perfectly.
+    //
+    // So the list comes to the front door and the room name goes behind a row.
+    // The ordering is the whole change and it is not a preference: a name is what
+    // you have when you want to talk to a PERSON, and a shared secret word is what
+    // you have when you want to talk to a STRANGER. The second is rarer, so it is
+    // one click further away, and it is still exactly where it was for anybody who
+    // needs it.
+    //
+    // Three things you can do here, and the card is only ever showing one of them:
+    //
+    //   .people   the faces. The default, whenever there is at least one.
+    //   .name     a field for a handle you were told out loud but have not called.
+    //   .word     the old room field, Suggest and Join, unchanged.
+    //
+    // One `mode` decides which, for the reason `WaitingCard` gives about its own:
+    // this began as two booleans that had to agree, and two booleans that have to
+    // agree are a state that can be both.
+    let people = Array(Identity.contactHandles().prefix(5))
     let pad = Metric.cardPad
-    // Every term is a thing on screen or the space above it, so the card is
-    // exactly as tall as its contents and no taller. The first version reserved a
-    // status line AND a recents gap with generous spacing on both, and the two
-    // empty bands together left sixty points of nothing in the middle of the card.
-    let statusH: CGFloat = 14
-    let cardH: CGFloat = pad + 24 + Metric.s1 + 32 + Metric.s5 + Metric.fieldHeight
-                       + Metric.s1 + statusH + (recents.isEmpty ? 0 : Metric.s2 + 24) + pad
     let cardW = W - Metric.gutter * 2
-    // Clear, with the dim underneath rather than a tint inside. The tint was
-    // `Palette.glassTint` and it is gone from every surface in the app -- see rule
-    // 2 in `Glass.swift`. This card sits over your own face in the bottom half of
-    // the window, below where the gradient above has any strength left.
+    let rowW = cardW - pad * 2
     let card = Glass("joinCard", radius: Metric.cardRadius)
-    card.frame = NSRect(x: Metric.gutter, y: Metric.gutter, width: cardW, height: cardH)
     v.addSubview(card)
 
-    let title = NSTextField(labelWithString: "Join a call")
+    // ── THE ONE EDITABLE THING, TWICE, BECAUSE THEY ARE TWO QUESTIONS ─────────
+    //
+    // `field` is a ROOM: a shared word, and also the encryption salt, which is why
+    // it is validated rather than normalised (see `validate`). `nameField` is a
+    // HANDLE: somebody's name in the registry, checked by `Identity.sanitize`,
+    // which is the server's own rule. They look identical and they are not
+    // interchangeable -- a room name may contain `-` and `_` and a handle may not
+    // -- so typing one into the other has to fail rather than half-work.
+    func vibrant(_ h: CGFloat) -> Vibrant {
+      let b = Vibrant()
+      b.radius = Metric.cardFieldRadius
+      b.setFrameSize(NSSize(width: 0, height: h))
+      return b
+    }
+    func plainField(_ placeholder: String, _ value: String) -> NSTextField {
+      let f = NSTextField()
+      f.placeholderString = placeholder
+      f.stringValue = value
+      f.font = Type_.field
+      f.textColor = Palette.fg
+      f.backgroundColor = .clear
+      f.drawsBackground = false
+      f.isBordered = false
+      f.focusRingType = .none
+      return f
+    }
+
+    let title = NSTextField(labelWithString: "")
     title.font = Type_.title
     title.textColor = Palette.fg
     title.backgroundColor = .clear
     title.isBordered = false
-    var cy = card.frame.maxY - pad - 24
-    title.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: 24)
     v.addSubview(title)
 
-    // Shorter than it was. The old copy ran to two dense lines about the name
-    // being the encryption key AND the rendezvous AND the setup; all true, and
-    // more than anyone reads standing in a doorway.
-    // Plainer again. "the key" is the right idea in the wrong register for the
-    // one screen a first-time user meets before anything else works; "password" is
-    // the word everybody already has for a secret you both know.
-    let sub = NSTextField(labelWithString: "Type the same word on both Macs. It is also the "
-                        + "password, so pick something only you two would say.")
+    let sub = NSTextField(labelWithString: "")
     sub.font = Type_.caption
     sub.textColor = Palette.muted
     sub.maximumNumberOfLines = 2
     sub.lineBreakMode = .byWordWrapping
     sub.backgroundColor = .clear
     sub.isBordered = false
-    cy -= Metric.s1 + 32
-    sub.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: 32)
     v.addSubview(sub)
 
-    // The row: name, Suggest, Join. Vibrant fills, not glass -- this is INSIDE a
-    // glass surface, and glass on glass is the one thing the guidance rules out.
-    cy -= Metric.s5 + Metric.fieldHeight
-    let joinW: CGFloat = 92, suggestW: CGFloat = 84
-    let fieldW = cardW - pad * 2 - Metric.s2 * 2 - joinW - suggestW
-    let fieldBack = Vibrant()
-    fieldBack.radius = Metric.cardFieldRadius
-    fieldBack.frame = NSRect(x: card.frame.minX + pad, y: cy,
-                             width: fieldW, height: Metric.fieldHeight)
-    v.addSubview(fieldBack)
-
-    let field = NSTextField(frame: NSRect(x: fieldBack.frame.minX + Metric.s4,
-                                          y: cy + (Metric.fieldHeight - 19) / 2,
-                                          width: fieldW - Metric.s4 * 2, height: 19))
-    // Not "room name". A room is this app's own plumbing, and this box is the
-    // first thing a new person is asked to fill in.
-    field.placeholderString = "a word you both know"
-    field.stringValue = UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom()
-    field.font = Type_.field
-    field.textColor = Palette.fg
-    field.backgroundColor = .clear
-    field.drawsBackground = false
-    field.isBordered = false
-    field.focusRingType = .none
-    v.addSubview(field)
-
+    // The room half: field, Suggest, Join. Every line of this is the code that was
+    // here before, moved rather than rewritten -- it is the path a first-time pair
+    // of Macs still takes, and it was correct.
+    let fieldBack = vibrant(Metric.fieldHeight)
+    let field = plainField("a word you both know",
+                           UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom())
     let newBtn = PillButton("Suggest")
     let join = PillButton("Join")
     join.prominent = true
-    newBtn.setFrameSize(NSSize(width: suggestW, height: Metric.fieldHeight))
-    join.setFrameSize(NSSize(width: joinW, height: Metric.fieldHeight))
-    newBtn.setFrameOrigin(NSPoint(x: fieldBack.frame.maxX + Metric.s2, y: cy))
-    join.setFrameOrigin(NSPoint(x: newBtn.frame.maxX + Metric.s2, y: cy))
-    v.addSubview(newBtn)
-    v.addSubview(join)
+    newBtn.setFrameSize(NSSize(width: 84, height: Metric.fieldHeight))
+    join.setFrameSize(NSSize(width: 92, height: Metric.fieldHeight))
+    for x in [fieldBack, field, newBtn, join] as [NSView] { v.addSubview(x) }
 
-    // Validation messages. A reserved line, so saying something does not shove
-    // the recents down and move a target under a finger already travelling.
-    cy -= Metric.s1 + statusH
+    // The handle half.
+    let nameBack = vibrant(Metric.fieldHeight)
+    let nameField = plainField("their name", "")
+    let callBtn = PillButton("Call")
+    callBtn.prominent = true
+    callBtn.setFrameSize(NSSize(width: 92, height: Metric.fieldHeight))
+    for x in [nameBack, nameField, callBtn] as [NSView] { v.addSubview(x) }
+
+    // Validation, on a line that is always reserved. Saying something must not
+    // shove the rows below it down and move a target under a pointer already
+    // travelling towards one.
+    let statusH: CGFloat = 14
     let status = NSTextField(labelWithString: "")
     status.font = Type_.caption
     status.textColor = Palette.warn
     status.backgroundColor = .clear
     status.isBordered = false
-    status.frame = NSRect(x: card.frame.minX + pad, y: cy, width: cardW - pad * 2, height: statusH)
     v.addSubview(status)
 
-    // Camera-denied recovery, in the same pill language as everything else.
-    let settingsButton = PillButton("Open Settings")
-    settingsButton.setFrameSize(NSSize(width: 132, height: Metric.pillHeight))
-    settingsButton.setFrameOrigin(NSPoint(x: (W - 132) / 2, y: H * 0.62 - Metric.s2 - Metric.pillHeight))
-    settingsButton.isHidden = true
-    settingsButton.onPress = {
-      // The exact pane, not the top of Settings: "go and find it" is how a person
-      // gives up on an app.
-      //
-      // The URL used to be typed here. It moved to Permissions.swift for two
-      // reasons: the microphone needed the same treatment and had none, so there
-      // would have been two copies of a string whose silent rot cannot be
-      // detected at runtime; and a pane identifier that goes stale opens the TOP
-      // of System Settings while every return value says success, so the one
-      // place it lives is also the place that carries the measurement proving it
-      // lands where it claims.
-      Permissions.reveal(.camera)
-    }
-    v.addSubview(settingsButton)
+    let peopleRows = people.map { ContactRow(handle: $0) }
+    let newRow = SheetRow("Call someone new", glyph: Glyph.person)
+    let wordRow = SheetRow("Join with a word")
+    let backRow = SheetRow("Back")
+    // Your own name, and the one state that gets a sentence instead of a control:
+    // a copy button over an empty value copies nothing, reports success, and
+    // teaches the person the feature is broken. Same rule as the People page.
+    let mineRow = ContactRow(handle: Identity.handle)
+    mineRow.value = "copy"
+    mineRow.valueIsWord = true
+    mineRow.ruled = true
+    let mineHint = SheetHint(Identity.handle.isEmpty ? Identity.nameTroubleLine
+                                                     : "Give this to someone and they can call you.")
+    let emptyHint = SheetHint("Talk to someone once and they’ll show up here.")
+    for r in peopleRows { v.addSubview(r) }
+    for x in [newRow, wordRow, backRow, mineRow] as [NSView] { v.addSubview(x) }
+    v.addSubview(mineHint)
+    v.addSubview(emptyHint)
+    // `newRow` and `wordRow` carry no glyph column of their own beside a list of
+    // 34 pt faces -- a page of faces has a 56 pt mark column and an ordinary row
+    // an 18 pt one, and the two together draw a ragged left edge that reads as two
+    // lists that happen to be adjacent. Same fix as `buildPeoplePage`.
+    for r in [wordRow, backRow] { r.textInset = Metric.rowAvatarInset }
+    newRow.textInset = Metric.rowAvatarInset
 
-    func startPreview() {
-      guard let dev = AVCaptureDevice.default(for: .video) ?? CameraSource.available().first,
-            let input = try? AVCaptureDeviceInput(device: dev), session.canAddInput(input) else {
-        setHint("No camera found — this call will be audio only.")
-        return
-      }
-      session.addInput(input)
-      let pl = AVCaptureVideoPreviewLayer(session: session)
-      pl.videoGravity = .resizeAspectFill
-      pl.frame = CGRect(x: 0, y: 0, width: W, height: H)
-      pl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-      // At index 0: the preview is the CONTENT of this window and everything else
-      // in it floats above. It used to be inserted below the dimming gradient for
-      // the same reason, and the gradient is gone.
-      host.insertSublayer(pl, at: 0)
-      setHint("")
-      DispatchQueue.global(qos: .userInitiated).async { session.startRunning() }
-    }
-
-    // ── ASK FOR THE CAMERA, HERE, AND SAY WHAT HAPPENED ───────────────────────
+    // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
-    // Starting a capture session prompts implicitly, and if the person does not
-    // answer -- clicks away, misses it behind another window -- the session simply
-    // never delivers a frame and the app shows black forever with no explanation.
-    // That is exactly what happened: `notDetermined` on a machine where the app had
-    // been opened repeatedly and the window was always empty, and the report was
-    // the only true summary available -- "I still don't see the self view."
-    //
-    // So it is requested explicitly, at the moment the person is looking at the
-    // window it is about, and each of the three outcomes says something different.
-    CameraSource.requestAccess { access in
-      DispatchQueue.main.async {
-        switch access {
-        case .granted:
-          startPreview()
-        case .denied:
-          setHint("Camera access is off, so they will not see you.")
-          settingsButton.isHidden = false
-          fputs("camera: access DENIED -- the call will be audio only\n", stderr)
-        case .restricted:
-          setHint("Camera use is restricted on this Mac — audio only.")
-          fputs("camera: access restricted by policy\n", stderr)
-        }
-      }
-    }
-
-    w.contentView = v
-
-    // A tiny target rather than a delegate class: the whole interaction is "did
-    // they press Join, and with what text".
+    // The old target answered one question -- "did they press Join, and with what
+    // text". There are three answers now and only a type can keep them apart: a
+    // room to join, a person already being rung, or nothing because the window was
+    // closed. Returning a `String?` for all three is what would let "the room is
+    // called meera" and "we are ringing meera" become the same value.
     final class Target: NSObject {
-      var picked: String?
+      var out: Intent?
       var done = false
+      /// A ring is in flight. ONE FLAG, guarded in every path that could start a
+      /// second one -- clicking a second face while the first ring is travelling
+      /// would leave two minted rooms, and the person would be told about one of
+      /// them. `PillButton` is a plain `NSView` with an `onPress` and has no
+      /// `isEnabled` to turn off, so the refusal lives here rather than in six
+      /// places that each have to remember to switch back on.
+      var ringing = false
+      var mode = Mode.people
       let field: NSTextField
+      let nameField: NSTextField
       let status: NSTextField
-      init(field: NSTextField, status: NSTextField) { self.field = field; self.status = status }
+      /// Minted when the pointer arrives on a face, used when the click lands.
+      /// One per handle: hovering across a list five times must not mint five
+      /// rooms and warm all of them.
+      var warmed: [String: String] = [:]
+      var relayout: () -> Void = {}
+      var ring: (String) -> Void = { _ in }
+      init(field: NSTextField, nameField: NSTextField, status: NSTextField) {
+        self.field = field; self.nameField = nameField; self.status = status
+      }
+
       func validate(_ raw: String) -> String? {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Refuse rather than silently normalise: the room name is the rendezvous
@@ -580,55 +615,255 @@ enum Launcher {
         }
         return name
       }
+
       @objc func go() {
-        guard let name = validate(field.stringValue) else { return }
-        picked = name
+        guard !ringing, let name = validate(field.stringValue) else { return }
+        out = .room(name)
         done = true
       }
       @objc func suggest() {
         field.stringValue = Launcher.suggestRoom()
         status.stringValue = ""
+        // Typed or suggested, the room is knowable now and the click is not for
+        // another second or two. Same free time the faces use.
+        if let r = validate(field.stringValue) { Warm.room(r, why: "suggested") }
       }
-      /// A recent room, from its button. The name rides in the button's title, so
-      /// there is no parallel array to fall out of step with what is on screen.
-      @objc func pickRecent(_ sender: NSButton) {
-        field.stringValue = sender.title
-        guard let name = validate(sender.title) else { return }
-        picked = name
-        done = true
+      /// A face was clicked. Everything after this is the ring, and the room is the
+      /// one that was minted and warmed when the pointer arrived.
+      @objc func callRow(_ sender: SheetRow) {
+        guard !ringing, let row = sender as? ContactRow else { return }
+        ring(row.handleName)
       }
+      @objc func callTyped() {
+        guard !ringing else { return }
+        let raw = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bare = raw.hasPrefix("@") ? String(raw.dropFirst()) : raw
+        guard let who = Identity.sanitize(bare) else {
+          // The server's rule, said in words rather than as a regex. A handle is
+          // not a room name and the two fields refuse different things.
+          status.stringValue = raw.isEmpty ? "Type their name."
+                                           : "Names are letters and numbers, starting with a letter."
+          return
+        }
+        ring(who)
+      }
+      @objc func copyMine(_ sender: SheetRow) {
+        guard let row = sender as? ContactRow, !row.handleName.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("@" + row.handleName, forType: .string)
+        row.value = "copied"
+      }
+      @objc func showName() { guard !ringing else { return }; status.stringValue = ""; mode = .name; relayout() }
+      @objc func showWord() { guard !ringing else { return }; status.stringValue = ""; mode = .word; relayout() }
+      @objc func showPeople() { guard !ringing else { return }; status.stringValue = ""; mode = .people; relayout() }
       @objc func cancel() { done = true }
     }
-    let t = Target(field: field, status: status)
-    join.onPress = { t.go() }
-    newBtn.onPress = { t.suggest() }
-    // Return joins. `keyEquivalent` belonged to the NSButton this replaced, so the
-    // field's own action carries it now -- and the field is where the Return is
-    // actually pressed, which is one fewer thing to keep in agreement.
-    field.target = t
-    field.action = #selector(Target.go)
+    let t = Target(field: field, nameField: nameField, status: status)
+    // With nobody in the list there is no people page to be the default: the card
+    // opens on the room field, which is exactly the screen this used to be.
+    t.mode = people.isEmpty ? .word : .people
 
-    // Rooms you have actually been in, one click each.
-    if !recents.isEmpty {
-      cy -= Metric.s2 + 24
-      var x = card.frame.minX + pad
-      for r in recents {
-        let chip = PillButton(r)
-        chip.setFrameSize(NSSize(width: min(160, chip.frame.width), height: 24))
-        if x + chip.frame.width > card.frame.maxX - pad { break }
-        chip.setFrameOrigin(NSPoint(x: x, y: cy))
-        chip.onPress = { [weak t] in
-          guard let t else { return }
-          t.field.stringValue = r
-          if let name = t.validate(r) { t.picked = name; t.done = true }
+    // ── PLACING THE CALL FROM HERE, AND NOT ONE PROCESS LATER ────────────────
+    //
+    // The obvious build is to return the name and let the call image ring them.
+    // It costs a SECOND re-exec: the image would come up, dial, mint a room, ring,
+    // and re-exec again into that room -- two process starts and two camera
+    // bring-ups (~670 ms cold each, and the camera is a platform floor) for one
+    // click. The ring is one signed HTTPS round trip and this window is already
+    // running a run loop, so it happens here and the window re-execs straight into
+    // the room it just made.
+    //
+    // Off the main thread, because signing and an HTTPS round trip on the thread
+    // that draws is a window that stops repainting the moment you click a face.
+    // The hint pill -- already on screen, already the place this window says what
+    // it is doing -- carries the news, so there is no second "calling" surface to
+    // drift out of agreement with `WaitingCard`'s.
+    t.ring = { [weak t] who in
+      guard let t, !t.done, !t.ringing else { return }
+      t.ringing = true
+      let room = t.warmed[who] ?? Launcher.mintRoom()
+      setHint("Calling \(Identity.display(who))…")
+      Thread {
+        Metrics.count("ring_sent_try")
+        let got = Identity.ring(to: who, room: room)
+        let listening = Identity.lastRingListening
+        DispatchQueue.main.async {
+          guard let got else {
+            Metrics.count("ring_sent_fail")
+            // Honest and vague on purpose: a 200 means the ring is in their
+            // mailbox, anything else means we could not put it there. Neither says
+            // whether they are awake.
+            setHint("Couldn’t reach \(Identity.display(who)) — check the name, and try again.")
+            t.ringing = false
+            return
+          }
+          Metrics.count("ring_sent_ok")
+          Metrics.fact("callee_listening", listening.map { $0 ? "yes" : "no" } ?? "unknown")
+          t.out = .calling(room: got, who: who, away: listening == false)
+          t.done = true
         }
-        v.addSubview(chip)
-        x += chip.frame.width + Metric.s2
-      }
+      }.start()
     }
 
+    // ── ONE PLACE THAT DECIDES WHERE EVERYTHING IS ───────────────────────────
+    //
+    // Three modes with three different card heights, and the alternative to this
+    // function is three copies of the arithmetic that have to agree about the
+    // padding. Rows are laid out by walking a list top-down rather than by naming
+    // a y for each: adding a row to the list is then one line and cannot leave a
+    // gap where a hidden view used to be.
+    let relayout = { [weak t] in
+      guard let t else { return }
+      let words = t.mode == .people
+      title.stringValue = words ? "" : (t.mode == .name ? "Call someone new" : "Join with a word")
+      sub.stringValue = t.mode == .word
+        ? "Type the same word on both Macs. It is also the password, so pick something only you two would say."
+        : (t.mode == .name ? "Their name is the one their Mac told them, like @meera." : "")
+
+      // What is on screen in this mode, top to bottom. Everything else is hidden,
+      // and hidden is the DEFAULT rather than something each branch has to undo --
+      // a view left visible by a mode that forgot it is the bug this shape exists
+      // to make impossible.
+      var column: [NSView] = []
+      let heads: [NSView] = t.mode == .people ? [] : [title, sub]
+      switch t.mode {
+      case .people:
+        column += people.isEmpty ? [emptyHint] : peopleRows
+        column += [newRow, wordRow]
+        column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
+      case .name:
+        column += [nameBack, status]
+        column += people.isEmpty ? [] : [backRow]
+      case .word:
+        column += [fieldBack, status]
+        column += people.isEmpty ? [] : [backRow]
+      }
+      let shown = Set((heads + column).map { ObjectIdentifier($0) })
+      for x in [title, sub, fieldBack, field, newBtn, join, nameBack, nameField, callBtn,
+                status, newRow, wordRow, backRow, mineRow, mineHint, emptyHint] as [NSView] {
+        x.isHidden = !shown.contains(ObjectIdentifier(x))
+      }
+      for r in peopleRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
+      // The two fields are not in `column` -- they ride inside their `Vibrant`
+      // backing -- so their visibility follows the thing they sit in.
+      field.isHidden = fieldBack.isHidden
+      newBtn.isHidden = fieldBack.isHidden
+      join.isHidden = fieldBack.isHidden
+      nameField.isHidden = nameBack.isHidden
+      callBtn.isHidden = nameBack.isHidden
+
+      func heightOf(_ x: NSView) -> CGFloat {
+        if x === title { return 24 }
+        if x === sub { return 32 }
+        if x === status { return statusH }
+        if x is SheetHint { return Metric.sheetHint }
+        if x === fieldBack || x === nameBack { return Metric.fieldHeight }
+        return Metric.sheetRow
+      }
+      let gap = Metric.s1
+      var h = pad + pad
+      for (i, x) in (heads + column).enumerated() { h += heightOf(x) + (i == 0 ? 0 : gap) }
+      // The title and the subtitle want more air under them than two rows want
+      // between them; without it the sentence and the field it is about read as
+      // one block.
+      if !heads.isEmpty { h += Metric.s3 }
+      card.frame = NSRect(x: Metric.gutter, y: Metric.gutter, width: cardW, height: h)
+
+      var y = card.frame.maxY - pad
+      for (i, x) in (heads + column).enumerated() {
+        let hh = heightOf(x)
+        y -= hh + (i == 0 ? 0 : gap)
+        if x === sub { y -= 0 }
+        x.frame = NSRect(x: card.frame.minX + pad, y: y, width: rowW, height: hh)
+        if x === title || x === sub || x === status { /* labels fill the row */ }
+        if x === fieldBack {
+          // The field shares its line with Suggest and Join, so it is the only
+          // thing here that is not full width.
+          let w = rowW - Metric.s2 * 2 - join.frame.width - newBtn.frame.width
+          x.setFrameSize(NSSize(width: w, height: hh))
+          field.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
+                               width: w - Metric.s4 * 2, height: 19)
+          newBtn.setFrameOrigin(NSPoint(x: x.frame.maxX + Metric.s2, y: y))
+          join.setFrameOrigin(NSPoint(x: newBtn.frame.maxX + Metric.s2, y: y))
+        }
+        if x === nameBack {
+          let w = rowW - Metric.s2 - callBtn.frame.width
+          x.setFrameSize(NSSize(width: w, height: hh))
+          nameField.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
+                                   width: w - Metric.s4 * 2, height: 19)
+          callBtn.setFrameOrigin(NSPoint(x: x.frame.maxX + Metric.s2, y: y))
+        }
+        if x === title || x === sub { y -= (x === sub ? Metric.s3 : 0) }
+        x.needsDisplay = true
+      }
+      // The hint pill sits over the picture ABOVE the card, and the card's height
+      // changes with the mode. Derived rather than a fraction of the window, so a
+      // tall card cannot slide underneath it.
+      // A clear band between the pill and the card. At `s5` the two were two
+      // points apart and photographed as one object with a bubble growing out of
+      // its top edge -- the pill is a statement about the PICTURE, and it has to
+      // sit in the picture rather than on the furniture.
+      hintY = card.frame.maxY + Metric.s8
+      card.needsDisplay = true
+      v.needsLayout = true
+    }
+    t.relayout = relayout
+
+    // ── WIRING ────────────────────────────────────────────────────────────────
+    join.onPress = { t.go() }
+    newBtn.onPress = { t.suggest() }
+    callBtn.onPress = { t.callTyped() }
+    // Return commits, in whichever field is on screen. `keyEquivalent` belonged to
+    // the buttons this replaced; the field is where Return is actually pressed,
+    // which is one fewer thing to keep in agreement.
+    field.target = t; field.action = #selector(Target.go)
+    nameField.target = t; nameField.action = #selector(Target.callTyped)
+    newRow.target = t; newRow.action = #selector(Target.showName)
+    wordRow.target = t; wordRow.action = #selector(Target.showWord)
+    backRow.target = t; backRow.action = #selector(Target.showPeople)
+    mineRow.target = t; mineRow.action = #selector(Target.copyMine(_:))
+    for r in peopleRows {
+      r.target = t
+      r.action = #selector(Target.callRow(_:))
+      // ── THE POINTER ARRIVING IS WORTH ABOUT A SECOND ────────────────────────
+      //
+      // The room a contact call uses is minted at the moment of the click, and a
+      // room nobody has touched costs ~1108 ms on its first request. Minting it
+      // when the pointer ENTERS the row, and warming it there, moves that whole
+      // cost into the time between deciding to click somebody and clicking them.
+      //
+      // Recorded per handle so the click uses the room that was actually warmed.
+      // Without that the warm would be for a room the call never joins, which is
+      // the same as no warm at all and looks identical in every log.
+      r.onHover = { [weak t] in
+        guard let t, t.warmed[r.handleName] == nil else { return }
+        let room = Launcher.mintRoom()
+        t.warmed[r.handleName] = room
+        Warm.room(room, why: "hover @" + r.handleName)
+      }
+    }
+    // Typing a room is the same signal as hovering a face: the name is knowable
+    // well before Join is pressed. `Warm` asks once per room, so a person typing
+    // `standup` one character at a time sends one request, not eight.
+    let typing = NotificationCenter.default.addObserver(
+      forName: NSControl.textDidChangeNotification, object: field, queue: .main) { _ in
+        let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.count >= 3, raw.count <= 64,
+              raw.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else { return }
+        Warm.room(raw, why: "typed")
+      }
+    defer { NotificationCenter.default.removeObserver(typing) }
+
+    relayout()
+
     w.makeKeyAndOrderFront(nil)
-    w.makeFirstResponder(field)
+    // ── THE CARET GOES WHERE THE MODE IS ─────────────────────────────────────
+    //
+    // Unconditionally `field` before, which was right when the room field was the
+    // only thing on the card. It is now hidden on the default screen, and AppKit
+    // will happily make a hidden text field the first responder: the caret would
+    // be in a box nobody can see, and the first thing typed would go into it.
+    w.makeFirstResponder(t.mode == .word ? field : (t.mode == .name ? nameField : nil))
     // ── THE ONE WINDOW IN THIS APP THAT STILL TOOK THE FRONT ─────────────────
     //
     // `Display.open` has had this switch since a rig's ring cards started landing
@@ -670,8 +905,15 @@ enum Launcher {
     // Release the device before the re-exec, so the call opens it cleanly rather
     // than racing a session this process is about to stop existing to own.
     if session.isRunning { session.stopRunning() }
-    if let r = t.picked { remember(r) }
-    return t.picked
+    // ── ONLY A ROOM YOU TYPED IS A ROOM WORTH REMEMBERING ────────────────────
+    //
+    // `recentRooms` is a list of shared words -- things you and somebody agreed to
+    // say to each other. A minted room from a contact call is a random 3-4-3 code
+    // that exists for one call and that neither person ever sees; putting those in
+    // the list would fill the only human-readable history in the app with noise
+    // within a week of the people list working.
+    if case .room(let r)? = t.out { remember(r) }
+    return t.out
   }
 
   /// Replace this process with the same binary, plus the arguments a joined call

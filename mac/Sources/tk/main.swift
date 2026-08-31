@@ -856,14 +856,36 @@ if arg("room") == nil, arg("peer") == nil, !flag("gui"),
 if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
                          hasPeer: arg("peer") != nil,
                          forced: flag("gui")) {
-  guard let room = Launcher.askRoom() else { exit(0) }   // closed the window
+  // ── THE FRONT DOOR ANSWERS TWO DIFFERENT THINGS NOW ──────────────────────
+  //
+  // It used to answer "which room", because a room was the only thing it could
+  // ask for. It can also ring a person, and when it does THE RING HAS ALREADY
+  // GONE OUT -- sent from the window's own run loop, deliberately, so that one
+  // click is one re-exec instead of two. See the note over `Launcher.home`'s
+  // `ring` closure for why that matters: each re-exec is a process start and a
+  // camera bring-up, and the camera is a ~670 ms platform floor.
+  //
+  // So this branch does not ring anybody. It carries the news of a ring that has
+  // happened into the image that will wait for the answer -- the same `--calling`
+  // flag the in-call dial path uses, which is what puts a name and a cancel
+  // button on the waiting card instead of an invite link.
+  guard let intent = Launcher.home() else { exit(0) }   // closed the window
   // Video on by default here and off for the command line: someone who typed
   // `tk` is measuring something, someone who double-clicked wants a video call.
   // A WINDOW, TOO. Without `--window` nothing ever creates one, so the app that
   // was just double-clicked showed a name prompt and then vanished into the dock
   // while running a perfectly good audio call nobody could see. A video calling
   // app that opens no video is the one bug a user notices before any latency.
-  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+  switch intent {
+  case .room(let room):
+    Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+  case .calling(let room, let who, let away):
+    var extra = ["--video", "camera", "--window", "--calling", who]
+    // Only an explicit false changes a word on screen. nil means the server had
+    // no basis to say, which is NOT the same as "they are away".
+    if away { extra.append("--callee-away") }
+    Launcher.reexec(room: room, extra: extra, why: "called @" + who)
+  }
 }
 
 // ── THE FIRST THING THIS IMAGE DOES WITH THE ROOM'S NAME ─────────────────────
@@ -1338,9 +1360,25 @@ func leaveCall() -> Never {
   let bundled = (Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
     .contains("/Contents/MacOS/")
   if bundled, !flag("leave-exits") {
-    fputs("left the call -- Kin stays open\n", stderr)
+    // ── HANGING UP LANDS ON THE FRONT DOOR ────────────────────────────────
+    //
+    // This re-exec'd into a freshly minted room with `--window`, so the screen
+    // after a call was a call: an empty room, a waiting card, and an invite link
+    // to a room whose name had just been made up and that nobody had been told
+    // about. You ended a conversation with somebody and the app answered by
+    // showing you a stranger's front door.
+    //
+    // The one thing a person does after a call is call somebody -- often the
+    // same person, because the line dropped or they forgot something. That is
+    // one click from the home screen and was previously five: type a word, wait
+    // for a call to start with nobody in it, open the sheet, go to People, tap.
+    //
+    // `--gui` rather than a new flag: `shouldPrompt` already takes `forced:`, and
+    // the room passed here is only what `reexec` requires in argv -- the front
+    // door replaces it with whatever is chosen, exactly as it does on a launch.
+    fputs("left the call -- Kin stays open, on the home screen\n", stderr)
     Launcher.reexec(room: Launcher.mintRoom(),
-                    extra: ["--video", "camera", "--window"], why: "hung up")
+                    extra: ["--video", "camera", "--window", "--gui"], why: "hung up")
   }
   fputs("left the call\n", stderr)
   exit(0)

@@ -949,9 +949,23 @@ class SheetRow: NSButton {
     addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow],
                                    owner: self, userInfo: nil))
   }
+  // ── THE POINTER ARRIVING IS THE EARLIEST HONEST SIGNAL OF INTENT ──────────
+  //
+  // The front door uses this to warm a room before the click: a room object costs
+  // ~1108 ms on the first request that touches it (CONTACTS.md), and the pointer
+  // reaches a row some hundreds of milliseconds before the button goes down. That
+  // is free time, and it was being spent on nothing.
+  //
+  // Fires on ENTER only, never on exit and never repeatedly, so a handler may
+  // assume it is called about as often as a person moves across a list. Whatever
+  // it starts must be idempotent and must not be something the click then waits
+  // on -- a prefetch that the click blocks on is slower than no prefetch at all.
+  var onHover: (() -> Void)?
+
   override func mouseEntered(with event: NSEvent) {
     guard !inert else { return }
     hovering = true; needsDisplay = true
+    onHover?()
   }
   override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
   override func resetCursorRects() {
