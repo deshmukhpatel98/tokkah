@@ -78,6 +78,43 @@ final class Floor {
     /// to end a vocalisation: 200-400 ms is a pause inside a sentence, past that
     /// the person has stopped.
     var releaseMs: Double = 450
+    /// ── THE SAME WAIT, WHEN SOMEBODY IS ALREADY TALKING INTO IT ─────────────
+    ///
+    /// 450 ms is the right answer to "has the holder finished?" asked in an
+    /// empty room: it protects a thinking pause from being read as the end of a
+    /// turn. It is the WRONG answer when the other person has already started
+    /// speaking, because then the room is not empty and the cost of waiting is
+    /// not caution -- it is dead air on somebody's live voice. Measured in
+    /// `--turn-test` at 4 s turns with 0.3 s of overlap: the second speaker was
+    /// silenced for 35% of everything they said, nearly all of it this wait,
+    /// and reported by the user as "a delay of one second... latency in
+    /// deciding who is speaking".
+    ///
+    /// 120 ms is longer than the gap between two syllables (a plosive closure
+    /// is 30-80 ms) and far shorter than a turn gap, so it cannot be triggered
+    /// by the holder drawing breath -- and if the holder was only pausing, they
+    /// are still voicing, so they take the floor straight back from `idle` on
+    /// their next block, with the contest below deciding it.
+    ///
+    /// Only ever SHORTENS a release, so like every other timeout in this file
+    /// it can only open a microphone.
+    var contendedReleaseMs: Double = 120
+    /// ── THE FASTEST WITNESS THERE IS: THEIR OWN AUDIO ───────────────────────
+    ///
+    /// Every other way of learning that the holder has stopped costs a cue: the
+    /// classification waits 450 ms before it will say `.quiet`, `ST_VOICING`
+    /// waits 120 ms and then a transit. But this end is PLAYING their stream --
+    /// silence in it is direct evidence, and its travel is already paid. No
+    /// hangover, no second message, and no protocol at all, so it works
+    /// against every build.
+    ///
+    /// 60 ms: longer than a plosive closure at the top of its range, shorter
+    /// than any gap a person hears as a pause. It only counts while somebody at
+    /// THIS end is already voicing, so the worst case is taking the floor from
+    /// a holder who paused 60 ms mid-word while another person was talking --
+    /// which is a contest, decided by the contest and the ceiling below exactly
+    /// as it would have been.
+    var playoutQuietMs: Double = 60
     /// Both claiming for this long is a deadlock, not a conversation. Brief
     /// overlap is what talking SOUNDS like and nothing here touches it.
     var deadlockMs: Double = 450
@@ -135,6 +172,15 @@ final class Floor {
     /// simultaneous start -- counted on every call as `strict_overlap_pct`.
     /// `--floor-soft` is the control arm (0.94.0 behaviour).
     var strict = true
+    /// ── THE CONTROL ARM FOR "ANY VOICE TAKES AN EMPTY FLOOR" ────────────────
+    ///
+    /// False restores the pre-0.98.0 rule, where a vocalisation still in its
+    /// backchannel phase could not take `idle` -- which under a silent strict
+    /// idle meant the first `claimMs` (700 ms) of every sentence was dead air.
+    /// Kept as a real switch, not a comment, because "we made it faster" is
+    /// worth nothing without the arm that shows how much
+    /// (`--turn-test` prints both).
+    var idleTakesAnyVoice = true
   }
 
   var cfg = Cfg()
@@ -146,6 +192,14 @@ final class Floor {
   private(set) var farAgeMs: Double = 1e9
   /// Milliseconds of loudspeaker tail still to run. See `notePlayout`.
   private(set) var playoutTail: Double = 0
+  /// How long the far end's stream has been silent at this speaker, and
+  /// whether it was EVER heard. `playoutHeard` is the guard that keeps a
+  /// call which has not started -- or one whose audio never arrives -- from
+  /// reading as a holder who has politely stopped
+  /// (`blind-instruments-report-negatives`).
+  private var playoutSilentMs: Double = 0
+  private var playoutHeard = false
+  private var playoutLiveNow = false
   /// Turns this end let go of early because its own sentence was ending, and the
   /// milliseconds of the 450 ms silence rule that saved. `predictedReleases` is
   /// both halves; `farPredictedReleases` is only the half that arrived on the
@@ -164,6 +218,12 @@ final class Floor {
   /// says nothing about a call's length.
   private(set) var echoGuardBlocks = 0
   private(set) var guardableBlocks = 0
+  /// Rig-only window into the release decision. Never read in production.
+  var dbg: String {
+    String(format: "st=%d hq=%.0f pq=%.0f fv=%d fk=%d fsil=%.0f",
+           state.rawValue, holderQuietMs, playoutSilentMs,
+           farVoicing ? 1 : 0, farVoicingKnown ? 1 : 0, farSilentMs)
+  }
   private var farVoice = Voice.quiet
   /// How long the far end has been quiet, on ITS clock: seeded to one transit
   /// when the first quiet cue lands, then counted here.
@@ -181,6 +241,12 @@ final class Floor {
   /// p has been below the threshold during the current hold. A leftover 0.9
   /// from the previous sentence must not release the first word of this one.
   private var farPredArmed = false
+  /// The far end's fast voicing bit, and how long it has said "no sound" for.
+  /// `farVoicingKnown` stays false against a build that cannot say, which is
+  /// what keeps this from reading silence into every older peer.
+  private var farVoicing = false
+  private var farVoicingKnown = false
+  private var farSilentMs: Double = 0
   /// We pre-released THEIR hold because they said it was ending. They must not
   /// take it back on the same claim that was wrapping up -- without this, the
   /// next line of `step` would see `farVoice == .claim` and undo the release
@@ -253,6 +319,12 @@ final class Floor {
     nearClaimMs = near == .claim ? nearClaimMs + ms : 0
     farClaimMs = farVoice == .claim ? farClaimMs + ms : 0
     if farVoice == .quiet { farQuietMs += ms }
+    if farVoicingKnown, !farVoicing { farSilentMs += ms }
+    // From the FIRST block their stream is quiet, not from the end of the
+    // 150 ms echo tail: `playoutTail` answers "could this speaker still be
+    // feeding the microphone", which is a different question with a
+    // deliberately longer answer.
+    if playoutHeard, !playoutLiveNow { playoutSilentMs += ms }
 
     // ── THE FALLBACK, FIRST, BECAUSE IT OUTRANKS EVERYTHING ─────────────────
     //
@@ -304,7 +376,18 @@ final class Floor {
     // the age of the news. Distance cancels.
     let holderVoice: Voice = state == .mine ? near : (state == .theirs ? farVoice : .quiet)
     if state == .theirs {
-      holderQuietMs = farVoice == .quiet ? farQuietMs : 0
+      // Their fast bit when they send one, their classification when they do
+      // not. The bit is the SAME fact measured without the 450 ms hangover, so
+      // a holder who has genuinely stopped is quiet here within a hop plus
+      // 120 ms instead of within a hop plus 570.
+      // Two independent witnesses that the holder stopped, and the more
+      // responsive one wins: their cue (a classification, or the faster
+      // `ST_VOICING` bit) and their own audio going silent in this speaker.
+      // The audio needs no protocol and carries no hangover, so on a healthy
+      // call it is normally the one that answers first.
+      let byCue = farVoicingKnown ? (farVoicing ? 0 : farSilentMs)
+                                  : (farVoice == .quiet ? farQuietMs : 0)
+      holderQuietMs = max(byCue, playoutSilentMs)
     } else {
       holderQuietMs = holderVoice == .quiet ? holderQuietMs + ms : 0
     }
@@ -334,7 +417,36 @@ final class Floor {
       let farPause = state == .theirs && farEndProb >= cfg.predictP && holderQuietMs > 0
       let farEarly = state == .theirs && farPredArmed && farEndProb >= cfg.predictP
       let predictedEnd = localPred || farPause || farEarly
-      if holderQuietMs >= cfg.releaseMs || predictedEnd {
+      // ── HOW LONG THIS RELEASE IS ALLOWED TO TAKE ─────────────────────────
+      //
+      // Contended when the end that does NOT hold the floor is voicing: they
+      // are waiting on this release, and every millisecond of it is silence
+      // over a live voice. A backchannel counts -- "mm-hm" into a pause is
+      // still somebody making sound, and releasing to `idle` does not grant
+      // them anything (the contest below needs a voice, and `farWrapping`
+      // stops a wrapping claim taking it straight back).
+      let contended = state == .theirs ? near != .quiet
+                                       : (farVoicingKnown ? farVoicing : farVoice != .quiet)
+      // ── AND THE SAME SILENCE IS NOT CHARGED FOR TWICE ────────────────────
+      //
+      // `ST_VOICING` only goes false after 120 ms of no sound at the holder's
+      // own microphone, and that report is already a transit old when it
+      // lands. So for a peer that sends the bit, the "has the holder really
+      // stopped" question has ALREADY been answered before this clock starts,
+      // and adding `contendedReleaseMs` on top measured as 313 ms at a
+      // handover in `--turn-test` -- most of it a second waiting period for a
+      // silence that was proven the first time. When somebody is voicing into
+      // that gap, release on the news itself.
+      //
+      // Against a peer that cannot say (`farVoicingKnown` false) the clock is
+      // running on the CLASSIFICATION, which outlives the sound rather than
+      // proving its absence, so the 120 ms filter is still needed there.
+      // Their audio going quiet is already a 60 ms observation by the time it
+      // counts, so like the voicing bit it must not be charged for twice.
+      let proven = (farVoicingKnown && !farVoicing) || playoutSilentMs >= cfg.playoutQuietMs
+      let contendedWait = proven && state == .theirs ? 0 : cfg.contendedReleaseMs
+      let waitMs = contended ? min(contendedWait, cfg.releaseMs) : cfg.releaseMs
+      if holderQuietMs >= waitMs || predictedEnd {
         // Counted, because "the predictor is wired" and "the predictor fires"
         // are two claims and only the second one is worth anything. This is the
         // number that says how much of the 450 ms wait it is actually saving.
@@ -361,9 +473,27 @@ final class Floor {
     // the floor to one would end the other person's sentence for saying "mm-hm".
     // `farWrapping`: they told us this claim is ending, so it must not take the
     // floor back in the same block the release ran.
-    if state == .idle, near != .quiet, near != .backchannel {
+    // ── STRICT: THE FIRST BLOCK OF ANY VOICE TAKES AN EMPTY FLOOR ────────────
+    //
+    // Every vocalisation begins life as a continuer -- the classifier cannot
+    // tell "mm-hm" from a sentence for `claimMs` (700 ms). "A backchannel does
+    // not take the floor" was written when idle TRANSMITTED, where it protected
+    // a HOLDER from being dethroned by a listening noise -- and it still does:
+    // the contest below requires a claim, unchanged. But strict idle is silent,
+    // so in strict the old rule silenced the first 700 ms of every sentence --
+    // measured 14:22 as both ends floor-muted 63%/71% of a two-person call, and
+    // heard as "a second of latency deciding who is speaking". From idle there
+    // is nobody to protect: take it, speak, and if it really was an "mm-hm"
+    // the ordinary release returns the floor within releaseMs.
+    if state == .idle, near != .quiet,
+       ((cfg.strict && cfg.idleTakesAnyVoice) || near != .backchannel) {
       state = .mine
-    } else if state == .idle, farVoice == .claim, !farWrapping {
+    } else if state == .idle, farVoice != .quiet,
+              (farVoice == .claim || (cfg.strict && cfg.idleTakesAnyVoice)), !farWrapping {
+      // The mirror, for the same reason: their first block took THEIR empty
+      // floor, their audio is already on the wire, and an end that waited for
+      // their cue to say `claim` sat with its ear open and its state idle for
+      // 700 ms -- which is where a second speaker collides with them.
       state = .theirs
     }
 
@@ -491,12 +621,29 @@ final class Floor {
   /// exactly one transit -- that is what it means for the news to have travelled
   /// -- and from there this end can simply count. Same distance-invariance, no
   /// protocol change, and nothing to negotiate with an older build.
-  func noteFar(_ v: Voice, transitMs: Double = 0) {
+  func noteFar(_ v: Voice, transitMs: Double = 0, voicing: Bool? = nil) {
     if v == .quiet, farVoice != .quiet { farQuietMs = transitMs }
     if v != .quiet { farQuietMs = 0 }
     farVoice = v
     farAgeMs = 0
     farTransitMs = transitMs
+    // ── AND THE FAST ANSWER, WHEN THEY CAN GIVE ONE ──────────────────────────
+    //
+    // `Wire.ST_VOICING`: sound leaving their microphone in the last 120 ms, as
+    // opposed to `v`, which is a classification that outlives the sound by
+    // 450 ms. The release clock below runs on THIS when it is available,
+    // seeded to one transit exactly like `farQuietMs` -- the news is already
+    // that old when it lands, and assuming otherwise is the distance limit
+    // this project has shipped six times.
+    //
+    // nil means they cannot say (an older build): the clock is left alone and
+    // the claim-based release is unchanged.
+    if let voicing {
+      farVoicingKnown = true
+      if voicing { farSilentMs = 0 }
+      else if farVoicing { farSilentMs = transitMs }
+      farVoicing = voicing
+    }
   }
   /// `Predict.probability`, 0-1, that this end's current turn is ending.
   func noteEndProb(_ p: Double) { endProb = p }
@@ -515,7 +662,8 @@ final class Floor {
   /// on this desk, so a microphone next to it is an echo path, whatever anybody
   /// thinks about whose turn it is. Fed from the render callback.
   func notePlayout(live: Bool) {
-    if live { playoutTail = cfg.playoutTailMs }
+    playoutLiveNow = live
+    if live { playoutTail = cfg.playoutTailMs; playoutSilentMs = 0; playoutHeard = true }
   }
 }
 
@@ -942,6 +1090,47 @@ extension Floor {
     q.noteFar(.quiet)
     say(!q.step(dt: 0.02, near: .quiet).mayTransmit, "idle transmits nothing")
     say(q.step(dt: 0.02, near: .claim).mayTransmit, "and the first voice is out in its own block")
+
+    // 8. AND "FIRST VOICE" MEANS WHAT THE CLASSIFIER ACTUALLY SAYS FIRST.
+    //    Every vocalisation begins as a BACKCHANNEL for 700 ms -- a rig that
+    //    feeds `.claim` directly is testing an input the product cannot
+    //    produce at an onset (`rig-picks-a-parameter-the-product-does-not`).
+    //    The old rule held that phase silent from idle, which was 700 ms of
+    //    dead air on every turn start.
+    let q2 = Floor()
+    q2.cfg.strict = true
+    q2.noteFar(.quiet)
+    _ = q2.step(dt: 0.02, near: .quiet)
+    let dq2 = q2.step(dt: 0.02, near: .backchannel)
+    say(dq2.state == .mine && dq2.mayTransmit,
+        "a voice still in its backchannel phase takes an empty floor at once")
+    let q3 = Floor()
+    q3.cfg.strict = false
+    q3.noteFar(.quiet)
+    _ = q3.step(dt: 0.02, near: .quiet)
+    say(q3.step(dt: 0.02, near: .backchannel).state == .idle,
+        "REJECT: soft keeps the old rule, so the arms are distinguishable")
+    // Their side of the same onset: their cue still says backchannel, their
+    // audio is already flowing -- this ear opens as THEIRS, not as a bystander.
+    let q4 = Floor()
+    q4.cfg.strict = true
+    q4.noteFar(.quiet)
+    _ = q4.step(dt: 0.02, near: .quiet)
+    q4.noteFar(.backchannel)
+    let dq4 = q4.step(dt: 0.02, near: .quiet)
+    say(dq4.state == .theirs && !dq4.mayTransmit,
+        "their backchannel-phase voice holds this mic shut from idle")
+    // And the protection the old rule was FOR is intact: an "mm-hm" over a
+    // holder still does not move the floor.
+    let q5 = Floor()
+    q5.cfg.strict = true
+    q5.noteFar(.quiet)
+    _ = q5.step(dt: 0.02, near: .quiet)
+    q5.noteFar(.claim)
+    _ = q5.step(dt: 0.02, near: .quiet)          // they hold
+    let dq5 = q5.step(dt: 0.02, near: .backchannel)
+    say(dq5.state == .theirs && !dq5.mayTransmit,
+        "an mm-hm over a holder still does not take the floor")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

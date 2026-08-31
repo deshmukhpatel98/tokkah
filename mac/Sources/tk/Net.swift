@@ -918,6 +918,22 @@ final class Wire {
   // what made a ring answer itself once already. So the asking end says so, and
   // every conclusion drawn from arrival has to consult this bit first.
   static let ST_RINGING  = 16      // this end is being asked and has not said yes
+  // ── MAKING SOUND RIGHT NOW, WHICH IS NOT THE SAME AS CLAIMING ─────────────
+  //
+  // `ST_CLAIM` is a classification and it deliberately OUTLIVES the sound: the
+  // gate keeps a vocalisation alive through 450 ms of silence so a breath
+  // between words does not end somebody's turn, and the edge drawing wants
+  // exactly that. The floor wants the opposite. Measured in `--turn-test`: the
+  // second speaker was silenced for 35% of everything they said, because the
+  // holder's cue still said CLAIM for 450 ms after they had actually stopped,
+  // so the release clock never even started -- `one-condition-two-concerns`,
+  // one bit answering "whose turn is it" and "is a voice coming out now".
+  //
+  // This bit is the second question, with a 120 ms hangover of its own: longer
+  // than a plosive closure, far shorter than a turn gap. An older build leaves
+  // it clear, and a peer that never sets it is read as "cannot say", which
+  // falls back to the claim-based release -- today's behaviour exactly.
+  static let ST_VOICING  = 32      // a voice is leaving this microphone now
   // MUTE IS NOT IN THIS BYTE. It rides at TPKTX+4 as its own byte and has since
   // before this one existed -- see `selfMuted`/`peerMuted` above. Noted here
   // because "the status byte" reads like the complete list of what one end tells
@@ -947,6 +963,17 @@ final class Wire {
   /// waiting on it needs a deadline as well.
   private(set) var peerStatusSeen = false
   var peerVocal: Bool { peerStatus & (Wire.ST_BACKCHAN | Wire.ST_CLAIM) != 0 }
+  /// Is the far end making sound right now? `nil` when they cannot say -- a
+  /// build older than `ST_VOICING`, or nothing heard from them yet -- which is
+  /// the value that changes nothing at this end.
+  var peerVoicing: Bool? {
+    guard peerStatusSeen, peerVocalSeen else { return nil }
+    return peerStatus & Wire.ST_VOICING != 0
+  }
+  /// Has a peer that sets the voicing bit ever been seen? The bit being CLEAR
+  /// is meaningful only from a build that would have set it, and the only
+  /// evidence of that is having seen it set once.
+  private(set) var peerVocalSeen = false
   /// The same byte as the turn layer's tri-state. A bid outranks a listening
   /// noise if a build ever sets both, because mistaking a bid for a continuer
   /// costs somebody their turn and the other way round costs a cue.
@@ -970,6 +997,7 @@ final class Wire {
   // far end already parses it, and an extra 32 bytes a few times a second is
   // nothing next to a 3 Mbps call. It also buys a free clock sample.
   private var lastVocalOut = -1
+  private var lastVoicingOut = false
   private var lastStateFlush: UInt64 = 0
   private var lastPredictAbove = false
   /// Returns true if the classification has moved since the last flush and enough
@@ -981,13 +1009,18 @@ final class Wire {
     case .backchannel: v = 1
     case .claim: v = 2
     }
-    guard v != lastVocalOut else { return false }
+    // The voicing bit rides the same watcher, because a signal with a 120 ms
+    // hangover that only travelled on a 300 ms heartbeat would arrive after
+    // the wait it exists to end (`fast-signal-on-a-slow-carrier`).
+    let voicing = Audio.sharedGate.voicingNow
+    guard v != lastVocalOut || voicing != lastVoicingOut else { return false }
     // A floor under the rate, so a classifier chattering on a noisy microphone
     // cannot turn into a packet storm. 15 ms is far below anything a person can
     // see and far above anything a gate does in normal speech.
     let now = Clock.now()
     guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
     lastVocalOut = v
+    lastVoicingOut = voicing
     lastStateFlush = now
     return true
   }
@@ -1044,12 +1077,13 @@ final class Wire {
     // Edge-triggered for speed, level-triggered once a second for repair -- so a
     // dropped edge costs a second of staleness rather than a cue that is wrong for
     // the rest of the call.
-    let vocalBits: Int
+    var vocalBits: Int
     switch Audio.sharedGate.vocal {
     case .quiet:       vocalBits = 0
     case .backchannel: vocalBits = Wire.ST_BACKCHAN
     case .claim:       vocalBits = Wire.ST_CLAIM
     }
+    if Audio.sharedGate.voicingNow { vocalBits |= Wire.ST_VOICING }
     p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus | vocalBits),
                  toByteOffset: TPKTX + 6, as: UInt8.self)
     // ── THE PRIOR RIDES BESIDE THE VOCAL BYTE ────────────────────────────────
@@ -1088,6 +1122,7 @@ final class Wire {
     // where that process stops existing as far as this end is concerned.
     peerStatus = 0
     peerStatusSeen = false
+    peerVocalSeen = false
     Audio.peerTurnEndProb = 0
     Audio.sharedFloor.noteFarEndProb(0)
     // Not nested inside `pathLock` below: nothing takes both, and keeping them
@@ -1580,7 +1615,11 @@ final class Wire {
           // zero -- an age measured from arrival says news that crossed the
           // planet is brand new, which was a hidden distance limit.
           Audio.peerVoiceNow = peerVoice
-          Audio.sharedFloor.noteFar(peerVoice, transitMs: Audio.owdMsNow)
+          // Latched the first time a peer sets it, so a CLEAR bit can be told
+          // from a build that never sets one (`blind-instruments-report-negatives`).
+          if peerStatus & Wire.ST_VOICING != 0 { peerVocalSeen = true }
+          Audio.sharedFloor.noteFar(peerVoice, transitMs: Audio.owdMsNow,
+                                    voicing: peerVoicing)
           // The prior belongs to THIS floor, computed on THEIR transcript.
           // Level-triggered: every TPKTY packet carries the standing value, so a
           // dropped crossing costs a second of staleness rather than a prior

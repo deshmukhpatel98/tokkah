@@ -5,6 +5,86 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.98.0 — 2026-08-31
+
+### Fixed — the second of delay was the app deciding who is speaking, in four places
+
+Reported as "a delay of one second... latency in deciding who is speaking, not
+in actual transportation of voice", and that diagnosis was exactly right: the
+media path measures **17 ms** mouth-to-ear on these calls. The wait was in the
+turn layer, and it was four separate things stacked on one another. Measured on
+real recorded speech through the real gate and floor (`--turn-test`), the time
+from a person starting to talk to being on the wire **when taking the turn**
+fell from **395–547 ms to 101–112 ms**, and to **0 ms** for the end that was
+not being talked over.
+
+- **Any voice takes an empty floor.** Every vocalisation begins life classified
+  as a continuer, and the classifier needs 700 ms to call it a bid. "A
+  backchannel does not take the floor" was written when a pause still
+  transmitted; under strict's silent pause it meant the first 700 ms of every
+  sentence was dead air. From `idle` there is nobody to protect, so the first
+  block of any voice takes it. An "mm-hm" over somebody who *holds* the floor
+  still does not move it — that is what the rule was actually for, and it is
+  asserted both ways. `Floor.Cfg.idleTakesAnyVoice` is the control arm.
+- **A fast "voicing now" bit crosses the wire** (`ST_VOICING`, 120 ms
+  hangover) beside the cue, which carries a 450 ms one so a breath between
+  words cannot end a turn. One bit was answering two questions: the drawing
+  needs the hangover, the floor must not have it. Older builds leave it clear
+  and behave exactly as before.
+- **The holder's own audio going silent is the fastest witness of all.** It
+  needs no cue, no hangover and no protocol — the listener is already playing
+  that stream. 60 ms of silence in it, while somebody at this end is talking,
+  releases the floor. And the same silence is no longer charged for twice: a
+  release proven by either witness no longer waits a further 120 ms.
+- **A microphone whose own speaker is closed is no longer suppressed.** The
+  level-based echo suppression was still attenuating a person the floor had
+  *already* put on the wire — measured as a speaker holding the floor, floor
+  gain 1.0, and inaudible because the echo gate held them at zero. Worst for a
+  quiet voice far from the mic, which is where it was reported. It relaxes only
+  once this machine's speaker is shut, which is the strongest form of the
+  argument: no acoustic path, so nothing arriving can be echo. The classifier's
+  echo test is untouched — deciding whether a sound may *claim* the floor still
+  needs it, and the correlation veto still sits beside it.
+
+Live calls now report `turn_onset_to_wire_p50` and `turn_onset_lost`: the old
+`turn_to_floor_p50` started counting only once the gate had already decided a
+voice was a bid, so it read 0 ms through the very call this was reported on.
+
+### Fixed — the edge you were told to feel, but had to look for
+
+"Really hard to spot, and you have to constantly look at them... you should
+FEEL, yes, your voice is going through. Maybe a thicker bar." Width is now the
+channel: speaking, the stroke is 4.5–8 pt and moves with your own syllables;
+listening, a calm 3 pt; nobody's turn, the original hairline. Fast to widen (a
+first syllable is news), slow to narrow (a breath must not flutter the frame).
+Still no glow, no shadow, no gradient, and nothing painted over the picture —
+that refusal stands, and `glass-check` still passes.
+
+### Fixed — the microphone trim regulated to the loudspeaker
+
+Both ends of the 14:22 call sat at the trim rail (0.17 and 0.06, i.e. −24 dB)
+with a person underneath tuned toward inaudibility, and 0.96.0's persistence
+carried the cut into the next call. The trim now learns nothing while the echo
+detector says the microphone is mostly this machine's own speaker, walks back
+up three times faster when the room is quiet (about fifteen seconds instead of
+minutes), and a stored trim is floored at 0.3 on load — a deeper one is more
+likely last call's loudspeaker than this microphone.
+
+### Fixed — `--turn-test` was measuring a room the product never builds
+
+Three rig faults, each of which looked exactly like a product defect. It fed
+the far-end reference as one RMS per block where the app feeds a per-sample
+peak envelope, understating it by the crest factor of speech, so the echo bar
+sat four times too low and each end classified the other's echo as its own
+voice — that alone reported 35% of a speaker silenced. It injected room echo
+into a microphone whose speaker the floor had closed, so a holder heard itself
+and claimed through its own silence for 8345 consecutive blocks. And it ended
+an "utterance" at the first quiet 0.33 ms block, counting 201 glottal periods
+as 201 late sentences. It now also runs soft and strict as separate arms judged
+on what each one promises, prints the pre-0.98.0 rule beside the new one, and
+fails if that arm is *not* measurably worse — a ruler that cannot see the
+defect it certifies is worth nothing.
+
 ## Kin 0.97.0 — 2026-08-31
 
 ### Fixed — closing a window before the call connected told nobody

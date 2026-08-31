@@ -6029,6 +6029,17 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // Turn-taking is the product now, so it reports like the product.
     "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
     "turn_to_floor_p50": audio.timeToFloorP50,
+    // ── WHAT THE PERSON FEELS AS "LATENCY DECIDING WHO IS SPEAKING" ──────────
+    //
+    // `turn_to_floor_p50` measures only the utterances the gate classified as
+    // a BID, from the moment it decided that -- so the 700 ms before it could
+    // decide was outside the ruler, and it read 0 ms through the call this was
+    // reported on. This one starts at the first block of voice, whatever the
+    // classifier calls it yet, and stops when the floor lets it out.
+    // `turn_onset_lost` is the utterances that never got out at all, which no
+    // percentile can carry.
+    "turn_onset_to_wire_p50": audio.onsetToWireP50,
+    "turn_onset_lost": audio.turns.onsetsLost,
     "turn_collisions": audio.turns.collisions,
     "turn_collision_ms": audio.turns.collisionMs,
     "turn_yielded": audio.turns.yieldedToPeer, "turn_peer_yielded": audio.turns.peerYielded,

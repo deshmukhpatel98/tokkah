@@ -852,6 +852,11 @@ final class Audio {
     var claims = 0                 // times this end bid for the floor
     var claimsGranted = 0          // ... and became audible
     var timeToFloorMs: [Double] = []
+    /// Voice-start to on-the-wire, one sample per utterance -- the number the
+    /// person FEELS as "latency deciding who is speaking". And the utterances
+    /// that never made it out at all, which no latency percentile can carry.
+    var onsetToWireMs: [Double] = []
+    var onsetsLost = 0
     var backchannels = 0           // listening noises, held back or not
     var escalated = 0              // a listening noise that turned into a bid
     var collisions = 0             // both ends vocalising at once
@@ -1051,6 +1056,19 @@ final class Audio {
     // stale about this end rather than the far one.
     dgate.floorMuted = Audio.floorOn && !d.mayTransmit && !d.duckOnly
     dgate.floorDucked = Audio.floorOn && d.duckOnly
+    // Strict only: in soft, `idle` transmits from both ends, so the local echo
+    // suppression is still the only thing standing between two live
+    // microphones and a loop.
+    // ── AND THE CONDITION IS THE EAR, NOT THE GRANT ────────────────────────
+    //
+    // `!playoutOpen` is the strongest possible form of the argument: this
+    // machine's speaker is CLOSED, so there is no acoustic path, so nothing
+    // arriving at this microphone can be echo and suppressing it can only
+    // ever cost the person their voice. It is also exactly the grant with the
+    // one window that matters carved out -- the ear closes 60 ms AFTER the
+    // floor arrives, so the far end's last half-word can land, and through
+    // that window the suppression stays on.
+    dgate.floorGranted = Audio.floorOn && fl.cfg.strict && !d.playoutOpen
     Audio.earOpen = !Audio.floorOn || d.playoutOpen
     if d.fallback { turns.floorFallbackBlocks += 1 }
     turns.floorHeldBlocks += d.mayTransmit ? 0 : 1
@@ -1059,6 +1077,22 @@ final class Audio {
     // also carries voice. 0.004 is the gate's own `farTalking` bar.
     if fl.cfg.strict, Audio.floorOn, d.mayTransmit, dgate.farEnvNow > 0.004 {
       turns.strictOverlapBlocks += 1
+    }
+    // Onset-to-wire, per utterance. Clocked from `myVocalStart` (set above on
+    // the same edge) to the first block the floor let out. An utterance that
+    // ends without ever transmitting is counted, not averaged away -- that is
+    // the "mic failed to capture me" case, and a percentile cannot hold it.
+    if mine != .quiet {
+      if !onsetOpen { onsetOpen = true; onsetServed = false }
+      if !onsetServed, !Audio.floorOn || d.mayTransmit {
+        onsetServed = true
+        if turns.onsetToWireMs.count < 4096, myVocalStart != 0 {
+          turns.onsetToWireMs.append(Clock.ms(now - myVocalStart))
+        }
+      }
+    } else if onsetOpen {
+      onsetOpen = false
+      if !onsetServed { turns.onsetsLost += 1 }
     }
 
     // Choppiness. A gate that opens and shuts inside a third of a second is
@@ -1076,6 +1110,14 @@ final class Audio {
     let v = turns.timeToFloorMs.sorted()
     return v.isEmpty ? -1 : v[v.count / 2]
   }
+  var onsetToWireP50: Double {
+    let v = turns.onsetToWireMs.sorted()
+    return v.isEmpty ? -1 : v[v.count / 2]
+  }
+  /// One utterance being measured right now. `myVocalStart` is the clock; these
+  /// only remember whether the current one has reached the wire yet.
+  private var onsetOpen = false
+  private var onsetServed = false
 
   // ── HEADPHONES CHANGE WHAT IS POSSIBLE, NOT JUST WHAT IS PLEASANT ─────────
   //
@@ -1155,6 +1197,22 @@ final class Audio {
 
   func tuneInputGain() {
     guard Audio.autoGain else { return }
+    // ── NEVER LEARN FROM THE LOUDSPEAKER ────────────────────────────────────
+    //
+    // The raw microphone peak includes whatever this machine's own speaker is
+    // blasting from inches away, and on a live call that is the LOUDEST thing
+    // the mic ever hears. The trim regulated to it: measured 14:22, both ends
+    // at the rail (0.17 and 0.06 -- minus 24 dB), the human underneath tuned
+    // into inaudibility, and the persistence carrying the cut into the next
+    // call. While the echo detector says the mic is mostly our own speaker,
+    // this tick teaches nothing -- and drains both windows, so a skipped
+    // blast cannot be mistaken for the person on the next tick either.
+    if Audio.corrVeto {
+      micPeakWin = 0
+      rawPeakWin = 0
+      Metrics.count("mic_tune_veto")
+      return
+    }
     let peak = micPeakWin
     micPeakWin = 0
     gainTicks += 1
@@ -1268,11 +1326,14 @@ final class Audio {
       }
       if !gainAtRail { gainAtRail = true; Metrics.fact("mic_gain_rail", "yes") }
     } else if raw < 0.5, inputTrim < 1 {
-      // Let it back up slowly when the room quietens, so a single shout does not
-      // leave somebody permanently faint. Slower than it came down on purpose:
-      // the cost of being 3 dB quiet is nothing, and the cost of being hot is
-      // this whole bug.
-      inputTrim = min(1, inputTrim * 1.05)
+      // Let it back up when the room quietens, so a single shout does not
+      // leave somebody permanently faint. Slower than it came down on purpose
+      // -- but not TOO slow: a raw peak under 0.25 through a trim already deep
+      // is a distant, quiet voice being thrown away, and at 5% a tick the walk
+      // back from 0.06 took minutes. 15% a tick clears a wrong deep cut in
+      // about fifteen seconds and still cannot oscillate: the hot direction
+      // cuts proportionally in one tick, and there is a dead band between.
+      inputTrim = min(1, inputTrim * (raw < 0.25 ? 1.15 : 1.05))
       if inputTrim > 0.98 { inputTrim = 1; gainAtRail = false }
       saveTrim()
     }
@@ -1295,7 +1356,13 @@ final class Audio {
     guard let data = try? Data(contentsOf: Audio.trimFile()),
           let map = try? JSONSerialization.jsonObject(with: data) as? [String: Double],
           let v = map[uid], v < 0.98 else { return }
-    inputTrim = Float(min(1, max(0.02, v)))
+    // Floored at 0.3 on the way IN, whatever was stored. A trim below that is
+    // more likely last call's loudspeaker than this microphone (the 14:22 call
+    // stored 0.06), and a person sitting far from the mic under a -24 dB cut
+    // is inaudible for the whole walk back up. 0.3 still takes 10 dB off a
+    // genuinely hot mic's first sentence, and the cut path re-learns the rest
+    // within two ticks of real speech.
+    inputTrim = Float(min(1, max(0.3, v)))
     trimSaved = inputTrim
     Metrics.count("mic_trim_loaded")
     Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
@@ -2392,6 +2459,23 @@ final class Audio {
     /// Talking, but not this end's turn. A duck, never a cut -- see `duckOnly`
     /// in Floor.swift for the 35% regression that made the distinction.
     var floorDucked = false
+    /// ── THE FLOOR HAS GRANTED THIS MICROPHONE ─────────────────────────────────
+    ///
+    /// In strict there is exactly one live microphone, and the other one is
+    /// MUTED -- so while this end holds the floor there is no loop for the
+    /// sample-level echo suppression to protect against, and the holder's own
+    /// speaker is closed as well. Leaving it on made the gate fight the person
+    /// it had just been told to carry: measured in `--turn-test` as a speaker
+    /// who had the floor (`state=mine`, floor gain 1.0) and was still
+    /// inaudible because the echo gate held `gain` at zero -- and heard as
+    /// "the mic is failing to capture the speaking person", worst when they sit
+    /// far from it and their voice is quiet.
+    ///
+    /// The CLASSIFIER is untouched: deciding whether a sound is a voice worth
+    /// claiming the floor with still needs the echo test (and the correlation
+    /// veto beside it). This only stops the gate attenuating audio the floor
+    /// has already decided belongs on the wire.
+    var floorGranted = false
     private var floorGain: Float = 1
     /// Where the floor's mute has actually reached, for a test that wants the
     /// bound rather than the intent.
@@ -2453,6 +2537,15 @@ final class Audio {
     /// the subtitle thread: a completion judgement is only meaningful AT A PAUSE,
     /// and this is the pause.
     var quietMsNow: Double { Double(quietSamples) / SR * 1000 }
+    /// ── IS A VOICE LEAVING THIS MICROPHONE RIGHT NOW ──────────────────────────
+    ///
+    /// `vocal` deliberately survives 450 ms of silence so a breath between
+    /// words does not end a turn -- correct for the drawing, and the reason the
+    /// floor's release clock could not start until 450 ms after the holder had
+    /// actually stopped. This is the same classifier's other question, with a
+    /// 120 ms hangover: longer than a plosive closure (30-80 ms), far shorter
+    /// than a turn gap. It crosses the wire as `Wire.ST_VOICING`.
+    var voicingNow: Bool { vocalSamples > 0 && quietMsNow < 120 }
     var vocalMsNow: Double { Double(vocalSamples) / SR * 1000 }
     private(set) var closedFrames = 0
     private(set) var openFrames = 0
@@ -2681,7 +2774,7 @@ final class Audio {
       // ONE OF THE TWO PLACES THAT TOUCHES SAMPLES, and the only one that is
       // about echo. On headphones this is always 1: nothing is held down,
       // because nothing would be heard twice.
-      let want: Float = (cfg.on && farTalking && !nearTalking)
+      let want: Float = (cfg.on && farTalking && !nearTalking && !floorGranted)
         ? Float(pow(10, cfg.floorDb / 20)) : 1
 
       // OPEN FAST, CLOSE ON A RAMP. Backwards, opening slowly clips the first

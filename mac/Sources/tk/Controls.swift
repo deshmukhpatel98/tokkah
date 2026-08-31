@@ -3199,6 +3199,10 @@ final class CallControls: NSView {
   /// 0...1 phase of the six-second drift. Not wall-clock, so it cannot jump when
   /// the timer sleeps and wakes.
   private var breath: CGFloat = 0
+  /// The felt channel: current stroke width and the width its path was last
+  /// cut for. See the width note in `floorTick`.
+  private var edgeWidthNow: CGFloat = CallControls.edgeWidth
+  private var edgePathWidth: CGFloat = CallControls.edgeWidth
 
   /// Blue at 0, green at 1, in sRGB. Both are already in the palette: `ok` is
   /// what this app means by "clear" and `accent` is its calm blue, so the edge
@@ -3271,7 +3275,11 @@ final class CallControls: NSView {
   /// line lands INSIDE the window rather than straddling an edge the compositor
   /// is about to round away.
   private func layoutEdge() {
-    let ins = CallControls.edgeWidth / 2
+    // At the CURRENT width, not the resting constant -- a resize mid-sentence
+    // would otherwise snap a wide speaking stroke onto a hairline's path and
+    // clip its outer half until the next tick re-cut it.
+    let ins = edgeWidthNow / 2
+    edgePathWidth = edgeWidthNow
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     edge.frame = bounds
@@ -3382,24 +3390,49 @@ final class CallControls: NSView {
     //
     // The note on `edge` forbids a pulse, and it was right for what it was
     // describing: a three-point rim with an eighteen-point glow breathing at
-    // 0.55 Hz over the picture. That was refused as an EFFECT.
+    // 0.55 Hz over the picture. That was refused as an EFFECT. The refusal
+    // still stands for glow, shadow and gradient -- nothing bleeds over the
+    // picture, ever.
     //
-    // What is asked for now is a different thing and the words matter: "it should
-    // be a kind of an animation, at the edges, a very soothing one, which makes
-    // you feel like you're in the same room." So: no glow, no shadow, no
-    // gradient, no change of width, and nothing over the picture. One and a half
-    // points of stroke whose opacity drifts by a tenth, once every six seconds --
-    // slower than breathing and far below the rate at which motion pulls the eye.
-    // If this ever gets faster, wider, or grows a shadow it has become the thing
-    // that was refused.
+    // WIDTH stopped being on that list on 2026-08-31, by the user, in their
+    // words: the hairline was "really hard to spot, and you have to constantly
+    // look at them... you should FEEL, yes, your voice is going through...
+    // maybe a thicker bar." So width is now the felt channel, the one
+    // peripheral vision actually has: speaking, the stroke is wide and moves
+    // with your own syllables (`nearLoudNow`, the loudness the gate already
+    // publishes for displays); listening, a calm three points; nobody's, the
+    // original hairline. Attack fast (your first syllable is the news), decay
+    // slow (a breath between words must not flutter the frame).
     breath += dt / 6.0
     if breath > 1 { breath -= 1 }
     let sway = 1 - 0.10 * (1 - cos(2 * .pi * breath)) / 2
+
+    let wTarget: CGFloat
+    if speaking {
+      wTarget = 4.5 + 3.5 * CGFloat(min(1, max(0, Audio.sharedGate.nearLoudNow)))
+    } else if listening {
+      wTarget = 3
+    } else {
+      wTarget = CallControls.edgeWidth
+    }
+    edgeWidthNow += (wTarget - edgeWidthNow) * min(1, dt / (wTarget > edgeWidthNow ? 0.05 : 0.20))
 
     CATransaction.begin()
     CATransaction.setDisableActions(true)   // or every frame animates over 0.25 s
     edge.opacity = Float(edgeOn * sway)
     edge.strokeColor = CallControls.edgeTint(edgeHue).cgColor
+    // The stroke is centered on its path, so a wider line must sit on a path
+    // inset by half its own width or the compositor clips its outer half at
+    // the rounded corner. Re-cut only on a visible change; a 30 Hz CGPath for
+    // a stroke that is not moving is work nobody can see.
+    if abs(edgeWidthNow - edgePathWidth) > 0.25 {
+      edgePathWidth = edgeWidthNow
+      let ins = edgeWidthNow / 2
+      edge.path = CGPath(roundedRect: bounds.insetBy(dx: ins, dy: ins),
+                         cornerWidth: max(0, Metric.windowRadius - ins),
+                         cornerHeight: max(0, Metric.windowRadius - ins), transform: nil)
+    }
+    edge.lineWidth = edgeWidthNow
     CATransaction.commit()
 
     // Stop when there is nothing to watch: fully through, settled, and a second
@@ -3438,7 +3471,11 @@ final class CallControls: NSView {
   /// edge is the second one. A rig can assert this without a photograph; the
   /// photograph is what proves the layer agrees with it.
   var edgeState: String {
+    // The width is part of the state now that it carries the message -- an
+    // audit that reported only opacity could not tell a felt speaking edge
+    // from the hairline it replaced.
     (edgeOn > 0.5 ? "on" : "off") + "/" + String(format: "%.2f", edgeOn)
+      + "/w" + String(format: "%.1f", edgeWidthNow)
   }
 
   /// Flattens foreign text for the one-line state dump. See `clip=` in

@@ -66,10 +66,17 @@ def call_summary(bs, label=""):
             early += f", their p peaked {theirp:.2f})" if theirp >= 0 else ", their p: not in this build)"
     else:
         early = "predictor: not in this build"
+    # onset-to-wire (0.98.0): first block of voice -> on the wire. THE number
+    # for "latency deciding who is speaking"; -1 means an older build.
+    ow = last(bs, "turn_onset_to_wire_p50", -1)
+    lost = last(bs, "turn_onset_lost", -1)
+    onset = (f"onset->wire p50 {ow:.0f} ms" if ow >= 0 else "onset->wire: not in this build")
+    if lost > 0:
+        onset += f" ({lost:.0f} never got out)"
     print(f"  TURNS     both talking {last(bs,'turn_collisions'):.0f}"
           f"  ·  choppy {last(bs,'turn_flaps'):.0f}"
           f"  ·  gave way {last(bs,'turn_yields'):.0f}"
-          f"  ·  to-audible p50 {last(bs,'turn_to_floor_p50'):.0f} ms"
+          f"  ·  {onset}"
           f"  ·  {early}")
     # corr-veto: how much of the call the classifier refused to call the
     # machine's own speaker a voice (0.94.0). -1 means an older build.
