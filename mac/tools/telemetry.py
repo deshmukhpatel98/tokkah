@@ -78,6 +78,16 @@ def call_summary(bs, label=""):
           f"  ·  gave way {last(bs,'turn_yields'):.0f}"
           f"  ·  {onset}"
           f"  ·  {early}")
+    # The interjection rescue (0.99.0). `grace_onsets` counts utterances that
+    # 0.98.0 would have deleted outright; `fast_takes` the floors won by the
+    # 180 ms voice contest instead of the 1150 ms claim contest.
+    # `gcp`, not `gp`: `gp` above is the echo-guard percentage and is still
+    # live in this scope.
+    gcp = last(bs, "turn_grace_pct", -1)
+    if gcp >= 0:
+        print(f"  INTERJECT rescued {last(bs,'turn_grace_onsets'):.0f}"
+              f"  ·  audible-over-holder {gcp:.1f}% of the call"
+              f"  ·  fast floor takes {last(bs,'turn_fast_takes'):.0f}")
     # corr-veto: how much of the call the classifier refused to call the
     # machine's own speaker a voice (0.94.0). -1 means an older build.
     cv = last(bs, "a_corr_veto_pct", -1)

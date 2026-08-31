@@ -6018,6 +6018,23 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // carried voice. The stated cost of a simultaneous start is deadlock plus a
     // hop; anything past that is the rule failing.
     "floor_strict": Audio.sharedFloor.cfg.strict ? 1 : 0,
+    // ── THE INTERJECTION RESCUE, COUNTED (0.99.0) ───────────────────────────
+    //
+    // `turn_onset_lost` is the defect: whole utterances that never reached the
+    // wire (30 and 20 on the two ends of one 333 s call). These three are the
+    // mechanism that ends it, so a live call can say whether it fired and how
+    // often -- "it never fired" and "it fired and did not help" must never
+    // look the same again.
+    //
+    //   grace_pct     share of the call a real voice was audible over a holder
+    //   grace_onsets  interjections that used it -- each one a deleted utterance
+    //                 under 0.98.0
+    //   fast_takes    floors taken by the 180 ms voice contest rather than the
+    //                 1150 ms claim contest
+    "turn_grace_pct": audio.turns.floorBlocks > 0
+      ? Double(Audio.sharedFloor.graceBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    "turn_grace_onsets": Audio.sharedFloor.graceOnsets,
+    "turn_fast_takes": Audio.sharedFloor.fastTakes,
     "strict_overlap_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.strictOverlapBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────

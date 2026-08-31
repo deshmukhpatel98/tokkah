@@ -172,6 +172,44 @@ final class Floor {
     /// simultaneous start -- counted on every call as `strict_overlap_pct`.
     /// `--floor-soft` is the control arm (0.94.0 behaviour).
     var strict = true
+    /// ── HOW LONG IT TAKES TO INTERRUPT, AND WHY IT WAS A SECOND ────────────
+    ///
+    /// Measured on a 333 s two-person call (2p183qa061zcu / 2adf00o87punm,
+    /// 0.98.0): 140 collisions, and **50 whole utterances that never reached
+    /// the wire at all** -- p50 onset-to-wire 0 ms, so every utterance was
+    /// either instant or entirely deleted. Reported as "it is still cutting
+    /// people in between and words are dropping while they speak".
+    ///
+    /// The arithmetic behind that second: taking the floor from a holder
+    /// required `nearClaimMs >= deadlockMs` (450 ms) -- and `nearClaimMs` only
+    /// starts counting when the classifier promotes a voice to `.claim`, which
+    /// takes `claimMs` (700 ms) of sustained sound. So an interruption cost
+    /// **1150 ms** before it was formally allowed, and in strict every one of
+    /// those milliseconds is silence rather than a duck. Any interjection
+    /// shorter than that was not delayed, it was deleted.
+    ///
+    /// Two constants, and they work as a pair:
+    ///
+    ///   `strictDeadlockMs` -- the contest runs on ANY near voice from its
+    ///   first block (see `nearVoiceMs`), not on the 700 ms-old `.claim`
+    ///   promotion, and it is 180 ms rather than 450. 180 ms is longer than a
+    ///   cough or a keystroke and shorter than the first syllable of a word.
+    ///
+    ///   `onsetGraceMs` -- and until that contest resolves the voice is
+    ///   AUDIBLE, so the 180 ms is not lost either. This is the piece that
+    ///   could not exist before 0.94.0: opening a microphone on "any near
+    ///   voice" over a live loudspeaker used to mean opening it on this
+    ///   machine's own echo, and the correlation veto is what finally tells
+    ///   those two apart (a vetoed block is classified `.quiet`, so it can
+    ///   never reach the grace window at all).
+    ///
+    /// Net: you start talking, you are heard from the first block, and 180 ms
+    /// later you formally hold the floor -- or, if it was an "mm-hm", you stop
+    /// and it returns to them with nothing lost either way. The cost is a
+    /// bounded genuine overlap, which is what a conversation sounds like, and
+    /// it is counted (`strict_overlap_pct`).
+    var strictDeadlockMs: Double = 180
+    var onsetGraceMs: Double = 400
     /// ── THE CONTROL ARM FOR "ANY VOICE TAKES AN EMPTY FLOOR" ────────────────
     ///
     /// False restores the pre-0.98.0 rule, where a vocalisation still in its
@@ -241,6 +279,20 @@ final class Floor {
   /// p has been below the threshold during the current hold. A leftover 0.9
   /// from the previous sentence must not release the first word of this one.
   private var farPredArmed = false
+  /// ── THE CONTEST CLOCK RUNS ON VOICE, NOT ON A 700 ms-OLD VERDICT ─────────
+  ///
+  /// `nearClaimMs`/`farClaimMs` count only `.claim`, which the classifier
+  /// cannot say until 700 ms of sound. These count ANY voice from its first
+  /// block, which is what "somebody is talking over the holder" actually is.
+  private var nearVoiceMs: Double = 0
+  private var farVoiceMs: Double = 0
+  /// Blocks the onset grace window kept a real voice audible over a holder,
+  /// and utterances that used it -- the interjections that 0.98.0 deleted.
+  private(set) var graceBlocks = 0
+  private(set) var graceOnsets = 0
+  /// Floors taken by the fast strict contest rather than the 1150 ms one.
+  private(set) var fastTakes = 0
+  private var inGrace = false
   /// The far end's fast voicing bit, and how long it has said "no sound" for.
   /// `farVoicingKnown` stays false against a build that cannot say, which is
   /// what keeps this from reading silence into every older peer.
@@ -318,6 +370,11 @@ final class Floor {
 
     nearClaimMs = near == .claim ? nearClaimMs + ms : 0
     farClaimMs = farVoice == .claim ? farClaimMs + ms : 0
+    // Any voice, from its first block. A backchannel counts: at the moment
+    // somebody starts making sound over a holder, nothing on earth knows yet
+    // whether it will turn into a word, and waiting to find out is the delay.
+    nearVoiceMs = near != .quiet ? nearVoiceMs + ms : 0
+    farVoiceMs = farVoice != .quiet ? farVoiceMs + ms : 0
     if farVoice == .quiet { farQuietMs += ms }
     if farVoicingKnown, !farVoicing { farSilentMs += ms }
     // From the FIRST block their stream is quiet, not from the end of the
@@ -457,6 +514,19 @@ final class Floor {
             farPredictedReleases += 1
             farPredictedSavedMs += max(0, cfg.releaseMs - holderQuietMs)
             farWrapping = true
+            // ── ONCE PER HOLD, WHICH IS WHAT THE COMMENT ALWAYS CLAIMED ────
+            //
+            // `farPredArmed` was set whenever p dipped below the threshold and
+            // never cleared when it fired, so every block with p above it
+            // fired AGAIN. Measured on one 333 s call: 6838 far releases and a
+            // reported saving of 2,623,182 ms -- 20 releases a second, and
+            // 7.9x the length of the call "saved". A number that large is not
+            // a win, it is a counter describing a state machine thrashing
+            // between `theirs` and `idle` twenty times a second, which is
+            // exactly what the other end recorded as 241 choppy gate flaps.
+            // Disarmed here: p must dip below the threshold again -- a real
+            // new wrap-up -- before this can fire once more.
+            farPredArmed = false
           }
         }
         state = .idle; holderQuietMs = 0
@@ -503,8 +573,17 @@ final class Floor {
     // allowed -- that is a conversation. What is not allowed is the deadlock:
     // both of you going, neither backing off. Past `deadlockMs` one of you has
     // to give, and it is decided by an ordering neither end picked.
-    let nearInsists = nearClaimMs >= cfg.deadlockMs
-    let farInsists = farClaimMs >= cfg.deadlockMs
+    // ── AND IN STRICT IT RUNS ON THE VOICE, AT 180 ms ───────────────────────
+    //
+    // `nearClaimMs` cannot start until the classifier has heard 700 ms of
+    // sound, so this contest used to open 700 ms after somebody began talking
+    // and then take another 450 -- see `strictDeadlockMs`. On the voice clock
+    // instead, and shorter, because in strict the waiting is not a duck, it is
+    // deletion. Soft keeps the old pair exactly.
+    let contestMs = cfg.strict ? cfg.strictDeadlockMs : cfg.deadlockMs
+    let nearInsists = cfg.strict ? nearVoiceMs >= contestMs : nearClaimMs >= contestMs
+    let farInsists = cfg.strict ? farVoiceMs >= contestMs : farClaimMs >= contestMs
+    let wasTheirs = state == .theirs
     if state == .theirs, nearInsists {
       // I take it, unless we are both insisting and the ordering says I am the
       // one who gives.
@@ -512,6 +591,7 @@ final class Floor {
     } else if state == .mine, farInsists {
       if !nearInsists || yieldsOnTie { state = .theirs }
     }
+    if cfg.strict, wasTheirs, state == .mine { fastTakes += 1 }
 
     // ── AND THE CEILING, WHICH NO BELIEF SURVIVES ────────────────────────────
     //
@@ -593,7 +673,28 @@ final class Floor {
     // there is nothing for a talker's speaker to carry anyway. The closing
     // edge keeps its one-hop lag so their last half-word still lands.
     if cfg.strict {
-      return Decision(mayTransmit: state == .mine,
+      // ── THE ONSET GRACE: AN INTERJECTION IS DELAYED, NEVER DELETED ────────
+      //
+      // The contest above needs `strictDeadlockMs` to resolve. Those 180 ms
+      // are the first syllable of whatever this person just started saying,
+      // and strict has no duck to fall back on -- so they are audible while it
+      // resolves. Bounded by `onsetGraceMs` so a person talking straight
+      // through somebody else's turn is not simply granted a parallel channel:
+      // past the window, if the contest did not hand them the floor, they are
+      // held like before.
+      //
+      // `near != .quiet` is doing the safety work, and it is stronger than it
+      // looks: a block the echo veto has claimed is classified `.quiet`, so
+      // this end's own loudspeaker can never open this window. That is the
+      // whole reason this is safe in 0.99.0 and would not have been in 0.93.
+      let grace = state == .theirs && near != .quiet && nearVoiceMs <= cfg.onsetGraceMs
+      if grace {
+        graceBlocks += 1
+        if !inGrace { inGrace = true; graceOnsets += 1 }
+      } else if state != .theirs || near == .quiet {
+        inGrace = false
+      }
+      return Decision(mayTransmit: state == .mine || grace,
                       duckOnly: false,
                       playoutOpen: !(state == .mine && playoutHold <= 0),
                       fallback: farBlind, state: state)
@@ -954,6 +1055,7 @@ extension Floor {
       fputs("floor: \(good ? "OK  " : "FAIL") \(what)\n", stderr)
     }
     let dt = 0.010
+    let cfg0 = Cfg()
     struct Tally {
       var bothOpenMs = 0.0        // both ends on the wire in the same block
       var noneOpenWhileClaimMs = 0.0  // somebody claiming, NOBODY audible
@@ -1023,9 +1125,18 @@ extension Floor {
       return t >= 1.0 ? .claim : .quiet
     }
     let s2 = run(seconds: 6, strict: true, voice: barge)
-    say(s2.bothOpenMs <= 2 * hop + 30,
-        "barge-in: overlap bounded by the hop (\(Int(s2.bothOpenMs)) ms <= \(Int(2 * hop + 30)))")
-    say(!s2.duckSeen, "barge-in: held means silent, never ducked")
+    // ── THE BOUND THE GRACE WINDOW MOVED, AND ON PURPOSE ──────────────────
+    //
+    // This was `2 * hop + 30` (110 ms at 40 ms owd), and it was the right bound
+    // for a design that deleted the interrupter's first 180 ms. It is now the
+    // hops PLUS the onset grace, because those milliseconds are exactly what a
+    // barge-in used to lose: an overlap this long IS the interjection being
+    // audible. Still bounded, still counted live as `strict_overlap_pct`, and
+    // still nowhere near a duplex channel.
+    let bargeBound = 2 * hop + cfg0.onsetGraceMs + 60
+    say(s2.bothOpenMs <= bargeBound,
+        "barge-in: overlap bounded by hops + the onset grace (\(Int(s2.bothOpenMs)) ms <= \(Int(bargeBound)))")
+    say(!s2.duckSeen, "barge-in: held means silent or heard, never ducked")
     say(s2.bOpenMs > 1000, "barge-in: the interrupter does get the floor (\(Int(s2.bOpenMs)) ms)")
     let s2soft = run(seconds: 6, strict: false, voice: barge)
     say(s2soft.duckSeen, "REJECT: soft ducks the interrupter -- the meter can see")
@@ -1129,8 +1240,113 @@ extension Floor {
     q5.noteFar(.claim)
     _ = q5.step(dt: 0.02, near: .quiet)          // they hold
     let dq5 = q5.step(dt: 0.02, near: .backchannel)
-    say(dq5.state == .theirs && !dq5.mayTransmit,
-        "an mm-hm over a holder still does not take the floor")
+    // ── WHAT AN mm-hm MUST AND MUST NOT DO, RESTATED ────────────────────────
+    //
+    // This row asserted the mm-hm was INAUDIBLE, which is the deletion 0.99.0
+    // exists to end -- "mm-hm" is the single most important thing a listener
+    // says, and holding it back is what made the app feel like a walkie-talkie.
+    // The property that actually matters is unchanged and still checked: it
+    // does not take the FLOOR away from the person talking. It is heard, it
+    // changes nothing, and when it stops the holder never noticed.
+    say(dq5.state == .theirs,
+        "an mm-hm over a holder does not take the floor away from them")
+    say(dq5.mayTransmit,
+        "and it is still HEARD -- a listening noise held back is the deletion")
+
+    // ── 9. AN INTERJECTION IS NEVER DELETED ─────────────────────────────────
+    //
+    // The defect this release exists for: 50 utterances on one live call that
+    // never reached the wire at all. A short interjection over a holder must be
+    // audible from its first block, and the floor must actually change hands
+    // fast enough that a normal interruption is not a special case.
+    func heldByThemStrict() -> Floor {
+      let f = Floor()
+      f.cfg.strict = true
+      f.speakers = true
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      f.noteFar(.claim)
+      _ = f.step(dt: 0.02, near: .quiet)
+      return f
+    }
+    // A 300 ms interjection -- "wait", "no", "yeah" -- entirely within what the
+    // old 1150 ms contest deleted.
+    let s9 = heldByThemStrict()
+    var outMs = 0.0, blockedMs = 0.0
+    for _ in 0..<15 {                                  // 300 ms of voice
+      if s9.step(dt: 0.02, near: .backchannel).mayTransmit { outMs += 20 } else { blockedMs += 20 }
+    }
+    say(blockedMs == 0,
+        "a 300 ms interjection over a holder is audible for all of it (\(Int(outMs)) ms out, \(Int(blockedMs)) ms lost)")
+    // The REJECT twin. Soft mode ducks instead of deleting, so it has never had
+    // this defect and must not be read as proof: the arm that has to fail is
+    // strict WITHOUT the grace window, which is what 0.98.0 shipped.
+    let s9b = heldByThemStrict()
+    s9b.cfg.onsetGraceMs = 0
+    s9b.cfg.strictDeadlockMs = 450
+    var lost9b = 0.0
+    for _ in 0..<15 {
+      if !s9b.step(dt: 0.02, near: .backchannel).mayTransmit { lost9b += 20 }
+    }
+    say(lost9b >= 280,
+        "REJECT: without the grace window the same interjection is deleted (\(Int(lost9b)) ms lost) -- the meter can see")
+
+    // 10. AND THE FLOOR REALLY CHANGES HANDS, on the voice clock, at 180 ms.
+    let s10 = heldByThemStrict()
+    var took = 0.0
+    var d10 = s10.step(dt: 0.02, near: .backchannel)
+    while took < 1000, d10.state != .mine {
+      took += 20
+      d10 = s10.step(dt: 0.02, near: .backchannel)
+    }
+    say(d10.state == .mine && took <= 260,
+        "the floor changes hands after \(Int(took)) ms of voice, not after 1150")
+    say(s10.fastTakes == 1, "and it is counted as a fast take")
+
+    // 11. THE WINDOW IS BOUNDED. Somebody talking straight through does not get
+    //     a parallel channel forever -- either they won the floor or they stop.
+    let s11 = heldByThemStrict()
+    s11.cfg.strictDeadlockMs = 9999          // never let the contest resolve it
+    var openMs = 0.0, mineMs = 0.0
+    for _ in 0..<60 {                        // 1.2 s of continuous voice
+      // Their cue, every block, exactly as a live call delivers it (the probe
+      // beats every 300 ms). Without this the 1.2 s loop crosses `staleMs` at
+      // block 50, the holder goes blind, releases, and this end takes the floor
+      // legitimately -- measuring the staleness path while claiming to measure
+      // the grace bound.
+      s11.noteFar(.claim)
+      let d = s11.step(dt: 0.02, near: .backchannel)
+      if d.mayTransmit { openMs += 20; if d.state == .mine { mineMs += 20 } }
+    }
+    // Reports WHICH mechanism held the mic open. A bound that fails without
+    // naming the path is a number somebody has to re-derive by hand.
+    say(openMs <= s11.cfg.onsetGraceMs + 40,
+        "the grace window is bounded at \(Int(s11.cfg.onsetGraceMs)) ms"
+        + " (\(Int(openMs)) ms open: \(s11.graceBlocks) grace blocks, \(Int(mineMs)) ms as holder)")
+
+    // 12. AND THE ECHO CANNOT OPEN IT. A block the veto claimed is classified
+    //     `.quiet` upstream, and `.quiet` is the one input the window refuses.
+    let s12 = heldByThemStrict()
+    var echoOut = 0.0
+    for _ in 0..<30 {
+      if s12.step(dt: 0.02, near: .quiet).mayTransmit { echoOut += 20 }
+    }
+    say(echoOut == 0, "a vetoed (quiet) block never opens the grace window")
+
+    // 13. THE PREDICTOR FIRES ONCE PER HOLD, NOT TWENTY TIMES A SECOND.
+    //     Live: 6838 far releases in 333 s, "saving" 7.9x the call length.
+    let s13 = heldByThemStrict()
+    for _ in 0..<50 {
+      s13.noteFarEndProb(0.3)                // dip: arms
+      _ = s13.step(dt: 0.02, near: .quiet)
+      s13.noteFarEndProb(0.9)                // rise: fires
+      _ = s13.step(dt: 0.02, near: .quiet)
+      s13.noteFar(.claim)                    // they are still talking
+    }
+    say(s13.farPredictedReleases <= 50,
+        "the far predictor fired \(s13.farPredictedReleases)x over 50 dip-rise cycles, not once per block")
+    say(s13.farPredictedSavedMs <= 50 * 450,
+        "and its claimed saving stays inside one release per cycle (\(Int(s13.farPredictedSavedMs)) ms)")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

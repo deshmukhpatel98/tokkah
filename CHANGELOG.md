@@ -5,6 +5,68 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.99.0 — 2026-08-31
+
+### Fixed — interrupting took 1150 ms, so short interjections were deleted
+
+Measured on a 333 s two-person call (`2p183qa061zcu` / `2adf00o87punm`, 0.98.0):
+140 collisions and **50 whole utterances that never reached the wire at all** —
+onset-to-wire p50 was 0 ms, so every utterance was either instant or entirely
+gone. Reported as "it is still cutting people in between and words are dropping
+while they speak".
+
+The arithmetic behind the second everyone could feel: taking the floor from a
+holder required `nearClaimMs >= deadlockMs` (450 ms), and `nearClaimMs` only
+starts counting once the classifier promotes a voice to `.claim`, which needs
+`claimMs` (700 ms) of sustained sound. **1150 ms** before an interruption was
+formally allowed — and in strict mode every one of those milliseconds is
+silence, not a duck. Anything shorter than that was not delayed, it was
+deleted: "yeah", "no", "wait", every "mm-hm".
+
+Three changes, and they work as one:
+
+- **The contest runs on voice, from its first block** (`nearVoiceMs`), not on
+  a 700 ms-old `.claim` verdict, and at **180 ms** instead of 450. Measured in
+  the two-end rig: the floor changes hands after **160 ms** of voice.
+- **The onset grace window** keeps that voice audible while the contest
+  resolves, bounded at 400 ms. A 300 ms interjection now loses **0 ms** where
+  0.98.0 lost all 300. This could not have shipped before 0.94.0: opening a
+  microphone on "any near voice" over a live loudspeaker used to mean opening
+  it on this machine's own echo, and the correlation veto is what tells those
+  apart — a vetoed block classifies as `.quiet`, which is the one input the
+  window refuses.
+- **An "mm-hm" is heard again.** It still cannot take the floor from the person
+  talking; it is simply no longer held back. The self-test row that asserted it
+  was inaudible encoded the defect and now asserts both halves.
+
+### Fixed — the turn-end predictor fired twenty times a second
+
+`farPredArmed` was set whenever the far end's prior dipped below the threshold
+and **never cleared when it fired**, so every subsequent block above the
+threshold fired again. The same call recorded **6838 far releases** and a
+claimed saving of **2,623,182 ms** — 7.9× the length of the call. That number
+was not a win, it was a state machine thrashing between `theirs` and `idle`
+twenty times a second, which the other end recorded as 241 choppy gate flaps.
+Now disarmed on fire: 25 releases over 50 dip-rise cycles in the rig, and the
+comment's "armed once per hold" is finally true.
+
+### Added — the interjection rescue is counted
+
+`turn_grace_pct`, `turn_grace_onsets` and `turn_fast_takes` ride every beat, so
+a live call says whether the rescue fired and how often — "it never fired" and
+"it fired and did not help" can no longer look the same. The telemetry summary
+gains an `INTERJECT` line.
+
+### Changed — the speaking edge is thick enough to feel
+
+On the user's instruction: the hairline was "really hard to spot, and you have
+to constantly look at [it]... you should FEEL, yes, your voice is going
+through." Width is now the felt channel — 1.5 pt at rest, 3 pt listening,
+4.5–8 pt while speaking and moving with your own syllables. Still a line and
+never a light: `floor-check`'s halo band moved past the widest stroke and now
+measures the ring just inside it as **unchanged from rest** (−4.933 vs −4.935),
+which is stricter proof than the old band gave.
+
 ## Kin 0.98.0 — 2026-08-31
 
 ### Fixed — the second of delay was the app deciding who is speaking, in four places
