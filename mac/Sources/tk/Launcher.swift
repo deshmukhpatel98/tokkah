@@ -547,6 +547,31 @@ enum Launcher {
     v.addSubview(status)
 
     let peopleRows = people.map { ContactRow(handle: $0) }
+    // ── THE ROOMS YOU HAVE ACTUALLY BEEN IN ──────────────────────────────────
+    //
+    // These were four chips under the old field, and rebuilding this card around
+    // the people list dropped them: `remember` still wrote `tk.recentRooms` on
+    // every join and NOTHING read it back. A stored list with no reader is the
+    // shape of a feature that has quietly stopped existing -- the writer keeps
+    // working, so nothing looks broken, and the only symptom is that somebody who
+    // meets the same people in the same room every week has to type its name
+    // again every week.
+    //
+    // Rows rather than chips, because everything else on this card is a row and a
+    // chip row would be a second idiom for the same job. Under the field, in the
+    // one mode that is about rooms.
+    // The field is prefilled with the last room, which is `recentRooms.first` --
+    // so without this the top row is always a copy of what is already in the box
+    // above it, and a list whose first item is the thing you are looking at reads
+    // as a bug in the list.
+    let prefilled = UserDefaults.standard.string(forKey: lastRoomKey) ?? ""
+    let recentRows = Array(recentRooms.filter { $0 != prefilled }.prefix(4)).map { r -> SheetRow in
+      let row = SheetRow(r)
+      row.textInset = Metric.rowAvatarInset
+      row.acceptsFirstClick = false
+      v.addSubview(row)
+      return row
+    }
     let newRow = SheetRow("Call someone new", glyph: Glyph.person)
     let wordRow = SheetRow("Join with a word")
     let backRow = SheetRow("Back")
@@ -695,6 +720,14 @@ enum Launcher {
       @objc func showName() { guard !ringing else { return }; status.stringValue = ""; mode = .name; relayout() }
       @objc func showWord() { guard !ringing else { return }; status.stringValue = ""; mode = .word; relayout() }
       @objc func showPeople() { guard !ringing else { return }; status.stringValue = ""; mode = .people; relayout() }
+      /// A recent room, from its row. The name rides in the row itself, so there is
+      /// no parallel array to fall out of step with what is on screen.
+      @objc func joinNamed(_ sender: SheetRow) {
+        guard !ringing, let name = validate(sender.spokenName) else { return }
+        field.stringValue = name
+        out = .room(name)
+        done = true
+      }
       @objc func reachable() { guard !ringing else { return }; makeReachable() }
       @objc func cancel() { done = true }
     }
@@ -780,6 +813,7 @@ enum Launcher {
         column += people.isEmpty ? [] : [backRow]
       case .word:
         column += [fieldBack, status]
+        column += recentRows
         column += people.isEmpty ? [] : [backRow]
       }
       let shown = Set((heads + column).map { ObjectIdentifier($0) })
@@ -789,6 +823,7 @@ enum Launcher {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       for r in peopleRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
+      for r in recentRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
       // The two fields are not in `column` -- they ride inside their `Vibrant`
       // backing -- so their visibility follows the thing they sit in.
       field.isHidden = fieldBack.isHidden
@@ -873,6 +908,13 @@ enum Launcher {
     mineRow.target = t; mineRow.action = #selector(Target.copyMine(_:))
     reachRow.target = t
     reachRow.action = #selector(Target.reachable)
+    for r in recentRows {
+      r.target = t
+      r.action = #selector(Target.joinNamed(_:))
+      // Same free time the faces get: the name is knowable the moment the pointer
+      // lands on it, and the room is very likely the one about to be joined.
+      r.onHover = { [weak r] in guard let r else { return }; Warm.room(r.spokenName, why: "hover room") }
+    }
     // ── SAYING WHAT HAPPENED, INCLUDING WHEN IT REFUSED ──────────────────────
     //
     // `Watch.install()` returns a SENTENCE, and three of the things it can say are
@@ -959,7 +1001,10 @@ enum Launcher {
       case "back": return backRow
       case "reach": return reachRow
       case "mine": return mineRow
+      // A recent room is addressed by its own name, exactly as a person is -- the
+      // row's label IS the datum in both cases.
       default: return peopleRows.first { $0.handleName == n }
+                  ?? recentRows.first { $0.spokenName == n }
       }
     }
     // ── AND WHAT THE FIRST CLICK WOULD DO, READ OUT RATHER THAN REASONED ABOUT ─

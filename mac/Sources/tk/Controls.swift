@@ -873,6 +873,11 @@ class SheetRow: NSButton {
     needsDisplay = true
   }
 
+  /// Just the words, with none of `spoken`'s decoration. A row whose LABEL is the
+  /// datum -- a room name you can click to rejoin -- needs the string back
+  /// unchanged, and `spoken` appends " ✓" and " = value" for the harness.
+  var spokenName: String { text.stringValue }
+
   /// What this row actually says, for a test that has to read the screen.
   var spoken: String {
     text.stringValue + (checked ? " ✓" : "") + (value.isEmpty ? "" : " = \(value)")
