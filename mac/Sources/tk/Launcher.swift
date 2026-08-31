@@ -330,6 +330,23 @@ enum Launcher {
   /// `WaitingCard.Mode` was extracted to fix, in the same shape, one screen away.
   enum Mode { case people, word, name }
 
+  /// Set when the front door has stopped its preview session and detached its
+  /// inputs. Read by the in-process path, which is the only caller that cannot
+  /// rely on `execv` to do this for it.
+  nonisolated(unsafe) private(set) static var cameraReleased = false
+
+  /// Say so, loudly, before the call opens the device. A camera still held here
+  /// surfaces as "camera: not permitted" or a session that never delivers a
+  /// frame, hundreds of lines away, with nothing pointing back at this decision --
+  /// and "the picture never came up" is indistinguishable from a denied grant.
+  static func assertCameraReleased() {
+    fputs(cameraReleased
+            ? "launch: front-door camera released before the call opens it\n"
+            : "launch: WARNING -- the front door never released its camera, and the"
+              + " call is about to open the same device in the same process\n",
+          stderr)
+  }
+
   static func home() -> Intent? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
@@ -1093,9 +1110,20 @@ enum Launcher {
     pumpAppKit(until: .distantFuture, while: { !t.done && w.isVisible })
     t.done = true                                  // they joined, or they closed it
     w.orderOut(nil)
-    // Release the device before the re-exec, so the call opens it cleanly rather
-    // than racing a session this process is about to stop existing to own.
+    // ── RELEASING THE CAMERA, WHICH USED TO BE EXEC'S JOB ────────────────────
+    //
+    // `stopRunning()` alone was enough while a re-exec followed: the process
+    // stopped existing a moment later and took every reference to the device with
+    // it. Without the re-exec (`--in-process`) this session is the ONLY thing
+    // standing between the front door and the call's own `CameraSource`, and a
+    // capture input still attached to a device is that device still being held.
+    //
+    // So the inputs come off explicitly and the session is remembered as released.
+    // `stopRunning` is synchronous and returns after the device is quiesced, which
+    // is why the order is stop-then-detach and not the other way round.
     if session.isRunning { session.stopRunning() }
+    for i in session.inputs { session.removeInput(i) }
+    cameraReleased = true
     // ── ONLY A ROOM YOU TYPED IS A ROOM WORTH REMEMBERING ────────────────────
     //
     // `recentRooms` is a list of shared words -- things you and somebody agreed to

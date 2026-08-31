@@ -355,7 +355,47 @@ if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-
   exit(0)
 }
 
+// ── ARGUMENTS THIS PROCESS DECIDED FOR ITSELF ───────────────────────────────
+//
+// Every state change in this app used to be a re-exec: the front door picks a
+// room, `execv` replaces the image, and the successor reads `--room` out of argv.
+// That is why argv could be the only source of truth here, and it is a good
+// design -- joining a room is a thing this program does perfectly from the first
+// line of main, and re-entering it inherits the whole call stack rather than
+// growing a second one that can disagree with it.
+//
+// It costs a process start (~150 ms) and, because the front door has already
+// opened the camera to show you your own face, A SECOND CAMERA BRING-UP: measured
+// on this Mac at 151 ms off-main plus the sensor's first frame, which is ~300 ms
+// warm and ~670 ms cold and is a platform floor either way. Six hundred to nine
+// hundred milliseconds, paid after the click, on the one interaction the product
+// is about.
+//
+// So argv gets an overlay, and the front door can write the answer into THIS
+// process instead of into the next one. Consulted first, argv second, so every
+// existing path -- and every rig that passes flags on a command line -- resolves
+// exactly as it did. Nothing writes to this unless `--in-process` is on.
+enum Args {
+  nonisolated(unsafe) private static var values: [String: String] = [:]
+  nonisolated(unsafe) private static var bare: Set<String> = []
+  /// Written once, on the main thread, before the call is built. Not a general
+  /// mutable settings store: two writers would make "what did this process decide"
+  /// a race, and the whole point of the overlay is that it has one answer.
+  static func decide(_ name: String, _ value: String?) {
+    if let value { values[name] = value } else { bare.insert(name) }
+  }
+  static func value(_ name: String) -> String? { values[name] }
+  static func isSet(_ name: String) -> Bool { bare.contains(name) || values[name] != nil }
+  /// What this process decided, for the log. A room that came from the front door
+  /// and a room that came from argv are indistinguishable everywhere else, and
+  /// that is the point -- but the launch line should still say which happened.
+  static var described: String {
+    (values.map { "--\($0.key) \($0.value)" } + bare.map { "--\($0)" }).sorted().joined(separator: " ")
+  }
+}
+
 func arg(_ name: String) -> String? {
+  if let v = Args.value(name) { return v }
   let a = CommandLine.arguments
   guard let i = a.firstIndex(of: "--" + name), i + 1 < a.count else { return nil }
   // A VALUE THAT IS ITSELF A FLAG MEANS THE VALUE WAS FORGOTTEN.
@@ -373,7 +413,9 @@ func arg(_ name: String) -> String? {
   }
   return a[i + 1]
 }
-func flag(_ name: String) -> Bool { CommandLine.arguments.contains("--" + name) }
+func flag(_ name: String) -> Bool {
+  Args.isSet(name) || CommandLine.arguments.contains("--" + name)
+}
 
 // ── STDERR, WHEN THERE IS NO TERMINAL TO SEE IT ─────────────────────────────
 //
@@ -429,6 +471,7 @@ let KNOWN_FLAGS: Set<String> = [
   // to kill the app. Same family as silent-no-op-flags, one worse.
   "no-ring-preview", "incoming-key", "with",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
+  "in-process",
   "callee-away",
   // A call that outlives its process is on by default and has to be switchable
   // off, because the negative arm of its own rig is "the same crash, and it does
@@ -717,7 +760,6 @@ func resolveVideoArg() -> String {
       + "(a path containing spaces needs quoting)\n", stderr)
   exit(2)
 }
-let videoArg = resolveVideoArg()
 
 // ── THIS IMAGE WAS LAUNCHED TO ASK, NOT TO TALK ──────────────────────────────
 //
@@ -876,15 +918,49 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   // was just double-clicked showed a name prompt and then vanished into the dock
   // while running a perfectly good audio call nobody could see. A video calling
   // app that opens no video is the one bug a user notices before any latency.
-  switch intent {
-  case .room(let room):
-    Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
-  case .calling(let room, let who, let away):
-    var extra = ["--video", "camera", "--window", "--calling", who]
-    // Only an explicit false changes a word on screen. nil means the server had
-    // no basis to say, which is NOT the same as "they are away".
-    if away { extra.append("--callee-away") }
-    Launcher.reexec(room: room, extra: extra, why: "called @" + who)
+  // ── WALKING INTO THE CALL, OR STARTING A NEW PROCESS TO DO IT ────────────
+  //
+  // `--in-process` skips the re-exec and writes the answer into `Args` instead,
+  // so execution simply continues down this file into the call it just chose.
+  // What that saves is a process start plus a SECOND camera bring-up -- the front
+  // door has already opened the device to show you your own face, and the
+  // successor opens it again from cold. See the note over `Args`.
+  //
+  // OFF BY DEFAULT, and it stays off until it has been on a real call. The prize
+  // here is the camera and so is the risk: two openers of one device in one
+  // process is exactly the race the re-exec was avoiding, and `execv` made it
+  // impossible by construction. A camera fix is verified on a real sensor or it
+  // is not verified, and the flag is how that happens without holding the rest of
+  // the app hostage to it.
+  if flag("in-process") {
+    Args.decide("video", "camera")
+    Args.decide("window", nil)
+    switch intent {
+    case .room(let room):
+      Args.decide("room", room)
+    case .calling(let room, let who, let away):
+      Args.decide("room", room)
+      Args.decide("calling", who)
+      if away { Args.decide("callee-away", nil) }
+    }
+    fputs("launch: in-process, no re-exec -- " + Args.described + "\n", stderr)
+    // And it must be said out loud that the camera the front door was using is
+    // gone before anything below asks for it. `Launcher.home` stops and unwires
+    // its session on the way out; this is the assertion that it did, because a
+    // device still held here fails as "camera not permitted" three hundred lines
+    // later with nothing pointing back at this decision.
+    Launcher.assertCameraReleased()
+  } else {
+    switch intent {
+    case .room(let room):
+      Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+    case .calling(let room, let who, let away):
+      var extra = ["--video", "camera", "--window", "--calling", who]
+      // Only an explicit false changes a word on screen. nil means the server had
+      // no basis to say, which is NOT the same as "they are away".
+      if away { extra.append("--callee-away") }
+      Launcher.reexec(room: room, extra: extra, why: "called @" + who)
+    }
   }
 }
 
@@ -901,6 +977,25 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
 // nothing when somebody already warmed it: the route is idempotent and `Warm`
 // asks once per room per process.
 if let r = arg("room") { Warm.room(r, why: "joining") }
+
+// ── DECLARED BELOW THE FRONT DOOR, WHICH IS WHY IT IS DOWN HERE ─────────────
+//
+// This was two hundred lines up, immediately under `resolveVideoArg`, which is
+// where it reads best and where it is WRONG. Top-level statements run in file
+// order, so `videoArg` was resolved before `Launcher.home()` had been asked
+// anything -- and with `--in-process` the front door is what decides there is a
+// camera at all. The call came up, joined its room, and ran audio-only, with
+// `--video camera` sitting in `Args` where nothing had looked.
+//
+// That is the third time this file has been bitten by declaration order (see the
+// notes on `ringPending` and `gOffered`, which say the same thing about the
+// camera bring-up and the poll thread). The rule that falls out of all three: a
+// global whose value depends on a DECISION must be declared below the code that
+// makes the decision, not beside the function that computes it.
+//
+// Safe because every reader is far below: the first is `noCameraHere`, and the
+// rest are the camera bring-up and the file-source paths, all past line 1600.
+let videoArg = resolveVideoArg()
 
 // ── A LINK CLICKED WHILE A CALL IS ALREADY UP ────────────────────────────────
 //
