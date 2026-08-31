@@ -560,6 +560,30 @@ enum Launcher {
     let mineHint = SheetHint(Identity.handle.isEmpty ? Identity.nameTroubleLine
                                                      : "Give this to someone and they can call you.")
     let emptyHint = SheetHint("Talk to someone once and they’ll show up here.")
+    // ── THE HALF OF "TAP A NAME TO CALL" THAT REACHED NOBODY ─────────────────
+    //
+    // Ringing a Mac whose app is closed is fully built -- a LaunchAgent, a poller,
+    // a spawn, a card, all of it tested. The only way to turn it on is
+    // `--watch-install` in a terminal, and the app has never mentioned it. So for
+    // everybody who will not open a terminal, which is everybody, half of "call
+    // someone by tapping their name" does not exist: you can ring them, and they
+    // can only ever ring you back while your app happens to be open.
+    //
+    // Building it and making it happen are separate pieces of work and only the
+    // first one feels like the feature. This row is the second one.
+    //
+    // IT ASKS. A login item is a persistent change to somebody's Mac and it is not
+    // ours to make quietly because we think it is good for them -- the row says
+    // what it does, in the sentence under it, and nothing happens until it is
+    // pressed. `healthy()` and not `installed`: the plist FILE existing is not the
+    // question, because one `launchctl bootout` leaves the file in place and the
+    // Mac uncallable for ever while every launch decides there is nothing to do.
+    var watchOK = Watch.healthy()
+    let reachRow = SheetRow("Let people reach you when Kin is closed")
+    let reachHint = SheetHint("Kin starts when you log in, just to listen for calls.")
+    reachRow.textInset = Metric.rowAvatarInset
+    v.addSubview(reachRow)
+    v.addSubview(reachHint)
     for r in peopleRows { v.addSubview(r) }
     for x in [newRow, wordRow, backRow, mineRow] as [NSView] { v.addSubview(x) }
     v.addSubview(mineHint)
@@ -570,6 +594,18 @@ enum Launcher {
     // lists that happen to be adjacent. Same fix as `buildPeoplePage`.
     for r in [wordRow, backRow] { r.textInset = Metric.rowAvatarInset }
     newRow.textInset = Metric.rowAvatarInset
+    // ── A CLICK THAT ARRIVES BEFORE YOU ARE LOOKING AT THIS WINDOW IS NOT A
+    //    DECISION TO RING ANYBODY ─────────────────────────────────────────────
+    //
+    // This window activates itself and opens centred, so it lands under whatever
+    // the pointer was already over. Every row here either reaches another person
+    // or changes this Mac, and none of them is worth firing on the click that
+    // merely brought the app forward -- which is exactly why AppKit's default is
+    // false and why `SheetRow` overriding it to true is right for the call bar and
+    // wrong here. Observed, before this line: an app launch put the list under a
+    // resting pointer and the next click rang @arjun.
+    for r in peopleRows { r.acceptsFirstClick = false }
+    for r in [newRow, wordRow, backRow, mineRow, reachRow] { r.acceptsFirstClick = false }
 
     // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
@@ -598,6 +634,9 @@ enum Launcher {
       var warmed: [String: String] = [:]
       var relayout: () -> Void = {}
       var ring: (String) -> Void = { _ in }
+      /// Turn on the login item. A closure rather than a method body because the
+      /// row it reports into is built outside this class.
+      var makeReachable: () -> Void = {}
       init(field: NSTextField, nameField: NSTextField, status: NSTextField) {
         self.field = field; self.nameField = nameField; self.status = status
       }
@@ -656,6 +695,7 @@ enum Launcher {
       @objc func showName() { guard !ringing else { return }; status.stringValue = ""; mode = .name; relayout() }
       @objc func showWord() { guard !ringing else { return }; status.stringValue = ""; mode = .word; relayout() }
       @objc func showPeople() { guard !ringing else { return }; status.stringValue = ""; mode = .people; relayout() }
+      @objc func reachable() { guard !ringing else { return }; makeReachable() }
       @objc func cancel() { done = true }
     }
     let t = Target(field: field, nameField: nameField, status: status)
@@ -730,6 +770,10 @@ enum Launcher {
       case .people:
         column += people.isEmpty ? [emptyHint] : peopleRows
         column += [newRow, wordRow]
+        // Below the things you came here to do and above your own name, which is
+        // the other thing on this card about being reachable rather than about
+        // reaching somebody.
+        if !watchOK { column += [reachRow, reachHint] }
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
       case .name:
         column += [nameBack, status]
@@ -740,7 +784,8 @@ enum Launcher {
       }
       let shown = Set((heads + column).map { ObjectIdentifier($0) })
       for x in [title, sub, fieldBack, field, newBtn, join, nameBack, nameField, callBtn,
-                status, newRow, wordRow, backRow, mineRow, mineHint, emptyHint] as [NSView] {
+                status, newRow, wordRow, backRow, mineRow, mineHint, emptyHint,
+                reachRow, reachHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       for r in peopleRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
@@ -756,7 +801,11 @@ enum Launcher {
         if x === title { return 24 }
         if x === sub { return 32 }
         if x === status { return statusH }
-        if x is SheetHint { return Metric.sheetHint }
+        // ASK the hint, do not assume. `Metric.sheetHint` is 34 and the hint that
+        // says why this Mac has no name wraps to three lines; a fixed box put its
+        // last line under the card's bottom edge everywhere else this was done by
+        // hand. The measure needs the width, which is known here and nowhere else.
+        if let h = x as? SheetHint { h.measure(width: rowW); return h.wantedHeight }
         if x === fieldBack || x === nameBack { return Metric.fieldHeight }
         return Metric.sheetRow
       }
@@ -822,6 +871,38 @@ enum Launcher {
     wordRow.target = t; wordRow.action = #selector(Target.showWord)
     backRow.target = t; backRow.action = #selector(Target.showPeople)
     mineRow.target = t; mineRow.action = #selector(Target.copyMine(_:))
+    reachRow.target = t
+    reachRow.action = #selector(Target.reachable)
+    // ── SAYING WHAT HAPPENED, INCLUDING WHEN IT REFUSED ──────────────────────
+    //
+    // `Watch.install()` returns a SENTENCE, and three of the things it can say are
+    // refusals -- a copy that is not in /Applications is not a stable target at
+    // login, the plist could not be written, another Kin got there first. A row
+    // that flips to "on" regardless would be the exact defect this project keeps
+    // finding: a control that reports success for work that did not happen.
+    //
+    // launchctl is a subprocess, so it is not run on the thread that draws.
+    t.makeReachable = { [weak t] in
+      reachRow.setLabel("Turning it on…")
+      Thread {
+        let said = Watch.install()
+        let ok = Watch.healthy()
+        DispatchQueue.main.async {
+          fputs(said + "\n", stderr)
+          Metrics.tap("watch_install", ok: ok)
+          guard ok else {
+            // The sentence, not a shrug. It names which of the three it was, and
+            // two of them are things the person can act on.
+            reachRow.setLabel("Couldn’t turn it on")
+            reachHint.setText(said.replacingOccurrences(of: "watch: ", with: ""))
+            return
+          }
+          watchOK = true
+          t?.relayout()
+        }
+      }.start()
+    }
+
     for r in peopleRows {
       r.target = t
       r.action = #selector(Target.callRow(_:))

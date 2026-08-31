@@ -860,6 +860,19 @@ class SheetRow: NSButton {
   /// move the text without overriding `layout` and re-deriving the rest of it.
   var textInset: CGFloat = Metric.s3 { didSet { needsLayout = true } }
 
+  /// Change what the row says after it has been built. A row whose words are
+  /// fixed at `init` forces anything with two states -- a switch that reports what
+  /// it did, an action that becomes its own result -- to be two rows that swap
+  /// places, and a hidden row is a row that can be left visible by a path that
+  /// forgot it. The accessibility label moves with the words, which is the half
+  /// that gets forgotten when this is done by hand at a call site.
+  func setLabel(_ s: String) {
+    text.stringValue = s
+    setAccessibilityLabel(s)
+    needsLayout = true
+    needsDisplay = true
+  }
+
   /// What this row actually says, for a test that has to read the screen.
   var spoken: String {
     text.stringValue + (checked ? " ✓" : "") + (value.isEmpty ? "" : " = \(value)")
@@ -881,7 +894,28 @@ class SheetRow: NSButton {
   // precisely when this window is NOT the one you were typing in, and the whole
   // point of a hang-up is that it works the first time. Apple's own call controls
   // accept first mouse for the same reason.
-  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+  // ── EXCEPT WHERE A FIRST CLICK REACHES ANOTHER PERSON ─────────────────────
+  //
+  // The same rule `WaitingCard.acceptsFirstMouse` already applies to answer,
+  // decline, cancel and call-again, for the same reason and with the same
+  // evidence behind it: a window that raises and activates ITSELF lands under
+  // wherever the pointer already was, and this app has had a real trackpad tap
+  // ANSWER a call nobody had decided to take.
+  //
+  // The home screen is the other half of that. It activates on launch, opens
+  // centred, and what is now under the resting pointer is a list of people --
+  // observed, before this existed: a launch put the list under the pointer and
+  // the next click rang @arjun. So rows whose action reaches somebody or changes
+  // the Mac turn this off, and the call bar's rows keep it, where a swallowed
+  // click ("mute me now") is itself the bug.
+  var acceptsFirstClick = true
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+    // Counted, because this is a refusal nobody sees: without it the only trace
+    // of "that click was aimed at another app" is that nothing happened, which is
+    // indistinguishable from a row that does not work.
+    if !acceptsFirstClick { Metrics.count("row_first_mouse_refused") }
+    return acceptsFirstClick
+  }
 
   // A row is one target, not a label with a row behind it. `hitTest` was handing
   // clicks to the `NSTextField` that draws the words -- which does nothing, and
@@ -1228,6 +1262,20 @@ final class SheetHint: NSView {
   /// one that says why this Mac has no name is the whole of what a person gets
   /// told about being uncallable, and nothing could see it.
   private(set) var text: String
+
+  /// Replace the sentence. The height a hint wants depends on the words in it, so
+  /// this re-measures rather than leaving the caller to remember to -- a hint that
+  /// grew from one line to two and kept its old box put the second line under the
+  /// bottom edge, which is the defect `wantedHeight` was added to fix in the first
+  /// place. `describeTree` reads `text`, so it moves too.
+  func setText(_ s: String) {
+    text = s
+    label.stringValue = s
+    measure(width: bounds.width)
+    needsLayout = true
+    needsDisplay = true
+  }
+
   init(_ text: String) {
     self.text = text
     super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 30))
