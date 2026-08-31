@@ -328,7 +328,20 @@ final class Floor {
     //
     // `speakers` because it is an echo measure and headphones have no echo path,
     // exactly like the ear above.
-    let echoRisk = state == .idle && speakers && playoutTail > 0
+    // ── AND ONLY WHEN THIS END IS SAYING NOTHING ─────────────────────────────
+    //
+    // `near == .quiet` is not belt and braces, it is the difference between an
+    // echo measure and a gag. Normally it is implied: idle plus a voice becomes
+    // `.mine` in the block above, so the guard cannot reach anybody talking.
+    // There is one path where it is NOT implied, and it is the one that matters
+    // most -- the ceiling on line 288 releases a held-down speaker to `idle`
+    // AFTER that block has run, precisely to give somebody their sentence back.
+    // Without this term the guard took it away again, on exactly the complaint
+    // this whole area exists to answer.
+    //
+    // A backchannel is left alone too. "mm-hm" is the thing the other person is
+    // listening for, and it does not take the floor.
+    let echoRisk = state == .idle && speakers && playoutTail > 0 && near == .quiet
     return Decision(mayTransmit: state != .theirs && !echoRisk,
                     duckOnly: state == .theirs && near != .quiet,
                     playoutOpen: !earClosed,
@@ -443,11 +456,43 @@ extension Floor {
     say(dc.mayTransmit, "somebody who actually speaks transmits at once, live speaker or not")
     say(dc.state == .mine, "and the floor is theirs")
 
+    // 3b. AND THE CEILING'S RESCUE MUST SURVIVE IT. Being held down too long
+    //     while talking releases the floor to `idle` at the very END of step(),
+    //     after the block that would have made it `.mine`. Without a `near`
+    //     term the new guard re-muted exactly the person the ceiling had just
+    //     rescued -- the complaint this whole area exists to answer.
+    let c2 = Floor()
+    c2.speakers = true
+    // The tiebreak has to point AWAY from this end, or it simply wins the
+    // deadlock at 450 ms and is never held down at all -- which is what the
+    // first version of this row measured, and it reported a ceiling that had not
+    // fired as a ceiling that does not exist.
+    c2.yieldsOnTie = true
+    var held = 0.0
+    var lastRescue = Decision(mayTransmit: true, duckOnly: false, playoutOpen: true,
+                              fallback: false, state: .idle)
+    while held < 4.0 {
+      c2.noteFar(.claim)                    // they hold it and will not stop
+      c2.notePlayout(live: true)            // and their voice is coming out here
+      lastRescue = c2.step(dt: 0.02, near: .claim)   // while this end is talking
+      held += 0.02
+      if lastRescue.state == .idle { break }         // the ceiling let go
+    }
+    say(lastRescue.state == .idle, "the ceiling releases a held-down speaker after \(Int(held * 1000)) ms")
+    say(lastRescue.mayTransmit, "and they get their sentence back, live loudspeaker or not")
+
     // 4. HEADPHONES HAVE NO ECHO PATH, so none of this applies to them.
     let d = fresh()
     d.speakers = false
     d.notePlayout(live: true)
     say(d.step(dt: 0.02, near: .quiet).mayTransmit, "on headphones the mic is left alone")
+
+    // 4b. A LISTENING NOISE IS WHAT THE OTHER PERSON IS LISTENING FOR.
+    let bc = fresh()
+    bc.notePlayout(live: true)
+    _ = bc.step(dt: 0.02, near: .quiet)
+    say(bc.step(dt: 0.02, near: .backchannel).mayTransmit,
+        "an \"mm-hm\" over a live loudspeaker still reaches them")
 
     // 5. A SILENT LOUDSPEAKER IS NOT AN ECHO PATH.
     let e = fresh()

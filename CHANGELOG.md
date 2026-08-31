@@ -5,6 +5,27 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.91.0 — 2026-08-31
+
+### Fixed — 0.90.0's echo guard could re-gag the person it had just rescued
+
+Found by being asked "so is the echo gone 100% of the time", which is a better
+question than it looks: it forces you to name the paths still open, and one of
+them turned out to be one I had made an hour earlier.
+
+The floor has a ceiling on being held down — if this end has been talking and
+suppressed for 1500 ms, whatever it believes about the far end is wrong in the
+one direction that costs somebody their sentence, so it releases. That release
+sets `idle`, and it runs at the very END of the decision, after the block that
+would otherwise have made the floor `.mine`. 0.90.0's new guard then saw `idle`
+plus a live loudspeaker and muted the microphone again — taking back the exact
+sentence the ceiling exists to give.
+
+The guard now applies only while this end is silent, which is what an echo
+measure means and what a gag does not. A listening noise — "mm-hm" — is left
+alone too: it is the thing the other person is listening for, and it does not
+take the floor.
+
 ## Kin 0.90.0 — 2026-08-31
 
 ### Fixed — the echo was living in the state the floor had no opinion about
