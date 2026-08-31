@@ -471,7 +471,7 @@ let KNOWN_FLAGS: Set<String> = [
   // to kill the app. Same family as silent-no-op-flags, one worse.
   "no-ring-preview", "incoming-key", "with",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
-  "in-process",
+  "in-process", "no-in-process",
   "callee-away",
   // A call that outlives its process is on by default and has to be switchable
   // off, because the negative arm of its own rig is "the same crash, and it does
@@ -932,7 +932,37 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   // impossible by construction. A camera fix is verified on a real sensor or it
   // is not verified, and the flag is how that happens without holding the rest of
   // the app hostage to it.
+  // ── ON BY DEFAULT SINCE 0.106.0 ─────────────────────────────────────────
+  //
+  // It shipped off in 0.105.0 with a stated condition: one real call, on a real
+  // sensor, proving the camera survives the handoff -- because the prize here is
+  // the camera and so is the risk, and two openers of one device in one process
+  // is the race `execv` made impossible by construction.
+  //
+  // That call happened. Launched through LaunchServices so the grant is the app's
+  // own, `--gui --in-process`, on this Mac's real camera:
+  //
+  //     camera: already granted at 205 ms -- starting it before the window
+  //     camera: bring-up 87 ms off-main -- done at 293 ms
+  //     preview: camera MacBook Air Camera on screen before the call connects
+  //     camera: FIRST FRAME at 969 ms (sensor 676 ms after startRunning)
+  //     mouth: faces found with the camera read as leftMirrored
+  //
+  // The picture arrived, and the lip detector's tap is alive -- which was the
+  // other open question, since the frame tap is installed by `attachCamera` and
+  // the front door never builds a `CameraSource` at all.
+  //
+  // Note the last number: the sensor took 676 ms to hand over its first frame,
+  // and under a re-exec that is paid A SECOND TIME. The measured 2366 -> 1150 ms
+  // was taken with the camera denied in both arms, so it is a floor.
+  //
+  // `--no-in-process` is the way back, and `--in-process` is still read so that
+  // the flag people were told to type one release ago does not become an unknown
+  // option -- which this CLI refuses by exiting, deliberately.
   if flag("in-process") {
+    fputs("launch: --in-process is the default since 0.106.0 (--no-in-process reverts)\n", stderr)
+  }
+  if !flag("no-in-process") {
     Args.decide("video", "camera")
     Args.decide("window", nil)
     switch intent {
