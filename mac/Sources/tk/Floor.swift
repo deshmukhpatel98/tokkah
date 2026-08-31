@@ -237,6 +237,40 @@ final class Floor {
     /// worth nothing without the arm that shows how much
     /// (`--turn-test` prints both).
     var idleTakesAnyVoice = true
+    /// ── HEADPHONES ARE NOT A QUIETER ROOM, THEY ARE NO ROOM (0.107.0) ───────
+    ///
+    /// Strict was written as a product statement -- "one microphone, one
+    /// loudspeaker, never the same end" -- and it was applied to every output
+    /// route, deliberately: with the far microphone muted there is nothing for
+    /// a talker's speaker to carry anyway, so closing it cost nothing and the
+    /// rule stayed simple. That argument is circular. It is only true because
+    /// the OTHER end was muted by the same rule, and the reason the other end
+    /// is muted is echo. Take the echo away and the whole structure has no
+    /// remaining justification.
+    ///
+    /// On headphones there is no acoustic path from the earcup to the
+    /// microphone. Not a weak one -- none. So there is nothing to arbitrate:
+    /// both microphones can be open for the whole call and both ears with them,
+    /// and the result is a conversation with the floor's cost removed entirely
+    /// rather than reduced. No contest, no 180 ms handover, no grace window to
+    /// bound, no deadlock to break, no `strict_overlap_pct` to apologise for.
+    /// Zero turn latency by construction, which is a thing no amount of tuning
+    /// buys on speakers.
+    ///
+    /// It is also the reference experience. Everything the floor does exists to
+    /// pay for echo; a call where none of it runs is the measurement of what
+    /// echo actually costs the feel of this product, which no rig on one machine
+    /// can produce (`same-room-is-a-test-artifact`).
+    ///
+    /// The decision is per END, from that end's own route, which is the only
+    /// place the fact lives -- my earcups say nothing about whether their
+    /// laptop speaker feeds their microphone, and their floor answers that
+    /// locally, exactly as mine does
+    /// (`directional-property-measured-at-wrong-end`).
+    ///
+    /// `--no-headphone-duplex` is the control arm and restores 0.106.0: strict
+    /// applied to every route.
+    var headphoneDuplex = true
   }
 
   var cfg = Cfg()
@@ -274,6 +308,13 @@ final class Floor {
   /// says nothing about a call's length.
   private(set) var echoGuardBlocks = 0
   private(set) var guardableBlocks = 0
+  /// Blocks the floor stood down entirely because this end is on headphones,
+  /// and the total it was asked. Both, because a share of a call is the only
+  /// readable form of "was this call full duplex" -- headphones can be plugged
+  /// in halfway through a sentence, so the answer is a fraction and not a flag
+  /// (`counted-without-a-denominator`).
+  private(set) var duplexBlocks = 0
+  private(set) var askedBlocks = 0
   /// Rig-only window into the release decision. Never read in production.
   var dbg: String {
     String(format: "st=%d hq=%.0f pq=%.0f fv=%d fk=%d fsil=%.0f",
@@ -410,6 +451,7 @@ final class Floor {
   @discardableResult
   func step(dt: Double, near: Voice) -> Decision {
     let ms = dt * 1000
+    askedBlocks += 1
     farAgeMs += ms
     playoutHold = max(0, playoutHold - ms)
     playoutTail = max(0, playoutTail - ms)
@@ -455,6 +497,33 @@ final class Floor {
     // evidence to keep talking, so both-muted cannot stick either.
     // Reported as fallback, because "running without far evidence" is what
     // that field has always meant.
+    // ── AND HEADPHONES STAND THE WHOLE THING DOWN ────────────────────────────
+    //
+    // Above the blind-strict rule, below the local-gate fallback, and before a
+    // single clock that decides who is allowed to speak. See
+    // `cfg.headphoneDuplex`: with no acoustic path there is nothing for a turn
+    // rule to protect, so the answer is not a faster floor, it is no floor.
+    //
+    // `state = .idle` rather than a frozen hold, and every contest clock
+    // cleared on every bypassed block. Headphones come out mid-sentence: what
+    // the machine must never do at that instant is resume from a stale belief
+    // formed a minute ago about who was talking. `.idle` is this file's OPEN
+    // state and re-entering from it can only ever open a microphone.
+    if cfg.headphoneDuplex, !speakers {
+      state = .idle
+      wasState = .idle
+      nearClaimMs = 0; farClaimMs = 0; holderQuietMs = 0; heldDownMs = 0
+      nearVoiceMs = 0; farVoiceMs = 0; playoutHold = 0
+      inGrace = false; farWrapping = false
+      duplexBlocks += 1
+      // NOT reported as `fallback`. That field means "this end stopped
+      // believing the far end and is running blind", which is a degradation;
+      // this is the opposite, and one flag answering both questions is
+      // `one-condition-two-concerns`.
+      return Decision(mayTransmit: true, duckOnly: false, playoutOpen: true,
+                      fallback: false, state: .idle)
+    }
+
     let farBlind = stale && cfg.strict
     if farBlind { farVoice = .quiet }
 
@@ -1258,19 +1327,26 @@ extension Floor {
         "dead peer: the survivor takes the floor at \(Int(s5.bOpenAfterMs ?? -1)) ms (asked at 4000)")
     say(s5.bothOpenMs == 0, "dead peer: and still never both")
 
-    // 6. THE EAR. While I hold, my speaker is closed -- on headphones too, in
-    //    strict, because the rule is a product statement now. One block after
-    //    the lag it must be shut; in idle it must be open.
+    // 6. THE EAR. While I hold, my speaker is closed -- ON LOUDSPEAKERS. One
+    //    block after the lag it must be shut; in idle it must be open.
+    //
+    //    This row used to assert the ear closed on HEADPHONES too, and that was
+    //    the 0.95.0 product statement: the rule applied to every route because
+    //    with the far microphone muted there was nothing for a talker's speaker
+    //    to carry. 0.107.0 removes the premise -- on headphones the far
+    //    microphone is NOT muted -- so the conclusion goes with it. The
+    //    loudspeaker half is unchanged and is checked here; the headphone half
+    //    is checked in row 18.
     let e = Floor()
     e.cfg.strict = true
-    e.speakers = false                        // headphones: the hard case
+    e.speakers = true
     e.noteFar(.quiet)
     _ = e.step(dt: 0.02, near: .quiet)
     var de = e.step(dt: 0.02, near: .claim)   // take the floor
     var waited = 0.0
     while waited < 0.5, de.playoutOpen { de = e.step(dt: 0.02, near: .claim); waited += 0.02 }
     say(de.state == .mine && !de.playoutOpen,
-        "holder's ear closes even on headphones (after \(Int(waited * 1000)) ms of lag)")
+        "holder's ear closes on loudspeakers (after \(Int(waited * 1000)) ms of lag)")
     let e2 = Floor()
     e2.cfg.strict = true
     e2.noteFar(.quiet)
@@ -1573,6 +1649,146 @@ extension Floor {
     }
     say(blindWaitMs > 60,
         "with vision off the release waits the ordinary \(Int(blindWaitMs)) ms")
+
+    // ── 18. HEADPHONES: THE FLOOR STANDS DOWN, AND IT IS MEASURED ───────────
+    //
+    // Six rows, and every one of them is PAIRED with its control arm, because
+    // "headphones are full duplex now" is trivially passed by a floor that
+    // stopped working -- and the way to tell those apart is that the same
+    // script on loudspeakers must still behave exactly as it did in 0.106.0.
+    //
+    // The measurement is the one the user asked for: milliseconds of a real
+    // interruption that never reached the wire. On headphones it must be zero
+    // for as long as somebody keeps talking, not zero for 400 ms and then
+    // bounded by a grace window.
+    /// The end that LOSES. Both people talking at once, this end's ordering
+    /// says it gives -- which on loudspeakers is the one case strict silences a
+    /// person who is mid-sentence, and it is the case a route with no echo path
+    /// has no reason to have at all.
+    ///
+    /// It has to be a genuine contest and not "somebody talking under a holder":
+    /// continuous voice WINS the strict contest in 160 ms and then transmits
+    /// legitimately, so that script loses 0 ms on speakers too and would make
+    /// the rows below unable to fail (`rig-picks-a-parameter-the-product-does-not`
+    /// -- the parameter here being which end the tiebreak picks).
+    func loser(_ speakers: Bool, duplex: Bool = true) -> Floor {
+      let f = Floor()
+      f.cfg.strict = true
+      f.cfg.headphoneDuplex = duplex
+      f.speakers = speakers
+      f.yieldsOnTie = true                      // the end that gives, by ordering
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      f.noteFar(.claim)
+      _ = f.step(dt: 0.02, near: .quiet)        // they have the floor
+      return f
+    }
+    /// Two seconds of both people talking. Their cue is refreshed every block,
+    /// exactly as the wire delivers it, so the holder never goes stale and
+    /// releases -- without that this measures `staleMs` and calls it duplex
+    /// (the same trap row 11 documents).
+    func bothTalk(_ f: Floor) -> (outMs: Double, lostMs: Double, earShutMs: Double) {
+      var out = 0.0, lost = 0.0, shut = 0.0
+      for _ in 0..<100 {
+        f.noteFar(.claim)
+        let d = f.step(dt: 0.02, near: .claim)
+        if d.mayTransmit { out += 20 } else { lost += 20 }
+        if !d.playoutOpen { shut += 20 }
+      }
+      return (out, lost, shut)
+    }
+    let h1 = bothTalk(loser(false))
+    say(h1.lostMs == 0,
+        "headphones: 2 s of talking over each other loses nothing (\(Int(h1.outMs)) ms out,"
+        + " \(Int(h1.lostMs)) ms lost)")
+    // THE EAR IS ITS OWN SCRIPT, because the ear only closes while this end
+    // HOLDS the floor -- and the end above never does, it is the one that loses.
+    // Asserting `earShutMs == 0` there would have passed in 0.106.0 as well,
+    // which is a row that cannot fail (`green-metrics-can-hide-defects`).
+    func holderEarShutMs(_ speakers: Bool, duplex: Bool) -> Double {
+      let f = Floor()
+      f.cfg.strict = true
+      f.cfg.headphoneDuplex = duplex
+      f.speakers = speakers
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      var shut = 0.0
+      for _ in 0..<50 {                          // 1 s of holding it
+        f.noteFar(.quiet)
+        if !f.step(dt: 0.02, near: .claim).playoutOpen { shut += 20 }
+      }
+      return shut
+    }
+    say(holderEarShutMs(false, duplex: true) == 0,
+        "headphones: a holder's own ear never closes")
+    // THE CONTROL ARM, and it is the shipped 0.106.0 behaviour: the grace window
+    // carries the first 400 ms, the ceiling hands back a moment every 1.5 s, and
+    // the rest is silence. If this row ever reads zero the one above is
+    // measuring nothing.
+    let h1old = bothTalk(loser(false, duplex: false))
+    say(h1old.lostMs > 800,
+        "REJECT: with --no-headphone-duplex the same 2 s loses \(Int(h1old.lostMs)) ms"
+        + " -- the meter can see")
+    let earOld = holderEarShutMs(false, duplex: false)
+    say(earOld > 800,
+        "REJECT: 0.106.0 closed a headphone holder's ear for \(Int(earOld)) ms of 1000"
+        + " -- the meter can see")
+    say(holderEarShutMs(true, duplex: true) > 800,
+        "and on loudspeakers it still closes, which is the whole echo measure")
+    // AND LOUDSPEAKERS ARE UNTOUCHED. Same script, same numbers as before this
+    // feature existed -- the route is the only thing that changed.
+    let h1spk = bothTalk(loser(true))
+    say(h1spk.lostMs > 800,
+        "speakers are unchanged: the same 2 s still loses \(Int(h1spk.lostMs)) ms")
+    say(abs(h1spk.lostMs - h1old.lostMs) < 60,
+        "and it loses the SAME as the control arm (\(Int(h1spk.lostMs)) vs \(Int(h1old.lostMs)) ms)"
+        + " -- headphones is the only thing this changed")
+
+    // The other half of "one mic, one speaker": on headphones both ends are
+    // fully open in the same block, for the whole of an overlap.
+    let h2 = Floor()
+    h2.cfg.strict = true
+    h2.speakers = false
+    h2.noteFar(.claim)                          // they hold and keep holding
+    var h2Open = 0.0
+    for _ in 0..<50 {
+      h2.noteFar(.claim)
+      let d = h2.step(dt: 0.02, near: .claim)   // and so do I
+      if d.mayTransmit && d.playoutOpen { h2Open += 20 }
+    }
+    say(h2Open == 1000, "headphones: both ends transmit AND hear for all of 1 s of overlap")
+
+    // AND IT IS COUNTED. A feature that stood down for 60% of a call and said so
+    // nowhere is `invisible-when-it-matters`; the beat carries this as
+    // `floor_duplex_pct`.
+    let h4 = Floor()
+    h4.cfg.strict = true
+    h4.speakers = false
+    h4.noteFar(.quiet)
+    for _ in 0..<25 { _ = h4.step(dt: 0.02, near: .quiet) }
+    h4.speakers = true                          // headphones come out mid-call
+    for _ in 0..<25 { _ = h4.step(dt: 0.02, near: .quiet) }
+    say(h4.duplexBlocks == 25 && h4.askedBlocks == 50,
+        "the stand-down is counted per block (\(h4.duplexBlocks)/\(h4.askedBlocks))")
+    // AND THE HANDBACK IS CLEAN. Pulling headphones out while the far end has
+    // been talking for a minute must not resume a hold formed before the route
+    // changed: the floor re-enters from `idle`, so this end's next word is out
+    // in its own block.
+    let h5 = Floor()
+    h5.cfg.strict = true
+    h5.speakers = true
+    h5.noteFar(.quiet)
+    _ = h5.step(dt: 0.02, near: .quiet)
+    h5.noteFar(.claim)
+    for _ in 0..<50 { h5.noteFar(.claim); _ = h5.step(dt: 0.02, near: .quiet) }
+    say(h5.state == .theirs, "on speakers a long far turn is held by them")
+    h5.speakers = false                         // headphones go on
+    _ = h5.step(dt: 0.02, near: .quiet)
+    h5.speakers = true                          // and come straight back off
+    h5.noteFar(.claim)
+    let d5 = h5.step(dt: 0.02, near: .backchannel)
+    say(d5.mayTransmit,
+        "and a word spoken the block after they come off is out at once, not held by a stale hold")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

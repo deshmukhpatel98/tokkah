@@ -481,7 +481,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
-  "no-corrveto", "floor-soft",
+  "no-corrveto", "floor-soft", "no-headphone-duplex",
   "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
@@ -4194,6 +4194,11 @@ func applyGateFlags() {
   // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
   // -20 dB out-of-turn duck, the open idle, the open fallback.
   if flag("floor-soft") { Audio.sharedFloor.cfg.strict = false }
+  // The control arm for headphone full duplex (0.107.0): strict applies to every
+  // output route again, which is exactly 0.106.0. Kept as a real switch because
+  // this is the reference experience -- the only way to hear what echo costs the
+  // feel of a call is to be able to turn the compensation for it off and on.
+  if flag("no-headphone-duplex") { Audio.sharedFloor.cfg.headphoneDuplex = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
@@ -6252,6 +6257,18 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // carried voice. The stated cost of a simultaneous start is deadlock plus a
     // hop; anything past that is the rule failing.
     "floor_strict": Audio.sharedFloor.cfg.strict ? 1 : 0,
+    // ── HOW MUCH OF THIS CALL HAD NO FLOOR AT ALL (0.107.0) ─────────────────
+    //
+    // On headphones the turn rule stands down completely -- both microphones
+    // open, both ears open, no contest -- because there is no acoustic path for
+    // it to protect. Published as a SHARE and not a flag, because a route can
+    // change mid-sentence and because the two experiences are so different that
+    // a beat which cannot say which one it is describing is unreadable: a
+    // `strict_overlap_pct` of 100% is a fault on speakers and the whole point on
+    // headphones.
+    "floor_duplex_pct": Audio.sharedFloor.askedBlocks > 0
+      ? Double(Audio.sharedFloor.duplexBlocks) / Double(Audio.sharedFloor.askedBlocks) * 100 : 0,
+    "floor_hp_duplex": Audio.sharedFloor.cfg.headphoneDuplex ? 1 : 0,
     // ── THE INTERJECTION RESCUE, COUNTED (0.99.0) ───────────────────────────
     //
     // `turn_onset_lost` is the defect: whole utterances that never reached the

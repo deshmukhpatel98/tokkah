@@ -142,6 +142,14 @@ def call_summary(bs, label=""):
         print(f"  RING      rang {rr}x  ·  " + (" · ".join(stops) if stops else "no stop recorded")
               + lag + ("  ·  POLL WENT SLOW (server stopped holding)" if slow else "")
               + (f"  ·  {out}" if out else ""))
+    # Which launch path produced this call (0.107.0). The first question to ask
+    # of a bad call: a compound failure is two changes at once, and this says
+    # which half was in play without asking anybody to retype a command.
+    # `direct` is a real third answer (a link, a ring, a resumed call), not a
+    # stand-in for "could not tell" -- absent means a build older than the fact.
+    lp = sub(bs, "facts", "launch_path")
+    if lp:
+        print(f"  LAUNCH    {lp}")
     # Where this end was, once per connected call (0.96.0) -- ~1 km grain.
     la, lo = sub(bs, "facts", "geo_lat"), sub(bs, "facts", "geo_lon")
     ge = sub(bs, "facts", "geo_err")

@@ -1183,8 +1183,15 @@ final class Audio {
       Audio.sharedGate.cfg = Audio.gate
     }
     Metrics.fact("output_route", speakers ? "speakers" : "headphones")
+    // Says which of the two products this call is now, because they are not
+    // small variations of each other: on headphones the turn rule stands down
+    // completely (`Floor.Cfg.headphoneDuplex`) and there is no handover cost at
+    // all, and a line that read the same either way would hide the single
+    // biggest difference in how a call feels.
+    let duplex = Audio.sharedFloor.cfg.headphoneDuplex
     let how = speakers ? "one at a time, so nobody hears themselves"
-                       : "both at once, nothing in the way"
+                       : (duplex ? "both at once, no turns, nothing in the way"
+                                 : "one at a time (--no-headphone-duplex)")
     fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\n", stderr)
   }
 
