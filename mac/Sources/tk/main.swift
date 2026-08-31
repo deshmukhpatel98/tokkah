@@ -442,7 +442,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
-  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test",
+  "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -476,7 +476,7 @@ let KNOWN_FLAGS: Set<String> = [
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
-                  "corr-test", "quantile-test", "reopen-test", "gain-test"]
+                  "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -640,6 +640,10 @@ if flag("reopen-test") { exit(Resident.Target.selfTestLive() ? 0 : 1) }
 // Driven with the peaks a real call delivered. Pure arithmetic over one struct:
 // no device, no port, no window, so it sits up here with the other rulers.
 if flag("gain-test") { exit(Audio.gainSelfTest() ? 0 : 1) }
+
+// The state the floor forgot: nobody's turn, both loudspeakers live, both
+// microphones open. Pure arithmetic over two Floor objects.
+if flag("echo-state-test") { exit(Floor.echoStateSelfTest() ? 0 : 1) }
 
 // ── ARE YOU TWO IN THE SAME ROOM? THE RULER, BEFORE ANY OF THE PRODUCT ─────
 //

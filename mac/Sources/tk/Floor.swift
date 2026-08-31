@@ -68,6 +68,14 @@ final class Floor {
     /// Far cue silence past which this end stops believing anything it was told
     /// and reverts to the purely local gate. OPENS. Never closes.
     var staleMs: Double = 1000
+    /// ── HOW LONG THE SPEAKER GOES ON BEING AN ECHO PATH ─────────────────────
+    ///
+    /// After the last far-end sample leaves the loudspeaker, the room it is in
+    /// carries on returning it for a while, and the microphone is still hearing
+    /// the tail. Opening the moment the level drops puts the last syllable of
+    /// their sentence back on the wire. 150 ms is longer than a laptop's room
+    /// tail and shorter than the gap between two people's turns.
+    var playoutTailMs: Double = 150
     /// Holder silent this long -> `idle`. The same 450 ms the gate already uses
     /// to end a vocalisation: 200-400 ms is a pause inside a sentence, past that
     /// the person has stopped.
@@ -114,6 +122,8 @@ final class Floor {
   /// without bound while the channel is dead, which is what triggers the
   /// fallback.
   private(set) var farAgeMs: Double = 1e9
+  /// Milliseconds of loudspeaker tail still to run. See `notePlayout`.
+  private(set) var playoutTail: Double = 0
   private var farVoice = Voice.quiet
   /// How long the far end has been quiet, on ITS clock: seeded to one transit
   /// when the first quiet cue lands, then counted here.
@@ -188,6 +198,7 @@ final class Floor {
     let ms = dt * 1000
     farAgeMs += ms
     playoutHold = max(0, playoutHold - ms)
+    playoutTail = max(0, playoutTail - ms)
 
     nearClaimMs = near == .claim ? nearClaimMs + ms : 0
     farClaimMs = farVoice == .claim ? farClaimMs + ms : 0
@@ -294,7 +305,31 @@ final class Floor {
     wasState = state
     let earClosed = state == .mine && speakers && playoutHold <= 0
 
-    return Decision(mayTransmit: state != .theirs,
+    // ── AND THE STATE THIS RULE FORGOT ───────────────────────────────────────
+    //
+    // `idle` is nobody's turn, and it was reached by "the holder went quiet for
+    // 450 ms" -- which is every pause between two sentences. In it, BOTH ends
+    // may transmit and BOTH ears are open, so both microphones sit live next to
+    // both loudspeakers. That is not a turn-taking state, it is a closed loop,
+    // and a call spends about 40% of itself there.
+    //
+    // Measured on the call this was found in, with both ends on 0.89.0: the
+    // floor muted one end for 22% of the call and the other for 38%, both
+    // correct, and the echo still peaked at 0.81 and 0.72. The missing 40% is
+    // this state.
+    //
+    // So in idle, a microphone next to a live loudspeaker does not transmit.
+    // This is the SAME rule the design already states -- one voice at a time, so
+    // nobody hears themselves -- applied to the case where the floor has no
+    // opinion. It costs nothing in a conversation: the instant this end actually
+    // speaks, `near` is no longer quiet, the block above has already moved the
+    // state to `.mine`, and this guard does not apply. Barging in still works,
+    // because the classifier reads the microphone BEFORE the gate mutes it.
+    //
+    // `speakers` because it is an echo measure and headphones have no echo path,
+    // exactly like the ear above.
+    let echoRisk = state == .idle && speakers && playoutTail > 0
+    return Decision(mayTransmit: state != .theirs && !echoRisk,
                     duckOnly: state == .theirs && near != .quiet,
                     playoutOpen: !earClosed,
                     fallback: false, state: state)
@@ -326,6 +361,16 @@ final class Floor {
   }
   /// `Predict.probability`, 0-1, that this end's current turn is ending.
   func noteEndProb(_ p: Double) { endProb = p }
+
+  /// ── IS THIS MACHINE'S LOUDSPEAKER LIVE RIGHT NOW? ─────────────────────────
+  ///
+  /// Not "does the far end hold the floor" -- that is a belief, and it is the
+  /// belief that was wrong. This is the fact: sound is coming out of the speaker
+  /// on this desk, so a microphone next to it is an echo path, whatever anybody
+  /// thinks about whose turn it is. Fed from the render callback.
+  func notePlayout(live: Bool) {
+    if live { playoutTail = cfg.playoutTailMs }
+  }
 }
 
 // ── PROVING IT ───────────────────────────────────────────────────────────────
@@ -350,6 +395,73 @@ extension Floor {
     var worstRunMs: Double = 0
     var runMs: Double = 0
     var earShutMs: Double = 0
+  }
+
+  /// ── THE ECHO STATE, ON ANSWERS ALREADY KNOWN ─────────────────────────────
+  ///
+  /// `idle` let both ends transmit with both loudspeakers live, and that is
+  /// where the echo that survived four releases was living. Every row here is a
+  /// case the shipped build got wrong or a case the fix must not break -- and
+  /// the second kind outnumbers the first, because "never transmit" would pass
+  /// a table of only the first.
+  static func echoStateSelfTest() -> Bool {
+    var ok = true
+    func say(_ good: Bool, _ what: String) {
+      if !good { ok = false }
+      fputs("floor: \(good ? "OK  " : "FAIL") \(what)\n", stderr)
+    }
+    func fresh() -> Floor {
+      let f = Floor()
+      f.speakers = true
+      f.noteFar(.quiet)                    // not stale, nobody talking
+      _ = f.step(dt: 0.02, near: .quiet)
+      return f
+    }
+    // 1. THE BUG: nobody's turn, my speaker is live, my mic must be shut.
+    let a = fresh()
+    a.notePlayout(live: true)
+    let da = a.step(dt: 0.02, near: .quiet)
+    say(da.state == .idle, "the pause after somebody speaks is idle, as before")
+    say(!da.mayTransmit, "and a microphone next to a live loudspeaker does NOT transmit")
+    say(da.playoutOpen, "while the ear stays open -- muting the mic is not going deaf")
+
+    // 2. AND IT MUST LET GO. A tail that never expires is a mic that never opens.
+    let b = fresh()
+    b.notePlayout(live: true)
+    _ = b.step(dt: 0.02, near: .quiet)
+    var waited = 0.0
+    while waited < 2.0, !b.step(dt: 0.02, near: .quiet).mayTransmit { waited += 0.02 }
+    say(waited > 0.05 && waited < 0.5,
+        "and it opens again \(Int(waited * 1000)) ms after the loudspeaker goes quiet")
+
+    // 3. BARGING IN STILL WORKS. This is the one that matters: the complaint
+    //    that started all of this was somebody being cut off mid-sentence.
+    let c = fresh()
+    c.notePlayout(live: true)
+    _ = c.step(dt: 0.02, near: .quiet)
+    let dc = c.step(dt: 0.02, near: .claim)
+    say(dc.mayTransmit, "somebody who actually speaks transmits at once, live speaker or not")
+    say(dc.state == .mine, "and the floor is theirs")
+
+    // 4. HEADPHONES HAVE NO ECHO PATH, so none of this applies to them.
+    let d = fresh()
+    d.speakers = false
+    d.notePlayout(live: true)
+    say(d.step(dt: 0.02, near: .quiet).mayTransmit, "on headphones the mic is left alone")
+
+    // 5. A SILENT LOUDSPEAKER IS NOT AN ECHO PATH.
+    let e = fresh()
+    say(e.step(dt: 0.02, near: .quiet).mayTransmit, "with nothing playing, idle transmits as before")
+
+    // 6. AND THE FALLBACK STILL OUTRANKS EVERYTHING. No word from the far end
+    //    means this end knows nothing, and reverting can only ever OPEN a mic.
+    let f = Floor()
+    f.speakers = true
+    f.notePlayout(live: true)
+    let df = f.step(dt: 2.0, near: .quiet)      // 2 s with no cue at all
+    say(df.fallback && df.mayTransmit, "a stale far end still falls back to open, not shut")
+    fputs("FLOOR ECHO CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
+    return ok
   }
 
   static func selfTest(owdMs: Double = 40, verbose: Bool = true) -> Bool {

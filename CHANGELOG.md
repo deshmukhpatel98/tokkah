@@ -5,6 +5,41 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.90.0 — 2026-08-31
+
+### Fixed — the echo was living in the state the floor had no opinion about
+
+Reported again after 0.84.0, on a call where both ends ran 0.89.0. The floor
+instruments added in 0.84.0 are what found it — the first release where this
+question could be asked at all:
+
+| | floor muted the mic | ran on the local gate | echo peak | mic open |
+| --- | --- | --- | --- | --- |
+| one end | 22% of the call | 0.03% | **0.81** | 99% |
+| other end | 38% of the call | 5.5% | **0.72** | 99% |
+
+Both ends were muting, both were believing each other's cues, and the echo was
+still there. The missing 40% is `idle` — nobody's turn. It is reached by "the
+holder went quiet for 450 ms", which is every pause between two sentences, and
+in it BOTH ends may transmit and BOTH ears are open. That is not a turn-taking
+state; it is a closed loop with a microphone sitting next to a live loudspeaker
+at each end, and a call spends about two fifths of itself there.
+
+So in `idle`, a microphone next to a live loudspeaker no longer transmits. The
+floor is told the FACT — is this machine's speaker emitting anything right now,
+measured on the render thread where the samples are — rather than being left to
+infer it from whose turn it is, which is the belief that was wrong. 150 ms of
+tail after the speaker falls quiet, because a room keeps returning the last
+syllable for a while.
+
+It costs nothing in a conversation. The instant this end actually speaks the
+floor is already `.mine` and the guard does not apply, so barging in works
+exactly as before — the classifier reads the microphone before the gate mutes
+it. Headphones are untouched, because there is no echo path to close.
+
+Measured on a loopback pair: the share of the call the microphone is muted for
+the other person went from 22% to about 50%.
+
 ## Kin 0.89.0 — 2026-08-31
 
 ### Changed — the repository catches up with the app

@@ -450,6 +450,19 @@ final class Audio {
   /// "did this call ever clip"; the tuner needs "how loud is it RIGHT NOW", and
   /// a lifetime maximum can never come back down.
   private(set) var micPeakWin: Float = 0
+  /// Energy of what the loudspeaker has played since the last capture block, and
+  /// how many samples that was. Written on the render thread, drained on the
+  /// capture thread; scalars only, which is the rule everywhere these two meet.
+  nonisolated(unsafe) var playoutSumSq: Double = 0
+  nonisolated(unsafe) var playoutN: Int = 0
+  /// Last drained loudspeaker RMS, for the readout. A number the person
+  /// debugging an echo asks for first and could not previously get.
+  private(set) var playoutRmsNow: Double = 0
+  /// The level below which a loudspeaker is not an echo path worth muting for.
+  /// -46 dBFS: quiet enough that a room tail and a line's noise floor sit under
+  /// it, loud enough that any audible speech sits over it. Chosen against the
+  /// measured null -- a call with nobody talking reads about -60.
+  static let PLAYOUT_LIVE_RMS: Double = 0.005
   /// The microphone before `inputTrim`, which is what the trim has to be chosen
   /// from: reading the trimmed signal would be a loop steering on its own output.
   nonisolated(unsafe) var rawPeakWin: Float = 0
@@ -998,6 +1011,17 @@ final class Audio {
     let fl = Audio.sharedFloor
     fl.yieldsOnTie = wantYield
     fl.speakers = Audio.outputIsSpeakers
+    // Drain what the loudspeaker did since the last block. The floor's `idle`
+    // state used to let both microphones stay live next to both loudspeakers,
+    // which is a closed loop rather than a turn -- see the decision in
+    // Floor.step. This is the measurement that closes it.
+    let pn = playoutN, psq = playoutSumSq
+    playoutN = 0; playoutSumSq = 0
+    if pn > 0 {
+      let rms = (psq / Double(pn)).squareRoot()
+      playoutRmsNow = rms
+      fl.notePlayout(live: rms > Audio.PLAYOUT_LIVE_RMS)
+    }
     fl.noteEndProb(Audio.turnEndProb)
     let d = fl.step(dt: Double(blockN) / SR,
                     near: Floor.Voice(rawValue: mine.rawValue) ?? .quiet)
@@ -3756,6 +3780,14 @@ final class Audio {
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
+        // ── THE FACT THE FLOOR NEEDS, TAKEN WHERE IT IS TRUE ──────────────────
+        //
+        // Whether this machine's loudspeaker is emitting anything right now.
+        // Not who holds the floor -- that is a belief, and the belief is what
+        // was wrong. Summed here on the render thread, where the sample is, and
+        // read once per block: two adds per sample, no allocation, no lock.
+        playoutSumSq += Double(played) * Double(played)
+        playoutN += 1
         sigSumSq += Double(val) * Double(val); sigN += 1
         // History is what was actually PLAYED, and only the good path writes it:
         // feeding synthesis back in would make the cursor chase its own tail.
@@ -3854,6 +3886,14 @@ final class Audio {
         prevOut = val
         if let d = dumpBuf { if dumpW < dumpCap { d[dumpW] = val; dumpW += 1 } else { dumpFull = true } }
         if let e = echoHist { e[echoW % Audio.ECHO_MAX] = played; echoW += 1 }
+        // ── THE FACT THE FLOOR NEEDS, TAKEN WHERE IT IS TRUE ──────────────────
+        //
+        // Whether this machine's loudspeaker is emitting anything right now.
+        // Not who holds the floor -- that is a belief, and the belief is what
+        // was wrong. Summed here on the render thread, where the sample is, and
+        // read once per block: two adds per sample, no allocation, no lock.
+        playoutSumSq += Double(played) * Double(played)
+        playoutN += 1
         if concealRun < 1_000_000_000 { concealRun += 1 }
         goodRun = 0
         ring.concealedS += 1
