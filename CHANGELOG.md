@@ -5,6 +5,51 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.94.0 — 2026-08-31
+
+### Fixed — the listening end's own speaker was classified as its person talking
+
+Measured on the first two-room 0.93.0 call (pair `8q0nwcduogm2`): the listening
+end sat alone with a healthy microphone and its voice gate was **open 97% of
+the call** — the only sound in that room was its own speaker. The level test
+cannot win there by design ("suppress less rather than gate somebody"), so the
+leak was classified a bid, and the floor answered with the −20 dB *duck*
+instead of the mute. A faint copy of the talker's own voice came back for the
+whole call. Echo correlation peaked 0.62/0.65 at the two ends.
+
+The echo detector already computes the evidence the level test lacks: a
+normalized correlation between this microphone and this machine's own playout
+(unrelated speech ≈ 0.26, a real echo lock 0.65–0.76, every 500 ms). While it
+reads ≥ 0.45 — the same number the telemetry has always called "speaker fed
+the mic" — the classifier now refuses to call that sound a voice. No cue
+crosses the wire, no claim takes the floor, the idle guard is no longer
+bypassed, and the floor mutes fully instead of ducking. The veto is withdrawn
+the moment a computation stops saying "echo" — a real voice wins it back
+within one tick of dominating the microphone — and a computation older than
+1.5 s clears it, so silence cannot gag the first word after it. Samples it
+kills are counted (`a_corr_veto_pct`); `--no-corrveto` is the control arm.
+The gate self-test reproduces the leak with a swinging room coupling and must
+see the defect with the veto off for the fixed arm to mean anything.
+
+### Fixed — the cue heartbeat had zero margin against the staleness limit
+
+The floor stops believing far cues 1000 ms after the last one, and the probe
+carrying them settled to exactly one per second. One late or lost probe put
+the far floor into full-open fallback — both ears open, both mics allowed —
+for a second at a time. On the same call the **talking** end ran on fallback
+for 20.1% of the call, which is where much of the echo lived. The steady probe
+now fires every 300 ms: three fit inside one staleness window, 32 bytes at
+3/s against a 3 Mbps call.
+
+### Fixed — a hot microphone re-taught the trim from scratch every call
+
+The software trim converged to its rail (0.11) and the beat still recorded a
+post-trim call-max peak of 3.08: the first sentence of every call shipped ~3×
+over full scale while the loop re-learned what it knew yesterday. The learned
+trim is now kept per device UID (`trim.json`) and applied from the first
+sample of the next call; the existing relax path walks a stale entry back up,
+so a microphone whose owner fixed its input gain is quietly forgiven.
+
 ## Kin 0.93.0 — 2026-08-31
 
 ### Added — the far end's turn-end number now crosses the wire

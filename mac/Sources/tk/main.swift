@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.93.0"
+let VERSION = "0.94.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -438,6 +438,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
+  "no-corrveto",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
@@ -3895,6 +3896,9 @@ func applyGateFlags() {
   // shipped four times (`one-condition-two-concerns`).
   if flag("no-floor") { Audio.floorOn = false }
   if flag("no-yield") { Audio.gate.yieldOn = false }
+  // The control arm for the correlation veto (0.94.0): the classifier goes back
+  // to trusting the level test alone, which is the 0.93.0 behaviour.
+  if flag("no-corrveto") { Audio.corrVetoOn = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
@@ -4232,7 +4236,65 @@ if flag("gate-test") {
      : "  GATE TEST FAILED" + (!untouched ? " (it altered the near voice)"
                               : !allOk ? " (the classifier never saw a bid at some block size)"
                               : " (it does not suppress enough)"))
-  exit(ok ? 0 : 1)
+
+  // ── THE CORRELATION VETO, ON THE ROOM THAT DEFEATS THE LEVEL TEST ──────────
+  //
+  // A room's coupling is not a constant, and the minimum tracker learns the
+  // QUIETEST moment of it. Vary the coupling and the level test is beaten
+  // honestly: the tracker holds the low ratio, the margin sits under the loud
+  // stretches, and the speaker's own sound is classified as a person. That is
+  // the defect measured live (a listening end's gate open 97% of a call it
+  // spent alone), reproduced here so the veto has a case it must fix -- and a
+  // twin it must NOT touch, because a test that cannot see the defect passes
+  // either way (`green-metrics-can-hide-defects`).
+  var vetoOk = true
+  do {
+    // Far end only. The coupling swings 0.2..0.9 at 0.3 Hz, like a person
+    // shifting in front of a laptop.
+    var emic = [Float](repeating: 0, count: n)
+    for i in 0..<n where i >= 400 {
+      let sway = Float(0.55 + 0.35 * sin(2 * Double.pi * 0.3 * Double(i) / SR))
+      emic[i] = sway * far[i - 400]
+    }
+    func classify(veto: Bool) -> Int {
+      Audio.corrVeto = veto
+      defer { Audio.corrVeto = false }
+      let g = Audio.DuplexGate()
+      g.cfg = Audio.gate
+      var buf = emic
+      buf.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 128 <= n {
+          for k in i..<(i + 128) { g.noteFar(far[k]) }
+          g.process(op.baseAddress! + i, 128)
+          i += 128
+        }
+      }
+      return g.claims + g.backchannels
+    }
+    let leak = classify(veto: false)
+    let fixed = classify(veto: true)
+    print("  the speaker's own sound, coupling swinging 20-90%:")
+    print("    without the veto the classifier called it a voice \(leak)x -- the 0.93.0 leak")
+    print("    with the veto: \(fixed)x")
+    if leak == 0 {
+      print("  VETO CHECK COULD NOT RUN -- the rig no longer reproduces the leak,")
+      print("  so \"fixed\" above proves nothing.")
+      vetoOk = false
+    }
+    if fixed > 0 { vetoOk = false }
+    // What this deliberately does NOT assert: that a latched veto spares a real
+    // near voice. It would not -- the veto kills whatever the level test
+    // passes, by design -- and what spares a person in production is the
+    // estimator WITHDRAWING the veto within one 500 ms tick of their voice
+    // dominating the correlation. That half lives on the estimator thread,
+    // which an offline rig cannot run; forcing the verdict here and calling the
+    // resulting gag a failure would be testing a state the product cannot hold.
+    Audio.corrVeto = false
+    print(vetoOk ? "  VETO CHECK PASSED -- our own speaker is never a voice, and the leak was real"
+                 : "  VETO CHECK FAILED")
+  }
+  exit(ok && vetoOk ? 0 : 1)
 }
 
 // ── BUILT AFTER THE TESTS, BECAUSE IT OPENS THE MICROPHONE ─────────────────
@@ -5137,7 +5199,17 @@ Thread {
     // twentieth of the shortest listening noise and a fiftieth of a bid, under
     // the resolution of the thing being reported, and this thread is asleep for
     // every one of those slices.
-    let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 1.0)
+    //
+    // ── AND THE STEADY BEAT CANNOT EQUAL THE STALENESS LIMIT ─────────────────
+    //
+    // The floor stops believing far cues `staleMs` (1000 ms) after the last one,
+    // and this probe settled to exactly 1000 ms -- zero margin, so one late or
+    // lost probe put the far end's floor into full-open fallback for a second
+    // at a time. Measured on call 8q0nwcduogm2: the TALKING end ran on fallback
+    // for 20.1% of the call, both ears open, which is where the echo lived.
+    // Three probes now fit inside one staleness window; 32 bytes at 3/s is
+    // nothing against a 3 Mbps call.
+    let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 0.3)
     while Date() < until {
       Thread.sleep(forTimeInterval: 0.02)
       if wire.vocalChanged() || wire.predictCrossed() {
@@ -5818,6 +5890,12 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "a_mic_rms": audio.micRms,
     "a_clip_pct": audio.micSamples > 0
       ? Double(audio.micClipped) * 100.0 / Double(audio.micSamples) : 0,
+    // How much of the call the correlation veto refused to classify as a voice
+    // -- sound the level test passed and the echo detector recognised as this
+    // machine's own speaker. Zero on a healthy call; the 0.93.0 leak it exists
+    // for would have read ~90% at the listening end.
+    "a_corr_veto_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.vetoFrames) * 100.0 / Double(audio.micSamples) : 0,
     "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
     "a_quality_s": audio.qualityTicks,
     "floor_held_pct": audio.floorHeldPct, "mic_access": gMicAccess,

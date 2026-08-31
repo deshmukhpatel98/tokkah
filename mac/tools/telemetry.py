@@ -55,10 +55,15 @@ def call_summary(bs, label=""):
           f"  ·  gave way {last(bs,'turn_yields'):.0f}"
           f"  ·  to-audible p50 {last(bs,'turn_to_floor_p50'):.0f} ms"
           f"  ·  {early}")
+    # corr-veto: how much of the call the classifier refused to call the
+    # machine's own speaker a voice (0.94.0). -1 means an older build.
+    cv = last(bs, "a_corr_veto_pct", -1)
+    veto = f"corr-veto {cv:.1f}%" if cv >= 0 else "corr-veto: not in this build"
     print(f"  MIC LEVEL trim {trim:.2f}{' (AT THE RAIL)' if rail else ''}"
           f"  ·  peak {last(bs,'a_mic_peak'):.2f}  ·  rms {last(bs,'a_mic_rms'):.3f}"
           f"  ·  clipping {last(bs,'a_clip_pct'):.2f}%"
-          f"  ·  fallback {last(bs,'floor_fallback_pct'):.1f}%")
+          f"  ·  fallback {last(bs,'floor_fallback_pct'):.1f}%"
+          f"  ·  {veto}")
 
 mode = sys.argv[1]
 if mode == "local":
