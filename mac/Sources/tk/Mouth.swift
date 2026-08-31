@@ -52,8 +52,41 @@ final class Mouth {
   /// A face is visible at all. False means this detector is BLIND and every
   /// consumer must fall back to audio alone.
   nonisolated(unsafe) static var visualKnown = false
-  /// `--no-mouth` is the control arm.
+  /// `--no-mouth` stops the detector entirely.
   nonisolated(unsafe) static var on = true
+  /// ── MEASURED, BUT NOT ACTED ON, UNTIL IT IS CALIBRATED ON REAL FACES ──────
+  ///
+  /// OFF by default as of 0.104.0, and this is a retraction rather than a
+  /// caution. Live call 1tv8qd52vuitl / 35ik4lvka5qkb, both ends 0.103.0:
+  ///
+  ///   mouth moving 70%  and  96%  of the call
+  ///
+  /// A two-person conversation cannot have both people talking 70-96% of the
+  /// time. The detector was not reporting speech, it was reporting *being alive
+  /// in front of a camera* — and the reason is the calibration, not the maths.
+  /// The rig footage is a talking head whose head barely moves; a real caller
+  /// moves constantly, and head YAW changes the apparent width of the mouth by
+  /// foreshortening, so the opening-over-width ratio moves when the pose moves
+  /// and not only when the jaw does. `validate-the-ruler-against-known-inputs`
+  /// held on the clip it was given and the clip was not the world.
+  ///
+  /// What that cost, on the same call: the echo veto is withdrawn whenever this
+  /// says "moving", so it fell from 6.9% of samples to 2.1% and 0.0%, echo
+  /// peaked at 0.92 — the worst measured in this project — and both microphones
+  /// were live for 23% and 29% of the call. The signal that was supposed to
+  /// separate a person from a loudspeaker had switched off the thing that
+  /// already did.
+  ///
+  /// So: the detector keeps LOOKING and keeps reporting, because a real call is
+  /// now the only place a threshold can honestly be derived and the beats are
+  /// how it gets derived. It influences nothing until `--mouth-influence`.
+  ///
+  /// The fix it needs is a different measure, not a bigger number: speech is an
+  /// OSCILLATION at 3-8 Hz and a head turn is a slow monotonic drift. Band-pass
+  /// energy separates those; a magnitude threshold cannot. That needs a faster
+  /// look rate than 12 Hz (Nyquist 6 Hz is inside the band) and is the next
+  /// piece of work, not a tuning pass.
+  nonisolated(unsafe) static var influence = false
 
   /// How often frames are looked at. 12 Hz is three or four samples per
   /// syllable -- enough to see the rate of change -- at 40% of the cost of

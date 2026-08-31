@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.103.0"
+let VERSION = "0.104.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -439,7 +439,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft",
-  "no-mouth", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
+  "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
@@ -4042,6 +4042,10 @@ func applyGateFlags() {
   // The control arm for the visual signal (0.100.0). Audio decides alone, which
   // is exactly 0.99.0.
   if flag("no-mouth") { Mouth.on = false }
+  // The visual signal measures and reports by default and influences NOTHING --
+  // it read "mouth moving" 70-96% of a live call, which is not speech. See the
+  // note on `Mouth.influence`. This opts back in for calibration runs.
+  if flag("mouth-influence") { Mouth.influence = true }
   if let th = Double(arg("mouth-threshold") ?? "") { Mouth.moveThreshold = th }
   // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
   // -20 dB out-of-turn duck, the open idle, the open fallback.

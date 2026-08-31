@@ -215,6 +215,19 @@ final class Floor {
     /// motion plus audio energy in the same window; below that the two signals
     /// are not independent of each other's jitter.
     var visualDeadlockMs: Double = 80
+    /// ── THE SHORTEST GAP BETWEEN TWO PREDICTED RELEASES ─────────────────────
+    ///
+    /// 0.99.0 disarmed the far predictor on fire, which made it once per HOLD --
+    /// and then the live call showed 8331 releases in 153 s, 54 a second, worse
+    /// than the 20 a second it replaced. Per-hold is not a bound when the hold
+    /// itself ends at the release: fire, state goes idle, they re-take on the
+    /// next block, their prior dips below the threshold and re-arms, it fires
+    /// again. The arming was correct and the cycle was the problem.
+    ///
+    /// A turn end is a thing that happens a few times a minute. 250 ms is far
+    /// below the shortest real gap between two of them and far above the block
+    /// rate, so it bounds the cycle without touching the feature.
+    var predictCooldownMs: Double = 250
     /// ── THE CONTROL ARM FOR "ANY VOICE TAKES AN EMPTY FLOOR" ────────────────
     ///
     /// False restores the pre-0.98.0 rule, where a vocalisation still in its
@@ -284,6 +297,8 @@ final class Floor {
   /// p has been below the threshold during the current hold. A leftover 0.9
   /// from the previous sentence must not release the first word of this one.
   private var farPredArmed = false
+  /// Time since the last predicted release, for `predictCooldownMs`.
+  private var sincePredictMs: Double = 1e9
   /// ── THE CONTEST CLOCK RUNS ON VOICE, NOT ON A 700 ms-OLD VERDICT ─────────
   ///
   /// `nearClaimMs`/`farClaimMs` count only `.claim`, which the classifier
@@ -404,6 +419,7 @@ final class Floor {
     // Any voice, from its first block. A backchannel counts: at the moment
     // somebody starts making sound over a holder, nothing on earth knows yet
     // whether it will turn into a word, and waiting to find out is the delay.
+    sincePredictMs += ms
     nearVoiceMs = near != .quiet ? nearVoiceMs + ms : 0
     farVoiceMs = farVoice != .quiet ? farVoiceMs + ms : 0
     if farVoice == .quiet { farQuietMs += ms }
@@ -504,7 +520,10 @@ final class Floor {
       // sentence.
       let farPause = state == .theirs && farEndProb >= cfg.predictP && holderQuietMs > 0
       let farEarly = state == .theirs && farPredArmed && farEndProb >= cfg.predictP
-      let predictedEnd = localPred || farPause || farEarly
+      // Rate-limited, or the cycle above turns a few-times-a-minute event into
+      // fifty-a-second and every number derived from it becomes fiction.
+      let predictedEnd = (localPred || farPause || farEarly)
+        && sincePredictMs >= cfg.predictCooldownMs
       // ── HOW LONG THIS RELEASE IS ALLOWED TO TAKE ─────────────────────────
       //
       // Contended when the end that does NOT hold the floor is voicing: they
@@ -554,6 +573,7 @@ final class Floor {
         // are two claims and only the second one is worth anything. This is the
         // number that says how much of the 450 ms wait it is actually saving.
         if predictedEnd {
+          sincePredictMs = 0
           predictedReleases += 1
           predictedSavedMs += max(0, cfg.releaseMs - holderQuietMs)
           if state == .theirs {
@@ -1507,6 +1527,52 @@ extension Floor {
       if w3.step(dt: 0.02, near: .claim).state != .mine { heldOn = false; break }
     }
     say(heldOn, "a talking holder keeps the floor however loudly their camera disagrees")
+
+    // ── 16. THE PREDICTOR CANNOT FIRE FIFTY TIMES A SECOND ──────────────────
+    //
+    // 0.99.0 disarmed on fire and the live call still recorded 8331 releases in
+    // 153 s. Per-hold is not a bound when the release ENDS the hold: fire, idle,
+    // they re-take, their prior dips, re-arm, fire. This drives exactly that
+    // cycle for 5 s and holds the count to the cooldown.
+    let c1 = heldByThemStrict()
+    for _ in 0..<250 {                       // 5 s of blocks
+      c1.noteFar(.claim)
+      c1.noteFarEndProb(0.3)                 // dip: arms
+      _ = c1.step(dt: 0.01, near: .quiet)
+      c1.noteFar(.claim)
+      c1.noteFarEndProb(0.95)                // rise: would fire
+      _ = c1.step(dt: 0.01, near: .quiet)
+    }
+    // 5 s at a 250 ms floor is at most ~20 releases.
+    say(c1.farPredictedReleases <= 25,
+        "the far predictor fired \(c1.farPredictedReleases)x over 5 s of dip-rise churn, not 250x")
+    // REJECT: with the cooldown removed the same churn runs away, so the row
+    // above is measuring the bound and not the arming.
+    let c2 = heldByThemStrict()
+    c2.cfg.predictCooldownMs = 0
+    for _ in 0..<250 {
+      c2.noteFar(.claim); c2.noteFarEndProb(0.3); _ = c2.step(dt: 0.01, near: .quiet)
+      c2.noteFar(.claim); c2.noteFarEndProb(0.95); _ = c2.step(dt: 0.01, near: .quiet)
+    }
+    say(c2.farPredictedReleases > 60,
+        "REJECT: without the cooldown the same churn fires \(c2.farPredictedReleases)x -- the meter can see")
+
+    // 17. AND A BLIND-BY-DEFAULT CAMERA CHANGES NOTHING. `farSeenTalking` is
+    //     nil unless this end opted into acting on vision, so the release path
+    //     must behave exactly as it did before the signal existed.
+    let c3 = Floor()
+    c3.cfg.strict = true
+    c3.noteFar(.quiet)
+    _ = c3.step(dt: 0.02, near: .quiet)
+    _ = c3.step(dt: 0.02, near: .claim)
+    c3.farSeenTalking = nil
+    var blindWaitMs = 0.0
+    var d3 = c3.step(dt: 0.02, near: .quiet)
+    while blindWaitMs < 1000, d3.state == .mine {
+      blindWaitMs += 20; c3.noteFar(.quiet); d3 = c3.step(dt: 0.02, near: .quiet)
+    }
+    say(blindWaitMs > 60,
+        "with vision off the release waits the ordinary \(Int(blindWaitMs)) ms")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

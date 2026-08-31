@@ -492,7 +492,10 @@ final class Audio {
   static let TRIM_QUIET: Float = 0.30
   /// The most a microphone may be amplified: +18 dB. Beyond this the room is
   /// louder than the person and a level control is the wrong tool.
-  static let MAKEUP_MAX: Float = 8
+  /// +12 dB, reduced from +18 in 0.104.0. On the live call that shipped +18 the
+  /// loop drove a 0.23 mic to an output of 1.86 -- and even without the dead
+  /// zone, 8x lifts the room's own noise by 18 dB along with the person.
+  static let MAKEUP_MAX: Float = 4
   /// Speech must stand this far above the room's own floor before amplifying
   /// it. ~15 dB. Below it, gain makes loud noise rather than a clear voice.
   static let TRIM_MIN_SNR: Float = 6
@@ -1066,7 +1069,7 @@ final class Audio {
     fl.noteEndProb(Audio.turnEndProb)
     // The visual prior, as a scalar across the thread boundary like every other
     // input this class hands the floor.
-    fl.nearVisualVoice = Mouth.on && Mouth.visualKnown && Mouth.visualVoice
+    fl.nearVisualVoice = Mouth.on && Mouth.influence && Mouth.visualKnown && Mouth.visualVoice
     let d = fl.step(dt: Double(blockN) / SR,
                     near: Floor.Voice(rawValue: mine.rawValue) ?? .quiet)
     // Applied to the NEXT block, one block late by construction -- 0.67 ms on
@@ -1268,7 +1271,7 @@ final class Audio {
     // knob to turn -- the ones that need it MOST -- were the ones it could
     // never reach. Decided here, from the raw microphone, on every tick.
     let knob: Float32 = micGainNow
-    trimStep(deviceAtFloor: knob <= Audio.MIN_INPUT + 1e-4, knob: knob)
+    trimStep(deviceAtFloor: knob <= Audio.MIN_INPUT + 1e-4, knob: knob, outPeak: peak)
     guard let dev = inDev as AudioDeviceID?, dev != 0 else { return }
     var cur: Float32 = 0
     var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
@@ -1298,7 +1301,7 @@ final class Audio {
       // volume scalar cannot be walked to silence by one loud cough.
       want = max(cur * max(0.5, 0.55 / peak), Audio.MIN_INPUT)
     }
-    trimStep(deviceAtFloor: want <= Audio.MIN_INPUT + 1e-4, knob: cur)
+    trimStep(deviceAtFloor: want <= Audio.MIN_INPUT + 1e-4, knob: cur, outPeak: peak)
     guard abs(want - cur) > 0.001 else { return }
     var v = want
     guard AudioObjectSetPropertyData(dev, &addr, 0, nil,
@@ -1329,11 +1332,61 @@ final class Audio {
   /// Rig only: plant this room's noise floor so the SNR guard in `trimStep`
   /// can be tested against a room that is too loud to amplify.
   func setFloorForTest(_ v: Float) { micFloor = v }
+  /// Rig only: start from a trim the field actually reached, so the dead zone
+  /// can be entered rather than argued about.
+  func forceTrimForTest(_ v: Float) { inputTrim = v }
 
-  func trimStep(deviceAtFloor: Bool, knob: Float32) {
+  /// `outPeak` is the peak AFTER the trim -- the level that actually leaves this
+  /// machine. Regulating on `raw` alone is what let 0.102.0 sit at 8x with its
+  /// output clipping at 1.86: see the note on the descent below.
+  func trimStep(deviceAtFloor: Bool, knob: Float32, outPeak: Float = 0) {
     let raw = rawPeakWin
     rawPeakWin = 0
     guard raw > 0 else { return }
+    // ── THE DESCENT, WHICH DID NOT EXIST ────────────────────────────────────
+    //
+    // 0.102.0 added a climb and no way down. Measured on live call
+    // 35ik4lvka5qkb: trim pinned at 8.00x with a post-trim peak of 1.86 --
+    // the microphone overdriven by 6 dB, which is the "sound is not being
+    // transported properly" the user heard. The arithmetic of the trap:
+    //
+    //   raw mic peak      0.233   (quiet -- a distant talker)
+    //   want = 0.55/raw   2.37
+    //   inputTrim         8.00
+    //   attenuation path  needs raw > 0.92   -> 0.233, never fires
+    //   makeup path       needs want > trim  -> 2.37 < 8.00, never fires
+    //
+    // Both guards were written when `inputTrim <= 1` made output ~= raw. The
+    // moment a gain existed they stopped covering the same range and left a
+    // dead zone with a clipping output inside it.
+    //
+    // Two fixes, and the first is the safety net: an output over full scale is
+    // cut IMMEDIATELY and unconditionally, whatever the raw level says.
+    if outPeak > 0.95, inputTrim > 1 {
+      let fix = max(1, inputTrim * max(0.5, 0.8 / outPeak))
+      if fix < inputTrim - 0.02 {
+        inputTrim = fix
+        trimMoves += 1
+        Metrics.count("mic_makeup_overload")
+        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+        fputs("mic gain: output hit \(String(format: "%.2f", outPeak))"
+            + " -- backing the makeup off to \(String(format: "%.1f", inputTrim))x\n", stderr)
+        saveTrim()
+      }
+      return
+    }
+    // And the second: a makeup gain that is now too large for the level in the
+    // room comes DOWN, on the same target the climb uses. Symmetric, so the
+    // loop can converge from either side instead of latching at the ceiling.
+    let target = min(Audio.MAKEUP_MAX, max(0.02, Audio.TRIM_TARGET / raw))
+    if inputTrim > 1, target < inputTrim - 0.02 {
+      inputTrim = max(max(1, target), inputTrim / Audio.TRIM_UP_RATE)
+      trimMoves += 1
+      Metrics.count("mic_makeup_down")
+      Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+      saveTrim()
+      return
+    }
     // ── ONE TARGET, BOTH DIRECTIONS ─────────────────────────────────────────
     //
     // This loop could only ever turn a microphone DOWN. Every path was
@@ -1532,8 +1585,16 @@ final class Audio {
     say(f.inputTrim > 3,
         "a microphone peaking at 0.06 is amplified \(String(format: "%.1f", f.inputTrim))x"
         + " (+\(String(format: "%.0f", 20 * log10(Double(f.inputTrim)))) dB)")
-    say(landed > 0.3 && landed < 0.8,
-        "which lands speech at \(String(format: "%.2f", landed)), the level a near talker gets")
+    // The ceiling bounds this, and the bound is a deliberate trade. A mic peaking
+    // at 0.06 is -24 dBFS; +12 dB reaches -12 dBFS, which is clearly audible but
+    // is NOT the -5 dBFS a near talker gets. 0.102.0 aimed for the full target
+    // with an 8x ceiling and overdrove a live call to 1.86 because it had no way
+    // back down. With the descent and the overload clamp in place 8x would be
+    // survivable again -- it is still not chosen, because +18 dB lifts the room's
+    // own noise by 18 dB along with the person.
+    say(landed > 0.2 && landed < 0.8,
+        "which lands speech at \(String(format: "%.2f", landed)) -- audible, and bounded"
+        + " by the \(Int(Audio.MAKEUP_MAX))x ceiling rather than reaching the full target")
     say(f.inputTrim <= Audio.MAKEUP_MAX + 0.01,
         "and it is bounded at \(Int(Audio.MAKEUP_MAX))x rather than chasing silence")
 
@@ -1563,6 +1624,45 @@ final class Audio {
     say(i.inputTrim < 1 && i.inputTrim < up,
         "leaning back in brings it down again (\(String(format: "%.1f", up))x ->"
         + " \(String(format: "%.2f", i.inputTrim))x)")
+    // ── 10. THE DEAD ZONE THAT SHIPPED, REPRODUCED ──────────────────────────
+    //
+    // Live call 35ik4lvka5qkb: trim pinned at 8.00x, post-trim peak 1.86. Neither
+    // guard could fire -- attenuation wanted raw > 0.92 (it was 0.233) and the
+    // climb wanted a target above the current trim (2.37 < 8.00). The loop had
+    // no descent at all, and this row is the exact state it got stuck in.
+    let j = Audio()
+    j.setFloorForTest(0.002)
+    j.forceTrimForTest(8.0)
+    // The level that trapped it: raw 0.233, output 8x that.
+    for _ in 0..<30 { j.rawPeakWin = 0.233; j.trimStep(deviceAtFloor: true, knob: 0.95, outPeak: 1.86) }
+    say(j.inputTrim < 3.0,
+        "a trim stuck at 8x over a 0.233 mic comes down to \(String(format: "%.2f", j.inputTrim))x")
+    let out = 0.233 * j.inputTrim
+    say(out < 0.95,
+        "and its output lands at \(String(format: "%.2f", out)) instead of clipping at 1.86")
+
+    // 11. AN OVERLOADED OUTPUT IS CUT WHATEVER THE RAW LEVEL SAYS. The safety
+    //     net, independent of the target maths above.
+    let k = Audio()
+    k.setFloorForTest(0.002)
+    k.forceTrimForTest(4.0)
+    k.rawPeakWin = 0.30
+    k.trimStep(deviceAtFloor: true, knob: 0.95, outPeak: 1.20)
+    say(k.inputTrim < 4.0,
+        "an output of 1.20 is backed off immediately (4.0x -> \(String(format: "%.2f", k.inputTrim))x)")
+
+    // 12. REJECT: and a healthy makeup is NOT dismantled. Without this the two
+    //     rows above are satisfied by a loop that simply refuses to amplify.
+    let l = Audio()
+    l.setFloorForTest(0.002)
+    for _ in 0..<20 { l.rawPeakWin = 0.10; l.trimStep(deviceAtFloor: true, knob: 0.95, outPeak: 0.10 * l.inputTrim) }
+    let lout = 0.10 * l.inputTrim
+    say(l.inputTrim > 2 && lout > 0.3 && lout < 0.95,
+        "REJECT: a genuinely quiet 0.10 mic is still lifted to \(String(format: "%.2f", lout))"
+        + " (\(String(format: "%.1f", l.inputTrim))x)")
+    say(l.inputTrim <= Audio.MAKEUP_MAX + 0.01,
+        "and the ceiling is \(Int(Audio.MAKEUP_MAX))x, not the 8x that overdrove a live call")
+
     fputs("GAIN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok
   }
@@ -2853,7 +2953,7 @@ final class Audio {
       // anybody, and when the detector is blind (`visualKnown` false: no face,
       // no camera, a dark room) it says nothing at all and the veto stands
       // exactly as it did in 0.99.0.
-      let mouthSays = Mouth.on && Mouth.visualKnown && Mouth.visualVoice
+      let mouthSays = Mouth.on && Mouth.influence && Mouth.visualKnown && Mouth.visualVoice
       let veto = Audio.corrVeto && !mouthSays && aboveEcho && aboveRoom
       if veto { vetoFrames += n }
       if Audio.corrVeto && mouthSays && aboveEcho && aboveRoom { unvetoFrames += n }

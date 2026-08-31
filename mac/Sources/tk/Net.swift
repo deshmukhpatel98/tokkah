@@ -1674,7 +1674,9 @@ final class Wire {
                                     voicing: peerVoicing)
           // Their camera's verdict, three-state. Level-triggered like the
           // voicing bit, plus its own edge flush at the sender.
-          Audio.sharedFloor.farSeenTalking = peerSeenTalking
+          // Consumed only when this end is acting on vision at all. The bit is
+          // still RECORDED either way, so a live call can say whether it crossed.
+          Audio.sharedFloor.farSeenTalking = Mouth.influence ? peerSeenTalking : nil
           // The prior belongs to THIS floor, computed on THEIR transcript.
           // Level-triggered: every TPKTY packet carries the standing value, so a
           // dropped crossing costs a second of staleness rather than a prior
