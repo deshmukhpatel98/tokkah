@@ -39,7 +39,74 @@ silences exactly one. Measured in `Floor.strictSelfTest` with the hop modeled:
 last window is counted on every live call as `strict_overlap_pct`.
 
 `--floor-soft` is the control arm and restores the 0.94.0 behaviour described
-below. The soft rules remain documented because they are the fallback arm and
+below.
+
+## Interrupting, and the 1150 ms nobody could see (0.99.0)
+
+Strict shipped with a hidden cost that a live call finally exposed: **50 whole
+utterances on one 333 s call never reached the wire at all.** Not late —
+deleted. Taking the floor from a holder needed 450 ms of sustained `.claim`,
+and `.claim` itself needs 700 ms of continuous voice before the classifier will
+say it. **1150 ms**, and in strict that wait is silence rather than a duck, so
+every interjection shorter than it — "yeah", "no", "wait", every "mm-hm" — was
+thrown away.
+
+Two constants fixed it, and they only work as a pair:
+
+- the contest runs on **any voice from its first block** (`nearVoiceMs`), at
+  **180 ms** instead of 450. Rig: the floor changes hands after 160 ms.
+- the **onset grace window** keeps that voice audible while the contest
+  resolves, bounded at 400 ms. A 300 ms interjection loses 0 ms.
+
+The grace window could not have shipped before 0.94.0. Opening a microphone on
+"any near voice" over a live loudspeaker means opening it on this machine's own
+echo — and the correlation veto is what finally tells those apart. A vetoed
+block classifies as `.quiet`, and `.quiet` is the one input the window refuses.
+
+## Seeing who is talking (0.100.0)
+
+Audio.swift states the root problem in writing: *at the instant of decision, an
+interruption and an echo are the same signal.* They are the same **acoustic**
+signal. A loudspeaker has no mouth.
+
+`Mouth.swift` watches the camera this app already runs — Apple's Vision
+framework, no dependency, ~2.9 ms of CPU per look at 12 Hz — and measures the
+**rate of change** of lip aperture, normalised by the face's own bounding box.
+Not "is the mouth open": a person sitting open-mouthed is not speaking and
+mouth shapes differ between faces. What separates speech from a face at rest is
+that the aperture keeps changing, 3–8 Hz.
+
+Three states, and the third is load-bearing:
+
+| | meaning |
+|---|---|
+| `moving` | a face is visible and its mouth is doing what speech does |
+| `still` | a face is visible and it is not |
+| `unknown` | no face, no camera, no frame, a failed request — **says nothing** |
+
+Measured on real talking-head footage: talking rate p50 **0.09** face-heights/s
+against the same face held still at p90 **0.02** — 4.4× apart. The threshold
+(0.03) was **read off that** and the first guess was wrong by 4×, which is the
+entire reason `--mouth-test` exists.
+
+It is allowed to do exactly two things, both of which can only open a
+microphone or speed up a handover:
+
+1. **Withdraw the echo veto.** The veto's own stated risk was gagging a real
+   voice quieter than the echo it sits under — acoustically unfixable. A
+   visible moving mouth overrules the correlation.
+2. **Shorten the contest** to `visualDeadlockMs` (80 ms), because two
+   independent signals need less of each. Rig: a camera-confirmed voice takes
+   the floor in **60 ms**.
+
+It can never mute anybody, and when it is blind everything reverts to 0.99.0
+exactly — asserted in `strictSelfTest` as a REJECT row, because
+`blind-instruments-report-negatives` would otherwise make every dark room and
+every camera-off call slower than it was. `--no-mouth` is the control arm.
+
+**Not yet done:** the signal is local only. Crossing it to the far end — so the
+holder's own release can be informed by seeing that somebody else has started
+talking — is a protocol change and a separate release. The soft rules remain documented because they are the fallback arm and
 the self-tests keep both honest.
 
 ## What is wrong with the gate we ship today

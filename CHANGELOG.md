@@ -5,6 +5,68 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.100.0 — 2026-08-31
+
+### Added — the app can see who is talking
+
+Every turn-taking bug in this project has one root, and Audio.swift has stated
+it in writing for months: *at the instant of decision, an interruption and an
+echo are the same signal.* They are the same **acoustic** signal. A loudspeaker
+has no mouth.
+
+`Mouth.swift` watches the camera the call already runs — Apple's Vision
+framework, so no dependency to vendor and no model to ship — and measures the
+**rate of change** of lip aperture, normalised by the face's own bounding box.
+Not "is the mouth open": a person sitting open-mouthed is not speaking, a
+person mid-consonant has it shut, and mouth shapes differ enormously between
+faces. What separates speech from a face at rest is that the aperture keeps
+changing, roughly a syllable at a time.
+
+Measured on real talking-head footage at 12 Hz: talking rate p50 **0.09**
+face-heights/s against the same face held still at p90 **0.02** — 4.4× apart,
+face found in 100% of frames, and 0% in a clip with no face in it. The
+threshold was read off that measurement, and **the first guess was wrong by
+4×** — it sat above the talking p90 and called a speaking face silent 100% of
+the time while passing every other arm in the rig. `--mouth-test` sweeps
+neighbouring thresholds on every run so the constant stays visible rather than
+becoming folklore.
+
+Three states, and the third is load-bearing: `moving`, `still`, and
+**`unknown`** — no face, no camera, no frame, a failed request. Only the first
+two influence anything, because `blind-instruments-report-negatives` would
+otherwise turn every dark room into "this person is not talking".
+
+The signal is allowed to do exactly two things, both of which can only open a
+microphone or speed up a handover:
+
+- **Withdraw the echo veto.** 0.94.0 shipped with a stated risk: a real voice
+  quieter than the echo it sits under gets gagged for an estimator tick, and no
+  acoustic threshold can fix it. A visible moving mouth overrules the
+  correlation — and only ever in that direction.
+- **Shorten the floor contest** from 180 ms to 80 ms, because two independent
+  signals need less of each. Rig: a camera-confirmed voice takes the floor in
+  **60 ms**, against 160 ms on audio alone and 1150 ms in 0.98.0.
+
+It can never mute anybody, and a blind detector reverts everything to 0.99.0
+exactly — asserted as a REJECT row in `strictSelfTest` ("blindness costs
+nothing", 160 ms unchanged), alongside a row proving a blind camera cannot take
+the floor from whoever holds it. `--no-mouth` is the control arm.
+
+Cost: ~2.9 ms of CPU per look — an upper bound, since the measuring rig also
+decoded the video — or about 0.035 CPU-s/s at 12 Hz against a 720p call's 0.16.
+Frames that arrive while the last is still being looked at are dropped and
+counted, never queued: a queued verdict describes a face that has already
+stopped talking.
+
+Every beat now carries `mouth_looks` / `mouth_faces` (which separate "never
+ran" from "ran and saw nobody" from "saw somebody sitting quietly"),
+`mouth_moving_pct`, `mouth_dropped`, `mouth_unveto_pct` and
+`turn_visual_takes`, and the telemetry summary gains a `CAMERA` line.
+
+**Not yet crossed to the far end.** The holder's own decision to release early
+would benefit from seeing that somebody else has started talking; that is a
+protocol change and a separate release.
+
 ## Kin 0.99.0 — 2026-08-31
 
 ### Fixed — interrupting took 1150 ms, so short interjections were deleted

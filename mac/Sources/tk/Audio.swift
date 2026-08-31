@@ -1048,6 +1048,9 @@ final class Audio {
       fl.notePlayout(live: rms > Audio.PLAYOUT_LIVE_RMS)
     }
     fl.noteEndProb(Audio.turnEndProb)
+    // The visual prior, as a scalar across the thread boundary like every other
+    // input this class hands the floor.
+    fl.nearVisualVoice = Mouth.on && Mouth.visualKnown && Mouth.visualVoice
     let d = fl.step(dt: Double(blockN) / SR,
                     near: Floor.Voice(rawValue: mine.rawValue) ?? .quiet)
     // Applied to the NEXT block, one block late by construction -- 0.67 ms on
@@ -2555,6 +2558,10 @@ final class Audio {
     /// said it was this machine's own speaker. The number that separates "the
     /// veto never fired" from "it fired and did not help" on a live call.
     private(set) var vetoFrames = 0
+    /// Samples the visual signal rescued from the echo veto -- a real voice the
+    /// correlation had mistaken for this machine's own loudspeaker. The number
+    /// that says whether the camera is earning its CPU.
+    private(set) var unvetoFrames = 0
     /// Whether the current vocalisation started life as a listening noise. A bid
     /// that escalated from one is a different event from a bid that began as
     /// one, and only the first says the classifier hesitated.
@@ -2714,8 +2721,26 @@ final class Audio {
       // untouched -- the near voice contract holds) but it is never a voice:
       // no cue crosses the wire, no claim takes the floor, and the floor mutes
       // instead of ducking. Counted, so a call can say how often it decided.
-      let veto = Audio.corrVeto && aboveEcho && aboveRoom
+      // ── AND THE MOUTH OUTRANKS THE CORRELATION ────────────────────────────
+      //
+      // The veto's own stated risk (0.94.0): "the worst wrong-mute is one
+      // estimator tick, ~500 ms, on a voice quieter than the echo it is
+      // under". That risk is real and it is acoustically unfixable -- a mic
+      // carrying both a person and a loud echo of the far end correlates with
+      // the far end, and no threshold separates them.
+      //
+      // A camera does. If a face is visible and its mouth is doing what speech
+      // does, the sound reaching this microphone is not only the loudspeaker,
+      // whatever the correlation says. So the visual signal is allowed to
+      // withdraw the veto -- and ONLY to withdraw it. It can open a microphone
+      // that would have been gagged; it can never close one, never mute
+      // anybody, and when the detector is blind (`visualKnown` false: no face,
+      // no camera, a dark room) it says nothing at all and the veto stands
+      // exactly as it did in 0.99.0.
+      let mouthSays = Mouth.on && Mouth.visualKnown && Mouth.visualVoice
+      let veto = Audio.corrVeto && !mouthSays && aboveEcho && aboveRoom
       if veto { vetoFrames += n }
+      if Audio.corrVeto && mouthSays && aboveEcho && aboveRoom { unvetoFrames += n }
       let voiced = aboveEcho && aboveRoom && !veto
       if voiced { run += 1 } else { run = 0 }
       let confirmed = run >= needed

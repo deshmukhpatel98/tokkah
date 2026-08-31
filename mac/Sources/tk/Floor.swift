@@ -210,6 +210,11 @@ final class Floor {
     /// it is counted (`strict_overlap_pct`).
     var strictDeadlockMs: Double = 180
     var onsetGraceMs: Double = 400
+    /// The contest when a camera has confirmed the voice -- see
+    /// `nearVisualVoice`. 80 ms is two 40 ms syllable-scale samples of visual
+    /// motion plus audio energy in the same window; below that the two signals
+    /// are not independent of each other's jitter.
+    var visualDeadlockMs: Double = 80
     /// ── THE CONTROL ARM FOR "ANY VOICE TAKES AN EMPTY FLOOR" ────────────────
     ///
     /// False restores the pre-0.98.0 rule, where a vocalisation still in its
@@ -325,6 +330,16 @@ final class Floor {
   /// call is fully duplex in the ear. Applying a route's property to a route
   /// that does not have it is `directional-property-measured-at-wrong-end`.
   var speakers = true
+  /// ── A CAMERA SAYS THIS PERSON IS TALKING (0.100.0) ──────────────────────────
+  ///
+  /// Fed from `Mouth`, and true only when a face is actually visible and its
+  /// mouth is moving the way speech moves it. False covers both "sitting
+  /// quietly" and "cannot see", which is safe HERE and only here, because the
+  /// single thing this is allowed to do is shorten the contest -- so its
+  /// absence restores 0.99.0 exactly rather than closing anything.
+  var nearVisualVoice = false
+  /// Floors won early because a camera confirmed the voice.
+  private(set) var visualTakes = 0
 
   struct Decision {
     /// Whether this end's captured audio goes on the wire. NOT whether the
@@ -580,7 +595,20 @@ final class Floor {
     // and then take another 450 -- see `strictDeadlockMs`. On the voice clock
     // instead, and shorter, because in strict the waiting is not a duck, it is
     // deletion. Soft keeps the old pair exactly.
-    let contestMs = cfg.strict ? cfg.strictDeadlockMs : cfg.deadlockMs
+    // ── AND THE CONTEST IS SHORTER WHEN A CAMERA AGREES ─────────────────────
+    //
+    // 180 ms of audio is how long it takes to be reasonably sure a sound is a
+    // person rather than a cough, a keystroke or an echo. A visible mouth
+    // moving in time with it is independent evidence of the same thing, and two
+    // independent signals need less of each. So a confirmed voice takes the
+    // floor in `visualDeadlockMs`.
+    //
+    // Only ever SHORTER, never longer, and only when a face is genuinely
+    // visible: a blind detector leaves this at 180 ms, which is 0.99.0.
+    let visualNow = cfg.strict && nearVisualVoice
+    let contestMs = cfg.strict
+      ? (visualNow ? min(cfg.visualDeadlockMs, cfg.strictDeadlockMs) : cfg.strictDeadlockMs)
+      : cfg.deadlockMs
     let nearInsists = cfg.strict ? nearVoiceMs >= contestMs : nearClaimMs >= contestMs
     let farInsists = cfg.strict ? farVoiceMs >= contestMs : farClaimMs >= contestMs
     let wasTheirs = state == .theirs
@@ -591,7 +619,10 @@ final class Floor {
     } else if state == .mine, farInsists {
       if !nearInsists || yieldsOnTie { state = .theirs }
     }
-    if cfg.strict, wasTheirs, state == .mine { fastTakes += 1 }
+    if cfg.strict, wasTheirs, state == .mine {
+      fastTakes += 1
+      if visualNow { visualTakes += 1 }
+    }
 
     // ── AND THE CEILING, WHICH NO BELIEF SURVIVES ────────────────────────────
     //
@@ -1347,6 +1378,51 @@ extension Floor {
         "the far predictor fired \(s13.farPredictedReleases)x over 50 dip-rise cycles, not once per block")
     say(s13.farPredictedSavedMs <= 50 * 450,
         "and its claimed saving stays inside one release per cycle (\(Int(s13.farPredictedSavedMs)) ms)")
+
+    // ── 14. THE CAMERA MAY ONLY EVER HELP ───────────────────────────────────
+    //
+    // Three rows, and the third is the one that matters most: a detector that
+    // cannot see must leave the floor behaving exactly as it did without one.
+    // `blind-instruments-report-negatives` -- if blindness read as "not
+    // talking" anywhere in this path, every dark room and every camera-off
+    // call would get slower turn-taking than 0.99.0 had.
+    let v1 = heldByThemStrict()
+    v1.nearVisualVoice = true
+    var vTook = 0.0
+    var dv1 = v1.step(dt: 0.02, near: .backchannel)
+    while vTook < 1000, dv1.state != .mine {
+      vTook += 20
+      v1.noteFar(.claim)
+      dv1 = v1.step(dt: 0.02, near: .backchannel)
+    }
+    say(dv1.state == .mine && vTook <= 120,
+        "a camera-confirmed voice takes the floor in \(Int(vTook)) ms")
+    say(v1.visualTakes == 1, "and it is counted as a visual take")
+
+    let v2 = heldByThemStrict()
+    v2.nearVisualVoice = false            // blind, or sitting quietly
+    var bTook = 0.0
+    var dv2 = v2.step(dt: 0.02, near: .backchannel)
+    while bTook < 1000, dv2.state != .mine {
+      bTook += 20
+      v2.noteFar(.claim)
+      dv2 = v2.step(dt: 0.02, near: .backchannel)
+    }
+    say(dv2.state == .mine && bTook >= 140,
+        "REJECT: with no camera the contest is unchanged at \(Int(bTook)) ms -- blindness costs nothing")
+    say(v2.visualTakes == 0, "and nothing is booked to the camera that it did not do")
+
+    // And it cannot mute: a camera that says nothing while this end holds the
+    // floor must not take it away.
+    let v3 = Floor()
+    v3.cfg.strict = true
+    v3.noteFar(.quiet)
+    _ = v3.step(dt: 0.02, near: .quiet)
+    _ = v3.step(dt: 0.02, near: .claim)          // I take the floor
+    v3.nearVisualVoice = false                   // and the camera sees nothing
+    let dv3 = v3.step(dt: 0.02, near: .claim)
+    say(dv3.state == .mine && dv3.mayTransmit,
+        "a blind camera never takes the floor from the person holding it")
 
     fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok

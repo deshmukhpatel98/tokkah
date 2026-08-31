@@ -439,6 +439,8 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft",
+  "no-mouth", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
+  "mouth-threshold",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
@@ -475,7 +477,7 @@ let KNOWN_FLAGS: Set<String> = [
 // Not moved -- this file is top-level code and I have been caught by its
 // ordering twice today. The side effects are skipped instead, which is the part
 // that can actually hurt somebody.
-let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
+let TEST_FLAGS = ["gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
                   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
@@ -1612,6 +1614,7 @@ var earlyCam: FrameSource?
 /// drift into showing different pictures or different camera lists.
 func attachCamera(_ cam: CameraSource) {
   cam.onFrame = { pb, _ in
+    Mouth.shared.note(pb)
     // Self-view. Replaced the moment a decoded frame from the far end arrives:
     // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
     // set so the two are never fighting over the same surface.
@@ -3972,6 +3975,10 @@ func applyGateFlags() {
   // The control arm for the correlation veto (0.94.0): the classifier goes back
   // to trusting the level test alone, which is the 0.93.0 behaviour.
   if flag("no-corrveto") { Audio.corrVetoOn = false }
+  // The control arm for the visual signal (0.100.0). Audio decides alone, which
+  // is exactly 0.99.0.
+  if flag("no-mouth") { Mouth.on = false }
+  if let th = Double(arg("mouth-threshold") ?? "") { Mouth.moveThreshold = th }
   // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
   // -20 dB out-of-turn duck, the open idle, the open fallback.
   if flag("floor-soft") { Audio.sharedFloor.cfg.strict = false }
@@ -4212,6 +4219,14 @@ if flag("floor-test") {
   let far = Floor.predictFarSelfTest()
   let strict = Floor.strictSelfTest(owdMs: owd)
   exit(soft && far && strict ? 0 : 1)
+}
+
+if flag("mouth-test") {
+  if let th = Double(arg("mouth-threshold") ?? "") { Mouth.moveThreshold = th }
+  let media = arg("mouth-media") ?? "../testbed/media/real"
+  exit(Mouth.selfTest(talking: arg("mouth-talking") ?? "\(media)/talkingheadA.mov",
+                      stillPath: arg("mouth-still") ?? "\(media)/mouth-still.mov",
+                      blind: arg("mouth-blind") ?? "\(media)/mouth-blind.mov") ? 0 : 1)
 }
 
 if flag("gate-test") {
@@ -4902,6 +4917,12 @@ if videoArg != "off", !ringPreview {
         return
       }
       e.encode(pb, hostTime: host)
+      // ── AND THE MOUTH LOOKS AT IT ─────────────────────────────────────────
+      //
+      // After the encoder, so the picture on the wire is never behind a face
+      // detector, and `note` returns immediately in every case: it samples at
+      // 12 Hz and drops rather than queues. See Mouth.swift.
+      Mouth.shared.note(pb)
       // Same single owner as the early-camera path above.
       display?.showSelf(pb)
       if !sawRemote && !peerHere { mdisplay?.show(pb, at: Clock.now()) }
@@ -6035,6 +6056,25 @@ func audioBeat(uptime: Double, up: Double, down: Double,
       ? Double(Audio.sharedFloor.graceBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     "turn_grace_onsets": Audio.sharedFloor.graceOnsets,
     "turn_fast_takes": Audio.sharedFloor.fastTakes,
+    // ── THE CAMERA'S SIDE OF TURN-TAKING (0.100.0) ────────────────────────────
+    //
+    // `looks` vs `faces` is the honesty pair: a detector that ran and never
+    // found a face is a different thing from one that never ran, and both are
+    // different from one watching somebody sit in silence. `dropped` is frames
+    // that arrived while the last was still being looked at -- if it climbs,
+    // 12 Hz is too fast for this machine.
+    "mouth_looks": Mouth.shared.report.looks,
+    "mouth_faces": Mouth.shared.report.faces,
+    "mouth_dropped": Mouth.shared.report.dropped,
+    "mouth_moving_pct": (Mouth.shared.report.moving + Mouth.shared.report.still) > 0
+      ? Double(Mouth.shared.report.moving) * 100
+        / Double(Mouth.shared.report.moving + Mouth.shared.report.still) : -1,
+    "mouth_rate": Mouth.shared.rateNow,
+    // What the camera actually bought: voices rescued from the echo veto, and
+    // floors won early because it confirmed them.
+    "mouth_unveto_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.unvetoFrames) * 100.0 / Double(audio.micSamples) : 0,
+    "turn_visual_takes": Audio.sharedFloor.visualTakes,
     "strict_overlap_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.strictOverlapBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────

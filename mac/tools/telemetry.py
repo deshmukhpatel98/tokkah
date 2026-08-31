@@ -88,6 +88,20 @@ def call_summary(bs, label=""):
         print(f"  INTERJECT rescued {last(bs,'turn_grace_onsets'):.0f}"
               f"  ·  audible-over-holder {gcp:.1f}% of the call"
               f"  ·  fast floor takes {last(bs,'turn_fast_takes'):.0f}")
+    # The camera's turn-taking signal (0.100.0). `looks`/`faces` separate "never
+    # ran" from "ran and saw nobody" from "saw somebody sitting quietly".
+    lk = last(bs, "mouth_looks", -1)
+    if lk > 0:
+        fc = last(bs, "mouth_faces", 0)
+        mv = last(bs, "mouth_moving_pct", -1)
+        seen = f"face in {fc * 100 / lk:.0f}% of {lk:.0f} looks"
+        mvs = f"mouth moving {mv:.0f}%" if mv >= 0 else "no verdict yet"
+        print(f"  CAMERA    {seen}  ·  {mvs}"
+              f"  ·  rescued from echo-veto {last(bs,'mouth_unveto_pct'):.1f}% of samples"
+              f"  ·  visual floor takes {last(bs,'turn_visual_takes'):.0f}"
+              f"  ·  dropped {last(bs,'mouth_dropped'):.0f}")
+    elif lk == 0:
+        print("  CAMERA    the detector never ran (no camera frames)")
     # corr-veto: how much of the call the classifier refused to call the
     # machine's own speaker a voice (0.94.0). -1 means an older build.
     cv = last(bs, "a_corr_veto_pct", -1)
