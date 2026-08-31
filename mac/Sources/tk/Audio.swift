@@ -2665,6 +2665,9 @@ final class Audio {
   /// subtitle thread. Zero until the predictor is fed, and zero is the value
   /// that changes nothing.
   nonisolated(unsafe) static var turnEndProb: Double = 0
+  /// The far end's prior, from TPKTX+7. Written by the receive thread. Zero
+  /// against an older build, which is the value that changes nothing.
+  nonisolated(unsafe) static var peerTurnEndProb: Double = 0
   /// The ear's close, per sample, from the same 4 ms the microphone side uses.
   /// Derived from `Gate.closeMs` rather than typed, so the two cannot drift.
   static let EAR_STEP = Float(1.0 / (SR * 4.0 / 1000.0))

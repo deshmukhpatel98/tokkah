@@ -37,7 +37,19 @@ def call_summary(bs, label=""):
           f"  ·  local gate open {last(bs,'floor_held_pct'):.0f}%")
     trim, rail = last(bs, "mic_trim", 1), last(bs, "mic_gain_rail", 0)
     pr, ps = last(bs, "predict_releases", -1), last(bs, "predict_saved_ms", 0)
-    early = f"handed over early {pr:.0f}x saving {ps:.0f} ms" if pr >= 0 else "predictor: not in this build"
+    fr, fs = last(bs, "predict_far_releases", -1), last(bs, "predict_far_saved_ms", 0)
+    # The PEAK of what they sent, not the last value -- a call whose prior
+    # reached 0.8 and ended at 0.0 would otherwise look like the byte never moved.
+    ppeak = series(bs, "predict_peer_p_peak")
+    pnow = series(bs, "predict_peer_p_now")
+    theirp = max(ppeak) if ppeak else (max(pnow) if pnow else -1)
+    if pr >= 0:
+        early = f"handed over early {pr:.0f}x saving {ps:.0f} ms"
+        if fr >= 0:
+            early += f" (far {fr:.0f}x / {fs:.0f} ms"
+            early += f", their p peaked {theirp:.2f})" if theirp >= 0 else ", their p: not in this build)"
+    else:
+        early = "predictor: not in this build"
     print(f"  TURNS     both talking {last(bs,'turn_collisions'):.0f}"
           f"  ·  choppy {last(bs,'turn_flaps'):.0f}"
           f"  ·  gave way {last(bs,'turn_yields'):.0f}"

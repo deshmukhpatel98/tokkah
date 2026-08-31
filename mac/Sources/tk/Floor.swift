@@ -33,13 +33,11 @@ import Foundation
 // See `held-is-a-one-way-door` and `idle-signaling-socket-dies`: a recovery gate
 // whose evidence stream can stop must survive its evidence stream stopping.
 //
-// ── NOT YET IN THE CALL PATH ─────────────────────────────────────────────────
+// ── IN THE CALL PATH ─────────────────────────────────────────────────────────
 //
-// Nothing constructs this outside `Floor.selfTest`. It is proven before it is
-// wired, deliberately -- but an unwired thing is not a shipped thing, and
-// `feature-behind-a-flag-nobody-runs` is what happens when that is forgotten.
-// The wiring is: Audio's block loop calls `step`, the cue path feeds `noteFar`,
-// and `Predict.probability` feeds `noteEndProb`.
+// Audio's block loop calls `step`, the cue path feeds `noteFar`,
+// `Predict.probability` feeds `noteEndProb`, and the far end's prior arrives
+// next to the vocal byte as `noteFarEndProb`.
 final class Floor {
 
   enum State: Int {
@@ -125,9 +123,18 @@ final class Floor {
   /// Milliseconds of loudspeaker tail still to run. See `notePlayout`.
   private(set) var playoutTail: Double = 0
   /// Turns this end let go of early because its own sentence was ending, and the
-  /// milliseconds of the 450 ms silence rule that saved.
+  /// milliseconds of the 450 ms silence rule that saved. `predictedReleases` is
+  /// both halves; `farPredictedReleases` is only the half that arrived on the
+  /// wire -- a total that cannot name which side fired is how 0.92.0 would have
+  /// hidden a protocol that never landed.
   private(set) var predictedReleases = 0
   private(set) var predictedSavedMs: Double = 0
+  private(set) var farPredictedReleases = 0
+  private(set) var farPredictedSavedMs: Double = 0
+  /// Peak of the far end's prior over the call. Zero against an older build, and
+  /// zero on a 0.93 call where they talked is the protocol not arriving -- those
+  /// two look the same if you only count releases.
+  private(set) var farEndProbPeak: Double = 0
   /// Blocks the idle echo guard muted, and blocks where it COULD have (idle, on
   /// speakers). The second is the denominator: a count with nothing to divide by
   /// says nothing about a call's length.
@@ -145,6 +152,16 @@ final class Floor {
   /// Consecutive time this end has been talking while not allowed to transmit.
   private var heldDownMs: Double = 0
   private var endProb: Double = 0
+  /// Their prior, last heard. Written by the receive thread, read here.
+  private var farEndProb: Double = 0
+  /// p has been below the threshold during the current hold. A leftover 0.9
+  /// from the previous sentence must not release the first word of this one.
+  private var farPredArmed = false
+  /// We pre-released THEIR hold because they said it was ending. They must not
+  /// take it back on the same claim that was wrapping up -- without this, the
+  /// next line of `step` would see `farVoice == .claim` and undo the release
+  /// in the same block.
+  private var farWrapping = false
   /// Milliseconds left on the ear-open hold after the floor arrived at me.
   private var playoutHold: Double = 0
   /// Last block's state, so the hold can be armed on the EDGE into `.mine`
@@ -254,10 +271,32 @@ final class Floor {
     } else {
       holderQuietMs = holderVoice == .quiet ? holderQuietMs + ms : 0
     }
+    // A p below threshold while they hold means a later rise is this sentence
+    // wrapping up, not a leftover from the last one. Armed once per hold.
+    if state == .theirs, farEndProb < cfg.predictP { farPredArmed = true }
+
     if state != .idle {
       // A prediction cannot take the floor from anybody. It can only let go of
-      // it early, at a pause, on behalf of the person who already has it.
-      let predictedEnd = state == .mine && endProb >= cfg.predictP && holderQuietMs > 0
+      // it early, on behalf of the person who already has it.
+      let localPred = state == .mine && endProb >= cfg.predictP && holderQuietMs > 0
+      // ── THE FAR HALF ─────────────────────────────────────────────────────
+      //
+      // 0.92.0 wired the local half: my transcript releases MY turn early, at a
+      // pause. The bigger win is the other way -- they tell us THEIR turn is
+      // ending, so this microphone is already open before their last word
+      // lands. Two ways, both only ever PRE-RELEASE:
+      //
+      //   a pause, same as local: skip the remaining 450 ms
+      //   they are still claiming, but p rose during this hold: release now
+      //
+      // A leftover high p at the START of their turn does not fire, because
+      // farPredArmed is false until p has been below the threshold on this hold.
+      // That is the case `predictFarSelfTest` requires to FAIL when the arming
+      // is removed -- a stale 0.9 would otherwise steal the first word of every
+      // sentence.
+      let farPause = state == .theirs && farEndProb >= cfg.predictP && holderQuietMs > 0
+      let farEarly = state == .theirs && farPredArmed && farEndProb >= cfg.predictP
+      let predictedEnd = localPred || farPause || farEarly
       if holderQuietMs >= cfg.releaseMs || predictedEnd {
         // Counted, because "the predictor is wired" and "the predictor fires"
         // are two claims and only the second one is worth anything. This is the
@@ -265,19 +304,29 @@ final class Floor {
         if predictedEnd {
           predictedReleases += 1
           predictedSavedMs += max(0, cfg.releaseMs - holderQuietMs)
+          if state == .theirs {
+            farPredictedReleases += 1
+            farPredictedSavedMs += max(0, cfg.releaseMs - holderQuietMs)
+            farWrapping = true
+          }
         }
         state = .idle; holderQuietMs = 0
       }
     }
+
+    if state != .theirs { farPredArmed = false }
+    if farVoice == .quiet || farEndProb < cfg.predictP { farWrapping = false }
 
     // ── TAKING IT ────────────────────────────────────────────────────────────
     //
     // From `idle`, either end takes it on voice. A backchannel does not: a
     // listening noise is produced without intent to take a turn, and granting
     // the floor to one would end the other person's sentence for saying "mm-hm".
+    // `farWrapping`: they told us this claim is ending, so it must not take the
+    // floor back in the same block the release ran.
     if state == .idle, near != .quiet, near != .backchannel {
       state = .mine
-    } else if state == .idle, farVoice == .claim {
+    } else if state == .idle, farVoice == .claim, !farWrapping {
       state = .theirs
     }
 
@@ -398,6 +447,13 @@ final class Floor {
   }
   /// `Predict.probability`, 0-1, that this end's current turn is ending.
   func noteEndProb(_ p: Double) { endProb = p }
+  /// The FAR end's prior, 0-1, from the byte beside the vocal status. Zero is
+  /// what an older build sends (the pad), and zero is the value that changes
+  /// nothing -- so a mixed-version call behaves as 0.92.0.
+  func noteFarEndProb(_ p: Double) {
+    farEndProb = p
+    if p > farEndProbPeak { farEndProbPeak = p }
+  }
 
   /// ── IS THIS MACHINE'S LOUDSPEAKER LIVE RIGHT NOW? ─────────────────────────
   ///
@@ -530,6 +586,146 @@ extension Floor {
     let df = f.step(dt: 2.0, near: .quiet)      // 2 s with no cue at all
     say(df.fallback && df.mayTransmit, "a stale far end still falls back to open, not shut")
     fputs("FLOOR ECHO CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
+    return ok
+  }
+
+  /// ── THE FAR-END PRIOR, ON ANSWERS ALREADY KNOWN ───────────────────────────
+  ///
+  /// 0.92.0 wired the local half. This is the other half: their number arrives
+  /// beside the vocal byte, and this microphone is open before they finish.
+  /// Every row that asserts a win has a twin that must FAIL when the prior is
+  /// left at 0 -- otherwise a test that cannot see the protocol reports PASS
+  /// on a build where the byte never moved.
+  static func predictFarSelfTest() -> Bool {
+    var ok = true
+    func say(_ good: Bool, _ what: String) {
+      if !good { ok = false }
+      fputs("floor: \(good ? "OK  " : "FAIL") \(what)\n", stderr)
+    }
+    func heldByThem() -> Floor {
+      let f = Floor()
+      f.speakers = true
+      f.noteFar(.quiet)
+      _ = f.step(dt: 0.02, near: .quiet)
+      f.noteFar(.claim)
+      _ = f.step(dt: 0.02, near: .quiet)
+      return f
+    }
+
+    // CONTROL: they hold, no prior, I start talking. I am held. Without this
+    // row the tests below would pass on a floor that never mutes anyone.
+    let ctrl = heldByThem()
+    var blocked = 0.0
+    for _ in 0..<30 {
+      if !ctrl.step(dt: 0.02, near: .claim).mayTransmit { blocked += 20 }
+    }
+    say(blocked > 300,
+        "CONTROL: with no prediction, barging in is held (\(Int(blocked)) ms)")
+
+    // 1. They hold, p goes 0.3 then 0.9 while they still claim. Floor goes idle.
+    let a = heldByThem()
+    a.noteFarEndProb(0.3)
+    _ = a.step(dt: 0.02, near: .quiet)          // arm
+    a.noteFarEndProb(0.9)
+    let da = a.step(dt: 0.02, near: .quiet)
+    say(da.state == .idle,
+        "far-end prior at 0.9 releases their hold while they still claim")
+    say(a.farPredictedReleases == 1,
+        "and it is counted as a far release, not only a local one")
+
+    // 2. This microphone transmits on the first block of my voice.
+    let db = a.step(dt: 0.02, near: .claim)
+    say(db.state == .mine && db.mayTransmit,
+        "so this microphone transmits on the first block")
+
+    // 3. REJECT: the same barge-in with p=0 is still held.
+    let c = heldByThem()
+    c.noteFarEndProb(0)
+    _ = c.step(dt: 0.02, near: .quiet)
+    c.noteFarEndProb(0)
+    _ = c.step(dt: 0.02, near: .quiet)
+    let dc = c.step(dt: 0.02, near: .claim)
+    say(dc.state == .theirs && !dc.mayTransmit,
+        "REJECT: the same barge-in with p=0 is still held — otherwise this proves nothing")
+
+    // 4. A leftover 0.9 at the START of their turn does not release.
+    let d = Floor()
+    d.speakers = true
+    d.noteFar(.quiet)
+    _ = d.step(dt: 0.02, near: .quiet)
+    d.noteFarEndProb(0.9)
+    d.noteFar(.claim)
+    let dd = d.step(dt: 0.02, near: .quiet)
+    say(dd.state == .theirs,
+        "a leftover 0.9 at the START of their turn does not release")
+
+    // 5. High p plus their pause skips the 450 ms wait.
+    let e = heldByThem()
+    e.noteFarEndProb(0.3)
+    _ = e.step(dt: 0.02, near: .quiet)
+    e.noteFarEndProb(0.9)
+    e.noteFar(.quiet, transitMs: 40)
+    let de = e.step(dt: 0.02, near: .quiet)
+    say(de.state == .idle,
+        "high p plus their pause releases without waiting 450 ms")
+    let f = heldByThem()
+    f.noteFar(.quiet, transitMs: 40)
+    let df = f.step(dt: 0.02, near: .quiet)
+    say(df.state == .theirs,
+        "REJECT: a pause with p=0 still waits")
+
+    // 6. After a far-end release the idle echo guard still shuts the mic.
+    let g = heldByThem()
+    g.noteFarEndProb(0.3)
+    _ = g.step(dt: 0.02, near: .quiet)
+    g.noteFarEndProb(0.9)
+    _ = g.step(dt: 0.02, near: .quiet)
+    g.notePlayout(live: true)
+    let dg = g.step(dt: 0.02, near: .quiet)
+    say(dg.state == .idle && !dg.mayTransmit,
+        "after a far-end release the idle echo guard still shuts the mic next to a live speaker")
+
+    // 7. A high LOCAL prior does not mute the person who has the floor.
+    let h = Floor()
+    h.speakers = true
+    h.noteFar(.quiet)
+    _ = h.step(dt: 0.02, near: .quiet)
+    _ = h.step(dt: 0.02, near: .claim)
+    h.noteEndProb(0.9)
+    let dh = h.step(dt: 0.02, near: .claim)
+    say(dh.state == .mine && dh.mayTransmit,
+        "a high local prior does not mute the person who has the floor")
+
+    // 8. If the prior falls they take the floor back (false-alarm recovery).
+    let i = heldByThem()
+    i.noteFarEndProb(0.3)
+    _ = i.step(dt: 0.02, near: .quiet)
+    i.noteFarEndProb(0.9)
+    _ = i.step(dt: 0.02, near: .quiet)
+    i.noteFarEndProb(0.2)
+    i.noteFar(.claim)
+    let di = i.step(dt: 0.02, near: .quiet)
+    say(di.state == .theirs, "if the prior falls they take the floor back")
+
+    // 9. An older build (p=0 forever) still releases after ~450 ms of quiet.
+    let j = heldByThem()
+    j.noteFar(.quiet, transitMs: 10)
+    var waited = 0.0
+    var last = j.step(dt: 0.02, near: .quiet)
+    while waited < 1.0, last.state == .theirs {
+      waited += 0.02
+      last = j.step(dt: 0.02, near: .quiet)
+    }
+    say(waited > 0.35 && waited < 0.55,
+        "an older build (p=0) still releases after ~450 ms (\(Int(waited * 1000)) ms)")
+
+    // 10. The wire byte. 0.7 is the threshold; 0 is what 0.92.0 writes.
+    let back = Wire.endProb(from: Wire.endProbByte(0.7))
+    say(abs(back - 0.7) < 0.01, "0.7 survives the wire byte (got \(String(format: "%.3f", back)))")
+    say(Wire.endProbByte(0) == 0 && Wire.endProb(from: 0) == 0,
+        "an older build's pad byte reads as no prediction")
+
+    fputs("FLOOR FAR-PREDICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok
   }
 

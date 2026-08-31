@@ -57,9 +57,13 @@ the interesting case: somebody starting while somebody else is still going.
 1. **Release** — holder has been silent past a real end-of-turn pause (> 450 ms,
    the existing `quietMs` rule) → `IDLE`. Costs nothing, needs no agreement.
 
-2. **Predicted handover** — `Predict.swift` says this turn is ending (it is
-   built, tested, and wired to nothing today). At p > threshold *and* in a
-   pause, the floor is **pre-released** to `IDLE` before the last word lands.
+2. **Predicted handover** — `Predict.swift` says this turn is ending. At p >
+   threshold, the floor is **pre-released** to `IDLE` before the last word
+   lands. Two halves:
+   - **Local** (0.92.0): my transcript, my pause, I let go of a floor I hold.
+   - **Far** (0.93.0): the same number rides TPKTX+7 beside the vocal byte, so
+     the listener's microphone is already open before the speaker finishes.
+     A leftover high p at the start of a new turn does not fire.
    The next speaker's first syllable then costs zero, because the decision was
    already made when they opened their mouth. This is the entire reason
    `Predict` exists and is the single largest win available here.

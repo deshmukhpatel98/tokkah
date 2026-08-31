@@ -5,6 +5,33 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.93.0 — 2026-08-31
+
+### Added — the far end's turn-end number now crosses the wire
+
+0.92.0 wired the local half: my transcript can release *my* turn early, at a
+pause, instead of waiting the full 450 ms of silence. The bigger win is the
+other way — knowing *their* turn is ending, so this microphone is already open
+before they finish. That number lived only on the speaker's machine. Subtitles
+cannot carry it: they only cross when the sender cannot be heard, which is
+exactly not the case while they hold the floor.
+
+It now rides the pad byte beside the vocal status (TPKTX+7), on every probe,
+and an extra probe fires the moment it crosses the threshold — a prior that
+only travelled once a second would arrive later than the wait it exists to
+skip. An older build writes 0 there and never reads it, which is the value
+that changes nothing, so a mixed-version call behaves as 0.92.0.
+
+A leftover high number at the *start* of their next sentence does not release
+the floor. The idle echo guard still shuts a microphone sitting next to a live
+loudspeaker after the floor has let go. Both are cases the test is required to
+fail when the fix is disabled.
+
+On a live call: `predict_far_releases` / `predict_far_saved_ms` is the far
+half, `predict_peer_p_peak` is whether their number arrived at all. Zero peak
+on a 0.93 call where they talked is the protocol not landing; zero far-releases
+with a high peak is the floor not consuming it. Those used to look the same.
+
 ## Kin 0.92.0 — 2026-08-31
 
 ### Fixed — the turn-end predictor was read by the floor and assigned nowhere

@@ -67,8 +67,8 @@ let TPKTX = TPKT + 8              // + rxLost, rxRecovered (cumulative, UInt32)
 //   +0  played   UInt32   packets rendered, cumulative
 //   +4  muted    UInt8    1 if their microphone is muted
 //   +5  qLevel   UInt8    their video quality rung
-//   +6  status   UInt8    0 running, 1 held/paused
-//   +7  pad      UInt8
+//   +6  status   UInt8    vocal bits (claim / backchannel / cam / pause / ringing)
+//   +7  endProb  UInt8    turn-end prior, 0-255. 0 is what 0.92.0 writes.
 let TPKTY = TPKTX + 8
 
 final class TimeSync {

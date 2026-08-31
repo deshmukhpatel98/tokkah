@@ -923,6 +923,14 @@ final class Wire {
   // because "the status byte" reads like the complete list of what one end tells
   // the other, and it is not.
 
+  /// The turn-end prior, 0-1, packed into TPKTX+7 (the byte that used to be pad).
+  /// An older build writes 0 and never reads it, which is the value that changes
+  /// nothing at this end -- so a mixed-version call behaves as 0.92.0.
+  static func endProbByte(_ p: Double) -> UInt8 {
+    UInt8(clamping: Int((min(1, max(0, p)) * 255.0).rounded()))
+  }
+  static func endProb(from b: UInt8) -> Double { Double(b) / 255.0 }
+
   var selfStatus = 0
   /// What the far end's status byte says. Both are false against a build that
   /// predates the byte, which is correct: it never pauses and never reports.
@@ -963,6 +971,7 @@ final class Wire {
   // nothing next to a 3 Mbps call. It also buys a free clock sample.
   private var lastVocalOut = -1
   private var lastStateFlush: UInt64 = 0
+  private var lastPredictAbove = false
   /// Returns true if the classification has moved since the last flush and enough
   /// time has passed to send another. Called from the watcher thread only.
   func vocalChanged() -> Bool {
@@ -979,6 +988,20 @@ final class Wire {
     let now = Clock.now()
     guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
     lastVocalOut = v
+    lastStateFlush = now
+    return true
+  }
+  /// True when this end's turn-end prior has crossed the floor's threshold
+  /// since the last flush. Same watcher, same 15 ms floor as `vocalChanged` --
+  /// a prior that only rides the 1 Hz probe is a prior that arrives a second
+  /// late (`fast-signal-on-a-slow-carrier`), which is longer than the 450 ms
+  /// wait it exists to skip.
+  func predictCrossed() -> Bool {
+    let above = Audio.turnEndProb >= Audio.sharedFloor.cfg.predictP
+    guard above != lastPredictAbove else { return false }
+    let now = Clock.now()
+    guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
+    lastPredictAbove = above
     lastStateFlush = now
     return true
   }
@@ -1029,7 +1052,15 @@ final class Wire {
     }
     p.storeBytes(of: UInt8(truncatingIfNeeded: selfStatus | vocalBits),
                  toByteOffset: TPKTX + 6, as: UInt8.self)
-    p.storeBytes(of: UInt8(0), toByteOffset: TPKTX + 7, as: UInt8.self)
+    // ── THE PRIOR RIDES BESIDE THE VOCAL BYTE ────────────────────────────────
+    //
+    // TPKTX+7 was pad. The number is computed where the words are (this
+    // machine's transcript) and applied where the gate is (the far end's floor),
+    // which is why it has to travel: subtitles only cross when the sender cannot
+    // be heard, and the interesting moment is while they still hold the floor.
+    // An older build writes 0 here and never reads it.
+    p.storeBytes(of: Wire.endProbByte(Audio.turnEndProb),
+                 toByteOffset: TPKTX + 7, as: UInt8.self)
   }
 
   /// Nothing has arrived for a while, so the address we locked onto is no longer
@@ -1057,6 +1088,8 @@ final class Wire {
     // where that process stops existing as far as this end is concerned.
     peerStatus = 0
     peerStatusSeen = false
+    Audio.peerTurnEndProb = 0
+    Audio.sharedFloor.noteFarEndProb(0)
     // Not nested inside `pathLock` below: nothing takes both, and keeping them
     // sequential means no future caller can invent a lock-order deadlock here.
     candLock.lock()
@@ -1548,6 +1581,13 @@ final class Wire {
           // planet is brand new, which was a hidden distance limit.
           Audio.peerVoiceNow = peerVoice
           Audio.sharedFloor.noteFar(peerVoice, transitMs: Audio.owdMsNow)
+          // The prior belongs to THIS floor, computed on THEIR transcript.
+          // Level-triggered: every TPKTY packet carries the standing value, so a
+          // dropped crossing costs a second of staleness rather than a prior
+          // that is wrong for the rest of the call -- same repair as the vocal
+          // byte. Zero is what 0.92.0 writes, and zero changes nothing.
+          Audio.peerTurnEndProb = Wire.endProb(from: plain[TPKTX + 7])
+          Audio.sharedFloor.noteFarEndProb(Audio.peerTurnEndProb)
           // ── THE FAST HALF OF THE TURN LAYER ─────────────────────────────────
           //
           // Fired on CHANGE, from the receive thread, rather than polled by the

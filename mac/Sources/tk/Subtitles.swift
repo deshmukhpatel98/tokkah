@@ -293,27 +293,20 @@ final class Subtitles {
         return p
     }
 
-    /// ── WHERE THIS VALUE IS SUPPOSED TO GO, AND WHY IT DOES NOT YET ─────────
+    /// ── WHERE THIS VALUE GOES ───────────────────────────────────────────────
     ///
-    /// The prior belongs to the FAR end's gate, not to this one. This machine's
-    /// gate holds THIS microphone down while the far end's voice is coming out of
-    /// this machine's speaker; the moment worth predicting is the far end's turn
-    /// ending, so that this microphone is already open when this person starts.
-    /// But only the speaker's own machine has their transcript -- and by the rule
-    /// in `subs.onText`, subtitles cross the wire only when the sender CANNOT be
-    /// heard, which is exactly not the case while they hold the floor.
+    /// Two consumers, both the floor, on opposite machines.
     ///
-    /// So the prior has to travel: computed where the words are, applied where the
-    /// gate is, one number per revision alongside the vocal status byte that
-    /// already crosses in `wire.onPeerVocal`. That is a change in Net.swift and
-    /// one `var` in `Audio.DuplexGate` -- neither of which is this lane's to
-    /// write, with four agents landing in those files at once.
+    /// LOCAL (0.92.0): `Audio.turnEndProb` is read by `Floor.step` on every
+    /// capture block. `predictedEnd` is guarded by `state == .mine`, so this
+    /// end can only let go of a floor it already holds.
     ///
-    /// `dead-controls-declared-never-wired` says a callback that is declared and
-    /// invoked and assigned nowhere reads as finished and does nothing, so this is
-    /// deliberately NOT dressed up as wired. It is a measured value with a stated
-    /// consumer, printed under `KIN_PREDICT_DEBUG` so it can be watched on a real
-    /// call today, and `mac/tools/predict-check.sh` says how good it is.
+    /// FAR (0.93.0): the same number is packed into TPKTX+7, the byte that used
+    /// to be pad beside the vocal status, and applied at the far end's floor so
+    /// that microphone is already open before this person finishes. Subtitles
+    /// cannot carry it -- by the rule in `subs.onText` they only cross when the
+    /// sender CANNOT be heard, which is exactly not the case while they hold
+    /// the floor.
     ///
     /// It is deliberately NOT published on `onComplete`. That hook carries
     /// smart-turn's number, which reads the WAVEFORM and hears prosody no
@@ -329,24 +322,9 @@ final class Subtitles {
     private func predictNow() -> Double {
         let p = predict.probability(nowMs: fedMs)
         turnEndingSoon = p
-        // ── AND HERE IS WHERE IT GOES ────────────────────────────────────────
-        //
-        // `Audio.turnEndProb` is read by `Floor.step` on every capture block and
-        // was assigned NOWHERE, so `predictedEnd` was always false and the floor
-        // always waited the full 450 ms of silence before a turn could change
-        // hands. A measured value with a stated consumer and no wire between
-        // them is the shape this project keeps getting caught by.
-        //
-        // This is the LOCAL half, and it is the half that needs no protocol: my
-        // own transcript predicts MY OWN turn ending, and `predictedEnd` is
-        // guarded by `state == .mine`, so the only thing it can do is let go of
-        // the floor early on behalf of the person who already has it. It can
-        // never take a turn from anybody.
-        //
-        // The other half -- knowing the FAR end's turn is ending, so this
-        // microphone is already open when this person starts -- is the bigger
-        // win and needs the number to cross the wire beside the vocal byte. It
-        // is not done, and the comment above this property says why.
+        // LOCAL half: this machine's floor. FAR half: TPKTX+7, packed by
+        // `Wire.appendRxReport` from this same value -- one number, two
+        // consumers, no second copy.
         Audio.turnEndProb = p
         if ProcessInfo.processInfo.environment["KIN_PREDICT_DEBUG"] != nil {
             fputs(String(format: "predict %.2f  words %.2f  falling %.1f dB  going %.0f ms  quiet %.0f ms\n",

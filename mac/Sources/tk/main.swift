@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.92.0"
+let VERSION = "0.93.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -443,6 +443,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
   "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
+  "predict-far-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake",
@@ -476,7 +477,8 @@ let KNOWN_FLAGS: Set<String> = [
 let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
-                  "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test"]
+                  "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
+                  "predict-far-test"]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
 }
@@ -644,6 +646,7 @@ if flag("gain-test") { exit(Audio.gainSelfTest() ? 0 : 1) }
 // The state the floor forgot: nobody's turn, both loudspeakers live, both
 // microphones open. Pure arithmetic over two Floor objects.
 if flag("echo-state-test") { exit(Floor.echoStateSelfTest() ? 0 : 1) }
+if flag("predict-far-test") { exit(Floor.predictFarSelfTest() ? 0 : 1) }
 
 // ── ARE YOU TWO IN THE SAME ROOM? THE RULER, BEFORE ANY OF THE PRODUCT ─────
 //
@@ -4125,7 +4128,7 @@ if flag("turn-test") {
 
 if flag("floor-test") {
   let owd = Double(arg("floor-owd") ?? "40") ?? 40
-  exit(Floor.selfTest(owdMs: owd) ? 0 : 1)
+  exit(Floor.selfTest(owdMs: owd) && Floor.predictFarSelfTest() ? 0 : 1)
 }
 
 if flag("gate-test") {
@@ -5137,7 +5140,7 @@ Thread {
     let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 1.0)
     while Date() < until {
       Thread.sleep(forTimeInterval: 0.02)
-      if wire.vocalChanged() {
+      if wire.vocalChanged() || wire.predictCrossed() {
         if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
           fputs(String(format: "cue out %.3f  me -> %d\n", Date().timeIntervalSince1970,
                        Audio.sharedGate.vocal.rawValue), stderr)
@@ -5841,7 +5844,11 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "playout_rms": audio.playoutRmsNow,
     "predict_releases": Audio.sharedFloor.predictedReleases,
     "predict_saved_ms": Audio.sharedFloor.predictedSavedMs,
+    "predict_far_releases": Audio.sharedFloor.farPredictedReleases,
+    "predict_far_saved_ms": Audio.sharedFloor.farPredictedSavedMs,
     "predict_p_now": Audio.turnEndProb,
+    "predict_peer_p_now": Audio.peerTurnEndProb,
+    "predict_peer_p_peak": Audio.sharedFloor.farEndProbPeak,
     "floor_muted_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.floorHeldBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // The share of the call this end had stopped believing the far end's cues
@@ -6274,9 +6281,13 @@ func reportLoop() {
                    ? Double(Audio.sharedFloor.echoGuardBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
                  audio.turns.floorBlocks > 0
                    ? Double(Audio.sharedFloor.guardableBlocks) / Double(audio.turns.floorBlocks) * 100 : 0)
-        + String(format: "  handed over early %d time(s), saving %.0f ms",
+        + String(format: "  handed over early %d time(s), saving %.0f ms"
+               + " (far %d / %.0f ms, their p peaked %.2f)",
                  Audio.sharedFloor.predictedReleases,
-                 Audio.sharedFloor.predictedSavedMs) + "\n", stderr)
+                 Audio.sharedFloor.predictedSavedMs,
+                 Audio.sharedFloor.farPredictedReleases,
+                 Audio.sharedFloor.farPredictedSavedMs,
+                 Audio.sharedFloor.farEndProbPeak) + "\n", stderr)
   }
   if flag("floor-debug"), t.floorBlocks > 0 {
     let n = Double(t.floorBlocks)
