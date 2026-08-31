@@ -104,6 +104,7 @@ const {
   kinRingDecide, kinPollDecide, kinPollBody, kinRegisterDecide, kinQuietDecide, kinQuietActive,
   kinBoxPut, kinBoxTake, kinBoxHas, kinWaitMs, kinWindow, kinTimingSafeEqual, turnOrderUdp,
   kinB64, kinB64Encode, kinVerifyEd25519,
+  kinPresenceBody,
   KIN_HANDLE_RE, KIN_ROUTE_RE,
 } = await import(bundle);
 // The two signed-message prefixes are NOT exported, and must not be: worker.ts
@@ -2477,6 +2478,30 @@ const DEV2 = await device('dev2');
     await mf.dispose();
   }
 }
+
+// ── PRESENCE: THE GREEN DOT'S ONE OPINION ────────────────────────────────────
+//
+// `here` is decided in exactly one exported line, so the Mac client, the edge
+// fan-out and this file cannot each have their own idea of "reachable". The
+// three states are a listener heard recently, one gone quiet, and one never
+// heard of -- and the last two must not collapse: "never heard of" is what a
+// freshly evicted DO says about a perfectly healthy listener (it self-corrects
+// within one 25 s hold), while "old" is a listener that actually left.
+// The threshold is read out of the source like the signing contexts, because
+// exporting a bare number from the worker entry module breaks the deploy --
+// which this very run proved again before this comment existed.
+sec('kin presence');
+const FRESH = Number((srcText.match(/KIN_PRESENCE_FRESH_MS = ([0-9_]+)/) ?? [])[1]?.replaceAll('_', ''));
+ok(Number.isFinite(FRESH), 'the freshness threshold is readable from the source');
+deep(kinPresenceBody(0), { here: true, ageS: 0 }, 'a parked poll is here, age zero');
+deep(kinPresenceBody(30_000), { here: true, ageS: 30 }, 'heard 30 s ago: inside one hold, here');
+deep(kinPresenceBody(FRESH), { here: false, ageS: Math.round(FRESH / 1000) },
+     'exactly at the threshold is NOT here -- a live listener polls before it');
+deep(kinPresenceBody(600_000), { here: false, ageS: 600 }, 'ten minutes quiet is gone');
+deep(kinPresenceBody(null), { here: false, ageS: null },
+     'never heard of: not here, and the age stays null rather than becoming a number');
+ok(FRESH > 30_000,
+   'the threshold clears the server hold ceiling (30 s), or every held listener flickers');
 
 console.log(failures === 0
   ? '\nAll contact/doorbell/TURN cases passed.'

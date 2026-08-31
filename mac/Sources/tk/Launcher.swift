@@ -481,7 +481,11 @@ enum Launcher {
     // One `mode` decides which, for the reason `WaitingCard` gives about its own:
     // this began as two booleans that had to agree, and two booleans that have to
     // agree are a state that can be both.
-    let people = Array(Identity.contactHandles().prefix(5))
+    // By recency, not by alphabet: the person you talked to yesterday is the
+    // person you are most likely opening the app to reach, and burying them
+    // under whoever's name starts with 'a' is the list optimising for a phone
+    // book nobody is reading top to bottom.
+    let people = Array(Identity.contactHandlesByRecency().prefix(5))
     let pad = Metric.cardPad
     let cardW = W - Metric.gutter * 2
     let rowW = cardW - pad * 2
@@ -564,6 +568,35 @@ enum Launcher {
     v.addSubview(status)
 
     let peopleRows = people.map { ContactRow(handle: $0) }
+    // "yesterday" on the row, so the order explains itself. `valueIsWord` is the
+    // muted small rendering the mine-row's "copy" already uses; these labels are
+    // not pressable and draw exactly like every other secondary word here.
+    let lastTimes = Identity.lastCallTimes()
+    for r in peopleRows {
+      if let t = lastTimes[r.handleName] {
+        r.value = Relative.time(t)
+        r.valueIsWord = true
+      }
+    }
+    // ── THE GREEN DOTS, REFRESHED WHILE THE WINDOW IS OPEN ───────────────────
+    //
+    // Asked once now and every 15 s after -- the same cadence a held poll makes
+    // meaningful -- and it paints dots only. It must never reorder: the order
+    // was fixed above, and a row that moves under a travelling pointer is how a
+    // stray click rings the wrong person. The timer rides `.common` so a menu
+    // being open does not freeze the dots, and it dies with the window.
+    var presenceTimer: Timer?
+    if !people.isEmpty {
+      let apply: () -> Void = {
+        Presence.fetch(people) { map in
+          for r in peopleRows { r.reachable = map[r.handleName] }
+        }
+      }
+      apply()
+      let t = Timer(timeInterval: 15, repeats: true) { _ in apply() }
+      RunLoop.main.add(t, forMode: .common)
+      presenceTimer = t
+    }
     // ── THE ROOMS YOU HAVE ACTUALLY BEEN IN ──────────────────────────────────
     //
     // These were four chips under the old field, and rebuilding this card around
@@ -904,7 +937,20 @@ enum Launcher {
       // points apart and photographed as one object with a bubble growing out of
       // its top edge -- the pill is a statement about the PICTURE, and it has to
       // sit in the picture rather than on the furniture.
-      hintY = card.frame.maxY + Metric.s8
+      // Centred in the sky above the card, where the camera picture lives --
+      // pinned to the card's edge it sat ON the first row's face the moment the
+      // card grew a tall mode. Clamped to the edge from below so a card that
+      // fills the window cannot push the sentence off the top.
+      hintY = max(card.frame.maxY + Metric.s8,
+                  card.frame.maxY + (H - card.frame.maxY - Metric.pillHeight) / 2)
+      // The pill is placed by `setHint` AT CALL TIME, and the camera's first
+      // sentence lands before the first relayout -- so a moved hintY has to
+      // re-place the pill that is already on screen or the fix only applies to
+      // the next sentence.
+      if !hint.isHidden {
+        hintPill.frame.origin.y = hintY
+        hint.frame.origin.y = hintY + (Metric.pillHeight - 16) / 2
+      }
       card.needsDisplay = true
       v.needsLayout = true
     }
@@ -1110,6 +1156,10 @@ enum Launcher {
     pumpAppKit(until: .distantFuture, while: { !t.done && w.isVisible })
     t.done = true                                  // they joined, or they closed it
     w.orderOut(nil)
+    // The dots die with the window: a timer that outlives it would keep asking
+    // the server about people whose rows no longer exist.
+    presenceTimer?.invalidate()
+    presenceTimer = nil
     // ── RELEASING THE CAMERA, WHICH USED TO BE EXEC'S JOB ────────────────────
     //
     // `stopRunning()` alone was enough while a re-exec followed: the process

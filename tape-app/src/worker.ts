@@ -255,6 +255,7 @@ export class Room implements DurableObject {
     // it is holding for has gone away — see kinHold. Every other verb answers
     // at once and has no use for it.
     if (url.pathname.endsWith('/kin/poll')) return this.kinPoll(url, request.signal);
+    if (url.pathname.endsWith('/kin/presence')) return this.kinPresence(url);
     if (url.pathname.endsWith('/kin/quiet')) return this.kinQuietSet(request, url);
     return this.signal(request);
   }
@@ -398,6 +399,28 @@ export class Room implements DurableObject {
     // caller: the response was already decided above.
     if (d.status === 200 && !d.muted) this.kinWake(to);
     return json(d.body, d.status);
+  }
+
+  // ── IS ANYBODY LISTENING FOR THIS HANDLE, RIGHT NOW ─────────────────────────
+  //
+  // The same two pieces of evidence kinRing already weighs before accepting a
+  // ring -- a poll parked on this DO at this moment, or how long ago one last
+  // authenticated -- exposed as an answer instead of consumed as a precondition.
+  // Nothing new is learned by the server and nothing new is trusted from the
+  // client; the route only says out loud what the mailbox already knew.
+  //
+  // Unauthenticated, deliberately, at ring parity: anyone who knows a handle can
+  // already learn its reachability by ringing it, and a ring is the LOUD probe --
+  // it can pop a card on the callee's screen. This is the quiet one, so a front
+  // door can show a green dot instead of making people discover reachability by
+  // ringing someone who left. What it leaks beyond ring is polling cadence
+  // ("their Mac is on"), which is the trade a green dot IS.
+  private kinPresence(url: URL): Response {
+    const to = url.searchParams.get('to') ?? '';
+    const held = (this.kinWaiters.get(to)?.size ?? 0) > 0;
+    const last = this.kinLastPoll.get(to);
+    const heardMs = held ? 0 : (last === undefined ? null : Date.now() - last);
+    return json(kinPresenceBody(heardMs));
   }
 
   private async kinPoll(url: URL, signal?: AbortSignal): Promise<Response> {
@@ -2430,6 +2453,23 @@ export function kinWindow(
 }
 
 /** Drop every ring past its lease, and forget handles left with none. */
+// A listener that long-polls at 25 s (the Mac's `holdMs`) against a 30 s server
+// ceiling is heard from at least every ~30 s while alive, so 45 s of silence is
+// a listener that is gone, not one between polls. `here` is decided HERE so both
+// callers -- and the tests -- share one line's opinion of what "reachable" means.
+// `ageS: null` is "never heard of", which must stay distinct from "old": a DO
+// that was just evicted has no memory, and the first poll after eviction lands
+// within one hold -- so null clears itself within ~30 s of the truth changing.
+// NOT exported, same trap as KIN_REG_CONTEXT above it: worker.ts is the worker
+// ENTRY module, and workerd reads every named export as an entrypoint -- a
+// exported number typechecks, passes every test, and refuses to deploy. The
+// test reads it out of the source text, like the signing contexts.
+const KIN_PRESENCE_FRESH_MS = 45_000;
+export function kinPresenceBody(heardMs: number | null): { here: boolean; ageS: number | null } {
+  if (heardMs === null) return { here: false, ageS: null };
+  return { here: heardMs < KIN_PRESENCE_FRESH_MS, ageS: Math.round(heardMs / 1000) };
+}
+
 export function kinBoxSweep(box: Map<string, KinStored[]>, now: number): void {
   for (const [k, list] of box) {
     const live = list.filter((r) => now - r.bornAt <= KIN_LEASE_MS);
@@ -3102,7 +3142,10 @@ const KIN_EDGE_WINDOW_MS = 3600_000;
 // `quiet` is sized like `register`: both are pressed by a person, not by a loop,
 // and both mint a DO on first touch. Its own key inside the map, so a ring flood
 // cannot stop someone turning their own silence off.
-const KIN_EDGE_CAP: Record<string, number> = { ring: 240, poll: 20_000, register: 120, quiet: 120 };
+const KIN_EDGE_CAP: Record<string, number> = { ring: 240, poll: 20_000, register: 120, quiet: 120,
+  // A home window refreshing five dots every 15 s is 20/min; 600 leaves room
+  // for several Macs behind one NAT without letting one of them scan.
+  presence: 600 };
 const kinPosts = new Map<string, number[]>();
 
 // ── /api/ice abuse control ────────────────────────────────────────────────────
@@ -5008,6 +5051,36 @@ export default {
     //     mailbox write must never appear in the operator's "which room was
     //     live when" table — that table is for turning a complaint into a call
     //     log, and a doorbell press is not a call.
+    // ── /api/kin/presence?who=a,b,c -- the front door's green dots ────────────
+    //
+    // Fan-out at the edge, because each handle's mailbox is its own DO and the
+    // client asking about five people must not pay five round trips. Capped at
+    // 12 handles -- the home list shows five -- and rate-limited per IP like
+    // every other kin verb.
+    if (url.pathname === '/api/kin/presence') {
+      if (request.method !== 'GET') return json({ error: 'method' }, 405);
+      const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+      if (!kinWindow(kinPosts, 'presence|' + ip, Date.now(), KIN_EDGE_WINDOW_MS, KIN_EDGE_CAP.presence)) {
+        return json({ error: 'rate' }, 429);
+      }
+      const who = (url.searchParams.get('who') ?? '').split(',')
+        .map((h) => h.trim()).filter((h) => /^[a-z][a-z0-9]{1,31}$/.test(h));
+      if (who.length === 0 || who.length > 12) return json({ error: 'who' }, 400);
+      const out: Record<string, unknown> = {};
+      await Promise.all([...new Set(who)].map(async (h) => {
+        try {
+          const r = await env.ROOM.get(env.ROOM.idFromName('inbox:' + h))
+            .fetch('https://do/kin/presence?to=' + h);
+          out[h] = await r.json();
+        } catch {
+          // One mailbox failing must not take the other dots with it, and
+          // "unknown" already has a spelling.
+          out[h] = { here: false, ageS: null };
+        }
+      }));
+      return json(out);
+    }
+
     const kin = url.pathname.match(KIN_ROUTE_RE);
     if (kin) {
       const handle = kin[1];

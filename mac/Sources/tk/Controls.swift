@@ -1106,6 +1106,21 @@ final class ContactRow: SheetRow {
   /// Who this row is, for the action that has to ring them. `tag` is taken -- the
   /// camera rows use it as an index -- and a handle is not an integer.
   var handleName: String { handle }
+  /// ── CAN THIS PERSON BE REACHED, RIGHT NOW ────────────────────────────────
+  ///
+  /// Three states, and the third is load-bearing: `true` draws the dot, `false`
+  /// draws nothing, and `nil` -- not asked yet, or the server unreachable --
+  /// also draws nothing but says nothing. A dot that defaulted to grey-means-
+  /// away would report every network hiccup as everybody having left
+  /// (`blind-instruments-report-negatives`); absence of a dot merely reverts
+  /// this row to what it was before presence existed.
+  var reachable: Bool? {
+    didSet {
+      guard reachable != oldValue else { return }
+      needsDisplay = true
+      setAccessibilityLabel("call @" + handle + (reachable == true ? ", reachable now" : ""))
+    }
+  }
 
   /// The handle is the row: the colour, the letter and the words all come from it.
   /// A separate display name would be a local nickname, and names are deliberately
@@ -1129,9 +1144,22 @@ final class ContactRow: SheetRow {
   override func draw(_ dirty: NSRect) {
     super.draw(dirty)
     let d = Metric.avatar
-    Avatar.draw(handle,
-                in: NSRect(x: Metric.s3, y: (bounds.height - d) / 2, width: d, height: d),
-                ring: Metric.avatarRing, font: Type_.avatar)
+    let box = NSRect(x: Metric.s3, y: (bounds.height - d) / 2, width: d, height: d)
+    Avatar.draw(handle, in: box, ring: Metric.avatarRing, font: Type_.avatar)
+    // The dot, on the avatar's shoulder, punched out of it by a gap the colour
+    // of nothing -- drawn as a clear circle rather than a background-coloured
+    // one, because this row sits on glass and there is no one background colour
+    // to imitate.
+    if reachable == true {
+      let dd: CGFloat = 9
+      let at = NSRect(x: box.maxX - dd + 1, y: box.minY - 1, width: dd, height: dd)
+      NSGraphicsContext.current?.saveGraphicsState()
+      NSGraphicsContext.current?.compositingOperation = .destinationOut
+      NSBezierPath(ovalIn: at.insetBy(dx: -2, dy: -2)).fill()
+      NSGraphicsContext.current?.restoreGraphicsState()
+      Palette.ok.setFill()
+      NSBezierPath(ovalIn: at).fill()
+    }
   }
 }
 
@@ -1146,6 +1174,24 @@ final class ContactRow: SheetRow {
 enum Avatar {
   static func draw(_ handle: String, in box: NSRect, ring rw: CGFloat, font: NSFont) {
     let ink = Palette.avatarInk(handle)
+    // ── THE PERSON'S ACTUAL FACE, WHEN A CALL HAS PROVIDED ONE ───────────────
+    //
+    // Clipped to the same circle the initial lived in, with the same ink ring on
+    // top -- the ring is the person's colour identity and it survives the
+    // upgrade, so a face arriving does not make the row a stranger. Falls back
+    // to the initial for anyone not yet called with video, which keeps this a
+    // drawing decision made per handle in one place rather than two row species.
+    if let img = Faces.image(handle) {
+      NSGraphicsContext.current?.saveGraphicsState()
+      NSBezierPath(ovalIn: box).addClip()
+      img.draw(in: box, from: .zero, operation: .sourceOver, fraction: 1)
+      NSGraphicsContext.current?.restoreGraphicsState()
+      let r = NSBezierPath(ovalIn: box.insetBy(dx: rw / 2, dy: rw / 2))
+      ink.setStroke()
+      r.lineWidth = rw
+      r.stroke()
+      return
+    }
     // A fill and a hairline, the same idiom as every other thing that lives INSIDE
     // a glass surface. A second pane of glass here would be the one place in the
     // app that breaks "avoid layering Liquid Glass elements on top of each other".

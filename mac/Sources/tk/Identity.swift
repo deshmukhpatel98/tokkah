@@ -871,6 +871,48 @@ enum Identity {
     return o.filter { sanitize($0) == $0 }
   }
 
+  /// ── WHEN, NOT ONLY WHO ─────────────────────────────────────────────────────
+  ///
+  /// `called.json` is a set and `contacts.json` is a key map; neither says when a
+  /// call happened, which is why the front door listed people ALPHABETICALLY --
+  /// the sort chose itself, because "an ordering derived from a field that does
+  /// not exist is a list that reshuffles itself for reasons nobody can explain".
+  /// The field exists now. Written at every placed and every answered call, read
+  /// by the home list's ordering and its "yesterday" labels.
+  private static var lastCallFile: URL { dir.appendingPathComponent("lastcall.json") }
+  static func lastCallTimes() -> [String: Double] {
+    guard let d = try? Data(contentsOf: lastCallFile),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Double]
+    else { return [:] }
+    return o
+  }
+  static func noteCallTime(_ handle: String, at t: Double = Date().timeIntervalSince1970) {
+    guard sanitize(handle) == handle else { return }
+    var map = lastCallTimes()
+    map[handle] = t
+    guard let d = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
+    else { return }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let tmp = lastCallFile.appendingPathExtension("tmp")
+    if (try? d.write(to: tmp)) != nil {
+      try? FileManager.default.removeItem(at: lastCallFile)
+      try? FileManager.default.moveItem(at: tmp, to: lastCallFile)
+    }
+  }
+
+  /// The home list's order: the people you actually talk to, most recent first,
+  /// then everyone never-timestamped, by name. Explicit tiebreak rather than a
+  /// stable sort, because Swift's sort is not stable and an order that changes
+  /// between two launches over identical data reads as the app forgetting you.
+  static func contactHandlesByRecency() -> [String] {
+    let t = lastCallTimes()
+    return contactHandles().sorted {
+      let a = t[$0] ?? 0, b = t[$1] ?? 0
+      return a == b ? $0 < $1 : a > b
+    }
+  }
+
   /// Write down somebody we called. Idempotent, and it NEVER touches
   /// `contacts.json` -- a dialled name must not be able to become a key.
   static func rememberCalled(_ handle: String) {

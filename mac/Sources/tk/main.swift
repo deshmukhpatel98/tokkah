@@ -67,6 +67,13 @@ teeStderrToLogIfNowhere()
 // candidate binary with it before allowing it to replace a running one, so this
 // is the smoke test that keeps a bad release from bricking the far machine.
 if CommandLine.arguments.contains("--version") { print(VERSION); exit(0) }
+// The home list's order, for a rig. THE function the window calls, not a copy of
+// its sort -- a second copy of a rule is the bug class, and this exists so the
+// rig can assert ordering without screen-scraping a screenshot.
+if CommandLine.arguments.contains("--order-audit") {
+  print(Identity.contactHandlesByRecency().joined(separator: " "))
+  exit(0)
+}
 
 // ── `--help` HAD TO OPEN A MICROPHONE TO TELL YOU IT DID NOTHING ────────────
 //
@@ -499,7 +506,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-far-test",
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
-  "headphone-test", "route", "contacts-fake",
+  "headphone-test", "route", "contacts-fake", "order-audit",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -2482,6 +2489,9 @@ display?.controls?.onAnswerRing = {
   // Only when we actually hold the key. The watcher route carries none, and
   // binding a name to an empty string would poison the contact list.
   if !o.k.isEmpty { Identity.remember(handle: o.from, key: o.k) }
+  // Answering is a call too: without this line only the CALLER's list learned
+  // recency and the callee's front door stayed alphabetical forever.
+  Identity.noteCallTime(o.from)
   display?.controls?.setStatus("answering \(Identity.display(o.from))…")
   // `--with`: WHO this room is shared with, carried through the re-exec.
   // `--incoming` is an event and rightly dies at the handoff, but the answered
@@ -3294,7 +3304,12 @@ if let room = arg("room") {
           // thing that passes `--calling` is the re-exec after the server
           // accepted our signed ring. A link-joined call has no `gCalling`, so it
           // writes nobody -- see below.
-          if let c = gCalling, !c.who.isEmpty { Identity.rememberCalled(c.who) }
+          if let c = gCalling, !c.who.isEmpty {
+            Identity.rememberCalled(c.who)
+            // The WHEN beside the WHO -- the home list's order and its
+            // "yesterday" labels both read this.
+            Identity.noteCallTime(c.who)
+          }
           // ── TWO PEOPLE WHO MET ON A LINK RECORD NOTHING, ON PURPOSE ───────
           //
           // Asked directly: should an hour on a link mean you can call each other
@@ -7358,6 +7373,20 @@ func reportLoop() {
   audio.tuneInputGain()
   // Same cadence: headphones appearing mid-call open it to full duplex.
   audio.checkOutputRoute()
+  // ── ONE FRAME OF THE PERSON, FOR THE FRONT DOOR ────────────────────────────
+  //
+  // At 20 s in -- past the camera warm-up and the first awkward seconds, when
+  // somebody is actually in frame -- and refreshed every two minutes so a long
+  // call ends holding a recent likeness. On THIS thread, deliberately: the crop
+  // and encode are milliseconds, which a media callback cannot spare and a
+  // 1 Hz reporter never notices. Only when the call knows who it is with; a
+  // word-room with no handle saves nothing (see Faces.swift for why).
+  if beatTick == 20 || (beatTick > 0 && beatTick % 120 == 0) {
+    let who = gCalling?.who ?? arg("with") ?? gOffered?.from ?? ""
+    if !who.isEmpty, let f = display?.lastRemoteForFace {
+      Faces.save(who, from: f)
+    }
+  }
   if Telemetry.enabled, !shuttingDown, beatTick % 5 == 0 {
     Telemetry.post(audioBeat(uptime: Double(beatTick), up: upMbps, down: downMbps,
                              played: d.played, concealed: d.concealed, cap: d.cap,

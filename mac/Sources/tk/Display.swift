@@ -92,6 +92,10 @@ final class Display {
   /// link gives out. Exactly one: a decoder pool can spare a buffer, and the
   /// alternative is having nothing to show at the moment it matters most.
   private var lastRemote: CVImageBuffer?
+  /// The same frame, for the report thread's once-a-call face snapshot. A
+  /// reference copy under ARC: the pool cannot recycle a buffer somebody still
+  /// holds, and the reader never touches the layer tree.
+  var lastRemoteForFace: CVImageBuffer? { lastRemote }
   private let ciCtx = CIContext(options: [.useSoftwareRenderer: false])
   private(set) var peerPaused = false
   private(set) var selfPaused = false
