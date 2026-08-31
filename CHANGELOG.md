@@ -5,6 +5,36 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.95.0 — 2026-08-31
+
+### Changed — the floor is strict: one microphone, one loudspeaker, never the same end
+
+The user's decision, verbatim: "only one mic is enabled at any given moment in
+time, and only one speaker is enabled, and it can't be the same person's."
+The turn machinery is unchanged — who holds, who releases, the deadlock break,
+the predictor, the ceiling — but its verdict is rendered without the soft
+edges 0.94.0 still had:
+
+- Out of turn is **silent**, not ducked at −20 dB. A barge-in crosses as a cue
+  and flips the floor; until it flips the interrupter is not heard.
+- A pause transmits **nothing**. The first voice takes the floor locally in
+  its own block, so the first speaker still pays nothing.
+- A dead cue channel **holds roles** instead of opening both mics. The holder
+  keeps talking on its own evidence; a blind holder reads as quiet and the
+  listener takes the empty floor in `releaseMs` (survivor of a dead peer
+  speaks 9 ms after asking, in the self-test).
+- The holder's **speaker is closed on every route**, headphones included.
+
+The two-end self-test, with the network hop modeled at 40 and 100 ms, measures
+0 ms of double-open in clean alternation (soft: 200 ms), one hop at a barge-in
+(40 ms), and deadlock-plus-hops at a genuinely simultaneous start (480 ms) —
+the one window physics keeps. Every live call now reports `floor_strict` and
+`strict_overlap_pct` (on the wire while the far stream also carried voice),
+and each strict scenario has a soft REJECT twin so the meter is proven able to
+see the defect it guards. `--floor-soft` is the control arm and is exactly the
+0.94.0 behaviour, kept for A/B on live calls and as the rollback that needs no
+reinstall.
+
 ## Kin 0.94.0 — 2026-08-31
 
 ### Fixed — the listening end's own speaker was classified as its person talking

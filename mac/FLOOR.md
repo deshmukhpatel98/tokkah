@@ -7,6 +7,41 @@ The rule, decided by the person this app is for:
 Everything below is how to make that rule invisible. A rule that is noticed is a
 walkie-talkie; the whole product is the rule being obeyed and nobody feeling it.
 
+## Strict, which is what ships (0.95.0)
+
+Restated by the user on 2026-08-31, after hearing the soft edges leak on a live
+call: *"only one mic is enabled at any given moment in time, and only one
+speaker is enabled, and it can't be the same person's."* So the shipping floor
+is **strict**: the state machine below is unchanged — who holds, who releases,
+who wins a deadlock, the predictor, the ceiling — but its verdict is rendered
+harder:
+
+- **Out of turn is silent.** The −20 dB duck is retired. A barge-in still works
+  — the claim crosses as a cue and flips the floor — but until it flips, the
+  interrupter is not heard. Capture never stops, so the classifier still sees
+  them instantly.
+- **A pause transmits nothing.** `idle` no longer lets both ends send. The
+  first voice takes the floor locally, in its own block, so the first speaker
+  still pays nothing.
+- **A dead cue channel holds roles.** The old fallback opened both ends; strict
+  keeps the holder talking on its own evidence, treats the blind far end as
+  quiet, and lets the listener take an empty floor after `releaseMs`. Proven:
+  the survivor of a dead peer speaks 9 ms after asking.
+- **The holder's speaker is closed on every route,** headphones included. The
+  rule is a product statement now, not an echo measure — and with the far
+  microphone muted there is nothing real for a talker's speaker to carry.
+
+What strict cannot remove is the speed of light: two people who start inside
+one hop of each other both take an empty floor, and the deadlock break then
+silences exactly one. Measured in `Floor.strictSelfTest` with the hop modeled:
+**0 ms** of double-open in alternation, **one hop** (~40 ms) at a barge-in,
+**`deadlockMs` + hops** (~480 ms) at a genuinely simultaneous start — and that
+last window is counted on every live call as `strict_overlap_pct`.
+
+`--floor-soft` is the control arm and restores the 0.94.0 behaviour described
+below. The soft rules remain documented because they are the fallback arm and
+the self-tests keep both honest.
+
 ## What is wrong with the gate we ship today
 
 `Audio.DuplexGate` is purely local and purely reactive. Every block it asks one

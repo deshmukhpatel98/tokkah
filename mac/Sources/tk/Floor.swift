@@ -111,6 +111,30 @@ final class Floor {
     /// instant the floor flips chops it off. One hop, from TimeSync.
     var playoutLagMs: Double = 60
     var on = true
+    /// ── STRICT: ONE MICROPHONE, ONE LOUDSPEAKER, NEVER THE SAME END ─────────
+    ///
+    /// The user's decision, 2026-08-31, in their words: "only one mic is
+    /// enabled at any given moment in time, and only one speaker is enabled,
+    /// and it can't be the same person's." Three soft edges go:
+    ///
+    ///   - the -20 dB out-of-turn duck: out of turn is SILENT, full stop.
+    ///     Barging in still works -- the claim crosses as a CUE and flips the
+    ///     floor -- but until it flips, the interrupter is not heard.
+    ///   - `idle` as an open state: nobody transmits in a pause. The first
+    ///     voice takes the floor LOCALLY, same block, so it still costs the
+    ///     first speaker nothing.
+    ///   - the stale-cue fallback opening both ends: roles HOLD when the far
+    ///     end goes dark. The holder keeps the floor on its own evidence; the
+    ///     listener's escape is that a blind holder reads as quiet, releases
+    ///     in `releaseMs`, and the listener takes an empty floor.
+    ///
+    /// What strict cannot remove is the speed of light: two people who start
+    /// inside one hop of each other both take an empty floor, and the deadlock
+    /// break then silences exactly one. So "one mic" holds everywhere except a
+    /// window bounded by `deadlockMs` plus a hop around a genuinely
+    /// simultaneous start -- counted on every call as `strict_overlap_pct`.
+    /// `--floor-soft` is the control arm (0.94.0 behaviour).
+    var strict = true
   }
 
   var cfg = Cfg()
@@ -237,13 +261,26 @@ final class Floor {
     // local echo gate, which needs no agreement with anybody. `idle` is the
     // OPEN state -- reverting here can only ever open a microphone.
     let stale = farAgeMs > cfg.staleMs
-    if !cfg.on || stale {
+    if !cfg.on || (stale && !cfg.strict) {
       state = .idle
       wasState = .idle
       nearClaimMs = 0; farClaimMs = 0; holderQuietMs = 0
       return Decision(mayTransmit: true, duckOnly: false, playoutOpen: true,
                       fallback: true, state: .idle)
     }
+    // ── STRICT AND BLIND: ROLES HOLD, NOTHING OPENS ──────────────────────────
+    //
+    // Opening both microphones is the one thing strict exists to never do, so
+    // a dead cue channel cannot do it either. The far end's last word is
+    // treated as quiet -- a frozen `.claim` must not keep insisting on behalf
+    // of a peer that may be gone -- and the ordinary machinery does the rest:
+    // a blind holder reads as quiet, releases in `releaseMs`, and this end
+    // takes an empty floor the moment it speaks. A holder needs no far
+    // evidence to keep talking, so both-muted cannot stick either.
+    // Reported as fallback, because "running without far evidence" is what
+    // that field has always meant.
+    let farBlind = stale && cfg.strict
+    if farBlind { farVoice = .quiet }
 
     // ── THE HOLDER GOING QUIET RELEASES IT ───────────────────────────────────
     //
@@ -415,6 +452,22 @@ final class Floor {
     // would look identical -- which is how the last two echo theories survived.
     if echoRisk { echoGuardBlocks += 1 }
     guardableBlocks += state == .idle && speakers ? 1 : 0
+    // ── STRICT: THE SAME STATE, A HARDER ANSWER ──────────────────────────────
+    //
+    // Everything above -- who holds, who releases, who wins a deadlock, the
+    // predictor, the ceiling -- is unchanged. Strict only maps the verdict:
+    // the microphone is on the wire ONLY while the floor is mine, out of turn
+    // is silent rather than ducked, idle transmits nothing, and my ear closes
+    // whenever I hold, on every output route -- the rule is a product
+    // statement now, not an echo measure, and with the far microphone muted
+    // there is nothing for a talker's speaker to carry anyway. The closing
+    // edge keeps its one-hop lag so their last half-word still lands.
+    if cfg.strict {
+      return Decision(mayTransmit: state == .mine,
+                      duckOnly: false,
+                      playoutOpen: !(state == .mine && playoutHold <= 0),
+                      fallback: farBlind, state: state)
+    }
     return Decision(mayTransmit: state != .theirs && !echoRisk,
                     duckOnly: state == .theirs && near != .quiet,
                     playoutOpen: !earClosed,
@@ -505,6 +558,9 @@ extension Floor {
     }
     func fresh() -> Floor {
       let f = Floor()
+      // This suite proves the SOFT arm (`--floor-soft`, the 0.94.0 rules).
+      // The shipping default is strict, proven by `strictSelfTest`.
+      f.cfg.strict = false
       f.speakers = true
       f.noteFar(.quiet)                    // not stale, nobody talking
       _ = f.step(dt: 0.02, near: .quiet)
@@ -542,6 +598,7 @@ extension Floor {
     //     term the new guard re-muted exactly the person the ceiling had just
     //     rescued -- the complaint this whole area exists to answer.
     let c2 = Floor()
+    c2.cfg.strict = false
     c2.speakers = true
     // The tiebreak has to point AWAY from this end, or it simply wins the
     // deadlock at 450 ms and is never held down at all -- which is what the
@@ -581,6 +638,7 @@ extension Floor {
     // 6. AND THE FALLBACK STILL OUTRANKS EVERYTHING. No word from the far end
     //    means this end knows nothing, and reverting can only ever OPEN a mic.
     let f = Floor()
+    f.cfg.strict = false
     f.speakers = true
     f.notePlayout(live: true)
     let df = f.step(dt: 2.0, near: .quiet)      // 2 s with no cue at all
@@ -604,6 +662,9 @@ extension Floor {
     }
     func heldByThem() -> Floor {
       let f = Floor()
+      // Soft arm, like echoStateSelfTest: the release/prior machinery under
+      // test is IDENTICAL in strict, but the open-idle assertions are not.
+      f.cfg.strict = false
       f.speakers = true
       f.noteFar(.quiet)
       _ = f.step(dt: 0.02, near: .quiet)
@@ -650,6 +711,7 @@ extension Floor {
 
     // 4. A leftover 0.9 at the START of their turn does not release.
     let d = Floor()
+    d.cfg.strict = false
     d.speakers = true
     d.noteFar(.quiet)
     _ = d.step(dt: 0.02, near: .quiet)
@@ -687,6 +749,7 @@ extension Floor {
 
     // 7. A high LOCAL prior does not mute the person who has the floor.
     let h = Floor()
+    h.cfg.strict = false
     h.speakers = true
     h.noteFar(.quiet)
     _ = h.step(dt: 0.02, near: .quiet)
@@ -729,6 +792,161 @@ extension Floor {
     return ok
   }
 
+  /// ── STRICT, PROVEN WITH THE WIRE IN ───────────────────────────────────────
+  ///
+  /// The claim is "one microphone, one loudspeaker, never the same end", and a
+  /// claim about two ends is only testable with two floors and a real hop
+  /// between them. Every scenario runs twice: strict must hold the claim, and
+  /// soft must VISIBLY break it -- a meter that reads zero on both arms is a
+  /// meter that cannot see (`green-metrics-can-hide-defects`).
+  static func strictSelfTest(owdMs: Double = 40) -> Bool {
+    var ok = true
+    func say(_ good: Bool, _ what: String) {
+      if !good { ok = false }
+      fputs("floor: \(good ? "OK  " : "FAIL") \(what)\n", stderr)
+    }
+    let dt = 0.010
+    struct Tally {
+      var bothOpenMs = 0.0        // both ends on the wire in the same block
+      var noneOpenWhileClaimMs = 0.0  // somebody claiming, NOBODY audible
+      var aOpenMs = 0.0, bOpenMs = 0.0
+      var duckSeen = false        // any duckOnly decision -- strict must never
+      var bOpenAfterMs: Double? = nil  // first time B transmitted
+    }
+    /// Two floors, one hop apart. `cutAt` kills the cue channel both ways.
+    func run(seconds: Double, strict: Bool, cutAt: Double = .infinity,
+             speakers: Bool = true,
+             voice: (Int, Double) -> Voice) -> Tally {
+      let fa = Floor(), fb = Floor()
+      fa.cfg.strict = strict; fb.cfg.strict = strict
+      fa.yieldsOnTie = true; fb.yieldsOnTie = false
+      fa.speakers = speakers; fb.speakers = speakers
+      fa.noteFar(.quiet); fb.noteFar(.quiet)
+      var pa: [(due: Double, v: Voice)] = [], pb: [(due: Double, v: Voice)] = []
+      var t = 0.0, tally = Tally()
+      while t < seconds {
+        var open = [false, false]
+        for i in 0..<2 {
+          let f = i == 0 ? fa : fb
+          var pending = i == 0 ? pa : pb
+          var still: [(due: Double, v: Voice)] = []
+          for p in pending { if p.due <= t { f.noteFar(p.v, transitMs: owdMs) } else { still.append(p) } }
+          pending = still
+          if i == 0 { pa = pending } else { pb = pending }
+          let v = voice(i, t)
+          let d = f.step(dt: dt, near: v)
+          open[i] = d.mayTransmit || d.duckOnly
+          if d.duckOnly { tally.duckSeen = true }
+          if t < cutAt {
+            let hop = (due: t + owdMs / 1000, v: v)
+            if i == 0 { pb.append(hop) } else { pa.append(hop) }
+          }
+        }
+        if open[0] && open[1] { tally.bothOpenMs += dt * 1000 }
+        if open[0] { tally.aOpenMs += dt * 1000 }
+        if open[1] { tally.bOpenMs += dt * 1000; if tally.bOpenAfterMs == nil { tally.bOpenAfterMs = t * 1000 } }
+        if (voice(0, t) == .claim || voice(1, t) == .claim) && !open[0] && !open[1] {
+          tally.noneOpenWhileClaimMs += dt * 1000
+        }
+        t += dt
+      }
+      return tally
+    }
+    let hop = owdMs
+
+    // 1. CLEAN ALTERNATION. A talks 0-2, B talks 2.5-4.5. In strict the pause
+    //    belongs to nobody and NOTHING overlaps, ever.
+    let alt: (Int, Double) -> Voice = { i, t in
+      if i == 0 { return t < 2.0 ? .claim : .quiet }
+      return (t >= 2.5 && t < 4.5) ? .claim : .quiet
+    }
+    let s1 = run(seconds: 5, strict: true, voice: alt)
+    say(s1.bothOpenMs == 0, "alternation: not one block of both microphones (\(Int(s1.bothOpenMs)) ms)")
+    say(!s1.duckSeen, "alternation: the duck does not exist in strict")
+    let s1soft = run(seconds: 5, strict: false, voice: alt)
+    say(s1soft.bothOpenMs > 100,
+        "REJECT: soft opens both through the pauses (\(Int(s1soft.bothOpenMs)) ms) -- the meter can see")
+
+    // 2. INTERRUPTION. B barges into A's turn and keeps going. The interrupter
+    //    is SILENT until the floor flips (no duck), and the overlap at the flip
+    //    is bounded by the hop, not by politeness.
+    let barge: (Int, Double) -> Voice = { i, t in
+      if i == 0 { return t < 4.0 ? .claim : .quiet }
+      return t >= 1.0 ? .claim : .quiet
+    }
+    let s2 = run(seconds: 6, strict: true, voice: barge)
+    say(s2.bothOpenMs <= 2 * hop + 30,
+        "barge-in: overlap bounded by the hop (\(Int(s2.bothOpenMs)) ms <= \(Int(2 * hop + 30)))")
+    say(!s2.duckSeen, "barge-in: held means silent, never ducked")
+    say(s2.bOpenMs > 1000, "barge-in: the interrupter does get the floor (\(Int(s2.bOpenMs)) ms)")
+    let s2soft = run(seconds: 6, strict: false, voice: barge)
+    say(s2soft.duckSeen, "REJECT: soft ducks the interrupter -- the meter can see")
+
+    // 3. SIMULTANEOUS START. Both take an empty floor inside one hop; the
+    //    deadlock break silences exactly one. This is the window strict cannot
+    //    remove, and the bound is stated rather than hidden: deadlockMs + hops.
+    let together: (Int, Double) -> Voice = { _, t in t >= 1.0 ? .claim : .quiet }
+    let s3 = run(seconds: 6, strict: true, voice: together)
+    say(s3.bothOpenMs <= 450 + 2 * hop + 30,
+        "simultaneous start: overlap inside deadlock + hops (\(Int(s3.bothOpenMs)) ms)")
+    say(s3.bothOpenMs > 0, "REJECT: the collision is real (otherwise this proves nothing)")
+    say(s3.noneOpenWhileClaimMs <= 2 * hop + 30,
+        "simultaneous start: never both silent beyond a hop (\(Int(s3.noneOpenWhileClaimMs)) ms)")
+
+    // 4. DEAD CUE CHANNEL. Cues stop mid-call. Strict may not open the
+    //    listener; the talker keeps talking on their own evidence.
+    let cutTalk: (Int, Double) -> Voice = { i, t in
+      i == 0 && t < 6.0 ? .claim : .quiet
+    }
+    let s4 = run(seconds: 6, strict: true, cutAt: 2.0, voice: cutTalk)
+    say(s4.bothOpenMs == 0, "dead cues: still not one block of both (\(Int(s4.bothOpenMs)) ms)")
+    say(s4.aOpenMs > 5500, "dead cues: the talker never loses the floor (\(Int(s4.aOpenMs)) ms)")
+    say(s4.bOpenMs == 0, "dead cues: the silent listener stays silent")
+    let s4soft = run(seconds: 6, strict: false, cutAt: 2.0, voice: cutTalk)
+    say(s4soft.bothOpenMs > 200,
+        "REJECT: soft falls back to open on dead cues (\(Int(s4soft.bothOpenMs)) ms) -- the meter can see")
+
+    // 5. THE PEER DIES. A talks, goes silent forever, cues die with it. B must
+    //    still be able to take the floor -- strict must not entomb the call.
+    let orphan: (Int, Double) -> Voice = { i, t in
+      if i == 0 { return t < 2.0 ? .claim : .quiet }
+      return t >= 4.0 ? .claim : .quiet
+    }
+    let s5 = run(seconds: 6, strict: true, cutAt: 2.0, voice: orphan)
+    say(s5.bOpenMs > 1500 && (s5.bOpenAfterMs ?? 9e9) < 4200,
+        "dead peer: the survivor takes the floor at \(Int(s5.bOpenAfterMs ?? -1)) ms (asked at 4000)")
+    say(s5.bothOpenMs == 0, "dead peer: and still never both")
+
+    // 6. THE EAR. While I hold, my speaker is closed -- on headphones too, in
+    //    strict, because the rule is a product statement now. One block after
+    //    the lag it must be shut; in idle it must be open.
+    let e = Floor()
+    e.cfg.strict = true
+    e.speakers = false                        // headphones: the hard case
+    e.noteFar(.quiet)
+    _ = e.step(dt: 0.02, near: .quiet)
+    var de = e.step(dt: 0.02, near: .claim)   // take the floor
+    var waited = 0.0
+    while waited < 0.5, de.playoutOpen { de = e.step(dt: 0.02, near: .claim); waited += 0.02 }
+    say(de.state == .mine && !de.playoutOpen,
+        "holder's ear closes even on headphones (after \(Int(waited * 1000)) ms of lag)")
+    let e2 = Floor()
+    e2.cfg.strict = true
+    e2.noteFar(.quiet)
+    say(e2.step(dt: 0.02, near: .quiet).playoutOpen, "and an idle ear is open")
+
+    // 7. IDLE IS SILENT, TAKING IS INSTANT. The strict pause transmits nothing,
+    //    and the first voice is on the wire in the same block that produced it.
+    let q = Floor()
+    q.cfg.strict = true
+    q.noteFar(.quiet)
+    say(!q.step(dt: 0.02, near: .quiet).mayTransmit, "idle transmits nothing")
+    say(q.step(dt: 0.02, near: .claim).mayTransmit, "and the first voice is out in its own block")
+
+    fputs("FLOOR STRICT CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
+    return ok
+  }
+
   static func selfTest(owdMs: Double = 40, verbose: Bool = true) -> Bool {
     var failures = 0
     func check(_ ok: Bool, _ what: String) {
@@ -746,6 +964,10 @@ extension Floor {
              cutAt: Double = .infinity,
              voice: (Int, Double) -> Voice) -> (Sim, Sim) {
       var a = Sim(), b = Sim()
+      // This harness scripts the SOFT arm; strict runs its own two-end sweep
+      // in `strictSelfTest` with the same hop model.
+      a.floor.cfg.strict = false
+      b.floor.cfg.strict = false
       // The ordering neither end chooses. Exactly one of them yields.
       a.floor.yieldsOnTie = true
       b.floor.yieldsOnTie = false

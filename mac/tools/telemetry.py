@@ -32,7 +32,15 @@ def call_summary(bs, label=""):
     gp, ip = last(bs, "echo_guard_pct", -1), last(bs, "echo_guard_idle_pct", -1)
     guard = (f"idle-guard muted {gp:.0f}% of the call (idle was {ip:.0f}%)"
              if gp >= 0 else "idle-guard: not in this build")
-    print(f"  MIC       floor muted {last(bs,'floor_muted_pct'):.0f}%"
+    # strict (0.95.0): one mic, one speaker, never the same end. `overlap` is
+    # its honesty meter -- on the wire while the far stream also carried voice.
+    st = last(bs, "floor_strict", -1)
+    mode = ("STRICT floor" if st == 1 else "soft floor" if st == 0 else "pre-strict build")
+    ov = last(bs, "strict_overlap_pct", -1)
+    if st == 1 and ov >= 0:
+        mode += f", overlap {ov:.1f}%"
+    print(f"  MIC       {mode}"
+          f"  ·  floor muted {last(bs,'floor_muted_pct'):.0f}%"
           f"  ·  {guard}"
           f"  ·  local gate open {last(bs,'floor_held_pct'):.0f}%")
     trim, rail = last(bs, "mic_trim", 1), last(bs, "mic_gain_rail", 0)

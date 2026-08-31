@@ -881,6 +881,11 @@ final class Audio {
     var floorBlocks = 0            // capture blocks the floor decided at all
     var floorHeldBlocks = 0        // ... in which this end could not transmit
     var floorFallbackBlocks = 0    // ... in which it was running on the local gate
+    /// Strict's own honesty meter: blocks this end was on the wire while the
+    /// far end's DECODED stream also carried voice. The physics window around
+    /// a simultaneous start lives here; anything past deadlock + a hop per
+    /// contest is the rule failing, not the rule's stated cost.
+    var strictOverlapBlocks = 0
     /// Deadlocks this end gave up. Published rather than shown: the far end
     /// publishes the same number for its own side, and the two together say
     /// whether the rule is splitting them evenly or picking on somebody.
@@ -897,6 +902,10 @@ final class Audio {
   private var peerVocalStart: UInt64 = 0
   private var collisionStart: UInt64 = 0
   private var pendingYield: UInt64 = 0
+  /// The yield DECISION's last value, tracked apart from the audible duck: in
+  /// strict the duck is retired but the decision keeps feeding the floor's
+  /// tiebreak, and the counter follows the decision.
+  private var lastWantYield = false
   private var lastOpenAt: UInt64 = 0
   private var wasOpen = true
 
@@ -999,10 +1008,16 @@ final class Audio {
     let wantYield = bothTalking && collisionStart != 0 && Yield.shouldYield(
       collisionMs: Clock.ms(now - collisionStart), gapMs: gap, owed: ledger.owed,
       afterMs: Audio.gate.yieldAfterMs)
-    if wantYield != dgate.yielding {
-      dgate.yielding = wantYield
+    // In strict the 9 dB social duck is retired -- the floor silences the
+    // loser outright -- but the DECISION must keep flowing: `yieldsOnTie`
+    // below is the floor's deadlock tiebreak, and forcing it false at both
+    // ends would let a deadlock resolve to BOTH microphones open. One
+    // decision, two renderings.
+    if wantYield != lastWantYield {
+      lastWantYield = wantYield
       if wantYield { turns.yields += 1 }
     }
+    dgate.yielding = wantYield && !Audio.sharedFloor.cfg.strict
 
     // ── AND THE FLOOR ────────────────────────────────────────────────────────
     //
@@ -1040,6 +1055,11 @@ final class Audio {
     if d.fallback { turns.floorFallbackBlocks += 1 }
     turns.floorHeldBlocks += d.mayTransmit ? 0 : 1
     turns.floorBlocks += 1
+    // Strict's honesty meter: on the wire while the far end's decoded stream
+    // also carries voice. 0.004 is the gate's own `farTalking` bar.
+    if fl.cfg.strict, Audio.floorOn, d.mayTransmit, dgate.farEnvNow > 0.004 {
+      turns.strictOverlapBlocks += 1
+    }
 
     // Choppiness. A gate that opens and shuts inside a third of a second is
     // audible as chopping, and no amount of good intent excuses it.
@@ -2411,6 +2431,10 @@ final class Audio {
     /// so the blue edge is driven by the same sound the ear is receiving, not by
     /// a status byte that says only that they are talking.
     var farLoudNow: Float { Self.loud(farEnv, over: floor) }
+    /// The raw far envelope, for strict's overlap meter. Fed from the DECODED
+    /// stream before the ear, so it reads what the far end is SENDING even
+    /// while this end's speaker is closed.
+    var farEnvNow: Float { farEnv }
     private static func loud(_ env: Float, over noise: Float) -> Float {
       // Never divide by the raw floor: it tracks DOWN into a silent room, and a
       // reference that approaches zero turns room tone into a shout.

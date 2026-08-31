@@ -438,7 +438,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
-  "no-corrveto",
+  "no-corrveto", "floor-soft",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
@@ -3899,6 +3899,9 @@ func applyGateFlags() {
   // The control arm for the correlation veto (0.94.0): the classifier goes back
   // to trusting the level test alone, which is the 0.93.0 behaviour.
   if flag("no-corrveto") { Audio.corrVetoOn = false }
+  // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
+  // -20 dB out-of-turn duck, the open idle, the open fallback.
+  if flag("floor-soft") { Audio.sharedFloor.cfg.strict = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
@@ -4132,7 +4135,10 @@ if flag("turn-test") {
 
 if flag("floor-test") {
   let owd = Double(arg("floor-owd") ?? "40") ?? 40
-  exit(Floor.selfTest(owdMs: owd) && Floor.predictFarSelfTest() ? 0 : 1)
+  let soft = Floor.selfTest(owdMs: owd)
+  let far = Floor.predictFarSelfTest()
+  let strict = Floor.strictSelfTest(owdMs: owd)
+  exit(soft && far && strict ? 0 : 1)
 }
 
 if flag("gate-test") {
@@ -5934,6 +5940,13 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // own fallback reports the fallback as health.
     "floor_fallback_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.floorFallbackBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    // Which floor is in force, and strict's own honesty meter: the share of the
+    // call this end was on the wire while the far end's decoded stream also
+    // carried voice. The stated cost of a simultaneous start is deadlock plus a
+    // hop; anything past that is the rule failing.
+    "floor_strict": Audio.sharedFloor.cfg.strict ? 1 : 0,
+    "strict_overlap_pct": audio.turns.floorBlocks > 0
+      ? Double(audio.turns.strictOverlapBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────
     //
     // `mic_gain_end` was a fact and said 0.15 -- the floor of a loop that had
