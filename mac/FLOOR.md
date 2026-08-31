@@ -39,7 +39,8 @@ silences exactly one. Measured in `Floor.strictSelfTest` with the hop modeled:
 last window is counted on every live call as `strict_overlap_pct`.
 
 `--floor-soft` is the control arm and restores the 0.94.0 behaviour described
-below.
+below. The soft rules remain documented because they are the fallback arm and
+the self-tests keep both honest.
 
 ## Interrupting, and the 1150 ms nobody could see (0.99.0)
 
@@ -106,8 +107,7 @@ every camera-off call slower than it was. `--no-mouth` is the control arm.
 
 **Not yet done:** the signal is local only. Crossing it to the far end — so the
 holder's own release can be informed by seeing that somebody else has started
-talking — is a protocol change and a separate release. The soft rules remain documented because they are the fallback arm and
-the self-tests keep both honest.
+talking — is a protocol change and a separate release.
 
 ## What is wrong with the gate we ship today
 
