@@ -62,8 +62,11 @@ PY
 # meera reachable, arjun not, dad unknown (absent) -- all three states on screen.
 export TK_PRESENCE_FAKE="meera=1,arjun=0"
 
+# --no-relocate: an INSTALLED Kin.app run through this rig would otherwise copy
+# itself toward /Applications and re-exec, and the log this rig reads would end
+# at the hop.
 "$TK" --contacts-fake "arjun,meera,dad" --gui --no-update --no-telemetry \
-  > "$SP/home.log" 2>&1 & PIDS="$PIDS $!"
+  --no-relocate > "$SP/home.log" 2>&1 & PIDS="$PIDS $!"
 sleep 4
 WID=$(grep -o "window id [0-9]*" "$SP/home.log" | awk '{print $3}' | tail -1)
 fail=0
