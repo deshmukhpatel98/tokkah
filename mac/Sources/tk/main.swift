@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.93.0"
+let VERSION = "0.102.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -427,7 +427,7 @@ let KNOWN_FLAGS: Set<String> = [
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
-  "no-ring-preview", "incoming-key",
+  "no-ring-preview", "incoming-key", "with",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "callee-away",
   // A call that outlives its process is on by default and has to be switchable
@@ -438,6 +438,9 @@ let KNOWN_FLAGS: Set<String> = [
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
+  "no-corrveto", "floor-soft",
+  "no-mouth", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
+  "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
   "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
@@ -474,7 +477,7 @@ let KNOWN_FLAGS: Set<String> = [
 // Not moved -- this file is top-level code and I have been caught by its
 // ordering twice today. The side effects are skipped instead, which is the part
 // that can actually hurt somebody.
-let TEST_FLAGS = ["gate-test", "ledger-test", "cue-test", "yield-test",
+let TEST_FLAGS = ["gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
                   "subtitle-test", "decimator-test", "headphone-test",
                   "predict-test", "floor-test", "turn-test",
                   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
@@ -747,6 +750,9 @@ let ringPending = arg("incoming") != nil
 // a button that works or does nothing depending on how the call arrived -- and
 // the watcher route is precisely the one nobody would test by hand.
 nonisolated(unsafe) var gOffered: Identity.Ring?
+// Mirrors `gOffered != nil` for the poll loop's cadence (Identity.ringShowing).
+// Set beside EVERY gOffered write; a missed clear costs battery (1 s polls),
+// never correctness.
 // gCalling: WHO AND WHICH ROOM, not just who. A bye is matched on both, and the
 // room is the half a stranger cannot guess -- it was minted for this call minutes
 // ago and only the two ends have ever seen it.
@@ -859,6 +865,20 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   // app that opens no video is the one bug a user notices before any latency.
   Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
 }
+
+// ── THE FIRST THING THIS IMAGE DOES WITH THE ROOM'S NAME ─────────────────────
+//
+// Everything above this line either re-execs or exits, so reaching here means
+// this process IS the call. The room object may still not exist -- the caller
+// warms it when they place a call, but a joiner off a pasted link, a typed name
+// or a resumed call has nobody warming for them, and that first touch is ~1108
+// ms of cold start (CONTACTS.md).
+//
+// As early as the room name is knowable and long before the socket, so the
+// object is being created while this image is still opening the camera. Costs
+// nothing when somebody already warmed it: the route is idempotent and `Warm`
+// asks once per room per process.
+if let r = arg("room") { Warm.room(r, why: "joining") }
 
 // ── A LINK CLICKED WHILE A CALL IS ALREADY UP ────────────────────────────────
 //
@@ -1346,6 +1366,29 @@ func leaveCall() -> Never {
 func closeWindowKeepingCall() -> Never {
   shuttingDown = true
   let held = Resume.holding
+  // ── A CLOSE BEFORE THE CALL EXISTS IS A NO, AND THE OTHER PERSON IS TOLD ──
+  //
+  // "Close keeps the call" is a promise about a call that EXISTS: the record
+  // stays, the far end holds, reopening walks back in. Before the transport
+  // locks there is no record and nothing to walk back into -- closing THIS
+  // window abandons the attempt, and silence about it is a ringing Mac (the
+  // red button never cancelled a ring) or a caller stuck on "Calling…" for
+  // the full no-answer timeout (measured live: answered at 13:57:14, window
+  // closed at :15, caller deaf for two minutes). Whoever this room was being
+  // shared with -- the person being called (`--calling`), the caller whose
+  // ring was answered (`--with`), or the caller still being asked
+  // (`gOffered`) -- gets the same mailbox bye a decline sends.
+  if !held {
+    let who = gCalling?.who ?? arg("with") ?? gOffered?.from ?? ""
+    let room = gCalling?.room ?? (arg("with") != nil ? (arg("room") ?? "") : (gOffered?.room ?? ""))
+    if !who.isEmpty, !room.isEmpty {
+      hangUpAndExit(to: who, room: room, why: "closed-early")
+      // hangUpAndExit returns at once and exits from its own completion
+      // (message out, or the 2 s cap). This thread must only not fall through
+      // to the silent exit below -- the one that told nobody.
+      while true { Thread.sleep(forTimeInterval: 0.1) }
+    }
+  }
   postFinalBeat(why: held ? "closed-holding" : "closed")
   fputs(held ? "window closed -- the call stays open; reopening Kin rejoins it\n"
              : "window closed\n", stderr)
@@ -1585,6 +1628,7 @@ var earlyCam: FrameSource?
 /// drift into showing different pictures or different camera lists.
 func attachCamera(_ cam: CameraSource) {
   cam.onFrame = { pb, _ in
+    Mouth.shared.note(pb)
     // Self-view. Replaced the moment a decoded frame from the far end arrives:
     // vdec.onDecoded shows the remote picture, and this stops once `sawRemote` is
     // set so the two are never fighting over the same surface.
@@ -2094,6 +2138,7 @@ if let from = arg("incoming"), let r = arg("room") {
   gOffered = Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
                            known: !ik.isEmpty && Identity.contacts()[from] == ik,
                            keyChanged: false, kind: nil)
+  Identity.ringShowing = true
   Metrics.count("ring_recv_watch")
   // ── THEY MAY ALREADY HAVE CANCELLED, AND ONLY THE WATCHER KNOWS ───────────
   //
@@ -2117,39 +2162,35 @@ if let from = arg("incoming"), let r = arg("room") {
     handleBye(Identity.Ring(from: from, room: r, t: 0, k: ik, ageMs: 0,
                             known: false, keyChanged: false, kind: "bye"))
   }
-  // ── AND IT CAN ALSO LAND A MOMENT AFTER THAT LINE ─────────────────────────
-  //
-  // The read above is one sample of a file another process writes, so it answers
-  // only for the instant it ran. A cancel that lands between it and this copy's
-  // own first poll would be taken by the watcher, written after we looked, and
-  // waited out in full -- the original bug moved a few hundred milliseconds to
-  // the right. `once-fired-probes-record-transients`: a state read once at
-  // startup is a birth certificate, not a subscription.
-  //
-  // Four times a second, for as long as this copy has something to ask about. It
-  // is one open() of a path that is usually not there, against a window that has
-  // a person looking at it, and it stops mattering the moment `gOffered` is
-  // cleared -- by an answer, a decline, or by the note itself. `.common` mode so
-  // it keeps firing while a menu or a drag is tracking.
-  //
-  // Handed straight to the run loop and not kept in a `let` of its own: a
-  // top-level variable in this file is initialised in file order, and this file
-  // has twice had one silently undone by its own initialiser after a thread had
-  // already written to it. There is nothing here that needs a name.
-  RunLoop.main.add(Timer(timeInterval: 0.25, repeats: true) { _ in
-    guard let o = gOffered, o.kind == nil,
-          Identity.takeCancelNote(from: o.from, room: o.room) else { return }
-    fputs("cancel: @\(o.from) called it off -- the watcher took the message"
-        + " while this copy was still starting up\n", stderr)
-    Metrics.count("bye_note_ringing")
-    handleBye(Identity.Ring(from: o.from, room: o.room, t: 0, k: o.k, ageMs: 0,
-                            known: o.known, keyChanged: false, kind: "bye"))
-  }, forMode: .common)
   DispatchQueue.main.async {
     display?.controls?.showIncoming(from: from, room: r)
     Ringer.start(raising: display?.callWindow)
   }
 }
+// ── EVERY RINGING COPY WATCHES FOR THE NOTE, WHATEVER LAUNCHED IT ────────────
+//
+// This timer lived inside the `--incoming` branch above, which quietly meant
+// the note dance only worked for a watcher-launched card. A resident copy that
+// drew its own card never looked, so a bye drained by any OTHER process --
+// which handleBye now writes as a note instead of dropping -- had a writer and
+// no reader on exactly the path the user hits most. Installed unconditionally:
+// the body is one nil check on a Mac that is not ringing, and one open() of a
+// path that is usually not there on one that is.
+//
+// Four times a second, `.common` mode so it keeps firing while a menu or a
+// drag is tracking; handed straight to the run loop and not kept in a `let` of
+// its own -- a top-level variable in this file is initialised in file order,
+// and this file has twice had one silently undone by its own initialiser after
+// a thread had already written to it.
+RunLoop.main.add(Timer(timeInterval: 0.25, repeats: true) { _ in
+  guard let o = gOffered, o.kind == nil,
+        Identity.takeCancelNote(from: o.from, room: o.room) else { return }
+  fputs("cancel: @\(o.from) called it off -- another copy took the message"
+      + " and left it here\n", stderr)
+  Metrics.count("bye_note_ringing")
+  handleBye(Identity.Ring(from: o.from, room: o.room, t: 0, k: o.k, ageMs: 0,
+                          known: o.known, keyChanged: false, kind: "bye"))
+}, forMode: .common)
 // ── WHO THIS IMAGE IS RINGING ──────────────────────────────────────────────
 //
 // The mirror of `--incoming`, and it exists because placing a call RE-EXECS. The
@@ -2168,6 +2209,18 @@ display?.controls?.onCall = { who in
   // Off main: signing and an HTTPS round trip, on the thread that draws.
   Thread {
     let room = Launcher.mintRoom()
+    // ── WARM THE ROOM WHILE THEIR MAC IS RINGING ──────────────────────────
+    //
+    // A freshly minted room has never been touched, and the first request that
+    // touches it pays ~1108 ms of cold start (CONTACTS.md). That cost used to
+    // land on whichever of the two of us joined first -- i.e. on the caller,
+    // one line after this, in the middle of the moment the product is about.
+    //
+    // Fired HERE and not awaited: `Identity.ring` on the next line is an HTTPS
+    // round trip of its own, so the warm runs underneath it for free and the
+    // object exists by the time either Mac opens a socket. Deliberately not
+    // before the ring -- see rule two in `Warm`.
+    Warm.room(room, why: "call placed")
     Metrics.count("ring_sent_try")
     guard let got = Identity.ring(to: who, room: room) else {
       Metrics.count("ring_sent_fail")
@@ -2241,7 +2294,15 @@ display?.controls?.onAnswerRing = {
   // binding a name to an empty string would poison the contact list.
   if !o.k.isEmpty { Identity.remember(handle: o.from, key: o.k) }
   display?.controls?.setStatus("answering \(Identity.display(o.from))…")
-  Launcher.reexec(room: o.room, extra: ["--video", "camera", "--window"], why: "ring answered")
+  // `--with`: WHO this room is shared with, carried through the re-exec.
+  // `--incoming` is an event and rightly dies at the handoff, but the answered
+  // image then knew nobody -- so when its window was closed before the
+  // transport locked, there was no handle to send the bye to, and the caller
+  // sat on "Calling…" until the no-answer timeout. Measured live, call
+  // 244yp0liz2dio: answered at 13:57:14, closed at 13:57:15, caller deaf for
+  // two minutes. A name is a property of the room, not an event.
+  Launcher.reexec(room: o.room, extra: ["--with", o.from, "--video", "camera", "--window"],
+                  why: "ring answered")
 }
 // Cancelling a call nobody has answered yet. `onLeave` still exists and still
 // just leaves; this one exists because there is a person on the other end whose
@@ -2260,6 +2321,7 @@ display?.controls?.onDeclineRing = {
   let who = gOffered?.from ?? ""
   let room = gOffered?.room ?? ""
   gOffered = nil
+  Identity.ringShowing = false
   // ── A PROCESS THAT EXISTS ONLY TO ASK IS DONE WHEN THE ANSWER IS NO ───────
   //
   // The watcher opens a whole new copy of Kin for each ring, precisely so that
@@ -2439,6 +2501,7 @@ func handleBye(_ r: Identity.Ring) {
     Metrics.fact("outcome", "they hung up before this Mac answered")
     Ringer.stop()
     gOffered = nil
+    Identity.ringShowing = false
     display?.controls?.hideIncoming()
     display?.controls?.setStatus("\(Identity.display(r.from)) hung up")
     fputs("bye: @\(r.from) stopped calling\n", stderr)
@@ -2453,7 +2516,18 @@ func handleBye(_ r: Identity.Ring) {
   // from a call that already ended -- ordinary -- or the two ends disagreeing
   // about which room they are in, which is not.
   Metrics.count("bye_recv_stale")
-  fputs("bye: @\(r.from) hung up on a call this Mac is not on -- ignored\n", stderr)
+  // ── AND NEVER DROPPED. THE DRAIN IS DESTRUCTIVE. ──────────────────────────
+  //
+  // This branch is the app-side twin of the watcher bug cancelrace-check exists
+  // for: whichever process polls first TAKES the message, and a bye taken by a
+  // copy that is not showing that ring used to die right here -- seen live as
+  // "ignored" in this Mac's own log while the other copy rang out a cancelled
+  // call. The note is how it reaches the copy that can use it; `noteCancelled`
+  // already refuses anything but a fresh bye, and the ringing copy's own timer
+  // consumes it under the caller/room/lease guards.
+  Identity.noteCancelled(r)
+  fputs("bye: @\(r.from) hung up on a call this Mac is not on"
+      + " -- left as a note for whichever copy is ringing it\n", stderr)
 }
 
 func startRingingOnce() {
@@ -2482,6 +2556,30 @@ func startRingingOnce() {
     // reaching a reused room could otherwise end a call that had just started.
     guard r.ageMs < 60_000 else { return }
     if r.kind == "bye" { handleBye(r); return }
+    // ── AN IDLE COPY HANDS THE RING TO THE IMAGE THAT CAN SHOW A FACE ───────
+    //
+    // The in-process card below rings with a NAME only. The `--incoming` image
+    // the watcher launches is the one with the caller's live picture on the
+    // card (ringpicture-check) and the cancel-note dance (cancelrace-check) --
+    // and a ring at an app that is already open was the one arrival that
+    // missed it. So an idle, room-less copy re-execs into exactly the image
+    // the watcher would have launched: same argv, same rig coverage, and the
+    // execv drops this copy's mailbox line (CLOEXEC) for the successor to
+    // claim. A bye that lands during the handoff waits in the mailbox -- the
+    // drain is destructive but nothing is draining, which for once is the
+    // safe direction.
+    //
+    // Only when idle. A copy in a room, in a call, or already ringing keeps
+    // the card in-process: consent must never tear down what a person is
+    // already looking at.
+    if r.kind == nil, arg("room") == nil, gCalling == nil, gOffered == nil,
+       !Resume.holding {
+      Metrics.count("ring_reexec")
+      Launcher.reexec(room: r.room,
+                      extra: ["--incoming", r.from, "--incoming-key", r.k,
+                              "--video", "camera", "--window"],
+                      why: "ring from @\(r.from) -- the card with a face on it")
+    }
     if r.keyChanged {
       // The name is one we know and the key is not. Say the name is in doubt
       // rather than dropping it: a reinstall looks exactly like this, and so
@@ -2489,6 +2587,7 @@ func startRingingOnce() {
       fputs("ring: @\(r.from) rang with a DIFFERENT key than we remember\n", stderr)
     }
     gOffered = r
+    Identity.ringShowing = true
     Metrics.count("ring_recv")
     Metrics.mark("ring_recv_ms", sinceLaunch())
     if r.keyChanged { Metrics.count("ring_key_changed") }
@@ -3041,6 +3140,10 @@ if let room = arg("room") {
             Resume.begin(room: room, port: Int(listenPort), peer: peerSpec,
                          video: videoArg, who: arg("calling") ?? arg("incoming") ?? "",
                          call: Telemetry.call, path: wire.lockedFrom)
+            // One location fix per connected call, and this gate is the same
+            // one that makes the call real: a ring preview must never prompt
+            // for anything -- nobody has agreed to talk yet.
+            Geo.shared.noteCallConnected()
           }
           // ── AND THE GAP, IF THIS LOCK IS A RETURN ───────────────────────────
           //
@@ -3895,6 +3998,16 @@ func applyGateFlags() {
   // shipped four times (`one-condition-two-concerns`).
   if flag("no-floor") { Audio.floorOn = false }
   if flag("no-yield") { Audio.gate.yieldOn = false }
+  // The control arm for the correlation veto (0.94.0): the classifier goes back
+  // to trusting the level test alone, which is the 0.93.0 behaviour.
+  if flag("no-corrveto") { Audio.corrVetoOn = false }
+  // The control arm for the visual signal (0.100.0). Audio decides alone, which
+  // is exactly 0.99.0.
+  if flag("no-mouth") { Mouth.on = false }
+  if let th = Double(arg("mouth-threshold") ?? "") { Mouth.moveThreshold = th }
+  // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
+  // -20 dB out-of-turn duck, the open idle, the open fallback.
+  if flag("floor-soft") { Audio.sharedFloor.cfg.strict = false }
   if let v = arg("yield-db"), let d = Double(v) { Audio.gate.yieldDb = d }
   if let v = arg("yield-after"), let d = Double(v) { Audio.gate.yieldAfterMs = d }
   if flag("force-gate") { Audio.gate.on = true; Audio.gateAuto = false }
@@ -4128,7 +4241,19 @@ if flag("turn-test") {
 
 if flag("floor-test") {
   let owd = Double(arg("floor-owd") ?? "40") ?? 40
-  exit(Floor.selfTest(owdMs: owd) && Floor.predictFarSelfTest() ? 0 : 1)
+  let soft = Floor.selfTest(owdMs: owd)
+  let far = Floor.predictFarSelfTest()
+  let strict = Floor.strictSelfTest(owdMs: owd)
+  exit(soft && far && strict ? 0 : 1)
+}
+
+if flag("mouth-test") {
+  if let th = Double(arg("mouth-threshold") ?? "") { Mouth.moveThreshold = th }
+  let media = arg("mouth-media") ?? "../testbed/media/real"
+  exit(Mouth.selfTest(talking: arg("mouth-talking") ?? "\(media)/talkingheadA.mov",
+                      stillPath: arg("mouth-still") ?? "\(media)/mouth-still.mov",
+                      blind: arg("mouth-blind") ?? "\(media)/mouth-blind.mov",
+                      rotated: arg("mouth-rotated") ?? "\(media)/mouth-rot.mov") ? 0 : 1)
 }
 
 if flag("gate-test") {
@@ -4232,7 +4357,65 @@ if flag("gate-test") {
      : "  GATE TEST FAILED" + (!untouched ? " (it altered the near voice)"
                               : !allOk ? " (the classifier never saw a bid at some block size)"
                               : " (it does not suppress enough)"))
-  exit(ok ? 0 : 1)
+
+  // ── THE CORRELATION VETO, ON THE ROOM THAT DEFEATS THE LEVEL TEST ──────────
+  //
+  // A room's coupling is not a constant, and the minimum tracker learns the
+  // QUIETEST moment of it. Vary the coupling and the level test is beaten
+  // honestly: the tracker holds the low ratio, the margin sits under the loud
+  // stretches, and the speaker's own sound is classified as a person. That is
+  // the defect measured live (a listening end's gate open 97% of a call it
+  // spent alone), reproduced here so the veto has a case it must fix -- and a
+  // twin it must NOT touch, because a test that cannot see the defect passes
+  // either way (`green-metrics-can-hide-defects`).
+  var vetoOk = true
+  do {
+    // Far end only. The coupling swings 0.2..0.9 at 0.3 Hz, like a person
+    // shifting in front of a laptop.
+    var emic = [Float](repeating: 0, count: n)
+    for i in 0..<n where i >= 400 {
+      let sway = Float(0.55 + 0.35 * sin(2 * Double.pi * 0.3 * Double(i) / SR))
+      emic[i] = sway * far[i - 400]
+    }
+    func classify(veto: Bool) -> Int {
+      Audio.corrVeto = veto
+      defer { Audio.corrVeto = false }
+      let g = Audio.DuplexGate()
+      g.cfg = Audio.gate
+      var buf = emic
+      buf.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 128 <= n {
+          for k in i..<(i + 128) { g.noteFar(far[k]) }
+          g.process(op.baseAddress! + i, 128)
+          i += 128
+        }
+      }
+      return g.claims + g.backchannels
+    }
+    let leak = classify(veto: false)
+    let fixed = classify(veto: true)
+    print("  the speaker's own sound, coupling swinging 20-90%:")
+    print("    without the veto the classifier called it a voice \(leak)x -- the 0.93.0 leak")
+    print("    with the veto: \(fixed)x")
+    if leak == 0 {
+      print("  VETO CHECK COULD NOT RUN -- the rig no longer reproduces the leak,")
+      print("  so \"fixed\" above proves nothing.")
+      vetoOk = false
+    }
+    if fixed > 0 { vetoOk = false }
+    // What this deliberately does NOT assert: that a latched veto spares a real
+    // near voice. It would not -- the veto kills whatever the level test
+    // passes, by design -- and what spares a person in production is the
+    // estimator WITHDRAWING the veto within one 500 ms tick of their voice
+    // dominating the correlation. That half lives on the estimator thread,
+    // which an offline rig cannot run; forcing the verdict here and calling the
+    // resulting gag a failure would be testing a state the product cannot hold.
+    Audio.corrVeto = false
+    print(vetoOk ? "  VETO CHECK PASSED -- our own speaker is never a voice, and the leak was real"
+                 : "  VETO CHECK FAILED")
+  }
+  exit(ok && vetoOk ? 0 : 1)
 }
 
 // ── BUILT AFTER THE TESTS, BECAUSE IT OPENS THE MICROPHONE ─────────────────
@@ -4761,6 +4944,12 @@ if videoArg != "off", !ringPreview {
         return
       }
       e.encode(pb, hostTime: host)
+      // ── AND THE MOUTH LOOKS AT IT ─────────────────────────────────────────
+      //
+      // After the encoder, so the picture on the wire is never behind a face
+      // detector, and `note` returns immediately in every case: it samples at
+      // 12 Hz and drops rather than queues. See Mouth.swift.
+      Mouth.shared.note(pb)
       // Same single owner as the early-camera path above.
       display?.showSelf(pb)
       if !sawRemote && !peerHere { mdisplay?.show(pb, at: Clock.now()) }
@@ -5137,10 +5326,20 @@ Thread {
     // twentieth of the shortest listening noise and a fiftieth of a bid, under
     // the resolution of the thing being reported, and this thread is asleep for
     // every one of those slices.
-    let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 1.0)
+    //
+    // ── AND THE STEADY BEAT CANNOT EQUAL THE STALENESS LIMIT ─────────────────
+    //
+    // The floor stops believing far cues `staleMs` (1000 ms) after the last one,
+    // and this probe settled to exactly 1000 ms -- zero margin, so one late or
+    // lost probe put the far end's floor into full-open fallback for a second
+    // at a time. Measured on call 8q0nwcduogm2: the TALKING end ran on fallback
+    // for 20.1% of the call, both ears open, which is where the echo lived.
+    // Three probes now fit inside one staleness window; 32 bytes at 3/s is
+    // nothing against a 3 Mbps call.
+    let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 0.3)
     while Date() < until {
       Thread.sleep(forTimeInterval: 0.02)
-      if wire.vocalChanged() || wire.predictCrossed() {
+      if wire.vocalChanged() || wire.predictCrossed() || wire.seenTalkingCrossed() {
         if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
           fputs(String(format: "cue out %.3f  me -> %d\n", Date().timeIntervalSince1970,
                        Audio.sharedGate.vocal.rawValue), stderr)
@@ -5818,6 +6017,12 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "a_mic_rms": audio.micRms,
     "a_clip_pct": audio.micSamples > 0
       ? Double(audio.micClipped) * 100.0 / Double(audio.micSamples) : 0,
+    // How much of the call the correlation veto refused to classify as a voice
+    // -- sound the level test passed and the echo detector recognised as this
+    // machine's own speaker. Zero on a healthy call; the 0.93.0 leak it exists
+    // for would have read ~90% at the listening end.
+    "a_corr_veto_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.vetoFrames) * 100.0 / Double(audio.micSamples) : 0,
     "a_conceal_ms_max": Double(audio.concealMaxRun) * 1000.0 / SR,
     "a_quality_s": audio.qualityTicks,
     "floor_held_pct": audio.floorHeldPct, "mic_access": gMicAccess,
@@ -5856,6 +6061,57 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // own fallback reports the fallback as health.
     "floor_fallback_pct": audio.turns.floorBlocks > 0
       ? Double(audio.turns.floorFallbackBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    // Which floor is in force, and strict's own honesty meter: the share of the
+    // call this end was on the wire while the far end's decoded stream also
+    // carried voice. The stated cost of a simultaneous start is deadlock plus a
+    // hop; anything past that is the rule failing.
+    "floor_strict": Audio.sharedFloor.cfg.strict ? 1 : 0,
+    // ── THE INTERJECTION RESCUE, COUNTED (0.99.0) ───────────────────────────
+    //
+    // `turn_onset_lost` is the defect: whole utterances that never reached the
+    // wire (30 and 20 on the two ends of one 333 s call). These three are the
+    // mechanism that ends it, so a live call can say whether it fired and how
+    // often -- "it never fired" and "it fired and did not help" must never
+    // look the same again.
+    //
+    //   grace_pct     share of the call a real voice was audible over a holder
+    //   grace_onsets  interjections that used it -- each one a deleted utterance
+    //                 under 0.98.0
+    //   fast_takes    floors taken by the 180 ms voice contest rather than the
+    //                 1150 ms claim contest
+    "turn_grace_pct": audio.turns.floorBlocks > 0
+      ? Double(Audio.sharedFloor.graceBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
+    "turn_grace_onsets": Audio.sharedFloor.graceOnsets,
+    "turn_fast_takes": Audio.sharedFloor.fastTakes,
+    // ── THE CAMERA'S SIDE OF TURN-TAKING (0.100.0) ────────────────────────────
+    //
+    // `looks` vs `faces` is the honesty pair: a detector that ran and never
+    // found a face is a different thing from one that never ran, and both are
+    // different from one watching somebody sit in silence. `dropped` is frames
+    // that arrived while the last was still being looked at -- if it climbs,
+    // 12 Hz is too fast for this machine.
+    "mouth_looks": Mouth.shared.report.looks,
+    "mouth_faces": Mouth.shared.report.faces,
+    "mouth_dropped": Mouth.shared.report.dropped,
+    "mouth_moving_pct": (Mouth.shared.report.moving + Mouth.shared.report.still) > 0
+      ? Double(Mouth.shared.report.moving) * 100
+        / Double(Mouth.shared.report.moving + Mouth.shared.report.still) : -1,
+    "mouth_rate": Mouth.shared.rateNow,
+    // What the camera actually bought: voices rescued from the echo veto, and
+    // floors won early because it confirmed them.
+    "mouth_unveto_pct": audio.micSamples > 0
+      ? Double(Audio.sharedGate.unvetoFrames) * 100.0 / Double(audio.micSamples) : 0,
+    "turn_visual_takes": Audio.sharedFloor.visualTakes,
+    // Their camera, arriving over the wire (0.102.0). `seen_releases` is the
+    // number of times this end let go of a finished turn because it SAW them
+    // start, rather than waiting the release window out.
+    "turn_seen_releases": Audio.sharedFloor.seenReleases,
+    "peer_seen_talking": wire.peerSeenTalking == nil ? -1 : (wire.peerSeenTalking! ? 1 : 0),
+    // Makeup gain: how far a distant talker had to be lifted, and the ticks
+    // refused because the room was too noisy to lift anything.
+    "mic_makeup": Double(audio.inputTrim > 1 ? audio.inputTrim : 1),
+    "strict_overlap_pct": audio.turns.floorBlocks > 0
+      ? Double(audio.turns.strictOverlapBlocks) / Double(audio.turns.floorBlocks) * 100 : 0,
     // ── AND THE MICROPHONE'S LEVEL, WHICH DECIDES ALL OF IT ─────────────────
     //
     // `mic_gain_end` was a fact and said 0.15 -- the floor of a loop that had
@@ -5865,6 +6121,17 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // Turn-taking is the product now, so it reports like the product.
     "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
     "turn_to_floor_p50": audio.timeToFloorP50,
+    // ── WHAT THE PERSON FEELS AS "LATENCY DECIDING WHO IS SPEAKING" ──────────
+    //
+    // `turn_to_floor_p50` measures only the utterances the gate classified as
+    // a BID, from the moment it decided that -- so the 700 ms before it could
+    // decide was outside the ruler, and it read 0 ms through the call this was
+    // reported on. This one starts at the first block of voice, whatever the
+    // classifier calls it yet, and stops when the floor lets it out.
+    // `turn_onset_lost` is the utterances that never got out at all, which no
+    // percentile can carry.
+    "turn_onset_to_wire_p50": audio.onsetToWireP50,
+    "turn_onset_lost": audio.turns.onsetsLost,
     "turn_collisions": audio.turns.collisions,
     "turn_collision_ms": audio.turns.collisionMs,
     "turn_yielded": audio.turns.yieldedToPeer, "turn_peer_yielded": audio.turns.peerYielded,

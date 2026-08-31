@@ -5,6 +5,478 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.102.0 — 2026-08-31
+
+### Added — the camera signal now crosses the wire, and it can beat its own audio
+
+0.100/0.101 were local-only: each Mac watched its own camera and the far end
+learnt nothing. `ST_SEEN_TALKING` (status bit 64) carries it, with its own
+edge-triggered flush so it never waits on a periodic carrier.
+
+The point is not that it is fast. **A mouth opens for a vowel some tens of
+milliseconds before sound leaves it**, so the cue can arrive at the far end
+*before the audio of the same word would have* — one network hop paid out of
+the pre-speech lead instead of added on top. It is the only mechanism in this
+project that can make a handover cost nothing rather than merely cost little.
+
+What the receiver may do with it is deliberately one thing: a holder who has
+already stopped talking lets go **on sight**. Measured in the two-end rig:
+their camera releases a finished turn in **0 ms**, against 400 ms waiting the
+window out. Three rows guard the rest, all passing:
+
+- a peer that *cannot* say (older build, no camera, dark room) reads as `nil`
+  and waits the ordinary 400 ms — absence of evidence is never silence
+- nothing is booked to a camera that said nothing
+- **a talking holder keeps the floor however loudly their camera disagrees** —
+  the signal can collapse a wait, never cut a sentence
+
+### Added — a distant talker can finally be heard
+
+Reported as *"if the mic is far away, it is failing to capture the speaking
+person"*, and the cause was not tuning: **every path in the level loop was
+`min(1, …)`**. The trim could only ever turn a microphone *down*. A talker
+peaking at 0.06 got no help, because the device volume knob is the only makeup
+path, most microphones do not expose one, and it caps at 0.95 regardless. The
+old rig even asserted the ceiling — *"never climbs past unity, which would be a
+gain"* — which was right while the only failure was a mic five times over full
+scale, and exactly wrong for this one.
+
+One target now (speech peaking at −5 dBFS), sought from either side, with a
+dead band between so a healthy microphone is never touched. Measured: a mic
+peaking at **0.06 is lifted 8× (+18 dB) to land speech at 0.48** — the level a
+near talker gets. Three guards, each with a REJECT row that fails when removed:
+
+- **speech only** — the loop already required 3 s of confirmed voice, so room
+  tone is never amplified
+- **not while the echo veto is claiming the mic** — a gain on our own
+  loudspeaker is the last thing anybody needs
+- **15 dB SNR minimum** — a voice only 6 dB over a noisy room is *not*
+  amplified, because that produces loud noise rather than a clear voice
+
+Bounded at +18 dB, and it comes back down: leaning in again takes 8.0× → 0.34×.
+The learned value persists per device, so a habitually distant mic starts the
+next call already lifted.
+
+### Measured — video latency is already at its floor, and a CPU "optimisation" was a pessimisation
+
+Video was checked before being touched, and there is nothing to win: **g2g p50
+14.6 ms** on a real call (encode 4.7, decode 1.6), 0 freezes over 150 ms, 30 fps
+solid, 3 frames lost in 10,194, jitter-queue depth 1–2. The dominant remaining
+term is the 33 ms frame interval itself, so the only real lever is frame rate,
+not the pipeline.
+
+CPU on a two-way 720p30 call measures **0.162 CPU-s/s**, and the lip detector
+adds **0.028–0.034 (≈20%)**. The obvious saving — hand Vision a small luma-only
+copy instead of a 720p frame — was built, measured, and **reverted**:
+
+| Vision input | cost |
+|---|---|
+| native 420v, no scaling | **2.90 ms/look** |
+| grayscale 1280 wide | 4.58 ms/look |
+| grayscale 320 wide | 7.17 ms/look |
+| grayscale 240 wide | 10.65 ms/look |
+
+Monotonically worse the smaller it got — the cost is not proportional to pixels.
+Vision has a fast path for the biplanar format the camera already produces, and
+a single-plane grayscale buffer leaves it. Recorded in `Mouth.swift` because it
+is the first thing anybody will try. Also noted: the rig's own run-to-run noise
+is ~8% of total CPU, which is why the per-look measurement was used to decide
+rather than the A/B.
+
+## Kin 0.101.0 — 2026-08-31
+
+### Fixed — the visual signal was measured in a frame that turns with the camera
+
+0.100.0 took the **vertical extent** of the inner lips. The rig arm added
+straight afterwards found what that costs: the same talking clip turned 90°
+still had its face detected in **100%** of frames — Vision does not need the
+orientation hint to *find* a face — while the talking verdict fell from 100% to
+**86%**, because "vertical extent" had quietly become partly mouth *width*.
+
+That is a defect no orientation search can catch, which is why the search built
+for it was the wrong answer: nothing fails, every face is still found, and the
+signal simply gets worse. A Mac camera does not deliver `.up`, and a rig binary
+on this machine is refused the camera outright (TCC binds the grant to code
+identity), so the live rotation is not testable here at all — the code had to
+stop depending on knowing it.
+
+Aperture is now measured on the **lip contour's own two axes**: mouth opening
+over mouth width, from a closed-form 2×2 eigen-decomposition of the point
+cloud in image pixels. Dimensionless, and identical under any rotation, scale,
+or distance from the camera. The mouth normalises itself, so no face-height
+term is needed either.
+
+It is also a **better** signal, not merely a safer one:
+
+| | talking p50 | still p90 | separation | rotated verdict |
+|---|---|---|---|---|
+| 0.100.0 (vertical extent) | 0.09 | 0.02 | 4.4× | 86% |
+| 0.101.0 (own axes) | 0.63 | 0.08 | **7.9×** | **96%** |
+
+Talking now reads as moving 100% of the time and the same face held still 0%.
+
+The threshold moved 0.03 → **0.15**, and the reason is worth naming: changing
+the measure changed the **units** (aperture-ratio per second, not face-heights
+per second), and the old constant survived the change looking perfectly
+reasonable — it called a face sitting perfectly still "moving" 31% of the time.
+That is `stale-constants-after-a-codec-win`, one release later.
+
+The orientation search stays as a cheap safety net, and the rig now records
+that Vision needed no hint rather than asserting it must have searched — the
+row that claimed otherwise was asserting something false.
+
+## Kin 0.100.0 — 2026-08-31
+
+### Added — the app can see who is talking
+
+Every turn-taking bug in this project has one root, and Audio.swift has stated
+it in writing for months: *at the instant of decision, an interruption and an
+echo are the same signal.* They are the same **acoustic** signal. A loudspeaker
+has no mouth.
+
+`Mouth.swift` watches the camera the call already runs — Apple's Vision
+framework, so no dependency to vendor and no model to ship — and measures the
+**rate of change** of lip aperture, normalised by the face's own bounding box.
+Not "is the mouth open": a person sitting open-mouthed is not speaking, a
+person mid-consonant has it shut, and mouth shapes differ enormously between
+faces. What separates speech from a face at rest is that the aperture keeps
+changing, roughly a syllable at a time.
+
+Measured on real talking-head footage at 12 Hz: talking rate p50 **0.09**
+face-heights/s against the same face held still at p90 **0.02** — 4.4× apart,
+face found in 100% of frames, and 0% in a clip with no face in it. The
+threshold was read off that measurement, and **the first guess was wrong by
+4×** — it sat above the talking p90 and called a speaking face silent 100% of
+the time while passing every other arm in the rig. `--mouth-test` sweeps
+neighbouring thresholds on every run so the constant stays visible rather than
+becoming folklore.
+
+Three states, and the third is load-bearing: `moving`, `still`, and
+**`unknown`** — no face, no camera, no frame, a failed request. Only the first
+two influence anything, because `blind-instruments-report-negatives` would
+otherwise turn every dark room into "this person is not talking".
+
+The signal is allowed to do exactly two things, both of which can only open a
+microphone or speed up a handover:
+
+- **Withdraw the echo veto.** 0.94.0 shipped with a stated risk: a real voice
+  quieter than the echo it sits under gets gagged for an estimator tick, and no
+  acoustic threshold can fix it. A visible moving mouth overrules the
+  correlation — and only ever in that direction.
+- **Shorten the floor contest** from 180 ms to 80 ms, because two independent
+  signals need less of each. Rig: a camera-confirmed voice takes the floor in
+  **60 ms**, against 160 ms on audio alone and 1150 ms in 0.98.0.
+
+It can never mute anybody, and a blind detector reverts everything to 0.99.0
+exactly — asserted as a REJECT row in `strictSelfTest` ("blindness costs
+nothing", 160 ms unchanged), alongside a row proving a blind camera cannot take
+the floor from whoever holds it. `--no-mouth` is the control arm.
+
+Cost: ~2.9 ms of CPU per look — an upper bound, since the measuring rig also
+decoded the video — or about 0.035 CPU-s/s at 12 Hz against a 720p call's 0.16.
+Frames that arrive while the last is still being looked at are dropped and
+counted, never queued: a queued verdict describes a face that has already
+stopped talking.
+
+Every beat now carries `mouth_looks` / `mouth_faces` (which separate "never
+ran" from "ran and saw nobody" from "saw somebody sitting quietly"),
+`mouth_moving_pct`, `mouth_dropped`, `mouth_unveto_pct` and
+`turn_visual_takes`, and the telemetry summary gains a `CAMERA` line.
+
+**Not yet crossed to the far end.** The holder's own decision to release early
+would benefit from seeing that somebody else has started talking; that is a
+protocol change and a separate release.
+
+## Kin 0.99.0 — 2026-08-31
+
+### Fixed — interrupting took 1150 ms, so short interjections were deleted
+
+Measured on a 333 s two-person call (`2p183qa061zcu` / `2adf00o87punm`, 0.98.0):
+140 collisions and **50 whole utterances that never reached the wire at all** —
+onset-to-wire p50 was 0 ms, so every utterance was either instant or entirely
+gone. Reported as "it is still cutting people in between and words are dropping
+while they speak".
+
+The arithmetic behind the second everyone could feel: taking the floor from a
+holder required `nearClaimMs >= deadlockMs` (450 ms), and `nearClaimMs` only
+starts counting once the classifier promotes a voice to `.claim`, which needs
+`claimMs` (700 ms) of sustained sound. **1150 ms** before an interruption was
+formally allowed — and in strict mode every one of those milliseconds is
+silence, not a duck. Anything shorter than that was not delayed, it was
+deleted: "yeah", "no", "wait", every "mm-hm".
+
+Three changes, and they work as one:
+
+- **The contest runs on voice, from its first block** (`nearVoiceMs`), not on
+  a 700 ms-old `.claim` verdict, and at **180 ms** instead of 450. Measured in
+  the two-end rig: the floor changes hands after **160 ms** of voice.
+- **The onset grace window** keeps that voice audible while the contest
+  resolves, bounded at 400 ms. A 300 ms interjection now loses **0 ms** where
+  0.98.0 lost all 300. This could not have shipped before 0.94.0: opening a
+  microphone on "any near voice" over a live loudspeaker used to mean opening
+  it on this machine's own echo, and the correlation veto is what tells those
+  apart — a vetoed block classifies as `.quiet`, which is the one input the
+  window refuses.
+- **An "mm-hm" is heard again.** It still cannot take the floor from the person
+  talking; it is simply no longer held back. The self-test row that asserted it
+  was inaudible encoded the defect and now asserts both halves.
+
+### Fixed — the turn-end predictor fired twenty times a second
+
+`farPredArmed` was set whenever the far end's prior dipped below the threshold
+and **never cleared when it fired**, so every subsequent block above the
+threshold fired again. The same call recorded **6838 far releases** and a
+claimed saving of **2,623,182 ms** — 7.9× the length of the call. That number
+was not a win, it was a state machine thrashing between `theirs` and `idle`
+twenty times a second, which the other end recorded as 241 choppy gate flaps.
+Now disarmed on fire: 25 releases over 50 dip-rise cycles in the rig, and the
+comment's "armed once per hold" is finally true.
+
+### Added — the interjection rescue is counted
+
+`turn_grace_pct`, `turn_grace_onsets` and `turn_fast_takes` ride every beat, so
+a live call says whether the rescue fired and how often — "it never fired" and
+"it fired and did not help" can no longer look the same. The telemetry summary
+gains an `INTERJECT` line.
+
+### Changed — the speaking edge is thick enough to feel
+
+On the user's instruction: the hairline was "really hard to spot, and you have
+to constantly look at [it]... you should FEEL, yes, your voice is going
+through." Width is now the felt channel — 1.5 pt at rest, 3 pt listening,
+4.5–8 pt while speaking and moving with your own syllables. Still a line and
+never a light: `floor-check`'s halo band moved past the widest stroke and now
+measures the ring just inside it as **unchanged from rest** (−4.933 vs −4.935),
+which is stricter proof than the old band gave.
+
+## Kin 0.98.0 — 2026-08-31
+
+### Fixed — the second of delay was the app deciding who is speaking, in four places
+
+Reported as "a delay of one second... latency in deciding who is speaking, not
+in actual transportation of voice", and that diagnosis was exactly right: the
+media path measures **17 ms** mouth-to-ear on these calls. The wait was in the
+turn layer, and it was four separate things stacked on one another. Measured on
+real recorded speech through the real gate and floor (`--turn-test`), the time
+from a person starting to talk to being on the wire **when taking the turn**
+fell from **395–547 ms to 101–112 ms**, and to **0 ms** for the end that was
+not being talked over.
+
+- **Any voice takes an empty floor.** Every vocalisation begins life classified
+  as a continuer, and the classifier needs 700 ms to call it a bid. "A
+  backchannel does not take the floor" was written when a pause still
+  transmitted; under strict's silent pause it meant the first 700 ms of every
+  sentence was dead air. From `idle` there is nobody to protect, so the first
+  block of any voice takes it. An "mm-hm" over somebody who *holds* the floor
+  still does not move it — that is what the rule was actually for, and it is
+  asserted both ways. `Floor.Cfg.idleTakesAnyVoice` is the control arm.
+- **A fast "voicing now" bit crosses the wire** (`ST_VOICING`, 120 ms
+  hangover) beside the cue, which carries a 450 ms one so a breath between
+  words cannot end a turn. One bit was answering two questions: the drawing
+  needs the hangover, the floor must not have it. Older builds leave it clear
+  and behave exactly as before.
+- **The holder's own audio going silent is the fastest witness of all.** It
+  needs no cue, no hangover and no protocol — the listener is already playing
+  that stream. 60 ms of silence in it, while somebody at this end is talking,
+  releases the floor. And the same silence is no longer charged for twice: a
+  release proven by either witness no longer waits a further 120 ms.
+- **A microphone whose own speaker is closed is no longer suppressed.** The
+  level-based echo suppression was still attenuating a person the floor had
+  *already* put on the wire — measured as a speaker holding the floor, floor
+  gain 1.0, and inaudible because the echo gate held them at zero. Worst for a
+  quiet voice far from the mic, which is where it was reported. It relaxes only
+  once this machine's speaker is shut, which is the strongest form of the
+  argument: no acoustic path, so nothing arriving can be echo. The classifier's
+  echo test is untouched — deciding whether a sound may *claim* the floor still
+  needs it, and the correlation veto still sits beside it.
+
+Live calls now report `turn_onset_to_wire_p50` and `turn_onset_lost`: the old
+`turn_to_floor_p50` started counting only once the gate had already decided a
+voice was a bid, so it read 0 ms through the very call this was reported on.
+
+### Fixed — the edge you were told to feel, but had to look for
+
+"Really hard to spot, and you have to constantly look at them... you should
+FEEL, yes, your voice is going through. Maybe a thicker bar." Width is now the
+channel: speaking, the stroke is 4.5–8 pt and moves with your own syllables;
+listening, a calm 3 pt; nobody's turn, the original hairline. Fast to widen (a
+first syllable is news), slow to narrow (a breath must not flutter the frame).
+Still no glow, no shadow, no gradient, and nothing painted over the picture —
+that refusal stands, and `glass-check` still passes.
+
+### Fixed — the microphone trim regulated to the loudspeaker
+
+Both ends of the 14:22 call sat at the trim rail (0.17 and 0.06, i.e. −24 dB)
+with a person underneath tuned toward inaudibility, and 0.96.0's persistence
+carried the cut into the next call. The trim now learns nothing while the echo
+detector says the microphone is mostly this machine's own speaker, walks back
+up three times faster when the room is quiet (about fifteen seconds instead of
+minutes), and a stored trim is floored at 0.3 on load — a deeper one is more
+likely last call's loudspeaker than this microphone.
+
+### Fixed — `--turn-test` was measuring a room the product never builds
+
+Three rig faults, each of which looked exactly like a product defect. It fed
+the far-end reference as one RMS per block where the app feeds a per-sample
+peak envelope, understating it by the crest factor of speech, so the echo bar
+sat four times too low and each end classified the other's echo as its own
+voice — that alone reported 35% of a speaker silenced. It injected room echo
+into a microphone whose speaker the floor had closed, so a holder heard itself
+and claimed through its own silence for 8345 consecutive blocks. And it ended
+an "utterance" at the first quiet 0.33 ms block, counting 201 glottal periods
+as 201 late sentences. It now also runs soft and strict as separate arms judged
+on what each one promises, prints the pre-0.98.0 rule beside the new one, and
+fails if that arm is *not* measurably worse — a ruler that cannot see the
+defect it certifies is worth nothing.
+
+## Kin 0.97.0 — 2026-08-31
+
+### Fixed — closing a window before the call connected told nobody
+
+"Close keeps the call" is a promise about a call that exists. Before the
+transport locks there is nothing to keep, and the red button told nobody:
+closing a "Calling…" window never cancelled the ring, and closing an
+answered-but-not-yet-connected window left the caller on "Calling…" until the
+no-answer timeout. Measured live (call `244yp0liz2dio`): the callee answered
+at 13:57:14, closed the window at 13:57:15, and the caller transmitted
+2.4 Mbps at a dead socket for two minutes with `opened` frozen at 50.
+
+A pre-connect close now sends the same mailbox bye a decline sends — the
+caller gets the ordinary "can't talk right now" card within a poll. To make
+that possible the answered image finally knows WHO it was answering:
+`--with <handle>` rides the answer re-exec (`--incoming` is an event and
+rightly dies there; who the room is shared with is a property of the room),
+and is stripped at every later re-exec so a fresh room can never inherit an
+old name. A connected call keeps today's behaviour: close, reopen, walk back
+in. `calling-check` grew the two arms: closing a Calling… window cancels, and
+closing an answered-unconnected window tells the caller.
+
+## Kin 0.96.0 — 2026-08-31
+
+### Fixed — a cancelled call rang on at the other end
+
+Measured live (calls `odfvn792xwxx` → `jqgqxwt6jn6l`): the caller cancelled,
+the mailbox was told instantly, and the callee rang on — the cancel landed
+**6.8 s after the ring**, and an earlier one was drained by a copy of Kin that
+was not showing that ring and dropped ("hung up on a call this Mac is not on —
+ignored", in this repo's own logs). Four fixes, one per hole:
+
+- **A second app copy no longer polls the mailbox.** The drain is destructive;
+  two copies ate each other's messages, spent the shared arming budget, and
+  crowded the four held-poll slots. A copy that does not win the line now
+  waits behind the holder exactly like the watcher does, and inherits it
+  within a second of the holder dying.
+- **A drained bye that this copy cannot use is written as a cancel note, never
+  dropped** — the app-side twin of the watcher bug `cancelrace-check` exists
+  for. And **every ringing copy now watches for notes**: the 4 Hz note timer
+  only existed on the watcher-launched path before, so the resident path had
+  a writer and no reader.
+- **The line lock is close-on-exec.** Placing and answering calls re-exec, and
+  execv inherits plain fds — the new image carried the old image's flock as an
+  orphan it could not see and then waited behind itself.
+- **While a ring card is up, the fallback poll cadence is 1 s, not 5.** A
+  cancel is only ever sent during a ring; bounded (rings last ≤ 45 s) and rare
+  (held polls remain instant when the server holds). `ring_poll_slow` /
+  `ring_poll_fail` now count the fallback itself — a Mac answering cancels
+  late is no longer indistinguishable from a healthy one.
+
+### Fixed — a ring at an open Kin showed a name, never the caller's face
+
+The `--incoming` image the watcher launches shows the caller's live video on
+the ring card before anybody answers (`ringpicture-check`, still green). A
+ring that arrived at an **already-open, idle** Kin drew its own card in-process
+— no preview join, no face, and none of the cancel-note machinery. An idle,
+room-less copy now re-execs into exactly the image the watcher would have
+launched: same argv, same rig coverage. A copy in a room, in a call, or
+already ringing keeps the in-process card — consent must not tear down what a
+person is looking at.
+
+### Added — one location fix per connected call
+
+For the launch phase: calls will happen from other people's Macs, and latency
+numbers mean nothing without the distance they crossed. When the transport
+locks on a real call — never at launch, never for a ring preview — Kin asks
+CoreLocation once, at kilometre accuracy, and writes `geo_lat`/`geo_lon`
+(2 decimals ≈ 1.1 km) and `geo_acc_km` to the beat; a denial writes `geo_err`
+instead, so "no number" and "never asked" stay distinguishable. The telemetry
+summary gains a `WHERE` line per end and a `RING` line that names what stopped
+a ring and how late the cancel landed.
+
+## Kin 0.95.0 — 2026-08-31
+
+### Changed — the floor is strict: one microphone, one loudspeaker, never the same end
+
+The user's decision, verbatim: "only one mic is enabled at any given moment in
+time, and only one speaker is enabled, and it can't be the same person's."
+The turn machinery is unchanged — who holds, who releases, the deadlock break,
+the predictor, the ceiling — but its verdict is rendered without the soft
+edges 0.94.0 still had:
+
+- Out of turn is **silent**, not ducked at −20 dB. A barge-in crosses as a cue
+  and flips the floor; until it flips the interrupter is not heard.
+- A pause transmits **nothing**. The first voice takes the floor locally in
+  its own block, so the first speaker still pays nothing.
+- A dead cue channel **holds roles** instead of opening both mics. The holder
+  keeps talking on its own evidence; a blind holder reads as quiet and the
+  listener takes the empty floor in `releaseMs` (survivor of a dead peer
+  speaks 9 ms after asking, in the self-test).
+- The holder's **speaker is closed on every route**, headphones included.
+
+The two-end self-test, with the network hop modeled at 40 and 100 ms, measures
+0 ms of double-open in clean alternation (soft: 200 ms), one hop at a barge-in
+(40 ms), and deadlock-plus-hops at a genuinely simultaneous start (480 ms) —
+the one window physics keeps. Every live call now reports `floor_strict` and
+`strict_overlap_pct` (on the wire while the far stream also carried voice),
+and each strict scenario has a soft REJECT twin so the meter is proven able to
+see the defect it guards. `--floor-soft` is the control arm and is exactly the
+0.94.0 behaviour, kept for A/B on live calls and as the rollback that needs no
+reinstall.
+
+## Kin 0.94.0 — 2026-08-31
+
+### Fixed — the listening end's own speaker was classified as its person talking
+
+Measured on the first two-room 0.93.0 call (pair `8q0nwcduogm2`): the listening
+end sat alone with a healthy microphone and its voice gate was **open 97% of
+the call** — the only sound in that room was its own speaker. The level test
+cannot win there by design ("suppress less rather than gate somebody"), so the
+leak was classified a bid, and the floor answered with the −20 dB *duck*
+instead of the mute. A faint copy of the talker's own voice came back for the
+whole call. Echo correlation peaked 0.62/0.65 at the two ends.
+
+The echo detector already computes the evidence the level test lacks: a
+normalized correlation between this microphone and this machine's own playout
+(unrelated speech ≈ 0.26, a real echo lock 0.65–0.76, every 500 ms). While it
+reads ≥ 0.45 — the same number the telemetry has always called "speaker fed
+the mic" — the classifier now refuses to call that sound a voice. No cue
+crosses the wire, no claim takes the floor, the idle guard is no longer
+bypassed, and the floor mutes fully instead of ducking. The veto is withdrawn
+the moment a computation stops saying "echo" — a real voice wins it back
+within one tick of dominating the microphone — and a computation older than
+1.5 s clears it, so silence cannot gag the first word after it. Samples it
+kills are counted (`a_corr_veto_pct`); `--no-corrveto` is the control arm.
+The gate self-test reproduces the leak with a swinging room coupling and must
+see the defect with the veto off for the fixed arm to mean anything.
+
+### Fixed — the cue heartbeat had zero margin against the staleness limit
+
+The floor stops believing far cues 1000 ms after the last one, and the probe
+carrying them settled to exactly one per second. One late or lost probe put
+the far floor into full-open fallback — both ears open, both mics allowed —
+for a second at a time. On the same call the **talking** end ran on fallback
+for 20.1% of the call, which is where much of the echo lived. The steady probe
+now fires every 300 ms: three fit inside one staleness window, 32 bytes at
+3/s against a 3 Mbps call.
+
+### Fixed — a hot microphone re-taught the trim from scratch every call
+
+The software trim converged to its rail (0.11) and the beat still recorded a
+post-trim call-max peak of 3.08: the first sentence of every call shipped ~3×
+over full scale while the loop re-learned what it knew yesterday. The learned
+trim is now kept per device UID (`trim.json`) and applied from the first
+sample of the next call; the existing relax path walks a stale entry back up,
+so a microphone whose owner fixed its input gain is quietly forgiven.
+
 ## Kin 0.93.0 — 2026-08-31
 
 ### Added — the far end's turn-end number now crosses the wire

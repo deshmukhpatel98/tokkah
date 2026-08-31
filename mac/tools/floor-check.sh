@@ -343,16 +343,30 @@ f "$G_B < $G_Q + 15" \
 
 # ── AND IT MUST NOT HAVE ACQUIRED A GLOW ────────────────────────────────────
 #
-# The refused rim was 3 pt with an 18 pt shadow; this is 1.5 pt with none. A glow
-# is energy spread INWARD from the line, so it shows up as green in a band that
-# starts where the stroke ends. If the ring 4-20 pt in has picked up green,
-# something has been added to this layer that should not be there.
+# The refused rim was 3 pt with an 18 pt shadow. A glow is energy spread INWARD
+# from the line, so it shows up as green in a band that starts where the stroke
+# ENDS -- and that is the whole subtlety here, because the stroke no longer has
+# one fixed width.
+#
+# 0.99.0 made width the felt channel on the user's own instruction ("really hard
+# to spot... you should FEEL your voice is going through... maybe a thicker
+# bar"): 1.5 pt at rest, 3 pt listening, and 4.5-8.0 pt while speaking, moving
+# with the speaker's own syllables. This band used to start at 4 pt, which was
+# outside a 1.5 pt stroke and is INSIDE an 8 pt one -- so it measured the line
+# and reported it as a halo (-1.890 vs -4.935 at rest, the first time it ran).
+#
+# So the band starts past the widest the stroke can be. SECOND COPY OF A
+# CONSTANT, said out loud: the 8 pt ceiling lives in `CallControls.floorTick`
+# (4.5 + 3.5 * loudness). If that grows, this band moves with it or this check
+# silently starts measuring the stroke again. The property is undamaged -- an
+# 18 pt shadow lights 10-26 pt far more brightly than 4-20 pt, so this is a
+# stricter place to look for one, not a laxer one.
 HALO="$(python3 - "$SP/through.png" <<'PY'
 import sys, numpy as np
 from PIL import Image
 a = np.asarray(Image.open(sys.argv[1]).convert("RGB")).astype(np.float64)
 H, W = a.shape[:2]; s = W / 1280.0
-i0, i1 = int(round(4*s)), int(round(20*s))
+i0, i1 = int(round(10*s)), int(round(26*s))
 m = np.zeros((H, W), bool)
 m[i0:i1, i0:W-i0] = True; m[H-i1:H-i0, i0:W-i0] = True
 m[i0:H-i0, i0:i1] = True; m[i0:H-i0, W-i1:W-i0] = True

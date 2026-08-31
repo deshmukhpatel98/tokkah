@@ -129,7 +129,8 @@ bad = 0
 for k in ("CFBundleExecutable", "CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName",
           "LSMinimumSystemVersion",
           "NSCameraUsageDescription", "NSMicrophoneUsageDescription",
-          "NSLocalNetworkUsageDescription"):
+          "NSLocalNetworkUsageDescription",
+          "NSLocationUsageDescription", "NSLocationWhenInUseUsageDescription"):
     a, b = bundle.get(k), sh_key(k)
     if a != b:
         print(f"  MISMATCH {k}: bundle={a!r} install.sh={b!r}")

@@ -7,6 +7,122 @@ The rule, decided by the person this app is for:
 Everything below is how to make that rule invisible. A rule that is noticed is a
 walkie-talkie; the whole product is the rule being obeyed and nobody feeling it.
 
+## Strict, which is what ships (0.95.0)
+
+Restated by the user on 2026-08-31, after hearing the soft edges leak on a live
+call: *"only one mic is enabled at any given moment in time, and only one
+speaker is enabled, and it can't be the same person's."* So the shipping floor
+is **strict**: the state machine below is unchanged — who holds, who releases,
+who wins a deadlock, the predictor, the ceiling — but its verdict is rendered
+harder:
+
+- **Out of turn is silent.** The −20 dB duck is retired. A barge-in still works
+  — the claim crosses as a cue and flips the floor — but until it flips, the
+  interrupter is not heard. Capture never stops, so the classifier still sees
+  them instantly.
+- **A pause transmits nothing.** `idle` no longer lets both ends send. The
+  first voice takes the floor locally, in its own block, so the first speaker
+  still pays nothing.
+- **A dead cue channel holds roles.** The old fallback opened both ends; strict
+  keeps the holder talking on its own evidence, treats the blind far end as
+  quiet, and lets the listener take an empty floor after `releaseMs`. Proven:
+  the survivor of a dead peer speaks 9 ms after asking.
+- **The holder's speaker is closed on every route,** headphones included. The
+  rule is a product statement now, not an echo measure — and with the far
+  microphone muted there is nothing real for a talker's speaker to carry.
+
+What strict cannot remove is the speed of light: two people who start inside
+one hop of each other both take an empty floor, and the deadlock break then
+silences exactly one. Measured in `Floor.strictSelfTest` with the hop modeled:
+**0 ms** of double-open in alternation, **one hop** (~40 ms) at a barge-in,
+**`deadlockMs` + hops** (~480 ms) at a genuinely simultaneous start — and that
+last window is counted on every live call as `strict_overlap_pct`.
+
+`--floor-soft` is the control arm and restores the 0.94.0 behaviour described
+below. The soft rules remain documented because they are the fallback arm and
+the self-tests keep both honest.
+
+## Interrupting, and the 1150 ms nobody could see (0.99.0)
+
+Strict shipped with a hidden cost that a live call finally exposed: **50 whole
+utterances on one 333 s call never reached the wire at all.** Not late —
+deleted. Taking the floor from a holder needed 450 ms of sustained `.claim`,
+and `.claim` itself needs 700 ms of continuous voice before the classifier will
+say it. **1150 ms**, and in strict that wait is silence rather than a duck, so
+every interjection shorter than it — "yeah", "no", "wait", every "mm-hm" — was
+thrown away.
+
+Two constants fixed it, and they only work as a pair:
+
+- the contest runs on **any voice from its first block** (`nearVoiceMs`), at
+  **180 ms** instead of 450. Rig: the floor changes hands after 160 ms.
+- the **onset grace window** keeps that voice audible while the contest
+  resolves, bounded at 400 ms. A 300 ms interjection loses 0 ms.
+
+The grace window could not have shipped before 0.94.0. Opening a microphone on
+"any near voice" over a live loudspeaker means opening it on this machine's own
+echo — and the correlation veto is what finally tells those apart. A vetoed
+block classifies as `.quiet`, and `.quiet` is the one input the window refuses.
+
+## Seeing who is talking (0.100.0)
+
+Audio.swift states the root problem in writing: *at the instant of decision, an
+interruption and an echo are the same signal.* They are the same **acoustic**
+signal. A loudspeaker has no mouth.
+
+`Mouth.swift` watches the camera this app already runs — Apple's Vision
+framework, no dependency, ~2.9 ms of CPU per look at 12 Hz — and measures the
+**rate of change** of lip aperture, normalised by the face's own bounding box.
+Not "is the mouth open": a person sitting open-mouthed is not speaking and
+mouth shapes differ between faces. What separates speech from a face at rest is
+that the aperture keeps changing, 3–8 Hz.
+
+Three states, and the third is load-bearing:
+
+| | meaning |
+|---|---|
+| `moving` | a face is visible and its mouth is doing what speech does |
+| `still` | a face is visible and it is not |
+| `unknown` | no face, no camera, no frame, a failed request — **says nothing** |
+
+The aperture is measured on the **lip contour's own two axes** — how open the
+mouth is relative to how wide it is — which is dimensionless and identical under
+any rotation, scale or distance. That is not decoration: the first version took
+vertical extent in bounding-box units, and a clip turned 90° still had its face
+found in 100% of frames (Vision needs no orientation hint to *detect* a face)
+while the talking verdict silently fell from 100% to 86%, because "vertical"
+had become partly mouth *width*. No orientation search can find that bug —
+nothing fails, the numbers just get worse — so the measurement stopped
+depending on the answer. Rotated verdict is now 96% against 100% upright.
+
+Measured on real talking-head footage: talking rate p50 **0.63** aperture-ratio/s
+against the same face held still at p90 **0.08** — **7.9× apart**, and the
+invariant measure is a *stronger* signal than the 4.4× it replaced. The
+threshold (0.15) is read off that, and it has been wrong twice before being
+measured: once as a pure guess (4× too high, called a speaking face silent 100%
+of the time) and once because changing the measure changed the units and the old
+constant survived (`stale-constants-after-a-codec-win`). `--mouth-test` sweeps
+neighbours on every run.
+
+It is allowed to do exactly two things, both of which can only open a
+microphone or speed up a handover:
+
+1. **Withdraw the echo veto.** The veto's own stated risk was gagging a real
+   voice quieter than the echo it sits under — acoustically unfixable. A
+   visible moving mouth overrules the correlation.
+2. **Shorten the contest** to `visualDeadlockMs` (80 ms), because two
+   independent signals need less of each. Rig: a camera-confirmed voice takes
+   the floor in **60 ms**.
+
+It can never mute anybody, and when it is blind everything reverts to 0.99.0
+exactly — asserted in `strictSelfTest` as a REJECT row, because
+`blind-instruments-report-negatives` would otherwise make every dark room and
+every camera-off call slower than it was. `--no-mouth` is the control arm.
+
+**Not yet done:** the signal is local only. Crossing it to the far end — so the
+holder's own release can be informed by seeing that somebody else has started
+talking — is a protocol change and a separate release.
+
 ## What is wrong with the gate we ship today
 
 `Audio.DuplexGate` is purely local and purely reactive. Every block it asks one
