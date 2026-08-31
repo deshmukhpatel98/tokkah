@@ -493,7 +493,7 @@ let KNOWN_FLAGS: Set<String> = [
   // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
   // correlation alone.
   "no-aec", "aec-test", "aec-sweep", "aec-taps", "aec-mu", "aec-media", "aec-block",
-  "aec-trace",
+  "aec-trace", "no-aec-drift",
   "no-overload-guard",
   "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-far-test",
@@ -4217,6 +4217,9 @@ func applyGateFlags() {
   // reaches the wire exactly as captured and the echo veto runs on the 500 ms
   // correlation alone, which is 0.106.0.
   if flag("no-aec") { Audio.aecOn = false }
+  // The control arm for the drift tracker (0.109.0): the filter is aimed at a
+  // fixed integer delay again, which is 0.108.0.
+  if flag("no-aec-drift") { Audio.aecDrift = false }
   if let v = arg("aec-taps"), let d = Int(v) { Audio.aecTaps = d }
   if let v = arg("aec-mu"), let d = Float(v) { Audio.aecMu = d }
   // The arm for the overload cut. See `Audio.overloadGuard`.
@@ -4453,10 +4456,10 @@ if flag("turn-test") {
 }
 
 if flag("aec-test") {
-  if flag("aec-trace") { Aec.trace = true }
   exit(Aec.selfTest(media: arg("aec-media") ?? "testbed/media/real",
                     sweep: flag("aec-sweep"),
-                    blockN: Int(arg("aec-block") ?? "16") ?? 16) ? 0 : 1)
+                    blockN: Int(arg("aec-block") ?? "16") ?? 16,
+                    trace: flag("aec-trace")) ? 0 : 1)
 }
 
 if flag("floor-test") {
@@ -6333,6 +6336,17 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "aec_diverges": audio.aec.diverges,
     "aec_reaims": audio.aec.reaims,
     "aec_cost_us_p99": audio.aec.cost.p(0.99) ?? -1,
+    // ── THE CLOCKS (0.109.0) ─────────────────────────────────────────────────
+    //
+    // `skew_sps` is the measured drift between the capture and render crystals,
+    // in samples per second, from a regression over the delay estimator's own
+    // readings -- ground truth this filter cannot influence. `carries` is how
+    // many whole samples of it the alignment absorbed. Together they say whether
+    // a call's echo path was a moving target and whether the tracker kept up.
+    "aec_skew_sps": Double(audio.aec.skewSps),
+    "aec_carries": audio.aec.carries,
+    "aec_skew_updates": audio.aec.dllSteps,
+    "aec_track_resets": audio.aec.dllResets,
     // ── AND THE DENOMINATORS THAT MADE THE VETO UNREADABLE ───────────────────
     //
     // One live call reported `a_corr_veto_pct` 6.9% while the correlation was over
@@ -6871,11 +6885,13 @@ func reportLoop() {
   if Audio.aecOn, audio.aec.ranBlocks > 0 {
     let path = Double(audio.aec.echoPathNow)
     fputs(String(format: "  echo: %.0f dB removed (call %.0f dB), %.0f dB of the path left"
-               + " -- aimed %.0f ms, subtracting %.0f%%, %d handovers%@\n",
+               + " -- aimed %.0f ms, subtracting %.0f%%, %d handovers,"
+               + " clocks drifting %.2f samples/s%@\n",
                  audio.aec.erleDb, audio.aec.erleLifetimeDb,
                  20 * log10(max(1e-4, path)),
                  Double(audio.aec.delayNow) / SR * 1000,
                  Double(audio.aec.mixNow) * 100, audio.aec.transfers,
+                 Double(audio.aec.skewSps),
                  audio.aec.diverges > 0 ? "  \(audio.aec.diverges) RESETS" : ""), stderr)
   }
   if flag("floor-debug"), t.floorBlocks > 0 {

@@ -170,6 +170,49 @@ final class Aec {
     /// How long the filter is held frozen after a divergence, so a diverging
     /// state cannot be re-entered on the next block.
     var coolMs: Double = 200
+    /// ── THE CLOCKS ARE NOT THE SAME CLOCK (0.109.0) ──────────────────────────
+    ///
+    /// Capture and render are two devices with two crystals, and the echo
+    /// therefore arrives at an offset that DRIFTS -- tens of parts per million is
+    /// tens of samples over a call. A filter aimed at a fixed integer delay is
+    /// aimed at a target that moves under it: measured live, this filter reached
+    /// 27-36 dB and fell back to single digits, over and over, which is not a
+    /// convergence failure, it is convergence on a moving target.
+    ///
+    /// So the reference is read at a FRACTIONAL delay steered by a delay-locked
+    /// loop: two probe filters evaluate the background at ±`dllDelta` samples,
+    /// and whichever side leaves less residual, sustained over `dllEveryMs`,
+    /// pulls the alignment that way. A learned skew term (an integrator, so it
+    /// holds when the corrections stop) then advances the alignment continuously
+    /// and the filter sees a stationary room.
+    ///
+    /// None of this touches the voice: it changes WHICH copy of the speaker
+    /// signal is subtracted, and the subtraction is still a function of the
+    /// reference alone -- the linearity identity in `--aec-test` covers the
+    /// tracked arm too.
+    var driftTrack = true
+    /// The regression needs at least this many aim readings spanning at least
+    /// this long before a slope means anything: the estimator's answer is
+    /// quantised to 8 samples, so a 30 ppm clock takes ~5.5 s to cross one step
+    /// and a shorter window measures the staircase, not the stairs.
+    var skewMinReads = 8
+    var skewMinSpanS: Float = 6
+    /// How much of the measured drift is folded into the skew per decision, and
+    /// the confidence gate: the slope must exceed 1.5x its own standard error
+    /// (from the regression residuals) AND an absolute floor. A stationary pair
+    /// of crystals must produce a tracker that does nothing at all.
+    var skewGain: Float = 0.6
+    var skewMin: Float = 0.15
+    /// The skew clamp. ±6 samples/s is ±125 ppm -- comfortably past the worst
+    /// crystal pair this could plausibly meet, and small enough that even a skew
+    /// stuck at the rail cannot outrun the recovery door below.
+    var dllSkewMax: Float = 6
+    /// The recovery door: the canceller not helping (`mix` at zero) for this long
+    /// while aimed resets the alignment AND the skew. Its evidence is the mix,
+    /// which is measured every block whether or not the steering runs -- a
+    /// recovery gate must never depend on the mechanism it recovers
+    /// (`held-is-a-one-way-door`).
+    var dllResetMs: Double = 2000
     /// ── WHEN THE BACKGROUND FILTER REPLACES THE ONE ON THE AUDIO ─────────────
     ///
     /// It has to be measurably better, not merely different: 0.97 is a 0.13 dB
@@ -251,6 +294,9 @@ final class Aec {
   private var eBuf: [Float]
   private var eBgBuf: [Float]
   private var gBuf: [Float]
+  /// The raw (uninterpolated) reference copy, with two older samples and one
+  /// newer so the interpolated window can sit anywhere inside a whole sample.
+  private var rawWin: [Float]
   private let maxBlock: Int
 
   /// Where the estimator says the echo is, in samples, and how sure it is.
@@ -298,6 +344,48 @@ final class Aec {
   /// Consecutive samples the reference has been above its floor. The onset guard
   /// for `pathGain` -- see the note where it is learned.
   private var refRun = 0
+  /// ── THE ALIGNMENT, AND ITS RATE ───────────────────────────────────────────
+  ///
+  /// `frac` is the fractional part of the delay, in samples, steered by the DLL.
+  /// `skewSps` is the learned drift rate in samples per second -- an INTEGRATOR
+  /// of the corrections, not an average of them, because a feed-forward that
+  /// decays toward zero whenever it is right re-creates the error it removed and
+  /// oscillates forever. It holds where the corrections stop.
+  private var frac: Float = 0
+  private(set) var skewSps: Float = 0
+  /// The alignment actually used for the LAST block's window -- the probe in the
+  /// rig must replicate this block, and steering happens after the window is
+  /// built, so "current" and "used" are different values one block a step.
+  private(set) var fracUsed: Float = 0
+  private(set) var delayUsed = 0
+  /// ── THE DRIFT SENSOR IS THE ESTIMATOR, NOT THE FILTER ─────────────────────
+  ///
+  /// The aim readings over signal time: the estimator's measured delay IS D(t),
+  /// taken from a 400 ms cross-correlation of raw capture against raw playout --
+  /// independent of this filter, of the window, of the carries, of everything
+  /// this class does. Its slope is the drift, directly.
+  ///
+  /// Two filter-side sensors were built first and both are in the git history
+  /// with their measurements: residual probes at ±0.25 samples (the verdict
+  /// followed the drift's sign at every skew, because carries and refit make the
+  /// window's own motion invisible to residuals -- railed at ±6), and the fitted
+  /// response's centroid (reads the fit FORMING as -5 samples/s of "drift" during
+  /// convergence, and saturates at the filter's own re-walk rate once converged).
+  /// Both failed the same way: they measured the filter, and the filter is the
+  /// actuator. A controller whose sensor watches its own actuator has no ground
+  /// truth anywhere in the loop.
+  private var aimT = [Float](repeating: 0, count: 64)
+  private var aimD = [Float](repeating: 0, count: 64)
+  private var aimN = 0
+  /// Signal-time seconds processed. The regression's clock, because the rig runs
+  /// twenty seconds of audio in two wall seconds and a wall clock would measure
+  /// the machine's speed, not the crystals'.
+  private var sigSec: Float = 0
+  private var notHelpingMs: Double = 0
+  private(set) var dllSteps = 0
+  private(set) var dllResets = 0
+  private(set) var carries = 0
+  private var lastTraceSec: Float = 0
   /// Lifetime energies, for the honest "what did this whole call get" figure.
   private var lifeMicE: Double = 0
   private var lifeOutE: Double = 0
@@ -343,6 +431,7 @@ final class Aec {
     eBuf = [Float](repeating: 0, count: maxBlock)
     eBgBuf = [Float](repeating: 0, count: maxBlock)
     gBuf = [Float](repeating: 0, count: 4096)
+    rawWin = [Float](repeating: 0, count: 4096 + maxBlock + 3)
   }
 
   /// ── WHAT IT IS DOING NOW, AND WHAT THE CALL GOT ───────────────────────────
@@ -428,9 +517,61 @@ final class Aec {
   }
 
   /// From the estimator thread. Scalars only across the boundary.
+  ///
+  /// Confident readings also feed the drift regression. `sigSec` is written by
+  /// the audio thread and read here -- a Float scalar, the same crossing every
+  /// other number in this file makes.
   func aim(delaySamples: Int, corr: Double) {
     aimSamples = delaySamples
     aimCorr = corr
+    guard cfg.driftTrack, corr >= cfg.minCorr else { return }
+    let t = sigSec
+    // The ring keeps the last 64 readings (~32 s at the estimator's cadence).
+    // A reading at the same signal time as the last (the rig can aim twice in
+    // one block) replaces it rather than stacking.
+    if aimN > 0, t - aimT[aimN - 1] < 0.25 { return }
+    if aimN == aimT.count {
+      for i in 1..<aimN { aimT[i - 1] = aimT[i]; aimD[i - 1] = aimD[i] }
+      aimN -= 1
+    }
+    aimT[aimN] = t
+    aimD[aimN] = Float(delaySamples)
+    aimN += 1
+    guard aimN >= cfg.skewMinReads, aimT[aimN - 1] - aimT[0] >= cfg.skewMinSpanS
+    else { return }
+    var st: Float = 0, sd: Float = 0
+    for i in 0..<aimN { st += aimT[i]; sd += aimD[i] }
+    let nF = Float(aimN)
+    let mt = st / nF, md = sd / nF
+    var stt: Float = 0, std: Float = 0
+    for i in 0..<aimN {
+      stt += (aimT[i] - mt) * (aimT[i] - mt)
+      std += (aimT[i] - mt) * (aimD[i] - md)
+    }
+    guard stt > 1e-3 else { return }
+    let slope = std / stt
+    var rss: Float = 0
+    for i in 0..<aimN {
+      let r = aimD[i] - md - slope * (aimT[i] - mt)
+      rss += r * r
+    }
+    let se = aimN > 2 ? (rss / Float(aimN - 2) / stt).squareRoot() : Float(1e9)
+    if Aec.trace {
+      fputs(String(format: "    skew: slope %+.2f±%.2f sps over %.0f s (n=%d)  skew %.2f\n",
+                   slope, se, aimT[aimN - 1] - aimT[0], aimN, skewSps), stderr)
+    }
+    // Blend toward the measurement only when it stands clear of its own noise.
+    // No feedback anywhere: the estimator cannot see the skew, so this cannot
+    // oscillate -- the failure mode is only "not confident yet", which is the
+    // untracked behaviour this whole feature improves on.
+    if abs(slope) > max(cfg.skewMin, 1.5 * se) || (slope == 0 && se < cfg.skewMin) {
+      let target = max(-cfg.dllSkewMax, min(cfg.dllSkewMax, slope))
+      skewSps += (target - skewSps) * cfg.skewGain
+      dllSteps += 1
+    } else if abs(slope) < cfg.skewMin, se < cfg.skewMin, skewSps != 0 {
+      // A confident zero is also information: the crystals agree, stand down.
+      skewSps += (0 - skewSps) * cfg.skewGain
+    }
   }
 
   func reset() {
@@ -476,6 +617,13 @@ final class Aec {
         delay = want
         for j in 0..<fFg.count { fFg[j] = 0; fBg[j] = 0 }
         cmpFgE = 0; cmpBgE = 0; cmpMicE = 0; betterMs = 0; worseMs = 0
+        // The alignment restarts with the aim; the SKEW does not -- it is a
+        // property of two crystals, not of one echo path, and it survives a
+        // person changing their output device.
+        frac = 0
+        // The aim history spans the move (the estimator found a NEW path), so it
+        // restarts; the skew survives -- it is a property of the crystals.
+        aimN = 0
         reaims += 1
         disagree = 0
         mix = 0                     // a zeroed filter subtracts nothing, at once
@@ -484,23 +632,52 @@ final class Aec {
       disagree = 0
     }
 
-    // ── THE REFERENCE WINDOW, CONTIGUOUS ─────────────────────────────────────
+    // ── THE REFERENCE WINDOW, CONTIGUOUS -- AND AT A FRACTIONAL DELAY ────────
+    //
+    // `rawWin` holds `span + 3` whole samples: the span, two OLDER and one NEWER,
+    // so a window can be interpolated at any alignment in (-0.25, 1.25) around
+    // the integer delay -- which is where `frac` and both DLL probes live by
+    // construction (`frac` carries into `delay` at the whole-sample marks).
+    //
+    // The value of the window at position i, delayed by a further phi samples, is
+    // ref[start + i - phi]. In rawWin coordinates (rawWin[j] = ref[start-2+j])
+    // that is position i + 2 - phi, linearly interpolated: with m = floor(phi)
+    // and t = phi - m, it is one vDSP_vintb over rawWin+(1-m) and rawWin+(2-m)
+    // at weight 1-t. Linear and not cubic, deliberately: the filter's own taps
+    // interpolate far better than any fixed kernel -- the DLL's job is only to
+    // keep the residual error inside the range the taps can absorb, and a
+    // quarter-sample probe is deep inside that.
+    let track = cfg.driftTrack
     let span = T - 1 + n
     let endIdx = refW - delay            // exclusive: newest usable ref index + 1
-    guard endIdx - span >= 0 else {
+    guard endIdx - span - (track ? 2 : 0) >= 0, !track || delay >= 1 else {
       rampMix(toward: 0, dt: dt)
       offBlocks += 1
       cost.add(Clock.ms(Clock.now() - t0) * 1000.0)
       return
     }
     let start = endIdx - span
-    xwin.withUnsafeMutableBufferPointer { w in
-      let wb = w.baseAddress!
-      // At most two runs, because the source is one circular buffer.
-      let s0 = ((start % refCap) + refCap) % refCap
-      let first = min(span, refCap - s0)
-      memcpy(wb, ref + s0, first * 4)
-      if first < span { memcpy(wb + first, ref, (span - first) * 4) }
+    fracUsed = track ? frac : 0
+    delayUsed = delay
+    if track {
+      let R = span + 3
+      rawWin.withUnsafeMutableBufferPointer { w in
+        let wb = w.baseAddress!
+        let s0 = (((start - 2) % refCap) + refCap) % refCap
+        let first = min(R, refCap - s0)
+        memcpy(wb, ref + s0, first * 4)
+        if first < R { memcpy(wb + first, ref, (R - first) * 4) }
+      }
+      buildWindow(&xwin, phi: frac, span: span)
+    } else {
+      xwin.withUnsafeMutableBufferPointer { w in
+        let wb = w.baseAddress!
+        // At most two runs, because the source is one circular buffer.
+        let s0 = ((start % refCap) + refCap) % refCap
+        let first = min(span, refCap - s0)
+        memcpy(wb, ref + s0, first * 4)
+        if first < span { memcpy(wb + first, ref, (span - first) * 4) }
+      }
     }
 
     var refSq: Float = 0
@@ -728,6 +905,24 @@ final class Aec {
       farRefE += (Double(refAlnSq) / Double(n) - farRefE) * kf
     }
 
+    // ── THE FEED-FORWARD ─────────────────────────────────────────────────────
+    //
+    // The skew is measured in `aim()` from the estimator's own delay readings --
+    // see the note there for the two filter-side sensors that failed first.
+    // Here it is only APPLIED: the alignment advances at the measured rate, the
+    // carries move whole samples into the integer delay with an exact tap shift,
+    // and the filter sees a room that stands still. There is no loop to
+    // stabilise because nothing here feeds anything that measures it.
+    if track {
+      sigSec += Float(dt)
+      frac += skewSps * Float(dt)
+      if Aec.trace, sigSec - lastTraceSec >= 5 {
+        lastTraceSec = sigSec
+        fputs(String(format: "    ff: t %.0fs frac %.2f delay %d skew %.2f carries %d mix %.2f erle %.1f\n",
+                     sigSec, frac, delay, skewSps, carries, mix, erleDb), stderr)
+      }
+    }
+
     if mayAdapt {
       // ── ONE BLOCK NLMS STEP, ON THE BACKGROUND ─────────────────────────────
       //
@@ -765,6 +960,30 @@ final class Aec {
       freezes += 1
     }
 
+    // ── THE CARRY, AFTER THE ADAPTATION ──────────────────────────────────────
+    //
+    // Whole samples of `frac` move into the integer delay, and both filters are
+    // shifted so the learned response describes the same room before and after.
+    // After the gradient has been applied, not before: a shift landing between
+    // the gradient's computation and its application would apply an update
+    // indexed for the old alignment to taps that have already moved.
+    if track {
+      // ── A CARRY CHANGES NOTHING, AND THAT IS THE WHOLE PROOF ────────────────
+      //
+      // delay+1 and frac-1 cancel by construction: the window at (delay+1,
+      // frac-1) is sample-for-sample the window at (delay, frac), so the taps
+      // must stay exactly where they are. The first version shifted them anyway
+      // -- the shift rule belongs to a REAIM, where delay moves alone -- and that
+      // misaligned the fit by one whole sample per carry, 1.4 times a second: a
+      // sawtooth with the same average misalignment power as the drift being
+      // corrected. Measured as the smoking gun that found it: tracked 12.2 dB,
+      // untracked 12.3 dB, with the skew locked at 1.45 against a planted 1.44
+      // and every carry firing on time. The tracker was perfect and its carry
+      // was undoing it.
+      while frac >= 1 { frac -= 1; delay += 1; carries += 1 }
+      while frac < 0 { frac += 1; delay -= 1; carries += 1 }
+    }
+
     // ── AND THE SUBTRACTION IS SCALED BY WHETHER IT HELPED ───────────────────
     //
     // A foreground achieving nothing has its contribution ramped out over 4 ms
@@ -774,6 +993,25 @@ final class Aec {
     // a bad filter is switched off, not papered over.
     let helping = erleDb >= cfg.helpDb && coolMsLeft <= 0
     rampMix(toward: helping ? 1 : 0, dt: dt)
+    // ── THE RECOVERY DOOR ────────────────────────────────────────────────────
+    //
+    // A canceller that is aimed, running, and has not earned a single block of
+    // subtraction for two seconds is a canceller whose model of the world is
+    // wrong -- and the one piece of that model that can silently poison
+    // everything else is the skew feed-forward, because it MOVES the target on
+    // its own. Reset the alignment and the skew and let the whole thing
+    // re-acquire from the estimator's aim, which is still live. The evidence
+    // here is `mix`, measured every block regardless of what the steering does.
+    if track {
+      notHelpingMs = mix < 0.05 ? notHelpingMs + dt * 1000 : 0
+      if notHelpingMs >= cfg.dllResetMs, skewSps != 0 || frac != 0 {
+        skewSps = 0
+        frac = 0
+        aimN = 0
+        notHelpingMs = 0
+        dllResets += 1
+      }
+    }
     if mix < 0.05 { offBlocks += 1 }
     if mix > 0 {
       var negMix = -mix
@@ -782,6 +1020,49 @@ final class Aec {
       }
     }
     cost.add(Clock.ms(Clock.now() - t0) * 1000.0)
+  }
+
+  /// Interpolate a reference window out of `rawWin` at a further `phi` samples of
+  /// delay, phi in [0, 1). Four-point Lagrange cubic, and the order matters more
+  /// than interpolation orders usually do:
+  ///
+  /// The tracker MOVES this alignment continuously -- at 30 ppm the weight sweeps
+  /// the whole unit interval every 0.7 s -- so the kernel's frequency response is
+  /// not a fixed colouration the filter absorbs once, it is a MORPHING one the
+  /// filter must chase forever. Linear interpolation morphs by up to 3 dB at the
+  /// top of the band across that sweep, and the measurement was unambiguous: with
+  /// the skew estimate reading 1.45 against a planted 1.44 -- the sensor as close
+  /// to perfect as it can be -- the tracked arm won 0.0 dB, because the re-fitting
+  /// the tracker saved on the drift it spent on the kernel. Cubic holds the
+  /// response within ~0.05 dB below 4 kHz across the whole sweep.
+  ///
+  /// Coefficients at t = 1 - phi (position p = i + 2 - phi sits between
+  /// rawWin[i+1] and rawWin[i+2]); t -> 1 collapses to the exact passthrough of
+  /// rawWin[i+2], which is the phi = 0 window.
+  private func buildWindow(_ dst: inout [Float], phi: Float, span: Int) {
+    let t = 1 - phi
+    if t >= 0.9999 {
+      rawWin.withUnsafeBufferPointer { r in
+        dst.withUnsafeMutableBufferPointer { d in
+          memcpy(d.baseAddress!, r.baseAddress! + 2, span * 4)
+        }
+      }
+      return
+    }
+    var c0 = -t * (t - 1) * (t - 2) / 6
+    var c1 = (t + 1) * (t - 1) * (t - 2) / 2
+    var c2 = -t * (t + 1) * (t - 2) / 2
+    var c3 = t * (t + 1) * (t - 1) / 6
+    rawWin.withUnsafeBufferPointer { r in
+      let rb = r.baseAddress!
+      dst.withUnsafeMutableBufferPointer { d in
+        let db = d.baseAddress!
+        vDSP_vsmul(rb, 1, &c0, db, 1, vDSP_Length(span))
+        vDSP_vsma(rb + 1, 1, &c1, db, 1, db, 1, vDSP_Length(span))
+        vDSP_vsma(rb + 2, 1, &c2, db, 1, db, 1, vDSP_Length(span))
+        vDSP_vsma(rb + 3, 1, &c3, db, 1, db, 1, vDSP_Length(span))
+      }
+    }
   }
 
   /// Up on a ~40 ms exponential, down on a 4 ms linear ramp. The direction that
@@ -905,6 +1186,11 @@ extension Aec {
     var transfers = 0
     var bgResets = 0
     var normEnd = 0.0
+    /// The learned drift, in samples per second, and how many corrections the
+    /// DLL applied. The estimate is the ruler's own check: driven with a KNOWN
+    /// skew, it has to read that skew back (`validate-the-ruler-against-known-inputs`).
+    var skewSps = 0.0
+    var dllSteps = 0
     var costUsP50 = 0.0
     var costUsP99 = 0.0
     var convergeMs = -1.0      // when the leaky ERLE first passed 10 dB
@@ -922,7 +1208,7 @@ extension Aec {
   /// `SubtitleCleaner.clean(probe:)` already makes.
   static func run(near: [Float], far: [Float], delayMs: Double, echoGain: Float,
                   cfg: Cfg, blockN: Int = 16, aimErrMs: Double = 0,
-                  corr: Double = 0.8, echoOn: Bool = true)
+                  corr: Double = 0.8, echoOn: Bool = true, skewPpm: Double = 0)
       -> (r: Result, out: [Float], nearOut: [Float]) {
     let n = min(near.count, far.count)
     let a = Aec()
@@ -946,17 +1232,63 @@ extension Aec {
     var mixSum = 0.0, mixN = 0
     let scoreFrom = Int(SR)
     a.aim(delaySamples: Int((delayMs + aimErrMs) / 1000 * SR), corr: corr)
+    // The product's estimator re-measures the delay every 500 ms, decimated by 8
+    // -- so its reading of a drifting path is a STAIRCASE with 8-sample treads.
+    // The rig feeds the same staircase, because the skew regression's whole job
+    // is to see the stairs through the treads, and a rig that handed it the
+    // smooth truth would be testing a sensor nobody has
+    // (`fixture-is-not-the-real-shape`).
+    let aimEvery = Int(0.5 * SR)
     var i = 0
     while i + blockN <= n {
+      if i > 0, i % aimEvery < blockN {
+        let dNow = Double(d) + skewPpm * 1e-6 * Double(i)
+        a.aim(delaySamples: (Int(dNow) / 8) * 8, corr: corr)
+      }
       // Play this block, then capture it: the same order the two callbacks run in.
       for k in 0..<blockN { ring[(i + k) % cap] = far[i + k] }
       let refW = i + blockN
       for k in 0..<blockN {
         var e: Float = 0
         if echoOn {
+          // ── AND THE CLOCKS CAN DISAGREE ─────────────────────────────────────
+          //
+          // `skewPpm` makes the echo's delay GROW with time, which is what two
+          // crystals tens of ppm apart do to a real call: 30 ppm is 1.44 samples
+          // a second, ~58 samples over this recording.
+          //
+          // The resampling is an 8-point windowed sinc, and that is load-bearing
+          // for the rig's honesty in BOTH directions. A drifting clock's real
+          // echo is the bandlimited reconstruction a physical DAC produces -- an
+          // ideal fractional delay, flat in magnitude -- and the first version of
+          // this generator used linear interpolation, whose response MORPHS by
+          // decibels at the top of the band as the phase sweeps. That planted an
+          // unfittable time-varying colouration in the echo itself: the tracker
+          // locked its skew at 1.45 against a planted 1.44, aligned perfectly,
+          // and won 0.0 dB, because the rig had built a room no canceller could
+          // cancel and no real clock produces (`fixture-is-not-the-real-shape`).
+          // And it must not be the same cubic the window uses, or the two kernels
+          // cancel exactly and the rig flatters the tracker instead.
+          let dEff = Double(d) + skewPpm * 1e-6 * Double(i + k)
           for (t, g) in taps {
-            let idx = i + k - d - t
-            if idx >= 0 { e += g * far[idx] }
+            let pos = Double(i + k) - dEff - Double(t)
+            let fl = Int(pos.rounded(.down))
+            if fl >= 4, fl + 4 < far.count {
+              let tt = pos - Double(fl)
+              if tt < 1e-9 {
+                e += g * far[fl]
+              } else {
+                var acc: Double = 0
+                for m in -3...4 {
+                  let u = Double(m) - tt
+                  let sinc = sin(Double.pi * u) / (Double.pi * u)
+                  // Hann window over the 8-tap support.
+                  let w = 0.5 + 0.5 * cos(Double.pi * u / 4)
+                  acc += Double(far[fl + m]) * sinc * w
+                }
+                e += g * Float(acc)
+              }
+            }
           }
           e *= echoGain
         }
@@ -977,20 +1309,23 @@ extension Aec {
       // Both probes go through the state the MIXTURE produced -- `snapshot` was
       // taken before `process` adapted, and `a.mixNow` after, which is the pair
       // the audio actually got.
-      let mixNow = a.mixNow, delayNow = a.delayNow
+      // `delayUsed`/`fracUsed`, not the live values: the DLL steers at the END
+      // of a block, so the alignment the audio actually went through is the one
+      // recorded at the window build.
+      let mixNow = a.mixNow, delayNow = a.delayUsed, fracNow = a.fracUsed
       if i >= scoreFrom {
         for k in 0..<blockN { echoInE += Double(echoBlock[k]) * Double(echoBlock[k]) }
       }
       nearBlock.withUnsafeMutableBufferPointer { b in
         ring.withUnsafeMutableBufferPointer { r in
-          Aec.applyOnly(snapshot, mix: mixNow, delay: delayNow,
+          Aec.applyOnly(snapshot, mix: mixNow, delay: delayNow, frac: fracNow,
                         x: b.baseAddress!, n: blockN,
                         ref: r.baseAddress!, refW: refW, refCap: cap)
         }
       }
       echoBlock.withUnsafeMutableBufferPointer { b in
         ring.withUnsafeMutableBufferPointer { r in
-          Aec.applyOnly(snapshot, mix: mixNow, delay: delayNow,
+          Aec.applyOnly(snapshot, mix: mixNow, delay: delayNow, frac: fracNow,
                         x: b.baseAddress!, n: blockN,
                         ref: r.baseAddress!, refW: refW, refCap: cap)
         }
@@ -1038,6 +1373,8 @@ extension Aec {
     r.transfers = a.transfers
     r.bgResets = a.bgResets
     r.normEnd = Double(a.normNow)
+    r.skewSps = Double(a.skewSps)
+    r.dllSteps = a.dllSteps
     r.echoErleDb = echoInE > 1e-12
       ? (echoOutE > 1e-12 ? 10 * log10(echoInE / echoOutE) : 120)
       : -120
@@ -1049,20 +1386,48 @@ extension Aec {
 
   /// Apply a FIXED filter with no adaptation and no measurement. The probe path
   /// only -- nothing in production calls this.
-  static func applyOnly(_ f: [Float], mix: Float, delay: Int,
+  static func applyOnly(_ f: [Float], mix: Float, delay: Int, frac: Float = 0,
                         x: UnsafeMutablePointer<Float>, n: Int,
                         ref: UnsafeMutablePointer<Float>, refW: Int, refCap: Int) {
     guard mix > 0, !f.isEmpty else { return }
     let T = f.count
     let span = T - 1 + n
     let endIdx = refW - delay
-    guard endIdx - span >= 0 else { return }
+    guard endIdx - span - 2 >= 0 else { return }
+    // The same fractional read as `process` -- the probe must replicate the
+    // window the audio actually went through, or the linearity identity would
+    // report the interpolation as damage.
     var w = [Float](repeating: 0, count: span)
-    let s0 = (((endIdx - span) % refCap) + refCap) % refCap
-    let first = min(span, refCap - s0)
-    w.withUnsafeMutableBufferPointer { wb in
+    var raw = [Float](repeating: 0, count: span + 3)
+    let R = span + 3
+    let s0 = (((endIdx - span - 2) % refCap) + refCap) % refCap
+    let first = min(R, refCap - s0)
+    raw.withUnsafeMutableBufferPointer { wb in
       memcpy(wb.baseAddress!, ref + s0, first * 4)
-      if first < span { memcpy(wb.baseAddress! + first, ref, (span - first) * 4) }
+      if first < R { memcpy(wb.baseAddress! + first, ref, (R - first) * 4) }
+    }
+    let t = 1 - frac
+    if t >= 0.9999 {
+      raw.withUnsafeBufferPointer { r in
+        w.withUnsafeMutableBufferPointer { wb in
+          memcpy(wb.baseAddress!, r.baseAddress! + 2, span * 4)
+        }
+      }
+    } else {
+      var c0 = -t * (t - 1) * (t - 2) / 6
+      var c1 = (t + 1) * (t - 1) * (t - 2) / 2
+      var c2 = -t * (t + 1) * (t - 2) / 2
+      var c3 = t * (t + 1) * (t - 1) / 6
+      raw.withUnsafeBufferPointer { r in
+        let rb = r.baseAddress!
+        w.withUnsafeMutableBufferPointer { wb in
+          let db = wb.baseAddress!
+          vDSP_vsmul(rb, 1, &c0, db, 1, vDSP_Length(span))
+          vDSP_vsma(rb + 1, 1, &c1, db, 1, db, 1, vDSP_Length(span))
+          vDSP_vsma(rb + 2, 1, &c2, db, 1, db, 1, vDSP_Length(span))
+          vDSP_vsma(rb + 3, 1, &c3, db, 1, db, 1, vDSP_Length(span))
+        }
+      }
     }
     var y = [Float](repeating: 0, count: n)
     w.withUnsafeBufferPointer { wp in
@@ -1080,7 +1445,7 @@ extension Aec {
   }
 
   static func selfTest(media: String = "testbed/media/real", sweep: Bool = false,
-                       blockN: Int = 16) -> Bool {
+                       blockN: Int = 16, trace: Bool = false) -> Bool {
     var ok = true
     func say(_ good: Bool, _ what: String) {
       if !good { ok = false }
@@ -1240,7 +1605,75 @@ extension Aec {
     say(none.r.erleDb == 0 && none.r.updates == 0,
         "--no-aec: nothing runs and nothing is claimed")
 
-    // ── 6. COST ──────────────────────────────────────────────────────────────
+    // ── 6. THE CLOCKS DRIFT, AND THE FILTER FOLLOWS (0.109.0) ────────────────
+    //
+    // The live rig's signature: the filter reaches 27-36 dB and falls back to
+    // single digits, over and over -- convergence on a moving target, because
+    // capture and render are two crystals. Driven here with a KNOWN skew so the
+    // rows can fail in both directions: the untracked arm must degrade (or the
+    // rig cannot see drift and every other row here is unproven), the tracked arm
+    // must hold, and the skew ESTIMATE must read back the skew that was planted.
+    // 40 s, not 20: the skew sensor is the estimator's 8-sample staircase, and a
+    // 30 ppm clock takes ~5.5 s per tread -- confidence needs several treads, and
+    // the arm has to leave room to profit from the lock it acquires.
+    let nD = min(min(A.count, B.count), Int(SR * 40))
+    let farD = Array(B[0..<nD])
+    let silenceD = [Float](repeating: 0, count: nD)
+    var noTrk = cfg0
+    noTrk.driftTrack = false
+    let driftOff = run(near: silenceD, far: farD, delayMs: 31, echoGain: 0.5,
+                       cfg: noTrk, blockN: blockN, skewPpm: 30)
+    if trace {
+      Aec.trace = true
+      fputs("  == trace: 0 ppm ==\n", stderr)
+      _ = run(near: silenceD, far: farD, delayMs: 31, echoGain: 0.5,
+              cfg: cfg0, blockN: blockN, skewPpm: 0)
+      fputs("  == trace: -30 ppm ==\n", stderr)
+      _ = run(near: silenceD, far: farD, delayMs: 31, echoGain: 0.5,
+              cfg: cfg0, blockN: blockN, skewPpm: -30)
+      fputs("  == trace: +30 ppm ==\n", stderr)
+    }
+    let driftOn = run(near: silenceD, far: farD, delayMs: 31, echoGain: 0.5,
+                      cfg: cfg0, blockN: blockN, skewPpm: 30)
+    Aec.trace = false
+    say(driftOff.r.echoErleDb < m.r.echoErleDb - 4,
+        String(format: "REJECT: 30 ppm of clock skew costs the untracked filter"
+             + " %.1f dB (%.1f -> %.1f) -- the rig can see drift",
+               m.r.echoErleDb - driftOff.r.echoErleDb, m.r.echoErleDb,
+               driftOff.r.echoErleDb))
+    say(driftOn.r.echoErleDb > driftOff.r.echoErleDb + 4,
+        String(format: "tracked: the DLL wins %.1f dB of it back (%.1f dB, %d steps)",
+               driftOn.r.echoErleDb - driftOff.r.echoErleDb, driftOn.r.echoErleDb,
+               driftOn.r.dllSteps))
+    say(driftOn.r.echoErleDb > 12,
+        String(format: "and holds %.1f dB under a drifting clock", driftOn.r.echoErleDb))
+    // The ruler's own check: 30 ppm at 48 kHz is 1.44 samples/s, and the echo's
+    // delay GROWS, which the window follows by looking further back -- positive
+    // frac, positive skew (`validate-the-ruler-against-known-inputs`).
+    say(driftOn.r.skewSps > 1.0 && driftOn.r.skewSps < 1.9,
+        String(format: "the skew estimate reads %.2f samples/s against a planted 1.44",
+               driftOn.r.skewSps))
+    // Linearity survives the tracker: the interpolated window is still a function
+    // of the reference alone, and the probe replicates the exact alignment.
+    let nearD = Array(A[0..<nD])
+    let driftBoth = run(near: nearD, far: farD, delayMs: 31, echoGain: 0.5,
+                        cfg: cfg0, blockN: blockN, skewPpm: 30)
+    say(driftBoth.r.linearityDb < -100,
+        String(format: "and the near voice is still exact under drift (%.0f dB)",
+               driftBoth.r.linearityDb))
+    // A clock that does NOT drift must not be made worse by the machinery that
+    // handles one: the tracker against 6a's own baseline.
+    say(m.r.echoErleDb > 15,
+        String(format: "REJECT: with no drift the tracker changes nothing (%.1f dB)",
+               m.r.echoErleDb))
+    // And the fast direction: 100 ppm, a genuinely bad crystal pair.
+    let drift100 = run(near: silenceD, far: farD, delayMs: 31, echoGain: 0.5,
+                       cfg: cfg0, blockN: blockN, skewPpm: 100)
+    say(drift100.r.echoErleDb > 8,
+        String(format: "100 ppm -- a genuinely bad pair -- still holds %.1f dB",
+               drift100.r.echoErleDb))
+
+    // ── 7. COST ──────────────────────────────────────────────────────────────
     //
     // Per block, on the audio thread. A block is 0.33 ms of real time at this
     // block size, so anything approaching 333 us is the callback's whole budget.

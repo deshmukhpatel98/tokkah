@@ -39,8 +39,14 @@ trap 'reap; rm -rf "$SP"' EXIT
 
 # --mute because the machine's speakers belong to whoever is sitting at it, and
 # the echo path this rig cares about is the simulated one either way.
+# `--route speakers`, PINNED: the canceller belongs to the loudspeaker route and
+# stands down on headphones -- correctly -- so a pair of Bluetooth earbuds
+# connecting to this Mac silently turned this whole rig into a measurement of
+# nothing (no echo line, "0 dB removed", FAIL). The echo path here is simulated
+# and the real playout is muted, so the physical route is irrelevant to what is
+# being measured and pinning it is honest.
 COMMON=(--video off --mute --no-telemetry --no-update --no-relocate --no-rings
-        --no-subtitles --no-floor)
+        --no-subtitles --no-floor --route speakers)
 # 22 ms and 0.55: a laptop's own speaker to its own microphone, which is the
 # case the whole feature is for.
 ECHO="22:0.55"

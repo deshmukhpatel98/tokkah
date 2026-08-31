@@ -250,6 +250,62 @@ Only a real two-room call can move any of this from theory. `--speaker-duplex` o
 one such call, with `aec_erle_db`, `aec_residual` and `floor_duplex_pct` in the
 beat, answers it.
 
+## The clocks are not the same clock (0.109.0)
+
+Capture and render are two devices with two crystals, so the echo arrives at an
+offset that **drifts** — tens of ppm is tens of samples over a call — and a filter
+aimed at a fixed integer delay converges and then loses its target, over and over.
+That was the live signature (27–36 dB peaks collapsing to single digits), and the
+rig reproduces it: a planted 30 ppm skew costs the untracked filter **6.6 dB**.
+
+0.109.0 tracks it: the reference window is read at a fractional delay that
+advances at the measured drift rate, whole samples carry into the integer delay,
+and the filter sees a room that stands still.
+
+    30 ppm:  untracked 12.3 dB  →  tracked 18.6 dB   (no-drift ceiling: 18.8)
+    100 ppm: tracked 15.8 dB
+    skew estimate: 1.45 samples/s against a planted 1.44
+    near voice: still exact (−148 dB), still an identity
+
+Four designs died on the way, each measured, each written in `Aec.swift`:
+
+1. **Residual probes at ±0.25 samples** (steer toward the smaller residual): the
+   verdict followed the *drift's* sign at every skew — +30 ppm railed the loop at
+   +6 samples/s, −30 ppm railed it at −6 — because carries and refit make the
+   window's own motion invisible to residuals. The sensor watched the actuator.
+2. **Gating that loop's steering on the fit being good**: a one-way door. The
+   overshooting skew degraded the fit, the degraded fit closed the gate, and the
+   mechanism that could undo the skew was disabled by the damage the skew caused.
+3. **The fitted response's centroid as a position sensor**: reads the fit
+   *forming* as −5 samples/s of "drift" during convergence, and saturates at the
+   filter's own re-walk rate after it.
+4. **A per-read PI on the centroid**: oscillated — the sensor lags the actuator by
+   the filter's re-walk time, so every kick was judged before it landed.
+
+What works is a sensor **outside the loop entirely**: the delay estimator's own
+readings over time. Its slope *is* the drift, it cannot see the skew (it
+correlates raw capture against raw playout), so nothing feeds back and nothing can
+oscillate — the failure mode is only "not confident yet", which is 0.108.0. The
+regression acts only when the slope clears 1.5× its own standard error, so a
+stationary pair of crystals produces a tracker that does nothing, asserted.
+
+And the bug that hid the entire win: **a carry must not shift the taps.** When
+`frac` rolls over, `delay+1` and `frac−1` cancel exactly — the window contents are
+identical before and after — but the first version shifted the filter anyway
+(that rule belongs to a re-aim, where delay moves alone). One whole sample of
+misalignment injected per carry, 1.4 times a second: a sawtooth with the same
+average misalignment power as the drift being corrected. The smoking gun was the
+skew locking at 1.45 against a planted 1.44 while the tracked arm won 0.0 dB —
+the tracker was perfect and its carry was undoing it.
+
+The rig's own honesty needed two fixes to see any of this: the drifting echo must
+be generated with a **windowed sinc**, because a real clock's echo is the
+bandlimited reconstruction a DAC produces, and the linear-interpolation generator
+planted a morphing colouration no canceller could fit and no real clock produces
+(`fixture-is-not-the-real-shape`); and the window's own interpolation is cubic,
+because the tracker sweeps the kernel phase continuously and a linear kernel's
+response morphs by decibels across the sweep.
+
 ## Through the real audio device
 
 `tools/aec-check.sh` runs two real ends of a real call with the echo path in

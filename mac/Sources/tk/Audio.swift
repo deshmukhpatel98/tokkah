@@ -3479,6 +3479,8 @@ final class Audio {
   /// shared instance at start. Read once; nothing on the call path reads them.
   nonisolated(unsafe) static var aecTaps = -1
   nonisolated(unsafe) static var aecMu: Float = -1
+  /// The drift tracker's arm. Off is 0.108.0: a fixed integer aim.
+  nonisolated(unsafe) static var aecDrift = true
   /// Whether the turn layer is in force. `--no-floor` is the control arm.
   nonisolated(unsafe) static var floorOn = true
   /// Whether the far end reaches this ear. Written by the capture thread, read
@@ -3905,6 +3907,7 @@ final class Audio {
     // these two are the ones `--aec-sweep` reads the defaults off.
     if Audio.aecTaps > 0 { aec.cfg.taps = Audio.aecTaps }
     if Audio.aecMu > 0 { aec.cfg.mu = Audio.aecMu }
+    aec.cfg.driftTrack = Audio.aecDrift
     // ONE unit in `vp`, two in `hal`. `inUnit` and `outUnit` point at the same
     // instance in duplex, so every existing stop/start/property path keeps
     // working -- but init and start must then happen ONCE, which is what the
