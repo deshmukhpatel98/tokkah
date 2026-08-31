@@ -937,6 +937,71 @@ enum Launcher {
 
     relayout()
 
+    // ── THIS WINDOW HAD NO PRESS PATH, AND NOW IT IS THE FRONT DOOR ──────────
+    //
+    // The comment further down still says "this window has no press path", and
+    // that was tolerable when it held one text field and a Join button. It is the
+    // first screen of the app now and every way into a call starts on it, so it
+    // needs what the call window has: a way for a rig to work it without a hand on
+    // the trackpad.
+    //
+    // Through `NSApp.sendAction` on the REAL control, not by calling the closure:
+    // that is the same edge a click arrives on after `SheetRow`'s own tracking,
+    // so a row with a missing target or a stale action fails here exactly as it
+    // would fail under a finger. What it CANNOT see is whether something
+    // decorative sits in front of the row, or whether the window can become key --
+    // those need a real click, and `firstMouseAt` below covers the half of it that
+    // is geometry.
+    func rowNamed(_ n: String) -> SheetRow? {
+      switch n {
+      case "new": return newRow
+      case "word": return wordRow
+      case "back": return backRow
+      case "reach": return reachRow
+      case "mine": return mineRow
+      default: return peopleRows.first { $0.handleName == n }
+      }
+    }
+    // ── AND WHAT THE FIRST CLICK WOULD DO, READ OUT RATHER THAN REASONED ABOUT ─
+    //
+    // `acceptsFirstClick` is off for every row that reaches a person or changes
+    // this Mac, and on for nothing else here. That is a rule written in a comment,
+    // and a rule written in a comment is a rule nobody checks again -- so the
+    // window says what it actually answers, per row, the way `WaitingCard`
+    // publishes `firstMouseAt` for the same rule and the same reason.
+    var audit: [String] = []
+    for r in peopleRows { audit.append("@\(r.handleName)=\(r.acceptsFirstMouse(for: nil))") }
+    for (n, r) in [("new", newRow), ("word", wordRow), ("back", backRow),
+                   ("reach", reachRow), ("mine", mineRow as SheetRow)] {
+      audit.append("\(n)=\(r.acceptsFirstMouse(for: nil))")
+    }
+    fputs("home firstmouse " + audit.joined(separator: " ") + "\n", stderr)
+
+    if let token = arg("press") {
+      // Deferred one turn of the run loop: the pump below has not started, and a
+      // press that fires before it does would set `done` on a window that has not
+      // drawn once -- which photographs as the app never opening.
+      DispatchQueue.main.async {
+        let bits = token.split(separator: ":", maxSplits: 1).map(String.init)
+        switch bits[0] {
+        case "join":
+          if bits.count > 1 { field.stringValue = bits[1] }
+          t.go()
+        case "type":
+          if bits.count > 1 { nameField.stringValue = bits[1] }
+          t.callTyped()
+        default:
+          guard let r = rowNamed(bits.count > 1 ? bits[1] : bits[0]),
+                !r.isHidden, let tgt = r.target, let act = r.action else {
+            fputs("press: no row named " + token + " on this screen\n", stderr)
+            return
+          }
+          NSApp.sendAction(act, to: tgt, from: r)
+        }
+        fputs("press: \(token) done -- mode is now \(t.mode)\n", stderr)
+      }
+    }
+
     w.makeKeyAndOrderFront(nil)
     // ── THE CARET GOES WHERE THE MODE IS ─────────────────────────────────────
     //
