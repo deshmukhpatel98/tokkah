@@ -134,6 +134,30 @@ grep -q "click cancel at" "$SP/d.log" \
   && say "OK" "and pressing it ended the call instead of just looking pressed" \
   || say "FAIL" "cancel was pressed and the call is still running"
 
+# ── 6. THE RED BUTTON IS ALSO A NO, BEFORE THE CALL EXISTS ──────────────────
+#
+# Closing the window deliberately keeps a CONNECTED call (walk back in later).
+# Before the transport locks there is nothing to keep, and closing used to tell
+# NOBODY: the red button never cancelled a ring, and an answered-then-closed
+# window left the caller on "Calling…" until the no-answer timeout -- measured
+# live, call 244yp0liz2dio: answered at 13:57:14, closed at :15, caller deaf
+# for two minutes. Both pre-connect shapes must send the same bye a decline
+# sends. The delivery half is bye-check's business; this proves the path FIRES.
+spawn "$TK" --window --room "callngE$$" --listen 8047 --peer 127.0.0.1:8048 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --calling meera --press-after 2 --press close-window > "$SP/e.log" 2>&1
+spawn "$TK" --window --room "callngF$$" --listen 8048 --peer 127.0.0.1:8047 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --with meera --press-after 2 --press close-window > "$SP/f.log" 2>&1
+perl -e 'select undef,undef,undef,6'
+reap
+grep -q "bye (closed-early): @meera" "$SP/e.log" \
+  && say "OK" "closing a Calling… window sends the cancel, same as the button" \
+  || say "FAIL" "closing a Calling… window told nobody"
+grep -q "bye (closed-early): @meera" "$SP/f.log" \
+  && say "OK" "closing an answered-but-not-connected window tells the caller" \
+  || say "FAIL" "closing an answered-but-not-connected window told nobody"
+
 echo
 if [ "$fail" = 0 ]; then
   echo "CALLING CHECK PASSED -- the caller sees the mirror of what the callee sees"

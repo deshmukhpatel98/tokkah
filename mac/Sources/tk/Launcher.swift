@@ -735,8 +735,12 @@ enum Launcher {
       // deferred update -- carrying it forward would put a "Calling @meera" card
       // over a call that has nothing to do with meera. Same rule as `--incoming`
       // one line up: a call being placed is an event, not a property of the room.
+      // `--with` names who the CURRENT room is shared with, and this line is
+      // where the room changes -- carried forward, a later close in a fresh
+      // room would send its "can't talk" bye to somebody from a previous call.
+      // The answer path passes it explicitly in `extra`, which is not filtered.
       if t == "--gui" || t == "--call" || t == "--incoming" || t == "--calling"
-        || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
+        || t == "--with" || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
       seen.insert(t)
       args.append(t)
       if let v = value { args.append(v) }

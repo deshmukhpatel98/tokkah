@@ -5,6 +5,28 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.97.0 — 2026-08-31
+
+### Fixed — closing a window before the call connected told nobody
+
+"Close keeps the call" is a promise about a call that exists. Before the
+transport locks there is nothing to keep, and the red button told nobody:
+closing a "Calling…" window never cancelled the ring, and closing an
+answered-but-not-yet-connected window left the caller on "Calling…" until the
+no-answer timeout. Measured live (call `244yp0liz2dio`): the callee answered
+at 13:57:14, closed the window at 13:57:15, and the caller transmitted
+2.4 Mbps at a dead socket for two minutes with `opened` frozen at 50.
+
+A pre-connect close now sends the same mailbox bye a decline sends — the
+caller gets the ordinary "can't talk right now" card within a poll. To make
+that possible the answered image finally knows WHO it was answering:
+`--with <handle>` rides the answer re-exec (`--incoming` is an event and
+rightly dies there; who the room is shared with is a property of the room),
+and is stripped at every later re-exec so a fresh room can never inherit an
+old name. A connected call keeps today's behaviour: close, reopen, walk back
+in. `calling-check` grew the two arms: closing a Calling… window cancels, and
+closing an answered-unconnected window tells the caller.
+
 ## Kin 0.96.0 — 2026-08-31
 
 ### Fixed — a cancelled call rang on at the other end

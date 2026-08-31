@@ -427,7 +427,7 @@ let KNOWN_FLAGS: Set<String> = [
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
-  "no-ring-preview", "incoming-key",
+  "no-ring-preview", "incoming-key", "with",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "callee-away",
   // A call that outlives its process is on by default and has to be switchable
@@ -1350,6 +1350,29 @@ func leaveCall() -> Never {
 func closeWindowKeepingCall() -> Never {
   shuttingDown = true
   let held = Resume.holding
+  // ── A CLOSE BEFORE THE CALL EXISTS IS A NO, AND THE OTHER PERSON IS TOLD ──
+  //
+  // "Close keeps the call" is a promise about a call that EXISTS: the record
+  // stays, the far end holds, reopening walks back in. Before the transport
+  // locks there is no record and nothing to walk back into -- closing THIS
+  // window abandons the attempt, and silence about it is a ringing Mac (the
+  // red button never cancelled a ring) or a caller stuck on "Calling…" for
+  // the full no-answer timeout (measured live: answered at 13:57:14, window
+  // closed at :15, caller deaf for two minutes). Whoever this room was being
+  // shared with -- the person being called (`--calling`), the caller whose
+  // ring was answered (`--with`), or the caller still being asked
+  // (`gOffered`) -- gets the same mailbox bye a decline sends.
+  if !held {
+    let who = gCalling?.who ?? arg("with") ?? gOffered?.from ?? ""
+    let room = gCalling?.room ?? (arg("with") != nil ? (arg("room") ?? "") : (gOffered?.room ?? ""))
+    if !who.isEmpty, !room.isEmpty {
+      hangUpAndExit(to: who, room: room, why: "closed-early")
+      // hangUpAndExit returns at once and exits from its own completion
+      // (message out, or the 2 s cap). This thread must only not fall through
+      // to the silent exit below -- the one that told nobody.
+      while true { Thread.sleep(forTimeInterval: 0.1) }
+    }
+  }
   postFinalBeat(why: held ? "closed-holding" : "closed")
   fputs(held ? "window closed -- the call stays open; reopening Kin rejoins it\n"
              : "window closed\n", stderr)
@@ -2242,7 +2265,15 @@ display?.controls?.onAnswerRing = {
   // binding a name to an empty string would poison the contact list.
   if !o.k.isEmpty { Identity.remember(handle: o.from, key: o.k) }
   display?.controls?.setStatus("answering \(Identity.display(o.from))…")
-  Launcher.reexec(room: o.room, extra: ["--video", "camera", "--window"], why: "ring answered")
+  // `--with`: WHO this room is shared with, carried through the re-exec.
+  // `--incoming` is an event and rightly dies at the handoff, but the answered
+  // image then knew nobody -- so when its window was closed before the
+  // transport locked, there was no handle to send the bye to, and the caller
+  // sat on "Calling…" until the no-answer timeout. Measured live, call
+  // 244yp0liz2dio: answered at 13:57:14, closed at 13:57:15, caller deaf for
+  // two minutes. A name is a property of the room, not an event.
+  Launcher.reexec(room: o.room, extra: ["--with", o.from, "--video", "camera", "--window"],
+                  why: "ring answered")
 }
 // Cancelling a call nobody has answered yet. `onLeave` still exists and still
 // just leaves; this one exists because there is a person on the other end whose
