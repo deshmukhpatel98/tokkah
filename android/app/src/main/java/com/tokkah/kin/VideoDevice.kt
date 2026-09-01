@@ -42,6 +42,7 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     private var decoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private var camThread: HandlerThread? = null
+    private var codecThread: HandlerThread? = null
     private var decoderConfigured = false
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
@@ -73,6 +74,14 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                 // No B-frames. Where the vendor honours it, say it explicitly.
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
+            // The codec's callbacks must NOT land on the main thread: they put
+            // packets on the wire, and Android kills network I/O there
+            // (NetworkOnMainThreadException, swallowed by the send path — the
+            // Mac saw "frags 0" while this end happily encoded 361 frames).
+            // It is also a real-time path and has no business on the UI thread.
+            val ct = HandlerThread("kin-codec").apply { start() }
+            codecThread = ct
+            val ch = Handler(ct.looper)
             val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             // setCallback BEFORE configure: that is the documented order for
             // asynchronous mode, and getting it wrong is silent — the codec
@@ -94,7 +103,7 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                     f.getByteBuffer("csd-0")?.let { sps = bytesOf(it) }
                     f.getByteBuffer("csd-1")?.let { pps = bytesOf(it) }
                 }
-            })
+            }, ch)
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = enc.createInputSurface()
             enc.start()
@@ -234,7 +243,8 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
         try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
         try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
         camThread?.quitSafely()
-        camera = null; encoder = null; decoder = null; camThread = null
+        codecThread?.quitSafely()
+        camera = null; encoder = null; decoder = null; camThread = null; codecThread = null
         decoderConfigured = false
     }
 }

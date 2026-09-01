@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.tokkah.kin"
     android:versionCode="1"
-    android:versionName="0.113.0-android.1" >
+    android:versionName="0.113.0-android.2" >
 
     <uses-sdk
         android:minSdkVersion="29"

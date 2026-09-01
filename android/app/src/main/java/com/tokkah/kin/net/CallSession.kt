@@ -92,10 +92,15 @@ class CallSession(
 
     // ── the wire ─────────────────────────────────────────────────────────────
 
+    var sendErrors = 0; private set
+    var lastSendError: String? = null; private set
+    var videoPacketsSent = 0; private set
+
     private fun sendRaw(b: ByteArray, n: Int = b.size) {
         val s = sock ?: return
         val targets = locked?.let { listOf(it) } ?: candidates
-        for (t in targets) try { s.send(DatagramPacket(b, n, t)) } catch (_: Exception) {}
+        for (t in targets) try { s.send(DatagramPacket(b, n, t)) }
+        catch (e: Exception) { sendErrors++; lastSendError = "${e.javaClass.simpleName}: ${e.message}" }
     }
 
     private fun sendSealed(b: ByteArray, n: Int = b.size) {
@@ -314,8 +319,13 @@ class CallSession(
             val len = minOf(Wire.VPAYLOAD, n - off)
             val m = Wire.packVideoFragment(videoSeq, cap, f, nfrag, payload, off, len, videoScratch)
             sendSealed(videoScratch, m)
+            videoPacketsSent++
         }
         videoSeq++
+        if (videoSeq % 60 == 1) {
+            android.util.Log.i("kin", "video out: seq=$videoSeq packets=$videoPacketsSent " +
+                "errors=$sendErrors last=$lastSendError locked=$locked")
+        }
     }
 
     /** One render block: the jitter buffer's answer for this device callback. */
