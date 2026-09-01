@@ -292,9 +292,20 @@ grep -q "window visible/onscreen" "$SP/b.log" \
        # level and sits behind it.
        case "$STATE" in
          *occluded*)
-           say "FAIL" "the ring window was OCCLUDED ($STATE), so nothing could be"
-           say "FAIL" "  photographed. Close any open Kin window and run this again:"
-           say "FAIL" "  it is a fact about this Mac, not about the build." ;;
+           # ── AND THAT IS NOT A FAILING BUILD ───────────────────────────────
+           #
+           # An occluded window is the owner of this Mac having Kin open in front
+           # of a rig that parks its windows at the desktop level. Reporting it as
+           # FAIL made the suite's only red, run after run, a fact about the room
+           # rather than about the code -- and a red that is usually environmental
+           # is a red nobody reads. COULD NOT RUN is what this suite already says
+           # for `doorbell-check` and `cancelrace-check` when the machine, not the
+           # build, is in the way.
+           echo "  RING PICTURE CHECK COULD NOT RUN -- the ring window was OCCLUDED"
+           echo "  ($STATE): another Kin window is in front of it, so nothing could"
+           echo "  be photographed. Close it and run this again. This is a fact"
+           echo "  about this Mac and not a verdict on the build."
+           exit 2 ;;
          *) say "FAIL" "the ring window was $STATE -- nobody could have seen it" ;;
        esac; }
 # WHOSE FRAMES THOSE WERE. `shown` is incremented by the self-view too, so the
