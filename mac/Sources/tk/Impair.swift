@@ -78,7 +78,9 @@ final class Impair {
   var enabled: Bool {
     dropPct > 0 || jitterMs > 0 || delayMs > 0 || spikeMs > 0 || capacityMbps > 0
   }
-  var holdsPackets: Bool { jitterMs > 0 || delayMs > 0 || spikeMs > 0 }
+  var holdsPackets: Bool {
+    jitterMs > 0 || delayMs > 0 || spikeMs > 0 || (capacityQueue && capacityMbps > 0)
+  }
   private(set) var stalls = 0
 
 
@@ -113,9 +115,14 @@ final class Impair {
   // then an EVENT rather than a condition, which is what wifi actually is.
   private let afterS: Double
 
+  /// Queue the excess instead of dropping it. See `queueDelayMs`.
+  let capacityQueue: Bool
+
   init(dropPct: Double, burstMs: Double, jitterMs: Double,
        delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0,
-       untilS: Double = 0, afterS: Double = 0, capacityMbps: Double = 0) {
+       untilS: Double = 0, afterS: Double = 0, capacityMbps: Double = 0,
+       capacityQueue: Bool = false) {
+    self.capacityQueue = capacityQueue
     self.untilS = untilS
     self.afterS = afterS
     self.capacityMbps = capacityMbps
@@ -138,7 +145,9 @@ final class Impair {
   /// model; the coin-flip models do not care how big a packet is, which is the
   /// whole difference between them.
   func shouldDrop(bytes: Int = 0) -> Bool {
-    if capacityMbps > 0, bytes > 0, overBudget(bytes) { return true }
+    // In queue mode the bucket is consulted by `queueDelayMs` on the send path
+    // instead: one model or the other, never both, or the excess is charged twice.
+    if capacityMbps > 0, bytes > 0, !capacityQueue, overBudget(bytes) { return true }
     guard dropPct > 0 else { return false }
     let now = Clock.now()
     // Both clocks run from the first packet, for the same reason: the socket, the
@@ -185,6 +194,59 @@ final class Impair {
   }
 
   /// The bucket. True when this packet cannot be paid for.
+  // ── A LINK THAT IS FULL, NOT ONE THAT IS LOSSY ─────────────────────────────
+  //
+  // The capacity model above is a leaky bucket that DROPS what does not fit, and
+  // under it the video pause has no domain at all: `vpause-check` arm B has never
+  // once been able to construct its case, and says so honestly -- "the far end
+  // reported conceal 0/s, so the voice never suffered and the controller correctly
+  // never paused". That is right, and it is right for a reason that is a fact
+  // about the model rather than about the app: FEC repairs a proportional share
+  // of 1500 small voice packets a second, the bursts that overflow the bucket are
+  // the video, and dropping video hurts nobody's voice.
+  //
+  // Real links do not behave like that. A home uplink, a hotel wifi, a phone on
+  // one bar -- they QUEUE. Video bursts sit in front of the voice packets behind
+  // them, and the voice arrives late rather than not at all: late enough to be
+  // concealed, which is exactly the harm the pause exists to relieve and exactly
+  // what it cannot be shown to relieve without this. Pausing the picture drains
+  // the queue and the voice comes back, which is the "it helped" half of the
+  // controller and the half no rig has ever exercised.
+  //
+  // So `--imp-capacity-queue` runs the same bucket and, instead of dropping the
+  // excess, DELAYS it by how long the backlog would take to drain. Beyond a
+  // bounded queue it drops, because a real queue is finite and a model that
+  // delays without limit is a model of nothing.
+  private(set) var queued = 0
+  private(set) var queueDroppedFull = 0
+  private var backlogBytes: Double = 0
+  private var backlogAt: UInt64 = 0
+
+  /// How long this packet waits behind what is already queued, in milliseconds.
+  /// `nil` means the queue is full and the packet is dropped, which a real one
+  /// also does. Only called when `capacityQueue` is on.
+  func queueDelayMs(_ bytes: Int) -> Double? {
+    let now = Clock.now()
+    let rateBytesPerMs = capacityMbps * 125_000 / 1000.0
+    guard rateBytesPerMs > 0 else { return 0 }
+    if backlogAt == 0 { backlogAt = now }
+    // Drain what has left the queue since the last packet.
+    backlogBytes = max(0, backlogBytes - Clock.ms(now - backlogAt) * rateBytesPerMs)
+    backlogAt = now
+    // A queue this deep is what a consumer uplink actually has: 250 ms of it.
+    let maxBacklog = rateBytesPerMs * 250
+    if backlogBytes + Double(bytes) > maxBacklog {
+      queueDroppedFull += 1
+      dropped += 1
+      overCapacity += 1
+      return nil
+    }
+    backlogBytes += Double(bytes)
+    let wait = backlogBytes / rateBytesPerMs
+    if wait > 1 { queued += 1 }
+    return wait
+  }
+
   @inline(__always) private func overBudget(_ bytes: Int) -> Bool {
     let now = Clock.now()
     let burst = capacityMbps * 125_000 * 0.05        // 50 ms of tolerance, in bytes

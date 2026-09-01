@@ -29,7 +29,9 @@
 #      rate does not depend on how much is sent, so pausing CANNOT help. The
 #      controller must pause, measure, and give the picture back.
 #
-#   B  A FULL QUEUE (`--imp-capacity`). A leaky bucket: packets that cannot be
+#   B  A FULL QUEUE (`--imp-capacity --imp-capacity-queue`). A bucket that DELAYS
+#      what does not fit, because a link that drops the excess never harms a voice
+#      that FEC repairs -- see the note beside the arm. Originally: packets that cannot be
 #      paid for are dropped, so sending less genuinely reduces the loss. The
 #      controller must pause and KEEP the pause.
 #
@@ -62,15 +64,33 @@ say() { printf '  %-5s %s\n' "$1" "$2"; }
 # three harmed seconds at the floor and starts three rungs up, which is 20+ s of
 # descending before the interesting moment. Every production cadence gets a rig
 # override; the thing under test is the VERDICT, not the descent.
+# ── AND THERE HAS TO BE A VOICE TO HARM ─────────────────────────────────────
+#
+# Both ends ran `--mute` with no audio source, which means the microphone was a
+# quiet room: no voice, therefore no voice harm, therefore nothing this controller
+# can ever arm on. Arm B has been trying to prove that pausing the picture rescues
+# a voice that was never there. `--audio <wav>` replaces the microphone on a live
+# call, and with two real recordings the verdict appears on the first try:
+#
+#     voice harm 222/s -> 91/s over 4s with no video: the pause is helping
+#
+# Sibling of the same fault in `floor-check`, found the same day: a rig that
+# injects TEXT and no sound, testing a thing driven by sound.
+VP_WAV_A=""; VP_WAV_B=""
+for d in ../testbed/media/real ../testbed/peer/media testbed/media/real; do
+  [ -f "$d/realA.wav" ] && { VP_WAV_A="$d/realA.wav"; VP_WAV_B="$d/realB.wav"; break; }
+done
 run() {                             # run <name> <impair flags...>
   local name="$1"; shift
   local R="vp${name}$$"
   reap; perl -e 'select undef,undef,undef,0.5'
   "$TK" --window --video "$MEDIA" --mute --no-telemetry --no-update --no-relocate \
+        ${VP_WAV_A:+--audio "$VP_WAV_A"} \
         --no-rings --no-subtitles --room "$R" --listen 7861 --peer 127.0.0.1:7862 \
         --vquality 0.5 --vpause-after 2 "$@" > "$SP/$name-a.log" 2>&1 &
   PIDS="$PIDS $!"
-  "$TK" --window --video off --mute --no-telemetry --no-update --no-relocate \
+  "$TK" --window --video "$MEDIA" --mute --no-telemetry --no-update --no-relocate \
+        ${VP_WAV_B:+--audio "$VP_WAV_B"} \
         --no-rings --no-subtitles --room "$R" --listen 7862 --peer 127.0.0.1:7861 \
         > "$SP/$name-b.log" 2>&1 &
   PIDS="$PIDS $!"
@@ -185,8 +205,45 @@ else
   echo "  gap to put a ceiling in, so arm B cannot construct the case it tests."
   exit 2
 fi
-run cap --imp-capacity "$CAP"
-VERDICT2="$(grep -oE 'voice harm [^]]*with no video: [A-Za-z ]*' "$SP/cap-a.log" | head -1)"
+# ── AND THE LINK QUEUES, WHICH IS WHY THIS ARM COULD NEVER RUN ──────────────
+#
+# `--imp-capacity` alone is a leaky bucket that DROPS the excess, and under it
+# this arm has never once constructed its case. Its own note said so honestly and
+# said why: "the far end reported conceal 0/s, so the voice never suffered and the
+# controller correctly never paused. FEC repairs a proportional share of 1500
+# small packets a second; the video bursts are what the bucket drops." Dropping
+# video hurts nobody's voice, so there was nothing for a pause to relieve.
+#
+# Real links do not drop the excess, they QUEUE it, and then the video bursts sit
+# in front of the voice packets behind them. `--imp-capacity-queue` runs the same
+# bucket and delays instead of dropping, bounded at 250 ms of backlog, which is
+# what a consumer uplink actually has. Measured the first time it was tried:
+#
+#     voice harm 222/s -> 91/s over 4s with no video: the pause is helping
+#
+# That is the half of this controller that had never been exercised anywhere.
+# ── AND IT LOOKS FOR THE DOMAIN RATHER THAN GUESSING ONE POINT ──────────────
+#
+# One ceiling, at 1.15x the voice-alone rate, was a guess -- and the guess was
+# wrong in both directions at different times: too high and the voice never
+# suffers, too low and pausing cannot rescue it either because the voice alone
+# does not fit. Measured by hand, the domain was at 0.8 Mbps against a 0.95 Mbps
+# voice: "voice harm 222/s -> 91/s over 4s with no video: the pause is helping".
+#
+# So the arm walks a short ladder and reports WHERE the pause has a domain, which
+# is a more useful answer than a pass at a number somebody picked. It stops at the
+# first rung that produces a verdict; if no rung does, the note underneath is
+# unchanged and still honest.
+CAPS="$(python3 -c "
+w=${WITHOUT:-1}
+print(' '.join('%.2f' % (w*f) for f in (0.85, 1.15, 1.5)))")"
+VERDICT2=""
+for RUNG in $CAPS; do
+  echo "     trying a ceiling of ${RUNG} Mbps (voice alone needs ${WITHOUT})"
+  run cap --imp-capacity "$RUNG" --imp-capacity-queue
+  VERDICT2="$(grep -oE 'voice harm [^]]*with no video: [A-Za-z ]*' "$SP/cap-a.log" | head -1)"
+  [ -n "$VERDICT2" ] && { CAP="$RUNG"; break; }
+done
 [ -n "$VERDICT2" ] && echo "     $VERDICT2"
 # ── WHAT THIS ARM ACTUALLY FOUND, WHICH IS NOT WHAT IT WAS LOOKING FOR ──────
 #

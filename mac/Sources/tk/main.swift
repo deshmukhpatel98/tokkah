@@ -566,7 +566,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
   "backdrop-test", "selftest-seal", "selftest-beat", "selftest-fit", "window-size", "window-resize", "skip-mic-permission",
-  "no-predict", "predict-p",
+  "no-predict", "predict-p", "imp-capacity-queue",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -5955,7 +5955,8 @@ let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
                     spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3,
                     untilS: Double(arg("imp-until") ?? "0") ?? 0,
                     afterS: Double(arg("imp-after") ?? "0") ?? 0,
-                    capacityMbps: Double(arg("imp-capacity") ?? "0") ?? 0)
+                    capacityMbps: Double(arg("imp-capacity") ?? "0") ?? 0,
+                    capacityQueue: flag("imp-capacity-queue"))
 if impair.enabled {
   wire.impair = impair
   if impair.holdsPackets { wire.armDelayQueue() }

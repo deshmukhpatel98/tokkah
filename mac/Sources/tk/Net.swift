@@ -602,6 +602,14 @@ final class Wire {
           sentOK = true
           if let im = impair, im.enabled {
             if im.shouldDrop(bytes: m) { return }
+            // A FULL LINK, not a lossy one: the excess waits behind what is
+            // already queued instead of vanishing. See `Impair.queueDelayMs`.
+            if im.capacityQueue, im.capacityMbps > 0 {
+              guard let waitMs = im.queueDelayMs(m) else { return }   // queue full
+              if waitMs > 0.05, let q = delayQ {
+                q.push(out, m, due: Clock.now() + Clock.ticks(ns: UInt64(waitMs * 1_000_000))); return
+              }
+            }
             let d = im.delayTicks()
             if d > 0, let q = delayQ { q.push(out, m, due: Clock.now() + d); return }
           }
@@ -619,6 +627,12 @@ final class Wire {
     crypto?.notePlaintextTx()
     if let im = impair, im.enabled {
       if im.shouldDrop(bytes: n) { return }
+      if im.capacityQueue, im.capacityMbps > 0 {
+        guard let waitMs = im.queueDelayMs(n) else { return }
+        if waitMs > 0.05, let q = delayQ {
+          q.push(p, n, due: Clock.now() + Clock.ticks(ns: UInt64(waitMs * 1_000_000))); return
+        }
+      }
       let d = im.delayTicks()
       if d > 0, let q = delayQ { q.push(p, n, due: Clock.now() + d); return }
     }
