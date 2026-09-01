@@ -5133,7 +5133,13 @@ export default {
     // No auth: the binary is meant to be downloadable by anyone with the link,
     // and the thing that makes an install safe is the Ed25519 signature the
     // client verifies, not obscurity about the URL.
-    const rel = url.pathname.match(/^\/macos\/dl\/([A-Za-z0-9._-]{1,64})$/);
+    // ── AND THE SAME DOOR FOR ANDROID ────────────────────────────────────────
+    //
+    // One route, two platforms: the APK lives in the same bucket beside the
+    // disk image, because a second bucket is a second thing to forget to
+    // upload to. The path says which platform a person came for, so the
+    // download page and the analytics can tell them apart.
+    const rel = url.pathname.match(/^\/(?:macos|android)\/dl\/([A-Za-z0-9._-]{1,64})$/);
     if (rel) {
       if (!env.MACREL) return json({ error: 'releases not configured' }, 503);
       const obj = await env.MACREL.get(rel[1]);
@@ -5153,6 +5159,8 @@ export default {
       // By extension, not a constant. This served a disk image as application/gzip.
       h.set('content-type', rel[1].endsWith('.dmg')
         ? 'application/x-apple-diskimage'
+        : rel[1].endsWith('.apk')
+        ? 'application/vnd.android.package-archive'
         : 'application/gzip');
       // ── HOW BIG IS IT: THE ONE HEADER NOBODY WAS SENDING ─────────────────────
       //

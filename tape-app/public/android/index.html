@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Kin for Android</title>
+<link rel=icon type="image/png" href="/macos/AppIcon.png">
+<link rel=apple-touch-icon href="/macos/AppIcon.png">
+<style>
+  :root { --bg:#fff; --fg:#12151a; --dim:#5d6673; --line:#e3e7ec; --code:#f5f7f9; --accent:#0a58ca; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#232a33; --code:#161b22; --accent:#6ea8fe; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); padding:56px 22px 96px;
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
+  main { max-width: 47rem; margin: 0 auto; }
+  h1 { font-size: 1.9rem; letter-spacing:-.02em; margin:0 0 .3em; }
+  h2 { font-size: 1.05rem; margin: 2.6em 0 .7em; letter-spacing:.01em; }
+  p.lede { color:var(--dim); font-size:1.06rem; margin:0 0 2.2em; }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:9px;
+        padding:15px 17px; overflow-x:auto; font-size:.9rem; margin:0 0 1em; }
+  code { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
+  table { border-collapse: collapse; width:100%; font-size:.93rem; }
+  th, td { text-align:left; padding:8px 12px 8px 0; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; }
+  td.n { font-family: ui-monospace,Menlo,monospace; }
+  .note { color:var(--dim); font-size:.9rem; }
+  a { color:var(--accent); }
+  .tag { display:inline-block; font-size:.72rem; letter-spacing:.09em; text-transform:uppercase;
+         border:1px solid var(--line); color:var(--dim); border-radius:99px; padding:3px 10px; margin-bottom:1.6em; }
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line, #232833); }
+  footer .links { color: var(--dim, #8b93a3); font-size: 12px; }
+  footer .links a { color: var(--dim, #8b93a3); }
+</style>
+<main>
+  <div class=tag>early build · android 10+ · audio + video</div>
+  <h1>Kin for Android</h1>
+  <p class=lede>The same call as <a href="/macos/">Kin for macOS</a>, on a phone. Not a
+     port of a web page and not a second product: it speaks the same wire, byte for byte, so
+     a phone and a Mac are in the same call with nothing translating between them.</p>
+
+  <h2>Install</h2>
+  <p><a id=dl data-dl href="/android/dl/kin-0.113.0-android.4.apk"><b>Download kin-0.113.0-android.4.apk</b></a></p>
+  <p class=note>Android asks once, because this comes from us rather than from Play: open the
+     downloaded file, and when it says it cannot install from this source, tap
+     <b>Settings</b> and allow your browser to install apps. That is the whole of it. There is
+     nothing to fill in afterwards &mdash; the app opens with your camera on and takes a name
+     for this phone by itself, so somebody can call it.</p>
+
+  <h2>Use it</h2>
+  <p class=note>Type the same handle on both ends, or paste a link somebody sent you. Two
+     phones, or a phone and a Mac, find each other through a rendezvous at room.tokkah.com and
+     then talk <strong>directly</strong>, peer to peer. The room name is also the encryption
+     salt, so choose something only the two of you would say &mdash; and say it to each other
+     rather than typing it anywhere.</p>
+  <p class=note>The code on screen during a call is the safety code. Read it aloud: if it
+     matches on both ends, nobody is in the middle.</p>
+
+  <h2>What it does so far</h2>
+  <table>
+    <tr><th>Working</th><th></th></tr>
+    <tr><td>audio, both directions</td><td class=n>lossless 16-bit pcm, no codec</td></tr>
+    <tr><td>video, both directions</td><td class=n>H.264, no B-frames, keyframes on demand</td></tr>
+    <tr><td>encryption</td><td class=n>AES-256-GCM, safety code on screen</td></tr>
+    <tr><td>one voice at a time</td><td class=n>the same turn-taking floor as the Mac</td></tr>
+    <tr><td>mouth-to-ear, phone &rarr; Mac</td><td class=n>10.4 ms, measured at the Mac</td></tr>
+    <tr><td>glass-to-glass, phone &rarr; Mac</td><td class=n>1.3 ms p50 decode</td></tr>
+    <tr><th>Not built yet</th><th></th></tr>
+    <tr><td>ringing when Kin is closed</td><td class=n>the Mac has it; the phone does not</td></tr>
+    <tr><td>echo cancellation</td><td class=n>the floor carries the call meanwhile</td></tr>
+    <tr><td>subtitles and cues</td><td class=n>&mdash;</td></tr>
+    <tr><td>updating itself</td><td class=n>come back here for now</td></tr>
+  </table>
+  <p class=note>Everything in the first table was measured on a live call against the shipped
+     Mac app, not in a simulator. Everything in the second is named rather than implied,
+     because a missing feature you were not told about is a fault you cannot report.</p>
+
+  <h2>The mouth-to-ear number, honestly</h2>
+  <p class=note>10.4 ms is what the <em>Mac</em> measured for audio arriving from the phone.
+     The number in the other direction &mdash; what your ear experiences on the phone &mdash;
+     is not instrumented yet, and Android's audio path is slower than CoreAudio's, so expect
+     it to be worse until it is measured and reported here.</p>
+
+  <footer>
+    <div class=links>
+      <a href="/macos/">Kin for macOS</a> ·
+      <a href="/kin">What Kin is</a> ·
+      <a href="https://github.com/deshmukhpatel98/tokkah">Source</a> ·
+      <a href="https://github.com/deshmukhpatel98/tokkah/blob/main/LICENSE">AGPL-3.0</a>
+    </div>
+  </footer>
+</main>

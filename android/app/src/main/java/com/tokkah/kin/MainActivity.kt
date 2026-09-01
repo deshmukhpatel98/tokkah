@@ -15,7 +15,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -90,6 +92,16 @@ fun KinApp(initialRoom: String?) {
             if (!identity.claimed) identity.claim(android.os.Build.MODEL ?: "kin")
             myHandle = identity.handle
             people = identity.contacts().keys.map { Person(it) }
+            // The same fixtures the Mac's own home-check plants, so the two
+            // front doors can be compared like for like until contacts and
+            // presence are really wired.
+            if (people.isEmpty() && KIN_FIXTURES) {
+                people = listOf(
+                    Person("meera", online = true, lastSeen = "5m ago"),
+                    Person("arjun", lastSeen = "yesterday"),
+                    Person("dad", lastSeen = "3w ago"),
+                )
+            }
         }
     }
 
@@ -181,6 +193,12 @@ fun KinApp(initialRoom: String?) {
     }
 }
 
+/** The Mac's home-check plants three people; this plants the same three. */
+private val KIN_FIXTURES =
+    android.os.Build.FINGERPRINT.contains("generic") ||
+    android.os.Build.FINGERPRINT.lowercase().contains("emulator") ||
+    android.os.Build.MODEL.lowercase().contains("sdk")
+
 private fun granted(ctx: Context, p: String) =
     ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
 
@@ -194,19 +212,36 @@ private fun SelfPreview(onHint: (String) -> Unit) {
     )
 }
 
-/** Their face. A SurfaceView, because here latency is the product. */
+/**
+ * Their face. A SurfaceView, because here latency is the product.
+ *
+ * ── AND IT KEEPS ITS SHAPE ──────────────────────────────────────────────────
+ *
+ * A SurfaceView stretches its buffer to its bounds, so a 16:9 picture in a
+ * 9:20 window made everybody tall and thin. Display.swift answers this with
+ * `.resizeAspect` — fit inside, keep the shape — so the surface is sized to the
+ * aspect the DECODER reports and centred. Their face is the wrong thing to
+ * take liberties with.
+ */
 @Composable
 private fun FarVideo(video: VideoDevice?) {
-    AndroidView(
-        factory = { c ->
-            SurfaceView(c).apply {
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(h: SurfaceHolder) { video?.attachDisplay(h.surface) }
-                    override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
-                    override fun surfaceDestroyed(h: SurfaceHolder) {}
-                })
-            }
-        },
-        modifier = Modifier.fillMaxSize(),
-    )
+    var aspect by remember { mutableStateOf(16f / 9f) }
+    DisposableEffect(video) {
+        video?.onDecodedSize = { w, h -> if (h > 0) aspect = w.toFloat() / h }
+        onDispose { video?.onDecodedSize = null }
+    }
+    Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+        AndroidView(
+            factory = { c ->
+                SurfaceView(c).apply {
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(h: SurfaceHolder) { video?.attachDisplay(h.surface) }
+                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                        override fun surfaceDestroyed(h: SurfaceHolder) {}
+                    })
+                }
+            },
+            modifier = Modifier.fillMaxWidth().aspectRatio(aspect),
+        )
+    }
 }

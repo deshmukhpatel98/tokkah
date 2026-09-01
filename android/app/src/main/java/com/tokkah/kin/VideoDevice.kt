@@ -49,6 +49,15 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
 
     var framesEncoded = 0; private set
     var framesDecoded = 0; private set
+    /**
+     * The far end's picture size, as the DECODER reports it — not as the
+     * encoder was configured. They are not the same claim: a peer can send any
+     * size, and a receiver that assumes 16:9 stretches a face the moment one
+     * does not. Display.swift uses `.resizeAspect` for exactly this reason.
+     */
+    var decodedW = 0; private set
+    var decodedH = 0; private set
+    var onDecodedSize: ((Int, Int) -> Unit)? = null
     var lastError: String? = null; private set
     var facingFront = true
 
@@ -214,6 +223,11 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                 val d = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
                 d.configure(fmt, surface, null, 0)
                 d.start()
+                d.outputFormat.let { of ->
+                    val w = runCatching { of.getInteger(MediaFormat.KEY_WIDTH) }.getOrDefault(W)
+                    val h = runCatching { of.getInteger(MediaFormat.KEY_HEIGHT) }.getOrDefault(H)
+                    if (w > 0 && h > 0) { decodedW = w; decodedH = h; onDecodedSize?.invoke(w, h) }
+                }
                 decoder = d
                 decoderConfigured = true
             } catch (e: Exception) { lastError = "decoder: ${e.message}"; return }
@@ -229,6 +243,15 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             d.queueInputBuffer(i, 0, n, System.nanoTime() / 1000, 0)
             val info = MediaCodec.BufferInfo()
             var o = d.dequeueOutputBuffer(info, 0)
+            if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                val of = d.outputFormat
+                val w = runCatching { of.getInteger(MediaFormat.KEY_WIDTH) }.getOrDefault(0)
+                val h = runCatching { of.getInteger(MediaFormat.KEY_HEIGHT) }.getOrDefault(0)
+                if (w > 0 && h > 0 && (w != decodedW || h != decodedH)) {
+                    decodedW = w; decodedH = h; onDecodedSize?.invoke(w, h)
+                }
+                o = d.dequeueOutputBuffer(info, 0)
+            }
             while (o >= 0) {
                 d.releaseOutputBuffer(o, true)   // render
                 framesDecoded++

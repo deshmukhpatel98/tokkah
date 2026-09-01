@@ -57,6 +57,9 @@ import androidx.compose.ui.unit.dp
  */
 val LocalBackdrop = staticCompositionLocalOf<GraphicsLayer?> { null }
 
+/** How much light the material adds, measured off the Mac's own card. */
+private const val LIFT = 0.13f
+
 @Composable
 fun GlassBackdrop(
     modifier: Modifier = Modifier,
@@ -126,8 +129,18 @@ fun GlassSurface(
                     // fallback — land on the same colour, and the blur shows
                     // through it as the movement that makes it glass.
                     drawRect(Palette.glass.copy(alpha = Palette.glass.alpha * dim / Palette.dimAlpha))
+                    // ── AND THE MATERIAL ADDS LIGHT ──────────────────────────
+                    //
+                    // A HUD material is vibrant: it does not only darken, it
+                    // lifts. Photographed against the Mac's own front door over
+                    // a black window, its card is a mid grey (~#2E3137) while
+                    // dark-wash-only came out nearly black — the same layout
+                    // reading as a different product. The lift is what makes a
+                    // pane look like a pane sitting ON something.
+                    drawRect(Palette.fill(LIFT))
                 } else {
                     drawRect(Palette.glass)
+                    drawRect(Palette.fill(LIFT))
                 }
                 if (tint != Color.Transparent) drawRect(tint)
                 // The specular top edge that makes a pane read as a pane.

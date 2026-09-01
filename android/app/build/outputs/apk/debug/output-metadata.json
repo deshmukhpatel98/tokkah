@@ -11,8 +11,8 @@
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 1,
-      "versionName": "0.113.0-android.3",
+      "versionCode": 4,
+      "versionName": "0.113.0-android.4",
       "outputFile": "app-debug.apk"
     }
   ],

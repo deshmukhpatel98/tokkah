@@ -62,29 +62,27 @@ class CameraPreview(ctx: Context) : TextureView(ctx), TextureView.SurfaceTexture
     private fun fit(viewW: Int, viewH: Int) {
         if (viewW <= 0 || viewH <= 0) return
         val display = when (context.display?.rotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
+            Surface.ROTATION_90 -> 1
+            Surface.ROTATION_180 -> 2
+            Surface.ROTATION_270 -> 3
             else -> 0
         }
-        // Front cameras are mirrored, and the sensor's rotation composes the
-        // other way round for them.
-        val rotation =
-            if (facingFront) (sensorOrientation + display) % 360
-            else (sensorOrientation - display + 360) % 360
-
-        // The buffer, after rotation, in the window's own axes.
-        val swapped = rotation % 180 != 0
-        val bufW = if (swapped) BUF_H.toFloat() else BUF_W.toFloat()
-        val bufH = if (swapped) BUF_W.toFloat() else BUF_H.toFloat()
-
+        val view = android.graphics.RectF(0f, 0f, viewW.toFloat(), viewH.toFloat())
+        // The buffer is landscape; the window is portrait. Map one onto the
+        // other with setRectToRect and then rotate, which is the only ordering
+        // that stays correct at every display rotation.
+        val buffer = android.graphics.RectF(0f, 0f, BUF_H.toFloat(), BUF_W.toFloat())
+        val cx = view.centerX()
+        val cy = view.centerY()
         val m = android.graphics.Matrix()
-        // TextureView has already stretched the buffer to the view, so undo that
-        // and re-apply a cover fit.
-        val scale = maxOf(viewW / bufW, viewH / bufH)
-        m.setScale(bufW * scale / viewW, bufH * scale / viewH, viewW / 2f, viewH / 2f)
-        if (rotation != 0) m.postRotate(-rotation.toFloat(), viewW / 2f, viewH / 2f)
-        if (facingFront) m.postScale(-1f, 1f, viewW / 2f, viewH / 2f)   // a mirror is a mirror
+        buffer.offset(cx - buffer.centerX(), cy - buffer.centerY())
+        m.setRectToRect(view, buffer, android.graphics.Matrix.ScaleToFit.FILL)
+        val scale = maxOf(viewH.toFloat() / BUF_H, viewW.toFloat() / BUF_W)
+        m.postScale(scale, scale, cx, cy)
+        val turn = (sensorOrientation - display * 90 + 360) % 360
+        if (turn != 0) m.postRotate(turn.toFloat(), cx, cy)
+        // A mirror is a mirror: your own face, the way a bathroom shows it.
+        if (facingFront) m.postScale(-1f, 1f, cx, cy)
         setTransform(m)
     }
 

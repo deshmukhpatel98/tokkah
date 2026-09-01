@@ -114,23 +114,25 @@ fun HomeScreen(
                             pastedLink?.let {
                                 KinRow("Join $it", detail = "from a link", onClick = { onRoom(it); onJoin() })
                             }
-                            if (people.isEmpty()) {
-                                KinHint("Nobody has called you yet. Type a room, or hand somebody your link.")
-                            } else {
-                                for (p in people) {
-                                    KinRow(
-                                        p.handle,
-                                        detail = if (p.online) "here" else p.lastSeen,
-                                        leading = { Avatar(p.handle, online = p.online) },
-                                        onClick = { onCall(p.handle) },
-                                    )
-                                }
+                            for (p in people) {
+                                KinRow(
+                                    "@" + p.handle,
+                                    detail = p.lastSeen,
+                                    leading = { Avatar(p.handle, online = p.online) },
+                                    onClick = { onCall(p.handle) },
+                                )
                             }
                             RoomField(room, onRoom, onJoin)
-                            KinRow("Copy my link", detail = "kin.tokkah.com", onClick = onInvite)
+                            KinRow("Copy a link to invite someone", detail = "copy",
+                                onClick = onInvite)
+                            // A brand-new install has nobody to call until
+                            // somebody knows this phone's name — so the name
+                            // stays on the front card exactly until the first
+                            // person is in the list, then moves behind the `…`.
                             if (people.isEmpty()) {
-                                KinRow("You are @$myHandle", ruled = true, enabled = false)
-                                KinHint("Give somebody that name and they can call this phone.")
+                                KinRow("@$myHandle", detail = "copy",
+                                    leading = { Avatar(myHandle) }, onClick = onInvite)
+                                KinHint("Give this to someone and they can call you.")
                             }
                         }
                     }
@@ -171,7 +173,7 @@ private fun RoomField(room: String, onRoom: (String) -> Unit, onJoin: () -> Unit
                 modifier = Modifier.fillMaxWidth(),
                 decorationBox = { inner ->
                     if (room.isEmpty()) {
-                        Text("type a room, or a name", color = Palette.muted,
+                        Text("Type a handle, like meera", color = Palette.muted,
                             fontSize = Type.field.first, fontWeight = Type.field.second)
                     }
                     inner()
@@ -184,13 +186,18 @@ private fun RoomField(room: String, onRoom: (String) -> Unit, onJoin: () -> Unit
 @Composable
 private fun SettingsRows(myHandle: String, quiet: Boolean, onQuiet: (Boolean) -> Unit) {
     if (myHandle.isEmpty()) {
-        KinHint("This phone has no name yet, so nobody can call it. It will take one the first time it reaches the server.")
+        KinHint("This phone has no name yet, so nobody can call it. It takes one the first time it reaches the server.")
     } else {
-        KinRow("You are @$myHandle", enabled = false)
-        KinHint("Give somebody that name and they can call this phone.")
+        KinRow("@$myHandle", detail = "copy", leading = { Avatar(myHandle) })
+        KinHint("Give this to someone and they can call you.")
     }
-    KinRow("Ring me when Kin is closed", detail = "off", enabled = false)
-    KinHint("Not built yet on Android — the phone has to hold a connection for this.")
-    KinRow(if (quiet) "Silent — nobody can ring" else "Silent mode", onClick = { onQuiet(!quiet) })
-    KinHint("Turns ringing off everywhere, until you turn it back on.")
+    KinRow("Let people reach you when Kin is closed", detail = "off",
+        labelInset = Metric.rowAvatarInset, tone = Palette.muted)
+    KinHint("Not built on Android yet — the phone has to hold a connection for this.")
+    KinRow(
+        "Don't ring me", detail = if (quiet) "on" else "off",
+        labelInset = Metric.rowAvatarInset,
+        onClick = { onQuiet(!quiet) },
+    )
+    KinHint("Calls to you are quietly declined until you turn this off.")
 }
