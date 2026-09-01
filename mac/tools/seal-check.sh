@@ -50,7 +50,26 @@ say() { printf '  %-5s %s\n' "$1" "$2"; }
 # ── 1. A SIGNED BUNDLE ───────────────────────────────────────────────────────
 # Built by the same script release.sh uses, so this is the artefact people
 # actually install and not a hand-rolled imitation of one.
-bash bundle/mkapp.sh 9.9.9-seal "$TK" "$SP" > "$SP/mkapp.log" 2>&1 || {
+# ── A PROBE VERSION THAT CANNOT OUTRANK PRODUCTION ──────────────────────────
+#
+# This said `9.9.9-seal`, and that one choice cost the user their install. The
+# bundles built here are launched (arms 3 and 4), they live outside /Applications,
+# and `Install.relocateIfHomeless` exists precisely to move such a bundle INTO
+# /Applications and hand over to it. `Install.install` has a downgrade guard and it
+# worked exactly as written -- it declined to treat the installed 0.118.0 as newer
+# than 9.9.9 -- so the probe was allowed to overwrite a working release, and
+# /Applications/Kin.app reported `9.9.9-seal` afterwards. Worse than a wrong label:
+# every later update comparison would have found 0.119.0 OLDER than 9.9.9 and the
+# app would never have updated itself again.
+#
+# `Install.swift`'s own comment records the first instance of this ("that happened,
+# and the install had to be restored from prod"). This is the second. So two
+# guards, not one:
+#
+#   0.0.1-seal   a version below every real release, so the downgrade guard
+#                catches a relocation even if the flag below is ever dropped
+#   --no-relocate  on every launch, which is the documented rule
+bash bundle/mkapp.sh 0.0.1-seal "$TK" "$SP" > "$SP/mkapp.log" 2>&1 || {
   echo "SEAL CHECK COULD NOT RUN -- mkapp.sh failed:"; sed 's/^/  /' "$SP/mkapp.log"; exit 2; }
 APP="$SP/Kin.app"
 if codesign --verify --deep --strict "$APP" 2>/dev/null; then
@@ -73,7 +92,7 @@ import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8", errors="replace").read()
 # The same shape the updater used: fill a version in and write the file back.
-io.open(p, "w", encoding="utf-8").write(s.replace("9.9.9-seal", "9.9.10-seal"))
+io.open(p, "w", encoding="utf-8").write(s.replace("0.0.1-seal", "0.0.2-seal"))
 PY
 if codesign --verify --deep --strict "$SP/Broken.app" 2>/dev/null; then
   say FAIL "rewriting Info.plist did NOT break the seal -- this whole file is measuring nothing"
@@ -105,7 +124,7 @@ seal_job() {                       # seal_job <app> <out>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$LABEL</string>
-<key>ProgramArguments</key><array><string>$1/Contents/MacOS/Tokkah</string><string>--version</string></array>
+<key>ProgramArguments</key><array><string>$1/Contents/MacOS/Tokkah</string><string>--version</string><string>--no-relocate</string></array>
 <key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>$2</string>
 <key>StandardErrorPath</key><string>$2.err</string>
@@ -137,7 +156,7 @@ GOOD_EXIT="$(seal_job "$APP" "$SP/good.out")"
 # CONTROL FIRST, because arm 3 is worthless if the good bundle cannot run either:
 # that would make "it did not start" a statement about this binary, not about the
 # seal. `--version` prints the version compiled into the source, which is not the
-# 9.9.9-seal in the plist -- so the assertion is that it printed SOMETHING.
+# 0.0.1-seal in the plist -- so the assertion is that it printed SOMETHING.
 if [ -s "$SP/good.out" ]; then
   say OK "CONTROL: launchd runs the untouched bundle -- it printed $(tr -d '\n' < "$SP/good.out")"
 else
@@ -173,7 +192,7 @@ fi
 # (`update-check.sh` has it). What IS reachable from here is the decision: the
 # guard is `isCertificateSigned()`, the same predicate `repairBundleIfStale` has
 # used for months, and `--selftest-seal` asks the running copy for its answer.
-SIGNED="$("$APP/Contents/MacOS/Tokkah" --selftest-seal 2>&1)"
+SIGNED="$("$APP/Contents/MacOS/Tokkah" --selftest-seal --no-relocate 2>&1)"
 case "$SIGNED" in
   *"certificate-signed: yes"*) say OK "a signed copy knows it is signed -- so the guard declines: $SIGNED" ;;
   *"certificate-signed: no"*) say FAIL "a certificate-signed copy reports NO, so the guard would patch it: $SIGNED"; fail=1 ;;
@@ -183,7 +202,7 @@ esac
 # constant and the guard would refuse to refresh anything, ever.
 cp -R "$APP" "$SP/Adhoc.app"
 codesign --force --sign - "$SP/Adhoc.app" >/dev/null 2>&1
-ADHOC="$("$SP/Adhoc.app/Contents/MacOS/Tokkah" --selftest-seal 2>&1)"
+ADHOC="$("$SP/Adhoc.app/Contents/MacOS/Tokkah" --selftest-seal --no-relocate 2>&1)"
 case "$ADHOC" in
   *"certificate-signed: no"*) say OK "CONTROL: an ad-hoc copy reports NO, so those are still refreshed" ;;
   *) say FAIL "CONTROL: an ad-hoc copy reports [$ADHOC] -- the predicate is a constant"; fail=1 ;;
