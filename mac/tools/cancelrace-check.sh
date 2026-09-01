@@ -209,8 +209,13 @@ spctl -a "$APP" 2>/dev/null \
 # rig that passes on one Mac and hangs on another. `--listen 8091` for the same
 # reason: the default port belongs to whatever else is running here.
 copyargs() { # log path
+  # `--skip-mic-permission` because this bundle is built freshper run and is
+  # therefore a NEW TCC IDENTITY: the first microphone request inside it puts up a
+  # dialog for an app nobody has ever seen, and the copy stops there -- eight lines
+  # into its log, forever. Measured; it is why arm B could never run. Nothing here
+  # is about audio.
   echo "--no-relocate --no-update --no-telemetry --no-subtitles --no-ring-preview" \
-       "--mute --listen 8091 --log $1 --press-after 4 --press ?"
+       "--skip-mic-permission --mute --listen 8091 --log $1 --press-after 4 --press ?"
 }
 # The pid the launched copy printed for itself. `--log` writes it as its first
 # line, and it is the only handle this shell has on a process `open` started.

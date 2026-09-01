@@ -332,6 +332,14 @@ trouble_arm() {                    # trouble_arm <microphone|camera> <words>
 }
 trouble_arm microphone "Kin can’t hear you — turn on the microphone"
 trouble_arm camera "Kin can’t see you — turn on the camera"
+# ── AND A CAMERA THAT IS ALLOWED AND STILL WILL NOT START ───────────────────
+#
+# Held by another app -- Zoom, Teams, Photo Booth -- or unplugged mid-call. That
+# case set the WINDOW TITLE, and this app hides its title bar, so the sentence was
+# drawn nowhere at all. It is a notice rather than a button: there is no pane to
+# open, and a sentence that looks pressable and does nothing is worse than one
+# that plainly is not.
+trouble_arm camerabusy "Kin can’t use your camera — another app may have it"
 # AND IT IS A CONTROL, not a notice: the fix is four clicks into a pane most
 # people have never opened, so the sentence opens it.
 # THE PILL IS A CONTROL, so it is CLICKED, not inspected. Two things had to be

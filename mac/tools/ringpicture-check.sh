@@ -281,7 +281,22 @@ LAYER_A=$(grep -oE "layer:[A-Za-z?]+" "$SP/b.log" | tail -1)
   || say "FAIL" "the layer refused $ENQF_A frames"
 grep -q "window visible/onscreen" "$SP/b.log" \
   && say "OK" "in a window that is visible and not occluded" \
-  || say "FAIL" "the window was $(grep -oE 'window [a-z]+/[a-z]+' "$SP/b.log" | tail -1) -- nobody could have seen it"
+  || { STATE="$(grep -oE 'window [a-z]+/[a-z]+' "$SP/b.log" | tail -1 | sed 's/^window //')"
+       # ── AN OCCLUDED WINDOW IS THIS MAC, NOT THE BUILD ──────────────────────
+       #
+       # The message used to read "the window was window visible/occluded", which
+       # is both mangled and misleading: it looks like a broken assertion when it
+       # is the rig correctly refusing to report on a photograph nobody could have
+       # taken. On a Mac whose owner has Kin open -- the normal state of the
+       # machine this suite runs on -- every rig window is parked at the desktop
+       # level and sits behind it.
+       case "$STATE" in
+         *occluded*)
+           say "FAIL" "the ring window was OCCLUDED ($STATE), so nothing could be"
+           say "FAIL" "  photographed. Close any open Kin window and run this again:"
+           say "FAIL" "  it is a fact about this Mac, not about the build." ;;
+         *) say "FAIL" "the ring window was $STATE -- nobody could have seen it" ;;
+       esac; }
 # WHOSE FRAMES THOSE WERE. `shown` is incremented by the self-view too, so the
 # claim "shown means the far end" holds only because a ring starts no camera --
 # asserted here rather than assumed, since it is the guarantee a future change to

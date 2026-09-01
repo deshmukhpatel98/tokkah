@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.122.0"
+let VERSION = "0.123.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -122,6 +122,40 @@ if flag("selftest-seal") { Update.selftestSeal() }
 // if any ratio in it divided by zero. The test therefore hands it exactly that,
 // and the pass condition is not "it did not crash": the line has to come back
 // out of the file, parse, and NAME the fields it replaced.
+// ── AM I OLDER THAN THE CODE I WAS BUILT FROM? ──────────────────────────────
+//
+// This repo builds two binaries -- `.build/debug/tk` and `.build/release/tk` --
+// and 23 of the rigs in `tools/` default to the first while 7 default to the
+// second. Building one and running a rig that uses the other tests the PREVIOUS
+// build and reports PASS about it. That has now happened three times in one
+// session, twice as a whole suite (`all-checks.sh` builds both now) and once as a
+// rig run by hand, where it looked exactly like a product bug: the arm asserted a
+// sentence the running binary had never contained.
+//
+// So the binary answers the question itself. `Sources/tk` exists beside a
+// development build and nowhere near an installed app, so this is silent for
+// every real user and loud for exactly the person who needs it.
+if let exe = Bundle.main.executableURL ?? URL(string: CommandLine.arguments[0]) {
+  // .build/<config>/tk -> ../../.. is the package root
+  let root = exe.deletingLastPathComponent().deletingLastPathComponent()
+              .deletingLastPathComponent()
+  let src = root.appendingPathComponent("Sources/tk")
+  if let mine = (try? FileManager.default.attributesOfItem(atPath: exe.path)[.modificationDate]) as? Date,
+     let all = try? FileManager.default.contentsOfDirectory(at: src, includingPropertiesForKeys: [.contentModificationDateKey]) {
+    var newest: (Date, String)?
+    for f in all where f.pathExtension == "swift" {
+      if let d = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+         d > mine, newest == nil || d > newest!.0 {
+        newest = (d, f.lastPathComponent)
+      }
+    }
+    if let n = newest {
+      fputs("STALE BINARY: \(exe.lastPathComponent) was built before \(n.1) was last"
+          + " edited. Whatever you are about to measure is the PREVIOUS build."
+          + " `swift build` and `swift build -c release` both, then try again.\n", stderr)
+    }
+  }
+}
 if flag("selftest-beat") { Telemetry.selftestBeat() }
 if flag("selftest-fit") { Launcher.selftestFit() }
 if flag("backdrop-test") {
@@ -531,7 +565,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
-  "backdrop-test", "selftest-seal", "selftest-beat", "selftest-fit", "window-size", "window-resize",
+  "backdrop-test", "selftest-seal", "selftest-beat", "selftest-fit", "window-size", "window-resize", "skip-mic-permission",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -1454,11 +1488,13 @@ Update.beforeRestart = {
 // on a test machine without changing the owner's privacy settings, which no rig
 // may do. Without it the sentence could only ever be verified by hand, once, by
 // whoever happened to have a denied microphone.
-enum LocalTrouble { case none, microphone, camera }
+enum LocalTrouble { case none, microphone, camera, cameraUnavailable }
 nonisolated(unsafe) var gTrouble: LocalTrouble = .none
 func showTrouble() {
   let words: String
-  let need: Permissions.Need
+  // Nil when there is nothing for a click to open. A sentence that looks
+  // pressable and does nothing is worse than one that plainly does not.
+  var need: Permissions.Need?
   switch gTrouble {
   case .none:
     display?.controls?.setTrouble(nil); return
@@ -1466,18 +1502,51 @@ func showTrouble() {
     words = "Kin can’t hear you — turn on the microphone"; need = .microphone
   case .camera:
     words = "Kin can’t see you — turn on the camera"; need = .camera
+  case .cameraUnavailable:
+    // ── A CAMERA THAT IS ALLOWED AND STILL WILL NOT START ────────────────────
+    //
+    // Held by another app -- Zoom, Teams, Photo Booth -- or unplugged mid-call.
+    // The old handling for this set the WINDOW TITLE ("Kin — no camera; waiting
+    // for the other person"), and this app hides its title bar: `titleVisibility
+    // = .hidden` under `.fullSizeContentView`, so the picture runs to the top
+    // edge and the title is drawn nowhere at all. The sentence existed and had no
+    // surface. Nothing to open in Settings here, so it is a notice, not a button.
+    words = CameraSource.available().isEmpty
+      ? "No camera on this Mac — they will hear you but not see you"
+      : "Kin can’t use your camera — another app may have it"
+    need = nil
   }
-  display?.controls?.onTroubleClick = { _ = Permissions.reveal(need) }
+  display?.controls?.onTroubleClick = need.map { n in { _ = Permissions.reveal(n) } }
   display?.controls?.setTrouble(words)
 }
 if let fake = ProcessInfo.processInfo.environment["TK_FAKE_DENIED"] {
-  gTrouble = fake == "camera" ? .camera : .microphone
+  gTrouble = fake == "camera" ? .camera
+           : (fake == "camerabusy" ? .cameraUnavailable : .microphone)
   fputs("TK_FAKE_DENIED=\(fake) -- pretending that permission is off, to prove the"
       + " sentence a person would see\n", stderr)
   // The window does not exist yet on this path, so it is armed for when it does.
   DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showTrouble() }
 }
 nonisolated(unsafe) var gMicAccess = -1
+// ── A RIG THAT CANNOT ANSWER A DIALOG MUST BE ABLE TO SKIP THE QUESTION ─────
+//
+// `--skip-mic-permission` exists for one measured case. `cancelrace-check` builds
+// a fresh app bundle per run and has the watcher open it the way a real ring
+// does. A fresh bundle is a NEW TCC IDENTITY, so the first
+// `AVCaptureDevice.requestAccess(for: .audio)` inside it goes to tccd, tccd puts
+// up a dialog for an app nobody has ever seen, and the process stops there --
+// eight lines into its log, forever, for a prompt no rig can answer and a bundle
+// that is deleted twenty seconds later.
+//
+// The arm behind that dialog is about a hang-up racing a launch. It has nothing
+// to do with audio. So the question can be skipped, loudly, and only when asked
+// for on the command line: nothing a person runs sets it, and the flag guard
+// refuses unknown options, so it cannot arrive by accident.
+if flag("skip-mic-permission") {
+  gMicAccess = -1
+  fputs("mic: NOT ASKING -- --skip-mic-permission. This end cannot be heard and"
+      + " nothing in this run is a statement about audio.\n", stderr)
+} else {
 switch AVCaptureDevice.authorizationStatus(for: .audio) {
 // ── AND IT SAYS WHEN ──────────────────────────────────────────────────────────
 //
@@ -1514,6 +1583,7 @@ case .denied, .restricted:
       + " System Settings > Privacy & Security > Microphone\n", stderr)
 @unknown default:
   break
+}
 }
 
 // ── WHAT YOU SEND SOMEONE TO GET THEM INTO THE CALL ─────────────────────────
@@ -1975,6 +2045,13 @@ func attachCamera(_ cam: CameraSource) {
       fputs("preview: unavailable (\(err)) -- continuing without a picture\n", stderr)
       noCameraHere = true
       setWindowTitle("Kin — no camera; waiting for the other person")
+      // AND ON THE SCREEN. The title above is drawn nowhere -- see `showTrouble`.
+      // Not overriding a permission sentence: "turn on the camera" is the cause,
+      // and this would be the symptom of it.
+      if gTrouble == .none {
+        gTrouble = .cameraUnavailable
+        DispatchQueue.main.async { showTrouble() }
+      }
       // Cleared so the reuse below the rendezvous builds a fresh source instead of
       // adopting a dead session -- which is also how a camera plugged in after
       // launch still gets picked up. The join loop pumps the main queue on every

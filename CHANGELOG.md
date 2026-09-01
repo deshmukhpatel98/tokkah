@@ -5,6 +5,97 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.123.0 — 2026-09-01
+
+### Fixed — a camera another app is holding said so only in the window title
+
+Zoom, Teams, Photo Booth, or a camera unplugged mid-call: the session fails to
+start, and the handling for it set the **window title** to "Kin — no camera;
+waiting for the other person". This app hides its title bar — `titleVisibility =
+.hidden` under `.fullSizeContentView`, so the picture runs to the top edge and the
+title is drawn nowhere at all. The sentence existed and had no surface. It now
+uses the same place a denied permission does, and says which case it is: *"Kin
+can't use your camera — another app may have it"*, or *"No camera on this Mac —
+they will hear you but not see you"*. A notice rather than a button: there is no
+pane to open, and a sentence that looks pressable and does nothing is worse than
+one that plainly is not.
+
+### Fixed — two controls announced as nothing in particular
+
+A control with no accessibility label announces as "button" — the same thing every
+other unnamed control announces as — so a screen reader meets a row of identical
+buttons. Two were unnamed, and they were not minor ones: the **scrim**, which is
+the most-used way out of the settings panel, and the **invite link**, which is the
+whole first experience of the app. The hit-test audit that already walks every
+control now reports `UNNAMED` per control, and `controls-check` fails on any.
+
+### Added — the bright-environment requirement finally has a number
+
+The one thing this app was asked for in the owner's own words — *"visibility has
+to be best even in bright environments, because this is liquid glass"* — was the
+only requirement with a meter in the app and **no threshold anywhere**.
+`Glass.contrastRatios` has reported `ink=fg N muted N` for every surface since the
+adaptive dim was built, and nothing ever held it to a number.
+
+`glass-check` now does, over its brightest calibrated background, with two bars
+from WCAG because they are different questions: **4.5:1 for text** (the panel, the
+pills, the cards, the invite link — sentences somebody reads) and **3:1 for
+glyphs** (the six round buttons; an icon is not a paragraph). Measured today:
+text **8.6:1 and 6.4:1**, glyphs **4.4:1 and 3.3:1**. The arm was calibrated in
+both directions — raised to an impossible 20:1 it named the three surfaces and
+their numbers — and a third arm refuses to let the other two pass by having
+nothing to judge: at least three surfaces must actually have been over a lit
+picture when measured.
+
+### Fixed — the four rigs that could never run, and one of them found a real bug
+
+Four of the 32 checks in `mac/tools/` had been reporting COULD NOT RUN or FAILED
+for weeks, none of them because of the app. All four run now, and the suite is
+**31 of 32** (the one exception refuses to photograph a window that another Kin is
+sitting in front of, which is this Mac and not the build).
+
+- `doorbell-check` — "launchd never parked the rig job in 90 s". The job was
+  `tk --version`, which exits in six milliseconds from a shell; under launchd it
+  produced no output at all and sat at `runs = 1, last exit code = (never
+  exited)`. Six substitutions, one variable at a time, and the first three answers
+  were all wrong — it was not the signature (SwiftPM already ad-hoc signs),
+  not the space in the path, not the `.build/debug` symlink. **It is the folder.**
+  This repo lives in `~/Downloads`, which macOS protects with TCC, and a launchd
+  agent has no session in which to ask — so the spawn stalls forever instead of
+  failing. The rig runs from a copy outside the protected folder and refuses
+  outright if its scratch dir is inside one. Now passes 10 assertions.
+- `cancelrace-check` — three faults stacked, and behind them a real one. Its rig
+  bundle was unsigned, so LaunchServices refused to open it silently; its launcher
+  then exec'd the repo binary from *outside* the bundle, which a GUI launch also
+  kills silently; and it timed a startup race with a `-Onone` build. With those
+  fixed the launched copy stopped eight lines into its log, forever, at a
+  microphone prompt for a brand-new bundle identity that no rig can answer —
+  `--skip-mic-permission` exists for exactly that, loudly, and only from the
+  command line. All three arms now pass, including the one that had never run.
+  It also caught the **answer button announcing as nothing at all** to a screen
+  reader, in the most important moment the app has.
+- `relaunch-check` — slept a flat 4 s after `launchctl bootstrap` then pgrepped
+  once, and reported "the agent never started" while the agent's own log showed it
+  running. It polls now.
+- `update-check` — was reading a stale debug binary. See above.
+
+And the runner itself: a 30-minute suite **will** overlap with editing the tree,
+and bash reads a script incrementally — so an edit two thirds of the way through a
+run killed it with `line 219: syntax error near unexpected token 'fi'` after 17
+rigs had gone green. It re-executes from a snapshot of itself now.
+
+### Fixed — the binary now says when it is older than the code
+
+Two binaries exist here, `.build/debug/tk` and `.build/release/tk`, and 23 rigs
+default to the first while 7 default to the second. Building one and running a rig
+that uses the other tests the **previous build** and reports PASS about it. That
+happened three times in one session — twice as a whole suite, and once as a rig run
+by hand where it looked exactly like a product bug, the arm asserting a sentence
+the running binary had never contained. The binary now compares its own
+modification time against `Sources/tk` and says so, loudly. `Sources` exists beside
+a development build and nowhere near an installed app, so it is silent for every
+real user.
+
 ## Kin 0.122.0 — 2026-09-01
 
 ### Added — you can answer a call without a mouse

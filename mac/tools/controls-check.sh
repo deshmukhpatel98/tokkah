@@ -124,6 +124,18 @@ A="$SP/a.log"
 NOTON=$(grep -c 'NOT ON SCREEN' "$A" || true)
 [ "${NOTON:-0}" = "0" ] && say OK "every named control was on screen when pressed" \
   || { say FAIL "$NOTON presses found nothing to press:"; grep 'NOT ON SCREEN' "$A" | sed 's/^/         /' | head -5; fail=1; }
+# ── AND EVERY ONE OF THEM HAS A NAME ────────────────────────────────────────
+#
+# A control with no accessibility label announces as "button" -- the same thing
+# every other unnamed control announces as -- so a screen reader meets a row of
+# six identical buttons. Two were unnamed when this arm was written: the scrim,
+# which is the most-used way out of the settings panel, and the invite link,
+# which is the whole first experience of the app.
+UNNAMED=$(grep -cE '^audit .* UNNAMED' "$A" || true)
+[ "${UNNAMED:-0}" = "0" ] && say OK "and every control on screen has a name a screen reader can say" \
+  || { say FAIL "$UNNAMED controls announce as nothing in particular:"
+       grep -oE '^audit [A-Z]+ +[a-z:#0-9]+.* UNNAMED' "$A" | sort -u | head -6 | sed 's/^/         /'
+       fail=1; }
 FAILHIT=$(grep -cE '^audit FAIL' "$A" || true)
 [ "${FAILHIT:-0}" = "0" ] && say OK "and the hit-test audit found nothing unreachable" \
   || { say FAIL "$FAILHIT controls are drawn and cannot be clicked"; grep '^audit FAIL' "$A" | sed 's/^/         /'; fail=1; }

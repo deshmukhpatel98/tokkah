@@ -2537,7 +2537,13 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     case .ringing: return [("answer", answerButton), ("decline", declineButton)]
     case .calling: return [("cancel", cancelButton)]
     case .noAnswer: return [("again", againButton), ("cancel", cancelButton)]
-    case .invite: return [("link", urlGlass), ("call", callIcon)]
+    case .invite:
+      // Named for the same reason the buttons are: a screen reader landing here
+      // otherwise announces a rectangle. The link IS the invite, and clicking it
+      // copies -- which is the part a person cannot guess and a reader must say.
+      urlGlass.setAccessibilityRole(.button)
+      urlGlass.setAccessibilityLabel("Invite link \(url), click to copy")
+      return [("link", urlGlass), ("call", callIcon)]
     case .dial: return [("dial", dialField), ("call", callIcon)]
     }
   }
@@ -2901,6 +2907,15 @@ final class PillButton: NSView {
   private func setTitle(_ t: String) {
     title2Storage = t
     label.stringValue = t
+    // ── AND A NAME, EVERY TIME THE WORDS CHANGE ────────────────────────────
+    //
+    // The `answer` button on an incoming call announced as nothing at all -- found
+    // by the audit's UNNAMED marker in `cancelrace-check`, in the most important
+    // moment the app has. Set here rather than in `init` because these buttons are
+    // relabelled in place (`answer`, `decline`, `cancel`, `call`), so a name
+    // assigned once would go stale the first time the card changed its mind.
+    setAccessibilityRole(.button)
+    setAccessibilityLabel(t)
     let w = ceil((t as NSString).size(withAttributes: [.font: label.font!]).width) + Metric.s8
     setFrameSize(NSSize(width: w, height: Metric.pillHeight))
     needsLayout = true
@@ -3037,7 +3052,15 @@ final class CallControls: NSView {
   private let cues = TurnCues(frame: .zero)
   /// `.sheetScrim`: a click anywhere else closes the sheet, which is how every
   /// bottom panel on a phone behaves and the only way out that needs no aiming.
-  private let sheetScrim = ScrimView()
+  private let sheetScrim: ScrimView = {
+    let v = ScrimView()
+    // The full-window dismiss layer. A click anywhere on it closes the panel and
+    // it is the most-used way out, so it is not "an unlabelled region" to anyone
+    // navigating by voice.
+    v.setAccessibilityRole(.button)
+    v.setAccessibilityLabel("Close settings")
+    return v
+  }()
   private let camPicker = NSPopUpButton()
   /// The camera picker's surface. Up beside the `more` button in the top corner,
   /// where the scrim is only 0.28 and is a gradient rather than a floor, so it
@@ -3726,6 +3749,14 @@ final class CallControls: NSView {
       let actionable = !self.troubleLocal.isEmpty && self.onTroubleClick != nil
       self.warnPill.toolTip = actionable ? "Opens System Settings" : nil
       self.warnPill.onClick = actionable ? { [weak self] in self?.troubleClicked() } : nil
+      // ── AND IT SAYS WHAT IT IS ──────────────────────────────────────────────
+      //
+      // VoiceOver reads the sentence either way; without a role it reads it as
+      // static text, so the one thing a person needs to know -- that this is the
+      // fix and it can be pressed -- is the part that does not get said.
+      self.warnPill.setAccessibilityRole(actionable ? .button : .staticText)
+      self.warnPill.setAccessibilityLabel(
+        actionable ? line + ", opens System Settings" : line)
       guard !line.isEmpty else { return }
       // Re-centre: the pill resizes itself to the sentence, so the origin set at
       // layout time belongs to whatever text was there before.
@@ -6471,9 +6502,24 @@ extension CallControls {
       // on the rest -- see WaitingCard.acceptsFirstMouse.
       let first = waiting.clickTargets.contains(where: { $0.1 === v })
         ? (waiting.firstMouseAt(v) ? "  first=yes" : "  first=no") : ""
-      lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)\(first)")
+      // ── AND WHAT A VOICEOVER USER MEETS ───────────────────────────────────
+      //
+      // A control with no accessibility label announces as "button", which is the
+      // same thing every other unnamed control announces as. That is not a
+      // cosmetic gap: it is a screen with six identical buttons on it. Reported
+      // per control, in the audit that already walks every one of them, so it
+      // cannot be a separate pass that nobody runs.
+      let named = (v.accessibilityLabel()?.isEmpty == false)
+      lines.append("\(verdict) \(name) at (\(Int(p.x)),\(Int(p.y))) -> \(got)\(first)"
+                 + (named ? "" : "  UNNAMED"))
     }
     return lines
+  }
+
+  /// Every clickable thing that a screen reader would announce as nothing in
+  /// particular. Empty is the only acceptable answer.
+  var unnamedControls: [String] {
+    clickTargets.filter { $0.1.accessibilityLabel()?.isEmpty != false }.map { $0.0 }
   }
 
   /// Real keystrokes, through THIS window. A text field filled by assigning

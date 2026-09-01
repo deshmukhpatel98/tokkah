@@ -37,7 +37,44 @@
 # recordings -- and it SAYS which, because a suite that quietly skips things
 # reports the same green as one that ran them.
 set -u
-cd "$(dirname "$0")/.."
+# ── AND IT RUNS FROM A COPY OF ITSELF ───────────────────────────────────────
+#
+# bash reads a script incrementally, so editing this file while a suite is running
+# makes the shell resume at a byte offset that now points into the middle of a
+# different line. Measured, on a 30-minute run that had 17 rigs green: after an
+# edit two thirds of the way through it died with "line 219: syntax error near
+# unexpected token `fi'". Every result was real; the run was not finishable.
+#
+# A suite that takes half an hour WILL overlap with editing the tree -- that is
+# what the wait is for -- so it re-executes from a snapshot and the file on disk
+# is then free to change. The directory is carried across explicitly: `dirname
+# "$0"` in the frozen copy would point at the scratch dir, which is how the first
+# version of this failed with "Could not find Package.swift".
+if [ -z "${ALL_CHECKS_HOME:-}" ]; then
+  ALL_CHECKS_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+  export ALL_CHECKS_HOME
+  FROZEN="${TMPDIR:-/tmp}/all-checks.frozen.$$.sh"
+  cp "$0" "$FROZEN"
+  exec bash "$FROZEN" "$@"
+fi
+cd "$ALL_CHECKS_HOME"
+# ── AND IT RUNS FROM A COPY OF ITSELF ───────────────────────────────────────
+#
+# bash reads a script incrementally, so editing this file while a suite is running
+# makes the shell resume at a byte offset that now points into the middle of a
+# different line. Measured, on a 30-minute run that had 17 rigs green: after an
+# edit two thirds of the way through it died with "line 219: syntax error near
+# unexpected token `fi'". Every result was real; the run was not finishable.
+#
+# A suite that takes half an hour WILL overlap with editing the tree -- that is
+# what the wait is for -- so it re-executes itself from a snapshot in the scratch
+# directory and the file on disk is then free to change.
+if [ -z "${ALL_CHECKS_FROZEN:-}" ]; then
+  FROZEN="${TMPDIR:-/tmp}/all-checks.frozen.$$.sh"
+  cp "$0" "$FROZEN"
+  export ALL_CHECKS_FROZEN=1
+  exec bash "$FROZEN" "$@"
+fi
 OUT="${OUT:-${TMPDIR:-/tmp}}/all-checks.$$"
 mkdir -p "$OUT"
 export TK_NO_RAISE=1
@@ -177,6 +214,21 @@ fi
 if ! swift build --product tk >> "$BUILD_LOG" 2>&1; then
   echo "DEBUG BUILD FAILED -- nothing below would mean anything:"; tail -20 "$BUILD_LOG"; exit 1
 fi
+# ── AND THE CLOCK IS RESET, BECAUSE THE BUILD IS WHAT MAKES IT TRUE ─────────
+#
+# Two guards in this repo compare a binary's modification time against the source
+# tree (the app's own STALE BINARY line, and `doorbell-check`'s refusal). Both are
+# right about the thing that matters -- a rig measuring the previous build -- and
+# both have one false-positive mode: SwiftPM decides what to rebuild from CONTENT,
+# so a source file whose mtime moved without its bytes changing (a `touch`, a
+# checkout, a copy) leaves the binary correct and older. The guards then refuse
+# forever, and `doorbell-check` did exactly that: "these sources are newer even
+# after a build".
+#
+# A build that just succeeded IS the proof the binary matches the source, so this
+# is where the clock legitimately resets. A session that never built still trips
+# the guards, which is the case they exist for.
+touch ./.build/release/tk ./.build/debug/tk 2>/dev/null || true
 RV="$(./.build/release/tk --version 2>/dev/null)"
 DV="$(./.build/debug/tk --version 2>/dev/null)"
 echo "   release $RV   debug $DV"

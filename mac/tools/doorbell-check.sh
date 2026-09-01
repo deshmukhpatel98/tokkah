@@ -189,6 +189,49 @@ status() {
 # The dead-job scenarios now install the OLD policy on purpose: that is the
 # historical condition being reproduced -- a job that ran, exited 0, and was
 # never restarted -- and with KeepAlive false it settles there and stays.
+# ── A LAUNCHD JOB CANNOT RUN ANYTHING UNDER ~/Downloads ─────────────────────
+#
+# This rig could not get past its own first step for weeks: "launchd never parked
+# the rig job in 90 s (state = running)". The job was `tk --version`, which exits
+# in six milliseconds from a shell. Under launchd it produced NO OUTPUT AT ALL and
+# sat at:
+#
+#     state = running
+#     runs = 1
+#     last exit code = (never exited)
+#
+# Four substitutions, one variable at a time, found it -- and the first three
+# answers were all wrong:
+#
+#   the same binary, ad-hoc signed, in a temp dir   -> ran, printed, parked
+#   the repo copy (already ad-hoc signed by SwiftPM)-> hung          NOT signing
+#   a copy at a path WITH a space in it             -> ran           NOT the space
+#   the real path behind .build/debug's symlink     -> hung          NOT the symlink
+#   a fresh copy inside ~/Downloads                 -> hung
+#   the same copy in ~/Library/Caches               -> ran
+#
+# It is the FOLDER. This repo lives in `~/Downloads`, which macOS protects with
+# TCC, and a launchd agent has no session in which to ask for access -- so the
+# spawn stalls forever instead of failing. No error, no exit code, no output, and
+# a rig left blaming its own timeout.
+#
+# Production never meets this: the agent points into `/Applications/Kin.app`. So
+# the rig runs from a copy outside the protected folder, which is also the more
+# faithful model. The ad-hoc re-sign is kept because the real install is signed
+# and a copy is cheap, not because signing was ever the problem.
+TKSIGNED="$SP/tk-signed"
+case "$SP" in "$HOME/Downloads"*|"$HOME/Desktop"*|"$HOME/Documents"*)
+  echo "DOORBELL CHECK COULD NOT RUN -- the scratch dir is inside a TCC-protected"
+  echo "  folder ($SP). launchd cannot execute anything there and will hang."; exit 2 ;;
+esac
+cp "$TK" "$TKSIGNED" 2>/dev/null || { echo "DOORBELL CHECK COULD NOT RUN -- no $TK to copy"; exit 2; }
+codesign --force --sign - "$TKSIGNED" > "$SP/sign.log" 2>&1 || true
+# Everything from here runs the copy: the app compares the plist's program path
+# against its OWN path when it decides whether a plist is stale, so a rig that
+# loads one copy and interrogates another gets a true answer to a question nobody
+# asked ("plist present (STALE -- points at a different copy)").
+TK="$TKSIGNED"
+
 write_plist() {
   local keep="$2" throttle="${3:-30}"
   cat > "$PLIST" <<EOF
@@ -196,7 +239,7 @@ write_plist() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$LABEL</string>
-<key>ProgramArguments</key><array><string>$TK</string><string>$1</string><string>--mute</string></array>
+<key>ProgramArguments</key><array><string>$TKSIGNED</string><string>$1</string><string>--mute</string></array>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><$keep/>
 <key>ThrottleInterval</key><integer>$throttle</integer>

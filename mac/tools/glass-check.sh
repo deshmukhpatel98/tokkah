@@ -219,6 +219,57 @@ NOTCLEAR=$(grep "^glass " "$SP/clear.log" | grep -vc "style=clear")
   && say "OK" "and every one of them is style=clear" \
   || { say "FAIL" "$NOTCLEAR surfaces are not clear:"
        grep "^glass " "$SP/clear.log" | grep -v "style=clear" | sed 's/^/         /'; }
+# ── AND THE WORDS ON THEM CAN BE READ IN A BRIGHT ROOM ──────────────────────
+#
+# The one requirement this app was asked for in the person's own words --
+# "visibility has to be best even in bright environments, because this is liquid
+# glass" -- and the only one with a meter in the app and no threshold anywhere.
+# `Glass.contrastRatios` has reported `ink=fg N muted N` for every surface since
+# the adaptive dim was built, and nothing has ever held it to a number: a meter
+# with no assertion is `green-metrics-can-hide-defects` waiting to happen, because
+# the number can drift a long way before a photograph looks obviously wrong.
+#
+# Two bars, from WCAG, and they are different on purpose:
+#
+#   TEXT (`want=0.26` -- the panel, the pills, the cards, the invite link) has to
+#   clear 4.5:1. These are sentences somebody reads.
+#
+#   GLYPHS (`want=0.42` -- the six round buttons) have to clear 3:1, the bar for
+#   non-text contrast. An icon is not a paragraph.
+#
+# Measured on this rig's brightest calibrated background (behind=0.83): text 8.6
+# and 6.4, glyphs 4.4 and 3.3. The thresholds are below those with real margin, so
+# this arm fails on a regression rather than on noise.
+contrast_floor() {                  # contrast_floor <want> <fg floor> <muted floor> <what>
+  local want="$1" fgmin="$2" mutmin="$3" what="$4" bad=0 worst=""
+  while read -r name behind fg muted; do
+    [ -z "${fg:-}" ] && continue
+    # Only surfaces that are actually over something bright: `behind=0.00` is a
+    # surface the sampler never saw under a picture, and a ratio against black is
+    # not evidence about a bright room.
+    awk -v b="$behind" 'BEGIN{exit !(b+0 > 0.3)}' || continue
+    if awk -v a="$fg" -v m="$fgmin" 'BEGIN{exit !(a+0 < m+0)}' \
+       || awk -v a="$muted" -v m="$mutmin" 'BEGIN{exit !(a+0 < m+0)}'; then
+      bad=$(( bad + 1 )); worst="$worst $name(fg $fg, muted $muted, behind $behind)"
+    fi
+  done < <(grep "^glass " "$SP/clear.log" \
+           | grep "want=$want" \
+           | sed -E 's/^glass ([^:]+):.*behind=([0-9.]+).*ink=fg ([0-9.]+) muted ([0-9.]+).*/\1 \2 \3 \4/' \
+           | grep -E '^[^ ]+ [0-9.]+ [0-9.]+ [0-9.]+$')
+  [ "$bad" = 0 ] \
+    && say "OK" "$what over a bright picture: every surface clears ${fgmin}:1 / ${mutmin}:1" \
+    || say "FAIL" "$bad $what surfaces are too faint to read over a bright picture:$worst"
+}
+contrast_floor "0.26" 4.5 4.5 "text"
+contrast_floor "0.42" 3.0 3.0 "glyphs"
+# AND THE METER MUST HAVE SEEN A BRIGHT PICTURE AT ALL. Every surface reporting
+# `behind=0.00` means the backdrop sampler is blind, and both arms above would
+# then pass by having nothing to judge -- `blind-instruments-report-negatives`.
+LITSURF=$(grep "^glass " "$SP/clear.log" | grep -cE "behind=0\.[3-9]")
+[ "${LITSURF:-0}" -ge 3 ] \
+  && say "OK" "and $LITSURF surfaces really were over a lit picture when measured" \
+  || say "FAIL" "only ${LITSURF:-0} surfaces saw any brightness -- the contrast arms judged nothing"
+
 NOTLIQUID=$(grep "^glass " "$SP/clear.log" | grep -vc "path=liquid")
 [ "${NOTLIQUID:-1}" = "0" ] \
   && say "OK" "and every one took the real Liquid Glass path, not a fallback" \
