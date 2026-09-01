@@ -120,10 +120,28 @@ else say FAIL "order is '$ORDER', want 'meera arjun dad'"; fail=1; fi
 # Command-W actually closes -- that needs a real press into a key window.
 grep -q "home: keys ready" "$SP/home.log" && say OK "key monitor installed" \
   || { say FAIL "no key monitor on the home window"; fail=1; }
-grep -q "home: menu ready (2 menus, close=true, quit=true)" "$SP/home.log" \
-  && say OK "menu bar installed with Close and Quit" \
-  || { say FAIL "no menu bar on the home window: $(grep -o 'home: menu.*' "$SP/home.log" | head -1)"
-       fail=1; }
+# ── AND ⌘V, WHICH DID NOT EXIST ──────────────────────────────────────────────
+# There was no Edit menu, in either window. On a Mac the Edit menu is where Cut,
+# Copy, Paste and Select All LIVE -- their key equivalents come from it -- so
+# Command-V did nothing anywhere in the app, including in the field on this very
+# screen whose placeholder says "Type a handle". The way a call link actually
+# arrives is a message somebody sends you, and pasting it was inert.
+#
+# The count is asserted as "at least", not "exactly": a hardcoded 2 is what made
+# this arm fail the day a menu was correctly added.
+MENUS=$(sed -n 's/.*home: menu ready (\([0-9]*\) menus.*/\1/p' "$SP/home.log" | head -1)
+if [ "${MENUS:-0}" -ge 3 ] && grep -q "close=true, quit=true" "$SP/home.log"; then
+  say OK "menu bar installed with Close and Quit ($MENUS menus)"
+else
+  say FAIL "no menu bar on the home window: $(grep -o 'home: menu.*' "$SP/home.log" | head -1)"
+  fail=1
+fi
+if grep -q "home: edit menu (paste=true, selectall=true)" "$SP/home.log"; then
+  say OK "and an Edit menu, so Command-V works in the handle field"
+else
+  say FAIL "no Edit menu: Command-V is dead in the one field on this screen"
+  fail=1
+fi
 
 # ── AND THE EMPTY FRONT DOOR ─────────────────────────────────────────────────
 # With nobody in the list this screen used to open on the ROOM FIELD -- the one

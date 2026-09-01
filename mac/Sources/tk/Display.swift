@@ -18,6 +18,8 @@ import QuartzCore
 // value. This is the same argument as no-B-frames, one stage later.
 final class Display {
   private var win: NSWindow?
+  /// Kept so the resize hook can be removed with the window. See `open`.
+  private var resizeObserver: NSObjectProtocol?
   /// The window itself, for the one caller that needs to act on the WINDOW
   /// rather than on what is drawn inside it: an arriving call has to come
   /// forward, and "forward" is not a property of any view.
@@ -145,6 +147,15 @@ final class Display {
     // are how a person closes a call window, and closing it ends the call.
     window.titlebarAppearsTransparent = true
     window.titleVisibility = .hidden
+    // ── FULL SCREEN, SAID RATHER THAN INFERRED ────────────────────────────────
+    //
+    // A `.titled` `.resizable` window usually gets this for free, and "usually" is
+    // not a property to ship: with it unstated, `toggleFullScreen:` validated as
+    // GREYED under the rig's window level, so the Window menu offered an item that
+    // could not be chosen. A video call is the app most likely to be run full
+    // screen, and the state that made it unavailable was a default nobody had
+    // written down.
+    window.collectionBehavior.insert(.fullScreenPrimary)
     window.isMovableByWindowBackground = true
     window.backgroundColor = Palette.bg
     // ── A TEST WINDOW DOES NOT SIT WHERE SOMEBODY IS WORKING ─────────────────
@@ -287,11 +298,51 @@ final class Display {
       Menu.install()
     }
     window.contentView = root
+    // ── A WINDOW SOMEBODY DRAGGED BIGGER ─────────────────────────────────────
+    //
+    // `resize(w:h:)` exists for the far end changing shape and was the ONLY thing
+    // that ever moved `selfLayer` -- which is a sublayer with no autoresizing mask,
+    // so dragging the window's corner left the self-view tile pinned to where the
+    // bottom-left of the OLD window used to be, floating in the middle of the
+    // picture. The overlay resizes (it has a mask), the video layer resizes (it is
+    // the hosted layer of a view that has one), and the one hand-placed layer did
+    // not.
+    //
+    // The backdrop map is measured in window points too, so it has to be told the
+    // new geometry in the same breath or every surface would dim for the rectangle
+    // the window used to be.
+    resizeObserver = NotificationCenter.default.addObserver(
+      forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
+        guard let self, let root = window.contentView else { return }
+        let r = root.bounds
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        self.layer.frame = r
+        self.pauseLayer.frame = r
+        self.selfLayer.frame = Display.selfFrame(in: r)
+        CATransaction.commit()
+        self.noteGeometry()
+        Glass.refreshAllAdaptiveDim()
+      }
     if let onClose {
       let cl = WindowCloser(onClose: onClose)
       window.delegate = cl
       closer = cl
     }
+    noteGeometry()
+    // ── WHAT THIS WINDOW CAN DO, SAID OUT LOUD ────────────────────────────────
+    //
+    // `toggleFullScreen:` validates against the window, so a rig can only ever
+    // observe the ANSWER -- and under `TK_NO_RAISE` the answer is no, because the
+    // window is parked at the desktop level on purpose and a window at an
+    // abnormal level cannot go full screen. That is the rig's doing, not the
+    // product's, and the two are indistinguishable from outside.
+    //
+    // So the window states what it asked for. `fullscreen=allowed` is a property
+    // of the app; `level=desktop` is the rig explaining why the menu item is grey
+    // in that mode and nowhere else.
+    fputs("window: fullscreen=\(window.collectionBehavior.contains(.fullScreenPrimary) ? "allowed" : "REFUSED")"
+        + " resizable=\(window.styleMask.contains(.resizable))"
+        + " level=\(window.level == .normal ? "normal" : "desktop")\n", stderr)
     window.makeKeyAndOrderFront(nil)
     // A call window that opens behind whatever you were reading is a call you miss.
     // Every other call app on this machine comes forward when it starts; this one
@@ -431,6 +482,7 @@ final class Display {
       self.layer.frame = r
       self.pauseLayer.frame = r
       self.selfLayer.frame = Display.selfFrame(in: r)
+      self.noteGeometry()
     }
   }
 
@@ -503,7 +555,34 @@ final class Display {
       return
     }
     // Before the far end arrives you ARE the window.
-    if !selfViewOn { if enqueue(img, into: layer) { shown += 1 } }
+    if !selfViewOn {
+      if enqueue(img, into: layer) { shown += 1 }
+      // ...so YOU are also what is behind the glass, mirrored the way the layer
+      // mirrors you. This is the state the front door and the whole wait before
+      // somebody answers are in, which is where a bright room actually shows up.
+      sampleBackdrop(img, mirrored: false)
+    }
+  }
+
+  /// How bright the picture is, for the surfaces floating on it. The letterbox and
+  /// the geometry are `Backdrop`'s own business now -- see `setGeometry` there for
+  /// why they cannot be plain properties read from this thread.
+  private func sampleBackdrop(_ img: CVImageBuffer, mirrored: Bool = false) {
+    guard let pb = img as CVPixelBuffer? else { return }
+    Backdrop.shared.sample(pb, mirrored: mirrored)
+  }
+
+  /// Tell the brightness map where the picture is. On main, at every point the
+  /// window or the layer moves.
+  func noteGeometry() {
+    let r = layer.frame
+    let h = win?.contentView?.bounds.height ?? r.height
+    let w = win?.contentView?.bounds.width ?? r.width
+    // TOP-LEFT origin: the map is built from a video frame, and every image format
+    // on this machine counts rows downward while AppKit counts them up.
+    Backdrop.shared.setGeometry(layerRect: CGRect(x: r.minX, y: h - r.maxY,
+                                                  width: r.width, height: r.height),
+                                windowSize: CGSize(width: w, height: h))
   }
 
 
@@ -522,6 +601,10 @@ final class Display {
   func clearPicture() {
     DispatchQueue.main.async { [weak self] in
       self?.layer.flushAndRemoveImage()
+      // Nothing is being shown, so nothing is behind the glass but the app's own
+      // dark ground. Without this the surfaces keep the dim they were carrying for
+      // a face that has gone.
+      Backdrop.shared.clear()
     }
   }
 
@@ -532,6 +615,10 @@ final class Display {
       shown += 1
       noteFrameShown()
     }
+    // How bright the thing behind the glass is. See `Backdrop.swift`: this is what
+    // stops white glyphs from being drawn on white glass in a bright room, and it
+    // costs a few dozen byte reads on a frame that is already in memory.
+    sampleBackdrop(img)
     // Kept whether or not the enqueue succeeded: a layer that refused a frame is
     // exactly when having a picture to fall back on matters.
     lastRemote = img
@@ -597,7 +684,34 @@ final class Display {
       } else {
         line = ""
       }
-      self.controls?.setWarning(line)
+      // ── THE SAME FACT, LARGE, AND SAID ONLY ONCE ──────────────────────────
+      //
+      // The pill is 12 pt in a corner and it fades with the row. When there is no
+      // picture at all it is the ONLY thing on the screen saying so, which is how
+      // an ordinary camera-off call came to look identical to a call that had
+      // died. The poster puts the person's circle and name in the middle instead;
+      // see `CameraOffPoster`.
+      //
+      // And when the poster is up it OWNS the sentence: a pill reading "their
+      // camera is off" eight points above a face captioned "Camera off" is the
+      // app saying one thing twice, in two registers, in two places. The pill
+      // carries only what the poster does not.
+      //
+      // Only when there is genuinely nothing to look at. A weak link still shows
+      // their blurred last frame, which is a picture of them and not a void.
+      let blank = camOff || (peer && self.lastRemote == nil)
+      if blank {
+        self.controls?.setNoPicture(muted && camOff ? "Camera and microphone off"
+                                    : camOff ? "Camera off" : "Reconnecting\u{2026}")
+        // The link half is still worth a pill: "their camera is off" is a choice
+        // they made and "their connection is weak" is not, and only the second
+        // one tells you why the sound might go next.
+        self.controls?.setWarning(peer && camOff
+          ? "their connection is weak \u{2014} audio is still on" : "")
+      } else {
+        self.controls?.setNoPicture(nil)
+        self.controls?.setWarning(line)
+      }
     }
   }
 

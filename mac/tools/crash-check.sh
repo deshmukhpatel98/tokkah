@@ -197,6 +197,52 @@ body = {
 with open(sys.argv[1], "w") as f:
     f.write(json.dumps(head) + "\n" + json.dumps(body))
 PY
+# ── AND ONE PLANTED FOR THE TWO CLAIMS THAT WERE RELYING ON THE WEATHER ─────
+#
+# Two arms below asserted properties of whatever historical reports happened to be
+# in this Mac's DiagnosticReports folder: that one of them carried the version
+# `0.27.0-test`, and that at least one carried a Swift symbol from our own binary
+# (a name with `()` in it). macOS prunes that folder, so both aged out -- and this
+# rig has been failing on a pristine checkout ever since, on claims about the
+# reporter that are perfectly true.
+#
+# A test whose fixtures are somebody's leftover crash reports is a test that goes
+# red for reasons that have nothing to do with the code. So the two claims get a
+# fixture the rig OWNS, and the historical replay keeps the job only it can do:
+# proving the parser recognises this app's three previous names.
+python3 - "$SP/replay/historic.ips" <<'PY2'
+import json, sys, os
+home = os.path.expanduser("~")
+head = {"app_name": "tk", "app_version": "0.27.0-test", "bug_type": "309",
+        "os_version": "macOS 27.0 (26A5421a)",
+        "slice_uuid": "bbbbbbbb-0000-0000-0000-000000000002",
+        "incident_id": "HIST-0000-0000-0000-000000000001", "name": "tk",
+        "timestamp": "2026-08-25 11:00:00.00 +0530"}
+body = {
+  "procName": "tk", "procPath": home + "/Applications/Kin.app/Contents/MacOS/Tokkah",
+  "pid": 4242, "parentProc": "launchd", "modelCode": "Mac17,3",
+  "bundleInfo": {"CFBundleIdentifier": "com.tokkah.tk",
+                 "CFBundleShortVersionString": "0.27.0-test"},
+  "codeSigningID": "com.tokkah.tk",
+  "exception": {"type": "EXC_CRASH", "signal": "SIGABRT"},
+  "termination": {"namespace": "SIGNAL", "indicator": "Abort trap: 6"},
+  "faultingThread": 0,
+  "procStartAbsTime": 0, "procExitAbsTime": 0,
+  "usedImages": [{"uuid": "bbbbbbbb-0000-0000-0000-000000000002", "name": "tk",
+                  "path": home + "/Applications/Kin.app/Contents/MacOS/Tokkah",
+                  "CFBundleIdentifier": "com.tokkah.tk"}],
+  # A real Swift symbol shape, parentheses and all: this is what the reporter has
+  # to lift into `where` so a crash names the line to open.
+  "threads": [{"triggered": True, "id": 1, "queue": "com.apple.main-thread",
+               "threadState": {"x": [1] * 29},
+               "frames": [{"imageOffset": 4096, "symbolLocation": 16, "imageIndex": 0,
+                           "symbol": "CallControls.setBar(visible:)"},
+                          {"imageOffset": 8192, "symbolLocation": 32, "imageIndex": 0,
+                           "symbol": "CallControls.setHolding(_:)"}]}],
+}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(head) + "\n" + json.dumps(body))
+PY2
 start_tk replay "$SP/replay" || { echo "CRASH CHECK COULD NOT RUN -- tk never started for the replay"; sed -n '1,6p' "$SP/replay.log"; exit 2; }
 perl -e 'select undef,undef,undef,5'
 kill -TERM "$TKPID" 2>/dev/null
@@ -569,9 +615,10 @@ done
 
 # ── 1. THE PARSER, ON REAL REPORTS FROM THREE OF THIS APP'S NAMES ───────────
 echo "  -- replayed $copied of this app's own crash reports and $others other applications'"
-[ "${REPLAY_ROWS:-0}" -eq $((copied + 1)) ] \
-  && say "OK" "every one of this app's own reports came through, and only those ($REPLAY_ROWS of $((copied + others + 1)) files)" \
-  || say "FAIL" "$REPLAY_ROWS reports were sent from $((copied + others + 1)) files -- expected $((copied + 1))"
+# `copied` historical ones plus the two planted here.
+[ "${REPLAY_ROWS:-0}" -eq $((copied + 2)) ] \
+  && say "OK" "every one of this app's own reports came through, and only those ($REPLAY_ROWS of $((copied + others + 2)) files)" \
+  || say "FAIL" "$REPLAY_ROWS reports were sent from $((copied + others + 2)) files -- expected $((copied + 2))"
 # THE ARM THAT RANKS THE OTHER WAY. Without it, "it sent them" is equally
 # consistent with a reporter that sends every .ips it can open.
 OTHERAPPS="$(q 'sum(1 for r in rows if r.get("proc","") not in ("tk","tk_new","tkreal","Tokkah","Kin"))')"
@@ -586,8 +633,14 @@ esac
 [ "${REPLAY_SYNTH:-0}" = "1" ] \
   && say "OK" "and a report named Kin, which no build has produced yet" \
   || say "FAIL" "a report from the app's NEXT name was not recognised"
+# ── A SWIFT SYMBOL, NOT LITERALLY "()" ──────────────────────────────────────
+# This looked for the two characters `()` side by side, which only matches a
+# function with NO arguments. `CallControls.setBar(visible:)` names the line to
+# open every bit as well and does not match -- so the pattern was asserting
+# something narrower than the claim above it, and the fixture that used to satisfy
+# it did so by luck.
 case "$REPLAY_WHERE" in
-  *"()"*) say "OK" "each one names the line to open: $REPLAY_WHERE" ;;
+  *"("*) say "OK" "each one names the line to open: $REPLAY_WHERE" ;;
   *) say "FAIL" "no crash carried a symbol from our own binary -- the stack explains nothing" ;;
 esac
 say "" "the versions that died: $REPLAY_VERSIONS (reported by $REPLAY_REPORTER)"

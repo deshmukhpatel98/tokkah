@@ -96,6 +96,23 @@ enum Launcher {
   /// The one thing a denied camera can offer: the pane that undoes it. A class
   /// because a gesture recognizer needs an objc target that outlives the closure
   /// it was born in.
+  /// Measures how bright the front door's own camera preview is, so the card
+  /// floating on top of it can dim by what it actually needs. See `Backdrop.swift`.
+  final class BackdropTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    var windowSize = CGSize(width: 560, height: 660)
+    private var seen = 0
+    func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer,
+                       from c: AVCaptureConnection) {
+      guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+      seen += 1
+      if seen == 1 { fputs("backdrop: front door tap delivering\n", stderr) }
+      Backdrop.shared.sample(pb, videoRect: CGRect(origin: .zero, size: windowSize),
+                             windowSize: windowSize, mirrored: true)
+    }
+  }
+  nonisolated(unsafe) static var backdropTap: BackdropTap?
+  static let backdropQueue = DispatchQueue(label: "tk.backdrop", qos: .utility)
+
   final class RevealCamera: NSObject {
     static let shared = RevealCamera()
     @objc func go() { Permissions.reveal(.camera) }
@@ -476,7 +493,7 @@ enum Launcher {
     // caption floating in a void.
     // It sits at the TOP edge of the gradient above, where the gradient is still
     // transparent, so it gets no help from it and carries its own dim.
-    let hintPill = Glass("hintPill", radius: Metric.capsule(Metric.pillHeight))
+    let hintPill = Glass("hintPill", radius: Metric.capsule(Metric.pillHeight), textual: true)
     // ── WHERE THE PILL SITS DEPENDS ON HOW TALL THE CARD IS ──────────────────
     //
     // This was `H * 0.62`, a fraction of the window, chosen when the card below it
@@ -544,6 +561,32 @@ enum Launcher {
       pl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
       // At index 0: everything else in the window floats above the picture.
       host.insertSublayer(pl, at: 0)
+      // ── AND THE CARD HAS TO KNOW HOW BRIGHT THAT PICTURE IS ─────────────────
+      //
+      // This window is the one place in the app where a big translucent card with
+      // three names and a text field on it floats over a LIVE camera picture, and
+      // it is the first thing anybody sees. Over a bright room the invite row's
+      // `copy` measured as very nearly the background it sat on.
+      //
+      // `AVCaptureVideoPreviewLayer` hands out no buffers, so the brightness has to
+      // come from a data output beside it. It is cheap -- the session is already
+      // running, `Backdrop` reads a 16x9 grid off the luma plane and skips two
+      // frames in three -- and it discards late frames so it can never become
+      // back-pressure on the preview somebody is looking at.
+      let tap = AVCaptureVideoDataOutput()
+      tap.alwaysDiscardsLateVideoFrames = true
+      if session.canAddOutput(tap) {
+        let sink = Launcher.BackdropTap()
+        // `.resizeAspectFill`, so the picture covers the whole window and there are
+        // no letterbox bars to exclude -- and mirrored, because the preview is.
+        sink.windowSize = CGSize(width: W, height: H)
+        tap.setSampleBufferDelegate(sink, queue: Launcher.backdropQueue)
+        session.addOutput(tap)
+        Launcher.backdropTap = sink
+        fputs("backdrop: front door tap armed\n", stderr)
+      } else {
+        fputs("backdrop: front door refused a data output -- the card cannot dim for the room\n", stderr)
+      }
       // The pill goes quiet the moment the session actually delivers -- not when
       // startRunning is CALLED, which returns before the first frame. A KVO on
       // `running` would still be early; the first video frame is the only honest
@@ -639,7 +682,7 @@ enum Launcher {
     let pad = Metric.cardPad
     let cardW = W - Metric.gutter * 2
     let rowW = cardW - pad * 2
-    let card = Glass("joinCard", radius: Metric.cardRadius)
+    let card = Glass("joinCard", radius: Metric.cardRadius, textual: true)
     v.addSubview(card)
 
     // ── THE ONE EDITABLE THING, ONCE ──────────────────────────────────────────
@@ -742,6 +785,7 @@ enum Launcher {
     let inviteRow = SheetRow("Copy a link to invite someone")
     inviteRow.value = "copy"
     inviteRow.valueIsWord = true
+    inviteRow.valueIsAction = true
     inviteRow.textInset = Metric.rowAvatarInset
     // ── AND THE CALL THAT NEVER PROPERLY ENDED ───────────────────────────────
     //
@@ -760,6 +804,7 @@ enum Launcher {
     let mineRow = ContactRow(handle: Identity.handle)
     mineRow.value = "copy"
     mineRow.valueIsWord = true
+    mineRow.valueIsAction = true
     mineRow.ruled = true
     // Empty only when there is trouble. "@devesh … copy" does not need a
     // sentence under it telling you what a name is for.
@@ -1398,10 +1443,25 @@ enum Launcher {
     let attemptBox = Box<(Bool) -> Void>()
     let renderReach: (String?) -> Void = { failure in
       let silenced = Identity.quietOn
-      reachRow.value = reachBusy ? "…" : (silenced ? "off" : (watchOK ? "on" : "only when open"))
+      // ── FOUR STATES, ONE SWITCH AND ONE SENTENCE ──────────────────────────
+      //
+      // This used to be a WORD in the value slot, drawn exactly like "yesterday"
+      // two rows above it, and the word for the half-working state was "only when
+      // open" -- a phrase somebody reads as "on". The whole promise of the row is
+      // that people can reach you, and the state where they mostly cannot looked
+      // like the state where they can.
+      //
+      // A switch answers the question the row asks. The degraded case is not a
+      // third position -- switches do not have one -- it is the switch ON plus a
+      // sentence saying what is missing, which is the same shape the failure case
+      // already used and the shape every settings pane on this machine uses.
+      reachRow.switchState = reachBusy ? nil : !silenced
+      reachRow.value = reachBusy ? "…" : ""
       reachRow.inert = reachBusy
       // A sentence only when something is wrong, and gone the moment it is not.
-      reachHint.setText(failure ?? "")
+      reachHint.setText(failure ?? ((!silenced && !watchOK)
+        ? "Only while Kin is open. Keep Kin in your Applications folder to be reached when it's closed."
+        : ""))
       t.relayout()
     }
     // ── AND WHAT THE PRESS DOES ──────────────────────────────────────────────
@@ -1542,6 +1602,16 @@ enum Launcher {
     Menu.installHome()
     fputs("home: menu ready (\(NSApp.mainMenu?.items.count ?? 0) menus,"
         + " close=\(Menu.find("Close") != nil), quit=\(Menu.find("Quit Kin") != nil))\n", stderr)
+    // ── SAID OUT LOUD, BECAUSE IT WAS MISSING FOR THE WHOLE LIFE OF THE APP ──
+    //
+    // Command-V did nothing, anywhere, in either window: there was no Edit menu,
+    // and on a Mac the Edit menu is where the key equivalents for Cut, Copy, Paste
+    // and Select All live. The field on this screen is the one thing in the app you
+    // type into, and the way a call link arrives is a message somebody sends you.
+    // An absence leaves no trace in a screenshot and no trace in a log, so it says
+    // so and `home-check` holds it to it.
+    fputs("home: edit menu (paste=\(Menu.find("Paste") != nil),"
+        + " selectall=\(Menu.find("Select All") != nil))\n", stderr)
     // ⌘Q goes through `NSApp.terminate`, which never returns to the pump below --
     // so the un-ring a close performs (see the teardown) has to happen HERE for a
     // quit, before terminate takes the process. Same cancel, same bounded wait.
@@ -1713,6 +1783,106 @@ enum Launcher {
         // does -- including the pump's exit on `!w.isVisible` and the un-ring
         // that follows it.
         case "close": w.performClose(nil)
+        // ── WHAT THIS WINDOW LOOKS LIKE RIGHT NOW ─────────────────────────────
+        //
+        // The call window has had `?` since the day a control turned out to be
+        // unreachable. The front door -- the first screen of the app, and the only
+        // one that floats a card over a LIVE camera picture -- had no way to ask,
+        // so its surfaces were only ever audited at build time, before the camera
+        // had produced a frame. Every `behind=` in the log read 0.00 for a card
+        // sitting on somebody's sunlit wall.
+        case "?":
+          for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
+          fputs("\(Backdrop.shared.describe)\n", stderr)
+          fputs("home rows: " + ([linkRow, inviteRow, resumeRow, mineRow, reachRow]
+            + peopleRows as [SheetRow])
+            .filter { !$0.isHidden }.map(\.spoken).joined(separator: " | ") + "\n", stderr)
+        // ── A REAL CLICK, NOT A HANDLER CALL ──────────────────────────────────
+        //
+        // `@meera` builds an NSEvent at the row's own centre and sends it through
+        // `window.sendEvent`, so it walks every `hitTest` on the way down and lands
+        // in `SheetRow.mouseDown`'s own tracking loop. That is the difference
+        // between "the action fires" and "a finger can reach it", and this file has
+        // shipped the first without the second: a blur that ate every click, a
+        // decorative view in front of a row, an `isFlipped` override that broke
+        // `NSCell` tracking. The call window has had this for months; the FRONT
+        // DOOR -- every route into a call -- had only `sendAction`.
+        //
+        // Same shape as `CallControls.click`: the release is QUEUED before the
+        // press, because `SheetRow.mouseDown` runs its own `nextEvent` loop and a
+        // press with no release behind it hangs the main thread forever.
+        case _ where bits[0].hasPrefix("@"):
+          let want = String(bits[0].dropFirst())
+          guard let r = rowNamed(want), !r.isHidden, r.isEnabled else {
+            fputs("click: no row named " + want + " on this screen\n", stderr)
+            return
+          }
+          let mid = NSPoint(x: r.bounds.midX, y: r.bounds.midY)
+          let pt = r.convert(mid, to: nil)
+          let hit = w.contentView?.hitTest(pt)
+          var reached = false
+          var walk: NSView? = hit
+          while let x = walk { if x === r { reached = true; break }; walk = x.superview }
+          fputs("click \(want) at (\(Int(pt.x)),\(Int(pt.y))) hit="
+              + "\(hit.map { "\(type(of: $0))" } ?? "nil") reaches=\(reached)"
+              + " key=\(w.isKeyWindow)\n", stderr)
+          func ev(_ t: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(with: t, location: pt, modifierFlags: [],
+                               timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: w.windowNumber, context: nil,
+                               eventNumber: 0, clickCount: 1,
+                               pressure: t == .leftMouseUp ? 0 : 1)
+          }
+          guard let down = ev(.leftMouseDown), let up = ev(.leftMouseUp) else { return }
+          // ── FORWARD FIRST, BECAUSE THAT IS WHAT A FINGER DOES ────────────────
+          //
+          // A person clicking a row has already brought the window to the front --
+          // either it was there, or their click did it and the next one acted. A
+          // synthetic press into a window that is neither key nor active is testing
+          // AppKit's ACTIVATION rules instead of the row: `SheetRow.acceptsFirstClick`
+          // is false for every row that reaches a person or changes this Mac, and
+          // AppKit correctly swallows such a click on a background window.
+          //
+          // Which is exactly what happened. `click invite ... reaches=true key=false`
+          // followed by `press: @invite done` and nothing copied: the press was spent
+          // activating the app and thrown away, and the log read as a row that does
+          // nothing. Same shape, same fix and the same fallback as
+          // `CallControls.click`, whose comment paid for this once already.
+          if !w.isKeyWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
+            let deadline = Date().addingTimeInterval(1)
+            while !w.isKeyWindow, Date() < deadline {
+              RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+          }
+          guard !w.isKeyWindow else {
+            // The faithful path: through the window, hit-tested by AppKit, into
+            // `SheetRow.mouseDown`'s own tracking loop. The release has to be
+            // QUEUED first or that loop waits forever for a finger.
+            w.postEvent(up, atStart: false)
+            w.sendEvent(down)
+            return
+          }
+          // A window that will not become key -- `TK_NO_RAISE` parks this one at the
+          // desktop level so a rig cannot land on whoever is using the Mac. Straight
+          // to the view, because otherwise the harness is testing activation policy
+          // rather than the row; the activation rule that matters has its own
+          // assertion (`home firstmouse` in the log) rather than being proved here
+          // by accident.
+          fputs("  click: window is not key -- delivering straight to"
+              + " \(hit.map { "\(type(of: $0))" } ?? "nil")\n", stderr)
+          guard let target = hit else { return }
+          // An `NSControl` pulls its own release out of the queue; a plain view
+          // needs one handed over. Handing a tracking control a second release
+          // would be a second click.
+          if target is NSControl {
+            w.postEvent(up, atStart: false)
+            target.mouseDown(with: down)
+          } else {
+            target.mouseDown(with: down)
+            target.mouseUp(with: up)
+          }
         default:
           guard let r = rowNamed(bits.count > 1 ? bits[1] : bits[0]),
                 !r.isHidden, let tgt = r.target, let act = r.action else {

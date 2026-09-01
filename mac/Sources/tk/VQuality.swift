@@ -88,6 +88,63 @@ final class VQuality {
   private(set) var pausedTicks = 0
   /// Consecutive harmed seconds while already at the floor.
   private var harmedAtFloor = 0
+
+  // ── A PAUSE THAT DOES NOT HELP IS NOT A PAUSE, IT IS AN OUTAGE ─────────────
+  //
+  // Reported from the field: *"my Internet speed is quite good, even then when I'm
+  // trying to make a call it is saying connection paused due to slow Internet
+  // speed... my Internet speed is actually sometimes one Gbps."*
+  //
+  // The telemetry from those calls says exactly what happened, per beat:
+  //
+  //     dLost  vmbps  qlvl  paused
+  //       161  1.147     1       0      <- loss appears, picture retreats
+  //       176  0.392     0       0
+  //       207  0.379     0       0
+  //        70      0     0       1      <- video stops
+  //       171      0     0       1
+  //       142      0     0       1
+  //       162      0     0       1      <- ...and the loss is UNCHANGED
+  //
+  // The picture went away for the rest of the call and the harm it went away to
+  // fix carried on at the same rate with nothing being sent. That is the whole
+  // proof: the loss was not caused by video volume, so no amount of sending less
+  // video could reduce it -- and the resume rule ("come back after N quiet
+  // seconds") can never fire on a path that is losing packets for its own
+  // reasons. One bad minute cost the entire rest of the conversation.
+  //
+  // The signal is also not what the name suggests. `peerRxLost` is the far end's
+  // AUDIO concealment count: packets of voice that did not arrive in time. It is
+  // reasonable evidence that a path is unhappy and it is not evidence that OUR
+  // video is why -- and this controller was treating it as both.
+  //
+  // So the pause now has to earn its keep. The harm in the seconds before it is
+  // remembered, the harm in the seconds after it is measured, and if stopping the
+  // video did not materially reduce it then the pause is abandoned and never tried
+  // again on this call. A control loop that cannot tell whether its own action
+  // worked is a control loop steering on a signal it does not move.
+  /// Harm counted in the seconds leading up to a pause.
+  private var harmBefore = 0
+  /// Harm counted in the judging window after one.
+  private var harmAfter = 0
+  private var judgeTicks = 0
+  /// Seconds of video-off before the verdict is read. Long enough for the far
+  /// end's counters to reflect a link with no video on it, short enough that a
+  /// wrong pause costs a few seconds of picture rather than a conversation.
+  private static let judgeWindow = 4
+  /// Set once a pause has been measured to make no difference. Pausing is then off
+  /// for the rest of the call.
+  private(set) var pauseHelpless = false
+  /// What the last verdict was, for the log and the beat.
+  private(set) var pauseVerdict = ""
+  /// The last few seconds of harm, so `harmBefore` is a real number rather than
+  /// the one tick that happened to cross the line.
+  private var recentHarm: [Int] = []
+  /// Hard ceiling on one pause. Even a pause that IS working must let the picture
+  /// try again: a permanently lossy path would otherwise mean a permanently black
+  /// call, and a soft picture beats no picture. Re-judged when it comes back.
+  private static let maxPausedTicks = 30
+  private var thisPauseTicks = 0
   /// Consecutive quiet seconds while paused.
   private var quietPaused = 0
   /// Harmed seconds at the floor before the video stops.
@@ -129,8 +186,36 @@ final class VQuality {
 
   /// One tick per second, with what happened since the last one. Returns the new
   /// quality when it changed, so the caller only touches the encoder on a change.
-  func tick(now: Double, framesLost: Int, concealed: Int, jitGrew: Bool) -> Double? {
+  /// `harmRaw` is the harm counted this second WHETHER OR NOT it crossed the line
+  /// that makes it actionable. `framesLost` is the actionable half and is what the
+  /// rules below steer on; `harmRaw` is what the pause is judged by, because a
+  /// verdict computed from a number that has been zeroed by a threshold can only
+  /// ever say "it worked".
+  /// ── TWO SIGNALS, EACH STEERING THE THING IT CAN ACTUALLY MOVE ────────────
+  ///
+  /// `pictureHarmed` is the far end losing VIDEO. That is what the quality ladder
+  /// is for: a smaller picture is fewer bytes and fewer fragments to lose.
+  ///
+  /// `voiceHarmed` / `voiceHarmRaw` is the far end losing AUDIO. That is what the
+  /// PAUSE is for, and the code has always said so in as many words -- "audio is
+  /// the call, video is the nice part... the video stops entirely and the voice
+  /// gets the whole link". The pause exists to protect the voice, so the voice is
+  /// what decides whether to take it and whether it worked.
+  ///
+  /// Getting this the wrong way round is not hypothetical, it is what shipped: one
+  /// signal (audio concealment) drove both, so a path losing voice packets for its
+  /// own reasons stopped the picture forever, and a path destroying the picture
+  /// while FEC repaired the voice was invisible.
+  ///
+  /// And the verdict CANNOT be read off the video's own loss, which is the trap in
+  /// the obvious fix: with the video paused there are no video fragments, so video
+  /// harm is necessarily zero and every pause would grade itself a success. A
+  /// metric that cannot see the failure returns the same value as a pass.
+  func tick(now: Double, pictureHarmed: Bool, voiceHarmed: Bool,
+            voiceHarmRaw: Int) -> Double? {
     if held { return nil }
+    recentHarm.append(voiceHarmRaw)
+    if recentHarm.count > pauseAfter { recentHarm.removeFirst() }
     // ── Ignore the first seconds entirely ────────────────────────────────────
     //
     // A call's opening is full of harm that means nothing: the buffer finding its
@@ -140,7 +225,9 @@ final class VQuality {
     // a wrong value gets learned, and this one costs real picture quality for the
     // first half-minute of every call.
     guard now >= Double(warmup) else { return nil }
-    let harmed = framesLost > 0 || concealed > 0 || jitGrew
+    // Either kind of unhappiness stops the picture climbing; only the picture's own
+    // loss makes it step down, and only the voice's makes it stop.
+    let harmed = pictureHarmed || voiceHarmed
 
     // ── WHILE PAUSED, THE ONLY QUESTION IS WHEN TO COME BACK ──────────────────
     //
@@ -153,11 +240,83 @@ final class VQuality {
     // end a black-to-blur-to-face flicker they did not ask for.
     if paused {
       pausedTicks += 1
-      if harmed { quietPaused = 0; return nil }
+      thisPauseTicks += 1
+      // ── THE VERDICT ────────────────────────────────────────────────────────
+      //
+      // Read once, `judgeWindow` seconds in, on the raw count rather than on the
+      // thresholded half: a number already zeroed by a threshold can only ever say
+      // the pause worked. Compared as RATES -- see below for what happened when it
+      // was not.
+      if judgeTicks < VQuality.judgeWindow {
+        harmAfter += voiceHarmRaw
+        judgeTicks += 1
+        if judgeTicks == VQuality.judgeWindow {
+          // ── THE BAR IS "DID IT FIX IT", NOT "DID IT MOVE IT" ────────────────
+          //
+          // At the floor rung the video is about 0.22 Mbps against the voice's
+          // 1.33, so stopping it gives back roughly a seventh of the link. On a
+          // path that is a little over capacity that seventh is decisive and the
+          // loss goes to nothing; on a path that is far over it, or one losing
+          // packets for reasons that have nothing to do with volume, a seventh
+          // changes nothing you could hear.
+          //
+          // So a bar of "fell by a third" would be measuring the wrong thing in
+          // both directions: it would credit a pause that shaved the edge off a
+          // still-broken call, and it can only ever be met at all when the video
+          // was a large share of the traffic. Halved-or-better is the line, and
+          // the `max(2,...)` is there because at small counts every ratio is
+          // noise -- two packets to one is not evidence of anything.
+          // ── RATES, NOT SUMS ─────────────────────────────────────────────────
+          //
+          // `harmBefore` is summed over `pauseAfter` seconds and `harmAfter` over
+          // `judgeWindow` seconds, and those are different numbers. Comparing the
+          // two totals directly made a pause that took the loss to nothing read as
+          // a pause that had DOUBLED it: measured 211 before, 354 after, on a link
+          // where the voice was demonstrably fine the moment the video stopped.
+          // Two seconds against four. A constant written per block hides the block
+          // size, and this file just paid for that once.
+          let beforeRate = Double(harmBefore) / Double(max(1, pauseAfter))
+          let afterRate = Double(harmAfter) / Double(VQuality.judgeWindow)
+          let helped = afterRate <= max(2.0, beforeRate * 0.5)
+          let word = helped ? "the pause is helping" : "THE PAUSE IS NOT HELPING"
+          pauseVerdict = String(format: "voice harm %.0f/s -> %.0f/s", beforeRate, afterRate)
+            + " over \(VQuality.judgeWindow)s with no video: \(word)"
+          if !helped {
+            // Stopping the video did not reduce the harm, so the video was never
+            // the cause. Give the picture back and do not take it away again on
+            // this call: whatever this path is doing, less video is not the answer
+            // and a black call is a worse one.
+            pauseHelpless = true
+            paused = false
+            thisPauseTicks = 0
+            level = 0
+            quietFor = 0
+            harmedAtFloor = 0
+            quietPaused = 0
+            return nil
+          }
+        }
+      }
+      // Even a pause that IS working does not get the rest of the call. See
+      // `maxPausedTicks`.
+      if thisPauseTicks >= VQuality.maxPausedTicks {
+        pauseVerdict += " -- \(VQuality.maxPausedTicks)s is long enough; trying the picture again"
+        paused = false
+        thisPauseTicks = 0
+        level = 0
+        quietFor = 0
+        harmedAtFloor = 0
+        quietPaused = 0
+        return nil
+      }
+      // While paused the picture cannot be harmed -- there is none -- so the only
+      // question that means anything is whether the VOICE is still suffering.
+      if voiceHarmed { quietPaused = 0; return nil }
       quietPaused += 1
       let need = min(resumeQuietBase << min(pauses - 1, 3), 60)
       guard quietPaused >= need else { return nil }
       paused = false
+      thisPauseTicks = 0
       // Back at the FLOOR, never at the level that was in effect when the link
       // gave out -- the picture has to earn its way up through the same quiet
       // seconds as everybody else. `level` is already 0 (pausing can only happen
@@ -175,15 +334,30 @@ final class VQuality {
         // send, so send nothing -- but only after a STREAK. A single harmed
         // second at the floor is an ordinary internet hiccup, and stopping the
         // video for it would make the feature the fault.
-        guard canPause else { return nil }
+        // The pause protects the voice, so the voice is what arms it. A picture
+        // being damaged on a link whose audio is perfectly fine is a reason to send
+        // a smaller picture, and there is no smaller one -- it is not a reason to
+        // send none.
+        guard voiceHarmed, canPause, !pauseHelpless else { return nil }
         harmedAtFloor += 1
         guard harmedAtFloor >= pauseAfter else { return nil }
         paused = true
         pauses += 1
         quietPaused = 0
         harmedAtFloor = 0
+        // The baseline the verdict is measured against, taken from the seconds
+        // that caused the pause -- before it, because after it there is nothing to
+        // compare with.
+        harmBefore = recentHarm.reduce(0, +)
+        harmAfter = 0
+        judgeTicks = 0
+        thisPauseTicks = 0
         return nil
       }
+      // Only the picture's own loss steps the picture down. A voice-only problem
+      // has nothing to do with which quantiser the encoder is using, and treating
+      // it as though it did is how a clean link ended up at the bottom rung.
+      guard pictureHarmed else { return nil }
       // This level hurt. Do not come back to it soon, and double the wait each
       // time it hurts again -- a level that fails twice is not unlucky.
       //
@@ -230,6 +404,8 @@ final class VQuality {
       + (paused ? ")" : "")
       + " (level \(level)/\(ceiling), \(stepDowns) down \(stepUps) up"
       + (refusedUps > 0 ? " \(refusedUps) up-refused" : "")
-      + (pauses > 0 ? ", \(pauses) pause\(pauses == 1 ? "" : "s") \(pausedTicks)s" : "") + ")"
+      + (pauses > 0 ? ", \(pauses) pause\(pauses == 1 ? "" : "s") \(pausedTicks)s" : "")
+      + (pauseHelpless ? ", pausing ABANDONED" : "") + ")"
+      + (pauseVerdict.isEmpty ? "" : " [\(pauseVerdict)]")
   }
 }

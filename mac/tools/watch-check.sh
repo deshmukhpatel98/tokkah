@@ -70,7 +70,7 @@ case "$SHEET" in
   *) say "FAIL" "the row is not in the panel at all" ;;
 esac
 case "$SHEET" in
-  *"Calls when Kin is closed ✓"*) say "FAIL" "it reads ON with nothing installed" ;;
+  *"Calls when Kin is closed = on"*) say "FAIL" "it reads ON with nothing installed" ;;
   *"Calls when Kin is closed"*)   say "OK" "and it reads OFF, which is the truth here" ;;
   *) ;;
 esac
@@ -101,13 +101,16 @@ CUT=$(grep -n 'press @row#' "$SP/b.log" | sed -n '2p' | cut -d: -f1)
 AFTER=$(head -n "${CUT:-99999}" "$SP/b.log" | grep -A2 '^audit state' | grep -o 'sheet=settings\[[^]]*\]' | tail -1)
 echo "  after the click: ${AFTER:-<nothing>}"
 case "$AFTER" in
-  *"Calls when Kin is closed ✓"*) say "OK" "and the row now reads ON" ;;
+  # The row is a SWITCH now, not a ticked row: a tick means "this one is selected"
+  # three rows above (the camera list), and the same mark was doing two opposite
+  # jobs. `SheetRow.spoken` reports a switch as `= on` / `= off`.
+  *"Calls when Kin is closed = on"*) say "OK" "and the row now reads ON" ;;
   *) say "FAIL" "the world changed and the row did not" ;;
 esac
 LAST=$(sheets "$SP/b.log" | tail -1)
 echo "  after the second: ${LAST:-<nothing>}"
 case "$LAST" in
-  *"Calls when Kin is closed ✓"*) say "FAIL" "clicking it again did not turn it off" ;;
+  *"Calls when Kin is closed = on"*) say "FAIL" "clicking it again did not turn it off" ;;
   *"Calls when Kin is closed"*)   say "OK" "and clicking it again turns it off" ;;
   *) say "FAIL" "the row vanished" ;;
 esac

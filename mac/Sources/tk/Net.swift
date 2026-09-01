@@ -601,7 +601,7 @@ final class Wire {
         if let m = c.seal(p, n, into: out) {
           sentOK = true
           if let im = impair, im.enabled {
-            if im.shouldDrop() { return }
+            if im.shouldDrop(bytes: m) { return }
             let d = im.delayTicks()
             if d > 0, let q = delayQ { q.push(out, m, due: Clock.now() + d); return }
           }
@@ -618,7 +618,7 @@ final class Wire {
     // so that a call which never encrypts cannot look like one that did.
     crypto?.notePlaintextTx()
     if let im = impair, im.enabled {
-      if im.shouldDrop() { return }
+      if im.shouldDrop(bytes: n) { return }
       let d = im.delayTicks()
       if d > 0, let q = delayQ { q.push(p, n, due: Clock.now() + d); return }
     }
@@ -702,7 +702,7 @@ final class Wire {
   /// the same packet.
   func probeAllCandidates() {
     guard !locked else { return }
-    var out = [UInt8](repeating: 0, count: TPKTY)
+    var out = [UInt8](repeating: 0, count: TPKTZ)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -1145,7 +1145,24 @@ final class Wire {
     // An older build writes 0 here and never reads it.
     p.storeBytes(of: Wire.endProbByte(Audio.turnEndProb),
                  toByteOffset: TPKTX + 7, as: UInt8.self)
+    // The video's own receive-side numbers. See TPKTZ.
+    guard p.count >= TPKTZ, let v = reportVideo else { return }
+    p.storeBytes(of: UInt32(truncatingIfNeeded: v.missing).littleEndian,
+                 toByteOffset: TPKTY, as: UInt32.self)
+    p.storeBytes(of: UInt32(truncatingIfNeeded: v.fragsIn).littleEndian,
+                 toByteOffset: TPKTY + 4, as: UInt32.self)
   }
+
+  /// The video assembler whose counters get reported to the peer, set when the
+  /// receive loop starts. Weak and optional for the same reason `reportRing` is:
+  /// an audio-only call has none and reports nothing rather than zeros.
+  private weak var reportVideo: VideoAssembler?
+  /// The far end's video loss, cumulative since ITS process start, and whether it
+  /// tells us at all. `peerVideoFrags` is the denominator -- a count with nothing
+  /// to divide by is the bug class this repo already has a name for.
+  private(set) var peerVideoMissing = 0
+  private(set) var peerVideoFrags = 0
+  private(set) var peerReportsVideoLoss = false
 
   /// Nothing has arrived for a while, so the address we locked onto is no longer
   /// true. Reasons this happens on a real daily call and not just in a test: the
@@ -1304,7 +1321,7 @@ final class Wire {
   /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
   /// media socket so it measures the path the media actually takes.
   func sendTimeProbe() {
-    var out = [UInt8](repeating: 0, count: TPKTY)
+    var out = [UInt8](repeating: 0, count: TPKTZ)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -1361,6 +1378,7 @@ final class Wire {
 
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
     reportRing = ring
+    reportVideo = video
     /// The value of `ring.restarts` this loop has already acted on. A counter and
     /// not a flag, so a second restart later in the same call is a second event
     /// rather than one that has already been consumed.
@@ -1645,6 +1663,13 @@ final class Wire {
           peerRxRecovered = Int(rv)
           peerReportsLoss = true
         }
+        if plainN >= TPKTZ {
+          let vm = (plain + TPKTY).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          let vf = (plain + TPKTY + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+          peerVideoMissing = Int(vm)
+          peerVideoFrags = Int(vf)
+          peerReportsVideoLoss = true
+        }
         if plainN >= TPKTY {
           let pl = (plain + TPKTX).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
           peerPlayed = Int(pl)
@@ -1701,7 +1726,7 @@ final class Wire {
           // another thread would put that thread's scheduling delay inside t3-t2,
           // where it is indistinguishable from network asymmetry and biases the
           // offset by half of it.
-          var out = [UInt8](repeating: 0, count: TPKTY)
+          var out = [UInt8](repeating: 0, count: TPKTZ)
           out.withUnsafeMutableBytes { p in
             p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
             p.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 4, as: UInt32.self)

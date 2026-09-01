@@ -58,10 +58,23 @@ bad=0
 say() { # label, got, want-substring
   case "$2" in (*"$3"*) echo "   ok   $1: $2";; (*) echo "  WRONG $1: $2  (want $3)"; bad=1;; esac
 }
-STATUS="$(sed -E 's/.*status=(.*)  room=.*/\1/' <<< "$AUDIT")"
-WARN="$(sed -E 's/.*  warn=(.*)  picker=.*/\1/' <<< "$AUDIT")"
+# ── THE DELIMITER MOVED, AND THIS DID NOT NOTICE ────────────────────────────
+# `room=` was a dead field -- built, laid out, never given a string -- and it is
+# now `who=`, the name and clock of whoever is on the call. This sed kept the old
+# delimiter, stopped matching, and handed the WHOLE audit line to a `case` looking
+# for "connected" somewhere in it. It passed, and it would have passed on a build
+# with no status pill at all. Anchored on a field that carries something now.
+STATUS="$(sed -E 's/.*status=(.*)  who=.*/\1/' <<< "$AUDIT")"
+WARN="$(sed -E 's/.*  warn=(.*)  card=.*/\1/' <<< "$AUDIT")"
+POSTER="$(sed -E 's/.*  poster=(.*)  quality=.*/\1/' <<< "$AUDIT")"
 say "the call says it is connected" "$STATUS" "connected"
-say "and says why there is no picture" "$WARN" "camera is off"
+# ── AND IT SAYS IT WHERE A PERSON IS LOOKING ────────────────────────────────
+# The pill was the whole of what a camera-off call said, at 12 pt, in a corner,
+# fading with the control row: a working call was a black rectangle. The face and
+# the name in the middle are what a person actually sees, so that is what is
+# asserted -- and the pill must NOT repeat it, or the app says one thing twice.
+say "and puts their face and the reason in the middle" "$POSTER" "Camera off"
+say "and the pill does not say it a second time" "[$WARN]" "[-]"
 # The pair: the far end really was heard, or "connected" is a label over nothing.
 PLAYED="$(grep -oE 'played [0-9]+' "$SP/b.log" | tail -1 | awk '{print $2}')"
 if [ "${PLAYED:-0}" -gt 1000 ]; then echo "   ok   and their audio arrived: $PLAYED frames"

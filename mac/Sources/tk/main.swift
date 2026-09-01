@@ -106,6 +106,15 @@ if flag("selftest-install") {
 // nobody typed is the one part of identity that can be wrong in a way the person
 // notices immediately -- being called `deveshs` or `2devesh` -- so the derivation
 // is checkable without claiming anything.
+// Same contract: pure arithmetic over synthetic frames, no window, no camera. The
+// brightness meter behind every glass surface, checked against six answers it
+// already knows -- two of which it must get WRONG if it has been wired to a
+// constant. See `Backdrop.selftest`.
+if flag("backdrop-test") {
+  let ok = Backdrop.selftest()
+  fputs("backdrop-test: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
 if flag("selftest-identity") {
   let ok = Identity.selftest()
   fputs("selftest-identity: \(ok ? "PASS" : "FAIL")\n", stderr)
@@ -486,6 +495,7 @@ let KNOWN_FLAGS: Set<String> = [
   // TK_NO_REJOIN=1 does the same, for a launch with no argv at all.
   "no-rejoin", "resumed",
   "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
+  "imp-capacity",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft", "no-headphone-duplex",
@@ -507,6 +517,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
+  "backdrop-test", "contrast-audit",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -2341,6 +2352,13 @@ display?.controls?.onSilent = { want in
     let now = Identity.quietOn
     display?.controls?.setSilent(now)
     if !ok {
+      // Under the switch, not only in the corner pill: the panel is open and the
+      // pill is behind it. `setSilent` above has already put the switch back to
+      // whatever the server says is true.
+      if now != want {
+        display?.controls?.silentRefused(
+          "That didn\u{2019}t go through. Check your connection and try again in a moment.")
+      }
       display?.controls?.setStatus(now == want ? "silent" : "could not change that")
     } else {
       display?.controls?.setStatus(want ? "silent" : "you can be reached")
@@ -2446,6 +2464,19 @@ if let who = arg("calling") {
   gCalling = (who, arg("room") ?? "")
   let away = flag("callee-away")
   DispatchQueue.main.async { display?.controls?.showOutgoing(to: who, away: away) }
+}
+// ── WHO THIS CALL IS WITH, TOLD TO THE WINDOW ONCE ─────────────────────────
+//
+// The same expression the bye path and the face-saver already use, in one more
+// place, because the WINDOW never had it: a connected call drew a picture, four
+// circles and nothing else, and the moment the picture stopped there was nothing
+// on screen naming the person at all. See `CallControls.setPeer`.
+//
+// A link-join answers "" and gets nothing, which is correct: this app has no
+// name for somebody who arrived through a URL and inventing one would be worse
+// than the blank.
+if let peerNow = gCalling?.who ?? arg("with") ?? gOffered?.from, !peerNow.isEmpty {
+  display?.controls?.setPeer(peerNow)
 }
 startRingingOnce()
 display?.controls?.onCall = { who in
@@ -3031,6 +3062,10 @@ if let room = arg("room") {
   fputs("room \(room): I am \(me), public \(mine ?? "unknown")"
       + "\(myLocal.map { ", local " + $0 } ?? "") at \(sinceLaunch()) ms\n", stderr)
   var found = false
+  /// Consecutive polls where the directory did not answer at all. See the note
+  /// beside `answer == nil` below: this is what separates "no network" from
+  /// "nobody came", and the two deserve different sentences and different endings.
+  var rvSilent = 0
   var bindTarget: (String, UInt16)?
   // ── A DEADLINE, NOT A COUNT ─────────────────────────────────────────────────
   //
@@ -3066,9 +3101,50 @@ if let room = arg("room") {
     // "the directory did not answer". Flattened rather than conflated, because
     // the caller further down that DOES care about the difference reads it
     // unflattened.
-    let peers = (Launcher.runPumping(pump: display != nil || mdisplay != nil) {
+    let answer = Launcher.runPumping(pump: display != nil || mdisplay != nil) {
       Rendezvous.exchange(room: room, me: me, addr: mine, local: myLocal, relay: relayNow)
-    } ?? nil) ?? []
+    } ?? nil
+    // ── "NOBODY IS THERE" AND "WE CANNOT ASK" ARE DIFFERENT SENTENCES ─────────
+    //
+    // `Rendezvous.exchange` has told these two apart for months -- nil for a
+    // directory that did not answer, `[]` for a directory that says the room is
+    // empty -- and this line threw the distinction away with `?? []`. So a Mac
+    // with no route to the server showed "Waiting for the other person…" for two
+    // minutes and then EXITED: the app vanished, having spent the whole time
+    // blaming the other person for its own lack of a network.
+    //
+    // Four consecutive silences before it says anything, because one timed-out
+    // poll on a working connection is ordinary.
+    if answer == nil {
+      rvSilent += 1
+      if rvSilent == 4 {
+        fputs("room \(room): the directory is not answering -- this is a network"
+            + " problem at this end, not somebody being slow to join\n", stderr)
+        Metrics.count("rv_unreachable")
+        display?.controls?.setStatus("can\u{2019}t reach Kin \u{2014} check your connection")
+      }
+    } else if rvSilent > 0 {
+      // It came back. Say so, and put the honest sentence back.
+      fputs("room \(room): the directory is answering again after \(rvSilent) silences\n", stderr)
+      rvSilent = 0
+      display?.controls?.setStatus("waiting for the other person")
+    }
+    // ── AN EXPLICIT PEER DOES NOT NEED A DIRECTORY ───────────────────────────
+    //
+    // `--peer host:port` is the loopback and measurement path: the destination is
+    // already known and the directory is only there to discover one. With the
+    // directory unreachable this loop waited out its full two minutes anyway and
+    // then killed the process, so every rig that points the identity base at a
+    // dead port -- which is how a rig avoids claiming names on the real server --
+    // could not complete a call at all. Nothing about the product path changes:
+    // a person never has `--peer`.
+    if answer == nil, rvSilent >= 4, arg("peer") != nil {
+      fputs("room \(room): the directory is unreachable and --peer was given"
+          + " -- going straight to it\n", stderr)
+      found = true
+      break
+    }
+    let peers = answer ?? []
     if let p = peers.first {
       // Every address we have, raced by measured RTT — LAN, public, and the
       // peer's TURN relayed address. First-packet-wins was the public internet
@@ -3121,7 +3197,37 @@ if let room = arg("room") {
     }
   }
   if !found {
-    fputs("room \(room): nobody else arrived in 2 minutes.\n", stderr)
+    // ── GIVING UP IS NOT THE SAME AS DISAPPEARING ─────────────────────────────
+    //
+    // This was `exit(1)`. Two minutes of "Waiting for the other person…" and then
+    // the window is gone -- which, for somebody who clicked a name and whose wifi
+    // was down, is an app that quits when you try to call people. It is also the
+    // one ending that leaves nothing on screen to read and nothing to press.
+    //
+    // The reason matters and the app knows it: a directory that never answered is
+    // this Mac's network, and a directory that answered with an empty room is
+    // somebody who did not come. Two sentences, and neither of them is silence.
+    let mine = rvSilent >= 4
+    let why = mine ? "the directory never answered" : "nobody else arrived"
+    fputs("room \(room): giving up after 2 minutes -- \(why).\n", stderr)
+    Metrics.fact("outcome", mine ? "no-network" : "nobody-came")
+    let says = mine ? "Couldn\u{2019}t reach Kin. Check your connection and try again."
+                    : "No answer."
+    display?.controls?.showCallFailed(says,
+      because: mine ? "your Mac could not reach Kin\u{2019}s servers" : "they didn\u{2019}t pick up")
+    // A bundle launch goes back to the front door, exactly as hanging up does: the
+    // thing a person wants next is to try again, and that is one click from there.
+    // A terminal run still exits, because a shell is not somebody's app.
+    let bundled = (Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
+      .contains("/Contents/MacOS/")
+    if bundled, !flag("leave-exits") {
+      // Long enough to read the card. `pumpAppKit` rather than sleep: the window
+      // is on screen and a frozen one would be a worse ending than the exit.
+      Launcher.pumpAppKit(until: Date().addingTimeInterval(4))
+      Launcher.reexec(room: Launcher.mintRoom(),
+                      extra: ["--video", "camera", "--window", "--gui"], why: "nobody came")
+    }
+    Launcher.pumpAppKit(until: Date().addingTimeInterval(4))
     exit(1)
   }
   // ── THE SOCKET IS OURS AGAIN ────────────────────────────────────────────────
@@ -5550,7 +5656,8 @@ let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
                     delayMs: Double(arg("imp-delay") ?? "0") ?? 0,
                     spikeMs: Double(arg("imp-spike") ?? "0") ?? 0,
                     spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3,
-                    untilS: Double(arg("imp-until") ?? "0") ?? 0)
+                    untilS: Double(arg("imp-until") ?? "0") ?? 0,
+                    capacityMbps: Double(arg("imp-capacity") ?? "0") ?? 0)
 if impair.enabled {
   wire.impair = impair
   if impair.holdsPackets { wire.armDelayQueue() }
@@ -5684,10 +5791,56 @@ if ringPreview {
   fputs("ring: audio engine not started -- nothing captured, nothing sent,"
       + " nothing played\n", stderr)
 } else {
+// ── A CALL WITH NO SOUND IS STILL BETTER THAN AN APP THAT VANISHES ─────────
+//
+// This was `exit(1)`. Three lines to stderr and the process gone -- so on a Mac
+// with an audio interface locked to 44.1 kHz, clicking a person's name made the
+// app disappear. No window, no sentence, nothing to press. `Audio.openUnit` now
+// tries every other device before giving up, so reaching this at all means NOTHING
+// on this Mac would run at 48 kHz, and the honest answer to that is a call you can
+// see with a sentence explaining the silence.
+var audioUp = true
 do { try audio.start() } catch {
-  fputs("audio start failed: \(error)\n", stderr)
-  fputs("if this is a permission error, macOS must be allowed to use the microphone for the terminal running this.\n", stderr)
-  exit(1)
+  audioUp = false
+  Metrics.count("audio_start_failed")
+  Metrics.fact("audio_start_error", "\(error)")
+  fputs("audio start FAILED: \(error)\n"
+      + "  Every input and output device on this Mac refused \(Int(SR)) Hz.\n"
+      + "  The call continues without sound; pick another device in Settings,\n"
+      + "  or set one to 48 kHz in Audio MIDI Setup.\n", stderr)
+  display?.controls?.setStatus("no sound \u{2014} check Settings")
+  display?.controls?.setNoPicture(nil)
+}
+if audioUp, !audio.deviceTrouble.isEmpty {
+  // A device swapped out from under somebody is news, and it is the kind of news
+  // that explains a symptom they are about to notice.
+  display?.controls?.setStatus(audio.deviceTrouble)
+  audio.clearDeviceTrouble()
+}
+// ── CHANGING THE MICROPHONE FROM INSIDE THE APP ────────────────────────────
+//
+// Asked for in as many words: "there should be an option to change the mic input
+// in the app itself, like there is an option to change the camera." Until now the
+// input device was whatever System Settings said when the call started, and the
+// app never even NAMED it -- so "they can't hear me" meant leaving Kin, changing
+// a system-wide default, and starting the call again.
+//
+// Wired here rather than beside the camera picker because it needs `audio`, which
+// does not exist until this line. The graph is rebuilt rather than retargeted (the
+// sample rate, buffer size and stream format all belong to the device), and the
+// name that comes back is the one ACTUALLY in use -- a headset can be unplugged
+// between the panel being drawn and the row being pressed.
+display?.controls?.setAudioNames(mic: Audio.name(of: audio.inDev),
+                                 speaker: Audio.name(of: audio.outDev))
+display?.controls?.onAudioDevice = { uid, input in
+  // Off main: a rebuild stops and starts two HAL units and that is not work for
+  // the thread that draws.
+  Thread {
+    _ = audio.useDevice(uid: uid, input: input)
+    display?.controls?.setAudioNames(mic: Audio.name(of: audio.inDev),
+                                     speaker: Audio.name(of: audio.outDev))
+    display?.controls?.setStatus(input ? "microphone changed" : "speaker changed")
+  }.start()
 }
 }
 
@@ -6171,6 +6324,20 @@ nonisolated(unsafe) var lastVqPeerLost = 0, lastVqPeerRec = 0
 // Pause bookkeeping. Seconds rather than events alone: two pauses of one second
 // each and one pause of forty are the same count and completely different calls.
 nonisolated(unsafe) var vPausedSecs = 0
+/// So the abandoned-pause verdict is filed once rather than every second.
+nonisolated(unsafe) var gSaidPauseAbandoned = false
+/// Baselines for the far end's VIDEO counters. Separate from the audio ones and
+/// primed on their own first sighting, for the reason written over `vqPrimedPeer`:
+/// a baseline of zero books the peer's whole history as one second of harm.
+nonisolated(unsafe) var vqPrimedVideo = false
+nonisolated(unsafe) var lastVqPeerVideo = 0
+nonisolated(unsafe) var lastVqPeerFrags = 0
+/// The voice-harm baseline, kept separately from the ladder's: the two are read at
+/// the same moment but one of them is only the fallback, and sharing a baseline
+/// between a signal in use and a signal not in use is how a fallback books a whole
+/// call's history as one second.
+nonisolated(unsafe) var lastVqVoiceLost = 0
+nonisolated(unsafe) var lastVqVoiceRec = 0
 nonisolated(unsafe) var vPeerPausedSecs = 0
 nonisolated(unsafe) var vPeerPauses = 0
 nonisolated(unsafe) var lastPeerPaused = false
@@ -7226,7 +7393,42 @@ func reportLoop() {
       vqPrimedPeer = true
       lastVqPeerLost = pLost; lastVqPeerRec = pRec
     }
-    var outboundHarm = (pLost - lastVqPeerLost) + (pRec - lastVqPeerRec)
+    // ── THE PICTURE'S OWN LOSS, WHICH IS WHAT THIS CONTROLLER IS FOR ──────────
+    //
+    // `pLost` is the far end's AUDIO concealment and it was the only receive-side
+    // number that had ever crossed the wire. Steering the VIDEO by it was wrong in
+    // both directions and measurably so:
+    //
+    //   * a 2 Mbps ceiling with 3.4 Mbps of video offered destroyed a quarter of
+    //     every second's video fragments while FEC repaired the voice completely.
+    //     The controller saw no harm, so the picture stayed broken.
+    //   * a real call losing voice packets for its own reasons made the controller
+    //     stop the video and never bring it back. That is the reported bug: "my
+    //     Internet speed is quite good, even then it is saying connection paused".
+    //
+    // The video's own loss now travels beside it (TPKTZ). It is the primary signal;
+    // the audio number stays as a fallback for a peer too old to send the new one,
+    // and it SAYS SO rather than falling back in silence.
+    let pvMissing = wire.peerVideoMissing
+    var outboundHarm = 0
+    var harmIsVideo = false
+    if wire.peerReportsVideoLoss {
+      harmIsVideo = true
+      if !vqPrimedVideo {
+        vqPrimedVideo = true
+        lastVqPeerVideo = pvMissing
+      }
+      outboundHarm = pvMissing - lastVqPeerVideo
+      if outboundHarm < 0 { outboundHarm = 0 }        // their process restarted
+      lastVqPeerVideo = pvMissing
+      // The audio baseline still has to be kept up to date even when it is not
+      // being used, or the day the peer stops reporting video the fallback would
+      // book its entire accumulated history as one second of harm.
+      lastVqPeerLost = pLost; lastVqPeerRec = pRec
+    } else {
+      outboundHarm = (pLost - lastVqPeerLost) + (pRec - lastVqPeerRec)
+    }
+
     // ── A PEER RESTART IS A NEW BASELINE, NOT A REPAIR ────────────────────────
     //
     // These are the PEER's counters, cumulative since the PEER's process start,
@@ -7241,11 +7443,11 @@ func reportLoop() {
     // right in the same shape: clamp to zero, and re-baseline on the new counters
     // (the assignment below is the re-baseline, and runs either way).
     if outboundHarm < 0 { outboundHarm = 0 }
-    lastVqPeerLost = pLost; lastVqPeerRec = pRec
+    if !harmIsVideo { lastVqPeerLost = pLost; lastVqPeerRec = pRec }
     // An older peer does not report, and falling back silently to the local
     // numbers would restore the exact bug this comment describes. So it falls
     // back and SAYS SO, once.
-    if !wire.peerReportsLoss {
+    if !harmIsVideo, !wire.peerReportsLoss {
       // `concealLost`, not `concealed`. The redundancy controller above says why
       // in its own words: concealment also covers STARVATION, which is this
       // machine's own receive buffer running dry -- and no amount of sending less
@@ -7281,21 +7483,49 @@ func reportLoop() {
     // therefore safe to hold up to roughly 3%, and 2% is the line -- expressed as
     // a fraction of what was sent, so it means the same thing at every packet rate
     // rather than being a hidden function of one.
+    // ── AND OVER THE RIGHT DENOMINATOR ────────────────────────────────────────
+    //
+    // A video harm count divided by the AUDIO packet rate is a ratio of two
+    // unrelated things: 1500 voice packets a second against a few hundred video
+    // fragments means the same amount of video damage reads as five times less
+    // harm than it is. Counted without a denominator, or with the wrong one, is a
+    // bug class this repo already has a name for.
+    let vFragsNow = wire.peerVideoFrags
+    var denom = Double(max(1, d.sent))
+    if harmIsVideo {
+      let dFrags = max(0, vFragsNow - lastVqPeerFrags)
+      lastVqPeerFrags = vFragsNow
+      // Their fragments received plus the ones they gave up on: what we sent, as
+      // far as they can tell. A denominator of only what ARRIVED would make the
+      // rate approach 100% as the path got worse and 0% only when nothing was sent.
+      denom = Double(max(1, dFrags + outboundHarm))
+    }
     let sentNow = max(1, d.sent)
-    let harmRate = Double(outboundHarm) / Double(sentNow)
+    let harmRate = Double(outboundHarm) / denom
     let HARM_RETREAT = Double(arg("vq-harm-pct") ?? "2") ?? 2.0
     let harmed = harmRate * 100.0 > HARM_RETREAT
     if harmed != lastVqHarmed {
       lastVqHarmed = harmed
-      fputs("  picture: outbound loss \(String(format: "%.2f", harmRate * 100))% of packets"
+      fputs("  picture: outbound \(harmIsVideo ? "VIDEO" : "audio") loss "
+          + "\(String(format: "%.2f", harmRate * 100))% of \(harmIsVideo ? "fragments" : "packets")"
           + " -- \(harmed ? "above" : "below") the \(String(format: "%.1f", HARM_RETREAT))% line,"
           + " so quality \(harmed ? "retreats" : "holds")\n", stderr)
     }
     let wasPaused = vq.paused
+    // ── THE VOICE'S OWN HARM, KEPT SEPARATE ───────────────────────────────────
+    //
+    // The far end's audio concealment, as a rate over the packets we sent it. It is
+    // what arms the pause and what the pause is judged by -- see `VQuality.tick`.
+    // Computed here whether or not it is the ladder's signal, because the day the
+    // peer stops reporting video this is all there is.
+    let voiceDelta = max(0, (pLost - lastVqVoiceLost) + (pRec - lastVqVoiceRec))
+    lastVqVoiceLost = pLost; lastVqVoiceRec = pRec
+    let voiceRate = Double(voiceDelta) / Double(sentNow)
+    let voiceHarmed = voiceRate * 100.0 > HARM_RETREAT
     let changed = vq.tick(now: Double(beatTick),
-                          framesLost: harmed ? outboundHarm : 0,
-                          concealed: 0,
-                          jitGrew: false)
+                          pictureHarmed: harmIsVideo ? harmed : false,
+                          voiceHarmed: voiceHarmed,
+                          voiceHarmRaw: voiceDelta)
     // ── STOPPING THE PICTURE, AND SAYING SO IN THREE PLACES ───────────────────
     //
     // The decision is made here and has to reach three separate consumers, none
@@ -7315,7 +7545,18 @@ func reportLoop() {
     if vq.paused != wasPaused {
       Metrics.count(vq.paused ? "video_pause" : "video_resume")
       fputs("  picture: video \(vq.paused ? "PAUSED -- the link could not carry the floor" : "resumed")"
-          + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)\n", stderr)
+          + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)"
+          + (vq.pauseVerdict.isEmpty ? "" : " -- \(vq.pauseVerdict)") + "\n", stderr)
+    }
+    // ── AND IT IS IN THE RECORD, BECAUSE IT IS A VERDICT ON AN ACTION ─────────
+    //
+    // A pause that was abandoned and a pause that never happened look identical
+    // in every other field. This is the one that says the app took the picture
+    // away, measured what that achieved, and gave it back.
+    if vq.pauseHelpless, !gSaidPauseAbandoned {
+      gSaidPauseAbandoned = true
+      Metrics.count("video_pause_abandoned")
+      Metrics.fact("video_pause_verdict", vq.pauseVerdict)
     }
     if gVideoPaused { vPausedSecs += 1 }
     // Our half of the status byte. Both bits every tick rather than a bitwise
@@ -7420,6 +7661,12 @@ func reportLoop() {
   audio.tuneInputGain()
   // Same cadence: headphones appearing mid-call open it to full duplex.
   audio.checkOutputRoute()
+  // And the panel's names track the graph rather than the last thing pressed:
+  // macOS moves the default device on its own when a headset connects, and a row
+  // still naming the built-in microphone after that is the instrument lying.
+  // `setAudioNames` returns immediately when nothing moved.
+  display?.controls?.setAudioNames(mic: Audio.name(of: audio.inDev),
+                                   speaker: Audio.name(of: audio.outDev))
   // ── ONE FRAME OF THE PERSON, FOR THE FRONT DOOR ────────────────────────────
   //
   // At 20 s in -- past the camera warm-up and the first awkward seconds, when

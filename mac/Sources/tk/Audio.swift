@@ -1647,6 +1647,114 @@ final class Audio {
     return u as String
   }
 
+  // ── CHOOSING THE MICROPHONE, IN THE APP ──────────────────────────────────
+  //
+  // Asked for directly: *"there should be an option to change the mic input in
+  // the app itself, like there is an option to change the camera."*
+  //
+  // Until now the input device was whatever macOS's System Settings said the
+  // default was, decided once inside `makeUnit` and never revisited. On a Mac with
+  // an external interface, a webcam with a microphone in it, or a headset that
+  // just connected, "they can't hear me" was a trip to System Settings and a
+  // restart of the call -- and the app gave no clue which microphone it had taken.
+  //
+  // ── BY UID, NOT BY DEVICE ID ──────────────────────────────────────────────
+  //
+  // `AudioDeviceID` is a handle that CoreAudio hands out at enumeration time. It
+  // does not survive a reboot, an unplug or a sleep, so remembering one and
+  // setting it later is a way to open a stranger's microphone. The UID is the
+  // stable name and is what gets written down; it is resolved back to an ID at the
+  // moment the unit is built, and a UID that no longer resolves falls back to the
+  // system default with a line in the log saying so.
+
+  /// One input or output device, as the picker sees it.
+  struct Device: Equatable { let uid: String; let name: String }
+
+  /// Every device with at least one channel in the requested direction. A device
+  /// with zero input channels is not a microphone, and listing one would put a
+  /// row in the panel that silences the call when pressed.
+  static func devices(input: Bool) -> [Device] {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                         0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                     0, nil, &size, &ids) == noErr else { return [] }
+    var out: [Device] = []
+    for id in ids where channelCount(id, input: input) > 0 {
+      guard let uid = deviceUID(id) else { continue }
+      out.append(Device(uid: uid, name: name(of: id)))
+    }
+    // Stable order, so a row does not move under a pointer already travelling
+    // toward it when a device appears. Alphabetical is arbitrary and consistent;
+    // CoreAudio's own order is neither.
+    return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+  }
+
+  /// Channels in one direction. The cheap, total test for "is this a microphone".
+  private static func channelCount(_ dev: AudioDeviceID, input: Bool) -> Int {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,
+      mScope: input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(dev, &addr, 0, nil, &size) == noErr, size > 0
+    else { return 0 }
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size),
+                                               alignment: MemoryLayout<AudioBufferList>.alignment)
+    defer { raw.deallocate() }
+    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, raw) == noErr else { return 0 }
+    let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+    return list.reduce(0) { $0 + Int($1.mNumberChannels) }
+  }
+
+  static func name(of dev: AudioDeviceID) -> String {
+    var s: Unmanaged<CFString>?
+    var sz = UInt32(MemoryLayout<CFString?>.size)
+    var a = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &s) == noErr, let v = s
+    else { return "?" }
+    return v.takeRetainedValue() as String
+  }
+
+  /// The UID this Mac has been told to use, or nil for "whatever macOS says".
+  /// Persisted, because a microphone choice that forgets itself on quit is a
+  /// choice somebody has to make again every call.
+  static var chosenInputUID: String? {
+    get { UserDefaults.standard.string(forKey: "tk.micUID") }
+    set {
+      if let newValue { UserDefaults.standard.set(newValue, forKey: "tk.micUID") }
+      else { UserDefaults.standard.removeObject(forKey: "tk.micUID") }
+    }
+  }
+  static var chosenOutputUID: String? {
+    get { UserDefaults.standard.string(forKey: "tk.spkUID") }
+    set {
+      if let newValue { UserDefaults.standard.set(newValue, forKey: "tk.spkUID") }
+      else { UserDefaults.standard.removeObject(forKey: "tk.spkUID") }
+    }
+  }
+
+  /// The chosen device, if it is still here. `nil` means fall back to the system
+  /// default -- a headset that has been unplugged must not silence the call.
+  static func resolve(_ uid: String?, input: Bool) -> AudioDeviceID? {
+    guard let uid, !uid.isEmpty else { return nil }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                         0, nil, &size) == noErr, size > 0 else { return nil }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                     0, nil, &size, &ids) == noErr else { return nil }
+    for id in ids where deviceUID(id) == uid && channelCount(id, input: input) > 0 { return id }
+    fputs("audio: the saved \(input ? "microphone" : "speaker") (\(uid)) is not here"
+        + " -- using the system default\n", stderr)
+    return nil
+  }
+
   // ── THE RULER, ON THE CALL THAT CAUSED THIS ──────────────────────────────
   //
   // Driven with the peaks the field actually delivered (1.40, 1.03, 5.24) and
@@ -3543,6 +3651,14 @@ final class Audio {
 
   // ── Device plumbing ──────────────────────────────────────────────────────
   private func defaultDevice(input: Bool) -> AudioDeviceID {
+    // The person's choice wins, when the thing they chose is still plugged in.
+    // Resolved HERE rather than remembered as an ID, so a device that comes and
+    // goes is picked up again the next time the graph is built. See
+    // `Audio.resolve`.
+    if let picked = Audio.resolve(input ? Audio.chosenInputUID : Audio.chosenOutputUID,
+                                  input: input) {
+      return picked
+    }
     var id = AudioDeviceID(0)
     var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
     var addr = AudioObjectPropertyAddress(
@@ -3855,7 +3971,9 @@ final class Audio {
     return u
   }
 
-  private func makeUnit(input: Bool) throws -> AudioUnit {
+  /// `forced` overrides the device this unit opens. Used by `openUnit`, which
+  /// tries other devices when the preferred one refuses the rate.
+  private func makeUnit(input: Bool, forced: AudioDeviceID? = nil) throws -> AudioUnit {
     var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
       componentSubType: kAudioUnitSubType_HALOutput, componentManufacturer: kAudioUnitManufacturer_Apple,
       componentFlags: 0, componentFlagsMask: 0)
@@ -3869,7 +3987,7 @@ final class Audio {
       try ck(AudioUnitSetProperty(u, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enable, 4), "enable in")
       try ck(AudioUnitSetProperty(u, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disable, 4), "disable out")
     }
-    var dev = defaultDevice(input: input)
+    var dev = forced ?? defaultDevice(input: input)
     try ck(AudioUnitSetProperty(u, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
       &dev, UInt32(MemoryLayout<AudioDeviceID>.size)), "set device")
 
@@ -3918,8 +4036,8 @@ final class Audio {
       let u = try makeDuplexUnit()
       iu = u; ou = u
     } else {
-      iu = try makeUnit(input: true)
-      ou = try makeUnit(input: false)
+      iu = try openUnit(input: true)
+      ou = try openUnit(input: false)
       // The control arm announces itself as loudly as the other one.
       //
       // Only the VPIO branch printed an `[io]` line, so "which unit is this
@@ -4100,6 +4218,69 @@ final class Audio {
     }.start()
   }
 
+  // ── A DEVICE THAT WILL NOT DO 48 kHz USED TO END THE PROCESS ──────────────
+  //
+  // `makeUnit` throws a hard error when a device refuses to move to 48 kHz, and
+  // the only caller printed three lines and called `exit(1)`. On a bare command
+  // line that is defensible. Inside Kin.app it means: you click a name, and the
+  // app disappears. No window, no sentence, nothing to press -- and the person is
+  // left with an app that quits when they try to call somebody.
+  //
+  // It stopped being hypothetical the moment this file grew a device picker. Half
+  // the audio interfaces in the world sit at 44.1 kHz, and choosing one from the
+  // panel would have quit the app.
+  //
+  // So the preferred device is a preference, not a requirement: if it refuses,
+  // every other device in that direction is tried, and the one that works is used
+  // and NAMED. Only if none of them works does this throw -- and the caller now
+  // keeps the call alive and says so on screen rather than exiting.
+  private func openUnit(input: Bool) throws -> AudioUnit {
+    var firstError: Error?
+    // The preferred device first: whatever the person chose, or the system default.
+    do { return try makeUnit(input: input) } catch { firstError = error }
+    let preferred = input ? inDev : outDev
+    for d in Audio.devices(input: input) {
+      guard let id = Audio.resolve(d.uid, input: input), id != preferred else { continue }
+      do {
+        let u = try makeUnit(input: input, forced: id)
+        fputs("audio: the \(input ? "microphone" : "speaker") that was asked for cannot run at"
+            + " \(Int(SR)) Hz -- using \"\(d.name)\" instead\n", stderr)
+        // The saved choice is dropped, or every launch would repeat this walk and
+        // the panel would keep ticking a device that is not carrying the call.
+        if input { Audio.chosenInputUID = nil } else { Audio.chosenOutputUID = nil }
+        Metrics.count(input ? "mic_device_fallback" : "spk_device_fallback")
+        deviceTrouble = "\(input ? "Microphone" : "Speaker") changed to \(d.name)"
+        return u
+      } catch { continue }
+    }
+    throw firstError ?? Err.e("no \(input ? "input" : "output") device would run at \(Int(SR)) Hz")
+  }
+
+  /// Set when a device had to be swapped out from under the person, so the window
+  /// can say so. Empty means nothing to report.
+  private(set) var deviceTrouble = ""
+  func clearDeviceTrouble() { deviceTrouble = "" }
+
+  /// Change the microphone (or the speaker) on a call that is running. The graph
+  /// is rebuilt rather than retargeted, because the sample rate, the buffer size
+  /// and the stream format are all properties of the DEVICE and a new one
+  /// invalidates every one of them -- which is exactly what `restart` re-runs.
+  ///
+  /// Returns the name actually in use afterwards, which is not always the one
+  /// asked for: a device can be unplugged between the panel being drawn and the
+  /// row being pressed, and saying "Built-in Microphone" when that happened is
+  /// better than a tick on a device that is not there.
+  @discardableResult
+  func useDevice(uid: String, input: Bool) -> String {
+    if input { Audio.chosenInputUID = uid } else { Audio.chosenOutputUID = uid }
+    fputs("audio: switching \(input ? "microphone" : "speaker") to \(uid)\n", stderr)
+    restart()
+    let now = input ? inDev : outDev
+    let nm = Audio.name(of: now)
+    fputs("audio: \(input ? "microphone" : "speaker") is now \"\(nm)\"\n", stderr)
+    return nm
+  }
+
   /// Tear the graph down and build it again. Heavier than a stop/start, and
   /// deliberately so: rebuilding re-runs the rate check, the buffer size and the
   /// stream format, which is exactly the state a device change invalidated.
@@ -4108,8 +4289,8 @@ final class Audio {
     if let u = outUnit { AudioOutputUnitStop(u); AudioUnitUninitialize(u); AudioComponentInstanceDispose(u) }
     inUnit = nil; outUnit = nil; started = false
     do {
-      let iu = try makeUnit(input: true)
-      let ou = try makeUnit(input: false)
+      let iu = try openUnit(input: true)
+      let ou = try openUnit(input: false)
       inUnit = iu; outUnit = ou
       let me = Unmanaged.passUnretained(self).toOpaque()
       var inCb = AURenderCallbackStruct(inputProc: captureProc, inputProcRefCon: me)

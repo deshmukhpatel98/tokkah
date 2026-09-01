@@ -48,8 +48,36 @@ final class Impair {
   // of the phenomenon, not an artefact.
   let spikeMs: Double
   let spikeHz: Double
+  // ── A LINK WITH A CEILING, WHICH IS WHAT CONGESTION ACTUALLY IS ────────────
+  //
+  // Every impairment above is a COIN FLIP: the loss rate does not depend on how
+  // much is being sent. That models a radio with interference and it cannot model
+  // a queue that is full -- and a queue that is full is the only thing "send less
+  // video" can fix.
+  //
+  // Which mattered, because the video-pause controller in `VQuality` acts on loss
+  // by stopping the picture, and until this existed there was no way to test it on
+  // a path where that action WORKS. Every arm ran against rate-independent loss,
+  // where pausing can only ever be useless -- so the arm that must rank the other
+  // way did not exist, and the shipped behaviour was a controller nobody had ever
+  // watched succeed.
+  //
+  // A leaky bucket: tokens accrue at `capacityMbps`, every packet spends its own
+  // size, and a packet that cannot pay is dropped. 50 ms of burst tolerance,
+  // because a bucket with none drops on every jitter spike and models nothing.
+  //
+  // The state is touched from the audio callback and the encoder thread without a
+  // lock, exactly as `seed` and `burstUntil` above already are: this is a test
+  // instrument, a torn double costs one wrong packet, and a lock on the audio
+  // thread is a dropout.
+  let capacityMbps: Double
+  private var bucketBytes: Double = 0
+  private var bucketAt: UInt64 = 0
+  private(set) var overCapacity = 0
   private var stallUntil: UInt64 = 0
-  var enabled: Bool { dropPct > 0 || jitterMs > 0 || delayMs > 0 || spikeMs > 0 }
+  var enabled: Bool {
+    dropPct > 0 || jitterMs > 0 || delayMs > 0 || spikeMs > 0 || capacityMbps > 0
+  }
   var holdsPackets: Bool { jitterMs > 0 || delayMs > 0 || spikeMs > 0 }
   private(set) var stalls = 0
 
@@ -73,8 +101,9 @@ final class Impair {
 
   init(dropPct: Double, burstMs: Double, jitterMs: Double,
        delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0,
-       untilS: Double = 0) {
+       untilS: Double = 0, capacityMbps: Double = 0) {
     self.untilS = untilS
+    self.capacityMbps = capacityMbps
     self.dropPct = dropPct
     self.burstMs = burstMs
     self.jitterMs = jitterMs
@@ -90,8 +119,11 @@ final class Impair {
     return Double(seed >> 11) * (1.0 / 9_007_199_254_740_992.0)
   }
 
-  /// true if this packet should vanish.
-  func shouldDrop() -> Bool {
+  /// true if this packet should vanish. `bytes` is only read by the capacity
+  /// model; the coin-flip models do not care how big a packet is, which is the
+  /// whole difference between them.
+  func shouldDrop(bytes: Int = 0) -> Bool {
+    if capacityMbps > 0, bytes > 0, overBudget(bytes) { return true }
     guard dropPct > 0 else { return false }
     let now = Clock.now()
     if untilS > 0 {
@@ -120,6 +152,25 @@ final class Impair {
       return false
     }
     if rnd() < dropPct / 100.0 { dropped += 1; return true }
+    return false
+  }
+
+  /// The bucket. True when this packet cannot be paid for.
+  @inline(__always) private func overBudget(_ bytes: Int) -> Bool {
+    let now = Clock.now()
+    let burst = capacityMbps * 125_000 * 0.05        // 50 ms of tolerance, in bytes
+    if bucketAt == 0 { bucketAt = now; bucketBytes = burst }
+    if now > bucketAt {
+      bucketBytes = min(burst, bucketBytes + Clock.ms(now - bucketAt) / 1000.0
+                                             * capacityMbps * 125_000)
+      bucketAt = now
+    }
+    if bucketBytes < Double(bytes) {
+      dropped += 1
+      overCapacity += 1
+      return true
+    }
+    bucketBytes -= Double(bytes)
     return false
   }
 
@@ -156,6 +207,7 @@ final class Impair {
     if delayMs > 0 { s.append("\(delayMs) ms one-way propagation (\(delayMs * 2) ms rtt)") }
     if jitterMs > 0 { s.append("0..\(jitterMs) ms jitter") }
     if spikeMs > 0 { s.append("\(spikeMs) ms queue stalls, \(spikeHz)/s") }
+    if capacityMbps > 0 { s.append("\(capacityMbps) Mbps ceiling (a full queue, not a coin flip)") }
     return s.joined(separator: ", ")
   }
 }

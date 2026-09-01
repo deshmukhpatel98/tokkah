@@ -288,7 +288,23 @@ enum Palette {
             blue: CGFloat(v & 0xff) / 255, alpha: a)
   }
   static let fg = hex(0xe8eaed)
-  static let muted = hex(0x9aa4b2)
+  // ── THE SECONDARY INK, RAISED, BECAUSE IT WAS FAILING ITS ONE JOB ─────────
+  //
+  // This was `0x9aa4b2`, which is the web app's `--muted` and was chosen against a
+  // near-black page. It is used for exactly three things and all three are
+  // SENTENCES A PERSON READS: the sheet's hints, the secondary word on a row, and
+  // the caption under the waiting card's title.
+  //
+  // Measured: relative luminance 0.368. Against a glass panel dimmed for a bright
+  // picture, which lands around 0.175, that is 1.86:1 -- the guidelines ask 4.5:1
+  // for text this size and the hint under "Calls when Kin is closed" photographed
+  // as grey-on-grey, which is what it looked like on a real call.
+  //
+  // 0xc3ccd8 is luminance 0.598. Against the darker ground text-bearing surfaces
+  // now ask for (`Glass.wantLuma` 0.26 -> about 0.05) that is 6.4:1, and against
+  // the old dark-room ground it is 10.8:1. Still visibly a step below `fg`, which
+  // is the whole point of having two inks.
+  static let muted = hex(0xc3ccd8)
   static let accent = hex(0x60a5fa)
   static let ok = hex(0x4ade80)
   static let warn = hex(0xfbbf24)
@@ -360,6 +376,18 @@ enum Palette {
   /// of glass: "avoid overcrowding or layering Liquid Glass elements on top of
   /// each other."
   static func fill(_ alpha: CGFloat) -> NSColor { NSColor(white: 1, alpha: alpha) }
+
+  /// The hairline round a chip -- a word on a row that can be PRESSED. A bare grey
+  /// word pinned to the right of a row is the same treatment as a timestamp, and
+  /// "copy" was drawn exactly like "yesterday": nothing on the screen said which
+  /// of the two did something.
+  static let chipLine = NSColor(white: 1, alpha: 0.28)
+  /// A switch that is on. Green is what every switch on this machine is when it is
+  /// on, and a setting whose state has to be read as a WORD is a setting people get
+  /// wrong -- "only when open" was the whole of what the front door said about
+  /// whether anyone could reach this Mac.
+  static let switchOn = hex(0x30d158)
+  static func switchOff() -> NSColor { NSColor(white: 1, alpha: 0.22) }
 
   // ── A PERSON'S COLOUR, DERIVED FROM THEIR NAME ─────────────────────────────
   //
@@ -485,6 +513,58 @@ final class Glass: NSView {
   var dim: CGFloat {
     didSet { guard dim != oldValue else { return }; applyDim() }
   }
+  // ── THE DIM IS NOT A CONSTANT ANY MORE ─────────────────────────────────────
+  //
+  // `dim` is what is on screen right now. `baseDim` is what this surface asked
+  // for, and it is the FLOOR: over a dark picture the two are equal and nothing
+  // about this app changes. Over a bright one `Backdrop.dim` raises it to
+  // whatever that patch of picture needs to carry white text at 4.5:1 -- see
+  // `Backdrop.swift`, which has the arithmetic and the arm that has to fail.
+  //
+  // A surface that asked for no dim keeps none: `Backdrop.dim(base: 0, …)` is 0.
+  // That is deliberate rather than incidental. Opting out is how a surface inside
+  // another surface's scrim avoids two dims stacking, and a rule that overrode it
+  // over bright content would bring the frosting back by the one door this file
+  // was written to close.
+  private(set) var baseDim: CGFloat
+  /// How bright this surface may end up over a bright picture. The default carries
+  /// a white glyph; a surface that holds SENTENCES lowers it, because secondary
+  /// ink at 11 pt needs a darker ground than a 26 pt stroke does. See
+  /// `Backdrop.dim`.
+  var wantLuma: CGFloat = 0.42 { didSet { refreshAdaptiveDim() } }
+  /// Reported by the audit, so `glass-check.sh` can hold a text surface to the
+  /// darker ground rather than the policy living only in a comment.
+  var wantsTextGround: Bool { wantLuma < 0.35 }
+  /// The backdrop luma this surface last dimmed for, so the audit can say what it
+  /// was reacting to rather than only what it did.
+  private(set) var backdropLuma: CGFloat = 0
+
+  /// Re-read what is behind this surface and dim for it. Cheap -- one rectangle
+  /// against a 144-cell map -- and idempotent, so it is safe to call from `layout`
+  /// and from the map's own change notification.
+  func refreshAdaptiveDim() {
+    guard baseDim > 0, Backdrop.shared.live, let win = window, !bounds.isEmpty else { return }
+    guard isEffectivelyVisible else { return }
+    let f = convert(bounds, to: nil)
+    let size = win.contentView?.bounds.size ?? win.frame.size
+    guard size.height > 1 else { return }
+    // TOP-LEFT origin: the map is built from a video frame and every image format
+    // on this machine counts rows downward while AppKit counts them up.
+    let r = CGRect(x: f.minX, y: size.height - f.maxY, width: f.width, height: f.height)
+    let l = Backdrop.shared.luma(under: r, in: size)
+    backdropLuma = l
+    let want = Backdrop.dim(base: baseDim, backdrop: l, want: wantLuma)
+    // A tenth of a step of hysteresis. Without it a surface straddling a moving
+    // edge -- somebody's shoulder against a window -- re-applies its dim on every
+    // publish, and a CALayer opacity change is a compositor pass.
+    if abs(want - dim) > 0.02 { dim = want }
+  }
+
+  /// Every surface, once, when the map moves. Installed by the first `Glass` built.
+  static func refreshAllAdaptiveDim() {
+    living = living.filter { $0.g != nil }
+    for w in living { w.g?.refreshAdaptiveDim() }
+  }
   /// The real thing, on a Mac new enough to have it. `NSGlassEffectView` is
   /// macOS 26, so this is untyped storage and every use is behind `#available`.
   private var glassView: NSView?
@@ -541,15 +621,19 @@ final class Glass: NSView {
     }
   }
 
+  /// `textual: true` for a surface with SENTENCES on it, which needs a darker
+  /// ground than one carrying a single white glyph. See `wantLuma`.
   init(_ name: String, radius: CGFloat, dim: CGFloat = Palette.dimAlpha,
-       interactive: Bool = false) {
+       interactive: Bool = false, textual: Bool = false) {
     self.name = name
     self.radius = radius
     // A surface that asked for no dim keeps none: the bar circles sit in the
     // overlay's own gradient, and sweeping them along with the panels would be
     // sweeping two different questions with one number.
     self.dim = dim > 0 ? (Glass.forcedDim ?? dim) : 0
+    self.baseDim = self.dim
     self.interactive = interactive
+    self.wantLuma = textual ? 0.26 : 0.42
     super.init(frame: .zero)
     wantsLayer = true
     // The material is composited by the window server behind this view, so this
@@ -568,6 +652,10 @@ final class Glass: NSView {
 
     build()
     Glass.living.append(Weak(self))
+    // One hook for the whole app, installed by whichever surface is built first.
+    // A per-surface observer would be 14 closures fired 5 times a second; this is
+    // one walk of a list that is already kept for the audit.
+    if Backdrop.onChange == nil { Backdrop.onChange = { Glass.refreshAllAdaptiveDim() } }
     // Reduce Transparency can be turned on mid-call, and the HIG is explicit that
     // custom elements have to be tested against it rather than assumed to adapt.
     NSWorkspace.shared.notificationCenter.addObserver(
@@ -787,6 +875,10 @@ final class Glass: NSView {
     CATransaction.setDisableActions(true)
     dimLayer.frame = bounds
     CATransaction.commit()
+    // A surface that just moved is over a different patch of picture. Asked here
+    // rather than only on the map's own tick, or a panel would open with the dim
+    // that suited wherever it used to be.
+    refreshAdaptiveDim()
     // The glass ties its geometry to its content view with Auto Layout, so the
     // content's frame is not decoration here -- it is what the material sizes
     // itself to. Setting it every pass keeps the two from disagreeing when a pill
@@ -840,6 +932,9 @@ final class Glass: NSView {
     let d = dimLayer.isHidden ? 0 : CGFloat(dimLayer.opacity)
     return "\(name): path=\(path) style=\(style)"
       + " dim=\(String(format: "%.2f", d))"
+      + " base=\(String(format: "%.2f", baseDim))"
+      + " want=\(String(format: "%.2f", wantLuma))"
+      + " behind=\(String(format: "%.2f", backdropLuma))"
       + " tint=\(tint == nil ? "none" : String(format: "%.2f", tint?.alphaComponent ?? 0))"
       + " fill=\(fill) \(whereItIs()) shown=\(isEffectivelyVisible)"
   }
@@ -991,6 +1086,19 @@ final class GlassGroup: NSView {
   /// than inside it is outside the effect and will not merge.
   var content: NSView { holder }
 
+  // ── AN INVISIBLE GROUP IS NOT CLICKABLE ────────────────────────────────────
+  //
+  // `IconButton.hitTest` already refuses below 0.01 alpha, and that guard became
+  // unreachable the day the row's fade moved onto this group: the CHILDREN keep
+  // alpha 1 forever, so every circle stayed armed while the group faded out from
+  // under them. AppKit does not do this for us -- `isHidden` stops a hit test and
+  // `alphaValue` does not.
+  //
+  // The instant matters, not just the end state. `alphaValue` is set to its target
+  // the moment an animation starts, so this refuses from the frame the app decides
+  // to take the row away rather than 240 ms later when the animation lands. That
+  // 240 ms is exactly where a hang-up button somebody can no longer see fires
+  // under a finger that was aiming at the picture.
   // ── A GROUP IS A COORDINATE SPACE, NOT A CONTROL ───────────────────────────
   //
   // Wrapping the row in two extra views puts two extra `hitTest` implementations
@@ -1002,6 +1110,9 @@ final class GlassGroup: NSView {
   // the picture. So anything that resolves to scaffolding resolves to nothing, and
   // only real controls claim a click.
   override func hitTest(_ point: NSPoint) -> NSView? {
+    // Invisible first, and see the block above for why AppKit will not do it: a
+    // hidden view stops a hit test and a zero-alpha one does not.
+    guard !isHidden, alphaValue > 0.01 else { return nil }
     guard let hit = super.hitTest(point) else { return nil }
     if hit === self || hit === holder || hit === container { return nil }
     return hit

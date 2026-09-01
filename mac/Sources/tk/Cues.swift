@@ -334,7 +334,7 @@ final class CaptionBand: NSView {
   // Clear, over the HIG's dim. The band floats in the MIDDLE of the window, where
   // neither scrim reaches, so it is on its own for contrast -- and it is two lines
   // of somebody's speech, which is the most reading anyone does in this app.
-  private let glass = Glass("caption", radius: 0)
+  private let glass = Glass("caption", radius: 0, textual: true)
   private let holder = NSView()
   private let theirs = NSTextField(labelWithString: "")
 

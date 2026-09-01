@@ -70,6 +70,29 @@ let TPKTX = TPKT + 8              // + rxLost, rxRecovered (cumulative, UInt32)
 //   +6  status   UInt8    vocal bits (claim / backchannel / cam / pause / ringing)
 //   +7  endProb  UInt8    turn-end prior, 0-255. 0 is what 0.92.0 writes.
 let TPKTY = TPKTX + 8
+// ── AND THE FAR END'S VIDEO LOSS, WHICH WAS NEVER ON THE WIRE AT ALL ────────
+//
+// `rxLost` above is AUDIO concealment, and for the whole life of this protocol it
+// was the only receive-side number that crossed. The video quality controller ran
+// on it -- so it was steering the picture by how the VOICE was arriving, and it
+// was wrong in both directions at once. Measured, on a 2 Mbps ceiling with 3.4
+// Mbps of video offered:
+//
+//     the far end's audio         lost 1 packet in thirty seconds (FEC repaired it)
+//     the far end's video         a quarter of every second's fragments gone
+//     what the controller saw     no harm at all, so the picture never retreated
+//
+// And in the other direction, from a real call's telemetry: a path losing voice
+// packets for its own reasons made the controller stop the video and never bring
+// it back, on a link that had no trouble carrying it.
+//
+// So the video's own loss travels now. Appended, never re-ordered, same rule as
+// every block above: a build that predates this reads to TPKTY and simply never
+// reports it, and `peerReportsVideoLoss` is how this end knows the difference
+// between "no video loss" and "not told".
+//   +0  vMissing  UInt32   video frames given up on, cumulative
+//   +4  vFrags    UInt32   video fragments received, cumulative -- the denominator
+let TPKTZ = TPKTY + 8
 
 final class TimeSync {
   private struct S { let delayNs: Int64; let thetaNs: Int64 }

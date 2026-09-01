@@ -19,6 +19,55 @@ enum Menu {
   /// What the menu needs to be able to do. Held weakly: the menu outlives nothing.
   static weak var controls: CallControls?
   static var onQuit: (() -> Void)?
+  /// Opens the front door's settings card. See `Target.homeSettings`.
+  static var onHomeSettings: (() -> Void)?
+
+  // ── THE EDIT MENU, WHICH WAS SIMPLY NOT THERE ───────────────────────────────
+  //
+  // Command-V did nothing. Anywhere. In either window.
+  //
+  // Cut, Copy, Paste, Select All and Undo are not menu decoration on a Mac -- the
+  // menu is where their key equivalents LIVE. `NSTextView` implements every one of
+  // those actions and nothing was sending them, so the field on the front door
+  // (the one whose placeholder says "Type a handle") and the rename field in the
+  // sheet could both be typed into and neither could be pasted into.
+  //
+  // The way a call link actually arrives is a message somebody sends you. You copy
+  // it. Then you open Kin and press Command-V. That was the app's most likely
+  // first interaction and it was inert -- the one thing saving it was the
+  // clipboard row on the front door, a feature that exists to make pasting
+  // unnecessary and was quietly the only way to paste.
+  //
+  // Nil targets throughout, deliberately: these resolve through the responder
+  // chain to whatever is being edited, which is exactly how every Mac app does it
+  // and the only way one menu can serve two windows and a field editor that does
+  // not exist until somebody clicks into a field.
+  private static func editMenu() -> NSMenuItem {
+    let item = NSMenuItem()
+    let m = NSMenu(title: "Edit")
+    m.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = m.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    m.addItem(.separator())
+    m.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    m.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    m.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    m.addItem(withTitle: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "")
+    m.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    item.submenu = m
+    return item
+  }
+
+  /// `⌘,`. The one keystroke every Mac user tries when they want to change
+  /// something, and it reached nothing: this app's settings are behind a `…`
+  /// button in the corner of a window, which is discoverable by looking and not by
+  /// reflex. Both windows get it and each opens its own panel.
+  private static func settingsItem(_ app: NSMenu, home: Bool) {
+    let it = app.addItem(withTitle: "Settings\u{2026}",
+                         action: home ? #selector(Target.homeSettings) : #selector(Target.more),
+                         keyEquivalent: ",")
+    it.target = Target.shared
+  }
 
   static func install(appName: String = "Kin") {
     let main = NSMenu()
@@ -51,6 +100,8 @@ enum Menu {
                               keyEquivalent: "")
     restart.target = Target.shared
     app.addItem(.separator())
+    settingsItem(app, home: false)
+    app.addItem(.separator())
     let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
     let servicesMenu = NSMenu()
     services.submenu = servicesMenu
@@ -71,6 +122,7 @@ enum Menu {
       .target = Target.shared
     appItem.submenu = app
     main.addItem(appItem)
+    main.addItem(editMenu())
 
     // ── Call ──────────────────────────────────────────────────────────────────
     let callItem = NSMenuItem()
@@ -117,6 +169,15 @@ enum Menu {
     win.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
     win.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
     win.addItem(.separator())
+    // ── AND THE ONE A VIDEO CALL ACTUALLY WANTS ─────────────────────────────
+    //
+    // The window has `.resizable`, so full screen works from the green button --
+    // and had no keyboard route and no menu entry, which on a Mac is where people
+    // look for it. `⌃⌘F` is the system's own.
+    let fs = win.addItem(withTitle: "Enter Full Screen",
+                         action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+    fs.keyEquivalentModifierMask = [.command, .control]
+    win.addItem(.separator())
     win.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
     winItem.submenu = win
     main.addItem(winItem)
@@ -151,6 +212,8 @@ enum Menu {
                             keyEquivalent: "")
     check.target = Target.shared
     app.addItem(.separator())
+    settingsItem(app, home: true)
+    app.addItem(.separator())
     app.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)),
                 keyEquivalent: "h")
     app.addItem(.separator())
@@ -158,6 +221,7 @@ enum Menu {
                 keyEquivalent: "q").target = Target.shared
     appItem.submenu = app
     main.addItem(appItem)
+    main.addItem(editMenu())
 
     let winItem = NSMenuItem()
     let win = NSMenu(title: "Window")
@@ -225,6 +289,10 @@ enum Menu {
     @objc func people() { Menu.controls?.nudgeBar(); Menu.controls?.openPeople() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }
     @objc func quit() { Menu.onQuit?(); NSApp.terminate(nil) }
+    /// The front door's own `…` button, from the keyboard. Set by `Launcher` while
+    /// its window is up and cleared when it goes, so `⌘,` is greyed rather than
+    /// silently dead once the call takes over.
+    @objc func homeSettings() { Menu.onHomeSettings?() }
     /// The background poller already checks every minute; this just makes it check
     /// now.
     ///
@@ -250,7 +318,13 @@ enum Menu {
     /// Grey it out instead, so the menu tells the truth about whether an update
     /// is actually waiting.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-      item.action == #selector(Target.restart) ? Update.pending != nil : true
+      if item.action == #selector(Target.restart) { return Update.pending != nil }
+      // Same rule, same reason: an item whose handler returns into a nil optional
+      // is a dead control, and a dead control that draws enabled is the defect
+      // this file already carries two scars for.
+      if item.action == #selector(Target.homeSettings) { return Menu.onHomeSettings != nil }
+      if item.action == #selector(Target.more) { return Menu.controls != nil }
+      return true
     }
     @objc func about() {
       let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? VERSION

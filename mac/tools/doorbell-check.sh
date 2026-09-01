@@ -213,7 +213,23 @@ say "1. the instrument itself: does launchctl distinguish loaded from running?"
 # not, and that is the whole bug -- so assert it rather than assume it.
 write_plist --version false                  # runs, prints, exits 0, STAYS exited
 rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
-wait_settled 40 || echo "  NOTE: the job never settled in 40 s"
+# ── THE CALIBRATION NEEDS A PARKED JOB, AND ONLY LAUNCHD DECIDES WHEN ───────
+#
+# `tk --version` exits in 7 ms. How long launchd then takes to stop calling the
+# job `running` is launchd's business: measured on this Mac it is usually a second
+# or two and occasionally more than forty, on the same binary, in back-to-back
+# runs. Reported as `FAIL the job should not be running here`, that read as the
+# app being broken and made this whole file fail about one run in three -- on a
+# pristine checkout as readily as on a patched one.
+#
+# It is a missing PRECONDITION, and this arm is the calibration the rest of the
+# file rests on, so the honest verdict for the whole rig is "could not run".
+if ! wait_settled 90; then
+  echo "DOORBELL CHECK COULD NOT RUN -- launchd never parked the rig job in 90 s"
+  echo "  ($(grep -m1 'state = ' "$PRINT" 2>/dev/null | tr -d '\t')). Nothing below can be"
+  echo "  calibrated without it, and none of this is a verdict on the app."
+  exit 2
+fi
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
 RC=$?
 if [ "$RC" -eq 0 ]; then ok "launchctl print exits 0 for this job"
@@ -252,10 +268,31 @@ say "2b. a dead agent under the NEW policy: unreachable, and just start it"
 # `spawn scheduled`, which is the second spelling of the twenty-hour bug.
 write_plist --version true 300
 rebootstrap || bad "could not bootstrap the rig job" "launchd refused it"
-wait_settled 40 || true
+# ── A PRECONDITION THAT DID NOT HAPPEN IS NOT A PRODUCT FAILURE ──────────────
+#
+# This arm needs launchd to have PARKED the job -- loaded, registered, nobody
+# listening -- and only launchd decides when that is true. Measured on this Mac:
+# it usually parks within a second or two and occasionally has not done so after
+# forty, on the same binary, in back-to-back runs. `tk --version` exits in 7 ms
+# either way, so the variance is entirely launchd's.
+#
+# It used to be reported as `FAIL could not park the job`, which reads as the app
+# being broken and made this rig fail about one run in three -- on a pristine
+# checkout as readily as on a patched one. A red that appears on unchanged code is
+# worse than no test: it is the thing that teaches you to ignore the next red.
+#
+# So a missing precondition says so, out loud, and the arm is SKIPPED rather than
+# scored. The rig's exit code separates the three cases: passed, failed, and could
+# not be run.
+SKIP2B=""
+if ! wait_settled 60; then
+  SKIP2B=1
+  printf '  %-5s %s\n' "SKIP" "launchd never parked the job in 60 s ($(grep -m1 'state = ' "$PRINT" 2>/dev/null | tr -d '\t'))"
+  printf '  %-5s %s\n' "" "-- 2b needs a parked job to test; nothing here is a verdict on the app"
+fi
 /bin/launchctl print "$DOM/$LABEL" > "$PRINT" 2>&1
-if grep -qE '^\s*state = running' "$PRINT"; then
-  bad "could not park the job" "$(grep -m1 'state = ' "$PRINT") -- 2b proved nothing"
+if [ -n "$SKIP2B" ] || grep -qE '^\s*state = running' "$PRINT"; then
+  [ -n "$SKIP2B" ] || printf '  %-5s %s\n' "SKIP" "the job is still running: $(grep -m1 'state = ' "$PRINT" | tr -d '\t')"
 else
   S2b="$(status)"
   printf '  %s\n' "$S2b"

@@ -81,6 +81,24 @@ enum Glyph {
     m(p, k, 12, 18); l(p, k, 12, 21)
   } }, filled: false)
 
+  /// A speaker cone and two waves. Same 24x24 grid, same 1.8 pt stroke as every
+  /// other glyph here, so the device rows read as one family.
+  /// <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M16 9.5a4.5 4.5 0 0 1 0 5"/>
+  /// <path d="M18.6 7a8 8 0 0 1 0 10"/>
+  static let speaker = Shape(build: { box in path(box) { p, k in
+    m(p, k, 4, 9.5); l(p, k, 7.5, 9.5); l(p, k, 12, 5.5); l(p, k, 12, 18.5)
+    l(p, k, 7.5, 14.5); l(p, k, 4, 14.5)
+    p.close()
+    m(p, k, 16, 9.5)
+    p.curve(to: NSPoint(x: 16 * k, y: 14.5 * k),
+            controlPoint1: NSPoint(x: 18.2 * k, y: 10.6 * k),
+            controlPoint2: NSPoint(x: 18.2 * k, y: 13.4 * k))
+    m(p, k, 18.6, 7)
+    p.curve(to: NSPoint(x: 18.6 * k, y: 17 * k),
+            controlPoint1: NSPoint(x: 22.2 * k, y: 9.2 * k),
+            controlPoint2: NSPoint(x: 22.2 * k, y: 14.8 * k))
+  } }, filled: false)
+
   /// <rect x=2.5 y=6 width=13 height=12 rx=3/><path d="M15.5 10.5l6-3.5v10l-6-3.5z"/>
   static let cam = Shape(build: { box in path(box) { p, k in
     rr(p, k, 2.5, 6, 13, 12, 3)
@@ -769,7 +787,7 @@ final class Pill: NSView {
   // is 0.28 and stops well short of a pill in the middle of the window. So: clear,
   // over the full dim, which is the same job `.regular` used to be asked for and
   // is the half of it that was actually about legibility.
-  private let glass = Glass("pill", radius: 0)
+  private let glass = Glass("pill", radius: 0, textual: true)
   var textColor: NSColor = Palette.fg { didSet { label.textColor = textColor } }
 
   init(font: NSFont = Type_.status) {
@@ -857,13 +875,37 @@ class SheetRow: NSButton {
   /// two different things rather than as two rows both half-lit.
   var keySelected = false { didSet { needsDisplay = true } }
   /// `.sheet .row .code` -- a monospaced value pinned right, for the encryption code.
-  var value: String = "" { didSet { needsDisplay = true } }
+  var value: String = "" { didSet { needsDisplay = true; needsLayout = true; announce() } }
   /// This value is a WORD, not a code. The code treatment is monospace at 0.09em of
   /// letter-spacing, which exists so two people can read a safety code aloud
   /// character by character -- and applied to "copy" it drew `c o p y` in a
   /// typewriter face, which reads as a serial number rather than as something to
   /// press. Same slot, different job, so it has to be told which.
   var valueIsWord = false { didSet { needsDisplay = true } }
+  // ── A ROW HAS TO SAY WHAT PRESSING IT WILL DO ──────────────────────────────
+  //
+  // Everything on the right-hand side of a row was drawn identically: "yesterday",
+  // "copy", "only when open", "0.118.0". A timestamp, a button, a switch and a
+  // fact, in the same 12 pt grey, in the same place. There was no way to look at
+  // the settings card and know which of those four you were about to press, and
+  // the one that mattered most -- whether anybody can reach this Mac -- was a
+  // sentence fragment that toggled.
+  //
+  // Three accessories, and they are the three every settings list on this machine
+  // has had for fifteen years. Nothing here is invented: a switch is a switch, a
+  // chevron means "this opens something", a chip means "this does something now".
+  /// A real switch, drawn where the value would be. `nil` for a row that is not a
+  /// setting.
+  var switchState: Bool? { didSet { needsDisplay = true; announce() } }
+  /// This row opens another page. Drawn as a chevron on the right.
+  var chevron = false { didSet { needsDisplay = true } }
+  /// The word on the right is a BUTTON, not a fact -- "copy". Drawn as a chip so
+  /// the difference between it and "yesterday" is visible rather than remembered.
+  var valueIsAction = false { didSet { needsDisplay = true } }
+  /// Which audio device this row selects. `tag` is an Int and already taken by the
+  /// camera list; a CoreAudio UID is a string.
+  var deviceUID: String?
+  var deviceIsInput = true
   /// Where the words start. A stored property rather than the `glyph == nil`
   /// expression it replaces, so a subclass drawing a WIDER mark than a glyph can
   /// move the text without overriding `layout` and re-deriving the rest of it.
@@ -880,6 +922,19 @@ class SheetRow: NSButton {
     setAccessibilityLabel(s)
     needsLayout = true
     needsDisplay = true
+    announce()
+  }
+
+  /// What VoiceOver reads out for the right-hand side. A switch that is only a
+  /// drawing is a switch a screen reader cannot report, and this app has exactly
+  /// one setting that decides whether anybody can reach the person using it.
+  private func announce() {
+    if let on = switchState {
+      setAccessibilityRole(.checkBox)
+      setAccessibilityValue(on ? 1 : 0)
+    } else if !value.isEmpty {
+      setAccessibilityValue(value)
+    }
   }
 
   /// Just the words, with none of `spoken`'s decoration. A row whose LABEL is the
@@ -889,7 +944,18 @@ class SheetRow: NSButton {
 
   /// What this row actually says, for a test that has to read the screen.
   var spoken: String {
-    text.stringValue + (checked ? " ✓" : "") + (value.isEmpty ? "" : " = \(value)")
+    // ── A SWITCH HAS TO SAY WHICH WAY IT IS ───────────────────────────────────
+    //
+    // The two settings that became switches used to carry a tick, and `checked`
+    // put " ✓" in here. A switch is drawn, not ticked, so this went silent about
+    // the one thing the row is for: "Calls when Kin is closed" read identically
+    // whether anybody could reach this Mac or not. Invisible to a rig, and
+    // invisible to VoiceOver until `announce()` was added beside it.
+    //
+    // ` = on` / ` = off` rather than a new word, because `= value` is the grammar
+    // every reader of this string already knows.
+    text.stringValue + (checked ? " ✓" : "")
+      + (switchState.map { " = \($0 ? "on" : "off")" } ?? (value.isEmpty ? "" : " = \(value)"))
   }
 
   // ── SAY WHICH WAY IS UP ────────────────────────────────────────────────────
@@ -1023,7 +1089,20 @@ class SheetRow: NSButton {
   override func layout() {
     super.layout()
     let x = textInset
-    text.frame = NSRect(x: x, y: (bounds.height - 18) / 2, width: bounds.width - x - 40, height: 18)
+    // The right-hand gutter is what the accessory needs, not a constant 40 that
+    // happened to fit the widest value anyone had tried. A long label used to run
+    // under "only when open" and the two overlapped.
+    var gutter: CGFloat = 40
+    if switchState != nil { gutter = 34 + Metric.s3 * 2 }
+    else if !value.isEmpty {
+      let f: NSFont = valueIsWord ? Type_.button : Type_.code
+      gutter = (value as NSString).size(withAttributes: [.font: f]).width
+             + Metric.s3 * 2 + (valueIsAction ? 20 : 0)
+             // A chevron sits outside the value, so it is not one or the other.
+             + (chevron ? Metric.s4 : 0)
+    } else if chevron { gutter = 28 }
+    text.frame = NSRect(x: x, y: (bounds.height - 18) / 2,
+                        width: max(20, bounds.width - x - gutter), height: 18)
   }
 
   override func draw(_ dirty: NSRect) {
@@ -1062,6 +1141,36 @@ class SheetRow: NSButton {
         path.stroke()
       }
     }
+    // ── THE SWITCH ────────────────────────────────────────────────────────────
+    if let on = switchState {
+      let tw: CGFloat = 34, th: CGFloat = 20
+      let box = NSRect(x: bounds.width - tw - Metric.s3, y: (bounds.height - th) / 2,
+                       width: tw, height: th)
+      (on ? Palette.switchOn : Palette.switchOff()).setFill()
+      NSBezierPath(roundedRect: box, xRadius: th / 2, yRadius: th / 2).fill()
+      // A hairline, so an OFF switch is still a shape over a bright picture rather
+      // than a slightly different grey.
+      Palette.chipLine.setStroke()
+      let edge = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5),
+                              xRadius: th / 2, yRadius: th / 2)
+      edge.lineWidth = 1; edge.stroke()
+      let k: CGFloat = th - 4
+      let kx = on ? box.maxX - k - 2 : box.minX + 2
+      NSColor.white.setFill()
+      NSBezierPath(ovalIn: NSRect(x: kx, y: box.minY + 2, width: k, height: k)).fill()
+    } else if chevron {
+      // `>` -- 8 pt, 2 pt stroke, the same one every disclosure on this machine
+      // draws. It costs nothing and it is the difference between a row that looks
+      // inert and a row that looks like a door.
+      let cx = bounds.width - Metric.s3 - 4, cy = bounds.height / 2
+      let p = NSBezierPath()
+      p.move(to: NSPoint(x: cx - 4, y: cy + 5))
+      p.line(to: NSPoint(x: cx + 1, y: cy))
+      p.line(to: NSPoint(x: cx - 4, y: cy - 5))
+      p.lineWidth = 1.8; p.lineCapStyle = .round; p.lineJoinStyle = .round
+      NSColor(white: 232.0 / 255, alpha: hovering ? 0.9 : 0.55).setStroke()
+      p.stroke()
+    }
     if !value.isEmpty {
       // `.sheet .code { font: 600 13px/1 ui-monospace; letter-spacing: .09em;
       //                 color: var(--fg) }`
@@ -1073,13 +1182,33 @@ class SheetRow: NSButton {
       let pending = value == "…"
       let f = valueIsWord ? Type_.button
             : (pending ? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) : Type_.code)
-      var a: [NSAttributedString.Key: Any] = [
-        .font: f, .foregroundColor: (pending || valueIsWord) ? Palette.muted : Palette.fg,
-      ]
+      // An ACTION reads at full strength inside a chip; a fact reads muted and bare.
+      let ink: NSColor = valueIsAction ? Palette.fg
+        : ((pending || valueIsWord) ? Palette.muted : Palette.fg)
+      var a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: ink]
       if !pending, !valueIsWord { a[.kern] = 13.0 * 0.09 }
       let sz = (value as NSString).size(withAttributes: a)
-      (value as NSString).draw(at: NSPoint(x: bounds.width - sz.width - Metric.s3,
-                                          y: (bounds.height - sz.height) / 2),
+      // ── A VALUE AND A CHEVRON SHARE ONE EDGE ────────────────────────────────
+      //
+      // Both were pinned to `bounds.width - Metric.s3`, so on the rows that have
+      // both -- Microphone, Speaker, Camera -- the device name ran underneath the
+      // chevron: "MacBook Air Microphon>". The whole point of naming the device on
+      // the row is that you can read which one it is.
+      let rightEdge = bounds.width - Metric.s3 - (chevron ? Metric.s4 : 0)
+      var tx = rightEdge - sz.width
+      if valueIsAction {
+        let padX: CGFloat = 10, h: CGFloat = 24
+        let chip = NSRect(x: rightEdge - sz.width - padX * 2,
+                          y: (bounds.height - h) / 2, width: sz.width + padX * 2, height: h)
+        Palette.fill(hovering || pressed || forcedActive ? 0.20 : 0.10).setFill()
+        NSBezierPath(roundedRect: chip, xRadius: h / 2, yRadius: h / 2).fill()
+        Palette.chipLine.setStroke()
+        let e = NSBezierPath(roundedRect: chip.insetBy(dx: 0.5, dy: 0.5),
+                             xRadius: h / 2, yRadius: h / 2)
+        e.lineWidth = 1; e.stroke()
+        tx = chip.minX + padX
+      }
+      (value as NSString).draw(at: NSPoint(x: tx, y: (bounds.height - sz.height) / 2),
                                withAttributes: a)
     }
     if checked {
@@ -1219,6 +1348,91 @@ enum Avatar {
     (letter as NSString).draw(at: NSPoint(x: box.midX - sz.width / 2,
                                           y: box.midY - sz.height / 2),
                               withAttributes: attrs)
+  }
+}
+
+// ── WHEN THERE IS NO PICTURE, SHOW THE PERSON ────────────────────────────────
+//
+// A connected call whose far camera is off was a BLACK RECTANGLE. The only thing
+// on it was a 12 pt warning pill at the top saying "their camera is off", and the
+// row of buttons at the bottom -- which fades. So the ordinary case of somebody
+// turning their camera off, on a call that is working perfectly, looked exactly
+// like a call that had died: no name, no face, no sound you can see, nothing.
+//
+// Every other calling app answers this the same way and has for fifteen years:
+// the person's circle, their name, and a word for what is happening. That is what
+// this is. It reuses the same `Avatar.draw` the contact rows and the calling card
+// use, so there is one face per person in this app and it cannot drift.
+//
+// It is NOT glass and it takes no dim. It is not a control floating above the
+// content -- while it is up it IS the content, which is the one case the material
+// policy in `Glass.swift` explicitly excludes ("don't use Liquid Glass in the
+// content layer").
+final class CameraOffPoster: NSView {
+  private let face = Face()
+  private let name = NSTextField(labelWithString: "")
+  private let note = NSTextField(labelWithString: "")
+  /// Decoration over the picture. Every click goes through to the controls.
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    wantsLayer = true
+    for (v, f, c) in [(name, Type_.name, Palette.fg), (note, Type_.status, Palette.muted)] {
+      v.font = f
+      v.textColor = c
+      v.alignment = .center
+      v.backgroundColor = .clear
+      v.isBordered = false
+      addSubview(v)
+    }
+    addSubview(face)
+    isHidden = true
+  }
+  required init?(coder: NSCoder) { fatalError() }
+
+  /// Whose face. An empty handle means a link-join, where the app does not know
+  /// who is there -- the poster still says the camera is off, with no name and no
+  /// circle, because inventing either would be worse than the blank.
+  func setPerson(_ handle: String) {
+    face.handle = handle
+    face.isHidden = handle.isEmpty
+    name.stringValue = handle.isEmpty ? "" : Identity.display(handle)
+    needsLayout = true
+    needsDisplay = true
+  }
+
+  /// The sentence under the name. Two states so far: their camera is off, and
+  /// their picture has stopped while the call is still up.
+  func setNote(_ s: String) {
+    note.stringValue = s
+    needsLayout = true
+  }
+
+  var describe: String {
+    isHidden ? "hidden"
+      : "\(face.handle.isEmpty ? "-" : face.handle)/\(note.stringValue)"
+  }
+
+  override func layout() {
+    super.layout()
+    // A column, centred, sized so it still fits a 320 pt window: the face shrinks
+    // with the window rather than being clipped by it.
+    let d = min(Metric.faceBig * 2, max(64, min(bounds.width, bounds.height) * 0.22))
+    let gap = Metric.s4
+    let nameH: CGFloat = name.stringValue.isEmpty ? 0 : 28
+    let noteH: CGFloat = note.stringValue.isEmpty ? 0 : 18
+    let total = (face.isHidden ? 0 : d + gap) + nameH + (nameH > 0 ? Metric.s2 : 0) + noteH
+    var y = bounds.midY + total / 2
+    if !face.isHidden {
+      face.frame = NSRect(x: bounds.midX - d / 2, y: y - d, width: d, height: d)
+      y -= d + gap
+    }
+    if nameH > 0 {
+      name.frame = NSRect(x: 0, y: y - nameH, width: bounds.width, height: nameH)
+      y -= nameH + Metric.s2
+    }
+    if noteH > 0 { note.frame = NSRect(x: 0, y: y - noteH, width: bounds.width, height: noteH) }
   }
 }
 
@@ -1375,7 +1589,7 @@ final class Sheet: NSView {
   /// text, such as alerts, sidebars, or popovers". It is clear anyway, because the
   /// person whose app this is asked for that everywhere; the reading it has to
   /// carry is why it takes the full dim and not a fraction of it.
-  private let glass = Glass("sheet", radius: Metric.sheetRadius)
+  private let glass = Glass("sheet", radius: Metric.sheetRadius, textual: true)
   private(set) var rows: [SheetRow] = []
   /// The one field a page can carry, so `clickTargets` can name it without every
   /// caller having to hold on to the view it just handed over.
@@ -1395,7 +1609,19 @@ final class Sheet: NSView {
   // It is also the only surface that exists on both sides of the join: the sheet
   // is there behind the waiting card and it is there mid-call, so `People` is
   // reachable at the moment somebody actually wants to ring a person.
-  enum Page: String { case settings, people, rename }
+  // ── AND THREE MORE, ONE PER PIECE OF HARDWARE ─────────────────────────────
+  //
+  // The camera list used to sit inline on the settings page, which worked because
+  // most Macs have one camera. Microphones and speakers do not behave like that:
+  // a Mac with a display, a headset and an interface plugged in has four of each,
+  // and twelve ticked rows above "Encryption code" is not a settings panel.
+  //
+  // So each becomes a row that NAMES what is in use and opens a page of choices --
+  // the idiom every settings pane on this machine uses, and the one that scales
+  // from one device to eight. Naming the current device on the row is half the
+  // value on its own: "which microphone is Kin actually using" was previously
+  // unanswerable from inside the app.
+  enum Page: String { case settings, people, rename, camera, microphone, speaker }
 
   init() {
     super.init(frame: .zero)
@@ -1533,7 +1759,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// it, over a 0.55 radial wash across the whole window -- three dimming devices
   /// and a blur, and what came out was a milky slab with a face somewhere behind
   /// it. Clear now, over one dim, and the dim stops at the card's own corners.
-  private let panel = Glass("card", radius: Metric.cardRadius)
+  private let panel = Glass("card", radius: Metric.cardRadius, textual: true)
   /// Who the card is about. There is no photograph in this app and never will be
   /// (see CONTACTS.md), so the circle IS the person: their own colour, derived
   /// from their handle and the same on both Macs for ever.
@@ -1554,7 +1780,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // white wall is a white box, and the link on it measured 3.7:1. Clear glass over
   // the dim beats both: the dim is a known quantity under a material that adapts
   // to what is behind it, which is what a constant alpha cannot do on its own.
-  private let urlGlass = Glass("url", radius: Metric.cardFieldRadius)
+  private let urlGlass = Glass("url", radius: Metric.cardFieldRadius, textual: true)
   // ── A HOLDER, BECAUSE THE GLASS OWNS ITS CONTENT VIEW ─────────────────────
   //
   // `NSGlassEffectView` places and sizes whatever it is given as `contentView` --
@@ -1572,7 +1798,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   // never beside it: the link is for people you have never called, the field is
   // for the ones you have, and being asked to choose between two boxes at the
   // moment you open the app is the choice this screen exists to not make you make.
-  private let dialGlass = Glass("dial", radius: Metric.cardFieldRadius)
+  private let dialGlass = Glass("dial", radius: Metric.cardFieldRadius, textual: true)
   private let dialHolder = NSView()
   private let dialField = NSTextField()
   /// A handset, not the word "call". The row it sits in is a link and a button;
@@ -2528,7 +2754,25 @@ final class CallControls: NSView {
   /// the edge cannot leave the self-view overlapping it.
   static let barHeight: CGFloat = Metric.barInset + Metric.control + Metric.s4
 
-  private let roomPill = Pill(font: Type_.status)
+  // ── WHO, AND FOR HOW LONG ──────────────────────────────────────────────────
+  //
+  // This was `roomPill`, and it was dead: built, laid out, never given a string,
+  // and reported by `describeTree` as an empty field for months. Meanwhile a
+  // connected call said NOTHING about who was on it. Every other calling app on
+  // this machine puts a name and a clock somewhere, and this one had a picture
+  // and four circles -- which is fine right up to the moment their camera is off,
+  // and then it is a black rectangle with no name on it.
+  //
+  // Same slot, same size, top-left, clear of the traffic lights. It fades with the
+  // control row, because it is chrome and the picture is the point.
+  private let whoPill = Pill(font: Type_.status)
+  /// The person, when there is no picture of them. See `CameraOffPoster`.
+  private let poster = CameraOffPoster(frame: .zero)
+  /// Who this call is with, as a handle. Empty for a link-join, where the app
+  /// genuinely does not know and must not invent one.
+  private(set) var peerHandle = ""
+  /// Ticks the clock in `whoPill` once a second while a call is up.
+  private var elapsedTimer: Timer?
   // ── THE TWO GRADIENTS THAT USED TO BE HERE ─────────────────────────────────
   //
   // `scrim` was 190 pt of dark up from the bottom edge, `topScrim` 130 pt down
@@ -2607,7 +2851,7 @@ final class CallControls: NSView {
   /// The camera picker's surface. Up beside the `more` button in the top corner,
   /// where the scrim is only 0.28 and is a gradient rather than a floor, so it
   /// carries the full dim of its own.
-  private let camGlass = Glass("camPicker", radius: 0)
+  private let camGlass = Glass("camPicker", radius: 0, textual: true)
   private var camNames: [String] = []
 
   private(set) var micMuted = false
@@ -2753,8 +2997,11 @@ final class CallControls: NSView {
     // The room pill is gone from the call surface: `#status` says what is
     // happening and the waiting card says where the call is. A room NAME is a
     // detail of the old flow, and this window no longer has that flow.
-    roomPill.isHidden = true
-    addSubview(roomPill)
+    whoPill.isHidden = true
+    addSubview(whoPill)
+    // BELOW the pills and the row, ABOVE nothing -- it is the content while it is
+    // up, so it goes in first and everything else floats over it as usual.
+    addSubview(poster, positioned: .below, relativeTo: nil)
     statusPill.text = "waiting for the other person"
     addSubview(statusPill)
     warnPill.textColor = Palette.warn
@@ -2934,6 +3181,7 @@ final class CallControls: NSView {
     // `#waiting { inset: 0 }` -- it is the whole surface, so the wash is centred on
     // the window and not on a box.
     waiting.frame = bounds
+    poster.frame = bounds
 
     // The turn layer is the whole window too; it places its own three pieces. The
     // one thing it cannot know is how tall the button row is, so it is told --
@@ -2961,8 +3209,8 @@ final class CallControls: NSView {
     // and at 20 pt the room pill sliced straight through all three.
     let topPad = Metric.topInset
     // Was a stack of two; the quality pill below it is gone, so there is one.
-    let py = h - roomPill.frame.height - topPad
-    roomPill.setFrameOrigin(NSPoint(x: Metric.gutter, y: py))
+    let py = h - whoPill.frame.height - topPad
+    whoPill.setFrameOrigin(NSPoint(x: Metric.gutter, y: py))
     // Bottom-left, vertically centred on the action row rather than on a number
     // that happened to line up when the row sat 14 points off the edge.
     let cpW: CGFloat = 210, cpH = Metric.pillHeight
@@ -3086,9 +3334,49 @@ final class CallControls: NSView {
 
   /// `#waiting.gone` -- the card goes the moment there is someone to look at, and
   /// `#status.gone`: "connected" is said once and then gets out of the face's way.
+  /// Who is on the other end. Told once, by whichever of the three routes into a
+  /// call knew it -- a ring placed, a ring answered, a resume. A link-join has no
+  /// answer and gets none: an invented name on a call is worse than no name.
+  func setPeer(_ handle: String) {
+    onMain { [weak self] in
+      guard let self, !handle.isEmpty, handle != self.peerHandle else { return }
+      self.peerHandle = handle
+      self.renderWho()
+      self.poster.setPerson(handle)
+    }
+  }
+
+  /// `Meera · 4:12`. The name alone before the call starts, the clock alone when
+  /// there is no name.
+  private func renderWho() {
+    let name = peerHandle.isEmpty ? "" : Identity.display(peerHandle)
+    var t = ""
+    if let s = startedAt {
+      let secs = Int(Date().timeIntervalSince(s))
+      t = secs >= 3600
+        ? String(format: "%d:%02d:%02d", secs / 3600, (secs / 60) % 60, secs % 60)
+        : String(format: "%d:%02d", secs / 60, secs % 60)
+    }
+    let line = [name, t].filter { !$0.isEmpty }.joined(separator: "  ·  ")
+    whoPill.text = line
+    whoPill.isHidden = line.isEmpty || !barShown
+    if !line.isEmpty {
+      whoPill.setFrameOrigin(NSPoint(x: Metric.gutter,
+                                     y: frame.height - whoPill.frame.height - Metric.topInset))
+    }
+  }
+
   func markConnected() {
     let first = startedAt == nil
     if first { startedAt = Date() }
+    if first {
+      // `.common`, so the clock keeps running while a menu is open or the window
+      // is being dragged -- the two moments a frozen clock looks like a frozen app.
+      let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.renderWho() }
+      RunLoop.main.add(t, forMode: .common)
+      elapsedTimer = t
+      onMain { [weak self] in self?.renderWho() }
+    }
     if first { onMain { [weak self] in self?.showBar(pin: true) } }
     onMain { [weak self] in
       guard let self else { return }
@@ -3164,6 +3452,25 @@ final class CallControls: NSView {
   private var warnRoom = ""
   /// What the far end's devices and link are doing. Every existing caller.
   func setWarning(_ line: String) { warnPeer = line; renderWarning() }
+
+  // ── AND THE SAME FACT, DRAWN LARGE ────────────────────────────────────────
+  //
+  // The warning pill and the poster are two renderings of ONE state, so they are
+  // set from one place. Two independent writers for one fact is the shape this
+  // file has already paid for twice -- see the note over `warnPeer`.
+  /// `nil` means there is a picture. A string means there is not, and it is the
+  /// sentence to put under their name.
+  func setNoPicture(_ why: String?) {
+    onMain { [weak self] in
+      guard let self else { return }
+      let show = why != nil && self.startedAt != nil
+      if let why { self.poster.setNote(why) }
+      guard show != !self.poster.isHidden else { return }
+      self.poster.isHidden = !show
+      self.poster.needsLayout = true
+      fputs("poster: \(show ? "showing \(self.poster.describe)" : "hidden")\n", stderr)
+    }
+  }
   /// Kin's own action on the sound. Outranks the above while it is non-empty.
   func setRoomWarning(_ line: String) { warnRoom = line; renderWarning() }
 
@@ -3836,8 +4143,26 @@ final class CallControls: NSView {
 
   func setSilent(_ on: Bool) {
     onMain { [weak self] in
-      guard let self, self.silent != on else { return }
+      guard let self else { return }
+      let moved = self.silent != on
       self.silent = on
+      // Refresh even when nothing moved: the switch is drawn busy while the round
+      // trip is out, and a request that comes back with the SAME answer still has
+      // to put it back. Without this a refused change left the switch spinning for
+      // the rest of the call.
+      guard moved || self.silentBusy else { return }
+      self.silentBusy = false
+      self.refreshSheet()
+    }
+  }
+
+  /// The server said no. The switch goes back to where it was and the reason
+  /// lands under it, inside the panel somebody is looking at.
+  func silentRefused(_ why: String) {
+    onMain { [weak self] in
+      guard let self else { return }
+      self.silentBusy = false
+      self.settingsNote = why
       self.refreshSheet()
     }
   }
@@ -3924,14 +4249,36 @@ final class CallControls: NSView {
 
 @objc private func toggleSilentRow(_ sender: SheetRow) {
     Metrics.tap("silent")
+    guard !silentBusy else { return }
     let want = !silent
     // Say what was asked for, not what is true yet. The switch itself only moves
     // when `setSilent` comes back, so a refusal leaves it where it was rather
     // than telling someone they are unreachable when they are not.
     setStatus(want ? "going silent…" : "turning silence off…")
+    // ── AND THE PANEL STAYS OPEN ───────────────────────────────────────────
+    //
+    // `closeMore()` was here. Pressing the one switch in the app shut the panel
+    // the switch lives in, so the result of the press was never visible: the
+    // state it landed in, and the sentence explaining a refusal, both arrived on
+    // a surface that had just been taken off screen. The status pill it wrote to
+    // is in the top-left corner and this panel hangs on the right, so even that
+    // was only readable because the panel had gone.
+    //
+    // A setting that reports its outcome somewhere you can only see by leaving is
+    // a setting people press twice -- which for this one means two round trips
+    // inside the server's rate limit, and the second is the one that gets refused.
+    silentBusy = true
+    settingsNote = ""
+    refreshSheet()
     onSilent?(want)
-    closeMore()
   }
+
+  /// Mid-flight, so the switch reads as busy rather than as the state it is
+  /// leaving. Cleared by `setSilent` or `silentRefused`.
+  private var silentBusy = false
+  /// A sentence under the switch, for the case where the server said no. It is
+  /// where somebody is already looking; the status pill is not.
+  private var settingsNote = ""
 
   @objc func invite() {
     NSPasteboard.general.clearContents()
@@ -4135,7 +4482,28 @@ final class CallControls: NSView {
   /// So a reason that holds for a whole call says so once instead of every 2.6 s.
   private var heldSaid: String?
 
+  /// Supersedes an in-flight fade. See `setBar`.
+  private var barFade: UInt32 = 0
+
   private func setBar(visible: Bool) {
+    // ── AND IT RUNS ON MAIN, BECAUSE IT NOW TOUCHES `isHidden` ────────────────
+    //
+    // For as long as this was only `animator().alphaValue`, an off-main call got
+    // away with it. Hiding a view does not: `-[NSView _setHidden:]` posts a window
+    // notification, and off the main thread that is an ObjC exception and a
+    // SIGABRT. It was one, immediately -- `setHolding` is called from the report
+    // thread, and `leave-check` died with `Abort trap: 6` in
+    // `_postWindowNeedsToResetDragMargins`.
+    //
+    // The guard is INSIDE the hop, not outside it: read from another thread,
+    // `barShown` is a race, and two hops that both decided "it changed" would run
+    // two fades. See `unexplained-death-is-a-bug` -- this file's rule is that no
+    // AppKit object is touched from a thread that is not the main one, and "it has
+    // not crashed yet" is not the test.
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { [weak self] in self?.setBar(visible: visible) }
+      return
+    }
     guard visible != barShown else { return }
     barShown = visible
     let row: [NSView] = [micButton, camButton, peekButton, flipButton, leaveButton, moreButton]
@@ -4166,8 +4534,53 @@ final class CallControls: NSView {
     // can perceive as a wait is the app arguing with them. One curve either way --
     // half the time on the way in. Reduce Motion gets neither, the same answer
     // `setRowMerge` gives.
-    Motion.run({ for v in row { v.animator().alphaValue = visible ? 1 : 0 } },
-               duration: Motion.reduceMotion ? 0 : (visible ? 0.12 : 0.24))
+    // ── THE FADE HAS TO BE APPLIED TO THE GROUP, NOT TO THE CIRCLES ──────────
+    //
+    // For every release that had a `GlassGroup` under the row, this line did
+    // nothing at all on screen and everything to the hit testing, which is the
+    // worst possible half of a fade.
+    //
+    // `NSGlassEffectContainerView` composites the material for every glass view
+    // inside it in ONE pass of its own, and a child's `alphaValue` is not an input
+    // to that pass -- the container draws the union of its children's shapes
+    // whatever opacity the child views are carrying. The glyphs went with it,
+    // because on macOS 26 the glyph is the glass's `contentView` and therefore
+    // inside the same pass. So the row stayed fully drawn: four circles and a red
+    // hang-up, at rest, over the picture.
+    //
+    // `IconButton.hitTest` reads that same alpha and refuses below 0.01. Measured
+    // over a bright picture, 2.6 s after the last movement: mic at pixel min 136,
+    // leave at 131 -- fully painted -- and both dead to the first click. The one
+    // button not in the group, `more`, faded correctly, which is what made this
+    // look like a drawing quirk rather than what it is.
+    //
+    // So the fade goes on the GROUP, which is an ordinary view outside the effect,
+    // and the group is HIDDEN outright when the fade lands. `isHidden` is the only
+    // state where drawing and hit testing cannot disagree: a hidden view is not
+    // reached by `hitTest` at all, so there is no second reader of a number to keep
+    // in step with the first.
+    let dur = Motion.reduceMotion ? 0 : (visible ? 0.12 : 0.24)
+    if visible { barGroup.isHidden = false; moreButton.isHidden = false }
+    // The name and the clock are chrome: they go with the row rather than staying
+    // on somebody's face after the app has decided the call is the whole window.
+    whoPill.isHidden = !visible || whoPill.text.isEmpty
+    barFade &+= 1
+    let token = barFade
+    Motion.run({
+      barGroup.animator().alphaValue = visible ? 1 : 0
+      moreButton.animator().alphaValue = visible ? 1 : 0
+    }, duration: dur)
+    if !visible {
+      // Not in the completion handler: `Motion.run`'s handler fires for whichever
+      // group finishes, and a show that starts mid-fade would otherwise be hidden
+      // by the fade it interrupted. The token is what makes a superseded fade
+      // harmless.
+      DispatchQueue.main.asyncAfter(deadline: .now() + dur + 0.02) { [weak self] in
+        guard let self, self.barFade == token, !self.barShown else { return }
+        self.barGroup.isHidden = true
+        self.moreButton.isHidden = true
+      }
+    }
     // Said out loud: a row at zero opacity and a row that was never built
     // photograph identically, and this is the app's own account of the moment it
     // took the controls off somebody's screen.
@@ -4368,6 +4781,7 @@ final class CallControls: NSView {
     case .settings: buildSettingsPage()
     case .people: buildPeoplePage()
     case .rename: buildRenamePage()
+    case .camera, .microphone, .speaker: buildDevicePage(sheetPage)
     }
   }
 
@@ -4383,17 +4797,63 @@ final class CallControls: NSView {
   private func refreshSheet() {
     guard moreOpen, sheetPage != .rename else { return }
     rebuildSheet()
+    // ── AND LAY IT OUT, IN THE SAME TURN ──────────────────────────────────────
+    //
+    // `showPage` has done this since the day a page swap photographed the old
+    // page's height with the new page's rows in it. This did not, and the
+    // consequence is worse than a wrong height: `setItems` replaces every row with
+    // a NEW view at its init frame, so until a layout pass runs they are all
+    // stacked at (0,0,400,48). Every one of them hit-tests to whatever is actually
+    // at that point.
+    //
+    // It became reachable the moment anything refreshed the panel on a timer. The
+    // device names are re-read once a second so the rows track the graph rather
+    // than the last thing pressed, and the audit caught the result: eighteen rows
+    // reporting the same coordinate and resolving to a `SheetHint`. A panel full of
+    // settings that cannot be clicked, from a refresh whose whole job was to keep
+    // them honest.
+    //
+    // One place rebuilds and one place lays out, so a route that forgets cannot
+    // exist.
+    needsLayout = true
+    layoutSubtreeIfNeeded()
   }
 
   private func buildSettingsPage() {
     var rows: [SheetRow] = []
-    for (i, name) in camNames.enumerated() {
-      let r = SheetRow(name, glyph: Glyph.cam)
-      r.checked = i == camPicker.indexOfSelectedItem
-      r.tag = i
-      r.target = self; r.action = #selector(pickCameraRow(_:))
-      rows.append(r)
+    // ── THE HARDWARE, AS THREE DOORS ──────────────────────────────────────────
+    //
+    // The camera was here as a flat ticked list and the microphone was not here at
+    // all -- it was whatever System Settings said, decided once when the call
+    // started, never named on screen. "They can't hear me" meant leaving the app.
+    //
+    // A row per piece of hardware, each showing what is in use and opening its own
+    // page. The camera row is hidden when there is exactly one camera, the way the
+    // flip button already is: a choice between one thing is not a choice. The
+    // microphone and speaker rows are always here, because even with one of each
+    // the row answers "which one is it" -- and the name it prints is read off the
+    // live audio graph rather than off what was asked for.
+    if camNames.count > 1 {
+      let c = SheetRow("Camera", glyph: Glyph.cam)
+      c.value = camNames.indices.contains(camPicker.indexOfSelectedItem)
+        ? camNames[camPicker.indexOfSelectedItem] : ""
+      c.valueIsWord = true
+      c.chevron = true
+      c.target = self; c.action = #selector(cameraPageRow(_:))
+      rows.append(c)
     }
+    let m = SheetRow("Microphone", glyph: Glyph.mic)
+    m.value = micName.isEmpty ? "…" : micName
+    m.valueIsWord = true
+    m.chevron = true
+    m.target = self; m.action = #selector(micPageRow(_:))
+    rows.append(m)
+    let sp = SheetRow("Speaker", glyph: Glyph.speaker)
+    sp.value = speakerName.isEmpty ? "…" : speakerName
+    sp.valueIsWord = true
+    sp.chevron = true
+    sp.target = self; sp.action = #selector(speakerPageRow(_:))
+    rows.append(sp)
     // ── NO "CONNECTION NUMBERS" ROW ───────────────────────────────────────────
     //
     // There was one here, a switch that put a latency readout over the other
@@ -4432,6 +4892,9 @@ final class CallControls: NSView {
       // above it used a word from the other register. A person has a name.
       let h = SheetRow("Your name", glyph: Glyph.person)
       h.value = "@" + handle
+      // Pressing it copies it, so it is drawn as something you press.
+      h.valueIsWord = true
+      h.valueIsAction = true
       h.target = self; h.action = #selector(copyHandleRow(_:))
       items.append(h)
     }
@@ -4444,6 +4907,7 @@ final class CallControls: NSView {
     // menu. A feature reachable only by a gesture nobody mentions is a feature
     // behind a flag nobody runs.
     let peopleEntry = SheetRow("People", glyph: Glyph.person)
+    peopleEntry.chevron = true
     peopleEntry.target = self; peopleEntry.action = #selector(peopleRow(_:))
     items.append(peopleEntry)
     // ── CHANGING YOUR NAME, WHETHER OR NOT YOU HAVE ONE ──────────────────────
@@ -4454,6 +4918,7 @@ final class CallControls: NSView {
     // Hiding the row until the name works would hide it from everybody it is for.
     let rename = SheetRow(handle.isEmpty ? "Choose your name" : "Change your name",
                           glyph: Glyph.pencil)
+    rename.chevron = true
     rename.target = self; rename.action = #selector(renameRow(_:))
     items.append(rename)
     items += rows as [NSView]
@@ -4467,16 +4932,24 @@ final class CallControls: NSView {
     // screen, whether people can reach you.
     let w = Watch.reach()
     let reach = SheetRow("Calls when Kin is closed", glyph: Glyph.phone)
-    reach.checked = w.on
+    // A SWITCH, not a tick. A tick on the right of a row means "this one is
+    // selected" everywhere else in this same panel -- it is what the camera list
+    // above uses -- so the same mark was doing two opposite jobs three rows apart.
+    // This is the setting that decides whether anybody can reach this Mac at all;
+    // it should be the least ambiguous control in the app.
+    reach.switchState = w.on
     reach.target = self; reach.action = #selector(toggleWatchRow(_:))
     items.append(reach)
     // Only when it is off, and it always names the one thing that fixes it.
     if !w.on, !w.says.isEmpty { items.append(SheetHint(w.says)) }
     // Silent is a switch, so it carries a tick and never a value.
     let q = SheetRow("Silent", glyph: Glyph.bell)
-    q.checked = silent
+    q.switchState = silentBusy ? nil : silent
+    q.value = silentBusy ? "…" : ""
+    q.inert = silentBusy
     q.target = self; q.action = #selector(toggleSilentRow(_:))
     items.append(q)
+    if !settingsNote.isEmpty { items.append(SheetHint(settingsNote)) }
     items.append(safety)
     items.append(SheetHint(silent
       ? "Silent: nobody can ring you. To them you simply look away."
@@ -4494,10 +4967,35 @@ final class CallControls: NSView {
     // nothing to press. Last in the panel because it is the thing you go looking
     // for rather than the thing you come here to do. `describeTree` prints the
     // sheet's rows, so a rig can assert the version on screen IS `VERSION`.
+    // ── AND IT IS THE ROW YOU PRESS TO GET A NEWER ONE ────────────────────────
+    //
+    // `inert = true` was right when this row was only a fact. It is the only place
+    // in the app where the version appears, so it is also where somebody goes when
+    // they want to know whether they have the latest -- and the answer to that
+    // question lived in a menu item two menus away.
+    //
+    // Three states, and the row is the whole of the feedback: pressing it says
+    // "checking…", finding nothing says so, and an update that is already
+    // downloaded and waiting turns the row into the thing that lands it.
     let ver = SheetRow("Version", glyph: Glyph.more)
-    ver.inert = true
-    ver.value = VERSION
+    if Update.pending != nil {
+      ver.setLabel("Update ready")
+      ver.value = "restart"
+      ver.valueIsWord = true
+      ver.valueIsAction = true
+      ver.target = self; ver.action = #selector(restartForUpdateRow(_:))
+    } else if updateChecking {
+      ver.value = "checking\u{2026}"
+      ver.valueIsWord = true
+      ver.inert = true
+    } else {
+      ver.value = VERSION
+      ver.valueIsWord = true
+      ver.valueIsAction = true
+      ver.target = self; ver.action = #selector(checkUpdateRow(_:))
+    }
     items.append(ver)
+    if !updateNote.isEmpty { items.append(SheetHint(updateNote)) }
     // ── AND WHAT IT IS ────────────────────────────────────────────────────────
     //
     // Kin is AGPL-3.0, and that gives the person running it rights: to the
@@ -4566,6 +5064,7 @@ final class CallControls: NSView {
       let mine = ContactRow(handle: handle)
       mine.value = "copy"
       mine.valueIsWord = true
+      mine.valueIsAction = true
       mine.ruled = !people.isEmpty
       mine.target = self; mine.action = #selector(copyHandleRow(_:))
       items.append(mine)
@@ -4729,7 +5228,127 @@ final class CallControls: NSView {
     camPicker.selectItem(at: sender.tag)
     onCamPick?(sender.tag)
     setStatus(camNames.indices.contains(sender.tag) ? camNames[sender.tag] : "camera changed")
-    closeMore()
+    // ── BACK, NOT SHUT ────────────────────────────────────────────────────────
+    //
+    // `closeMore()` was here. Picking a camera took the whole panel off screen, so
+    // the tick that says which one you now have was drawn onto a surface that had
+    // just been hidden -- you had to reopen the panel to find out whether the press
+    // had worked. Every other settings list on this machine leaves you where you
+    // were with the tick moved.
+    showPage(.settings, opening: false)
+  }
+
+  @objc private func cameraPageRow(_ sender: SheetRow) { showPage(.camera, opening: true) }
+  @objc private func micPageRow(_ sender: SheetRow) { showPage(.microphone, opening: true) }
+  @objc private func speakerPageRow(_ sender: SheetRow) { showPage(.speaker, opening: true) }
+
+  @objc private func pickAudioRow(_ sender: SheetRow) {
+    guard let uid = sender.deviceUID else { return }
+    let input = sender.deviceIsInput
+    Metrics.tap(input ? "pick_mic" : "pick_speaker")
+    // Optimistic, then corrected: `onAudioDevice` rebuilds the audio graph and
+    // hands back the name that is ACTUALLY in use, which is not always the one
+    // asked for -- a headset can be unplugged between this panel being drawn and
+    // this row being pressed.
+    if input { micName = sender.spokenName } else { speakerName = sender.spokenName }
+    showPage(.settings, opening: false)
+    onAudioDevice?(uid, input)
+  }
+
+  /// The chosen microphone or speaker, changed live. `main.swift` rebuilds the
+  /// audio graph and calls `setAudioNames` back with what actually happened.
+  var onAudioDevice: ((String, Bool) -> Void)?
+  /// What the live audio graph is using, as names. Empty until it exists.
+  private(set) var micName = ""
+  private(set) var speakerName = ""
+
+  func setAudioNames(mic: String, speaker: String) {
+    onMain { [weak self] in
+      guard let self, mic != self.micName || speaker != self.speakerName else { return }
+      self.micName = mic
+      self.speakerName = speaker
+      self.refreshSheet()
+    }
+  }
+
+  /// One page, three kinds. The list, a tick on the live one, and a way back.
+  private func buildDevicePage(_ kind: Sheet.Page) {
+    var items: [NSView] = []
+    switch kind {
+    case .camera:
+      for (i, name) in camNames.enumerated() {
+        let r = SheetRow(name, glyph: Glyph.cam)
+        r.checked = i == camPicker.indexOfSelectedItem
+        r.tag = i
+        r.target = self; r.action = #selector(pickCameraRow(_:))
+        items.append(r)
+      }
+    case .microphone, .speaker:
+      let input = kind == .microphone
+      let live = input ? micName : speakerName
+      let list = Audio.devices(input: input)
+      if list.isEmpty {
+        items.append(SheetHint(input
+          ? "No microphone found. Plug one in, or check Privacy & Security."
+          : "No speaker found."))
+      }
+      for d in list {
+        let r = SheetRow(d.name, glyph: input ? Glyph.mic : Glyph.speaker)
+        // Ticked from the LIVE device's name, not from what was saved: a saved
+        // choice that is unplugged falls back to the system default, and a tick on
+        // a device that is not carrying the call is the instrument lying.
+        r.checked = d.name == live
+        r.deviceUID = d.uid
+        r.deviceIsInput = input
+        r.target = self; r.action = #selector(pickAudioRow(_:))
+        items.append(r)
+      }
+    default: break
+    }
+    let back = SheetRow("Back")
+    back.target = self; back.action = #selector(backToSettings(_:))
+    items.append(back)
+    sheet.setItems(items)
+  }
+
+  @objc private func backToSettings(_ sender: SheetRow) { showPage(.settings, opening: false) }
+
+  /// Whether a check asked for from the panel is still out, and what it said.
+  private var updateChecking = false
+  private var updateNote = ""
+
+  @objc private func checkUpdateRow(_ sender: SheetRow) {
+    Metrics.tap("check_update_row")
+    guard !updateChecking else { return }
+    updateChecking = true
+    updateNote = ""
+    refreshSheet()
+    Update.checkNowForPerson()
+    // The poller answers on its own thread and there is no completion to hang on,
+    // so the row waits a bounded time and then reports what it can see. A spinner
+    // with no end is worse than either answer.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+      guard let self else { return }
+      self.updateChecking = false
+      self.updateNote = Update.pending != nil
+        ? "" : "This is the newest version."
+      self.refreshSheet()
+      // The sentence is a moment, not a state: it answers a press and then gets
+      // out of the way. A panel that keeps telling you it is up to date is a panel
+      // with a stale sentence on it the next time you open it.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+        guard let self, !self.updateNote.isEmpty else { return }
+        self.updateNote = ""
+        self.refreshSheet()
+      }
+    }
+  }
+
+  @objc private func restartForUpdateRow(_ sender: SheetRow) {
+    Metrics.tap("restart_for_update_row")
+    guard Update.pending != nil else { return }
+    Update.restartNow = true
+    setStatus("restarting\u{2026}")
   }
 
   private var leaveTimer: Timer?
@@ -4968,14 +5587,34 @@ final class CallControls: NSView {
   var visibleRowNames: [String] {
     [("mic", micButton), ("cam", camButton), ("peek", peekButton), ("flip", flipButton),
      ("xlate", xlateButton), ("leave", leaveButton)]
-      .filter { !$0.1.isHidden && $0.1.alphaValue > 0.01 && $0.1.frame.width > 4 }
+      // ── ASKED OF THE WHOLE CHAIN, NOT OF THE BUTTON ────────────────────────
+      //
+      // The buttons' own alpha stopped being the answer the day the row's fade
+      // moved onto the `GlassGroup` they sit in: a child of a hidden container is
+      // not hidden and its alpha is still 1. This reported four visible buttons on
+      // a screen with none -- an instrument describing the code's intent instead of
+      // the screen, which is the exact failure `describeTree` exists to prevent.
+      .filter { CallControls.onScreen($0.1) && $0.1.frame.width > 4 }
       .map { $0.0 }
+  }
+
+  /// Reachable AND drawn: this view and every ancestor up to the overlay. The one
+  /// question two separate readers here kept answering differently.
+  static func onScreen(_ v: NSView) -> Bool {
+    var w: NSView? = v
+    while let x = w {
+      if x.isHidden || x.alphaValue <= 0.01 { return false }
+      if x is CallControls { return true }
+      w = x.superview
+    }
+    return true
   }
 
   var describeTree: String {
     "controls \(Int(bounds.width))x\(Int(bounds.height))"
       + "  status=\(status.isEmpty ? "-" : status)"
-      + "  room=\(roomPill.text)"
+      + "  who=\(whoPill.text.isEmpty ? "-" : whoPill.text)"
+      + "  poster=\(poster.describe)"
       + "  quality=\(qualityText.isEmpty ? "-" : qualityText)"
       // THE WARNING IS A SENTENCE THE USER READS, so an instrument that cannot see
       // it cannot check the one thing that matters about it. "their camera is off"
@@ -5346,8 +5985,16 @@ extension CallControls {
   var clickTargets: [(String, NSView)] {
     var out: [(String, NSView)] = []
     func add(_ n: String, _ v: NSView) {
-      guard !v.isHidden, v.alphaValue > 0.01, v.bounds.width > 4, v.bounds.height > 4,
-            !v.frame.isEmpty else { return }
+      // ── AN ANCESTOR'S STATE IS THIS VIEW'S STATE ──────────────────────────
+      //
+      // `!v.isHidden` alone was a lie the moment the row's fade moved onto the
+      // GlassGroup: the buttons themselves are never hidden, their container is,
+      // and `hitTest` stops at the container. An audit that reports five reachable
+      // controls on a screen with none is exactly the instrument this file keeps
+      // finding -- so reachability is asked of the whole chain, which is what a
+      // click actually walks.
+      guard CallControls.onScreen(v) else { return }
+      guard v.bounds.width > 4, v.bounds.height > 4, !v.frame.isEmpty else { return }
       out.append((n, v))
     }
     // ── AN OPEN SHEET REALLY DOES TAKE THE BAR AWAY ───────────────────────────
@@ -5367,15 +6014,44 @@ extension CallControls {
       add("flip", flipButton); add("leave", leaveButton)
       add("more", moreButton)
     } else {
-      for (i, r) in sheet.rows.enumerated() where r.isEnabled { add("row#\(i)", r) }
+      // ── NAMED BY WHAT THEY SAY, NOT BY WHERE THEY SIT ─────────────────────
+      //
+      // `row#3` is a position, and every row in this panel changes position: the
+      // camera list is one row on this Mac and three on another, the name row is
+      // absent until a handle is claimed, and pressing `People` replaces the whole
+      // page. A rig that clicks `row#3` twice clicks two different things and has
+      // no way to know. The index names stay, because existing invocations use
+      // them, and every row gains the name a person would call it by.
+      for (i, r) in sheet.rows.enumerated() where r.isEnabled {
+        add("row#\(i)", r)
+        let slug = CallControls.slug(r.spokenName)
+        if !slug.isEmpty { add("row:" + slug, r) }
+      }
       // The one thing in a sheet that is typed into rather than pressed. Named, so
       // `@name` focuses it and `+meera` has somewhere to land.
       if let f = sheet.field { add("name", f) }
+      // ── AND THE WAY OUT THAT NEEDS NO AIMING ────────────────────────────────
+      //
+      // A click anywhere outside the panel closes it, and that is the primary
+      // route: the corner button cannot close it (it is under the scrim, which is
+      // correct and is why it is absent from this list while the panel is open),
+      // Escape is a keyboard reflex, and the swipe is for a trackpad. So the most
+      // used exit in the app was the one no click had ever tested -- and a rig
+      // that cannot close the panel cannot test anything that comes after it.
+      add("scrim", sheetScrim)
     }
     // Under the scrim too, for the same reason and with the same consequence: while
     // the panel is open, a click on `copy` closes the panel rather than copying.
     if !waiting.isHidden, !moreOpen { for (n, v) in waiting.clickTargets { add(n, v) } }
     return out
+  }
+
+  /// Lowercase, letters and digits only. `"Calls when Kin is closed"` becomes
+  /// `callswhenkinisclosed`, which is ugly and unambiguous; a rig can also pass a
+  /// PREFIX of it (see `click`).
+  static func slug(_ s: String) -> String {
+    String(s.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+             .map(Character.init))
   }
 
   /// `hitTest` from the content view down, exactly as a click arrives.
@@ -5450,8 +6126,25 @@ extension CallControls {
   /// ever runs in production is a defence nobody has seen work.
   func click(_ name: String, holdFor: TimeInterval = 0, stray: Bool = false) -> Bool {
     guard let win = window else { return false }
-    guard let (_, v) = clickTargets.first(where: { $0.0 == name }) else {
-      fputs("click: \(name) is not on screen\n", stderr); return false
+    let targets = clickTargets
+    // Exact first, then a unique prefix -- `row:calls` for "Calls when Kin is
+    // closed". Ambiguity is refused rather than resolved: a rig that quietly
+    // pressed whichever row matched first would be a rig that pressed a different
+    // row on a Mac with two cameras.
+    var found = targets.first(where: { $0.0 == name })?.1
+    if found == nil {
+      let hits = targets.filter { $0.0.hasPrefix(name) }
+      if hits.count > 1 {
+        fputs("click: \(name) matches \(hits.map(\.0).joined(separator: ", "))"
+            + " -- say which\n", stderr)
+        return false
+      }
+      found = hits.first?.1
+    }
+    guard let v = found else {
+      fputs("click: \(name) is not on screen -- on screen: "
+          + targets.map(\.0).joined(separator: " ") + "\n", stderr)
+      return false
     }
     // ── FORWARD FIRST, BECAUSE THAT IS WHAT A FINGER DOES ────────────────────
     //
