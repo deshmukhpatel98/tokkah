@@ -144,6 +144,35 @@ enum Watch {
   /// Present, current, and actually loaded. Anything else calls for a reinstall.
   static func healthy() -> Bool { installed && !stale() && loaded() }
 
+  /// ── AND SOMETHING THAT PUTS IT BACK ────────────────────────────────────────
+  ///
+  /// `healthy()` had exactly one caller and it drew a row. Nothing repaired the
+  /// unhealthy case, so a job that went missing stayed missing until somebody
+  /// noticed a switch was off and pressed it -- and the symptom of a missing job
+  /// is silence, which nobody notices. Found on this Mac: the plist present, the
+  /// service gone from launchd, and no way to be called with Kin closed. The
+  /// comment above this one describes the same thing happening once before.
+  ///
+  /// A repair, not an install: it runs only when the plist is already there,
+  /// which is the record of somebody having asked for this. It never creates one.
+  /// Off the main thread -- `launchctl` is a subprocess.
+  ///
+  /// Returns what it did, for the log. `nil` means there was nothing to do.
+  @discardableResult
+  static func repairIfNeeded() -> String? {
+    guard installed else { return nil }        // never asked for -- not ours to add
+    if let why = staleReason() {
+      // Pointing at a copy that no longer exists. `install()` rewrites the plist
+      // from where this binary actually is, which is the only thing that fixes it.
+      let said = install()
+      return "watch: the login item was stale (\(why)) -- \(said)"
+    }
+    guard !loaded() else { return nil }
+    let ok = reregister()
+    return "watch: the login item was not loaded in launchd -- "
+         + (ok ? "put back" : "COULD NOT put it back; calls will not reach this Mac while Kin is closed")
+  }
+
   /// True when the agent's plist points at an executable that no longer exists,
   /// or at a different copy than the one running. A stale agent is worse than no
   /// agent: it fails silently at every login and nobody is reachable.

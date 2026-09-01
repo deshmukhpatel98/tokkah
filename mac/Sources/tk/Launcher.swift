@@ -778,6 +778,14 @@ enum Launcher {
     // pressed. `healthy()` and not `installed`: the plist FILE existing is not the
     // question, because one `launchctl bootout` leaves the file in place and the
     // Mac uncallable for ever while every launch decides there is nothing to do.
+    // ── AND IF IT WENT MISSING, PUT IT BACK ──────────────────────────────────
+    //
+    // Opening the app is the only moment anything can notice that the login item
+    // has stopped existing, and until now nothing looked: `healthy()` drew a row
+    // and no code anywhere repaired the unhealthy answer. A Mac in that state is
+    // simply not reachable with Kin closed, silently, until somebody happens to
+    // open the settings card. Off the main thread; the row is redrawn if it
+    // changed anything.
     var watchOK = Watch.healthy()
     let reachRow = SheetRow(watchOK ? "People can reach you when Kin is closed"
                                     : "Let people reach you when Kin is closed")
@@ -1339,6 +1347,34 @@ enum Launcher {
       t.relayout()
     }
     scanClipboard()
+    // ── AND IF THE LOGIN ITEM WENT MISSING, PUT IT BACK ──────────────────────
+    //
+    // Opening the app is the only moment anything can notice that the login item
+    // has stopped existing, and until now nothing looked: `healthy()` drew a row
+    // and no code anywhere repaired the unhealthy answer. A Mac in that state is
+    // not reachable with Kin closed -- silently, until somebody happens to open
+    // the settings card and see a switch they thought was on. Found exactly that
+    // here: the plist present, the service gone from launchd.
+    //
+    // Off the main thread (`launchctl` is a subprocess), and the row is corrected
+    // only if the repair actually worked.
+    if !watchOK {
+      Thread { [weak t] in
+        guard let said = Watch.repairIfNeeded() else { return }
+        let ok = Watch.healthy()
+        DispatchQueue.main.async {
+          fputs(said + "\n", stderr)
+          Metrics.tap("watch_repair", ok: ok)
+          guard ok else { return }
+          watchOK = true
+          reachRow.setLabel("People can reach you when Kin is closed")
+          reachRow.value = "on"
+          reachRow.valueIsWord = true
+          reachRow.inert = true
+          t?.relayout()
+        }
+      }.start()
+    }
     let clipWatch = NotificationCenter.default.addObserver(
       forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
         scanClipboard()

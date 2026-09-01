@@ -225,6 +225,44 @@ case "$GOT" in
   *) say FAIL "invite link is the wrong shape: '$GOT' for room '$ROOM'"; fail=1 ;;
 esac
 
+# ── A LOGIN ITEM THAT WENT MISSING IS PUT BACK ───────────────────────────────
+# `bootout` unloads the agent and leaves the plist exactly where it was, so the
+# file says "you can be reached when Kin is closed" and launchd has no job at
+# all. Found in that state on this Mac, with no way to be called and nothing
+# saying so; `healthy()` had one caller and it only drew a row. Opening the app
+# is the one moment anything can notice.
+#
+# Its own label and its own bundle: this must never touch the real login item.
+RLBL="com.tokkah.tk.repaircheck.$$"
+RPL="$HOME/Library/LaunchAgents/$RLBL.plist"
+REP="$SP/repair"; mkdir -p "$REP/Kin.app/Contents/MacOS" "$REP/kin"
+cp "$TK" "$REP/Kin.app/Contents/MacOS/Tokkah"
+[ -f bundle/Info.plist ] && cp bundle/Info.plist "$REP/Kin.app/Contents/"
+cat > "$RPL" <<RP
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>$RLBL</string>
+<key>ProgramArguments</key><array><string>$REP/Kin.app/Contents/MacOS/Tokkah</string><string>--watch</string></array>
+<key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>
+RP
+if launchctl print "gui/$(id -u)/$RLBL" >/dev/null 2>&1; then
+  say FAIL "the repair arm's own label was already loaded -- it proves nothing"; fail=1
+else
+  TK_KIN_DIR="$REP/kin" TK_WATCH_LABEL="$RLBL" TK_WATCH_ANYWHERE=1 TK_NO_IDENTITY=1 TK_NO_RAISE=1 \
+    "$REP/Kin.app/Contents/MacOS/Tokkah" --contacts-fake "meera" --gui --no-update \
+    --no-telemetry --no-relocate --no-rings --press close --press-after 6 \
+    > "$REP/log" 2>&1 & PIDS="$PIDS $!"
+  sleep 9
+  reap
+  if launchctl print "gui/$(id -u)/$RLBL" >/dev/null 2>&1; then
+    say OK "a login item that went missing is put back when Kin opens"
+  else
+    say FAIL "the login item was missing and opening Kin did not restore it"
+    fail=1
+  fi
+fi
+launchctl bootout "gui/$(id -u)/$RLBL" 2>/dev/null || true
+rm -f "$RPL"
+
 # ── CLOSING THE DOOR MID-RING HAS TO UN-RING THE OTHER MAC ───────────────────
 # Reported: "if I'm calling someone and I close the app, it should close the
 # ringing itself". It did not -- the ring sat in their mailbox on a 60 s lease
