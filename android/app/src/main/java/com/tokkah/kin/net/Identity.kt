@@ -33,6 +33,8 @@ class Identity(private val dir: File, private val base: String = Server.base) {
     private var seed = ByteArray(0)
     private val keyFile get() = File(dir, "identity.json")
     private val contactsFile get() = File(dir, "contacts.json")
+    private val calledFile get() = File(dir, "called.json")
+    private val lastCallFile get() = File(dir, "lastcall.json")
 
     var lastPollStatus = 0; private set
 
@@ -194,6 +196,65 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         val t = contactsFile.readText()
         return Regex("\"([^\"]+)\"\\s*:\\s*\"([^\"]+)\"").findAll(t)
             .associate { it.groupValues[1] to it.groupValues[2] }
+    }
+
+    // ── WHO YOU TALK TO, AND WHEN YOU LAST DID ──────────────────────────────
+
+    /** Written at every placed and every answered call. */
+    fun noteCallTime(handle: String, at: Double = System.currentTimeMillis() / 1000.0) {
+        if (!handleOK(handle)) return
+        val map = lastCallTimes().toMutableMap()
+        map[handle] = at
+        dir.mkdirs()
+        val tmp = File(dir, "lastcall.json.tmp")
+        tmp.writeText(map.entries.sortedBy { it.key }
+            .joinToString(",", "{", "}") { "\"${it.key}\":${it.value}" })
+        lastCallFile.delete()
+        if (!tmp.renameTo(lastCallFile)) tmp.delete()
+    }
+
+    fun lastCallTimes(): Map<String, Double> {
+        if (!lastCallFile.isFile) return emptyMap()
+        return Regex("\"([a-z][a-z0-9]{1,31})\"\\s*:\\s*([0-9.eE+-]+)")
+            .findAll(lastCallFile.readText())
+            .mapNotNull { m -> m.groupValues[2].toDoubleOrNull()?.let { m.groupValues[1] to it } }
+            .toMap()
+    }
+
+    /**
+     * Write down somebody we called. Idempotent, and it NEVER touches
+     * contacts.json — a dialled name must not be able to become a key.
+     */
+    fun rememberCalled(handle: String) {
+        if (!handleOK(handle)) return
+        val list = called().toMutableSet()
+        if (!list.add(handle)) return
+        dir.mkdirs()
+        calledFile.writeText(list.sorted().joinToString(",", "[", "]") { "\"$it\"" })
+    }
+
+    fun called(): List<String> {
+        if (!calledFile.isFile) return emptyList()
+        return Regex("\"([a-z][a-z0-9]{1,31})\"").findAll(calledFile.readText())
+            .map { it.groupValues[1] }.toList()
+    }
+
+    /** Everyone this phone knows: people who proved a key, plus people we dialled. */
+    fun contactHandles(): List<String> = (contacts().keys + called()).distinct()
+
+    /**
+     * The list's order: the people you actually talk to, most recent first, then
+     * everyone never-timestamped, by name. An EXPLICIT tiebreak, because an
+     * order that changes between two launches over identical data reads as the
+     * app forgetting you.
+     */
+    fun contactHandlesByRecency(): List<String> {
+        val t = lastCallTimes()
+        return contactHandles().sortedWith(Comparator { x, y ->
+            val a = t[x] ?: 0.0
+            val b = t[y] ?: 0.0
+            if (a == b) x.compareTo(y) else b.compareTo(a)
+        })
     }
 
     private fun sign(msg: String): String? = try {

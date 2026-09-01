@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -38,7 +39,13 @@ import androidx.compose.ui.unit.dp
  * gap where a hidden view used to be — the order is: a call still running, a
  * link somebody sent, the people, the field, the invite.
  */
-class Person(val handle: String, val online: Boolean = false, val lastSeen: String? = null)
+class Person(
+    val handle: String,
+    val online: Boolean = false,
+    val lastSeen: String? = null,
+    /** Their picture, from a call you were in. Null until one has provided it. */
+    val face: java.io.File? = null,
+)
 
 @Composable
 fun HomeScreen(
@@ -118,7 +125,7 @@ fun HomeScreen(
                                 KinRow(
                                     "@" + p.handle,
                                     detail = p.lastSeen,
-                                    leading = { Avatar(p.handle, online = p.online) },
+                                    leading = { Avatar(p.handle, online = p.online, face = faceOf(p)) },
                                     onClick = { onCall(p.handle) },
                                 )
                             }
@@ -139,6 +146,17 @@ fun HomeScreen(
                 }
             }
         }
+    }
+}
+
+/** A face decoded once per file, not once per recomposition. */
+@Composable
+private fun faceOf(p: Person): androidx.compose.ui.graphics.ImageBitmap? {
+    val f = p.face ?: return null
+    return androidx.compose.runtime.remember(f.path, f.lastModified()) {
+        runCatching {
+            android.graphics.BitmapFactory.decodeFile(f.path)?.asImageBitmap()
+        }.getOrNull()
     }
 }
 

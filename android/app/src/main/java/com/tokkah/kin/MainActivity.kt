@@ -22,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -66,8 +67,16 @@ fun KinApp(initialRoom: String?) {
     var quiet by remember { mutableStateOf(false) }
     var myHandle by remember { mutableStateOf("") }
     var people by remember { mutableStateOf(listOf<Person>()) }
+    // Mirrored into Compose state, not read off the state object: a @Volatile
+    // field is invisible to the snapshot system, so the card set by the poll
+    // thread never recomposed anything and a real ring drew nothing.
+    var cardMode by remember { mutableStateOf(com.tokkah.kin.ui.CallCardMode.INVITE) }
+    var cardWho by remember { mutableStateOf("") }
+    var cardLine by remember { mutableStateOf<String?>(null) }
+    var cardBecause by remember { mutableStateOf<String?>(null) }
 
-    val identity = remember { Identity(ctx.filesDir.resolve("kin"), Server.base) }
+    val state = remember { KinState(ctx.filesDir) }
+    val identity = state.identity
 
     var micGranted by remember {
         mutableStateOf(granted(ctx, Manifest.permission.RECORD_AUDIO))
@@ -87,22 +96,6 @@ fun KinApp(initialRoom: String?) {
         if (!micGranted || !camGranted) {
             askAll.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
         }
-        // A name for this phone, so somebody can call it. Never asked for.
-        withContext(Dispatchers.IO) {
-            if (!identity.claimed) identity.claim(android.os.Build.MODEL ?: "kin")
-            myHandle = identity.handle
-            people = identity.contacts().keys.map { Person(it) }
-            // The same fixtures the Mac's own home-check plants, so the two
-            // front doors can be compared like for like until contacts and
-            // presence are really wired.
-            if (people.isEmpty() && KIN_FIXTURES) {
-                people = listOf(
-                    Person("meera", online = true, lastSeen = "5m ago"),
-                    Person("arjun", lastSeen = "yesterday"),
-                    Person("dad", lastSeen = "3w ago"),
-                )
-            }
-        }
     }
 
     fun join(name: String) {
@@ -121,6 +114,25 @@ fun KinApp(initialRoom: String?) {
         video = null; audio = null; session = null
     }
 
+    // The mailbox, and the panel it fills. One owner, so the poll loop and the
+    // presence refresh are not tied to a recomposition.
+    DisposableEffect(state) {
+        state.onChanged = {
+            myHandle = identity.handle
+            people = state.people.ifEmpty {
+                if (KIN_FIXTURES) FIXTURES else emptyList()
+            }
+            cardMode = state.cardMode
+            cardWho = state.incoming?.from ?: state.outgoingTo ?: ""
+            cardLine = state.cardLine
+            cardBecause = state.cardBecause
+        }
+        state.onCall = { room, who -> join(room); state.answered() }
+        state.start()
+        onDispose { state.stop() }
+    }
+
+
     Box(Modifier.fillMaxSize().background(Palette.bg)) {
         val s = session
         if (s == null) {
@@ -133,8 +145,13 @@ fun KinApp(initialRoom: String?) {
                 pastedLink = null,
                 settingsOpen = settingsOpen,
                 onSettings = { settingsOpen = !settingsOpen },
-                onJoin = { join(room) },
-                onCall = { handle -> room = handle; join(handle) },
+                onJoin = {
+                    // A handle rings a person; anything else is a room name.
+                    val typed = room.trim().removePrefix("@")
+                    if (identity.handleOK(typed) && typed != myHandle) state.call(typed)
+                    else join(room)
+                },
+                onCall = { handle -> state.call(handle) },
                 onResume = {},
                 onInvite = {
                     val link = "${Server.invite}/${room.ifBlank { myHandle }}"
@@ -145,6 +162,22 @@ fun KinApp(initialRoom: String?) {
                 onQuiet = { on -> quiet = on },
             ) {
                 if (camGranted) SelfPreview { cameraHint = it }
+            }
+            // The calling card sits OVER the front door, because a call being
+            // offered is not a different screen — it is something happening on
+            // this one.
+            if (cardMode != com.tokkah.kin.ui.CallCardMode.INVITE) {
+                com.tokkah.kin.ui.CallCard(
+                    mode = cardMode,
+                    who = cardWho,
+                    line = cardLine,
+                    because = cardBecause,
+                    faceFile = state.faces.path(cardWho),
+                    onAnswer = { state.answerIncoming() },
+                    onDecline = { state.declineIncoming() },
+                    onCancel = { state.cancelOutgoing() },
+                    onCallAgain = { state.callAgain() },
+                )
             }
         } else {
             var sentence by remember { mutableStateOf("connecting") }
@@ -194,6 +227,12 @@ fun KinApp(initialRoom: String?) {
 }
 
 /** The Mac's home-check plants three people; this plants the same three. */
+private val FIXTURES = listOf(
+    Person("meera", online = true, lastSeen = "5m ago"),
+    Person("arjun", lastSeen = "yesterday"),
+    Person("dad", lastSeen = "3w ago"),
+)
+
 private val KIN_FIXTURES =
     android.os.Build.FINGERPRINT.contains("generic") ||
     android.os.Build.FINGERPRINT.lowercase().contains("emulator") ||
