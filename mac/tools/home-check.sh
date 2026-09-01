@@ -28,6 +28,13 @@ trap 'reap' EXIT
 # An isolated identity dir (TK_KIN_DIR), or this rig would write pretend faces
 # and pretend call times into the real install (`rig-isolation-that-does-not-isolate`).
 export TK_KIN_DIR="$SP/kin"
+# ── AND ITS OWN LOGIN-ITEM LABEL, FOR THE SAME REASON ───────────────────────
+# Without this every arm reads -- and the automatic repair would try to WRITE --
+# `com.tokkah.tk.watch`, the real one belonging to whoever is at this Mac. It
+# was saved only by `install()` refusing a binary outside /Applications, which
+# is a guard in a different file having a good day (`rig-isolation-that-does-
+# not-isolate`). The arms that want a job of their own override this again.
+export TK_WATCH_LABEL="com.tokkah.tk.homecheck.$$"
 mkdir -p "$TK_KIN_DIR/faces"
 # Two distinct face images, generated here: sips can make solid-colour JPEGs
 # out of nothing via a PNG intermediate. Distinct colours, so "arjun's face on
@@ -173,7 +180,7 @@ SWID=$(grep -o "window id [0-9]*" "$SP/set.log" | awk '{print $3}' | tail -1)
 reap
 SET=$(grep -o 'home card \[settings\]: .*' "$SP/set.log" | tail -1 | sed 's/home card \[settings\]: //')
 case "$SET" in
-  *mine*reach*quiet*) say OK "settings card carries all three: $SP/settings.png" ;;
+  *mine*reach*) say OK "settings card is your name and one switch: $SET" ;;
   "") say FAIL "the settings button opened nothing"; fail=1 ;;
   *) say FAIL "settings card is missing something: $SET"; fail=1 ;;
 esac
@@ -262,6 +269,72 @@ else
 fi
 launchctl bootout "gui/$(id -u)/$RLBL" 2>/dev/null || true
 rm -f "$RPL"
+
+# ── THE SWITCH GOES BOTH WAYS, TWICE ─────────────────────────────────────────
+# Reported: "couldn't turn it on or off", and it was true twice over. The login
+# item half was `inert` once it was on, so `SheetRow.mouseDown` returned early
+# and the row refused every press -- on and never off, while drawing the right
+# word. The silence half was rate-limited by the server at six changes a minute,
+# and because a press gave no feedback it was pressed again, which is what
+# guaranteed the failure: this Mac's log has eight consecutive
+# `silent mode off refused -- 429`.
+#
+# So the rig presses it four times against a doorbell that records the value,
+# and asserts the sequence actually alternates. A row that only ever goes one
+# way passes any check that presses it once.
+QSW="$SP/switch"; mkdir -p "$QSW/kin"
+python3 - "$QSW/kin/identity.json" <<'PY'
+import json, os, base64, sys
+json.dump({"seed": base64.b64encode(os.urandom(32)).decode(), "tok": os.urandom(32).hex(),
+           "handle": "rigswitch", "claimed": True, "quiet": False}, open(sys.argv[1], "w"))
+PY
+python3 - > "$QSW/srv.log" 2>&1 <<'PY' & PIDS="$PIDS $!"
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import json
+S = {'q': False}
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get('content-length', 0)))
+        o = json.loads(b or b'{}')
+        if self.path.endswith('/quiet'):
+            S['q'] = bool(o.get('quiet'))
+            print('quiet=%s' % S['q'], flush=True)
+            body = json.dumps({'ok': True, 'quiet': S['q']}).encode()
+        else:
+            body = b'{"ok":true,"queued":1}'
+        self.send_response(200); self.send_header('content-type', 'application/json')
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        self.send_response(200); self.send_header('content-type', 'application/json')
+        self.end_headers(); self.wfile.write(b'{}')
+    def log_message(self, *a): pass
+class T(ThreadingMixIn, HTTPServer): daemon_threads = True
+T(('127.0.0.1', 8203), H).serve_forever()
+PY
+sleep 1
+TK_KIN_DIR="$QSW/kin" TK_KIN_BASE="http://127.0.0.1:8203" TK_NO_RAISE=1 \
+  TK_WATCH_LABEL="com.tokkah.tk.switchcheck.$$" TK_WATCH_ANYWHERE=1 "$TK" \
+  --contacts-fake "meera" --gui --no-update --no-telemetry --no-relocate --no-rings \
+  --press "settings,reach,reach,reach,reach" --press-after 3 > "$QSW/app.log" 2>&1 & PIDS="$PIDS $!"
+sleep 20
+reap
+launchctl bootout "gui/$(id -u)/com.tokkah.tk.switchcheck.$$" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.tokkah.tk.switchcheck.$$.plist" \
+      "$HOME/Library/LaunchAgents/.com.tokkah.tk.switchcheck.$$.installing"
+SEQ=$(tr -d '\r' < "$QSW/srv.log" | sed -n 's/^quiet=//p' | tr '\n' ' ')
+case "$SEQ" in
+  "False True False True "*|"True False True False "*)
+    say OK "the switch alternates on four presses: $SEQ" ;;
+  "") say FAIL "four presses reached the server zero times -- the row is dead"; fail=1 ;;
+  *) say FAIL "the switch does not alternate: $SEQ"; fail=1 ;;
+esac
+# And the row's own word tracks it, rather than the row saying one thing while
+# the server holds another -- the "Couldn't turn it on / on" photograph.
+grep -q "people-can-call-me asked off, now off" "$QSW/app.log" \
+  && grep -q "people-can-call-me asked on, now on" "$QSW/app.log" \
+  && say OK "and the row reports both directions" \
+  || { say FAIL "the row never reported both directions: $(grep -o 'people-can-call-me.*' "$QSW/app.log" | tail -2 | tr '\n' ' ')"; fail=1; }
 
 # ── CLOSING THE DOOR MID-RING HAS TO UN-RING THE OTHER MAC ───────────────────
 # Reported: "if I'm calling someone and I close the app, it should close the

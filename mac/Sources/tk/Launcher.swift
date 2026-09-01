@@ -204,6 +204,10 @@ enum Launcher {
     }
   }
 
+  /// A closure cannot refer to itself while it is being defined, and a retry is
+  /// exactly that: the thing that runs on failure is the thing that failed.
+  final class Box<F> { var f: F? }
+
   /// The one slot `runPumping` writes its answer into. A class, so the closure
   /// that runs off-thread and the caller that reads it afterwards are looking at
   /// the same storage; a local type cannot be nested in a generic function.
@@ -795,28 +799,28 @@ enum Launcher {
     // setting. The name says what it is and the right-hand word says whether it
     // is on. The hint views survive for ONE job: saying what went wrong, when
     // something goes wrong, which is not decoration.
+    // ── ONE SWITCH, BECAUSE IT IS ONE QUESTION ───────────────────────────────
+    //
+    // There were two: "Let people reach you when Kin is closed" (a login item, so
+    // this Mac can HEAR a ring with the app shut) and "Don't ring me" (a
+    // server-side flag, so callers are declined). One is whether you CAN be
+    // reached and the other is whether you MAY be -- a real distinction, and not
+    // one anybody should have to hold. Worse, they can disagree: reachable and
+    // silenced is unreachable, and neither row said so.
+    //
+    // So: one row that answers the only question a person is actually asking.
+    // Turning it on installs the login item AND lifts the silence; turning it
+    // off silences. The login item is plumbing and is never mentioned again --
+    // except in the one state where it is the whole answer, which is when the
+    // silence is lifted and the login item could not be installed: then calls
+    // reach you only while Kin is open, and the row says exactly that.
     var watchOK = Watch.healthy()
-    let reachRow = SheetRow("Ring me when Kin is closed")
+    let reachRow = SheetRow("People can call me")
     let reachHint = SheetHint("")
-    reachRow.value = watchOK ? "on" : "off"
     reachRow.valueIsWord = true
-    reachRow.inert = watchOK
     reachRow.textInset = Metric.rowAvatarInset
     v.addSubview(reachRow)
     v.addSubview(reachHint)
-    // Silent mode, from the same server switch the in-call sheet flips. The row
-    // shows the SERVER's verdict, never the wish -- `setQuiet` only moves local
-    // state when the server agreed, so "on" here is true unreachability.
-    // "Do not disturb" and not "Don't ring me": the second one reads "Don't ring
-    // me -- off", which is a double negative the person has to unpick to learn
-    // that calls DO come through.
-    let quietRow = SheetRow("Do not disturb")
-    let quietHint = SheetHint("")
-    quietRow.value = Identity.quietOn ? "on" : "off"
-    quietRow.valueIsWord = true
-    quietRow.textInset = Metric.rowAvatarInset
-    v.addSubview(quietRow)
-    v.addSubview(quietHint)
     // ── THE FURNITURE GOES BEHIND ONE BUTTON ─────────────────────────────────
     //
     // Your own handle, the login item, silent mode: all three are ABOUT you and
@@ -888,14 +892,12 @@ enum Launcher {
       var stopRing: () -> Void = {}
       /// The settings card is open: your handle, the login item, silent mode.
       var settingsOpen = false
-      var toggleQuiet: () -> Void = {}
       @objc func settings() {
         guard !ringing else { return }
         settingsOpen.toggle()
         fputs("home: settings \(settingsOpen ? "open" : "closed")\n", stderr)
         relayout()
       }
-      @objc func quietPressed() { guard !ringing else { return }; toggleQuiet() }
       let field: NSTextField
       let status: NSTextField
       /// The room parsed off the clipboard, when the clipboard holds a call link.
@@ -1182,7 +1184,7 @@ enum Launcher {
         // here used to sit under the people list and push the card up over the
         // camera picture.
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
-        column += [reachRow, reachHint, quietRow, quietHint]
+        column += [reachRow, reachHint]
       } else {
         // A call you are still in comes first: it is the only row on this card
         // about something already happening. Then a link somebody just sent you,
@@ -1206,7 +1208,7 @@ enum Launcher {
       column = column.filter { ($0 as? SheetHint).map { !$0.text.isEmpty } ?? true }
       let shown = Set(column.map { ObjectIdentifier($0) })
       for x in [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
-                emptyHint, reachRow, reachHint, quietRow, quietHint] as [NSView] {
+                emptyHint, reachRow, reachHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       moreBtn.on = t?.settingsOpen == true
@@ -1292,13 +1294,11 @@ enum Launcher {
         if x === status { return "status" }
         if x === mineRow { return "mine" }
         if x === reachRow { return "reach" }
-        if x === quietRow { return "quiet" }
         if x === emptyHint { return "empty" }
         // Named, not "hint": three of these can be on one card and a rig that
         // cannot tell them apart cannot say which sentence came back.
         if x === mineHint { return "mine-hint" }
         if x === reachHint { return "reach-hint" }
-        if x === quietHint { return "quiet-hint" }
         if x is SheetHint { return "hint" }
         if let c = x as? ContactRow { return "@" + c.handleName }
         return "?"
@@ -1324,33 +1324,6 @@ enum Launcher {
     // The room is known and about to be joined -- the same free second the faces
     // and the clipboard row get.
     resumeRow.onHover = { if let r = resume { Warm.room(r.room, why: "hover rejoin") } }
-    quietRow.target = t; quietRow.action = #selector(Target.quietPressed)
-    // ── A SWITCH THAT MOVES ONLY WHEN THE SERVER SAYS IT DID ─────────────────
-    //
-    // `setQuiet` is an HTTPS round trip and it is the authority: a row that
-    // flipped optimistically would tell somebody they are unreachable while
-    // calls keep arriving, which is the one error in this feature that matters.
-    // So the row says "asking…" and then reports what came back.
-    var quietBusy = false
-    t.toggleQuiet = { [weak t] in
-      guard !quietBusy else { return }
-      quietBusy = true
-      let want = !Identity.quietOn
-      quietRow.value = "…"
-      Thread {
-        let ok = Identity.setQuiet(want)
-        let now = Identity.quietOn
-        DispatchQueue.main.async {
-          quietBusy = false
-          quietRow.value = now ? "on" : "off"
-          // A sentence only when the switch did not move. When it did, the word
-          // on the right is the whole story.
-          quietHint.setText(ok ? "" : "Couldn’t reach the server — nothing changed.")
-          fputs("home: quiet asked \(want), server says \(now ? "on" : "off")\n", stderr)
-          t?.relayout()
-        }
-      }.start()
-    }
     // Same free time the faces get: the room is knowable the moment the pointer
     // lands on the row, and it is very likely the one about to be joined.
     linkRow.onHover = { [weak t] in if let r = t?.clipRoom { Warm.room(r, why: "hover link") } }
@@ -1406,34 +1379,98 @@ enum Launcher {
     // real Mac reading "Couldn't turn it on" on the left and "on" on the right.
     // The name never changes now; only the state word does, and only here.
     // `reachBusy` is what stops two attempts overlapping at all.
+    // ── ONE SWITCH, TWO MECHANISMS, THREE HONEST STATES ──────────────────────
+    //
+    //   on             the silence is lifted AND the login item is healthy
+    //   only when open the silence is lifted and the login item is not, so a
+    //                  ring reaches this Mac only while Kin is running. Named,
+    //                  because it is the state somebody would otherwise read as
+    //                  "on" and then miss a call
+    //   off            silenced at the server: nobody gets through
+    //
+    // `inert` is never set from the STATE any more. It was `inert = watchOK`,
+    // which meant that once this was on the row refused every press
+    // (`SheetRow.mouseDown` returns early on `inert`) -- so it could be turned on
+    // and never off, and it looked finished because it drew the right word.
     var reachBusy = false
+    var retryTimer: Timer?
+    // Holds the attempt closure so its own retry can call it.
+    let attemptBox = Box<(Bool) -> Void>()
     let renderReach: (String?) -> Void = { failure in
-      watchOK = Watch.healthy()
-      reachRow.value = reachBusy ? "…" : (watchOK ? "on" : "off")
-      reachRow.inert = watchOK || reachBusy
-      // A sentence only when there is something wrong, and gone the moment there
-      // is not.
-      reachHint.setText(watchOK ? "" : (failure ?? reachHint.text))
+      let silenced = Identity.quietOn
+      reachRow.value = reachBusy ? "…" : (silenced ? "off" : (watchOK ? "on" : "only when open"))
+      reachRow.inert = reachBusy
+      // A sentence only when something is wrong, and gone the moment it is not.
+      reachHint.setText(failure ?? "")
       t.relayout()
     }
-    t.makeReachable = { [weak t] in
+    // ── AND WHAT THE PRESS DOES ──────────────────────────────────────────────
+    //
+    // On means both halves: lift the silence, and make sure this Mac can hear a
+    // ring with Kin closed. Off means the silence, and leaves the login item
+    // alone -- it is plumbing, it costs nothing while silenced, and tearing it
+    // down would make the next "on" slow for no reason anybody asked for.
+    //
+    // THE RATE LIMIT IS PART OF THIS FEATURE, not an edge case. The server
+    // allows a handful of silence changes a minute, and this Mac's own log has
+    // eight consecutive `silent mode off refused -- 429`: the first press looked
+    // like it did nothing, so it was pressed again, and pressing again is what
+    // guaranteed it would keep failing. `reachBusy` stops the second press, the
+    // sentence says which failure this is, and a 429 retries itself once the
+    // window has passed rather than leaving somebody stuck silenced.
+    let attempt: (Bool) -> Void = { turningOn in
       guard !reachBusy else { return }
       reachBusy = true
+      retryTimer?.invalidate(); retryTimer = nil
       renderReach(nil)
       Thread {
-        let said = Watch.install()
-        DispatchQueue.main.async {
+        var trouble: String?
+        // The login item first: with the silence lifted and no way to hear a
+        // ring, "on" would be a lie for every moment Kin is not open.
+        if turningOn, !Watch.healthy() {
+          let said = Watch.install()
           fputs(said + "\n", stderr)
+        }
+        let quietOK = Identity.setQuiet(!turningOn)
+        let status = Identity.lastQuietStatus
+        if !quietOK {
+          trouble = status == 429
+            ? "Too many changes at once — trying again in a moment."
+            : "Couldn’t reach the server — nothing changed."
+        }
+        DispatchQueue.main.async {
           reachBusy = false
-          let ok = Watch.healthy()
-          Metrics.tap("watch_install", ok: ok)
-          // The sentence names which refusal it was, and some of them are things
-          // the person can act on. Only shown while it is still off.
-          renderReach(ok ? nil : said.replacingOccurrences(of: "watch: ", with: ""))
-          _ = t
+          watchOK = Watch.healthy()
+          let on = !Identity.quietOn
+          Metrics.tap(turningOn ? "reach_on" : "reach_off", ok: quietOK && on == turningOn)
+          fputs("home: people-can-call-me asked \(turningOn ? "on" : "off"),"
+              + " now \(on ? (watchOK ? "on" : "only-when-open") : "off")"
+              + " quiet_http=\(status)\n", stderr)
+          if turningOn, on, !watchOK {
+            // Reachable, but only while Kin is open. `reach()` names the one
+            // thing that fixes it, which is usually "move Kin to Applications".
+            trouble = Watch.reach().says
+          }
+          renderReach(trouble)
+          // A 429 is a "not yet", not a "no". One retry, after the window.
+          if !quietOK, status == 429 {
+            let r = Timer(timeInterval: 12, repeats: false) { _ in attemptBox.f?(turningOn) }
+            RunLoop.main.add(r, forMode: .common)
+            retryTimer = r
+          }
         }
       }.start()
     }
+    // A closure cannot name itself while it is being defined, and the retry above
+    // has to call this same function.
+    attemptBox.f = attempt
+    // Pressing it means "the other way from wherever it is now". Read at press
+    // time, not captured: the automatic repair below can move it first.
+    t.makeReachable = { attempt(Identity.quietOn) }
+    // The state word, before anybody touches anything. Without this the switch
+    // is blank until the first press -- which is a row that looks broken and,
+    // worse, gives no clue which way pressing it will go.
+    renderReach(nil)
     // ── AND THE AUTOMATIC REPAIR, THROUGH THE SAME DOOR ──────────────────────
     //
     // A login item that went missing is put back when the app opens. It writes
@@ -1625,7 +1662,6 @@ enum Launcher {
       case "reach": return reachRow
       case "mine": return mineRow
       case "link": return linkRow
-      case "quiet": return quietRow
       case "invite": return inviteRow
       case "rejoin": return resumeRow
       default: return peopleRows.first { $0.handleName == n }

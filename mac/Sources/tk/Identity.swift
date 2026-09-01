@@ -671,6 +671,12 @@ enum Identity {
   // client must never expose "they are silenced" to a caller, because the only
   // reason the server pays for that indistinguishability is so the caller cannot
   // learn it.
+  /// The HTTP status of the last `setQuiet`, so a caller can tell the three
+  /// failures apart. They are not the same thing to a person: 429 means "you did
+  /// it too fast, it will work in a moment" and 0 means "we never reached the
+  /// server". Both used to arrive as a bare `false`, and the app said "couldn't
+  /// reach the server" for a request the server answered.
+  nonisolated(unsafe) static var lastQuietStatus = 0
   private static var quietCache = false
   static var quietOn: Bool {
     lock.lock(); defer { lock.unlock() }
@@ -722,6 +728,7 @@ enum Identity {
       sem.signal()
     }.resume()
     _ = sem.wait(timeout: .now() + 10)
+    lastQuietStatus = status
     guard let got = okQuiet else {
       fputs("identity: silent mode \(on ? "on" : "off") refused -- \(status) \(payload)\n", stderr)
       return false
