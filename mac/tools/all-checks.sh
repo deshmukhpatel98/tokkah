@@ -102,7 +102,10 @@ export TK_NO_RAISE=1
 # `recover-check` verdicts are packets and playout per second, so it belongs here
 # and not in the parallel lane -- and it was in NO lane at all until this line:
 # written, passing, and run by nobody. `unrun-tests-are-not-coverage`.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check floor-check"
+# `predict-live-check` is two 40-second calls of real speech through the real
+# audio path, and its verdict is a count and a number of milliseconds saved, so it
+# belongs alone with the rest of the timing work.
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check floor-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
 # ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
 #

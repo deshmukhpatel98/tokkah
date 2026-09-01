@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.123.0"
+let VERSION = "0.124.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -566,6 +566,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
   "backdrop-test", "selftest-seal", "selftest-beat", "selftest-fit", "window-size", "window-resize", "skip-mic-permission",
+  "no-predict", "predict-p",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -4643,6 +4644,28 @@ func applyGateFlags() {
   // The control arm for the strict floor (0.95.0): the 0.94.0 rules -- the
   // -20 dB out-of-turn duck, the open idle, the open fallback.
   if flag("floor-soft") { Audio.sharedFloor.cfg.strict = false }
+  // ── THE OFF SWITCH THE TURN PREDICTION NEVER HAD ──────────────────────────
+  //
+  // The prior is wired at both ends -- this Mac's floor reads `Audio.turnEndProb`
+  // and the far end's reads TPKTX+7 -- and both halves are counted separately
+  // (`predictedReleases` / `farPredictedReleases`). What has never existed is a
+  // way to turn it OFF, and without that there is no control arm: "handed over
+  // early 6 times, saving 1400 ms" is a number with nothing to compare it to, and
+  // a feature that cannot be A/B'd cannot be shown to do anything at all. Same
+  // reason `--no-fec` exists.
+  //
+  // 2.0 rather than a bool: the threshold is what every decision reads, so raising
+  // it out of range disables the feature without adding a second condition to four
+  // hot lines -- `one-condition-two-concerns` in reverse.
+  if flag("no-predict") {
+    Audio.sharedFloor.cfg.predictP = 2.0
+    fputs("floor: turn prediction OFF (--no-predict) -- every handover waits the"
+        + " full release window\n", stderr)
+  }
+  if let pp = Double(arg("predict-p") ?? "") {
+    Audio.sharedFloor.cfg.predictP = pp
+    fputs("floor: turn prediction fires at p >= \(pp)\n", stderr)
+  }
   // The control arm for headphone full duplex (0.107.0): strict applies to every
   // output route again, which is exactly 0.106.0. Kept as a real switch because
   // this is the reference experience -- the only way to hear what echo costs the

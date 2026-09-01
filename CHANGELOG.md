@@ -5,6 +5,42 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.124.0 — 2026-09-02
+
+### Added — the turn prediction is measured on a real call for the first time
+
+Kin scores how likely it is that the person talking is about to finish, from the
+recogniser's partial text and the shape of their voice, and both halves have been
+wired since 0.92/0.93: this Mac's floor lets go of a floor it holds, and the same
+number crosses the wire in TPKTX+7 so the **listener's microphone is already open
+when the talker stops**. That far half is the only mechanism in the app that can
+make a handover cost nothing instead of a release window.
+
+Nothing had ever measured either half **on a call**. `predict-check` scores the
+predictor inside one process; `floor-check` runs the floor with `--mute` and no
+speech at all. The counters fired in production, the numbers went into every beat,
+and there was nothing to compare them against — "handed over early 6 times, saving
+1400 ms" is a number with no denominator.
+
+There was also no way to turn it off, so `--no-predict` (and `--predict-p`) now
+exist, for the same reason `--no-fec` does: a feature that cannot be A/B'd cannot
+be shown to do anything.
+
+Measured, two ends, two real recordings of real speech through `--audio` — the
+production audio path, the production wire, the production floor:
+
+| | early handovers | time saved | their p peaked |
+|---|---|---|---|
+| as shipped | **4** | **1675 ms** over 40 s of talk | 0.93 |
+| `--no-predict` | 0 | 0 ms | 0.93 |
+
+The control is deliberately not a blind arm: the prior is still computed and still
+crosses the wire in both rows, so `--no-predict` removes the **action** and not the
+**measurement**. A control that silenced the predictor too would make the second
+row pass on a build where the recogniser had simply stopped.
+
+`tools/predict-live-check.sh` holds all of it and is in the timing lane.
+
 ## Kin 0.123.0 — 2026-09-01
 
 ### Fixed — a camera another app is holding said so only in the window title
