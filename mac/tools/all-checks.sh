@@ -267,11 +267,30 @@ echo "logs: $OUT"
 # Both are socket-and-state work with no timing verdict and no photograph, so
 # sharing the machine costs them nothing.
 if [ -n "$LANE_STATE$LANE_LOGIC$LANE_SLOW" ]; then
-  echo "── phase 1: slow + state + logic, in parallel"
+  # ── TWO AT A TIME, NOT THREE ────────────────────────────────────────────────
+  #
+  # This ran SLOW, STATE and LOGIC all at once, and each of those is serial
+  # inside itself -- so three rigs at any moment, each with two or three processes
+  # of its own, is nine copies of a video-calling app on one laptop. Four rigs
+  # have now failed in this phase and passed every time they were run alone
+  # (`watch-check`, `liveupdate-check`, `update-check`, `mute-check`), and two of
+  # them have been moved to the lane that runs alone for that reason. The rest are
+  # not obviously timing rigs; they are just being starved.
+  #
+  # STATE and LOGIC run one after the other now, in a single background lane
+  # beside SLOW. It costs nothing in wall clock: `predict-check` alone is 1208 s
+  # and the two lanes together are about 700 s, so they still finish inside its
+  # shadow -- the phase is bounded by the slow lane either way, and the machine
+  # carries two rigs instead of three.
+  echo "── phase 1: slow, beside state-then-logic"
   PP=""
   [ -n "$LANE_SLOW" ]  && { run_lane slow  $LANE_SLOW  & PP="$PP $!"; }
-  [ -n "$LANE_STATE" ] && { run_lane state $LANE_STATE & PP="$PP $!"; }
-  [ -n "$LANE_LOGIC" ] && { run_lane logic $LANE_LOGIC & PP="$PP $!"; }
+  if [ -n "$LANE_STATE$LANE_LOGIC" ]; then
+    {
+      [ -n "$LANE_STATE" ] && run_lane state $LANE_STATE
+      [ -n "$LANE_LOGIC" ] && run_lane logic $LANE_LOGIC
+    } & PP="$PP $!"
+  fi
   # shellcheck disable=SC2086
   wait $PP 2>/dev/null
   cat "$OUT"/slow.res "$OUT"/state.res "$OUT"/logic.res 2>/dev/null | sort
