@@ -424,6 +424,41 @@ enum Update {
     let fm = FileManager.default
     let me = selfPath()
     guard me.path.contains("/Contents/MacOS/") else { return [] }
+    // ── NEVER PATCH A BUNDLE THAT IS SIGNED WITH A CERTIFICATE ────────────────
+    //
+    // This function writes `Info.plist` and `Contents/Resources/AppIcon.icns` into
+    // the app it is running from. Both are covered by `_CodeSignature/CodeResources`
+    // -- the resource seal -- so rewriting either one makes `codesign --verify`
+    // fail. The kernel then refuses to launch the app at all:
+    //
+    //     Process:  Tokkah [93007]  /Applications/Kin.app/Contents/MacOS/Tokkah
+    //     Parent:   launchd [1]     Coalition: com.tokkah.tk.watch
+    //     Exception: EXC_CRASH (SIGKILL (Code Signature Invalid))
+    //     Termination: Namespace CODESIGNING, Code 4, Launch Constraint Violation
+    //
+    // Launched 08:50:20.3473, dead 08:50:20.4314. Eighty-four milliseconds, no
+    // frames, no symbols -- it never ran an instruction. And the parent is the
+    // login item, so the watcher spawns it, the kernel kills it, and nothing on
+    // screen ever says why. An update that makes the app unlaunchable is the worst
+    // outcome this whole file can produce, and it produced it in the field.
+    //
+    // `release.sh` and `SIGNING.md` both already say why in as many words --
+    // "patching files inside a bundle invalidates any real signature over them" --
+    // and `swapBundle` above exists precisely to replace the bundle WHOLE. This
+    // function is the legacy path for archives that predate that payload, and its
+    // right answer for a certificate-signed app is to do nothing: the assets ride
+    // in with the next whole-bundle swap, which is one release away, and a stale
+    // icon for one release is not comparable to an app that will not start.
+    //
+    // Ad-hoc copies are still patched, because there is no seal to break and they
+    // are the population this was written for.
+    if isCertificateSigned() {
+      fputs("update: not patching Info.plist or the icon into a certificate-signed"
+          + " bundle -- that breaks the resource seal and the kernel then refuses"
+          + " to launch it. They arrive with the next whole-bundle update.\n", stderr)
+      Metrics.count("update_assets_skipped_signed")
+      return []
+    }
     let contents = me.deletingLastPathComponent().deletingLastPathComponent()
     let src = tmp.appendingPathComponent("bundle")
     var applied: [String] = []
@@ -607,6 +642,61 @@ enum Update {
     let out = pipe.fileHandleForReading.readDataToEndOfFile()
     cs.waitUntilExit()
     return String(decoding: out, as: UTF8.self).contains("certificate root")
+  }
+
+  /// Does the bundle on disk still satisfy its own signature? Answered out loud,
+  /// because the alternative is the kernel answering it 84 ms into a launch that
+  /// leaves no stack, no symbol and nothing on screen.
+  ///
+  /// Not a repair. There is nothing this process can honestly do about it: it has
+  /// no key, and re-signing ad-hoc would mint a new identity and drop every
+  /// camera and microphone grant the person has given. What it can do is say so,
+  /// record it, and let the poller fetch a whole signed bundle again.
+  /// `--selftest-seal`: does this copy think it is certificate-signed? The one
+  /// question the patch guard turns on, asked of the running image, so a rig can
+  /// hold it to BOTH answers -- a predicate wired to a constant would either brick
+  /// every certificate install or stop refreshing every ad-hoc one, and only a
+  /// pair of arms can tell those apart. See `tools/seal-check.sh`.
+  static func selftestSeal() -> Never {
+    // STDOUT, like `--version` and `--order-audit` beside it. Everything else in
+    // this program writes to stderr, and stderr is redirected into
+    // ~/Library/Logs/Kin the moment it is not a terminal or a regular file --
+    // which is every rig that reads the answer through a pipe. The first draft of
+    // this printed to stderr and the rig read an empty string.
+    print("certificate-signed: \(isCertificateSigned() ? "yes" : "no")")
+    exit(0)
+  }
+
+  @discardableResult
+  static func verifyInstalled(why: String) -> Bool {
+    let me = selfPath()
+    guard me.path.contains("/Contents/MacOS/") else { return true }
+    let appDir = me.deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let cs = Process()
+    cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    cs.arguments = ["--verify", "--deep", "--strict", appDir.path]
+    cs.standardOutput = FileHandle.nullDevice
+    let pipe = Pipe()
+    cs.standardError = pipe
+    guard (try? cs.run()) != nil else { return true }
+    let out = pipe.fileHandleForReading.readDataToEndOfFile()
+    cs.waitUntilExit()
+    guard cs.terminationStatus != 0 else {
+      fputs("update: the installed bundle still verifies (\(why))\n", stderr)
+      return true
+    }
+    let said = String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    fputs("*** update: THE INSTALLED BUNDLE NO LONGER VERIFIES after \(why).\n"
+        + "*** codesign says: \(said)\n"
+        + "*** macOS will refuse to launch it (SIGKILL, Code Signature Invalid).\n"
+        + "*** Nothing here can re-sign it -- this Mac has no key, and an ad-hoc\n"
+        + "*** signature would be a new identity and lose every permission grant.\n"
+        + "*** The next whole-bundle update replaces it; until then reinstall.\n", stderr)
+    Metrics.count("bundle_signature_broken")
+    Metrics.fact("bundle_signature_error", String(said.prefix(200)))
+    return false
   }
 
   private static func resign(at bundle: URL? = nil) {
@@ -970,6 +1060,14 @@ enum Update {
       return
     }
     installBundle(from: tmp, version: m.version)
+    // ── AND CHECK THAT WHAT IS ON DISK CAN STILL BE LAUNCHED ──────────────────
+    //
+    // The legacy path replaces the executable inside a bundle by `rename(2)`, and
+    // whether the result still verifies depends on what was in the archive. There
+    // is exactly one moment where that is knowable and cheap, and it is here --
+    // after this, the next thing that touches the question is the kernel, in a
+    // process with no frames and nobody watching.
+    verifyInstalled(why: "legacy install of \(m.version)")
 
     // The app may be changing its name. Do it after the payload is in place, so a
     // failure here leaves a working app under the old name rather than half of a

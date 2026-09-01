@@ -95,7 +95,28 @@ FINAL=$(grep -oE 'mic=(on|muted) cam=(on|off)' "$A" | tail -1)
   || { say FAIL "only ${CLICKS:-0} clicks landed -- the harness never reached the button"; fail=1; }
 case "$FINAL" in
   "mic=on cam=on") say OK "and an even number of presses left both where they started: $FINAL" ;;
-  *) say FAIL "twenty presses left the controls out of step: $FINAL"; fail=1 ;;
+  *)
+    # ── WHICH HALF DROPPED IT ─────────────────────────────────────────────────
+    #
+    # Seen once, under a loaded machine, as `mic=on cam=off`: an odd number of
+    # camera toggles from an even number of presses. Two candidates, and the plain
+    # verdict cannot tell them apart:
+    #
+    #   the APP swallowed a press -- a real defect, a button that sometimes does
+    #     nothing under a fast hand
+    #   the HARNESS never delivered one -- synthetic events can interleave in a way
+    #     a finger cannot: `IconButton.mouseDown` runs its own tracking loop on
+    #     `nextEvent(matching: .leftMouseUp)`, and two presses landing in one
+    #     runloop turn let the second press's DOWN be taken as the first's release
+    #
+    # So the counts go in the message. A press the harness logged and the app did
+    # not act on is the first; a press with no log line at all is the second.
+    say FAIL "twenty presses left the controls out of step: $FINAL"
+    printf '        harness delivered: %s mic, %s cam clicks (10 each expected)\n' \
+      "$(grep -c '^  click mic' "$A" || echo 0)" "$(grep -c '^  click cam' "$A" || echo 0)"
+    printf '        the app logged:    %s mic, %s cam presses\n' \
+      "$(grep -c 'click mic: sent' "$A" || echo 0)" "$(grep -c 'click cam: sent' "$A" || echo 0)"
+    fail=1 ;;
 esac
 NOTON=$(grep -c 'NOT ON SCREEN' "$A" || true)
 [ "${NOTON:-0}" = "0" ] && say OK "and no press ever missed its control" \

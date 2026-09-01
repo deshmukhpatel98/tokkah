@@ -936,7 +936,40 @@ final class Glass: NSView {
       + " want=\(String(format: "%.2f", wantLuma))"
       + " behind=\(String(format: "%.2f", backdropLuma))"
       + " tint=\(tint == nil ? "none" : String(format: "%.2f", tint?.alphaComponent ?? 0))"
-      + " fill=\(fill) \(whereItIs()) shown=\(isEffectivelyVisible)"
+      + " fill=\(fill) ink=\(contrastRatios) \(whereItIs()) shown=\(isEffectivelyVisible)"
+  }
+
+  // ── WHAT THE TEXT ON THIS SURFACE MEASURES AT ──────────────────────────────
+  //
+  // The photometric half of the legibility check needs a camera, a calibrated
+  // background and a Mac nobody is using. This is the arithmetic half, and it is
+  // available on every surface on every frame: the backdrop this surface last read
+  // and the dim it chose are enough to say what its ground is, and therefore what
+  // the two inks on it come to.
+  //
+  // Reported as two ratios -- `fg` (a white glyph or a heading) and `muted` (a
+  // hint) -- so a rig can assert 4.5:1 without photographing anything, and so a
+  // surface that is legible over black and illegible over a window says so in the
+  // log rather than in a screenshot somebody has to look at.
+  //
+  // Gamma in, relative luminance out: the map is in the video's own gamma-encoded
+  // scale, and the WCAG ratio is defined on linear luminance. `^2.2` is close
+  // enough for a diagnostic and avoids a piecewise sRGB curve in a log line.
+  var contrastRatios: String {
+    guard baseDim > 0 else { return "-" }
+    let ground = pow(max(0, min(1, backdropLuma * (1 - dim) + 0.03 * dim)), 2.2)
+    func ratio(_ c: NSColor) -> Double {
+      guard let s = c.usingColorSpace(.sRGB) else { return 0 }
+      func lin(_ v: CGFloat) -> Double {
+        let d = Double(v)
+        return d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4)
+      }
+      let l = 0.2126 * lin(s.redComponent) + 0.7152 * lin(s.greenComponent)
+            + 0.0722 * lin(s.blueComponent)
+      let hi = max(l, Double(ground)), lo = min(l, Double(ground))
+      return (hi + 0.05) / (lo + 0.05)
+    }
+    return String(format: "fg %.1f muted %.1f", ratio(Palette.fg), ratio(Palette.muted))
   }
 
   // ── WHERE IT IS, SO SOMETHING CAN PHOTOGRAPH IT ────────────────────────────

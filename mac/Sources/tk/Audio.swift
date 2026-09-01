@@ -1719,22 +1719,54 @@ final class Audio {
     return v.takeRetainedValue() as String
   }
 
+  // ── PERSISTED IN THE IDENTITY DIRECTORY, NOT IN UserDefaults ───────────────
+  //
+  // The first version of this used `UserDefaults.standard`, and it cost an
+  // afternoon within the hour. `TK_KIN_DIR` is how every other piece of this app's
+  // state is isolated -- the handle, the contacts, the faces, the resume record --
+  // and UserDefaults is NOT covered by it. It is keyed by the executable's bundle
+  // identifier, or by the executable NAME for a bare binary, so:
+  //
+  //   * a rig cannot isolate a device choice at all, and
+  //   * a choice made by one test is inherited by every later run on the machine.
+  //
+  // Which happened. A mic-picker test selected the built-in microphone, and
+  // `aec-check` -- three rigs later, in its own exclusive lane -- opened that
+  // microphone while the output was a pair of EarPods. No acoustic path, nothing
+  // to cancel, `p50 0 dB` against a floor of 4, and a canceller that measures
+  // 13-14 dB in the field looked completely broken. `defaults read tk` said
+  // `"tk.micUID" = BuiltInMicrophoneDevice` an hour after the test that wrote it.
+  //
+  // One line of JSON beside identity.json instead. Same directory, same override,
+  // same isolation as everything else -- see `rig-isolation-that-does-not-isolate`,
+  // which is this exact shape and already had two instances before this one.
+  private static var deviceFile: URL {
+    Identity.dir.appendingPathComponent("devices.json")
+  }
+  private static func devicePrefs() -> [String: String] {
+    guard let d = try? Data(contentsOf: deviceFile),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: String]
+    else { return [:] }
+    return o
+  }
+  private static func setDevicePref(_ key: String, _ value: String?) {
+    var o = devicePrefs()
+    if let value { o[key] = value } else { o.removeValue(forKey: key) }
+    try? FileManager.default.createDirectory(at: Identity.dir, withIntermediateDirectories: true)
+    guard let d = try? JSONSerialization.data(withJSONObject: o) else { return }
+    try? d.write(to: deviceFile, options: .atomic)
+  }
+
   /// The UID this Mac has been told to use, or nil for "whatever macOS says".
   /// Persisted, because a microphone choice that forgets itself on quit is a
   /// choice somebody has to make again every call.
   static var chosenInputUID: String? {
-    get { UserDefaults.standard.string(forKey: "tk.micUID") }
-    set {
-      if let newValue { UserDefaults.standard.set(newValue, forKey: "tk.micUID") }
-      else { UserDefaults.standard.removeObject(forKey: "tk.micUID") }
-    }
+    get { devicePrefs()["mic"] }
+    set { setDevicePref("mic", newValue) }
   }
   static var chosenOutputUID: String? {
-    get { UserDefaults.standard.string(forKey: "tk.spkUID") }
-    set {
-      if let newValue { UserDefaults.standard.set(newValue, forKey: "tk.spkUID") }
-      else { UserDefaults.standard.removeObject(forKey: "tk.spkUID") }
-    }
+    get { devicePrefs()["speaker"] }
+    set { setDevicePref("speaker", newValue) }
   }
 
   /// The chosen device, if it is still here. `nil` means fall back to the system
@@ -2688,6 +2720,10 @@ final class Audio {
   // is what separates "coalesced" from "lost", and it is the difference between a
   // buffer size being serviceable and being lossy.
   var capFrames = 0, renderFrames = 0
+  /// Set while the microphone is delivering far below the sample rate. Read by the
+  /// report loop, which puts a sentence on screen: a call at a quarter of the
+  /// packet rate is broken, and the person must not have to guess.
+  private(set) var micTooSlow = false
   private var firstCapHost: UInt64 = 0
   private var lastCapHost: UInt64 = 0
   private var lastRenderHost: UInt64 = 0
@@ -4137,6 +4173,34 @@ final class Audio {
       var stillCap = 0, stillRender = 0
       var lastPlayed = -1, lastGot = -1, stuck = 0
       var announced = false
+      // ── A FOURTH WAY TO BE BROKEN: RUNNING, AND FAR TOO SLOWLY ──────────────
+      //
+      // The three arms below catch a callback that stopped, a callback that never
+      // started, and packets arriving with nothing played. All three are blind to a
+      // microphone that is DELIVERING, at a fraction of the rate.
+      //
+      // Measured on this Mac, on a call between two local processes:
+      //
+      //     cap 405/s  sent 413/s  recv 111/s  played 9/s (0.6%)
+      //
+      // against 1504/s on a healthy call. Twenty-seven percent of the packets and
+      // under one percent of the playout -- a destroyed call -- and every arm here
+      // stayed quiet, because the callbacks were alive (so `stillCap` reset) and
+      // playout was moving (so `stuck` reset). The person is told nothing at all.
+      //
+      // `capFrames` is the right instrument and the only one that is not a
+      // function of the buffer size: SAMPLES, which must track the sample rate
+      // however large or small the callbacks are. A rate expressed in callbacks
+      // per second falls legitimately when another app enlarges the device's
+      // buffer, and a watchdog on it would cry wolf on a healthy call.
+      //
+      // Cause-agnostic on purpose. This Mac's copy of it is Voice Control holding
+      // the built-in microphone, which no app can do anything about -- but "the
+      // sound is broken and here is the number" is worth saying whatever the
+      // reason, and a diagnosis this code cannot make is not a reason for silence.
+      var lastCapFrames = -1
+      var slowTicks = 0
+      var slowSaid = false
       func rate(_ d: AudioDeviceID) -> Int {
         var r: Float64 = 0; var sz = UInt32(MemoryLayout<Float64>.size)
         var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -4196,6 +4260,35 @@ final class Audio {
               + "*** Re-anchoring.\n\n", stderr)
           self.ring.pos = -1
           continue
+        }
+        // ── THE RATE ARM ──────────────────────────────────────────────────────
+        //
+        // Four seconds of evidence before it says anything (16 ticks at 0.25 s),
+        // and 70% of nominal as the line. A call opening, a device changing and a
+        // graph rebuilding all produce a second or two of short measurements, and
+        // a watchdog that fires on those is one nobody reads. 70% is far outside
+        // anything a healthy device does and far inside the 27% that was measured.
+        let cf = self.capFrames
+        if lastCapFrames >= 0 {
+          let want = SR * 0.25 * 0.70
+          slowTicks = Double(cf - lastCapFrames) < want ? slowTicks + 1 : 0
+        }
+        lastCapFrames = cf
+        if slowTicks >= 16, !slowSaid {
+          slowSaid = true
+          self.micTooSlow = true
+          Metrics.count("mic_too_slow")
+          fputs("\n*** THE MICROPHONE IS DELIVERING FAR LESS THAN IT SHOULD."
+              + " About \(Int(Double(cf - lastCapFrames) * 4)) samples a second"
+              + " against \(Int(SR)).\n"
+              + "*** The callbacks are alive, so nothing above catches this."
+              + " Something else on this Mac is holding the input device -- Voice\n"
+              + "*** Control and Dictation both do, permanently. The call will be"
+              + " choppy and this cannot be fixed from here.\n\n", stderr)
+        } else if slowTicks == 0, slowSaid {
+          slowSaid = false
+          self.micTooSlow = false
+          fputs("*** the microphone is back up to rate.\n", stderr)
         }
         let dead = stillCap >= 3 || stillRender >= 3        // 750 ms of nothing
         if dead, !announced {

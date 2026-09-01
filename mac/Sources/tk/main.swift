@@ -110,6 +110,10 @@ if flag("selftest-install") {
 // brightness meter behind every glass surface, checked against six answers it
 // already knows -- two of which it must get WRONG if it has been wired to a
 // constant. See `Backdrop.selftest`.
+// Same contract as the other `--selftest-*` flags: one question, no hardware, and
+// the answer decides whether an update is allowed to write into this bundle. See
+// `Update.selftestSeal` and `tools/seal-check.sh`.
+if flag("selftest-seal") { Update.selftestSeal() }
 if flag("backdrop-test") {
   let ok = Backdrop.selftest()
   fputs("backdrop-test: \(ok ? "PASS" : "FAIL")\n", stderr)
@@ -517,7 +521,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
-  "backdrop-test", "contrast-audit",
+  "backdrop-test", "selftest-seal",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -7661,6 +7665,17 @@ func reportLoop() {
   audio.tuneInputGain()
   // Same cadence: headphones appearing mid-call open it to full duplex.
   audio.checkOutputRoute()
+  // ── AND WHEN THE MICROPHONE IS NOT DELIVERING, SAY SO ─────────────────────
+  //
+  // `Audio.micTooSlow` is set by the watchdog's rate arm: callbacks alive, samples
+  // far below the sample rate. Measured on this Mac at 27% of nominal with 0.6%
+  // playout -- a destroyed call that every other arm was blind to. Plain words, no
+  // numbers, on the surface the person is looking at; the numbers are on stderr
+  // and in the beat.
+  if audio.micTooSlow {
+    display?.controls?.setWarning("your microphone isn\u{2019}t keeping up"
+                               + " \u{2014} another app may be using it")
+  }
   // And the panel's names track the graph rather than the last thing pressed:
   // macOS moves the default device on its own when a headset connects, and a row
   // still naming the built-in microphone after that is the instrument lying.

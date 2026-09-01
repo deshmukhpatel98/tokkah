@@ -121,9 +121,33 @@ for arm in on off; do
       if [ "$arm" = off ]; then
         echo "  --no-aec  end $e: silent, as it must be"
       else
-        echo "  aec on    end $e: NO ECHO LINE AT ALL -- the canceller never ran"
-        echo "$(tail -3 "$SP/$arm.$e.log" | sed 's/^/      /')"
-        fail=1
+        # ── A MICROPHONE THE FLOOR HELD SHUT HAS NO ECHO TO CANCEL ───────────
+        #
+        # The floor is one voice at a time: whichever end loses it has its
+        # microphone muted for the other person, and a muted microphone cannot
+        # pick up the speaker, so there is nothing for the canceller to subtract
+        # and it correctly never runs. Which end loses is decided by who spoke
+        # first, and that varies run to run -- so requiring an echo line from BOTH
+        # ends made this rig fail about one run in three on a canceller that was
+        # working perfectly at the other end.
+        #
+        # Measured, on the run that produced this comment:
+        #
+        #     end a: best 16 dB  p50 12 dB  over 28 seconds
+        #     end b: NO ECHO LINE  ... mic muted for the other person 93.3%
+        #
+        # So a silent end is a FAILURE only when its microphone was actually open.
+        # The floor's own readout is the evidence, and it is in the same log.
+        MUTEDPCT="$(grep -oE 'mic muted for the other person [0-9.]+%' "$SP/$arm.$e.log" \
+                    | tail -1 | grep -oE '[0-9.]+' | head -1)"
+        if [ -n "$MUTEDPCT" ] && python3 -c "import sys; sys.exit(0 if ${MUTEDPCT:-0} > 60 else 1)"; then
+          echo "  aec on    end $e: no echo line, and its mic was shut ${MUTEDPCT}% of the"
+          echo "                    call by the floor -- nothing to cancel, correctly"
+        else
+          echo "  aec on    end $e: NO ECHO LINE AT ALL -- the canceller never ran"
+          echo "$(tail -3 "$SP/$arm.$e.log" | sed 's/^/      /')"
+          fail=1
+        fi
       fi
     else
       if [ "$arm" = off ]; then

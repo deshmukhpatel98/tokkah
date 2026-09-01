@@ -45,26 +45,71 @@ export TK_NO_RAISE=1
 # ── THE LANES ────────────────────────────────────────────────────────────────
 # Serial lanes, in the order they cost least to most, so a failure in something
 # cheap is reported before the expensive one has finished.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check floor-check predict-check"
+# ── WHAT A CLEAN RUN MEASURED, AND WHERE THE FIRST DRAFT WAS WRONG ───────────
+#
+# The first version of this file put `vpause-check`, `stress-check` and
+# `bye-check` in the parallel LOGIC lane on the reasoning that they are "sockets
+# and cards". All three failed, and every failure was the machine rather than the
+# build:
+#
+#     stress-check   capture ended at 552/s -- a swap left the graph dead
+#                    (idle: 1515/s. The graph was fine.)
+#     vpause-check   the control arm never paused
+#                    (its ceiling was calibrated on an idle Mac)
+#     bye-check      a stranger's bye changed this call: <empty audit line>
+#                    (the press had not landed yet)
+#
+# So the rule is not "does it use sockets", it is WHAT THE ASSERTION IS MADE OF.
+# Anything whose verdict is a rate, a percentile, a latency or a per-second count
+# is measuring the machine as much as the build, and belongs alone.
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check floor-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
-# Parallel-safe lanes, run two at a time.
+# ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
+#
+# `predict-check` is twenty minutes of real speech at 1x and it was in the
+# exclusive lane, which put its twenty minutes on the critical path. Its own
+# comment is the reason it does not have to be: "under load the feed loop can only
+# slip LATE, which makes the text staler and the test harder, so three other
+# builds running on this machine cannot flatter the number." A rig that can only
+# be made harder by company is a rig that can keep company.
+LANE_SLOW="predict-check"
+# Parallel-safe lanes.
 LANE_STATE="permissions-check firstrun-ring-check relaunch-check watch-check update-check doorbell-check cancelrace-check"
-LANE_LOGIC="invite-check camoff-check calling-check bye-check leave-check contacts-check liveupdate-check controls-check vpause-check stress-check crash-check"
+LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check liveupdate-check controls-check crash-check seal-check"
 
 # The two whose whole cost is a real-time pass over real speech. `predict-check`
 # feeds 600 s of recording at 1x on purpose -- the recogniser's partials arrive
 # about once a second and surviving that staleness IS the thing under test, so
 # there is no honest way to hurry it.
-SLOW="predict-check floor-check"
+# The three that cost minutes rather than seconds. `fast` drops them and names
+# them; `full` is what runs before a release.
+SLOW="predict-check floor-check update-check"
 
 MODE="${1:-full}"
 case "$MODE" in
   fast)
     shift || true
-    for s in $SLOW; do
-      LANE_TIME="${LANE_TIME//$s/}"
-      LANE_LIGHT="${LANE_LIGHT//$s/}"
-    done
+    # ── DROP WHOLE NAMES, NOT SUBSTRINGS ────────────────────────────────────
+    #
+    # `${LANE_LOGIC//update-check/}` turned `liveupdate-check` into `live`, and the
+    # runner then reported `live  MISSING` -- a rig silently removed from the suite
+    # by a string substitution that matched inside another rig's name. Sibling of
+    # `pkill -f is a regex`: a pattern applied to a list of words has to be applied
+    # a word at a time.
+    drop_from() {                    # drop_from <lane> ; echoes the lane without $SLOW
+      local out=""
+      for c in $1; do
+        local skip=""
+        for s in $SLOW; do [ "$c" = "$s" ] && skip=1; done
+        [ -n "$skip" ] || out="$out $c"
+      done
+      echo "$out"
+    }
+    LANE_TIME="$(drop_from "$LANE_TIME")"
+    LANE_LIGHT="$(drop_from "$LANE_LIGHT")"
+    LANE_STATE="$(drop_from "$LANE_STATE")"
+    LANE_LOGIC="$(drop_from "$LANE_LOGIC")"
+    LANE_SLOW="$(drop_from "$LANE_SLOW")"
     echo "fast: skipping$(printf ' %s' $SLOW) -- their cost is a deliberate 1x pass"
     echo "      over real recordings, so run \`all-checks.sh\` before a release."
     ;;
@@ -72,7 +117,7 @@ case "$MODE" in
   *)
     # An explicit list: one lane, in the order given, so `all-checks.sh a b c`
     # cannot silently reorder or parallelise things the caller wanted serial.
-    LANE_TIME="$*"; LANE_LIGHT=""; LANE_STATE=""; LANE_LOGIC=""
+    LANE_TIME="$*"; LANE_LIGHT=""; LANE_STATE=""; LANE_LOGIC=""; LANE_SLOW=""
     ;;
 esac
 
@@ -98,24 +143,31 @@ run_lane() {                     # run_lane <name> <checks...>
 #
 # Said before anything runs, because it is the difference between a red to
 # investigate and a red to ignore, and nobody can tell them apart afterwards.
-if pgrep -f "/Applications/Kin.app/Contents/MacOS/Tokkah --room" >/dev/null 2>&1; then
-  echo "NOTE: the installed Kin is in a call right now. Its window sits in front of"
-  echo "      the ones these rigs park at the desktop level, so anything in the"
-  echo "      photography lane may report an occluded window. That is this Mac, not"
-  echo "      the build."
+# ANY window, not only a call. The first version of this looked for `--room`, and
+# the front door occludes exactly as well as a call does: `ringpicture-check`
+# reported "the window was occluded -- nobody could have seen it" with the
+# installed Kin sitting on its home screen. A rig that photographs windows cannot
+# be trusted while another copy of the app has one.
+if pgrep -f "/Applications/Kin.app/Contents/MacOS/Tokkah" | grep -qv "^$$" 2>/dev/null \
+   && pgrep -fl "/Applications/Kin.app/Contents/MacOS/Tokkah" | grep -qv -- "--watch"; then
+  echo "NOTE: the installed Kin is open right now (a call or its home screen). Its"
+  echo "      window sits in front of the ones these rigs park at the desktop level,"
+  echo "      so anything in the photography lane may report an occluded window."
+  echo "      That is this Mac, not the build."
 fi
 echo "logs: $OUT"
 # ── PHASE 1: the two independent lanes, together ─────────────────────────────
 # Both are socket-and-state work with no timing verdict and no photograph, so
 # sharing the machine costs them nothing.
-if [ -n "$LANE_STATE$LANE_LOGIC" ]; then
-  echo "── phase 1: state + logic, in parallel"
-  run_lane state $LANE_STATE &
-  P1=$!
-  run_lane logic $LANE_LOGIC &
-  P2=$!
-  wait $P1 $P2 2>/dev/null
-  cat "$OUT"/state.res "$OUT"/logic.res 2>/dev/null | sort
+if [ -n "$LANE_STATE$LANE_LOGIC$LANE_SLOW" ]; then
+  echo "── phase 1: slow + state + logic, in parallel"
+  PP=""
+  [ -n "$LANE_SLOW" ]  && { run_lane slow  $LANE_SLOW  & PP="$PP $!"; }
+  [ -n "$LANE_STATE" ] && { run_lane state $LANE_STATE & PP="$PP $!"; }
+  [ -n "$LANE_LOGIC" ] && { run_lane logic $LANE_LOGIC & PP="$PP $!"; }
+  # shellcheck disable=SC2086
+  wait $PP 2>/dev/null
+  cat "$OUT"/slow.res "$OUT"/state.res "$OUT"/logic.res 2>/dev/null | sort
 fi
 
 # ── PHASE 2: the lanes that must be alone ────────────────────────────────────

@@ -560,12 +560,51 @@ RING="--incoming astranger"
 # restored in others, so the cadence arms would have silently leaked their
 # settings into every later arm on one machine and not on another --
 # `silent-no-op-flags` with the no-op depending on the shell.
-run() { # <arm> <install-dir> <seconds> <grace> <poll> <args...>
+# ── THE SECONDS ARE A DEADLINE, NOT A DURATION ──────────────────────────────
+#
+# `$secs` used to be a flat sleep, and with fourteen arms at 20-60 s each this
+# file spent about sixteen minutes asleep -- most of it after the thing being
+# asserted had already been logged. Measured: the install arm's evidence lands in
+# about three seconds of a twenty-two second wait.
+#
+# It cannot become a marker-per-arm without a sixth positional in front of
+# `"$@"`, which every call site passes through. So the generic version: reap when
+# the arm's log has STOPPED GROWING. Nothing here is a call -- these processes
+# poll for an update every `TK_UPDATE_POLL` seconds and narrate what they find --
+# so silence for comfortably longer than one poll means the arm has said
+# everything it is going to say.
+#
+# Assertion-preserving by construction: every arm below reads the finished log, and
+# a log that has not changed for two poll intervals is the same log two minutes
+# later. `$secs` remains the outer bound, so an arm that never goes quiet waits
+# exactly as long as it used to and fails exactly as it used to.
+#
+# The quiet window is `2 * poll` with a four-second floor, because an arm whose
+# whole claim is "nothing happened" has an empty log from the start -- so it also
+# has a minimum: no arm is reaped before three seconds, or a process that had not
+# yet written its first line would read as one that finished.
+run() { # <arm> <install-dir> <deadline> <grace> <poll> <args...>
   local arm="$1" dir="$2" secs="$3" g="$4" p="$5"; shift 5
   spawn env TK_UPDATE_BASE="http://127.0.0.1:8381/$arm" \
             TK_UPDATE_POLL="$p" TK_UPDATE_GRACE="$g" \
             "$dir/Kin.app/Contents/MacOS/Tokkah" "$@" > "$SP/$arm.log" 2>&1
-  perl -e "select undef,undef,undef,$secs"
+  # EVERYTHING BELOW COUNTS HALF-SECONDS, including the deadline. A first draft
+  # mixed the two -- `while [ "$waited" -lt "$secs" ]` with `waited` in
+  # half-seconds -- which silently halved every arm's outer bound. A threshold in
+  # the wrong unit is a hidden limit, and this file's own header has a paragraph
+  # about that.
+  local quietTicks=$(( p * 2 * 2 )); [ "$quietTicks" -lt 8 ] && quietTicks=8
+  local deadlineTicks=$(( secs * 2 ))
+  local waited=0 same=0 size=-1 now
+  while [ "$waited" -lt "$deadlineTicks" ]; do
+    perl -e 'select undef,undef,undef,0.5'
+    waited=$(( waited + 1 ))
+    now=$(wc -c < "$SP/$arm.log" 2>/dev/null || echo 0)
+    if [ "$now" = "$size" ]; then same=$(( same + 1 )); else same=0; size="$now"; fi
+    # Never before three seconds: a process that has not written its first line
+    # yet has a log that is "unchanged", and that must not read as finished.
+    [ "$waited" -ge 6 ] && [ "$same" -ge "$quietTicks" ] && break
+  done
   reap
 }
 ver_on_disk() { "$1/Kin.app/Contents/MacOS/Tokkah" --version 2>/dev/null || echo "WILL-NOT-RUN"; }
