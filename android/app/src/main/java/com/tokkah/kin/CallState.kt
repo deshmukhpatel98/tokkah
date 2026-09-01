@@ -73,6 +73,9 @@ class KinState(root: File) {
 
     fun stop() = watcher.stop()
 
+    /** The UI is listening for changes; publish what we already know. */
+    fun onChangedReady() { onChanged?.invoke() }
+
     /** The people panel: known handles, most recent first, with faces and dots. */
     fun refresh() {
         thread(isDaemon = true) {

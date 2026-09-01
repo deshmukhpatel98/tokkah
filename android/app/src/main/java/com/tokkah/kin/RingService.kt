@@ -33,7 +33,7 @@ import com.tokkah.kin.net.RingWatcher
  * polling half first means the feature works today rather than being a plan.
  */
 class RingService : Service() {
-    private var watcher: RingWatcher? = null
+    var watcher: RingWatcher? = null; private set
     private lateinit var identity: Identity
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -46,8 +46,10 @@ class RingService : Service() {
         val w = RingWatcher(identity)
         w.onRing = { r -> ring(r) }
         w.onBye = { _ -> cancelRing() }
+        w.standDown = appInFront
         w.start()
         watcher = w
+        live = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -66,6 +68,7 @@ class RingService : Service() {
     }
 
     override fun onDestroy() {
+        live = null
         watcher?.stop()
         watcher = null
         super.onDestroy()
@@ -131,6 +134,19 @@ class RingService : Service() {
     }
 
     companion object {
+        /**
+         * Set by the activity while it is in front. A flag rather than a
+         * stop/start, because Android REFUSES startForegroundService() from a
+         * backgrounded app — the first version tried to hand the mailbox back
+         * in ON_STOP and took a ForegroundServiceStartNotAllowedException with
+         * the app on its way out, which is a crash on the way to the home
+         * screen. The service simply keeps running and stops READING.
+         */
+        @Volatile var appInFront = false
+            set(v) { field = v; live?.watcher?.standDown = v }
+
+        @Volatile private var live: RingService? = null
+
         const val CH_ONGOING = "kin.listening"
         const val CH_RING = "kin.ring"
         const val ONGOING_ID = 1

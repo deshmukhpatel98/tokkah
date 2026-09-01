@@ -154,14 +154,41 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             resumeWho = state.pending?.who ?: ""
         }
         state.onCall = { room, who -> join(room, who); state.answered() }
-        // One mailbox, one reader: the service yields while the app is in
-        // front, exactly as the Mac's resident stands down for the window.
-        if (listening) RingService.stop(ctx)
-        state.start()
-        onDispose {
-            state.stop()
-            if (listening) RingService.start(ctx)
+        state.onChangedReady()
+        onDispose { state.stop() }
+    }
+
+    // ── ONE MAILBOX, ONE READER ─────────────────────────────────────────────
+    //
+    // The Mac's resident stands down whenever the window is open. The handover
+    // has to happen on the LIFECYCLE, not on composition: pressing Home stops
+    // the activity but leaves the composition alive, so a handover keyed on
+    // disposal never ran — both readers polled, the in-app one drained the
+    // mailbox first, and a ring arriving with the app backgrounded raised no
+    // notification at all. It was not lost; it was answered by the half that
+    // could not show it.
+    val owner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            when (e) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    RingService.appInFront = true
+                    // Started HERE, in the foreground, where Android allows it:
+                    // the service then runs for the whole session and merely
+                    // stops reading while the window is up.
+                    if (ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
+                            .getBoolean("listening", false)) RingService.start(ctx)
+                    state.start()
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    state.stop()
+                    RingService.appInFront = false
+                }
+                else -> {}
+            }
         }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
     }
 
     // Answering from the lock screen: the notification named the call, so go

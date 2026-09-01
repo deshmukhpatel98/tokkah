@@ -19,6 +19,13 @@ import kotlin.concurrent.thread
  */
 class RingWatcher(private val identity: Identity) {
     @Volatile var running = false; private set
+    /**
+     * Yield the mailbox. The Mac's resident stands down whenever the window is
+     * open, because two readers of one mailbox means whichever polls first
+     * takes the ring — and if that is the half with no UI, a real call raises
+     * nothing at all.
+     */
+    @Volatile var standDown = false
     @Volatile var quiet = false; private set
     @Volatile var serverHolds: Boolean? = null; private set
     @Volatile var lastError: String? = null; private set
@@ -42,7 +49,7 @@ class RingWatcher(private val identity: Identity) {
     private fun loop() {
         var backoff = 1000L
         while (running) {
-            if (!identity.claimed) { Thread.sleep(2000); continue }
+            if (standDown || !identity.claimed) { Thread.sleep(500); continue }
             when (val r = identity.pollOnce(HELD_MS)) {
                 is Identity.PollOutcome.Answer -> {
                     backoff = 1000
