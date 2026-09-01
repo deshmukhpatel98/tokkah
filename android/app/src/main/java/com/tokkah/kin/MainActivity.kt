@@ -1,45 +1,50 @@
 package com.tokkah.kin
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Bundle
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import com.tokkah.kin.net.CallSession
 import com.tokkah.kin.net.Floor
+import com.tokkah.kin.net.Identity
+import com.tokkah.kin.net.Server
+import com.tokkah.kin.ui.CallScreen
+import com.tokkah.kin.ui.HomeScreen
+import com.tokkah.kin.ui.Palette
+import com.tokkah.kin.ui.Person
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // A deep link is a room: tokkah://join/<room>, tokkah://<room>, kin://…
+        // The picture goes edge to edge; the card floats over it.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         val deep = intent?.data?.let { u ->
             (u.pathSegments?.lastOrNull() ?: u.host)?.takeIf { it.isNotBlank() }
         }
@@ -52,188 +57,156 @@ fun KinApp(initialRoom: String?) {
     val ctx = LocalContext.current
     var room by remember { mutableStateOf(initialRoom ?: "") }
     var session by remember { mutableStateOf<CallSession?>(null) }
-    var device by remember { mutableStateOf<AudioDevice?>(null) }
-    var vdevice by remember { mutableStateOf<VideoDevice?>(null) }
-    var camGranted by remember {
-        mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED)
-    }
-    val askCam = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        camGranted = it
-    }
+    var audio by remember { mutableStateOf<AudioDevice?>(null) }
+    var video by remember { mutableStateOf<VideoDevice?>(null) }
+    var settingsOpen by remember { mutableStateOf(false) }
+    var cameraHint by remember { mutableStateOf<String?>(null) }
+    var quiet by remember { mutableStateOf(false) }
+    var myHandle by remember { mutableStateOf("") }
+    var people by remember { mutableStateOf(listOf<Person>()) }
+
+    val identity = remember { Identity(ctx.filesDir.resolve("kin"), Server.base) }
+
     var micGranted by remember {
-        mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED)
+        mutableStateOf(granted(ctx, Manifest.permission.RECORD_AUDIO))
     }
-    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        micGranted = it
+    var camGranted by remember { mutableStateOf(granted(ctx, Manifest.permission.CAMERA)) }
+    val askAll = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        micGranted = granted(ctx, Manifest.permission.RECORD_AUDIO)
+        camGranted = granted(ctx, Manifest.permission.CAMERA)
+    }
+
+    // Ask once, on arrival: the front door needs the camera to show you your
+    // own face, and the call needs the microphone. Asking at the moment of the
+    // tap puts a system dialog between a person and the call they are placing.
+    LaunchedEffect(Unit) {
+        if (!micGranted || !camGranted) {
+            askAll.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
+        }
+        // A name for this phone, so somebody can call it. Never asked for.
+        withContext(Dispatchers.IO) {
+            if (!identity.claimed) identity.claim(android.os.Build.MODEL ?: "kin")
+            myHandle = identity.handle
+            people = identity.contacts().keys.map { Person(it) }
+        }
     }
 
     fun join(name: String) {
         if (name.isBlank()) return
         val s = CallSession(name.trim())
         s.start()
-        val d = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
-        d.start()
+        val a = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
+        a.start()
         val v = VideoDevice(ctx, s)
         s.onKeyframeRequest = { v.requestKeyframe() }
-        session = s; device = d; vdevice = v
+        session = s; audio = a; video = v
     }
 
     fun leave() {
-        vdevice?.stop(); device?.stop(); session?.stop()
-        vdevice = null; device = null; session = null
+        video?.stop(); audio?.stop(); session?.stop()
+        video = null; audio = null; session = null
     }
 
-    Box(Modifier.fillMaxSize().background(Glass.bg)) {
+    Box(Modifier.fillMaxSize().background(Palette.bg)) {
         val s = session
-        if (s == null) JoinScreen(room, { room = it }, micGranted,
-            onAskMic = { askMic.launch(Manifest.permission.RECORD_AUDIO) },
-            onJoin = { join(room) })
-        else CallScreen(s, vdevice, camGranted,
-            onAskCam = { askCam.launch(Manifest.permission.CAMERA) },
-            onLeave = { leave() })
-    }
-}
-
-@Composable
-private fun JoinScreen(
-    room: String, onRoom: (String) -> Unit, micGranted: Boolean,
-    onAskMic: () -> Unit, onJoin: () -> Unit,
-) {
-    Column(
-        Modifier.fillMaxSize().padding(32.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text("Kin", color = Glass.fg, fontSize = 44.sp, fontWeight = FontWeight.Light)
-        Spacer(Modifier.height(8.dp))
-        Text("Type the same words on both ends.", color = Glass.fg.copy(alpha = 0.55f),
-            fontSize = 15.sp, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(28.dp))
-        OutlinedTextField(
-            value = room, onValueChange = onRoom, singleLine = true,
-            placeholder = { Text("room", color = Glass.fg.copy(alpha = 0.35f)) },
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = Glass.fg, unfocusedTextColor = Glass.fg,
-                focusedBorderColor = Glass.accent, unfocusedBorderColor = Glass.glassLine,
-                cursorColor = Glass.accent,
-            ),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(20.dp))
-        if (!micGranted) {
-            Text("Kin needs the microphone to carry your voice.",
-                color = Glass.warn, fontSize = 14.sp, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(10.dp))
-            Button(onClick = onAskMic, colors = ButtonDefaults.buttonColors(
-                containerColor = Glass.accent, contentColor = Glass.bg)) {
-                Text("Allow microphone")
+        if (s == null) {
+            HomeScreen(
+                room = room, onRoom = { room = it },
+                people = people,
+                myHandle = myHandle,
+                cameraHint = cameraHint,
+                resumeRoom = null,
+                pastedLink = null,
+                settingsOpen = settingsOpen,
+                onSettings = { settingsOpen = !settingsOpen },
+                onJoin = { join(room) },
+                onCall = { handle -> room = handle; join(handle) },
+                onResume = {},
+                onInvite = {
+                    val link = "${Server.invite}/${room.ifBlank { myHandle }}"
+                    ctx.getSystemService(ClipboardManager::class.java)
+                        ?.setPrimaryClip(ClipData.newPlainText("kin", link))
+                },
+                quiet = quiet,
+                onQuiet = { on -> quiet = on },
+            ) {
+                if (camGranted) SelfPreview { cameraHint = it }
             }
         } else {
-            Button(
-                onClick = onJoin, enabled = room.isNotBlank(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Glass.accent, contentColor = Glass.bg,
-                    disabledContainerColor = Glass.fill(0.10f),
-                    disabledContentColor = Glass.fg.copy(alpha = 0.35f)),
-                modifier = Modifier.fillMaxWidth().height(50.dp),
-                shape = RoundedCornerShape(12.dp),
-            ) { Text("Join", fontSize = 17.sp) }
+            var sentence by remember { mutableStateOf("connecting") }
+            var muted by remember { mutableStateOf(false) }
+            var camOn by remember { mutableStateOf(false) }
+            var peeking by remember { mutableStateOf(false) }
+            var turn by remember { mutableStateOf(Floor.State.IDLE) }
+            var voicing by remember { mutableStateOf(false) }
+
+            LaunchedEffect(s) {
+                while (true) {
+                    sentence = when {
+                        !s.crypto.established -> "connecting"
+                        s.ended -> "they left"
+                        s.peerMuted -> "they are muted"
+                        else -> "connected"
+                    }
+                    turn = s.floor.state
+                    voicing = s.gate.voicingNow
+                    delay(100)
+                }
+            }
+
+            CallScreen(
+                room = s.room,
+                sentence = sentence,
+                safetyCode = s.safetyCode,
+                turnMine = turn == Floor.State.MINE,
+                turnTheirs = turn == Floor.State.THEIRS,
+                voicing = voicing,
+                muted = muted,
+                camOn = camOn,
+                onMute = { muted = !muted; s.selfMuted = muted },
+                onCamera = {
+                    if (!camOn) { if (video?.startEncode() == true) { camOn = true; s.camOn = true } }
+                    else { video?.stop(); camOn = false; s.camOn = false }
+                },
+                onFlip = { video?.let { it.facingFront = !it.facingFront } },
+                onLeave = { leave() },
+                peeking = peeking,
+                onPeek = { peeking = it },
+                farVideo = { FarVideo(video) },
+                selfVideo = { if (camGranted) SelfPreview {} },
+            )
         }
     }
 }
 
+private fun granted(ctx: Context, p: String) =
+    ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
+
+/** Your own face, through a TextureView so the glass above it can refract it. */
 @Composable
-private fun CallScreen(
-    s: CallSession, v: VideoDevice?, camGranted: Boolean,
-    onAskCam: () -> Unit, onLeave: () -> Unit,
-) {
-    // No numbers on the consumer surface: plain words only.
-    var sentence by remember { mutableStateOf("connecting") }
-    var muted by remember { mutableStateOf(false) }
-    var turn by remember { mutableStateOf(Floor.State.IDLE) }
-    var edge by remember { mutableStateOf(0f) }
-    var camOn by remember { mutableStateOf(false) }
+private fun SelfPreview(onHint: (String) -> Unit) {
+    AndroidView(
+        factory = { c -> CameraPreview(c).apply { this.onHint = onHint } },
+        modifier = Modifier.fillMaxSize(),
+        onRelease = { it.close() },
+    )
+}
 
-    LaunchedEffect(s) {
-        while (true) {
-            sentence = when {
-                !s.crypto.established -> "connecting"
-                s.ended -> "they left"
-                s.peerMuted -> "they are muted"
-                else -> "connected"
-            }
-            turn = s.floor.state
-            edge = if (s.gate.voicingNow) 1f else 0f
-            delay(100)
-        }
-    }
-
-    Box(Modifier.fillMaxSize()) {
-      AndroidView(
+/** Their face. A SurfaceView, because here latency is the product. */
+@Composable
+private fun FarVideo(video: VideoDevice?) {
+    AndroidView(
         factory = { c ->
             SurfaceView(c).apply {
                 holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(h: SurfaceHolder) { v?.attachDisplay(h.surface) }
+                    override fun surfaceCreated(h: SurfaceHolder) { video?.attachDisplay(h.surface) }
                     override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
                     override fun surfaceDestroyed(h: SurfaceHolder) {}
                 })
             }
         },
         modifier = Modifier.fillMaxSize(),
-      )
-      Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(24.dp))
-        // The speaking edge: colour is whose turn, and it is never dark.
-        Box(
-            Modifier.fillMaxWidth().height(if (turn == Floor.State.MINE) 6.dp else 4.dp)
-                .clip(RoundedCornerShape(3.dp))
-                .background(when (turn) {
-                    Floor.State.MINE -> Glass.ok.copy(alpha = 0.35f + 0.65f * edge)
-                    Floor.State.THEIRS -> Glass.accent.copy(alpha = 0.85f)
-                    else -> Glass.fill(0.14f)
-                })
-        )
-        Spacer(Modifier.weight(1f))
-        Text(s.room, color = Glass.fg, fontSize = 30.sp, fontWeight = FontWeight.Light)
-        Spacer(Modifier.height(10.dp))
-        Text(sentence, color = Glass.fg.copy(alpha = 0.6f), fontSize = 16.sp)
-        s.safetyCode?.let {
-            Spacer(Modifier.height(18.dp))
-            Text(it, color = Glass.fg.copy(alpha = 0.45f), fontSize = 14.sp)
-            Text("read this aloud to check nobody is in the middle",
-                color = Glass.fg.copy(alpha = 0.3f), fontSize = 12.sp, textAlign = TextAlign.Center)
-        }
-        Spacer(Modifier.weight(1f))
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            Button(
-                onClick = {
-                    if (!camGranted) onAskCam()
-                    else if (!camOn) { if (v?.startEncode() == true) { camOn = true; s.camOn = true } }
-                    else { v?.stop(); camOn = false; s.camOn = false }
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (camOn) Glass.accent else Glass.fill(0.12f),
-                    contentColor = if (camOn) Glass.bg else Glass.fg),
-                shape = CircleShape, modifier = Modifier.height(56.dp),
-            ) { Text(if (camOn) "Camera" else "Camera off") }
-            Button(
-                onClick = { muted = !muted; s.selfMuted = muted },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (muted) Glass.warn else Glass.fill(0.12f),
-                    contentColor = if (muted) Glass.bg else Glass.fg),
-                shape = CircleShape, modifier = Modifier.height(56.dp),
-            ) { Text(if (muted) "Muted" else "Mic") }
-            Button(
-                onClick = onLeave,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Glass.destructive, contentColor = Glass.fg),
-                shape = CircleShape, modifier = Modifier.height(56.dp),
-            ) { Text("Leave") }
-        }
-        Spacer(Modifier.height(20.dp))
-      }
-    }
+    )
 }
