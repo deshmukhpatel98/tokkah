@@ -81,19 +81,64 @@ class KinState(root: File) {
     fun stop() = watcher.stop()
 
     /**
-     * Look for a newer build, verify it, and hold it until the person is not on
-     * a call. An update that interrupts the thing the app exists to do is worse
-     * than an update that waits.
+     * Look for a newer build, verify it, and install it — every 30 minutes,
+     * the Mac's own cadence, for the lifetime of the app.
+     *
+     * DEFERRED WHILE IN A CALL, always: an update that interrupts the thing the
+     * app exists to do is worse than an update that waits half an hour.
+     *
+     * Where this copy is its own installer of record it replaces itself with no
+     * prompt at all, which is the Mac's promise — download once and never think
+     * about it again. Where it cannot, the row on the front door is the one tap,
+     * and that difference is stated rather than hidden.
      */
     fun checkForUpdate(installed: String = com.tokkah.kin.net.Telemetry.VERSION) {
-        thread(isDaemon = true) {
-            val r = updater.check() ?: return@thread
-            if (!updater.isNewer(r, installed)) return@thread
-            val f = updater.download(r) ?: return@thread
-            ready = r
-            readyFile = f
-            onChanged?.invoke()
+        if (updateThread != null) return
+        updateThread = thread(isDaemon = true, name = "kin-update") {
+            while (true) {
+                runCatching { updateOnce(installed) }
+                Thread.sleep(CHECK_EVERY_MS)
+            }
         }
+    }
+
+    private var updateThread: Thread? = null
+    var onInstall: ((java.io.File) -> Unit)? = null
+
+    private fun updateOnce(installed: String) {
+        // Never mid-call, and never while a call is being offered either: a
+        // process replaced under a ringing phone is a missed call.
+        if (inCall || cardMode != CallCardMode.INVITE) {
+            android.util.Log.i("kin", "update: deferred, in a call")
+            return
+        }
+        val r = updater.check()
+        if (r == null) {
+            android.util.Log.i("kin", "update: no release (${updater.lastError})")
+            return
+        }
+        if (!updater.isNewer(r, installed)) {
+            android.util.Log.i("kin", "update: ${r.version} is not newer than $installed")
+            return
+        }
+        android.util.Log.i("kin", "update: ${r.version} is newer than $installed, fetching")
+        if (readyFile?.name?.contains(r.version) == true) { offerInstall(); return }
+        val f = updater.download(r)
+        if (f == null) {
+            android.util.Log.i("kin", "update: download failed (${updater.lastError})")
+            return
+        }
+        android.util.Log.i("kin", "update: staged ${f.name}, ${f.length()} bytes")
+        ready = r
+        readyFile = f
+        onChanged?.invoke()
+        offerInstall()
+    }
+
+    private fun offerInstall() {
+        val f = readyFile ?: return
+        if (inCall || cardMode != CallCardMode.INVITE) return
+        onInstall?.invoke(f)
     }
 
     /** The UI is listening for changes; publish what we already know. */
@@ -221,6 +266,9 @@ class KinState(root: File) {
 
     companion object {
         const val RING_TIMEOUT_MS = 30_000L
+        /** The Mac's cadence, for the same reason: often enough to matter, rare
+         *  enough to be free on somebody else's battery and data. */
+        const val CHECK_EVERY_MS = 30L * 60 * 1000
         private val WORDS = listOf(
             "amber", "basil", "cedar", "delta", "ember", "fable", "grove", "hazel",
             "indigo", "jasper", "kite", "lilac", "mango", "nectar", "olive", "pearl",

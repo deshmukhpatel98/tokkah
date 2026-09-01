@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.tokkah.kin"
-    android:versionCode="5"
-    android:versionName="0.114.0-android.5" >
+    android:versionCode="11"
+    android:versionName="0.116.0-android.11" >
 
     <uses-sdk
         android:minSdkVersion="29"
@@ -33,6 +33,13 @@
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!--
+         The permission that makes "download once" true: with it, and only when
+         this copy is its own installer of record, an update of THIS package
+         signed by THIS certificate installs without a prompt. It grants nothing
+         over any other app.
+    -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
     <permission
         android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
@@ -44,7 +51,9 @@
         android:appComponentFactory="androidx.core.app.CoreComponentFactory"
         android:debuggable="true"
         android:extractNativeLibs="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="Kin"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar" >
         <activity

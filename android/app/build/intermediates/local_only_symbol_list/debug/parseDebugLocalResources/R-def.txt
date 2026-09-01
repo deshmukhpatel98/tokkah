@@ -1,3 +1,7 @@
 R_DEF: Internal format may change without notice
 local
+color icon_bg
+mipmap ic_launcher
+mipmap ic_launcher_foreground
+mipmap ic_launcher_round
 xml paths

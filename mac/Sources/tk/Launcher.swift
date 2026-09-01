@@ -757,8 +757,9 @@ enum Launcher {
     mineRow.value = "copy"
     mineRow.valueIsWord = true
     mineRow.ruled = true
-    let mineHint = SheetHint(Identity.handle.isEmpty ? Identity.nameTroubleLine
-                                                     : "Give this to someone and they can call you.")
+    // Empty only when there is trouble. "@devesh … copy" does not need a
+    // sentence under it telling you what a name is for.
+    let mineHint = SheetHint(Identity.handle.isEmpty ? Identity.nameTroubleLine : "")
     let emptyHint = SheetHint("Talk to someone once and they’ll show up here.")
     // ── THE HALF OF "TAP A NAME TO CALL" THAT REACHED NOBODY ─────────────────
     //
@@ -786,19 +787,31 @@ enum Launcher {
     // simply not reachable with Kin closed, silently, until somebody happens to
     // open the settings card. Off the main thread; the row is redrawn if it
     // changed anything.
+    // ── A NAME AND A STATE, AND NOTHING ELSE ─────────────────────────────────
+    //
+    // Each of these used to carry a sentence underneath explaining what it did.
+    // Three rows, three explanations, on a card that floats over the person's
+    // face -- and a setting whose name needs a paragraph is a badly named
+    // setting. The name says what it is and the right-hand word says whether it
+    // is on. The hint views survive for ONE job: saying what went wrong, when
+    // something goes wrong, which is not decoration.
     var watchOK = Watch.healthy()
-    let reachRow = SheetRow(watchOK ? "People can reach you when Kin is closed"
-                                    : "Let people reach you when Kin is closed")
-    let reachHint = SheetHint("Kin starts when you log in, just to listen for calls.")
-    if watchOK { reachRow.value = "on"; reachRow.valueIsWord = true; reachRow.inert = true }
+    let reachRow = SheetRow("Ring me when Kin is closed")
+    let reachHint = SheetHint("")
+    reachRow.value = watchOK ? "on" : "off"
+    reachRow.valueIsWord = true
+    reachRow.inert = watchOK
     reachRow.textInset = Metric.rowAvatarInset
     v.addSubview(reachRow)
     v.addSubview(reachHint)
     // Silent mode, from the same server switch the in-call sheet flips. The row
     // shows the SERVER's verdict, never the wish -- `setQuiet` only moves local
     // state when the server agreed, so "on" here is true unreachability.
-    let quietRow = SheetRow("Don’t ring me")
-    let quietHint = SheetHint("Calls to you are quietly declined until you turn this off.")
+    // "Do not disturb" and not "Don't ring me": the second one reads "Don't ring
+    // me -- off", which is a double negative the person has to unpick to learn
+    // that calls DO come through.
+    let quietRow = SheetRow("Do not disturb")
+    let quietHint = SheetHint("")
     quietRow.value = Identity.quietOn ? "on" : "off"
     quietRow.valueIsWord = true
     quietRow.textInset = Metric.rowAvatarInset
@@ -1168,7 +1181,7 @@ enum Launcher {
         // The card about YOU: handle, the login item, silent mode. Everything
         // here used to sit under the people list and push the card up over the
         // camera picture.
-        column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
+        column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
         column += [reachRow, reachHint, quietRow, quietHint]
       } else {
         // A call you are still in comes first: it is the only row on this card
@@ -1184,9 +1197,13 @@ enum Launcher {
         // Mac's name -- so the name stays on the front card exactly until the
         // first person is in the list, then moves behind the `…`.
         if people.isEmpty {
-          column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
+          column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
         }
       }
+      // A hint with nothing in it is not a row. They exist only to carry a
+      // failure, and an empty one reserving 34 points of card is the padding
+      // this card was asked to stop spending.
+      column = column.filter { ($0 as? SheetHint).map { !$0.text.isEmpty } ?? true }
       let shown = Set(column.map { ObjectIdentifier($0) })
       for x in [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
                 emptyHint, reachRow, reachHint, quietRow, quietHint] as [NSView] {
@@ -1277,6 +1294,11 @@ enum Launcher {
         if x === reachRow { return "reach" }
         if x === quietRow { return "quiet" }
         if x === emptyHint { return "empty" }
+        // Named, not "hint": three of these can be on one card and a rig that
+        // cannot tell them apart cannot say which sentence came back.
+        if x === mineHint { return "mine-hint" }
+        if x === reachHint { return "reach-hint" }
+        if x === quietHint { return "quiet-hint" }
         if x is SheetHint { return "hint" }
         if let c = x as? ContactRow { return "@" + c.handleName }
         return "?"
@@ -1309,18 +1331,21 @@ enum Launcher {
     // flipped optimistically would tell somebody they are unreachable while
     // calls keep arriving, which is the one error in this feature that matters.
     // So the row says "asking…" and then reports what came back.
+    var quietBusy = false
     t.toggleQuiet = { [weak t] in
+      guard !quietBusy else { return }
+      quietBusy = true
       let want = !Identity.quietOn
-      quietRow.value = "asking…"
+      quietRow.value = "…"
       Thread {
         let ok = Identity.setQuiet(want)
         let now = Identity.quietOn
         DispatchQueue.main.async {
+          quietBusy = false
           quietRow.value = now ? "on" : "off"
-          quietHint.setText(ok
-            ? (now ? "Calls to you are quietly declined until you turn this off."
-                   : "People can ring you.")
-            : "Couldn’t reach the server — nothing changed.")
+          // A sentence only when the switch did not move. When it did, the word
+          // on the right is the whole story.
+          quietHint.setText(ok ? "" : "Couldn’t reach the server — nothing changed.")
           fputs("home: quiet asked \(want), server says \(now ? "on" : "off")\n", stderr)
           t?.relayout()
         }
@@ -1358,23 +1383,8 @@ enum Launcher {
     //
     // Off the main thread (`launchctl` is a subprocess), and the row is corrected
     // only if the repair actually worked.
-    if !watchOK {
-      Thread { [weak t] in
-        guard let said = Watch.repairIfNeeded() else { return }
-        let ok = Watch.healthy()
-        DispatchQueue.main.async {
-          fputs(said + "\n", stderr)
-          Metrics.tap("watch_repair", ok: ok)
-          guard ok else { return }
-          watchOK = true
-          reachRow.setLabel("People can reach you when Kin is closed")
-          reachRow.value = "on"
-          reachRow.valueIsWord = true
-          reachRow.inert = true
-          t?.relayout()
-        }
-      }.start()
-    }
+    // The repair itself is started below, once `renderReach` -- the one thing
+    // allowed to write this row -- exists.
     let clipWatch = NotificationCenter.default.addObserver(
       forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
         scanClipboard()
@@ -1389,30 +1399,59 @@ enum Launcher {
     // finding: a control that reports success for work that did not happen.
     //
     // launchctl is a subprocess, so it is not run on the thread that draws.
+    // ── ONE WRITER FOR THIS ROW ──────────────────────────────────────────────
+    //
+    // It had three: the initial layout, the automatic repair, and this press.
+    // They raced and the screen said both things at once -- photographed on a
+    // real Mac reading "Couldn't turn it on" on the left and "on" on the right.
+    // The name never changes now; only the state word does, and only here.
+    // `reachBusy` is what stops two attempts overlapping at all.
+    var reachBusy = false
+    let renderReach: (String?) -> Void = { failure in
+      watchOK = Watch.healthy()
+      reachRow.value = reachBusy ? "…" : (watchOK ? "on" : "off")
+      reachRow.inert = watchOK || reachBusy
+      // A sentence only when there is something wrong, and gone the moment there
+      // is not.
+      reachHint.setText(watchOK ? "" : (failure ?? reachHint.text))
+      t.relayout()
+    }
     t.makeReachable = { [weak t] in
-      reachRow.setLabel("Turning it on…")
+      guard !reachBusy else { return }
+      reachBusy = true
+      renderReach(nil)
       Thread {
         let said = Watch.install()
-        let ok = Watch.healthy()
         DispatchQueue.main.async {
           fputs(said + "\n", stderr)
+          reachBusy = false
+          let ok = Watch.healthy()
           Metrics.tap("watch_install", ok: ok)
-          guard ok else {
-            // The sentence, not a shrug. It names which of the three it was, and
-            // two of them are things the person can act on.
-            reachRow.setLabel("Couldn’t turn it on")
-            reachHint.setText(said.replacingOccurrences(of: "watch: ", with: ""))
-            return
-          }
-          watchOK = true
-          // It stays on the settings card once it is on, saying so, rather than
-          // vanishing: a row that disappears when it succeeds leaves nowhere to
-          // check the answer later.
-          reachRow.setLabel("People can reach you when Kin is closed")
-          reachRow.value = "on"
-          reachRow.valueIsWord = true
-          reachRow.inert = true
-          t?.relayout()
+          // The sentence names which refusal it was, and some of them are things
+          // the person can act on. Only shown while it is still off.
+          renderReach(ok ? nil : said.replacingOccurrences(of: "watch: ", with: ""))
+          _ = t
+        }
+      }.start()
+    }
+    // ── AND THE AUTOMATIC REPAIR, THROUGH THE SAME DOOR ──────────────────────
+    //
+    // A login item that went missing is put back when the app opens. It writes
+    // the row through `renderReach` and takes `reachBusy` first, so it and a
+    // press by hand can never both be describing this row at once -- which is
+    // exactly how the screen came to say "Couldn't turn it on" and "on".
+    if !watchOK, Watch.installed {
+      reachBusy = true
+      renderReach(nil)
+      Thread {
+        let said = Watch.repairIfNeeded()
+        DispatchQueue.main.async {
+          reachBusy = false
+          guard let said else { renderReach(nil); return }
+          fputs(said + "\n", stderr)
+          let ok = Watch.healthy()
+          Metrics.tap("watch_repair", ok: ok)
+          renderReach(ok ? nil : "Kin couldn’t switch this back on by itself.")
         }
       }.start()
     }

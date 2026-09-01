@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.tokkah.kin.CryptoTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-09-01T04:34:57.723Z" hostname="Deveshs-MacBook-Air.local" time="0.094">
+<testsuite name="com.tokkah.kin.CryptoTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-09-01T04:48:13.670Z" hostname="Deveshs-MacBook-Air.local" time="0.078">
   <properties/>
-  <testcase name="safetyCodeMatches" classname="com.tokkah.kin.CryptoTest" time="0.058"/>
-  <testcase name="adoptPeerSemantics" classname="com.tokkah.kin.CryptoTest" time="0.011"/>
-  <testcase name="tamperedPacketFailsOpen" classname="com.tokkah.kin.CryptoTest" time="0.007"/>
-  <testcase name="openSwiftPackets" classname="com.tokkah.kin.CryptoTest" time="0.009"/>
-  <testcase name="sealMatchesSwiftPacketsByteExact" classname="com.tokkah.kin.CryptoTest" time="0.006"/>
-  <testcase name="publicKeysMatchCryptoKit" classname="com.tokkah.kin.CryptoTest" time="0.003"/>
+  <testcase name="safetyCodeMatches" classname="com.tokkah.kin.CryptoTest" time="0.047"/>
+  <testcase name="adoptPeerSemantics" classname="com.tokkah.kin.CryptoTest" time="0.009"/>
+  <testcase name="tamperedPacketFailsOpen" classname="com.tokkah.kin.CryptoTest" time="0.008"/>
+  <testcase name="openSwiftPackets" classname="com.tokkah.kin.CryptoTest" time="0.007"/>
+  <testcase name="sealMatchesSwiftPacketsByteExact" classname="com.tokkah.kin.CryptoTest" time="0.004"/>
+  <testcase name="publicKeysMatchCryptoKit" classname="com.tokkah.kin.CryptoTest" time="0.002"/>
   <testcase name="hkdfMatches" classname="com.tokkah.kin.CryptoTest" time="0.0"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>

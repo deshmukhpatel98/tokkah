@@ -43,6 +43,13 @@ export TK_NO_RAISE=1
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/reopen-check.$$"
+# ── THE PATH LaunchServices REPORTS IS NOT THE PATH WE TYPED ────────────────
+# $TMPDIR ends in a slash, so this used to build ".../T//reopen-check.$$", and
+# macOS resolves a launched bundle to its real path ("/private/var/...", one
+# slash). Every `pgrep -f "$SP/..."` then matched NOTHING -- so the rig read
+# "0 processes before, 0 after" for a click that had visibly opened a window,
+# and reported the product broken because its ruler was.
+SP="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SP")"
 ID="com.tokkah.tk.reopenrig$$"
 LABEL="$ID.watch"
 APP="$SP/Kin.app"

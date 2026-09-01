@@ -30,8 +30,16 @@ import java.nio.ByteBuffer
  */
 class VideoDevice(private val ctx: Context, private val session: CallSession) {
     companion object {
-        const val W = 1280
-        const val H = 720
+        /**
+         * PORTRAIT, because a phone held upright frames a person tall. The Mac
+         * sends 1280x720 because a Mac camera and a Mac window are both
+         * landscape; sending that shape from a phone means the far end throws
+         * most of its screen away on black bars. The receiver reads the size
+         * out of the stream's own parameter sets, so no orientation field is
+         * needed on the wire and an older peer needs no change.
+         */
+        const val W = 720
+        const val H = 1280
         const val FPS = 30
         const val BITRATE = 1_200_000
     }
@@ -43,6 +51,7 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     private var inputSurface: Surface? = null
     private var camThread: HandlerThread? = null
     private var codecThread: HandlerThread? = null
+    private var rotator: GlRotator? = null
     private var decoderConfigured = false
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
@@ -71,6 +80,7 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     private var faceReader: android.media.ImageReader? = null
     var lastError: String? = null; private set
     var facingFront = true
+    private var sensorOrientation = 90
 
     fun startEncode(): Boolean {
         return try {
@@ -125,7 +135,12 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                 }
             }, ch)
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            inputSurface = enc.createInputSurface()
+            // The camera cannot write a turned picture, so it writes a texture
+            // and one GL pass turns it into the encoder's portrait surface.
+            val encSurface = enc.createInputSurface()
+            val rot = GlRotator(encSurface, W, H)
+            rotator = rot
+            inputSurface = rot.inputSurface
             enc.start()
             encoder = enc
             android.util.Log.i("kin", "encoder started ${W}x$H @$FPS ${BITRATE / 1000} kbps")
@@ -182,9 +197,22 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             val f = cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING)
             if (facingFront) f == CameraMetadata.LENS_FACING_FRONT else f == CameraMetadata.LENS_FACING_BACK
         } ?: cm.cameraIdList.firstOrNull() ?: return
+        sensorOrientation = try {
+            cm.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        } catch (e: Exception) { 90 }
         val t = HandlerThread("kin-cam").apply { start() }
         camThread = t
         val h = Handler(t.looper)
+        rotator?.let { r ->
+            r.rotation = sensorOrientation
+            r.mirror = facingFront
+            // Every camera frame becomes one encoder frame, turned. On the
+            // camera's own thread, so the draw never sits on the UI.
+            r.inputTexture.setOnFrameAvailableListener({
+                try { r.draw(System.nanoTime()) }
+                catch (e: Exception) { lastError = "rotator: ${e.message}" }
+            }, h)
+        }
         try {
             cm.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(dev: CameraDevice) {
@@ -362,6 +390,7 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
         try { camera?.close() } catch (_: Exception) {}
         try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
         try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
+        rotator?.release(); rotator = null
         camThread?.quitSafely()
         codecThread?.quitSafely()
         camera = null; encoder = null; decoder = null; camThread = null; codecThread = null

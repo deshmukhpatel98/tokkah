@@ -323,12 +323,43 @@ enum Watch {
     }
     defer { if fd >= 0 { flock(fd, LOCK_UN); close(fd) } }
 
-    // Kick it now so it works without a logout. `bootout` first, because
-    // bootstrapping an already-loaded label is an error rather than a refresh.
-    _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
-    let r = run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistURL.path])
+    // Kick it now so it works without a logout.
+    let r = reloadNow()
     return r.ok ? "watch: login item installed -- this Mac can now be rung while Kin is closed"
                 : "watch: plist written but launchctl said: \(r.out)"
+  }
+
+  /// ── ONE BOOTOUT-THEN-BOOTSTRAP, AND IT RETRIES ────────────────────────────
+  ///
+  /// `bootout` returns before launchd has finished tearing the job down, and a
+  /// `bootstrap` that lands inside that window fails with
+  ///
+  ///     Bootstrap failed: 5: Input/output error
+  ///
+  /// `install()` did it exactly once and put that sentence in front of the
+  /// person as a permanent failure, on a Mac where the very next attempt
+  /// succeeds -- observed here, and the retry by hand worked first time.
+  /// `reregister()`'s detached script had a five-round retry loop all along, so
+  /// the two paths that do the same thing disagreed about whether it needs one
+  /// (`second-copy-of-a-rule`). This is that loop, for the callers that are not
+  /// about to exit.
+  ///
+  /// Success is `loaded()` -- what launchd says -- and not the exit code of the
+  /// last bootstrap: a bootstrap can fail because the job is ALREADY there,
+  /// which is the outcome we wanted.
+  @discardableResult
+  static func reloadNow(tries: Int = 5) -> (ok: Bool, out: String) {
+    _ = run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+    var last = ""
+    for i in 0..<tries {
+      if i > 0 { Thread.sleep(forTimeInterval: 0.4) }
+      let r = run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistURL.path])
+      if loaded() { return (true, "") }
+      last = r.out.isEmpty ? last : r.out
+    }
+    // Never leave the Mac with no job because a bootstrap kept losing a race.
+    _ = run("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+    return (loaded(), last)
   }
 
   @discardableResult
@@ -898,6 +929,16 @@ enum Resident {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
       fputs("watch: somebody opened Kin -- handing it to a new process\n", stderr)
       launch()
+      // ── AND STAY OUT OF THE DOCK WHILE DOING IT ────────────────────────────
+      //
+      // Handling a reopen is what promotes this process to `.regular`, and the
+      // repair lived only on the resident's tick -- so between the click and the
+      // next tick there really were two Kin icons in the Dock, which is the
+      // report that started all of this. Put back here, at the moment it
+      // happens, and again on the next turn of the run loop because AppKit sets
+      // the policy AFTER this delegate returns.
+      stayInvisible()
+      DispatchQueue.main.async { stayInvisible() }
       return true
     }
 
@@ -916,6 +957,9 @@ enum Resident {
               stderr)
         launch(url: u)
       }
+      // A link opens this process too, and promotes it exactly as a reopen does.
+      stayInvisible()
+      DispatchQueue.main.async { stayInvisible() }
     }
 
     /// `-n`, and it is the whole point: without it LaunchServices resolves the

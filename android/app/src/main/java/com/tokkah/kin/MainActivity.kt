@@ -135,12 +135,14 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             s.onVideoFrame = { payload, _ -> v.faceFromKeyframe(payload) }
         }
         session = s; audio = a; video = v
+        state.inCall = true
     }
 
     fun leave() {
         video?.stop(); audio?.stop()
         session?.stop(hungUp = true)
         video = null; audio = null; session = null
+        state.inCall = false
         state.refresh()
     }
 
@@ -161,8 +163,23 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             updateVersion = state.ready?.version
         }
         state.onCall = { room, who -> join(room, who); state.answered() }
+        // Silent where this copy is its own installer of record, one tap where
+        // it is not. Either way the person downloaded Kin once.
+        state.onInstall = { f ->
+            val silent = Installer.canInstallSilently(ctx)
+            android.util.Log.i("kin", "update: installing ${f.name}, silent=$silent")
+            // Try the silent path regardless: the system decides, and if it
+            // wants a tap it says so and that intent is honoured. Refusing to
+            // try because the installer of record is null would mean a
+            // sideloaded copy could never adopt itself.
+            if (!Installer.install(ctx, f)) Installer.installWithPrompt(ctx, f)
+        }
+        val installReceiver = Installer.register(ctx)
         state.onChangedReady()
-        onDispose { state.stop() }
+        onDispose {
+            state.stop()
+            runCatching { ctx.unregisterReceiver(installReceiver) }
+        }
     }
 
     // ── ONE MAILBOX, ONE READER ─────────────────────────────────────────────
@@ -224,16 +241,8 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     // the only thing on Android that can actually replace an
                     // app, so the last tap is the person's.
                     state.readyFile?.let { f ->
-                        val uri = androidx.core.content.FileProvider.getUriForFile(
-                            ctx, ctx.packageName + ".files", f,
-                        )
-                        ctx.startActivity(
-                            android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                                setDataAndType(uri, "application/vnd.android.package-archive")
-                                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                            },
-                        )
+                        if (Installer.canInstallSilently(ctx)) Installer.install(ctx, f)
+                        else Installer.installWithPrompt(ctx, f)
                     }
                 },
                 pastedLink = null,
