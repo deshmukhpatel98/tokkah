@@ -48,6 +48,21 @@ rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
 # `?` -> `@more` -> `?` -> click the row -> `?` -> click again -> `?`
 # The row's index is not knowable before the panel is built, so the presses are
 # split across two launches: the first one reads it, the second one uses it.
+# ── THIS CHOREOGRAPHY IS LOAD-SENSITIVE, AND THE FIX IS THE LANE ─────────────
+#
+# Clicking the row below asks launchd to install a LaunchAgent, and the four `?`
+# audits after it are 0.7 s apart -- 2.8 s for a bootstrap that takes as long as
+# the machine takes. Under a parallel lane it loses; run alone it has never once
+# failed, so `all-checks.sh` runs it alone now, beside `liveupdate-check`.
+#
+# Widening the window here was tried first and made things worse in two ways. The
+# later assertions read the LAST panel dump, so adding pauses moved which dump
+# that was and three arms about the Version and Licence rows began failing. And
+# the comment explaining it was put INSIDE this command's backslash continuation,
+# which ends the command at the `#` -- so `--press-after 3 --press "..."` and
+# everything after it silently vanished from the invocation, and the same three
+# arms failed for a completely different reason. `bash -n` sees nothing wrong
+# with either. A comment is not always free.
 spawn "$TK" --window --video off --mute --no-telemetry --no-update --no-relocate \
       --no-subtitles --no-rings --listen 8061 --room "watchchk$$" \
       --press-after 3 --press "@more,?" > "$SP/a.log" 2>&1

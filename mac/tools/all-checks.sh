@@ -105,7 +105,7 @@ export TK_NO_RAISE=1
 # `predict-live-check` is two 40-second calls of real speech through the real
 # audio path, and its verdict is a count and a number of milliseconds saved, so it
 # belongs alone with the rest of the timing work.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check liveupdate-check floor-check"
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check liveupdate-check watch-check floor-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
 # ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
 #
@@ -117,7 +117,11 @@ LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-chec
 # be made harder by company is a rig that can keep company.
 LANE_SLOW="predict-check"
 # Parallel-safe lanes.
-LANE_STATE="permissions-check firstrun-ring-check relaunch-check watch-check update-check doorbell-check cancelrace-check"
+# `watch-check` moved out: clicking its row asks launchd to install an agent and
+# the audits that follow are 2.8 s apart. It failed in this lane twice and has
+# never failed alone. Widening its own window was tried and broke three other arms
+# in it -- the sequence was right, the lane was wrong.
+LANE_STATE="permissions-check firstrun-ring-check relaunch-check update-check doorbell-check cancelrace-check"
 # `liveupdate-check` moved OUT of this lane. Its verdict is "cost of taking an
 # update mid-call, measured at the far end: 1081 ms of media" and "4 of their last
 # 6 reports had media" -- a latency and a rate, which by the rule at the top of
