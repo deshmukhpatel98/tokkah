@@ -84,6 +84,30 @@ enum Launcher {
     @objc func go() { Permissions.reveal(.camera) }
   }
 
+  /// The room inside a call link, or nil for text that is not one. One parser
+  /// for every place a link can arrive as TEXT -- typed into the field, sitting
+  /// on the clipboard -- with the same shapes the Apple Event handler below
+  /// accepts: tokkah://join/<room>, tokkah://<room>, kin://…, and the https
+  /// links people actually send each other (kin.tokkah.com/<room>,
+  /// room.tokkah.com/<room>, with or without the scheme typed).
+  static func roomFromLink(_ s: String) -> String? {
+    let raw = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = raw.lowercased()
+    guard lower.contains("://") || lower.contains("tokkah.com") else { return nil }
+    guard let u = URL(string: raw.contains("://") ? raw : "https://" + raw) else { return nil }
+    var name = u.path.hasPrefix("/") ? String(u.path.dropFirst()) : u.path
+    if u.scheme == "tokkah" || u.scheme == "kin" {
+      if name.isEmpty { name = u.host ?? "" }
+      if name == "join" { name = "" }
+    } else {
+      guard let h = u.host?.lowercased(), h == "tokkah.com" || h.hasSuffix(".tokkah.com")
+      else { return nil }
+    }
+    let ok = !name.isEmpty && name.count <= 64
+      && name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    return ok ? name : nil
+  }
+
   final class Handler: NSObject {
     static let shared = Handler()
     @objc func handle(event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
@@ -336,7 +360,6 @@ enum Launcher {
   /// Which of the three things this card is currently for. One value, because two
   /// booleans that have to agree are a state that can be both -- the bug
   /// `WaitingCard.Mode` was extracted to fix, in the same shape, one screen away.
-  enum Mode { case people, word, name }
 
   /// Set when the front door has stopped its preview session and detached its
   /// inputs. Read by the in-process path, which is the only caller that cannot
@@ -589,14 +612,17 @@ enum Launcher {
     let card = Glass("joinCard", radius: Metric.cardRadius)
     v.addSubview(card)
 
-    // ── THE ONE EDITABLE THING, TWICE, BECAUSE THEY ARE TWO QUESTIONS ─────────
+    // ── THE ONE EDITABLE THING, ONCE ──────────────────────────────────────────
     //
-    // `field` is a ROOM: a shared word, and also the encryption salt, which is why
-    // it is validated rather than normalised (see `validate`). `nameField` is a
-    // HANDLE: somebody's name in the registry, checked by `Identity.sanitize`,
-    // which is the server's own rule. They look identical and they are not
-    // interchangeable -- a room name may contain `-` and `_` and a handle may not
-    // -- so typing one into the other has to fail rather than half-work.
+    // This was TWO fields behind two rows and two modes -- "Call someone new"
+    // opened a handle field, "Join with a word" opened the old room field with
+    // Suggest and Join and the recent-room rows, each with a title, a sentence,
+    // and a Back row. Four clicks of furniture for one question: WHO. So it is
+    // one field now, always on screen, and what you put in it decides what it
+    // does: a name rings them, a pasted call link joins it, and a word with a
+    // `-` or `_` in it (every suggested room, and no legal handle) joins as a
+    // room. The distinction the two fields guarded -- a handle may not contain
+    // `-` or `_`, a room may -- is exactly what makes one field unambiguous.
     func vibrant(_ h: CGFloat) -> Vibrant {
       let b = Vibrant()
       b.radius = Metric.cardFieldRadius
@@ -616,42 +642,9 @@ enum Launcher {
       return f
     }
 
-    let title = NSTextField(labelWithString: "")
-    title.font = Type_.title
-    title.textColor = Palette.fg
-    title.backgroundColor = .clear
-    title.isBordered = false
-    v.addSubview(title)
-
-    let sub = NSTextField(labelWithString: "")
-    sub.font = Type_.caption
-    sub.textColor = Palette.muted
-    sub.maximumNumberOfLines = 2
-    sub.lineBreakMode = .byWordWrapping
-    sub.backgroundColor = .clear
-    sub.isBordered = false
-    v.addSubview(sub)
-
-    // The room half: field, Suggest, Join. Every line of this is the code that was
-    // here before, moved rather than rewritten -- it is the path a first-time pair
-    // of Macs still takes, and it was correct.
     let fieldBack = vibrant(Metric.fieldHeight)
-    let field = plainField("a word you both know",
-                           UserDefaults.standard.string(forKey: lastRoomKey) ?? suggestRoom())
-    let newBtn = PillButton("Suggest")
-    let join = PillButton("Join")
-    join.prominent = true
-    newBtn.setFrameSize(NSSize(width: 84, height: Metric.fieldHeight))
-    join.setFrameSize(NSSize(width: 92, height: Metric.fieldHeight))
-    for x in [fieldBack, field, newBtn, join] as [NSView] { v.addSubview(x) }
-
-    // The handle half.
-    let nameBack = vibrant(Metric.fieldHeight)
-    let nameField = plainField("their name", "")
-    let callBtn = PillButton("Call")
-    callBtn.prominent = true
-    callBtn.setFrameSize(NSSize(width: 92, height: Metric.fieldHeight))
-    for x in [nameBack, nameField, callBtn] as [NSView] { v.addSubview(x) }
+    let field = plainField("Type a name, or paste a call link", "")
+    for x in [fieldBack, field] as [NSView] { v.addSubview(x) }
 
     // Validation, on a line that is always reserved. Saying something must not
     // shove the rows below it down and move a target under a pointer already
@@ -694,34 +687,18 @@ enum Launcher {
       RunLoop.main.add(t, forMode: .common)
       presenceTimer = t
     }
-    // ── THE ROOMS YOU HAVE ACTUALLY BEEN IN ──────────────────────────────────
+    // ── A LINK ON THE CLIPBOARD IS A KNOCK ON THE DOOR ───────────────────────
     //
-    // These were four chips under the old field, and rebuilding this card around
-    // the people list dropped them: `remember` still wrote `tk.recentRooms` on
-    // every join and NOTHING read it back. A stored list with no reader is the
-    // shape of a feature that has quietly stopped existing -- the writer keeps
-    // working, so nothing looks broken, and the only symptom is that somebody who
-    // meets the same people in the same room every week has to type its name
-    // again every week.
-    //
-    // Rows rather than chips, because everything else on this card is a row and a
-    // chip row would be a second idiom for the same job. Under the field, in the
-    // one mode that is about rooms.
-    // The field is prefilled with the last room, which is `recentRooms.first` --
-    // so without this the top row is always a copy of what is already in the box
-    // above it, and a list whose first item is the thing you are looking at reads
-    // as a bug in the list.
-    let prefilled = UserDefaults.standard.string(forKey: lastRoomKey) ?? ""
-    let recentRows = Array(recentRooms.filter { $0 != prefilled }.prefix(4)).map { r -> SheetRow in
-      let row = SheetRow(r)
-      row.textInset = Metric.rowAvatarInset
-      row.acceptsFirstClick = false
-      v.addSubview(row)
-      return row
-    }
-    let newRow = SheetRow("Call someone new", glyph: Glyph.person)
-    let wordRow = SheetRow("Join with a word")
-    let backRow = SheetRow("Back")
+    // The way a call link actually arrives is a message: somebody sends it, you
+    // copy it, you open Kin. The old answer was four clicks of furniture --
+    // "Join with a word", a field, paste, Join. If the clipboard is holding a
+    // call link when this window is up, the join is ONE row at the top of the
+    // card, and the row says which room so a stale clipboard cannot walk you
+    // into last week's call unannounced. Refreshed when the app comes forward,
+    // which is the moment the copy could have changed.
+    let linkRow = SheetRow("")
+    linkRow.value = "from your copied link"
+    linkRow.valueIsWord = true
     // Your own name, and the one state that gets a sentence instead of a control:
     // a copy button over an empty value copies nothing, reports success, and
     // teaches the person the feature is broken. Same rule as the People page.
@@ -751,21 +728,42 @@ enum Launcher {
     // question, because one `launchctl bootout` leaves the file in place and the
     // Mac uncallable for ever while every launch decides there is nothing to do.
     var watchOK = Watch.healthy()
-    let reachRow = SheetRow("Let people reach you when Kin is closed")
+    let reachRow = SheetRow(watchOK ? "People can reach you when Kin is closed"
+                                    : "Let people reach you when Kin is closed")
     let reachHint = SheetHint("Kin starts when you log in, just to listen for calls.")
+    if watchOK { reachRow.value = "on"; reachRow.valueIsWord = true; reachRow.inert = true }
     reachRow.textInset = Metric.rowAvatarInset
     v.addSubview(reachRow)
     v.addSubview(reachHint)
+    // Silent mode, from the same server switch the in-call sheet flips. The row
+    // shows the SERVER's verdict, never the wish -- `setQuiet` only moves local
+    // state when the server agreed, so "on" here is true unreachability.
+    let quietRow = SheetRow("Don’t ring me")
+    let quietHint = SheetHint("Calls to you are quietly declined until you turn this off.")
+    quietRow.value = Identity.quietOn ? "on" : "off"
+    quietRow.valueIsWord = true
+    quietRow.textInset = Metric.rowAvatarInset
+    v.addSubview(quietRow)
+    v.addSubview(quietHint)
+    // ── THE FURNITURE GOES BEHIND ONE BUTTON ─────────────────────────────────
+    //
+    // Your own handle, the login item, silent mode: all three are ABOUT you and
+    // none of them is why the window is open. On the front card they sat under
+    // the people list and pushed the card up over the camera picture -- the
+    // person's own face, hidden behind settings. The same corner `…` the call
+    // window has opens them; the card everybody actually uses is faces and one
+    // field.
+    let moreBtn = IconButton(Glyph.more, size: Metric.controlSmall, help: "settings")
+    v.addSubview(moreBtn)
     for r in peopleRows { v.addSubview(r) }
-    for x in [newRow, wordRow, backRow, mineRow] as [NSView] { v.addSubview(x) }
+    for x in [linkRow, mineRow] as [NSView] { v.addSubview(x) }
     v.addSubview(mineHint)
     v.addSubview(emptyHint)
-    // `newRow` and `wordRow` carry no glyph column of their own beside a list of
-    // 34 pt faces -- a page of faces has a 56 pt mark column and an ordinary row
-    // an 18 pt one, and the two together draw a ragged left edge that reads as two
-    // lists that happen to be adjacent. Same fix as `buildPeoplePage`.
-    for r in [wordRow, backRow] { r.textInset = Metric.rowAvatarInset }
-    newRow.textInset = Metric.rowAvatarInset
+    // `linkRow` carries no glyph column of its own beside a list of 34 pt faces --
+    // a page of faces has a 56 pt mark column and an ordinary row an 18 pt one,
+    // and the two together draw a ragged left edge that reads as two lists that
+    // happen to be adjacent. Same fix as `buildPeoplePage`.
+    linkRow.textInset = Metric.rowAvatarInset
     // ── A CLICK THAT ARRIVES BEFORE YOU ARE LOOKING AT THIS WINDOW IS NOT A
     //    DECISION TO RING ANYBODY ─────────────────────────────────────────────
     //
@@ -777,7 +775,7 @@ enum Launcher {
     // wrong here. Observed, before this line: an app launch put the list under a
     // resting pointer and the next click rang @arjun.
     for r in peopleRows { r.acceptsFirstClick = false }
-    for r in [newRow, wordRow, backRow, mineRow, reachRow] { r.acceptsFirstClick = false }
+    for r in [linkRow, mineRow, reachRow] { r.acceptsFirstClick = false }
 
     // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
@@ -803,16 +801,35 @@ enum Launcher {
       /// window would re-exec into the room half a second later anyway
       /// (`a-final-record-that-isnt-final`, from the other side).
       var ringGen = 0
+      /// False while the ring POST is travelling. The teardown paths wait on it:
+      /// an exit that outruns the POST cannot know whether anybody was rung, and
+      /// so cannot know whether anybody needs un-ringing.
+      var ringSettled = true
+      /// A bye is on its way to the mailbox. Exit waits for this too -- a bye
+      /// believed-sent by a process that quit first was never sent.
+      var byeInFlight = false
       /// The two-second revert on the mine-row's "copied". Held so teardown can
       /// kill it: a timer holding a row of a window that has gone away.
       var copyTimer: Timer?
       /// Put the screen back the way it was before the ring. Owned by `home()`,
       /// which is where the pill, the rows and the dots timer all live.
       var stopRing: () -> Void = {}
-      var mode = Mode.people
+      /// The settings card is open: your handle, the login item, silent mode.
+      var settingsOpen = false
+      var toggleQuiet: () -> Void = {}
+      @objc func settings() {
+        guard !ringing else { return }
+        settingsOpen.toggle()
+        fputs("home: settings \(settingsOpen ? "open" : "closed")\n", stderr)
+        relayout()
+      }
+      @objc func quietPressed() { guard !ringing else { return }; toggleQuiet() }
       let field: NSTextField
-      let nameField: NSTextField
       let status: NSTextField
+      /// The room parsed off the clipboard, when the clipboard holds a call link.
+      /// The row that joins it shows this same value, so what fires is what was
+      /// on screen -- never a re-read of a clipboard that changed under the click.
+      var clipRoom: String?
       /// Minted when the pointer arrives on a face, used when the click lands.
       /// One per handle: hovering across a list five times must not mint five
       /// rooms and warm all of them.
@@ -822,8 +839,8 @@ enum Launcher {
       /// Turn on the login item. A closure rather than a method body because the
       /// row it reports into is built outside this class.
       var makeReachable: () -> Void = {}
-      init(field: NSTextField, nameField: NSTextField, status: NSTextField) {
-        self.field = field; self.nameField = nameField; self.status = status
+      init(field: NSTextField, status: NSTextField) {
+        self.field = field; self.status = status
       }
 
       func validate(_ raw: String) -> String? {
@@ -840,36 +857,40 @@ enum Launcher {
         return name
       }
 
-      @objc func go() {
-        guard !ringing, let name = validate(field.stringValue) else { return }
-        out = .room(name)
-        done = true
-      }
-      @objc func suggest() {
-        field.stringValue = Launcher.suggestRoom()
-        status.stringValue = ""
-        // Typed or suggested, the room is knowable now and the click is not for
-        // another second or two. Same free time the faces use.
-        if let r = validate(field.stringValue) { Warm.room(r, why: "suggested") }
-      }
       /// A face was clicked. Everything after this is the ring, and the room is the
       /// one that was minted and warmed when the pointer arrived.
       @objc func callRow(_ sender: SheetRow) {
         guard !ringing, let row = sender as? ContactRow else { return }
         ring(row.handleName)
       }
-      @objc func callTyped() {
+      /// Return in the one field. What was typed decides what happens: a call
+      /// link joins its room, a word with `-` or `_` (every suggested room, and
+      /// no legal handle) joins as a room, and anything else is a name to ring.
+      @objc func commit() {
         guard !ringing else { return }
-        let raw = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { status.stringValue = "Type a name, or paste a call link."; return }
+        if let room = Launcher.roomFromLink(raw) {
+          out = .room(room); done = true; return
+        }
+        if raw.contains("-") || raw.contains("_") {
+          guard let name = validate(raw) else { return }
+          out = .room(name); done = true; return
+        }
         let bare = raw.hasPrefix("@") ? String(raw.dropFirst()) : raw
         guard let who = Identity.sanitize(bare) else {
-          // The server's rule, said in words rather than as a regex. A handle is
-          // not a room name and the two fields refuse different things.
-          status.stringValue = raw.isEmpty ? "Type their name."
-                                           : "Names are letters and numbers, starting with a letter."
+          // The server's rule, said in words rather than as a regex.
+          status.stringValue = "Names are letters and numbers, starting with a letter."
           return
         }
+        status.stringValue = ""
         ring(who)
+      }
+      /// The clipboard row. Joins the room the ROW names -- `clipRoom`, parsed
+      /// when the row was shown -- not a re-read of the clipboard now.
+      @objc func joinClip() {
+        guard !ringing, let room = clipRoom else { return }
+        out = .room(room); done = true
       }
       @objc func copyMine(_ sender: SheetRow) {
         guard let row = sender as? ContactRow, !row.handleName.isEmpty else { return }
@@ -885,33 +906,14 @@ enum Launcher {
         RunLoop.main.add(t, forMode: .common)
         copyTimer = t
       }
-      @objc func showName() { guard !ringing else { return }; status.stringValue = ""; mode = .name; relayout() }
-      @objc func showWord() { guard !ringing else { return }; status.stringValue = ""; mode = .word; relayout() }
-      @objc func showPeople() { guard !ringing else { return }; status.stringValue = ""; mode = .people; relayout() }
-      /// A recent room, from its row. The name rides in the row itself, so there is
-      /// no parallel array to fall out of step with what is on screen.
-      @objc func joinNamed(_ sender: SheetRow) {
-        guard !ringing, let name = validate(sender.spokenName) else { return }
-        field.stringValue = name
-        out = .room(name)
-        done = true
-      }
       @objc func reachable() { guard !ringing else { return }; makeReachable() }
       @objc func cancel() { done = true }
     }
-    let t = Target(field: field, nameField: nameField, status: status)
-    // ── EMPTY IS STILL THE PEOPLE SCREEN ─────────────────────────────────────
-    //
-    // This was `people.isEmpty ? .word : .people`, on the reasoning that with
-    // nobody in the list there is no people page to show. What it actually did
-    // was hand every first-ever launch the room field -- the one screen the whole
-    // 0.103 rebuild existed to demote -- and with it no "Call someone new" at all.
-    // The very first thing anybody sees of this app was the opposite of what the
-    // app is for, and it fixed itself only after they had somehow already made a
-    // call. The empty people screen is a sentence plus the two things you can do;
-    // that is a better front door than a text box.
-    t.mode = .people
-    fputs("home: mode \(t.mode)\(people.isEmpty ? " (empty)" : "") -- \(people.count) people\n",
+    let t = Target(field: field, status: status)
+    // The one screen. There used to be three (`people`, `name`, `word`) with a
+    // Back row between them; the one field made the other two redundant. The log
+    // line keeps its old shape because the rig greps for it.
+    fputs("home: mode people\(people.isEmpty ? " (empty)" : "") -- \(people.count) people\n",
           stderr)
 
     // ── PLACING THE CALL FROM HERE, AND NOT ONE PROCESS LATER ────────────────
@@ -950,9 +952,11 @@ enum Launcher {
         // name is in flight without a second surface saying it.
         r.alphaValue = (who == nil || r.handleName == who) ? 1 : 0.4
       }
-      for r in ([newRow, wordRow, backRow, mineRow, reachRow] + recentRows) {
+      for r in [linkRow, mineRow, reachRow] as [NSView] {
         r.alphaValue = who == nil ? 1 : 0.4
       }
+      fieldBack.alphaValue = who == nil ? 1 : 0.4
+      field.alphaValue = who == nil ? 1 : 0.4
     }
     t.stopRing = { [weak t] in
       guard let t, t.ringing else { return }
@@ -968,6 +972,7 @@ enum Launcher {
     t.ring = { [weak t] who in
       guard let t, !t.done, !t.ringing else { return }
       t.ringing = true
+      t.ringSettled = false
       let gen = t.ringGen
       let room = t.warmed[who] ?? Launcher.mintRoom()
       hintBefore = hint.isHidden ? "" : hint.stringValue
@@ -995,10 +1000,23 @@ enum Launcher {
         let got = Identity.ring(to: who, room: room)
         let listening = Identity.lastRingListening
         DispatchQueue.main.async {
+          t.ringSettled = true
           // Cancelled while this was in flight. Not an error and not a call: the
-          // window is back where it was and nothing here may touch it.
+          // window is back where it was and nothing here may touch it -- EXCEPT
+          // that if the ring landed, the other Mac is ringing for a call nobody
+          // is placing any more, and only this branch knows both facts. The
+          // un-ring is sent from here, never from the cancel itself: a bye that
+          // races its own ring and arrives first is a no-op, and the ring then
+          // rings out the whole lease anyway (`held-is-a-one-way-door`, the
+          // ordering half).
           guard t.ringGen == gen else {
             Metrics.count("ring_cancelled")
+            if got != nil {
+              t.byeInFlight = true
+              sendBye(to: who, room: room, why: "cancelled-at-door") {
+                DispatchQueue.main.async { t.byeInFlight = false }
+              }
+            }
             return
           }
           dotTimer?.invalidate(); dotTimer = nil
@@ -1014,6 +1032,10 @@ enum Launcher {
           }
           Metrics.count("ring_sent_ok")
           Metrics.fact("callee_listening", listening.map { $0 ? "yes" : "no" } ?? "unknown")
+          // The ring is no longer in flight; the call is. Left true, the teardown
+          // below reads a SUCCESSFUL ring as an abandoned one and says so in the
+          // log of every call this window ever places.
+          t.ringing = false
           t.out = .calling(room: got, who: who, away: listening == false)
           t.done = true
         }
@@ -1040,106 +1062,72 @@ enum Launcher {
     // when the shutter fell.
     var animateLayout = false
     let layout = { [weak t] in
-      guard let t else { return }
-      let words = t.mode == .people
-      title.stringValue = words ? "" : (t.mode == .name ? "Call someone new" : "Join with a word")
-      sub.stringValue = t.mode == .word
-        ? "Type the same word on both Macs. It is also the password, so pick something only you two would say."
-        : (t.mode == .name ? "Their name is the one their Mac told them, like @meera." : "")
-
-      // What is on screen in this mode, top to bottom. Everything else is hidden,
-      // and hidden is the DEFAULT rather than something each branch has to undo --
-      // a view left visible by a mode that forgot it is the bug this shape exists
-      // to make impossible.
+      guard t != nil else { return }
+      // What is on screen, top to bottom. Everything else is hidden, and hidden
+      // is the DEFAULT rather than something each branch has to undo -- a view
+      // left visible by a state that forgot it is the bug this shape exists to
+      // make impossible.
       var column: [NSView] = []
-      let heads: [NSView] = t.mode == .people ? [] : [title, sub]
-      switch t.mode {
-      case .people:
-        column += people.isEmpty ? [emptyHint] : peopleRows
-        column += [newRow, wordRow]
-        // Below the things you came here to do and above your own name, which is
-        // the other thing on this card about being reachable rather than about
-        // reaching somebody.
-        if !watchOK { column += [reachRow, reachHint] }
+      if t?.settingsOpen == true {
+        // The card about YOU: handle, the login item, silent mode. Everything
+        // here used to sit under the people list and push the card up over the
+        // camera picture.
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
-      // `backRow` unconditionally, both modes: it used to be dropped when the
-      // list was empty, which was correct only while an empty list meant there
-      // was no people screen to go back TO. There always is one now, and a mode
-      // you can enter and not leave is a dead end.
-      case .name:
-        column += [nameBack, status, backRow]
-      case .word:
+        column += [reachRow, reachHint, quietRow, quietHint]
+      } else {
+        // The clipboard row first: a link somebody just sent you is the most
+        // recent intent in the room, newer than any name on the list.
+        if !linkRow.spokenName.isEmpty { column += [linkRow] }
+        column += people.isEmpty ? [emptyHint] : peopleRows
         column += [fieldBack, status]
-        column += recentRows
-        column += [backRow]
+        // A brand-new install has nobody to call until somebody knows this
+        // Mac's name -- so the name stays on the front card exactly until the
+        // first person is in the list, then moves behind the `…`.
+        if people.isEmpty {
+          column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
+        }
       }
-      let shown = Set((heads + column).map { ObjectIdentifier($0) })
-      for x in [title, sub, fieldBack, field, newBtn, join, nameBack, nameField, callBtn,
-                status, newRow, wordRow, backRow, mineRow, mineHint, emptyHint,
-                reachRow, reachHint] as [NSView] {
+      let shown = Set(column.map { ObjectIdentifier($0) })
+      for x in [fieldBack, status, linkRow, mineRow, mineHint, emptyHint,
+                reachRow, reachHint, quietRow, quietHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
-      for r in peopleRows {
-        r.isHidden = !shown.contains(ObjectIdentifier(r))
-        // A keyboard highlight on a row that is off screen comes back lit when
-        // the mode does, pointing at a selection nothing is tracking.
-        if r.isHidden { r.keySelected = false }
-      }
-      for r in recentRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
-      // The two fields are not in `column` -- they ride inside their `Vibrant`
-      // backing -- so their visibility follows the thing they sit in.
+      moreBtn.on = t?.settingsOpen == true
+      // The rule under the mine-row separates it from the list ABOVE it. At the
+      // top of the settings card there is no list, and the line drew a divider
+      // to nothing.
+      mineRow.ruled = t?.settingsOpen != true
+      for r in peopleRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
+      // The field is not in `column` -- it rides inside its `Vibrant` backing --
+      // so its visibility follows the thing it sits in.
       field.isHidden = fieldBack.isHidden
-      newBtn.isHidden = fieldBack.isHidden
-      join.isHidden = fieldBack.isHidden
-      nameField.isHidden = nameBack.isHidden
-      callBtn.isHidden = nameBack.isHidden
 
       func heightOf(_ x: NSView) -> CGFloat {
-        if x === title { return 24 }
-        if x === sub { return 32 }
         if x === status { return statusH }
         // ASK the hint, do not assume. `Metric.sheetHint` is 34 and the hint that
         // says why this Mac has no name wraps to three lines; a fixed box put its
         // last line under the card's bottom edge everywhere else this was done by
         // hand. The measure needs the width, which is known here and nowhere else.
         if let h = x as? SheetHint { h.measure(width: rowW); return h.wantedHeight }
-        if x === fieldBack || x === nameBack { return Metric.fieldHeight }
+        if x === fieldBack { return Metric.fieldHeight }
         return Metric.sheetRow
       }
       let gap = Metric.s1
       var h = pad + pad
-      for (i, x) in (heads + column).enumerated() { h += heightOf(x) + (i == 0 ? 0 : gap) }
-      // The title and the subtitle want more air under them than two rows want
-      // between them; without it the sentence and the field it is about read as
-      // one block.
-      if !heads.isEmpty { h += Metric.s3 }
+      for (i, x) in column.enumerated() { h += heightOf(x) + (i == 0 ? 0 : gap) }
       card.frame = NSRect(x: Metric.gutter, y: Metric.gutter, width: cardW, height: h)
 
       var y = card.frame.maxY - pad
-      for (i, x) in (heads + column).enumerated() {
+      for (i, x) in column.enumerated() {
         let hh = heightOf(x)
         y -= hh + (i == 0 ? 0 : gap)
-        if x === sub { y -= 0 }
         x.frame = NSRect(x: card.frame.minX + pad, y: y, width: rowW, height: hh)
-        if x === title || x === sub || x === status { /* labels fill the row */ }
         if x === fieldBack {
-          // The field shares its line with Suggest and Join, so it is the only
-          // thing here that is not full width.
-          let w = rowW - Metric.s2 * 2 - join.frame.width - newBtn.frame.width
-          x.setFrameSize(NSSize(width: w, height: hh))
+          // Full width, no buttons: Return is the commit, and the placeholder is
+          // the label.
           field.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
-                               width: w - Metric.s4 * 2, height: 19)
-          newBtn.setFrameOrigin(NSPoint(x: x.frame.maxX + Metric.s2, y: y))
-          join.setFrameOrigin(NSPoint(x: newBtn.frame.maxX + Metric.s2, y: y))
+                               width: rowW - Metric.s4 * 2, height: 19)
         }
-        if x === nameBack {
-          let w = rowW - Metric.s2 - callBtn.frame.width
-          x.setFrameSize(NSSize(width: w, height: hh))
-          nameField.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
-                                   width: w - Metric.s4 * 2, height: 19)
-          callBtn.setFrameOrigin(NSPoint(x: x.frame.maxX + Metric.s2, y: y))
-        }
-        if x === title || x === sub { y -= (x === sub ? Metric.s3 : 0) }
         x.needsDisplay = true
       }
       // The hint pill sits over the picture ABOVE the card, and the card's height
@@ -1153,6 +1141,13 @@ enum Launcher {
       // pinned to the card's edge it sat ON the first row's face the moment the
       // card grew a tall mode. Clamped to the edge from below so a card that
       // fills the window cannot push the sentence off the top.
+      // Top-right of the WINDOW, where the call window keeps its own `…`, and
+      // clear of the traffic lights on the left. Pinned to the window rather
+      // than to the card so it does not travel every time the card changes
+      // height -- a control that moves when the content moves is a control you
+      // have to find again.
+      moreBtn.setFrameOrigin(NSPoint(x: W - Metric.gutter - moreBtn.frame.width,
+                                     y: H - Metric.gutter - moreBtn.frame.height))
       hintY = max(card.frame.maxY + Metric.s8,
                   card.frame.maxY + (H - card.frame.maxY - Metric.pillHeight) / 2)
       // The pill is placed by `setHint` AT CALL TIME, and the camera's first
@@ -1165,32 +1160,90 @@ enum Launcher {
       }
       card.needsDisplay = true
       v.needsLayout = true
+      // ── WHAT IS ACTUALLY ON THE CARD, READ OUT ───────────────────────────────
+      //
+      // The card's whole job is to be SHORT -- it floats over the person's own
+      // face, and every row on it is a row of their face it covers. A rig can
+      // photograph the window but cannot say which rows those are, and "the
+      // settings crept back onto the front card" is exactly the drift that
+      // happens one well-meaning row at a time.
+      let names = column.map { x -> String in
+        if x === linkRow { return "link" }
+        if x === fieldBack { return "field" }
+        if x === status { return "status" }
+        if x === mineRow { return "mine" }
+        if x === reachRow { return "reach" }
+        if x === quietRow { return "quiet" }
+        if x === emptyHint { return "empty" }
+        if x is SheetHint { return "hint" }
+        if let c = x as? ContactRow { return "@" + c.handleName }
+        return "?"
+      }
+      fputs("home card [\(t?.settingsOpen == true ? "settings" : "front")]: "
+            + names.joined(separator: " ") + "\n", stderr)
     }
     let relayout = { if animateLayout { Motion.run { layout() } } else { layout() } }
     t.relayout = relayout
 
     // ── WIRING ────────────────────────────────────────────────────────────────
-    join.onPress = { t.go() }
-    newBtn.onPress = { t.suggest() }
-    callBtn.onPress = { t.callTyped() }
-    // Return commits, in whichever field is on screen. `keyEquivalent` belonged to
-    // the buttons this replaced; the field is where Return is actually pressed,
-    // which is one fewer thing to keep in agreement.
-    field.target = t; field.action = #selector(Target.go)
-    nameField.target = t; nameField.action = #selector(Target.callTyped)
-    newRow.target = t; newRow.action = #selector(Target.showName)
-    wordRow.target = t; wordRow.action = #selector(Target.showWord)
-    backRow.target = t; backRow.action = #selector(Target.showPeople)
+    // Return commits the field. `keyEquivalent` belonged to the buttons this
+    // replaced; the field is where Return is actually pressed.
+    field.target = t; field.action = #selector(Target.commit)
     mineRow.target = t; mineRow.action = #selector(Target.copyMine(_:))
     reachRow.target = t
     reachRow.action = #selector(Target.reachable)
-    for r in recentRows {
-      r.target = t
-      r.action = #selector(Target.joinNamed(_:))
-      // Same free time the faces get: the name is knowable the moment the pointer
-      // lands on it, and the room is very likely the one about to be joined.
-      r.onHover = { [weak r] in guard let r else { return }; Warm.room(r.spokenName, why: "hover room") }
+    linkRow.target = t; linkRow.action = #selector(Target.joinClip)
+    moreBtn.target = t; moreBtn.action = #selector(Target.settings)
+    quietRow.target = t; quietRow.action = #selector(Target.quietPressed)
+    // ── A SWITCH THAT MOVES ONLY WHEN THE SERVER SAYS IT DID ─────────────────
+    //
+    // `setQuiet` is an HTTPS round trip and it is the authority: a row that
+    // flipped optimistically would tell somebody they are unreachable while
+    // calls keep arriving, which is the one error in this feature that matters.
+    // So the row says "asking…" and then reports what came back.
+    t.toggleQuiet = { [weak t] in
+      let want = !Identity.quietOn
+      quietRow.value = "asking…"
+      Thread {
+        let ok = Identity.setQuiet(want)
+        let now = Identity.quietOn
+        DispatchQueue.main.async {
+          quietRow.value = now ? "on" : "off"
+          quietHint.setText(ok
+            ? (now ? "Calls to you are quietly declined until you turn this off."
+                   : "People can ring you.")
+            : "Couldn’t reach the server — nothing changed.")
+          fputs("home: quiet asked \(want), server says \(now ? "on" : "off")\n", stderr)
+          t?.relayout()
+        }
+      }.start()
     }
+    // Same free time the faces get: the room is knowable the moment the pointer
+    // lands on the row, and it is very likely the one about to be joined.
+    linkRow.onHover = { [weak t] in if let r = t?.clipRoom { Warm.room(r, why: "hover link") } }
+
+    // ── READING THE CLIPBOARD, AND SAYING SO ON A ROW ────────────────────────
+    //
+    // Checked when the window opens and again whenever the app comes forward --
+    // the only two moments the clipboard can have changed while this screen is
+    // what you see. The row names the room it would join; `clipRoom` is what
+    // fires, so the click always does what the row said.
+    let scanClipboard = { [weak t] in
+      guard let t, !t.ringing else { return }
+      let s = NSPasteboard.general.string(forType: .string) ?? ""
+      let room = Launcher.roomFromLink(s)
+      guard room != t.clipRoom else { return }
+      t.clipRoom = room
+      linkRow.setLabel(room.map { "Join \($0)" } ?? "")
+      fputs("home: clipboard link \(room ?? "none")\n", stderr)
+      t.relayout()
+    }
+    scanClipboard()
+    let clipWatch = NotificationCenter.default.addObserver(
+      forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+        scanClipboard()
+      }
+    defer { NotificationCenter.default.removeObserver(clipWatch) }
     // ── SAYING WHAT HAPPENED, INCLUDING WHEN IT REFUSED ──────────────────────
     //
     // `Watch.install()` returns a SENTENCE, and three of the things it can say are
@@ -1216,6 +1269,13 @@ enum Launcher {
             return
           }
           watchOK = true
+          // It stays on the settings card once it is on, saying so, rather than
+          // vanishing: a row that disappears when it succeeds leaves nowhere to
+          // check the answer later.
+          reachRow.setLabel("People can reach you when Kin is closed")
+          reachRow.value = "on"
+          reachRow.valueIsWord = true
+          reachRow.inert = true
           t?.relayout()
         }
       }.start()
@@ -1247,6 +1307,10 @@ enum Launcher {
     let typing = NotificationCenter.default.addObserver(
       forName: NSControl.textDidChangeNotification, object: field, queue: .main) { _ in
         let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only what would JOIN as a room is worth warming as one: a `-` or `_`
+        // is what routes a committed word to a room, and warming every typed
+        // name would send a request per person whose room this will never be.
+        guard raw.contains("-") || raw.contains("_") else { return }
         guard raw.count >= 3, raw.count <= 64,
               raw.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else { return }
         Warm.room(raw, why: "typed")
@@ -1266,6 +1330,18 @@ enum Launcher {
     Menu.installHome()
     fputs("home: menu ready (\(NSApp.mainMenu?.items.count ?? 0) menus,"
         + " close=\(Menu.find("Close") != nil), quit=\(Menu.find("Quit Kin") != nil))\n", stderr)
+    // ⌘Q goes through `NSApp.terminate`, which never returns to the pump below --
+    // so the un-ring a close performs (see the teardown) has to happen HERE for a
+    // quit, before terminate takes the process. Same cancel, same bounded wait.
+    Menu.onQuit = { [weak t] in
+      guard let t, !t.ringSettled else { return }
+      t.ringGen &+= 1
+      t.ringing = false
+      fputs("home: ring abandoned by quit -- sending bye\n", stderr)
+      pumpAppKit(until: Date().addingTimeInterval(2.5),
+                 while: { !t.ringSettled || t.byeInFlight })
+    }
+    defer { Menu.onQuit = nil }
 
     // ── AND THE KEYBOARD ─────────────────────────────────────────────────────
     //
@@ -1301,18 +1377,28 @@ enum Launcher {
     }
     let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
       guard e.window === w else { return e }
-      let esc = e.keyCode == 53
-      // Esc first and in every mode, including while a field has the caret: it is
-      // the only key this window takes out from under the text editor, and it is
-      // the way out of the one state that has no other one.
-      if esc {
+      let editing = field.currentEditor() != nil
+      // Esc first, including while the field has the caret: it is the only key
+      // this window takes out from under the text editor. In order: a ring in
+      // flight is cancelled, typed text is cleared, a resting caret is released
+      // back to the list. Each press undoes one thing.
+      if e.keyCode == 53 {
         if t.ringing { t.stopRing(); return nil }
-        if t.mode != .people { t.showPeople(); w.makeFirstResponder(nil); return nil }
+        if t.settingsOpen { t.settings(); return nil }
+        if editing, !(field.currentEditor()?.string.isEmpty ?? true) {
+          field.stringValue = ""; field.currentEditor()?.string = ""
+          status.stringValue = ""
+          return nil
+        }
+        if editing { w.makeFirstResponder(nil) }
         return nil
       }
+      // The field's editor keeps every other key: arrows move its caret, Return
+      // fires its action, letters are letters.
+      guard !editing else { return e }
       // Ringing owns the keyboard except for Esc: every other key here starts
       // something, and `Target` refuses all of it anyway.
-      guard !t.ringing, t.mode == .people else { return e }
+      guard !t.ringing else { return e }
       switch e.keyCode {
       case 125: moveSel(1); return nil                                   // down
       case 126: moveSel(-1); return nil                                  // up
@@ -1326,19 +1412,17 @@ enum Launcher {
         return nil
       default: break
       }
-      // A letter at the list means a name. Straight into the mode that takes one,
-      // carrying the character, so typing "m" never costs a click first.
+      // A letter at the list goes into the one field, so typing "m" never costs
+      // a click first.
       guard let ch = e.charactersIgnoringModifiers, let first = ch.first, first.isLetter,
             !e.modifierFlags.contains(.command) else { return e }
       keySel = nil
       paintSel()
-      t.showName()
-      nameField.stringValue = String(first)
-      w.makeFirstResponder(nameField)
+      w.makeFirstResponder(field)
       // The caret AFTER the character, in the live field editor -- `stringValue`
       // is the committed value and the editor is what the next keystroke goes to
       // (`committed-value-is-not-current-value`).
-      if let ed = nameField.currentEditor() {
+      if let ed = field.currentEditor() {
         ed.string = String(first)
         ed.selectedRange = NSRange(location: ed.string.count, length: 0)
       }
@@ -1363,15 +1447,11 @@ enum Launcher {
     // is geometry.
     func rowNamed(_ n: String) -> SheetRow? {
       switch n {
-      case "new": return newRow
-      case "word": return wordRow
-      case "back": return backRow
       case "reach": return reachRow
       case "mine": return mineRow
-      // A recent room is addressed by its own name, exactly as a person is -- the
-      // row's label IS the datum in both cases.
+      case "link": return linkRow
+      case "quiet": return quietRow
       default: return peopleRows.first { $0.handleName == n }
-                  ?? recentRows.first { $0.spokenName == n }
       }
     }
     // ── AND WHAT THE FIRST CLICK WOULD DO, READ OUT RATHER THAN REASONED ABOUT ─
@@ -1383,8 +1463,7 @@ enum Launcher {
     // publishes `firstMouseAt` for the same rule and the same reason.
     var audit: [String] = []
     for r in peopleRows { audit.append("@\(r.handleName)=\(r.acceptsFirstMouse(for: nil))") }
-    for (n, r) in [("new", newRow), ("word", wordRow), ("back", backRow),
-                   ("reach", reachRow), ("mine", mineRow as SheetRow)] {
+    for (n, r) in [("link", linkRow), ("reach", reachRow), ("mine", mineRow as SheetRow)] {
       audit.append("\(n)=\(r.acceptsFirstMouse(for: nil))")
     }
     fputs("home firstmouse " + audit.joined(separator: " ") + "\n", stderr)
@@ -1393,24 +1472,44 @@ enum Launcher {
       // Deferred one turn of the run loop: the pump below has not started, and a
       // press that fires before it does would set `done` on a window that has not
       // drawn once -- which photographs as the app never opening.
-      DispatchQueue.main.async {
-        let bits = token.split(separator: ":", maxSplits: 1).map(String.init)
+      //
+      // A COMMA-SEPARATED SEQUENCE, spaced by `--press-after` seconds -- the same
+      // shape the call window's `--press "?,~,~,?"` already has. One token still
+      // fires immediately, so every existing invocation means what it meant.
+      //
+      // A sequence is the only way to press something while an earlier press is
+      // still working: closing this window while a ring is in flight is a path
+      // with no other rig route, because a global keystroke goes to whatever app
+      // is frontmost -- which in a rig is somebody's own real window.
+      let gap = Double(arg("press-after") ?? "") ?? 0
+      for (n, one) in token.split(separator: ",").map(String.init).enumerated() {
+      DispatchQueue.main.asyncAfter(deadline: .now() + gap * Double(n)) {
+        let bits = one.split(separator: ":", maxSplits: 1).map(String.init)
         switch bits[0] {
-        case "join":
+        // Both verbs land in the one field now -- kept as two names so old rig
+        // invocations still mean what they meant: `join:x` joins x, `type:x`
+        // rings @x. What each does is decided by `commit`'s own routing.
+        case "join", "type":
           if bits.count > 1 { field.stringValue = bits[1] }
-          t.go()
-        case "type":
-          if bits.count > 1 { nameField.stringValue = bits[1] }
-          t.callTyped()
+          t.commit()
+        // Not a row, so `rowNamed` cannot reach it -- through the real button's
+        // target/action, the same edge a click arrives on.
+        case "settings":
+          NSApp.sendAction(moreBtn.action!, to: moreBtn.target, from: moreBtn)
+        // The red button's own path, so what the rig exercises is what a finger
+        // does -- including the pump's exit on `!w.isVisible` and the un-ring
+        // that follows it.
+        case "close": w.performClose(nil)
         default:
           guard let r = rowNamed(bits.count > 1 ? bits[1] : bits[0]),
                 !r.isHidden, let tgt = r.target, let act = r.action else {
-            fputs("press: no row named " + token + " on this screen\n", stderr)
+            fputs("press: no row named " + one + " on this screen\n", stderr)
             return
           }
           NSApp.sendAction(act, to: tgt, from: r)
         }
-        fputs("press: \(token) done -- mode is now \(t.mode)\n", stderr)
+        fputs("press: \(one) done\n", stderr)
+      }
       }
     }
 
@@ -1421,7 +1520,9 @@ enum Launcher {
     // only thing on the card. It is now hidden on the default screen, and AppKit
     // will happily make a hidden text field the first responder: the caret would
     // be in a box nobody can see, and the first thing typed would go into it.
-    w.makeFirstResponder(t.mode == .word ? field : (t.mode == .name ? nameField : nil))
+    // No caret anywhere by default: the list owns the arrows, and the first
+    // letter typed puts itself in the field (see the key monitor).
+    w.makeFirstResponder(nil)
     // ── THE ONE WINDOW IN THIS APP THAT STILL TOOK THE FRONT ─────────────────
     //
     // `Display.open` has had this switch since a rig's ring cards started landing
@@ -1460,6 +1561,26 @@ enum Launcher {
     pumpAppKit(until: .distantFuture, while: { !t.done && w.isVisible })
     t.done = true                                  // they joined, or they closed it
     w.orderOut(nil)
+    // ── CLOSING THE DOOR IS ALSO HANGING UP ──────────────────────────────────
+    //
+    // A ring that has left this Mac is a Mac somewhere else that is RINGING, and
+    // closing this window does not change that: the lease runs 60 s. So a close
+    // (or ⌘Q -- see `Menu.onQuit` below) while a ring is travelling cancels it
+    // the same way Esc does, and then WAITS -- pumping, bounded -- for the POST
+    // to settle and the un-ring to actually leave. An exit that outruns its own
+    // bye told nobody (`execv-discards-unsent-analytics`, the same ending).
+    // `!ringSettled` and not `ringing`: the question is whether the POST is still
+    // in flight, which is the only state where nobody yet knows if a Mac is
+    // ringing. A ring that already came back succeeded (we are walking into that
+    // call) or failed (nothing to un-ring) -- reading `ringing` here called every
+    // successful call an abandoned one.
+    if !t.ringSettled {
+      t.ringGen &+= 1          // the completion's stale branch sends the bye
+      t.ringing = false
+      fputs("home: ring abandoned by close -- sending bye\n", stderr)
+    }
+    pumpAppKit(until: Date().addingTimeInterval(2.5),
+               while: { !t.ringSettled || t.byeInFlight })
     // The dots die with the window: a timer that outlives it would keep asking
     // the server about people whose rows no longer exist.
     presenceTimer?.invalidate()

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.tokkah.kin.FloorTest" tests="12" skipped="0" failures="0" errors="0" timestamp="2026-09-01T02:49:18.550Z" hostname="Deveshs-MacBook-Air.local" time="0.002">
+  <properties/>
+  <testcase name="strictIdleIsSilentUntilVoiceTakesIt" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="backchannelStillReachesThem" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="headphonesAreLeftAlone" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="silentSpeakerIsNotAnEchoPath" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="staleFarEndFallsBackOpen" classname="com.tokkah.kin.FloorTest" time="0.001"/>
+  <testcase name="strictEarClosesOneHopIntoMyTurn" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="bargingInStillWorks" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="idleNextToLiveSpeakerDoesNotTransmit" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="strictOnsetGraceLetsAnInterjectionThrough" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="echoGuardLetsGoAfterTail" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <testcase name="ceilingRescuesHeldDownSpeaker" classname="com.tokkah.kin.FloorTest" time="0.001"/>
+  <testcase name="farPriorReleasesOnlyAfterArming" classname="com.tokkah.kin.FloorTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

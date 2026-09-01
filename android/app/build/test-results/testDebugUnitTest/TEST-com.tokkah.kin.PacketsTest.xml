@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.tokkah.kin.PacketsTest" tests="11" skipped="0" failures="0" errors="0" timestamp="2026-09-01T02:49:18.568Z" hostname="Deveshs-MacBook-Air.local" time="0.01">
+  <properties/>
+  <testcase name="clockUnitsRoundTrip" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="textPacketRoundtripUtf8" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="stunXorMappedAddressParsesByHand" classname="com.tokkah.kin.PacketsTest" time="0.008"/>
+  <testcase name="endProbByteMatchesSwiftRounding" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="handshakeRoundtrip" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="audioHeaderTagBits" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="timeProbeLayoutAndStateBytes" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="constantsMatchNetSwift" classname="com.tokkah.kin.PacketsTest" time="0.001"/>
+  <testcase name="videoHeaderRoundtrip" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="timeSyncTakesMinDelaySampleAndRefusesNegative" classname="com.tokkah.kin.PacketsTest" time="0.0"/>
+  <testcase name="rendezvousParserShapes" classname="com.tokkah.kin.PacketsTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

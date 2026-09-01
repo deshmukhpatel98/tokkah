@@ -138,6 +138,112 @@ else
   say FAIL "empty front door is not the people screen -- $(grep -o 'home: mode.*' "$SP/empty.log" | head -1)"
   fail=1
 fi
+# An empty list has nobody to call, so the one thing that helps is your own name
+# for somebody else to dial. It stays on the FRONT card exactly until the list
+# has somebody in it.
+grep -q "home card \[front\]:.*mine" "$SP/empty.log" \
+  && say OK "empty door still shows your handle" \
+  || { say FAIL "empty door hid the handle: $(grep -o 'home card.*' "$SP/empty.log" | tail -1)"; fail=1; }
+
+# ── THE CARD IS SHORT, AND STAYS SHORT ───────────────────────────────────────
+# This card floats over the person's own face and every row on it covers part of
+# that face -- the report that started this was "I really can't see my face".
+# The front card is the people, the field, and nothing about YOU: the handle, the
+# login item and silent mode live behind the corner button. A rig can photograph
+# the window but cannot say which rows those were, and settings creeping back
+# onto the front card happens one well-meaning row at a time.
+FRONT=$(grep -o 'home card \[front\]: .*' "$SP/home.log" | tail -1 | sed 's/home card \[front\]: //')
+case "$FRONT" in
+  *reach*|*quiet*|*mine*)
+    say FAIL "settings are back on the front card: $FRONT"; fail=1 ;;
+  *"@meera"*"field"*)
+    say OK "front card is people + one field: $FRONT" ;;
+  *) say FAIL "front card is not people + field: $FRONT"; fail=1 ;;
+esac
+
+# ── AND THE SETTINGS THEY MOVED TO ───────────────────────────────────────────
+# A button that opens nothing is the defect this repo keeps finding, so the rig
+# presses it and reads what the card became.
+export TK_KIN_DIR="$SP/kin"
+"$TK" --contacts-fake "arjun,meera,dad" --gui --no-update --no-telemetry \
+  --no-relocate --press settings > "$SP/set.log" 2>&1 & PIDS="$PIDS $!"
+sleep 4
+SWID=$(grep -o "window id [0-9]*" "$SP/set.log" | awk '{print $3}' | tail -1)
+[ -n "$SWID" ] && screencapture -l "$SWID" -x "$SP/settings.png"
+reap
+SET=$(grep -o 'home card \[settings\]: .*' "$SP/set.log" | tail -1 | sed 's/home card \[settings\]: //')
+case "$SET" in
+  *mine*reach*quiet*) say OK "settings card carries all three: $SP/settings.png" ;;
+  "") say FAIL "the settings button opened nothing"; fail=1 ;;
+  *) say FAIL "settings card is missing something: $SET"; fail=1 ;;
+esac
+
+# ── CLOSING THE DOOR MID-RING HAS TO UN-RING THE OTHER MAC ───────────────────
+# Reported: "if I'm calling someone and I close the app, it should close the
+# ringing itself". It did not -- the ring sat in their mailbox on a 60 s lease
+# and their Mac rang for a call nobody was placing. The un-ring is a signed
+# `bye` to the same room, and the ONLY way to see it is from the server's side:
+# a local doorbell that answers a ring slowly, so the POST is genuinely in
+# flight when the window closes, and then records what arrives next.
+#
+# The close is `--press close`, never a synthetic Command-W: a global keystroke
+# goes to whatever app is frontmost, which in a rig is the person's own window.
+BYE="$SP/bye"; mkdir -p "$BYE/kin"
+python3 - "$BYE/kin/identity.json" <<'PY'
+import json, os, base64, sys
+# A claimed handle, so `ring` signs and posts instead of stopping at "no handle
+# yet". The seed is random and the doorbell below verifies nothing.
+json.dump({"seed": base64.b64encode(os.urandom(32)).decode(), "tok": os.urandom(32).hex(),
+           "handle": "rigcaller", "claimed": True, "quiet": False}, open(sys.argv[1], "w"))
+PY
+python3 - > "$BYE/door.log" 2>&1 <<'PY' & PIDS="$PIDS $!"
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import json, time
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get('content-length', 0)))
+        o = json.loads(b or b'{}')
+        kind = o.get('kind', 'ring')
+        print('POST kind=%s room=%s' % (kind, o.get('room')), flush=True)
+        # Three seconds on the ring and none on the bye: the window closes while
+        # the ring is still travelling, which is the whole state under test.
+        if kind == 'ring':
+            time.sleep(3)
+        self.send_response(200)
+        self.send_header('content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{"ok":true,"queued":1,"listening":true}')
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
+    def log_message(self, *a): pass
+class T(ThreadingMixIn, HTTPServer): daemon_threads = True
+T(('127.0.0.1', 8199), H).serve_forever()
+PY
+sleep 1
+TK_KIN_DIR="$BYE/kin" TK_KIN_BASE="http://127.0.0.1:8199" TK_NO_RAISE=1 "$TK" \
+  --contacts-fake "bob" --gui --no-update --no-telemetry --no-relocate --no-rings \
+  --press "bob,close" --press-after 1 > "$BYE/app.log" 2>&1 & PIDS="$PIDS $!"
+sleep 9
+reap
+RANG=$(grep -c "kind=ring" "$BYE/door.log" || true)
+BYES=$(grep -c "kind=bye" "$BYE/door.log" || true)
+RROOM=$(sed -n 's/.*kind=ring room=\(.*\)/\1/p' "$BYE/door.log" | head -1)
+BROOM=$(sed -n 's/.*kind=bye room=\(.*\)/\1/p' "$BYE/door.log" | head -1)
+if [ "$RANG" -ge 1 ] && [ "$BYES" -ge 1 ] && [ -n "$RROOM" ] && [ "$RROOM" = "$BROOM" ]; then
+  say OK "closing mid-ring un-rings them (bye for $BROOM)"
+else
+  say FAIL "no un-ring on close: rings=$RANG byes=$BYES ring-room=$RROOM bye-room=$BROOM"
+  fail=1
+fi
+# And the twin defect the first cut of this shipped: a SUCCESSFUL ring left
+# `ringing` true, so the teardown called every completed call an abandoned one.
+if grep -q "ring abandoned" "$SP/set.log"; then
+  say FAIL "a call that placed fine was logged as abandoned"
+  fail=1
+else
+  say OK "a ring that lands is not called abandoned"
+fi
 
 [ "$fail" = 0 ] && echo "HOME CHECK PASSED" || echo "HOME CHECK FAILED"
 exit "$fail"
