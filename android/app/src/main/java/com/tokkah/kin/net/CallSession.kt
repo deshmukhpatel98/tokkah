@@ -30,6 +30,9 @@ class CallSession(
     val vquality = VQuality()
     val resume: Resume? = store?.let { Resume(it) }
     val telemetry: Telemetry? = store?.let { Telemetry(it) }
+    private val power = Power()
+    @Volatile private var cpuUser = 0.0
+    @Volatile private var cpuSys = 0.0
 
     @Volatile var running = false; private set
     @Volatile var locked: InetSocketAddress? = null; private set
@@ -49,6 +52,17 @@ class CallSession(
 
     var onState: ((String) -> Unit)? = null
     var onPeerVocal: ((Int) -> Unit)? = null
+    /** A word from the quiet side, and whether the recogniser is done with it. */
+    var onText: ((String, Boolean, Boolean) -> Unit)? = null
+    /** The far end's cue level, eased. */
+    val cue = FloorCue()
+
+    /** Text only, never audio: the words cross, the microphone does not. */
+    fun sendText(text: String, final: Boolean, listening: Boolean) {
+        if (ended || !crypto.established) return
+        sendSealed(Wire.packText(text, final, listening))
+    }
+
     /** A whole far-end video frame, reassembled. */
     var onVideoFrame: ((ByteArray, Long) -> Unit)? = null
     /** The far end asked for a keyframe (KMAGIC): make one now. */
@@ -115,6 +129,12 @@ class CallSession(
             lastPlayed = ring.played; lastConceal = ring.concealed
             lastFrames = video.framesOut; lastFrags = video.fragsIn
 
+            cue.vocal = when {
+                peerStatus and Wire.ST_CLAIM != 0 -> 2
+                peerStatus and Wire.ST_BACKCHAN != 0 -> 1
+                else -> 0
+            }
+            cue.step(1f)
             held.beat(concealed, played, frames, frags)
             heldSentence = held.sentence
 
@@ -130,6 +150,7 @@ class CallSession(
                 }
                 callSeconds = ((System.currentTimeMillis() - t0) / 1000).toInt()
                 resume?.touch(locked?.toString())
+                power.sample()?.let { (u, sy) -> cpuUser = u; cpuSys = sy }
                 vquality.tick(callSeconds.toDouble(), 0, concealed, false)
                     ?.let { onQuality?.invoke(it) }
 
@@ -174,6 +195,10 @@ class CallSession(
         "peer_played" to peerPlayed,
         "speakers" to speakers,
         "send_errors" to sendErrors,
+        // Kept apart because they answer different questions: our own
+        // arithmetic, and the kernel carrying our packets.
+        "cpu_usr" to cpuUser,
+        "cpu_sys" to cpuSys,
     )
 
     /**
@@ -365,6 +390,10 @@ class CallSession(
                             sendSealed(Wire.keyframeRequest())
                         }
                     }
+                }
+                Wire.SMAGIC -> {
+                    val t = Wire.parseText(b, n) ?: continue
+                    onText?.invoke(t.text, t.final, t.listening)
                 }
                 Wire.KMAGIC -> onKeyframeRequest?.invoke()
                 Wire.BMAGIC -> { onState?.invoke("peer left"); ended = true }

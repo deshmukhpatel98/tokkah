@@ -29,6 +29,12 @@ class KinState(root: File) {
     /** A call this phone never hung up on. Read once, at the front door. */
     @Volatile var pending: com.tokkah.kin.net.Resume.Live? = null
 
+    val updater = com.tokkah.kin.net.Update(File(File(root, "kin").parentFile, "cache"))
+    @Volatile var ready: com.tokkah.kin.net.Update.Release? = null
+    @Volatile var readyFile: File? = null
+    /** True while a call is running: an update never interrupts one. */
+    @Volatile var inCall = false
+
     @Volatile var people: List<Person> = emptyList()
     @Volatile var incoming: Identity.Ring? = null
     @Volatile var outgoingTo: String? = null
@@ -69,9 +75,26 @@ class KinState(root: File) {
         pending = resume.pending()
         watcher.start()
         refresh()
+        checkForUpdate()
     }
 
     fun stop() = watcher.stop()
+
+    /**
+     * Look for a newer build, verify it, and hold it until the person is not on
+     * a call. An update that interrupts the thing the app exists to do is worse
+     * than an update that waits.
+     */
+    fun checkForUpdate(installed: String = com.tokkah.kin.net.Telemetry.VERSION) {
+        thread(isDaemon = true) {
+            val r = updater.check() ?: return@thread
+            if (!updater.isNewer(r, installed)) return@thread
+            val f = updater.download(r) ?: return@thread
+            ready = r
+            readyFile = f
+            onChanged?.invoke()
+        }
+    }
 
     /** The UI is listening for changes; publish what we already know. */
     fun onChangedReady() { onChanged?.invoke() }

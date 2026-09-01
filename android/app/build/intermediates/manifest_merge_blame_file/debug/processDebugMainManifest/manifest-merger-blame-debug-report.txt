@@ -50,162 +50,182 @@
 29    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 29-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:15:5-81
 29-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:15:22-78
-30
-31    <permission
-31-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:22:5-24:47
-32        android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-32-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:23:9-81
-33        android:protectionLevel="signature" />
-33-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:24:9-44
-34
-35    <uses-permission android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
-35-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:26:5-97
-35-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:26:22-94
-36
-37    <application
-37-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:5-41:19
-38        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
-38-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:28:18-86
-39        android:debuggable="true"
-40        android:extractNativeLibs="false"
-41        android:label="Kin"
-41-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:18-37
-42        android:supportsRtl="true"
-42-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:9-35
-43        android:theme="@android:style/Theme.Material.NoActionBar" >
-43-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:36-93
-44        <activity
-44-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:9-36:20
-45            android:name="com.tokkah.kin.MainActivity"
-45-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:19-47
-46            android:exported="true" >
-46-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:48-71
-47            <intent-filter>
-47-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:13-22:29
-48                <action android:name="android.intent.action.MAIN" />
-48-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:20:17-69
-48-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:20:25-66
-49
-50                <category android:name="android.intent.category.LAUNCHER" />
-50-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:21:17-77
-50-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:21:27-74
-51            </intent-filter>
-52            <intent-filter>
-52-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:23:13-29:29
-53                <action android:name="android.intent.action.VIEW" />
-53-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:24:17-69
-53-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:24:25-66
-54
-55                <category android:name="android.intent.category.DEFAULT" />
-55-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:17-76
-55-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:27-73
-56                <category android:name="android.intent.category.BROWSABLE" />
-56-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:17-78
-56-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:27-75
-57
-58                <data android:scheme="tokkah" />
-58-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:17-49
-58-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:23-46
-59                <data android:scheme="kin" />
-59-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:17-49
-59-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:23-46
-60            </intent-filter>
-61            <intent-filter>
-61-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:30:13-35:29
-62                <action android:name="android.intent.action.VIEW" />
-62-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:24:17-69
-62-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:24:25-66
-63
-64                <category android:name="android.intent.category.DEFAULT" />
-64-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:17-76
-64-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:27-73
-65                <category android:name="android.intent.category.BROWSABLE" />
-65-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:17-78
-65-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:27-75
-66
-67                <data
-67-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:17-49
-68                    android:host="kin.tokkah.com"
-68-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:34:46-75
-69                    android:scheme="https" />
-69-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:23-46
-70            </intent-filter>
-71        </activity>
-72
-73        <service
-73-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:37:9-40:56
-74            android:name="com.tokkah.kin.RingService"
-74-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:38:13-40
-75            android:exported="false"
-75-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:39:13-37
-76            android:foregroundServiceType="dataSync" />
-76-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:40:13-53
-77
-78        <provider
-78-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:24:9-32:20
-79            android:name="androidx.startup.InitializationProvider"
-79-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:25:13-67
-80            android:authorities="com.tokkah.kin.androidx-startup"
-80-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:26:13-68
-81            android:exported="false" >
-81-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:27:13-37
-82            <meta-data
-82-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:29:13-31:52
-83                android:name="androidx.emoji2.text.EmojiCompatInitializer"
-83-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:30:17-75
-84                android:value="androidx.startup" />
-84-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:31:17-49
-85            <meta-data
-85-->[androidx.lifecycle:lifecycle-process:2.8.3] /Users/deveshpatel/.gradle/caches/8.13/transforms/531e51f60f48d41d9849de8aa2e87d01/transformed/lifecycle-process-2.8.3/AndroidManifest.xml:29:13-31:52
-86                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
-86-->[androidx.lifecycle:lifecycle-process:2.8.3] /Users/deveshpatel/.gradle/caches/8.13/transforms/531e51f60f48d41d9849de8aa2e87d01/transformed/lifecycle-process-2.8.3/AndroidManifest.xml:30:17-78
-87                android:value="androidx.startup" />
-87-->[androidx.lifecycle:lifecycle-process:2.8.3] /Users/deveshpatel/.gradle/caches/8.13/transforms/531e51f60f48d41d9849de8aa2e87d01/transformed/lifecycle-process-2.8.3/AndroidManifest.xml:31:17-49
-88            <meta-data
-88-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:29:13-31:52
-89                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
-89-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:30:17-85
-90                android:value="androidx.startup" />
-90-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:31:17-49
-91        </provider>
-92
-93        <receiver
-93-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:34:9-52:20
-94            android:name="androidx.profileinstaller.ProfileInstallReceiver"
-94-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:35:13-76
-95            android:directBootAware="false"
-95-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:36:13-44
-96            android:enabled="true"
-96-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:37:13-35
-97            android:exported="true"
-97-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:38:13-36
-98            android:permission="android.permission.DUMP" >
-98-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:39:13-57
-99            <intent-filter>
-99-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:40:13-42:29
-100                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
-100-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:41:17-91
-100-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:41:25-88
-101            </intent-filter>
-102            <intent-filter>
-102-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:43:13-45:29
-103                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
-103-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:44:17-85
-103-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:44:25-82
-104            </intent-filter>
-105            <intent-filter>
-105-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:46:13-48:29
-106                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
-106-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:47:17-88
-106-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:47:25-85
-107            </intent-filter>
-108            <intent-filter>
-108-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:49:13-51:29
-109                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
-109-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:50:17-95
-109-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:50:25-92
-110            </intent-filter>
-111        </receiver>
-112    </application>
-113
-114</manifest>
+30    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+30-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:5-83
+30-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:22-80
+31
+32    <permission
+32-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:22:5-24:47
+33        android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+33-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:23:9-81
+34        android:protectionLevel="signature" />
+34-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:24:9-44
+35
+36    <uses-permission android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+36-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:26:5-97
+36-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:26:22-94
+37
+38    <application
+38-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:5-51:19
+39        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+39-->[androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:28:18-86
+40        android:debuggable="true"
+41        android:extractNativeLibs="false"
+42        android:label="Kin"
+42-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:18-37
+43        android:supportsRtl="true"
+43-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:9-35
+44        android:theme="@android:style/Theme.Material.NoActionBar" >
+44-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:36-93
+45        <activity
+45-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:9-37:20
+46            android:name="com.tokkah.kin.MainActivity"
+46-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:19-47
+47            android:exported="true" >
+47-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:48-71
+48            <intent-filter>
+48-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:20:13-23:29
+49                <action android:name="android.intent.action.MAIN" />
+49-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:21:17-69
+49-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:21:25-66
+50
+51                <category android:name="android.intent.category.LAUNCHER" />
+51-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:22:17-77
+51-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:22:27-74
+52            </intent-filter>
+53            <intent-filter>
+53-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:24:13-30:29
+54                <action android:name="android.intent.action.VIEW" />
+54-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:17-69
+54-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:25-66
+55
+56                <category android:name="android.intent.category.DEFAULT" />
+56-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:17-76
+56-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:27-73
+57                <category android:name="android.intent.category.BROWSABLE" />
+57-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:17-78
+57-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:27-75
+58
+59                <data android:scheme="tokkah" />
+59-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:17-49
+59-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:23-46
+60                <data android:scheme="kin" />
+60-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:17-49
+60-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:23-46
+61            </intent-filter>
+62            <intent-filter>
+62-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:31:13-36:29
+63                <action android:name="android.intent.action.VIEW" />
+63-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:17-69
+63-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:25:25-66
+64
+65                <category android:name="android.intent.category.DEFAULT" />
+65-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:17-76
+65-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:26:27-73
+66                <category android:name="android.intent.category.BROWSABLE" />
+66-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:17-78
+66-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:27:27-75
+67
+68                <data
+68-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:17-49
+69                    android:host="kin.tokkah.com"
+69-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:35:46-75
+70                    android:scheme="https" />
+70-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:28:23-46
+71            </intent-filter>
+72        </activity>
+73
+74        <provider
+75            android:name="androidx.core.content.FileProvider"
+75-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:39:13-62
+76            android:authorities="com.tokkah.kin.files"
+76-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:40:13-57
+77            android:exported="false"
+77-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:41:13-37
+78            android:grantUriPermissions="true" >
+78-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:42:13-47
+79            <meta-data
+79-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:43:13-45:49
+80                android:name="android.support.FILE_PROVIDER_PATHS"
+80-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:44:17-67
+81                android:resource="@xml/paths" />
+81-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:45:17-46
+82        </provider>
+83
+84        <service
+84-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:47:9-50:56
+85            android:name="com.tokkah.kin.RingService"
+85-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:48:13-40
+86            android:exported="false"
+86-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:49:13-37
+87            android:foregroundServiceType="dataSync" />
+87-->/Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:50:13-53
+88
+89        <provider
+89-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:24:9-32:20
+90            android:name="androidx.startup.InitializationProvider"
+90-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:25:13-67
+91            android:authorities="com.tokkah.kin.androidx-startup"
+91-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:26:13-68
+92            android:exported="false" >
+92-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:27:13-37
+93            <meta-data
+93-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:29:13-31:52
+94                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+94-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:30:17-75
+95                android:value="androidx.startup" />
+95-->[androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:31:17-49
+96            <meta-data
+96-->[androidx.lifecycle:lifecycle-process:2.8.7] /Users/deveshpatel/.gradle/caches/8.13/transforms/17848cd0b603c459d945ddcf36a27877/transformed/lifecycle-process-2.8.7/AndroidManifest.xml:29:13-31:52
+97                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+97-->[androidx.lifecycle:lifecycle-process:2.8.7] /Users/deveshpatel/.gradle/caches/8.13/transforms/17848cd0b603c459d945ddcf36a27877/transformed/lifecycle-process-2.8.7/AndroidManifest.xml:30:17-78
+98                android:value="androidx.startup" />
+98-->[androidx.lifecycle:lifecycle-process:2.8.7] /Users/deveshpatel/.gradle/caches/8.13/transforms/17848cd0b603c459d945ddcf36a27877/transformed/lifecycle-process-2.8.7/AndroidManifest.xml:31:17-49
+99            <meta-data
+99-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:29:13-31:52
+100                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+100-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:30:17-85
+101                android:value="androidx.startup" />
+101-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:31:17-49
+102        </provider>
+103
+104        <receiver
+104-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:34:9-52:20
+105            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+105-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:35:13-76
+106            android:directBootAware="false"
+106-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:36:13-44
+107            android:enabled="true"
+107-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:37:13-35
+108            android:exported="true"
+108-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:38:13-36
+109            android:permission="android.permission.DUMP" >
+109-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:39:13-57
+110            <intent-filter>
+110-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:40:13-42:29
+111                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
+111-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:41:17-91
+111-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:41:25-88
+112            </intent-filter>
+113            <intent-filter>
+113-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:43:13-45:29
+114                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
+114-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:44:17-85
+114-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:44:25-82
+115            </intent-filter>
+116            <intent-filter>
+116-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:46:13-48:29
+117                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
+117-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:47:17-88
+117-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:47:25-85
+118            </intent-filter>
+119            <intent-filter>
+119-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:49:13-51:29
+120                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
+120-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:50:17-95
+120-->[androidx.profileinstaller:profileinstaller:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/e0a43e85e8645980d2bdc5347284e18c/transformed/profileinstaller-1.3.1/AndroidManifest.xml:50:25-92
+121            </intent-filter>
+122        </receiver>
+123    </application>
+124
+125</manifest>

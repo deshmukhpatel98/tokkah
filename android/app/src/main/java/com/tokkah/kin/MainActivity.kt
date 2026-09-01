@@ -81,6 +81,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     var cardBecause by remember { mutableStateOf<String?>(null) }
     var resumeRoom by remember { mutableStateOf<String?>(null) }
     var resumeWho by remember { mutableStateOf("") }
+    var updateVersion by remember { mutableStateOf<String?>(null) }
     var listening by remember {
         mutableStateOf(ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
             .getBoolean("listening", false))
@@ -152,6 +153,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             cardBecause = state.cardBecause
             resumeRoom = state.pending?.room
             resumeWho = state.pending?.who ?: ""
+            updateVersion = state.ready?.version
         }
         state.onCall = { room, who -> join(room, who); state.answered() }
         state.onChangedReady()
@@ -210,6 +212,25 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                 myHandle = myHandle,
                 cameraHint = cameraHint,
                 resumeRoom = resumeRoom?.let { if (resumeWho.isNotEmpty()) "@$resumeWho" else it },
+                updateVersion = updateVersion,
+                onUpdate = {
+                    // The bytes were checked against a signature we control
+                    // before this row ever appeared; the system installer is
+                    // the only thing on Android that can actually replace an
+                    // app, so the last tap is the person's.
+                    state.readyFile?.let { f ->
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            ctx, ctx.packageName + ".files", f,
+                        )
+                        ctx.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "application/vnd.android.package-archive")
+                                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                            },
+                        )
+                    }
+                },
                 pastedLink = null,
                 settingsOpen = settingsOpen,
                 listening = listening,
@@ -268,6 +289,23 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             var peeking by remember { mutableStateOf(false) }
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
+            var caption by remember { mutableStateOf<String?>(null) }
+            var bloom by remember { mutableStateOf<String?>(null) }
+            var cueLevel by remember { mutableStateOf(0f) }
+            var subsRef by remember { mutableStateOf<Subtitles?>(null) }
+
+            DisposableEffect(s) {
+                val subs = Subtitles(ctx, s)
+                subsRef = subs
+                s.onText = { text, final, _ ->
+                    // A short one is the sound somebody makes to stay with you;
+                    // a long one is something they said. The wire does not
+                    // label them, and the length is the honest separator.
+                    if (text.length <= 12 && final) { bloom = text; caption = null }
+                    else { caption = text; bloom = null }
+                }
+                onDispose { subs.stop(); s.onText = null }
+            }
 
             LaunchedEffect(s) {
                 while (true) {
@@ -282,6 +320,14 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     }
                     turn = s.floor.state
                     voicing = s.gate.voicingNow
+                    cueLevel = s.cue.level
+                    // The words cross exactly while the voice cannot: muted by
+                    // hand, or muted by the floor because it is not your turn.
+                    subsRef?.setMuted(muted || s.floor.state == Floor.State.THEIRS)
+                    // Nothing to read once they have stopped: a caption that
+                    // outlives the sentence is furniture over somebody's face.
+                    if (s.cue.idle && caption != null && !voicing) caption = null
+                    if (s.cue.idle) bloom = null
                     delay(100)
                 }
             }
@@ -304,6 +350,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                 onLeave = { leave() },
                 peeking = peeking,
                 onPeek = { peeking = it },
+                caption = caption,
+                bloom = bloom,
+                cueLevel = cueLevel,
                 farVideo = { FarVideo(video) },
                 selfVideo = { if (camGranted) SelfPreview {} },
             )

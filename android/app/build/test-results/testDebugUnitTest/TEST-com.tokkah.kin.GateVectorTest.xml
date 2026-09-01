@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.tokkah.kin.GateVectorTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-01T04:09:23.049Z" hostname="Deveshs-MacBook-Air.local" time="0.029">
+<testsuite name="com.tokkah.kin.GateVectorTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-01T04:21:47.563Z" hostname="Deveshs-MacBook-Air.local" time="0.034">
   <properties/>
-  <testcase name="everyBlockMatchesTheSwiftOriginal" classname="com.tokkah.kin.GateVectorTest" time="0.029"/>
+  <testcase name="everyBlockMatchesTheSwiftOriginal" classname="com.tokkah.kin.GateVectorTest" time="0.034"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>
 </testsuite>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Only the staged update: the installer needs a readable uri, and
+         nothing else in the app's storage should be reachable through it. -->
+    <files-path name="updates" path="cache/" />
+</paths>

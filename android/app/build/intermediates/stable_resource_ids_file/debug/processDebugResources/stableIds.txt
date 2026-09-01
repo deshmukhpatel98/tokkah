@@ -1,3 +1,4 @@
+com.tokkah.kin:xml/paths = 0x7f0b0000
 com.tokkah.kin:styleable/GradientColorItem = 0x7f0a0005
 com.tokkah.kin:styleable/GradientColor = 0x7f0a0004
 com.tokkah.kin:styleable/FontFamily = 0x7f0a0002

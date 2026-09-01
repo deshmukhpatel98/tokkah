@@ -55,6 +55,8 @@ fun HomeScreen(
     myHandle: String,
     cameraHint: String?,
     resumeRoom: String?,
+    updateVersion: String?,
+    onUpdate: () -> Unit,
     pastedLink: String?,
     settingsOpen: Boolean,
     listening: Boolean,
@@ -119,6 +121,11 @@ fun HomeScreen(
                         } else {
                             resumeRoom?.let {
                                 KinRow("Back to $it", detail = "still going", onClick = onResume)
+                            }
+                            // Checked and downloaded already; this row is the
+                            // person's one tap, and it only appears off a call.
+                            updateVersion?.let {
+                                KinRow("Update Kin", detail = it, onClick = onUpdate)
                             }
                             pastedLink?.let {
                                 KinRow("Join $it", detail = "from a link", onClick = { onRoom(it); onJoin() })

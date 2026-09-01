@@ -72,6 +72,9 @@ fun CallScreen(
     onLeave: () -> Unit,
     peeking: Boolean,
     onPeek: (Boolean) -> Unit,
+    caption: String?,
+    bloom: String?,
+    cueLevel: Float,
     farVideo: @Composable () -> Unit,
     selfVideo: @Composable () -> Unit,
 ) {
@@ -148,6 +151,47 @@ fun CallScreen(
                             }
                         }
                     }
+                }
+            }
+
+            // ── THE BLOOM ────────────────────────────────────────────────────
+            //
+            // A listening noise, as a word: brief, large and warm, in the
+            // middle of their face rather than in a caption band. It is not
+            // something to READ — it is the sound somebody makes to say they
+            // are still with you, and it should register the way that does.
+            if (bloom != null) {
+                Text(
+                    bloom, color = Palette.fg.copy(alpha = (0.35f + 0.65f * cueLevel)),
+                    fontSize = Type.bloom.first, fontWeight = Type.bloom.second,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+            }
+
+            // ── THE CAPTION BAND ─────────────────────────────────────────────
+            //
+            // A real utterance from the muted side, revised in place as the
+            // recogniser changes its mind rather than appended to, so a wrong
+            // first guess is corrected instead of stacking up. Sits above the
+            // chrome, because reading competes with listening and this is the
+            // thing you do INSTEAD of hearing them.
+            if (caption != null) {
+                GlassSurface(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(horizontal = Metric.gutter)
+                        .padding(bottom = Metric.control + Metric.s8 + Metric.s5)
+                        .fillMaxWidth(),
+                    radius = Metric.captionRadius,
+                    blurRadius = 22.dp,
+                ) {
+                    Text(
+                        caption, color = Palette.fg,
+                        fontSize = Type.said.first, fontWeight = Type.said.second,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(Metric.s4),
+                    )
                 }
             }
 
