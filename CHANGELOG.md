@@ -5,6 +5,35 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.122.0 — 2026-09-01
+
+### Added — you can answer a call without a mouse
+
+A ringing call could only be answered by clicking it. Return answers now and
+Escape declines, and the two are guarded differently on purpose:
+
+- **Escape ends something.** The worst a stray one can do is refuse a call, which
+  the caller sees and can repeat. No waiting period.
+- **Return starts a camera and a microphone**, and the ring window raises itself
+  in front of whatever somebody was typing in. This project has already had that
+  accident with the mouse — real trackpad taps answered Kin calls because the card
+  arrived under a finger that was already moving. So a Return inside the first
+  **600 ms** of a ring is refused and says why.
+
+Both halves are tested, because a defence whose passing half cannot be exercised
+is one nobody has seen work. `window.isKeyWindow` was in that condition and came
+out again: it adds nothing in production — a keyDown only reaches this app while
+it is frontmost — and it made the guard untestable, since every rig here parks its
+window so it never takes the front.
+
+The keys reach the app through `NSApp.postEvent`, this process's own queue, so
+they travel the path a real keystroke travels. Two other mechanisms were wrong
+first: `window.sendEvent` does not pass through `addLocalMonitorForEvents`, which
+is where the call window's key handling lives, so a press sent that way tests
+nothing at all; and `CGEvent.post` is a **global** keystroke, which this project
+has a law against — it hits whatever is frontmost, and it once quit the user's
+browser and their editor.
+
 ## Kin 0.121.0 — 2026-09-01
 
 ### Fixed — a denied microphone was completely invisible

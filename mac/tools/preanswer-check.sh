@@ -271,6 +271,79 @@ grep -q "ignored a click nobody aimed" "$SP/d.log" \
   || say "OK" "CONTROL: the real answer press went through, so it discriminates"
 
 [ "$fail" = 0 ]; then
+# ════════════════════════════════════════════════════════════════════════════
+# ── AND YOU CAN ANSWER IT WITHOUT A MOUSE ───────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#
+# A ringing call could only be answered by clicking it. That is a gap on a Mac --
+# Return answers in FaceTime -- and a wall for anybody who does not use a
+# trackpad. Return answers now and Escape declines, and the two are guarded
+# differently on purpose:
+#
+#   Escape ends something. The worst a stray one can do is refuse a call, which
+#   the caller sees and can repeat.
+#
+#   Return STARTS A CAMERA AND A MICROPHONE, and the ring window raises itself in
+#   front of whatever somebody was typing in. This project has already had that
+#   accident with the mouse -- real trackpad taps answered Kin calls because the
+#   card arrived under a finger already moving. So a Return is refused for the
+#   first 600 ms of a ring, and both halves of that are tested here: a defence
+#   that only ever runs in production is a defence nobody has seen work.
+#
+# The keys go through `NSApp.postEvent`, this process's own queue, so they travel
+# the path a real keystroke travels and cannot reach any other app.
+echo "── the keyboard: Return answers, Escape declines, and neither is a hair trigger"
+RK="preans$$k"
+spawn "$TK" --window --room "$RK" --listen 8027 --peer 127.0.0.1:8028 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --calling tester > "$SP/k1.log" 2>&1
+perl -e 'select undef,undef,undef,2'
+# `--press-after 0.2` puts the first Return inside the 600 ms window; the second,
+# a token later, lands well outside it.
+spawn "$TK" --window --room "$RK" --listen 8028 --peer 127.0.0.1:8027 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --incoming somebody --incoming-key "$KEY" --press-after 0.2 \
+      --press "key:return,?,key:return,?" > "$SP/k2.log" 2>&1
+perl -e 'select undef,undef,undef,12'
+reap
+K="$SP/k2.log"
+grep -q "ring: Return ignored" "$K" \
+  && say OK "a Return in the first 600 ms is refused, and says why" \
+  || { say FAIL "an immediate Return was accepted -- a keystroke already in flight"
+       say FAIL "  when the card appeared would answer a call"; fail=1; }
+grep -q "ring: answered from the keyboard" "$K" \
+  && say OK "and a Return after that answers" \
+  || { say FAIL "Return never answered the call:"
+       grep -E "^ring:|^key " "$K" | tail -3 | sed 's/^/         /'; fail=1; }
+# ── AND IT REALLY ANSWERED, WHICH IS NOT WHAT THE CARD SAYS ─────────────────
+#
+# The obvious assertion -- the ring card is gone -- is the wrong one, and it fails
+# on a build that works. Answering RE-EXECS this process (the callee walks into
+# the call as a new image), so the card state after the press belongs to a process
+# that is on its way out; the last `card=` in the log is from before the handover.
+# What proves an answer is the handover itself.
+grep -qE "re-exec|reexec|answering|joining" "$K" \
+  && say OK "and the answer really started the handover into the call" \
+  || { say FAIL "Return logged an answer and nothing followed it:"
+       tail -4 "$K" | cut -c1-100 | sed 's/^/         /'; fail=1; }
+
+# ── AND ESCAPE DECLINES ─────────────────────────────────────────────────────
+RE="preans$$e"
+spawn "$TK" --window --room "$RE" --listen 8029 --peer 127.0.0.1:8030 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --calling tester > "$SP/e1.log" 2>&1
+perl -e 'select undef,undef,undef,2'
+spawn "$TK" --window --room "$RE" --listen 8030 --peer 127.0.0.1:8029 --video off \
+      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --incoming somebody --incoming-key "$KEY" --press-after 2 \
+      --press "key:esc" > "$SP/e2.log" 2>&1
+perl -e 'select undef,undef,undef,8'
+reap
+grep -q "ring: declined from the keyboard" "$SP/e2.log" \
+  && say OK "Escape declines, with no waiting period" \
+  || { say FAIL "Escape did not decline the call:"
+       grep -E "^ring:|^key " "$SP/e2.log" | tail -3 | sed 's/^/         /'; fail=1; }
+
   echo "PRE-ANSWER CHECK PASSED -- a ring asks, and only an answer starts a call"
 else
   echo "PRE-ANSWER CHECK FAILED -- see above; logs in $SP"

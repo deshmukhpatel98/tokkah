@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.121.0"
+let VERSION = "0.122.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -2298,6 +2298,39 @@ if let seq = arg("press"), let afterS = arg("press-after"), let after = Double(a
         // now, and `tools/glass-check.sh` holds them to it.
         for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
         fputs("audit state \(display?.controls?.describeTree ?? "-")\n", stderr)
+      } else if token.hasPrefix("key:") {
+        // ── A REAL KEY, INTO THIS APP'S OWN QUEUE ─────────────────────────────
+        //
+        // `key:return`, `key:esc`. Two mechanisms were wrong before this one.
+        // `window.sendEvent` does not pass through `addLocalMonitorForEvents`,
+        // which is where the call window's key handling lives, so a press sent
+        // that way tests nothing. And `CGEvent.post` is a GLOBAL keystroke, which
+        // this project has a law against in capital letters: it hits whatever is
+        // frontmost, and it once quit the user's browser and their editor.
+        //
+        // `NSApp.postEvent` puts it in THIS process's queue, so it travels the
+        // path a real keystroke travels -- monitors, responder chain, menu key
+        // equivalents -- and cannot reach any other app.
+        let name = String(token.dropFirst(4)).lowercased()
+        let codes: [String: UInt16] = ["return": 36, "enter": 76, "esc": 53,
+                                       "escape": 53, "tab": 48, "space": 49]
+        guard let code = codes[name] else {
+          fputs("key: no such key \(name) -- have \(codes.keys.sorted().joined(separator: " "))\n",
+                stderr)
+          return
+        }
+        let chars = code == 36 || code == 76 ? "\r" : (code == 53 ? "\u{1b}" : " ")
+        if let win = display?.callWindow ?? NSApp.windows.first,
+           let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                    timestamp: ProcessInfo.processInfo.systemUptime,
+                                    windowNumber: win.windowNumber, context: nil,
+                                    characters: chars, charactersIgnoringModifiers: chars,
+                                    isARepeat: false, keyCode: code) {
+          NSApp.postEvent(e, atStart: false)
+          fputs("key \(name): posted -> \(display?.controls?.describeTree ?? "-")\n", stderr)
+        } else {
+          fputs("key \(name): no window to post into\n", stderr)
+        }
       } else if token.hasPrefix("utter:") {
         // The words a rig puts in this Mac's mouth. Straight into the recogniser's
         // own callback, so the send gate below decides its fate exactly as it

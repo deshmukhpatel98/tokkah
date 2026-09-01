@@ -2049,8 +2049,13 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
   /// Somebody is ringing. Set to switch the card from "invite" to "answer".
   private(set) var incoming: (from: String, room: String)?
 
+  /// When the ring card appeared. Read by the keyboard path -- see
+  /// `CallControls.handleKey`.
+  private(set) var ringingSince: Date?
+
   func setIncoming(from: String, room: String) {
     incoming = (from, room)
+    ringingSince = Date()
     face.handle = from
     // ── THE SENTENCE UNDER IT IS GONE, ON BOTH SIDES ─────────────────────────
     //
@@ -6005,6 +6010,54 @@ final class CallControls: NSView {
     // carries on to whoever it belonged to whatever happens here.
     nudgeBar()
     let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    // ── ANSWERING WITHOUT A MOUSE ─────────────────────────────────────────────
+    //
+    // A call could only be answered by clicking, which is a gap on a Mac (Return
+    // answers in FaceTime) and a wall for anyone who does not use a trackpad.
+    //
+    // Return is guarded and Escape is not, and the asymmetry is the whole design.
+    // Declining ends something: the worst a stray Escape can do is refuse a call,
+    // which the caller sees and can repeat. Answering STARTS A CAMERA AND A
+    // MICROPHONE, and this window raises itself in front of whatever somebody was
+    // typing in -- the exact accident this project has already had with the mouse,
+    // where "real trackpad taps ANSWERED Kin calls" because the ring window
+    // arrived under a finger that was already moving. A keystroke in flight when
+    // the card appears must not be the thing that opens a camera.
+    //
+    // 600 ms is longer than the gap between deciding to press a key and pressing
+    // it, and far shorter than the time it takes to read a name and choose. The
+    // window is also required to be KEY: a ring that has not been brought forward
+    // is not one somebody is looking at.
+    if !waiting.isHidden, waiting.mode == .ringing {
+      // ── THE AGE IS THE GUARD, AND IT IS THE ONLY ONE ────────────────────────
+      //
+      // `window.isKeyWindow` was in this condition too and came out again. It adds
+      // nothing in production -- a keyDown only reaches this app's monitor while
+      // the app is frontmost, and a window that is not key cannot be the one
+      // receiving it -- and it made the defence UNTESTABLE: every rig here parks
+      // its window with `TK_NO_RAISE` precisely so it never takes the front, so the
+      // guard could only ever be observed refusing. A defence whose passing half
+      // cannot be exercised is one nobody has seen work
+      // (`handler-tests-cannot-see-interaction-bugs`).
+      let age = waiting.ringingSince.map { Date().timeIntervalSince($0) } ?? 0
+      if event.keyCode == 36 || event.keyCode == 76 {           // return / enter
+        guard age >= 0.6 else {
+          fputs("ring: Return ignored -- the card is only \(Int(age * 1000)) ms old."
+              + " A key already travelling must not answer a call.\n", stderr)
+          return true
+        }
+        fputs("ring: answered from the keyboard (Return, card \(Int(age * 1000)) ms old)\n", stderr)
+        Metrics.count("answer_key")
+        waiting.onAnswer?()
+        return true
+      }
+      if event.keyCode == 53 {                                  // esc
+        fputs("ring: declined from the keyboard (Escape)\n", stderr)
+        Metrics.count("decline_key")
+        waiting.onDecline?()
+        return true
+      }
+    }
     if event.keyCode == 53 {  // esc
       guard moreOpen || leaveArmed else { return false }
       closeMore(); cancelLeaveConfirm(); nudgeBar()
