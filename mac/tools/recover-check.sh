@@ -135,6 +135,19 @@ OUTRECV="$(grep -oE "recv [0-9]+/s" "$SP/a.log" | tail -1 | grep -oE '[0-9]+')"
 #
 # So it is asserted, on the log line AND on the status field, because the line
 # proves the decision and the field proves a person can see it.
+# ── POLL FOR THE SENTENCE, DO NOT SAMPLE FOR IT ─────────────────────────────
+#
+# The detector fires three seconds into the silence, and this arm used to look for
+# it once, at whatever moment `nap` happened to land on. Moving the outage window
+# (so the call is healthy first) moved the sentence too, and the single sample
+# then landed just before it: "A said nothing during a total outage" about a build
+# that says it every time. Same shape as every other fixed sleep this suite has
+# had to delete -- the thing being waited for is the thing to wait on.
+W=0
+while [ "$W" -lt 60 ]; do                    # up to 12 s, well inside the outage
+  grep -qE "telling them: reconnecting" "$SP/a.log" && break
+  nap 0.2; W=$(( W + 1 ))
+done
 if grep -qE "telling them: reconnecting" "$SP/a.log"; then
   say OK "and A says so: the silence detector fired and set the status"
   grep -qE "status=reconnecting" "$SP/a.log" \

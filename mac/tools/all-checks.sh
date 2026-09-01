@@ -54,7 +54,7 @@ if [ -z "${ALL_CHECKS_HOME:-}" ]; then
   ALL_CHECKS_HOME="$(cd "$(dirname "$0")/.." && pwd)"
   export ALL_CHECKS_HOME
   FROZEN="${TMPDIR:-/tmp}/all-checks.frozen.$$.sh"
-  cp "$0" "$FROZEN"
+  [ "$0" = "$FROZEN" ] || cp -f "$0" "$FROZEN" 2>/dev/null
   exec bash "$FROZEN" "$@"
 fi
 cd "$ALL_CHECKS_HOME"
@@ -71,7 +71,7 @@ cd "$ALL_CHECKS_HOME"
 # directory and the file on disk is then free to change.
 if [ -z "${ALL_CHECKS_FROZEN:-}" ]; then
   FROZEN="${TMPDIR:-/tmp}/all-checks.frozen.$$.sh"
-  cp "$0" "$FROZEN"
+  [ "$0" = "$FROZEN" ] || cp -f "$0" "$FROZEN" 2>/dev/null
   export ALL_CHECKS_FROZEN=1
   exec bash "$FROZEN" "$@"
 fi
@@ -105,7 +105,7 @@ export TK_NO_RAISE=1
 # `predict-live-check` is two 40-second calls of real speech through the real
 # audio path, and its verdict is a count and a number of milliseconds saved, so it
 # belongs alone with the rest of the timing work.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check floor-check"
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check liveupdate-check floor-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
 # ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
 #
@@ -118,7 +118,12 @@ LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-chec
 LANE_SLOW="predict-check"
 # Parallel-safe lanes.
 LANE_STATE="permissions-check firstrun-ring-check relaunch-check watch-check update-check doorbell-check cancelrace-check"
-LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check liveupdate-check controls-check beat-check crash-check seal-check"
+# `liveupdate-check` moved OUT of this lane. Its verdict is "cost of taking an
+# update mid-call, measured at the far end: 1081 ms of media" and "4 of their last
+# 6 reports had media" -- a latency and a rate, which by the rule at the top of
+# this file means it is measuring the machine as much as the build. It failed
+# twice in the parallel lane and passed every time it was run alone.
+LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check controls-check beat-check crash-check seal-check"
 
 # The two whose whole cost is a real-time pass over real speech. `predict-check`
 # feeds 600 s of recording at 1x on purpose -- the recogniser's partials arrive
