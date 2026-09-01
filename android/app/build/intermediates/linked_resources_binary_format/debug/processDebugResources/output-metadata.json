@@ -11,8 +11,8 @@
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 4,
-      "versionName": "0.113.0-android.4",
+      "versionCode": 5,
+      "versionName": "0.114.0-android.5",
       "outputFile": "linked-resources-binary-format-debug.ap_"
     }
   ],

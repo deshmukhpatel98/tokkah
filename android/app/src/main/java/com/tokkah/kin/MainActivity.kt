@@ -121,6 +121,11 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         a.start()
         val v = VideoDevice(ctx, s)
         s.onKeyframeRequest = { v.requestKeyframe() }
+        val geo = Geo(ctx)
+        s.onTransportLock = {
+            geo.onTransportLock()
+            s.geoLat = geo.lat; s.geoLon = geo.lon; s.geoErr = geo.err
+        }
         // Their picture, but only when the call knows WHO it is with: a face
         // filed under a room name would surface under whoever uses that word
         // next.

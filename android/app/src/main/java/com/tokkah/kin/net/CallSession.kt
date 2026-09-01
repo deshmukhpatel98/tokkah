@@ -32,6 +32,7 @@ class CallSession(
     val telemetry: Telemetry? = store?.let { Telemetry(it) }
     private val power = Power()
     val aec = Aec()
+    val predict = Predict()
 
     /**
      * The camera's verdict about THIS end. Only ever WITHDRAWS the echo veto:
@@ -80,6 +81,7 @@ class CallSession(
     /** Text only, never audio: the words cross, the microphone does not. */
     fun sendText(text: String, final: Boolean, listening: Boolean) {
         if (ended || !crypto.established) return
+        predict.noteText(text, System.currentTimeMillis().toDouble())
         sendSealed(Wire.packText(text, final, listening))
     }
 
@@ -171,6 +173,7 @@ class CallSession(
                     // an empty room.
                     resume?.begin(room, s.localPort, locked?.toString() ?: "",
                         who, telemetry?.call ?: "")
+                    onTransportLock?.invoke()
                 }
                 callSeconds = ((System.currentTimeMillis() - t0) / 1000).toInt()
                 resume?.touch(locked?.toString())
@@ -188,6 +191,11 @@ class CallSession(
     }
 
     var onQuality: ((Double) -> Unit)? = null
+    /** Fired once, when the transport locks: the only moment geo may be taken. */
+    var onTransportLock: (() -> Unit)? = null
+    @Volatile var geoLat: Double? = null
+    @Volatile var geoLon: Double? = null
+    @Volatile var geoErr: String? = null
 
     /** Never the room name: it is the encryption salt and never leaves here. */
     fun beatFields(): Map<String, Any?> = mapOf(
@@ -223,6 +231,14 @@ class CallSession(
         "aec_diverges" to aec.diverges,
         "seen_talking" to peerSeenTalkingSeen,
         "visual_known" to visualKnown,
+        "end_prob" to predict.probability(System.currentTimeMillis().toDouble()),
+        "pred_syntax" to predict.lastSyntax,
+        "pred_fall" to predict.lastFall,
+        "geo_lat" to geoLat,
+        "geo_lon" to geoLon,
+        // An absent number that cannot be told from "never asked" is a blind
+        // instrument reporting a negative.
+        "geo_err" to geoErr,
         "send_errors" to sendErrors,
         // Kept apart because they answer different questions: our own
         // arithmetic, and the kernel carrying our packets.
@@ -318,7 +334,10 @@ class CallSession(
         if (visualKnown && visualVoice) status = status or Wire.ST_SEEN_TALKING
         if (!camOn) status = status or Wire.ST_CAMOFF
         r.status = status
-        r.endProbByte = 0
+        // Computed where the words are, applied where the gate is. Zero is what
+        // an older build writes, and zero changes nothing.
+        r.endProbByte = Wire.endProbByte(
+            predict.probability(System.currentTimeMillis().toDouble()))
         return r
     }
 
@@ -463,6 +482,11 @@ class CallSession(
         }
         // The mouth outranks the correlation, and in one direction only.
         gate.mouthSays = visualKnown && visualVoice
+        // The prior is computed on THIS machine's own voice, and travels: it
+        // is applied where the gate is, which is the far end's floor.
+        var sum = 0.0
+        for (i in 0 until n) sum += x[i].toDouble() * x[i]
+        predict.noteLoud(kotlin.math.sqrt(sum / n).toFloat())
         gate.process(x, n)
         floor.speakers = speakers
         floor.nearVisualVoice = visualKnown && visualVoice

@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.tokkah.kin"
-    android:versionCode="4"
-    android:versionName="0.113.0-android.4" >
+    android:versionCode="5"
+    android:versionName="0.114.0-android.5" >
 
     <uses-sdk
         android:minSdkVersion="29"
@@ -18,6 +18,11 @@
 
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!--
+         One coarse fix, after a call locks, rounded to ~1.1 km. Optional:
+         the app works exactly the same without it.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
