@@ -457,11 +457,29 @@ echo "── 6-7. LIVE: a real gate on a real call, and the arm that must not mo
 # changes a THRESHOLD and not a decision -- the same class of rig override as
 # TK_CAPTION_SCALE. The control arm below gets the identical margin and differs
 # only in the two switches that can hold a microphone, and nothing else.
+# ── AND THE FAR END ACTUALLY SPEAKS ─────────────────────────────────────────
+#
+# These arms have been skipping themselves for as long as they have existed:
+# "the live arms had no stimulus: the far end vocalised 0 times, so nothing could
+# hold this end. Speak near the Mac while this runs, then believe it." They put
+# TEXT into the recogniser with `utter:` and no sound anywhere, so the floor -- a
+# thing driven by voice -- had nothing to react to. Three arms that report an
+# honest SKIP are three arms nobody has ever seen pass.
+#
+# `--audio <wav>` replaces the microphone on a live call, which is what the far
+# end needed all along: a real voice, from a real recording, through the real
+# capture path. The `utter:` stays, because the text half feeds the turn
+# predictor and the two are different inputs.
+LIVE_WAV=""
+for d in ../testbed/media/real ../testbed/peer/media testbed/media/real; do
+  [ -f "$d/realB.wav" ] && { LIVE_WAV="$d/realB.wav"; break; }
+done
 live() {   # $1 = name, $2 = extra flags, $3/$4 = ports
   reap
   spawn "$TK" $C $2 --room "flr$$$1" --listen "$3" --peer "127.0.0.1:$4" \
         > "$SP/$1-a.log" 2>&1
   spawn "$TK" $C $2 --room "flr$$$1" --listen "$4" --peer "127.0.0.1:$3" \
+        ${LIVE_WAV:+--audio "$LIVE_WAV"} \
         --press "utter:so_the_thing_about_a_call_is_you_never_know_whose_turn_it_is" \
         --press-after 8 > "$SP/$1-b.log" 2>&1
   perl -e 'select undef,undef,undef,22'
@@ -695,6 +713,93 @@ FLOOR2="$(grep -oE 'floor: yours .*' "$SP/gate-b.log" | tail -1)"
 
 echo
 if [ "$fail" = 0 ]; then
+# ════════════════════════════════════════════════════════════════════════════
+# ── AND ALL OF IT WITH TWO PEOPLE ACTUALLY TALKING ──────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Every arm above runs with `--mute`. They test the floor's LOGIC -- who holds it,
+# what the state machine does with a bid, what the guard does with an echo -- and
+# not one of them has ever had a voice in it. The floor is the most distinctive
+# thing this app does and its failure modes are all audible: a gate held open by a
+# hot microphone (98% of a call, measured), an idle state that let both mics sit
+# open next to both speakers (~40% of a call), a metric that counted the voice gate
+# and called it the floor. None of those is visible without speech.
+#
+# `--audio <wav>` replaces the microphone on a LIVE call, so this arm is the
+# production capture path, the production wire and the production floor, with two
+# real recordings of two real sides of a conversation. The numbers below are the
+# ones a person would describe: was I heard, and how long did it take.
+echo "── two people actually talking, through the real audio path"
+LIVE_MEDIA=""
+for d in ../testbed/media/real ../testbed/peer/media testbed/media/real; do
+  [ -f "$d/realA.wav" ] && { LIVE_MEDIA="$d"; break; }
+done
+if [ -z "$LIVE_MEDIA" ]; then
+  say "note" "no realA.wav under testbed/ -- skipping the live-speech arm (it is the"
+  say "note" "  only arm here with a voice in it, so this is a real gap, not a pass)"
+else
+  LR="flrlive$$"
+  spawn "$TK" --window --video off --audio "$LIVE_MEDIA/realA.wav" --no-telemetry \
+        --no-update --no-relocate --no-rings --room "$LR" --listen 8341 \
+        --peer 127.0.0.1:8342 > "$SP/live-a.log" 2>&1
+  spawn "$TK" --window --video off --audio "$LIVE_MEDIA/realB.wav" --no-telemetry \
+        --no-update --no-relocate --no-rings --room "$LR" --listen 8342 \
+        --peer 127.0.0.1:8341 > "$SP/live-b.log" 2>&1
+  W=0; V=0
+  while [ "$W" -lt 120 ]; do
+    V="$(grep -oE 'recv [0-9]+/s' "$SP/live-a.log" | tail -1 | grep -oE '[0-9]+')"
+    [ "${V:-0}" -gt 500 ] && break
+    perl -e 'select undef,undef,undef,0.5'; W=$(( W + 1 ))
+  done
+  if [ "${V:-0}" -le 500 ]; then
+    say "note" "the live-speech arm never got a call (recv ${V:-0}/s) -- not asserted"
+  else
+    perl -e 'select undef,undef,undef,45'
+    reap
+    # `N bids (M heard, median X ms to be audible)` -- the sentence the app prints
+    # about itself at the end of every call.
+    bids()   { grep -oE "[0-9]+ bids \([0-9]+ heard" "$1" | tail -1 | grep -oE "^[0-9]+"; }
+    heard()  { grep -oE "[0-9]+ bids \([0-9]+ heard" "$1" | tail -1 | grep -oE "\([0-9]+" | tr -d "("; }
+    ttf()    { grep -oE "median [0-9]+ ms to be audible" "$1" | tail -1 | grep -oE "[0-9]+"; }
+    muted()  { grep -oE "mic muted for the other person [0-9.]+%" "$1" | tail -1 | grep -oE "[0-9.]+"; }
+    alone()  { grep -oE "local gate alone [0-9.]+%" "$1" | tail -1 | grep -oE "[0-9.]+"; }
+    BA="$(bids "$SP/live-a.log")"; BB="$(bids "$SP/live-b.log")"
+    HA="$(heard "$SP/live-a.log")"; HB="$(heard "$SP/live-b.log")"
+    TA="$(ttf "$SP/live-a.log")"; TB="$(ttf "$SP/live-b.log")"
+    MA="$(muted "$SP/live-a.log")"; AL="$(alone "$SP/live-a.log")"
+    # 1. BOTH PEOPLE TALKED. Without this every claim below is about one speaker.
+    if [ "${BA:-0}" -ge 3 ] && [ "${BB:-0}" -ge 3 ]; then
+      say "OK" "both ends bid for the floor (A $BA, B $BB) over 45 s of real speech"
+    else
+      say "FAIL" "only A ${BA:-0} / B ${BB:-0} bids -- one end never spoke, so nothing below holds"
+    fi
+    # 2. AND BOTH WERE HEARD. This is the complaint the floor can cause: you talk
+    #    and the other person never gets it.
+    if [ "${BA:-0}" = "${HA:-x}" ] && [ "${BB:-0}" = "${HB:-x}" ]; then
+      say "OK" "and every bid was heard (A $HA/$BA, B $HB/$BB) -- nobody was cut out"
+    else
+      say "FAIL" "bids that never became audible: A $HA of $BA, B $HB of $BB"
+    fi
+    # 3. AND IMMEDIATELY. The release window is about 400 ms, and the turn
+    #    prediction exists to spend less than that; measured here: 0 ms.
+    if [ "${TA:-9999}" -le 200 ] && [ "${TB:-9999}" -le 200 ]; then
+      say "OK" "and audible almost at once (median A ${TA} ms, B ${TB} ms)"
+    else
+      say "FAIL" "slow to be heard: median A ${TA:-?} ms, B ${TB:-?} ms (want <= 200)"
+    fi
+    # 4. THE TWO ENDS AGREED. "Running on the local gate alone" is the fraction of
+    #    the call where this end had no word from the other about who was talking.
+    python3 -c "import sys; sys.exit(0 if ${AL:-100} <= 5 else 1)" \
+      && say "OK" "and the two ends agreed about who had the floor (alone ${AL}% of the call)" \
+      || say "FAIL" "the ends disagreed for ${AL}% of the call -- each was guessing"
+    # 5. THE BLINDNESS GUARD. If the floor never muted anybody, arms 1-3 pass on a
+    #    build with no floor in it at all.
+    python3 -c "import sys; sys.exit(0 if ${MA:-0} >= 20 else 1)" \
+      && say "OK" "and the floor really was working: this end muted for the other ${MA}% of the call" \
+      || say "FAIL" "the floor muted this end only ${MA:-0}% of the time -- with two people"
+  fi
+fi
+
   echo "FLOOR CHECK PASSED -- nothing is painted on the picture, the microphone button"
   echo "  carries the three states, the green edge is up exactly when this end is"
   echo "  audible, a finger still reaches the button, and a real gate gets to both"
