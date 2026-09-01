@@ -389,6 +389,23 @@ enum Palette {
   static let switchOn = hex(0x30d158)
   static func switchOff() -> NSColor { NSColor(white: 1, alpha: 0.22) }
 
+  // ── A SELECTION THAT CAN BE READ ON DARK GLASS ─────────────────────────────
+  //
+  // The rename page pre-fills the field and selects it, so typing replaces the old
+  // name -- which is the right default and made the one thing in the app you type
+  // into unreadable. Photographed over a bright picture: `devesh`, selected, as
+  // grey letters on a grey block inside a dimmed glass well.
+  //
+  // The system selection is drawn with the accent colour, and the app has no say
+  // in what that is: somebody on a yellow accent gets white text on yellow. So the
+  // field editor is given its own pair, chosen so the arithmetic holds whatever the
+  // person's accent is. #1d4ed8 is relative luminance 0.13; white on it is 7.0:1.
+  static let selectionFill = hex(0x1d4ed8)
+  /// The caret. `Palette.fg` on the well, because a caret the colour of the text is
+  /// what every text field on this machine has -- and on dark glass the system
+  /// default is nearly invisible.
+  static let caret = fg
+
   // ── A PERSON'S COLOUR, DERIVED FROM THEIR NAME ─────────────────────────────
   //
   // A contact has no photograph and never will -- nothing in this app has ever

@@ -62,7 +62,10 @@ export TK_NO_RAISE=1
 # So the rule is not "does it use sockets", it is WHAT THE ASSERTION IS MADE OF.
 # Anything whose verdict is a rate, a percentile, a latency or a per-second count
 # is measuring the machine as much as the build, and belongs alone.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check floor-check"
+# `recover-check` verdicts are packets and playout per second, so it belongs here
+# and not in the parallel lane -- and it was in NO lane at all until this line:
+# written, passing, and run by nobody. `unrun-tests-are-not-coverage`.
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check floor-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
 # ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
 #
@@ -75,7 +78,7 @@ LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-chec
 LANE_SLOW="predict-check"
 # Parallel-safe lanes.
 LANE_STATE="permissions-check firstrun-ring-check relaunch-check watch-check update-check doorbell-check cancelrace-check"
-LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check liveupdate-check controls-check crash-check seal-check"
+LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check liveupdate-check controls-check beat-check crash-check seal-check"
 
 # The two whose whole cost is a real-time pass over real speech. `predict-check`
 # feeds 600 s of recording at 1x on purpose -- the recogniser's partials arrive
@@ -148,12 +151,52 @@ run_lane() {                     # run_lane <name> <checks...>
 # reported "the window was occluded -- nobody could have seen it" with the
 # installed Kin sitting on its home screen. A rig that photographs windows cannot
 # be trusted while another copy of the app has one.
+# ── AND WHAT ARE THEY TESTING? ───────────────────────────────────────────────
+#
+# This runner never built anything. It ran 29 rigs against whatever binaries
+# happened to be in `.build`, and there are TWO of them: 23 of the rigs default to
+# `.build/debug/tk` and 7 to `.build/release/tk`. A session that builds only
+# release therefore runs two thirds of the suite against the LAST RELEASE'S CODE,
+# and every one of those rigs reports PASS about a build that does not contain the
+# change under test.
+#
+# Measured, in the run that found this: `update-check` refused with "the repo
+# binary reports 0.118.0, not 0.119.0" -- the only rig that compares the two --
+# while `doorbell-check` rebuilt the debug binary half way through the same run,
+# so rigs before it and rigs after it were testing different code. A suite that
+# cannot say which build it exercised has no verdict to give.
+#
+# So both are built here, once, before any lane starts, and the versions are
+# printed. Nothing after this point touches the tree -- that is the other half of
+# the rule, and the reason this is the only build in the file.
+echo "== building both binaries (23 rigs use debug, 7 use release) =="
+BUILD_LOG="$OUT/build.log"
+if ! swift build -c release --product tk > "$BUILD_LOG" 2>&1; then
+  echo "RELEASE BUILD FAILED -- nothing below would mean anything:"; tail -20 "$BUILD_LOG"; exit 1
+fi
+if ! swift build --product tk >> "$BUILD_LOG" 2>&1; then
+  echo "DEBUG BUILD FAILED -- nothing below would mean anything:"; tail -20 "$BUILD_LOG"; exit 1
+fi
+RV="$(./.build/release/tk --version 2>/dev/null)"
+DV="$(./.build/debug/tk --version 2>/dev/null)"
+echo "   release $RV   debug $DV"
+[ -n "$RV" ] && [ "$RV" = "$DV" ] \
+  || { echo "THE TWO BINARIES DISAGREE ($RV vs $DV) -- refusing to run a suite"
+       echo "that would report on two different builds."; exit 1; }
+
 if pgrep -f "/Applications/Kin.app/Contents/MacOS/Tokkah" | grep -qv "^$$" 2>/dev/null \
    && pgrep -fl "/Applications/Kin.app/Contents/MacOS/Tokkah" | grep -qv -- "--watch"; then
   echo "NOTE: the installed Kin is open right now (a call or its home screen). Its"
   echo "      window sits in front of the ones these rigs park at the desktop level,"
   echo "      so anything in the photography lane may report an occluded window."
   echo "      That is this Mac, not the build."
+  # AND THE WATCHER LANE, for a different reason: a Kin that is open holds the
+  # ring line, so a rig watcher correctly stands down ("Kin is open and listening
+  # for calls itself") and never opens the copy its arm is about. Measured:
+  # `cancelrace-check` reporting "the watcher never opened Kin" on a Mac whose
+  # owner had the app on screen.
+  echo "      cancelrace-check and doorbell-check may also report COULD NOT RUN:"
+  echo "      an open Kin holds the ring line, so a rig watcher stands down by design."
 fi
 echo "logs: $OUT"
 # ── PHASE 1: the two independent lanes, together ─────────────────────────────

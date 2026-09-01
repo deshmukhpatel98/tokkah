@@ -97,12 +97,27 @@ final class Impair {
   // thing: it is the only test of the other thing.
   private let untilS: Double
   private var healed = false
+  private var announcedStart = false
   private var startedAt: UInt64 = 0
+  // ── AND ONE THAT STARTS GOOD ───────────────────────────────────────────────
+  //
+  // The mirror of `untilS`, and it is not symmetry for its own sake. An
+  // impairment that is on from the first packet means the two ends never had a
+  // working call, so nothing that happens afterwards can be attributed to losing
+  // one -- and a silence detector that reads "time since the last packet from the
+  // peer" has no such time to read, correctly says nothing, and gets recorded as
+  // an app that says nothing during an outage. Measured: exactly that, in
+  // `recover-check` arm A, which then passed.
+  //
+  // `--imp-after 6` gives the call six seconds of health first. The outage is
+  // then an EVENT rather than a condition, which is what wifi actually is.
+  private let afterS: Double
 
   init(dropPct: Double, burstMs: Double, jitterMs: Double,
        delayMs: Double = 0, spikeMs: Double = 0, spikeHz: Double = 0,
-       untilS: Double = 0, capacityMbps: Double = 0) {
+       untilS: Double = 0, afterS: Double = 0, capacityMbps: Double = 0) {
     self.untilS = untilS
+    self.afterS = afterS
     self.capacityMbps = capacityMbps
     self.dropPct = dropPct
     self.burstMs = burstMs
@@ -126,6 +141,20 @@ final class Impair {
     if capacityMbps > 0, bytes > 0, overBudget(bytes) { return true }
     guard dropPct > 0 else { return false }
     let now = Clock.now()
+    // Both clocks run from the first packet, for the same reason: the socket, the
+    // handshake and the first candidate race are not part of what is being
+    // measured. `startedAt` is stamped by the `untilS` branch below when it is
+    // armed, so it is stamped here too when only `afterS` is in play.
+    if afterS > 0 {
+      if startedAt == 0 { startedAt = now }
+      if Clock.msSigned(now, startedAt) < afterS * 1000 { return false }
+      if !announcedStart {
+        announcedStart = true
+        FileHandle.standardError.write(
+          "IMPAIRED: the path is going bad now (\(Int(afterS)) s of health first)\n"
+            .data(using: .utf8)!)
+      }
+    }
     if untilS > 0 {
       // Measured from the first packet, not from process start: the socket, the
       // room and the peer all happen first, and anchoring on launch would spend

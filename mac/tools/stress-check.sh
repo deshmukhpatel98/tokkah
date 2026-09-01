@@ -189,8 +189,23 @@ FAILED=$(grep -c 'audio graph rebuild FAILED' "$D" || true)
 # changing shape is what `Display.resize` exists for, and the far end is a process
 # this rig owns. Sizes chosen to cross the awkward ones -- narrower than the
 # control row, shorter than the sheet.
-echo "── 4. resize the window under a live call"
-run resize "?,~,?,~,?" 6
+# ── 4. THE WINDOW REALLY CHANGES SIZE, WITH THE PANEL OPEN ──────────────────
+#
+# This arm was called "resize the window under a live call" and resized nothing:
+# it waited, audited twice, and its own comment admitted it was about the FAR
+# end's shape changing. Meanwhile the relayout path had a defect that only a real
+# resize could find -- the settings panel drew itself ABOVE the top edge of its
+# own window at any height under about 660 points, putting every setting out of
+# reach -- and it survived thirty rigs because every one of them opens one window
+# and never changes it.
+#
+# So now the window is walked through four sizes while a call is up and the panel
+# is OPEN, which is the hardest case: the panel is the tallest thing in the window
+# and it is sized from its own content. `?` after each size hit-tests everything
+# on screen, and the assertion is that nothing is ever unreachable.
+echo "── 4. resize the window under a live call, with the settings panel open"
+run resize "@more,?,~,?,~,?,~,?" 4 \
+  --window-resize "480x320@7,760x480@11,1280x720@15,520x360@19"
 naptime 6
 WID=$(grep -o "window id [0-9]*" "$SP/resize.log" | awk '{print $3}' | tail -1)
 if [ -n "$WID" ]; then
@@ -206,6 +221,29 @@ R4="$SP/resize.log"
 AUDITS=$(grep -c 'audit state controls' "$R4" || true)
 [ "${AUDITS:-0}" -ge 2 ] && say OK "the overlay kept answering audits through it ($AUDITS)" \
   || { say FAIL "the overlay stopped answering"; fail=1; }
+# THE SIZES REALLY CHANGED. Without this the arm passes on a window that never
+# moved, which is exactly what it used to do.
+SIZES=$(grep -oE 'window: resized to [0-9]+x[0-9]+' "$R4" | awk '{print $4}' | tr '\n' ' ')
+NSIZES=$(echo $SIZES | wc -w | tr -d ' ')
+[ "${NSIZES:-0}" -ge 3 ] \
+  && say OK "the window really changed size $NSIZES times: $SIZES" \
+  || { say FAIL "the window changed size ${NSIZES:-0} times -- this arm resized nothing"; fail=1; }
+# And the smallest one is the one that used to be unreachable.
+echo "$SIZES" | grep -q "480x320" \
+  && say OK "including the smallest window the app will open" \
+  || say note "the 480x320 step did not land (contentMinSize may have raised it)"
+# THE ASSERTION THE DEFECT WOULD HAVE FAILED. Every audit, at every size.
+BAD4=$(grep -cE '^audit FAIL' "$R4" || true)
+[ "${BAD4:-0}" = "0" ] \
+  && say OK "and nothing was unreachable at any of them" \
+  || { say FAIL "$BAD4 controls were unreachable while the window was resized:"
+       grep -E '^audit FAIL' "$R4" | sort -u | head -6 | sed 's/^/         /'; fail=1; }
+# The panel has to still be the panel afterwards: a relayout that empties it
+# would pass the audit above by having nothing to reach.
+ROWS4=$(grep -oE 'sheet=settings\[[^]]*\]' "$R4" | tail -1 | tr '|' '\n' | wc -l | tr -d ' ')
+[ "${ROWS4:-0}" -ge 5 ] \
+  && say OK "and the panel still had $ROWS4 rows in it at the end" \
+  || { say FAIL "the panel had ${ROWS4:-0} rows after the resizes"; fail=1; }
 
 # ── 5. FIVE CALLS, BACK TO BACK ─────────────────────────────────────────────
 #

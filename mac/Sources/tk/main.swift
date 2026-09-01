@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.119.0"
+let VERSION = "0.120.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -114,6 +114,16 @@ if flag("selftest-install") {
 // the answer decides whether an update is allowed to write into this bundle. See
 // `Update.selftestSeal` and `tools/seal-check.sh`.
 if flag("selftest-seal") { Update.selftestSeal() }
+// ── THE BEAT WRITER, CALIBRATED ON WHAT IT MUST REJECT ──────────────────────
+//
+// A guard that has only ever seen good input is a guard nobody has watched work.
+// This one exists because `JSONSerialization` RAISES on a non-finite number --
+// an ObjC exception, uncatchable from Swift -- so the app died at the next beat
+// if any ratio in it divided by zero. The test therefore hands it exactly that,
+// and the pass condition is not "it did not crash": the line has to come back
+// out of the file, parse, and NAME the fields it replaced.
+if flag("selftest-beat") { Telemetry.selftestBeat() }
+if flag("selftest-fit") { Launcher.selftestFit() }
 if flag("backdrop-test") {
   let ok = Backdrop.selftest()
   fputs("backdrop-test: \(ok ? "PASS" : "FAIL")\n", stderr)
@@ -498,7 +508,7 @@ let KNOWN_FLAGS: Set<String> = [
   // NOT come back" -- a rig that cannot run the control is measuring nothing.
   // TK_NO_REJOIN=1 does the same, for a launch with no argv at all.
   "no-rejoin", "resumed",
-  "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until",
+  "no-vpause", "vpause-after", "vpause-quiet", "vpause-test", "imp-until", "imp-after",
   "imp-capacity",
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
@@ -521,7 +531,7 @@ let KNOWN_FLAGS: Set<String> = [
   "predict-test", "predict-wav", "predict-seconds", "predict-model", "predict-usecase",
   "predict-budget", "predict-fast",
   "headphone-test", "route", "contacts-fake", "order-audit",
-  "backdrop-test", "selftest-seal",
+  "backdrop-test", "selftest-seal", "selftest-beat", "selftest-fit", "window-size", "window-resize",
   // Reading what macOS has decided, and opening the exact pane that decides it.
   "permissions", "permissions-open",
   // Running against somebody else's deployment. SELF-HOSTING.md is the walkthrough.
@@ -1424,11 +1434,22 @@ Update.beforeRestart = {
 /// silence" and "the microphone was never allowed" are the same symptom.
 nonisolated(unsafe) var gMicAccess = -1
 switch AVCaptureDevice.authorizationStatus(for: .audio) {
+// ── AND IT SAYS WHEN ──────────────────────────────────────────────────────────
+//
+// `sinceLaunch()` on this line makes it a launch milestone rather than only a
+// state report, and it removes an entire class of rig from the equation:
+// `crash-check` measures what a full crash folder costs a launch, and it was
+// doing it by wrapping the app in `script -q /dev/null` and holding a stopwatch
+// against the pty. Where this suite runs there is no terminal --
+// "script: tcgetattr/ioctl: Operation not supported on socket" -- so it read zero
+// lines, all three arms reported -1, and it took 611 s to say nothing. The
+// process that owns the clock is this one; a reader outside it only needs the
+// number.
 case .authorized:
   gMicAccess = 1
-  fputs("mic: already granted\n", stderr)
+  fputs("mic: already granted at \(sinceLaunch()) ms\n", stderr)
 case .notDetermined:
-  fputs("mic: asking for permission (look for a dialog)\n", stderr)
+  fputs("mic: asking for permission (look for a dialog) at \(sinceLaunch()) ms\n", stderr)
   AVCaptureDevice.requestAccess(for: .audio) { ok in
     gMicAccess = ok ? 1 : 0
     Metrics.count(ok ? "mic_granted" : "mic_denied")
@@ -1960,10 +1981,61 @@ if flag("window") {
       fputs("display: metal unavailable, falling back\n", stderr)
     }
   }
+  // ── THE WINDOW AT A SIZE SOMEBODY DRAGGED IT TO ───────────────────────────
+  //
+  // Every frame in this window is placed by hand in `layout()` and the only size
+  // any rig had ever photographed was 1280x720. `Display.open` now sets a
+  // `contentMinSize` of 480x320 -- chosen because the control row needs 344 pt
+  // before the circles overlap their own gutters -- and a floor nobody has
+  // photographed AT is a floor nobody has checked.
+  //
+  // A rig override, not a product option: nothing in the app reads it, a person
+  // resizes with the corner, and this is how a screenshot of the smallest legal
+  // window gets taken without a hand on the trackpad.
+  // ── AND THE SIZE CHANGING WHILE THE CALL RUNS ────────────────────────────
+  //
+  // `--window-size` photographs one size. `--window-resize 480x320@6,1280x720@12`
+  // walks through several WHILE A CALL IS UP, which is a different question and
+  // the one with a defect behind it: the settings panel drew itself above the top
+  // of its own window at any height under about 660 points, and every rig here
+  // opened one size and never changed it. `stress-check` had an arm called "resize
+  // the window under a live call" that did not resize anything -- it waited and
+  // audited, and the comment admitted it was really about the FAR end's shape
+  // changing. So the relayout path had no test that moved a window at all.
+  //
+  // Times are seconds from launch. A rig override; nothing in the app reads it.
+  if let plan = arg("window-resize") {
+    for step in plan.split(separator: ",") {
+      let bits = step.split(separator: "@")
+      let wh = (bits.first ?? "").split(separator: "x")
+      guard let w = Int(wh.first ?? ""), let h = Int(wh.last ?? ""),
+            let at = Double(bits.count > 1 ? bits[1] : "0") else {
+        fputs("window-resize: cannot read \(step) -- want WxH@seconds\n", stderr)
+        continue
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + at) {
+        guard let win = display?.callWindow else {
+          fputs("window: no window to resize at \(sinceLaunch()) ms\n", stderr); return
+        }
+        win.setContentSize(NSSize(width: w, height: h))
+        // Said out loud with the size the window ACTUALLY took, not the one asked
+        // for: `contentMinSize` is a floor and a rig that prints its request would
+        // report a 200 point window that macOS never made.
+        let got = win.contentRect(forFrameRect: win.frame).size
+        fputs("window: resized to \(Int(got.width))x\(Int(got.height))"
+            + " (asked \(w)x\(h)) at \(sinceLaunch()) ms\n", stderr)
+        display?.controls?.needsLayout = true
+        display?.controls?.layoutSubtreeIfNeeded()
+      }
+    }
+  }
+  let winSize = (arg("window-size") ?? "1280x720").split(separator: "x")
+  let winW = Int(winSize.first ?? "") ?? 1280
+  let winH = Int(winSize.last ?? "") ?? 720
   if mdisplay == nil {
     let d = Display()
     let roomName = arg("room") ?? "direct"
-    d.open(title: "Kin — waiting for the other person", w: 1280, h: 720,
+    d.open(title: "Kin — waiting for the other person", w: winW, h: winH,
            room: roomName,
            onMic: { m in
              gMicMuted = m
@@ -5661,6 +5733,7 @@ let impair = Impair(dropPct: Double(arg("imp-drop") ?? "0") ?? 0,
                     spikeMs: Double(arg("imp-spike") ?? "0") ?? 0,
                     spikeHz: Double(arg("imp-spike-hz") ?? "0.3") ?? 0.3,
                     untilS: Double(arg("imp-until") ?? "0") ?? 0,
+                    afterS: Double(arg("imp-after") ?? "0") ?? 0,
                     capacityMbps: Double(arg("imp-capacity") ?? "0") ?? 0)
 if impair.enabled {
   wire.impair = impair

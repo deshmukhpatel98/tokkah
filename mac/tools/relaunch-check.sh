@@ -112,9 +112,24 @@ cat > "$HOME/Library/LaunchAgents/$LABEL.plist" <<PLIST
 PLIST
 /bin/launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
 /bin/launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null
-perl -e 'select undef,undef,undef,4'
-PID=$(pgrep -f "$SP/Kin.app/Contents/MacOS/Tokkah --watch" | head -1)
-[ -n "$PID" ] || { echo "RELAUNCH CHECK COULD NOT RUN -- the agent never started:"; sed -n '1,6p' "$OUT" 2>/dev/null | sed 's/^/  /'; exit 2; }
+# ── POLL FOR IT, DO NOT SLEEP AT IT ─────────────────────────────────────────
+#
+# This was a flat 4 s followed by one `pgrep`, and it reported "the agent never
+# started" while the agent's own log -- printed by the same message -- showed it
+# had started and got as far as claiming a handle. launchd's bootstrap, a code
+# signature check on a freshly re-signed bundle, and the agent's first network
+# call are not this rig's business and take as long as the machine takes; four
+# other rigs on nine cores make that longer. A precondition that is a race is a
+# precondition that fails on a busy Mac and passes on an idle one.
+PID=""
+for i in $(seq 1 50); do
+  PID=$(pgrep -f "$SP/Kin.app/Contents/MacOS/Tokkah --watch" | head -1)
+  [ -n "$PID" ] && break
+  perl -e 'select undef,undef,undef,0.5'
+done
+[ -n "$PID" ] || { echo "RELAUNCH CHECK COULD NOT RUN -- the agent never started in 25 s:"
+                   /bin/launchctl print "gui/$(id -u)/$LABEL" 2>&1 | grep -E "state|last exit|program" | sed 's/^/  /'
+                   sed -n '1,6p' "$OUT" 2>/dev/null | sed 's/^/  /'; exit 2; }
 echo "agent up as pid $PID"
 BEFORE=$(ls "$SP/crash" 2>/dev/null | wc -l | tr -d ' ')
 

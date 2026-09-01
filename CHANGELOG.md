@@ -5,6 +5,134 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.120.0 — 2026-09-01
+
+### Fixed — the settings panel drew itself above the top of its own window
+
+Photographed at 480x320 — the smallest window Kin will now open — every row of
+the settings panel came back unreachable, at y coordinates of **543, 495, 447,
+399 and 351 in a window 320 points tall**. The panel was laid out with its bottom
+edge pinned to the gutter and its top edge wherever the content wanted: nine rows
+and three hint sentences want 565 points, and nothing in the arithmetic compared
+that to the window. Not one setting was clickable, and there was no scrollbar and
+no clipped edge to say why — the rows were not hidden, they were somewhere a
+mouse cannot go.
+
+It could not have been seen before: all thirty rigs in `mac/tools/` open the
+default window, so the smallest legal size was a floor nobody had ever
+photographed at. `--window-size WxH` exists now for exactly that, and
+`contentMinSize` is 480x320 (the control row needs 344 points).
+
+The panel now takes the room it is given and the content scrolls inside it. No
+scroll view: the rows keep their own frames, so click routing, the hit-test audit
+and `clickTargets` all work unchanged, and the clip is switched on **only** while
+the content overflows — at any ordinary window size the glass is untouched.
+`click("row:…")` scrolls to a row that is out of view before pressing it, which
+is what a person does. Measured at 480x320: **0 unreachable controls**, the panel
+reports `panel=5/12 shown scroll=143/333`, and a click on the scrim still closes
+it.
+
+That last one was a second defect hiding behind the first. The aim point for a
+control is its centre — and at this size the panel covers the centre of the
+window, which is where `scrim` sits. So the audit printed `FAIL scrim` about a
+screen that worked, and `click("scrim")`, the way four rigs close the panel
+between steps, would have silently pressed whichever setting happened to be in
+the middle of the list. One `probeCentre(_:)`, shared by the audit and by `click`.
+
+### Fixed — a NaN in any beat would have killed the app, mid-call
+
+`JSONSerialization.data(withJSONObject:)` does not throw on a non-finite number.
+It raises `NSInvalidArgumentException`, an ObjC exception Swift cannot catch and
+`try?` cannot see:
+
+```
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException',
+    reason: 'Invalid number value (NaN) in JSON write'
+```
+
+Every beat is built from ratios — percentages of a call, per-second rates, ERLE
+in dB, means of a window — and there was not one `isFinite` anywhere on the path.
+Any one of those dividing by a zero denominator (a call with no frames yet, a
+window with nothing in it, a device that never opened) aborted Kin at the next
+beat, from a diagnostic. The guard has to be *before* the call, because there is
+no after. Offenders are now replaced by null, **named** by full path in the beat
+itself, and counted.
+
+### Fixed — a fifth of the app's own record was unreadable
+
+`~/Library/Logs/Kin/beats.ndjson` is the file that answers "what happened on that
+call" an hour later. Read strictly for the first time:
+
+```
+1824 lines, 394 unparseable
+  366  Illegal trailing comma before end of object
+   17  Expecting value        (a line that starts mid-token)
+    9  Extra data             (two records spliced into one line)
+```
+
+Two more faults behind that:
+
+- **A comma too many.** Every strict parser refuses `{"a":1,}`; Apple's does not.
+  `JSONSerialization` **and** `JSONDecoder` both accept it, so the stack that
+  wrote these lines and the stack that would have caught them are the same
+  tolerant one, and the first reader to complain was a person with python. Kin now
+  scans its own output strictly and *repairs* that comma — the record on either
+  side of it is perfectly good — counting the repairs and reporting them in the
+  next beat.
+- **Two Kins, one file, no `O_APPEND`.** The log path is fixed and does not move
+  with `TK_KIN_DIR`; the handle was opened for writing and seeked to the end
+  *once*. A second Kin — a rig, a second install — then wrote at its own advancing
+  offset, straight over the first one's records. That is the spliced and mid-token
+  lines. `O_APPEND` puts every write at the true end under the kernel's own lock.
+
+`tools/beat-check.sh` holds all of it, on a real call's beats rather than a
+fixture, and `--selftest-beat` calibrates the guard on sixteen known answers —
+including the five inputs it must refuse.
+
+### Fixed — the suite tested whatever binaries happened to be lying around
+
+`all-checks.sh` never built anything. 23 of the rigs default to
+`.build/debug/tk` and 7 to `.build/release/tk`, so a session that builds only
+release runs two thirds of the suite **against the last release's code** and every
+one of those rigs reports PASS about a build that does not contain the change
+under test. Caught by the only rig that compares the two — `update-check`,
+refusing with "the repo binary reports 0.118.0, not 0.119.0" — in a run where
+`doorbell-check` rebuilt the debug binary half way through, so rigs before it and
+rigs after it were testing different code. Both binaries are now built once,
+before any lane starts, their versions printed, and a disagreement refuses to run
+the suite at all.
+
+Four rigs that had been reporting COULD NOT RUN, and what was really wrong:
+
+- `relaunch-check` slept a flat 4 s after `launchctl bootstrap` and then pgrepped
+  once, reporting "the agent never started" while the agent's own log — printed by
+  the same message — showed it running. It polls now. **PASSES.**
+- `update-check` was reading a stale debug binary. Fixed by the build step above.
+  **PASSES.**
+- `cancelrace-check` had three faults stacked. Its rig bundle was **not signed at
+  all** (`spctl: rejected, source=no usable signature`), so LaunchServices refused
+  to open it — silently: no process, no crash report, no line in any log, while
+  the watcher had already said "is calling — opening Kin". Its launcher script
+  then exec'd the repo binary *outside* the bundle, which a GUI launch also kills
+  silently. And it timed a startup race with a `-Onone` build. Arm A now runs and
+  proves the three claims that matter: the watcher takes the cancel while it is
+  still the holder, opens no second window for a hang-up, and leaves nothing
+  ringing. The remaining arm needs microphone access for a temporary bundle — a
+  fresh ad-hoc bundle is a new TCC identity — and says so instead of reporting a
+  failure it cannot see.
+- `doorbell-check` still cannot park its launchd job on this Mac. Unfixed, and
+  reported as such.
+
+`recover-check` was written, passing, and **in no lane at all** — run by nobody.
+It is registered now, and two of its assertions were blind: its precondition
+waited on `cap N/s`, this end's *microphone*, which reads 1500/s on a Mac that has
+never exchanged a packet with anyone. So an arm whose impairment began before the
+two ends locked never had a working call to lose, and the rig recorded "A drew no
+warning during the outage" about an app that says **"reconnecting…"** three
+seconds in — it was grepping `warn=` and `poster=`, the video sentences, while the
+app writes `status=`. Both fixed, and `--imp-after` exists so an outage can be an
+event rather than a condition.
+
 ## Kin 0.102.0 — 2026-08-31
 
 ### Added — the camera signal now crosses the wire, and it can beat its own audio

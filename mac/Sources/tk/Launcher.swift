@@ -439,7 +439,32 @@ enum Launcher {
     // a 520 point window -- so the camera preview it floats over was a 110 point
     // strip showing the top of somebody's head. A pane of glass over a face is the
     // composition; a pane of glass with a face peeking out above it is a dialog.
-    let W: CGFloat = 560, H: CGFloat = 660
+    // ── AND IT HAS TO FIT THE SCREEN IT OPENS ON ─────────────────────────────
+    //
+    // 560x660 is the size this card wants, and this window is NOT resizable --
+    // deliberately, because everything in it is laid out by hand at a fixed
+    // width. Those two facts together are a defect on any Mac whose usable
+    // height is under 660 points, and that is not a hypothetical machine: a 13"
+    // Air set to the largest Accessibility text scaling reports about 1024x665,
+    // and the menu bar takes 25 of it. AppKit shrinks a RESIZABLE window to fit
+    // a screen and only MOVES one that is not, so the bottom of this card -- the
+    // invite link and the button that starts a call -- would sit below the screen
+    // with no way to drag it up. The first thing a new user sees, unusable, on a
+    // configuration a person chooses for accessibility reasons.
+    //
+    // Same class as the settings panel that drew above the top of its own window
+    // (0.120.0): a dimension taken from content with nothing comparing it to the
+    // container. The arithmetic is in `fitToScreen` so it can be tested on sizes
+    // this Mac does not have -- a screen nobody here owns is exactly the case
+    // that cannot be photographed.
+    let want = NSSize(width: 560, height: 660)
+    let fit = Launcher.fitToScreen(want: want, screen: NSScreen.main?.visibleFrame.size)
+    let W: CGFloat = fit.width, H: CGFloat = fit.height
+    if fit != want {
+      fputs("home: the screen is \(Int(NSScreen.main?.visibleFrame.height ?? 0)) points"
+          + " tall, so the card opens at \(Int(W))x\(Int(H)) instead of"
+          + " \(Int(want.width))x\(Int(want.height))\n", stderr)
+    }
     let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                      styleMask: [.titled, .closable, .fullSizeContentView],
                      backing: .buffered, defer: false)
@@ -2082,5 +2107,59 @@ enum Launcher {
     // Only reached if execv failed, which means the binary moved underneath us.
     fputs("launch: could not re-exec \(me) (errno \(errno))\n", stderr)
     exit(1)
+  }
+}
+
+
+// ── HOW BIG A FIXED WINDOW MAY BE ────────────────────────────────────────────
+//
+// Separated from the window it sizes for one reason: the interesting inputs are
+// screens this Mac does not have. `--selftest-fit` runs it on five of them,
+// including the two that matter -- a screen shorter than the card, and no screen
+// at all -- per `validate-the-ruler-against-known-inputs`.
+extension Launcher {
+  /// The card's size, reduced to fit `screen` with a margin, never enlarged, and
+  /// never below a floor that still holds the card's content. `nil` screen means
+  /// the question could not be asked, and an unanswerable question must not
+  /// shrink anything -- `blind-instruments-report-negatives`.
+  static func fitToScreen(want: NSSize, screen: NSSize?) -> NSSize {
+    guard let s = screen, s.width > 0, s.height > 0 else { return want }
+    // 24 points of air, so the window is not flush against the dock or the menu
+    // bar, and the traffic lights are not touching the top edge of the screen.
+    let margin: CGFloat = 24
+    let floor = NSSize(width: 420, height: 380)
+    return NSSize(width: max(floor.width, min(want.width, s.width - margin)),
+                  height: max(floor.height, min(want.height, s.height - margin)))
+  }
+
+  /// Five known answers, printed. Two of them are the cases that cannot be
+  /// photographed on the machine this is written on.
+  static func selftestFit() -> Never {
+    var ok = true
+    func say(_ good: Bool, _ what: String) {
+      print("  \(good ? "OK  " : "FAIL") \(what)"); if !good { ok = false }
+    }
+    let want = NSSize(width: 560, height: 660)
+    let big = fitToScreen(want: want, screen: NSSize(width: 1710, height: 1080))
+    say(big == want, "a screen with room to spare changes nothing (\(Int(big.width))x\(Int(big.height)))")
+    // THE CASE THIS EXISTS FOR: a 13" Air at the largest Accessibility text size.
+    let small = fitToScreen(want: want, screen: NSSize(width: 1024, height: 640))
+    say(small.height == 616 && small.width == 560,
+        "a 640 point screen gets a 616 point card, not a 660 point one"
+          + " (\(Int(small.width))x\(Int(small.height)))")
+    say(small.height < 640, "and it fits, which is the whole point")
+    let narrow = fitToScreen(want: want, screen: NSSize(width: 500, height: 900))
+    say(narrow.width == 476, "a narrow screen narrows it too (\(Int(narrow.width)))")
+    let tiny = fitToScreen(want: want, screen: NSSize(width: 200, height: 200))
+    say(tiny.width == 420 && tiny.height == 380,
+        "and an absurd screen stops at the floor rather than at zero"
+          + " (\(Int(tiny.width))x\(Int(tiny.height)))")
+    // AND THE UNANSWERABLE QUESTION. No screen is not a small screen.
+    say(fitToScreen(want: want, screen: nil) == want, "no screen at all changes nothing")
+    say(fitToScreen(want: want, screen: NSSize(width: 0, height: 0)) == want,
+        "and neither does a screen of zero size")
+    print(ok ? "FIT SELFTEST PASSED -- the card fits every screen, including ones this Mac is not"
+             : "FIT SELFTEST FAILED")
+    exit(ok ? 0 : 1)
   }
 }

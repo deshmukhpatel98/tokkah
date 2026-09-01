@@ -557,17 +557,47 @@ reap
 # arms would differ by how much of that had piled up rather than by the folder.
 one() {  # $1 = crash dir -> milliseconds from exec to the microphone check
   rm -rf "$SP/cost-state"; mkdir -p "$SP/cost-state"
-  TK_KIN_DIR="$SP/cost-state" TK_CRASH_DIR="$1" perl -MTime::HiRes=time -e '
-    my $t0 = time;
-    my $pid = open(my $fh, "-|", "script", "-q", "/dev/null", $ARGV[0],
-      "--room", "costcheck" . $$, "--listen", "8103", "--peer", "127.0.0.1:8199",
-      "--video", "off", "--mute", "--no-update", "--no-relocate", "--no-rings",
-      "--no-subtitles", "--tel-endpoint", $ARGV[1]) or die;
-    my $ms = -1;
-    while (<$fh>) { if (/^mic: /) { $ms = (time - $t0) * 1000; last; } }
-    kill "KILL", $pid; close($fh);
-    printf "%.1f\n", $ms;
-  ' -- "$TK" "$ENDPOINT"
+  # ── THE APP TIMES ITSELF ────────────────────────────────────────────────
+  #
+  # Two harnesses failed here before this one, and both failed the same way: they
+  # tried to hold a stopwatch against the app from outside.
+  #
+  #   `script -q /dev/null` -- needs a terminal, and there is none where this
+  #   suite runs ("tcgetattr/ioctl: Operation not supported on socket"). Zero
+  #   lines read, 27 launches, all three arms -1, 611 seconds.
+  #
+  #   perl `open(-|)` + exec -- the child ran for the full timeout and wrote
+  #   nothing at all, not even to a file, while the identical command from a
+  #   shell printed 24 lines in six seconds.
+  #
+  # So the stopwatch moved into the process that owns the clock: the app prints
+  # `mic: ... at N ms`, measured from its own start, and this reads the number.
+  # No pty, no fork, no polling clock, and nothing here can be blind to a line
+  # that is simply written to a file.
+  local log="$SP/cost-run.log"
+  rm -f "$log"
+  TK_KIN_DIR="$SP/cost-state" TK_CRASH_DIR="$1" "$TK" \
+    --room "costcheck$$" --listen 8103 --peer 127.0.0.1:8199 \
+    --video off --mute --no-update --no-relocate --no-rings --no-subtitles \
+    --tel-endpoint "$ENDPOINT" > "$log" 2>&1 &
+  local pid=$!
+  local w=0 ms=-1
+  while [ "$w" -lt 400 ]; do              # 20 s, in 50 ms steps
+    ms="$(grep -oE 'mic: .* at [0-9]+ ms' "$log" 2>/dev/null | grep -oE '[0-9]+ ms$' | grep -oE '[0-9]+')"
+    [ -n "${ms:-}" ] && break
+    kill -0 "$pid" 2>/dev/null || break   # it died; stop waiting for it
+    perl -e 'select undef,undef,undef,0.05'
+    w=$(( w + 1 ))
+  done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  if [ -z "${ms:-}" ]; then
+    echo "  cost arm: no 'mic: ... at N ms' line in $(wc -l < "$log" | tr -d ' ') lines of output" >&2
+    [ -s "$log" ] && sed -n '1,3p' "$log" | sed 's/^/    /' >&2
+    echo "-1.0"
+  else
+    echo "$ms.0"
+  fi
 }
 # THE FLOOR, not the middle. A launch time is the work plus whatever else this
 # Mac happened to be doing, and only the work is common to every sample -- so the

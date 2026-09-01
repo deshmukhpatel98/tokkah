@@ -304,7 +304,23 @@ final class IconButton: NSButton {
   private let ink = Ink()
 
   /// Muted, camera dark, translation off: red glyph plus the slash.
-  var off = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
+  var off = false {
+    didSet {
+      needsDisplay = true; ink.needsDisplay = true
+      // ── A SCREEN READER CANNOT SEE A RED GLYPH ──────────────────────────────
+      //
+      // `setAccessibilityLabel(help)` in `init` gives these buttons a name --
+      // "microphone", "camera", "leave call" -- and that was the whole of it. The
+      // state is drawn: the glyph turns red and gains a slash. So VoiceOver read
+      // "microphone" whether the microphone was live or muted, on the one control
+      // where getting it wrong means talking to somebody who cannot hear you.
+      //
+      // Label is the NAME and value is the STATE, which is the platform's own
+      // division and what every system control does. A word rather than a checkbox
+      // 0/1, because "microphone, checked" does not say which way round that is.
+      setAccessibilityValue(off ? "off" : "on")
+    }
+  }
   /// Active: `box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.35)`.
   var on = false { didSet { needsDisplay = true; ink.needsDisplay = true } }
   // ── HOW MUCH OF THIS CONTROL IS ACTUALLY REACHING THE OTHER PERSON ─────────
@@ -476,6 +492,7 @@ final class IconButton: NSButton {
     title = ""
     toolTip = help
     setAccessibilityLabel(help)
+    setAccessibilityValue("on")
     wantsLayer = true
     glass.frame = NSRect(x: 0, y: 0, width: size, height: size)
     glass.radius = Metric.capsule(size)
@@ -1462,7 +1479,7 @@ final class Face: NSView {
 // gives a field that draws, highlights on hover, and can never be typed into.
 final class SheetField: NSView {
   private let well = Vibrant()
-  let field = NSTextField()
+  let field = Field()
   var onCommit: (() -> Void)?
 
   var text: String {
@@ -1490,6 +1507,55 @@ final class SheetField: NSView {
   required init?(coder: NSCoder) { fatalError() }
 
   @objc private func committed() { onCommit?() }
+
+  // ── THE CARET AND THE SELECTION, WHICH THE APP DOES NOT OWN BY DEFAULT ─────
+  //
+  // An `NSTextField` does not draw its own text while it is being edited: the
+  // window lends it a FIELD EDITOR, a shared `NSTextView`, and that is what owns
+  // the caret colour and the selection colours. So `field.textColor` -- which this
+  // sets correctly -- has no say over either.
+  //
+  // Both were wrong on dark glass and one of them was wrong on every Mac. The
+  // caret is the system default, which is nearly invisible on a dimmed well; and
+  // the selection is drawn with the person's ACCENT COLOUR, which the app has no
+  // control over at all -- somebody on the yellow accent gets white text on
+  // yellow. Photographed over a bright picture, the pre-selected name in the
+  // rename field was grey on grey and simply could not be read.
+  //
+  // ── APPLIED IN `becomeFirstResponder`, WHICH IS WHEN THE EDITOR EXISTS ─────
+  //
+  // The first version of this observed `textDidBeginEditing` and never once took
+  // effect: `editor=selection=system caret=system` in the audit, with the field
+  // focused and an editor present. `becomeFirstResponder` is the documented moment
+  // AppKit installs the field editor, and returning from `super` is the first
+  // instant `currentEditor()` is the object that will do the drawing.
+  //
+  // Per-session rather than once, because the editor is SHARED by every field in
+  // the window: whatever it was last dressed in is what the next field inherits.
+  final class Field: NSTextField {
+    override func becomeFirstResponder() -> Bool {
+      let ok = super.becomeFirstResponder()
+      if ok, let tv = currentEditor() as? NSTextView {
+        tv.insertionPointColor = Palette.caret
+        tv.selectedTextAttributes = [
+          .backgroundColor: Palette.selectionFill,
+          .foregroundColor: NSColor.white,
+        ]
+      }
+      return ok
+    }
+  }
+
+  /// What the field editor is actually dressed in, for the audit. A colour set on
+  /// a shared object by a notification is exactly the kind of thing that stops
+  /// happening and leaves no trace.
+  var describeEditor: String {
+    guard let tv = field.currentEditor() as? NSTextView else { return "not editing" }
+    let sel = (tv.selectedTextAttributes[.backgroundColor] as? NSColor)
+      .map { $0 == Palette.selectionFill ? "ours" : "system" } ?? "none"
+    let car = tv.insertionPointColor == Palette.caret ? "ours" : "system"
+    return "selection=\(sel) caret=\(car)"
+  }
 
   /// See IconButton.acceptsFirstMouse.
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1687,11 +1753,94 @@ final class Sheet: NSView {
     Metric.sheetPad + items.reduce(0) { $0 + height(of: $1) } + Metric.sheetPad
   }
 
+  // ── A PANEL TALLER THAN THE WINDOW ─────────────────────────────────────────
+  //
+  // Photographed at the smallest window this app will now open -- 480x320, the
+  // floor `contentMinSize` sets -- every row of the settings panel came back
+  // `audit FAIL`, at y coordinates of 543, 495, 447, 399 and 351 in a window 320
+  // points tall. The panel was drawn ABOVE the top edge of its own window. Nine
+  // rows and three sentences want 565 points; the window had 258 to give; nothing
+  // in the arithmetic compared the two, so the panel simply grew off the screen
+  // and took every control on it out of reach. Not one setting was clickable, and
+  // there was no scrollbar and no clipped edge to say why -- the rows were not
+  // hidden, they were somewhere a mouse cannot go.
+  //
+  // It could not have been seen before, either: every rig here opens the default
+  // window, so the smallest legal size was a floor nobody had ever photographed
+  // AT. That is the whole reason `--window-size` exists.
+  //
+  // The fix is the ordinary answer for a list that outgrows its box, and it needs
+  // no scroll view: the panel takes the room it is given, and the CONTENT moves
+  // inside it. `scrollOffset` is how far down the list we are looking, in points,
+  // from 0 to `maxScroll`; `layout()` adds it to the starting edge, so a larger
+  // offset brings later rows up into the box. The rows keep their own frames and
+  // their own `hitTest`, so click routing, `clickTargets` and the audit all keep
+  // working unchanged -- the only thing that changes is which rows are inside the
+  // box, and `onScreen` now asks that question.
+  var scrollOffset: CGFloat = 0 { didSet { if scrollOffset != oldValue { needsLayout = true } } }
+  /// How far the content can move. Zero when everything fits, which is the case
+  /// on every window anyone has actually opened -- so the clip below, and every
+  /// behaviour that follows from it, is inert at any ordinary size.
+  var maxScroll: CGFloat { max(0, wantedHeight - bounds.height) }
+  var scrolls: Bool { maxScroll > 0.5 }
+  func clampScroll() { scrollOffset = min(max(0, scrollOffset), maxScroll) }
+  /// A wheel or a two-finger swipe. Precise deltas are already points; a notched
+  /// wheel reports lines, and half a row per line is the usual conversion.
+  func scrollBy(_ delta: CGFloat, precise: Bool) {
+    scrollOffset = min(max(0, scrollOffset - (precise ? delta : delta * Metric.sheetRow / 2)),
+                       maxScroll)
+  }
+
+  /// Bring one item fully inside the box, and say whether anything moved. This is
+  /// what lets a rig -- and the keyboard, and `click(_:)` -- reach a row that is
+  /// currently scrolled out, instead of reporting it missing.
+  @discardableResult
+  func reveal(_ v: NSView) -> Bool {
+    guard scrolls, items.contains(where: { $0 === v }) else { return false }
+    // Where the item sits in the content, measured from the content's top.
+    var top = Metric.sheetPad
+    for it in items {
+      if it === v { break }
+      top += height(of: it)
+    }
+    let h = height(of: v)
+    let before = scrollOffset
+    // Offset counts down the list, so the item is inside the box when
+    // `top >= offset` (not off the top) and `top + h <= offset + boxHeight`.
+    if top < scrollOffset { scrollOffset = top }
+    else if top + h > scrollOffset + bounds.height { scrollOffset = top + h - bounds.height }
+    clampScroll()
+    if scrollOffset != before { needsLayout = true; layoutSubtreeIfNeeded() }
+    return scrollOffset != before
+  }
+
+  /// What a rig can read instead of guessing: how many rows are actually inside
+  /// the box, and where in the list we are. An instrument that cannot see the
+  /// clip would report the same thing for a panel that fits and one that hides
+  /// four settings.
+  var describeScroll: String {
+    guard scrolls else { return "fits" }
+    let shown = items.filter { $0.frame.minY >= -0.5 && $0.frame.maxY <= bounds.height + 0.5 }.count
+    return "\(shown)/\(items.count) shown scroll=\(Int(scrollOffset))/\(Int(maxScroll))"
+  }
+
   override func layout() {
     super.layout()
     glass.frame = bounds
     glass.radius = Metric.sheetRadius
-    var y = bounds.height - Metric.sheetPad
+    clampScroll()
+    // ── CLIPPED ONLY WHEN IT HAS TO BE ──────────────────────────────────────
+    //
+    // A mask on this layer is what makes a half-row at the edge read as "there is
+    // more" -- the only affordance this panel has, and the one every list on this
+    // machine uses. It is also a mask over a glass surface, and the material
+    // samples what is behind it, so it is switched on ONLY while the content
+    // overflows. At every ordinary window size this line does nothing, which is
+    // deliberate: a change that alters how the glass draws for everybody, to fix
+    // a case that only exists below 320 points, would be the wrong trade.
+    layer?.cornerRadius = Metric.sheetRadius
+    layer?.masksToBounds = scrolls
+    var y = bounds.height - Metric.sheetPad + scrollOffset
     for v in items {
       let h = height(of: v)
       y -= h
@@ -3159,10 +3308,21 @@ final class CallControls: NSView {
     // every popover on this machine already does. So it hangs under `#more`, its
     // right edge on the same gutter, and the whole middle of the picture is free.
     let sw = min(w - Metric.gutter * 2, Metric.sheetWidth)
-    let sh = sheet.wantedHeight
-    sheet.frame = NSRect(x: w - Metric.gutter - sw,
-                         y: max(Metric.s3, moreButton.frame.minY - Metric.s2 - sh),
+    // ── AND IT STOPS AT THE BOTTOM OF THE WINDOW ──────────────────────────────
+    //
+    // This was `y: max(s3, moreY - s2 - sh)` with `sh` the panel's full wanted
+    // height, which pinned the BOTTOM edge at the gutter and let the top edge go
+    // wherever the content wanted -- off the top of the window, on any window
+    // shorter than about 660 points. See `Sheet.scrollOffset`. Now the top edge is
+    // fixed under the button that opened the panel, the bottom stops at the same
+    // gutter everything else uses, and the height is whichever is smaller: what
+    // the content wants, or the room there is. The content scrolls inside it.
+    let top = moreButton.frame.minY - Metric.s2
+    let room = max(Metric.sheetRow * 2, top - Metric.s3)
+    let sh = min(sheet.wantedHeight, room)
+    sheet.frame = NSRect(x: w - Metric.gutter - sw, y: max(0, top - sh),
                          width: sw, height: sh)
+    sheet.clampScroll()
     sheetScrim.frame = bounds
     sheet.isHidden = !moreOpen
     sheetScrim.isHidden = !moreOpen
@@ -4594,7 +4754,17 @@ final class CallControls: NSView {
   // absent: two fingers on a trackpad is somebody at this Mac, the rule is "a
   // touch of a mouse or a keyboard or something like that", and a gesture the app
   // has no other use for costs nothing at all to accept as presence.
-  override func scrollWheel(with event: NSEvent) { showBar() }
+  override func scrollWheel(with event: NSEvent) {
+    // A scroll over an overflowing settings panel moves the list; anywhere else
+    // it is a person moving, which is what wakes the control row.
+    if moreOpen, sheet.scrolls,
+       sheet.frame.contains(convert(event.locationInWindow, from: nil)) {
+      sheet.scrollBy(event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas)
+      layoutSubtreeIfNeeded()
+      return
+    }
+    showBar()
+  }
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
     trackingAreas.forEach(removeTrackingArea)
@@ -4694,6 +4864,11 @@ final class CallControls: NSView {
       moreOpen = true
       moreButton.on = true
     }
+    // A new page starts at its top. `setItems` only CLAMPS the offset, because a
+    // refresh -- a camera appearing, an update check finishing -- must not yank
+    // the list out from under somebody's eyes; an explicit page change is the
+    // opposite, and arriving half way down a list nobody has scrolled is wrong.
+    sheet.scrollOffset = 0
     rebuildSheet()
     // The panel is sized from its content, so a page swap has to re-lay it in the
     // same turn. Deferring to the next pass photographs the OLD page's height with
@@ -4710,7 +4885,7 @@ final class CallControls: NSView {
     moreButton.on = moreOpen
     // The dots always open the settings page. A button that opens whichever page
     // you happened to leave behind is a button whose effect depends on history.
-    if moreOpen { sheetPage = .settings; rebuildSheet() }
+    if moreOpen { sheetPage = .settings; sheet.scrollOffset = 0; rebuildSheet() }
     needsLayout = true
     layoutSubtreeIfNeeded()
   }
@@ -5604,6 +5779,19 @@ final class CallControls: NSView {
     var w: NSView? = v
     while let x = w {
       if x.isHidden || x.alphaValue <= 0.01 { return false }
+      // ── AND CLIPPED IS NOT ON SCREEN EITHER ────────────────────────────────
+      //
+      // The third way a control can be undrawn, after `isHidden` and a zero
+      // alpha: inside a container that masks to its bounds, at a position outside
+      // them. The settings panel scrolls at small window sizes, so a row can be
+      // perfectly visible in the view hierarchy and above the top edge of the
+      // panel holding it -- and this reader is the one both `clickTargets` and
+      // `visibleRowNames` ask, so answering `true` there would put a row nobody
+      // can see into the audit and then report it FAIL.
+      if let sv = x.superview, sv.layer?.masksToBounds == true,
+         !sv.bounds.insetBy(dx: -1, dy: -1).contains(NSPoint(x: x.frame.midX, y: x.frame.midY)) {
+        return false
+      }
       if x is CallControls { return true }
       w = x.superview
     }
@@ -5680,7 +5868,19 @@ final class CallControls: NSView {
                   // The sentences, not only the controls. See `SheetHint.text`.
                   + " hints=[" + sheet.hints.map { Self.oneLine($0) }
                                       .joined(separator: " | ") + "]"
-                  + (sheet.field.map { " field=\"\($0.text)\"" } ?? "") : "")
+                  + (sheet.field.map { " field=\"\($0.text)\" editor=\($0.describeEditor)" } ?? "")
+                  // ── A NEW FACT GOES IN A NEW FIELD ──────────────────────────
+                  //
+                  // How much of the panel is showing went inside `sheet=` first,
+                  // as `sheet=settings(fits)[...]`, and it broke four assertions
+                  // in `controls-check` and three more in `watch-check`,
+                  // `stress-check` and `firstrun-ring-check` -- all of which match
+                  // `sheet=settings\[`, correctly, because that field has meant one
+                  // thing for months. Every one of those failures named a page
+                  // navigation that was working perfectly. A state dump is an
+                  // interface: adding to it is free, changing the shape of a field
+                  // in it is a rename with seven callers.
+                  + "  panel=\(sheet.describeScroll)" : "")
   }
 
   private var leaveState: String {
@@ -6054,6 +6254,45 @@ extension CallControls {
              .map(Character.init))
   }
 
+  // ── WHERE TO AIM AT A CONTROL ────────────────────────────────────────────
+  //
+  // The centre of the control, which is what a person aims at and what every
+  // press in this file has always used -- with one exception that only exists
+  // now that the settings panel can fill a small window.
+  //
+  // `scrim` is the whole window; the way to close the panel is a click ON the
+  // scrim, meaning anywhere the panel is not. At a normal size its centre is well
+  // clear of the panel and its centre is the right point. At 480x320 the panel is
+  // 452x258 of a 480x320 window, so the scrim's CENTRE is under the panel -- and
+  // aiming there does not close anything, it presses whichever setting happens to
+  // be in the middle of the list. Two consequences, and the second is worse than
+  // the first: the audit printed `FAIL scrim` about a screen that was working,
+  // and `click("scrim")` -- the way four rigs in this directory close the panel
+  // between steps -- would have pressed a settings row instead, silently, and
+  // gone on to test whatever that row did.
+  //
+  // So the aim point for a covered scrim is the middle of the largest band of it
+  // that the panel leaves free. One reader, used by the audit and by `click`,
+  // because two places computing one aim point is two places that can disagree --
+  // and the disagreement would be invisible in both.
+  func probeCentre(_ v: NSView) -> NSPoint {
+    let mid = NSPoint(x: v.bounds.midX, y: v.bounds.midY)
+    guard v === sheetScrim, moreOpen, !sheet.isHidden else { return mid }
+    let s = sheet.frame, b = v.bounds
+    guard s.contains(v.convert(mid, to: self)) else { return mid }
+    // The four bands around the panel, in this view's own coordinates.
+    let bands: [NSRect] = [
+      NSRect(x: b.minX, y: s.maxY, width: b.width, height: max(0, b.maxY - s.maxY)),
+      NSRect(x: b.minX, y: b.minY, width: b.width, height: max(0, s.minY - b.minY)),
+      NSRect(x: b.minX, y: b.minY, width: max(0, s.minX - b.minX), height: b.height),
+      NSRect(x: s.maxX, y: b.minY, width: max(0, b.maxX - s.maxX), height: b.height),
+    ]
+    guard let best = bands.filter({ $0.width > 8 && $0.height > 8 })
+                          .max(by: { $0.width * $0.height < $1.width * $1.height })
+    else { return mid }
+    return NSPoint(x: best.midX, y: best.midY)
+  }
+
   /// `hitTest` from the content view down, exactly as a click arrives.
   func auditClicks() -> [String] {
     guard let win = window, let root = win.contentView else { return ["no window"] }
@@ -6064,8 +6303,7 @@ extension CallControls {
     guard root.frame.origin == .zero else { return ["content view is not at the window origin"] }
     var lines: [String] = []
     for (name, v) in clickTargets {
-      let mid = NSPoint(x: v.bounds.midX, y: v.bounds.midY)
-      let p = v.convert(mid, to: nil)
+      let p = v.convert(probeCentre(v), to: nil)
       let hit = root.hitTest(p)
       // The glyph overlay and the glass blur are both subviews of the button, so a
       // hit on either IS a hit on the button. Anything else is a control a finger
@@ -6126,6 +6364,28 @@ extension CallControls {
   /// ever runs in production is a defence nobody has seen work.
   func click(_ name: String, holdFor: TimeInterval = 0, stray: Bool = false) -> Bool {
     guard let win = window else { return false }
+    // ── SCROLL TO IT FIRST, AS A PERSON WOULD ─────────────────────────────────
+    //
+    // `clickTargets` lists what is reachable RIGHT NOW, which is the only useful
+    // definition -- and in a small window some settings rows are scrolled out of
+    // the panel. A person scrolls and then clicks; so does this. Without it every
+    // rig in the directory would report the last four settings "not on screen" at
+    // any window under about 660 points tall, which is true and useless.
+    if moreOpen, sheet.scrolls, !clickTargets.contains(where: { $0.0 == name }) {
+      // Both spellings a rig can use: the name a person would read off the row,
+      // and the index that existing invocations still pass.
+      var target: SheetRow?
+      if name.hasPrefix("row:") {
+        let want = String(name.dropFirst(4))
+        target = sheet.rows.first { CallControls.slug($0.spokenName).hasPrefix(want) }
+      } else if name.hasPrefix("row#"), let i = Int(name.dropFirst(4)),
+                i >= 0, i < sheet.rows.count {
+        target = sheet.rows[i]
+      }
+      if let r = target, sheet.reveal(r) {
+        fputs("  scrolled the panel to reach \(name) (\(sheet.describeScroll))\n", stderr)
+      }
+    }
     let targets = clickTargets
     // Exact first, then a unique prefix -- `row:calls` for "Calls when Kin is
     // closed". Ambiguity is refused rather than resolved: a rig that quietly
@@ -6186,7 +6446,7 @@ extension CallControls {
     // instead, because by the time the event was built there was nothing there.
     // A finger does not pause for a second between arriving and pressing.
     nudgeBar()
-    let p = v.convert(NSPoint(x: v.bounds.midX, y: v.bounds.midY), to: nil)
+    let p = v.convert(probeCentre(v), to: nil)
     func ev(_ t: NSEvent.EventType) -> NSEvent? {
       NSEvent.mouseEvent(with: t, location: p, modifierFlags: [],
                          timestamp: ProcessInfo.processInfo.systemUptime,

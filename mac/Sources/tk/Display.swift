@@ -156,6 +156,20 @@ final class Display {
     // screen, and the state that made it unavailable was a default nobody had
     // written down.
     window.collectionBehavior.insert(.fullScreenPrimary)
+    // ── A FLOOR UNDER THE LAYOUT ──────────────────────────────────────────────
+    //
+    // Every frame in this window is placed by hand in `layout()`, and none of that
+    // arithmetic has a lower bound: the control row is four 58 pt circles plus
+    // three 18 pt gaps plus a 20 pt gutter either side, which needs 344 pt before
+    // anything overlaps, and the settings panel is 420 pt wide before it starts
+    // being clamped to the window. Dragged narrower than that the row runs off its
+    // own edges and the panel is wider than the thing it hangs inside.
+    //
+    // 480x320 is comfortably clear of both and still small enough to tuck a call
+    // into a corner of a screen, which is the thing people actually do with one.
+    // Stated rather than defended per-control: a minimum is one number in one
+    // place, and clamping nine frames individually is nine places to forget.
+    window.contentMinSize = NSSize(width: 480, height: 320)
     window.isMovableByWindowBackground = true
     window.backgroundColor = Palette.bg
     // ── A TEST WINDOW DOES NOT SIT WHERE SOMEBODY IS WORKING ─────────────────

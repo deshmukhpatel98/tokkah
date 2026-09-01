@@ -220,6 +220,61 @@ reap
 P="$SP/p.log"
 want "the Edit menu is on the front door too" "$P" 'home: edit menu \(paste=true, selectall=true\)'
 
+# ════════════════════════════════════════════════════════════════════════════
+# ── AND ALL OF IT AT THE SMALLEST WINDOW THE APP WILL OPEN ──────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Every arm above -- and every other rig in this directory -- opens the default
+# window. So the smallest size a person can drag Kin to was a size nobody had
+# ever photographed at, and this is what was there: the settings panel drew ABOVE
+# THE TOP EDGE of its own window, at y=543 in a window 320 points tall, and all
+# nine rows reported `audit FAIL`. Not one setting was clickable. The panel was
+# sized from its content with nothing comparing that to the window.
+#
+# The panel now takes the room it is given and scrolls inside it, so the two
+# claims here are the ones that were false: nothing is unreachable, and a row that
+# is scrolled out can still be reached -- by scrolling to it, which is what
+# `click` now does and what a person does.
+echo "── THE SMALLEST WINDOW (480x320, the floor contentMinSize sets)"
+export TK_KIN_DIR="$SP/small"; mkdir -p "$TK_KIN_DIR"
+"$TK" --window --window-size 480x320 --video off --mute --no-telemetry --no-update \
+      --no-relocate --no-rings --no-subtitles --room "sm$$" --listen 7941 \
+      --peer 127.0.0.1:7942 \
+      --press "@more,?,@row:encryption,?,@scrim,?" --press-after 3 \
+      > "$SP/s.log" 2>&1 &
+PIDS="$PIDS $!"
+naptime 14
+reap
+S="$SP/s.log"
+# The window really is that size, or every assertion below is about a big window.
+want "the window opened at the size asked for" "$S" 'controls 480x320'
+SNOTON=$(grep -c 'NOT ON SCREEN' "$S" || true)
+[ "${SNOTON:-0}" = "0" ] && say OK "every named control was reachable at 480x320" \
+  || { say FAIL "$SNOTON presses found nothing to press in a small window:"
+       grep 'NOT ON SCREEN' "$S" | sed 's/^/         /' | head -5; fail=1; }
+SFAIL=$(grep -cE '^audit FAIL' "$S" || true)
+[ "${SFAIL:-0}" = "0" ] && say OK "and nothing was drawn where a click cannot reach it" \
+  || { say FAIL "$SFAIL controls are unreachable at 480x320"
+       grep '^audit FAIL' "$S" | sed 's/^/         /' | head -8; fail=1; }
+# THE PANEL MUST KNOW IT DOES NOT FIT. An instrument that reports `fits` here is
+# blind to the whole defect -- and a panel that reports `fits` at 320 points is
+# the panel that ran off the top of the window.
+if grep -qE 'panel=[0-9]+/[0-9]+ shown scroll=' "$S"; then
+  say OK "the panel says how much of itself is showing: $(grep -oE 'panel=[^ ]+ shown scroll=[0-9/]+' "$S" | tail -1)"
+else
+  say FAIL "the panel reported no scroll state at 480x320 -- either it thinks it"
+  say FAIL "  fits (it cannot) or the instrument cannot see the clip"; fail=1
+fi
+# A row past the bottom of the box is reached by SCROLLING to it. Without this the
+# last four settings are simply gone at this size.
+want "a scrolled-out row is reached by scrolling to it" "$S" 'scrolled the panel to reach row:encryption'
+want "and the row it scrolled to was really pressed" "$S" 'click row:encryption: sent'
+# And the way out still works when the panel covers the middle of the window.
+LAST=$(grep -oE 'more=(open|closed)' "$S" | tail -1)
+[ "$LAST" = "more=closed" ] \
+  && say OK "and a click on the scrim still closes it (more=closed)" \
+  || { say FAIL "the panel did not close at 480x320 -- last state $LAST"; fail=1; }
+
 [ "$fail" = 0 ] && echo "CONTROLS CHECK PASSED -- every control was clicked and every one of them did something" \
                 || echo "CONTROLS CHECK FAILED"
 exit $fail

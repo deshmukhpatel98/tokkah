@@ -54,7 +54,13 @@ spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 alive() { kill -0 "$1" 2>/dev/null; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TK="${TK:-$HERE/../.build/debug/tk}"
+# ── THE RELEASE BINARY, BECAUSE THIS ARM IS A RACE ──────────────────────────
+#
+# Every other rig here can use the debug build; this one measures what happens in
+# the half-second between a watcher opening a copy and that copy reaching its
+# first poll. A `-Onone` build runs that half-second at a completely different
+# speed, so the debug default was timing a race nobody will ever run.
+TK="${TK:-$HERE/../.build/release/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/cancelrace-check.$$"
 # ── TWO REAL IDENTITIES, KEPT ───────────────────────────────────────────────
 # A handle is bound to the key that first claimed it, so a rig minting a fresh
@@ -145,7 +151,23 @@ cp "$TK" "$APP/Contents/MacOS/tkreal"
   # login item is kept away from by `--no-relocate` instead, which is the switch
   # that actually guards it.
   echo "export TK_WATCH_LABEL=\"$LABEL\""
-  echo "exec \"$TK\" \"\$@\""
+  # ── AND IT EXECS THE COPY INSIDE THE BUNDLE, NOT THE REPO BINARY ───────────
+  #
+  # This was `exec "$TK"` -- the binary in `.build`, outside the bundle -- and it
+  # is why this arm reported "the copy the watcher launched never wrote a log" for
+  # weeks. `open` returned 0, no process appeared, `--stderr` stayed empty, and
+  # nothing was written anywhere: a GUI launch through LaunchServices kills a
+  # signed app that execs an image outside its own bundle, silently, with no crash
+  # report. Every visible symptom pointed at the app, and the watcher had already
+  # said "is calling -- opening Kin", so the app looked like the thing that failed.
+  #
+  # Proved by substitution, by hand, with the watcher's exact `open` line: with
+  # `exec "$TK"` the log was NONE; pointing the same script at
+  # `Contents/MacOS/tkreal` and re-signing, it was WROTE on the first try. It is
+  # the same binary either way -- `tkreal` is a copy of `$TK` made three lines
+  # above -- so nothing about what is under test changes. A bundle that is a real
+  # bundle is also what the real install is.
+  echo "exec \"$APP/Contents/MacOS/tkreal\" \"\$@\""
 } > "$APP/Contents/MacOS/tk"
 chmod +x "$APP/Contents/MacOS/tk"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -158,6 +180,28 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>
 PLIST
+
+# ── AND IT HAS TO BE SIGNED, OR LAUNCHSERVICES WILL NOT OPEN IT ──────────────
+#
+# This arm reported "the copy the watcher launched never wrote a log" for weeks,
+# and the cause was not in the app at all:
+#
+#     spctl -a -vv KinRig.app  ->  rejected, source=no usable signature
+#
+# The watcher runs because the rig `exec`s its binary directly, and exec does not
+# consult Gatekeeper. The COPY is started the way a real ring starts one -- through
+# LaunchServices -- which does, and refused an unsigned bundle silently: no
+# process, no crash report, no line in any log. The watcher had already printed
+# "is calling -- opening Kin", so every piece of evidence pointed at the app.
+#
+# Ad-hoc is enough and is what the real install uses anyway (`no-notarization`),
+# and it must come AFTER the Info.plist is written: the plist is inside the seal.
+codesign --force --sign - "$APP" > "$SP/sign.log" 2>&1 \
+  || { sed 's/^/  /' "$SP/sign.log"
+       echo "CANCEL-RACE CHECK COULD NOT RUN -- could not ad-hoc sign the rig bundle,"
+       echo "  and LaunchServices will not open an unsigned one."; exit 2; }
+spctl -a "$APP" 2>/dev/null \
+  || echo "  note: spctl still rejects the rig bundle (ad-hoc is not notarised);"
 
 # What the watcher adds to its own fixed launch line. `--no-ring-preview` because
 # whether the caller is in this identity's contact list decides whether the copy
@@ -290,9 +334,33 @@ TREEA=$(grep -m1 "card=" "$SP/a-copy.log" | tail -1)
 [ "$A_ALIVE" = "no" ] \
   && say "OK" "the copy that was launched to ask is gone" \
   || say "FAIL" "it is STILL RINGING a call that was cancelled 16 s ago: ${TREEA:-<no card dump>}"
-grep -q "cancel: @$H1 called it off" "$SP/a-copy.log" \
-  && say "OK" "and it says how it found out: the watcher left the message" \
-  || say "FAIL" "nothing told the launched copy the call was off"
+# ── AND AN INSTRUMENT THAT CANNOT SEE THE EVENT SAYS SO ─────────────────────
+#
+# The note is applied by the launched copy, so this assertion needs a copy that
+# got far enough to read one. On this Mac it does not: the copy runs from a
+# freshly made, ad-hoc signed bundle at a new path, and that is a NEW TCC IDENTITY
+# -- `tcc-identity-is-a-content-hash`. Its log ends here:
+#
+#     mic: asking for permission (look for a dialog)
+#
+# A dialog nobody can answer, for a bundle that will be deleted in twenty seconds.
+# The production app has both grants and never takes this path, so what stops the
+# arm is the rig's own bundle being new, not anything about the cancel.
+#
+# `blind-instruments-report-negatives`: this used to print FAIL, which reads as
+# "the cancel never reached the copy" -- a claim about the app, from an arm that
+# had no copy to reach. It now names the real reason, and the three assertions
+# above it still hold: the watcher took the cancel, opened no window for it, and
+# nothing was left ringing.
+if grep -q "cancel: @$H1 called it off" "$SP/a-copy.log"; then
+  say "OK" "and it says how it found out: the watcher left the message"
+elif grep -qE "mic: asking for permission|camera: asking for permission" "$SP/a-copy.log"; then
+  say "note" "the note itself is unverified here: the launched copy stopped at a"
+  say "note" "  permission dialog, because a fresh rig bundle is a new TCC identity."
+  say "note" "  Grant the mic to a persistent rig bundle to test this arm."
+else
+  say "FAIL" "nothing told the launched copy the call was off"
+fi
 
 # ── ARM B: THE SAME CANCEL, TEN SECONDS LATER ───────────────────────────────
 #
