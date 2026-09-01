@@ -37,6 +37,17 @@ class CallSession(
 
     var onState: ((String) -> Unit)? = null
     var onPeerVocal: ((Int) -> Unit)? = null
+    /** A whole far-end video frame, reassembled. */
+    var onVideoFrame: ((ByteArray, Long) -> Unit)? = null
+    /** The far end asked for a keyframe (KMAGIC): make one now. */
+    var onKeyframeRequest: (() -> Unit)? = null
+
+    val video = VideoAssembler()
+    @Volatile var camOn = false
+    private var videoSeq = 0
+    private val videoScratch = ByteArray(Wire.VHDR + Wire.VPAYLOAD)
+    private var lastKeyReq = 0L
+    private var firstVideoSeen = false
 
     private var sock: DatagramSocket? = null
     private var candidates = listOf<InetSocketAddress>()
@@ -59,8 +70,16 @@ class CallSession(
         val s = DatagramSocket()
         s.reuseAddress = true
         sock = s
-        thread(isDaemon = true, name = "kin-rx") { receiveLoop(s) }
-        thread(isDaemon = true, name = "kin-signal") { signalLoop(s) }
+        // STUN BEFORE the receive loop starts, and on this same socket. It must
+        // be this socket — a mapping discovered on another describes that
+        // socket's hole — and it must be before, or the receive loop eats the
+        // binding response, no public address is ever published, and the peer
+        // can only find us by LAN candidate (measured: 28 s to connect).
+        thread(isDaemon = true, name = "kin-signal") {
+            mapped = Stun.discoverAny(s)
+            thread(isDaemon = true, name = "kin-rx") { receiveLoop(s) }
+            signalLoop(s)
+        }
     }
 
     fun stop() {
@@ -85,7 +104,6 @@ class CallSession(
     }
 
     private fun signalLoop(s: DatagramSocket) {
-        mapped = Stun.discoverAny(s)
         val local = localIPv4()?.let { "$it:${s.localPort}" }
         val addr = mapped?.let { "${it.ip}:${it.port}" }
         var lastRv = 0L
@@ -135,8 +153,7 @@ class CallSession(
             else -> {}
         }
         if (gate.voicingNow) status = status or Wire.ST_VOICING
-        // Video off for now: the camera has its own phase.
-        status = status or Wire.ST_CAMOFF
+        if (!camOn) status = status or Wire.ST_CAMOFF
         r.status = status
         r.endProbByte = 0
         return r
@@ -224,6 +241,27 @@ class CallSession(
                     }
                     ring.write(h.seq, h.capHost, fbuf, frames)
                 }
+                Wire.VMAGIC -> {
+                    val h = Wire.videoHeader(b, n) ?: continue
+                    val len = n - Wire.VHDR
+                    if (len <= 0) continue
+                    video.offer(h, b, Wire.VHDR, len)?.let { (payload, cap) ->
+                        firstVideoSeen = true
+                        onVideoFrame?.invoke(payload, cap)
+                    }
+                    // Nothing decodable yet: ask for a keyframe, rate-limited.
+                    // Parameter sets ride only with keyframes, so a receiver
+                    // joining mid-stream has to ask rather than wait for a timer
+                    // the sender does not run.
+                    if (!firstVideoSeen) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastKeyReq > 300) {
+                            lastKeyReq = now
+                            sendSealed(Wire.keyframeRequest())
+                        }
+                    }
+                }
+                Wire.KMAGIC -> onKeyframeRequest?.invoke()
                 Wire.BMAGIC -> { onState?.invoke("peer left"); ended = true }
                 else -> {}
             }
@@ -263,6 +301,21 @@ class CallSession(
             seq++
             at += Wire.FPP
         }
+    }
+
+    /** One encoded frame out: fragmented to 1150-byte payloads, sealed per packet. */
+    fun sendVideoFrame(payload: ByteArray) {
+        if (ended || !crypto.established) return
+        val cap = KinClock.now()
+        val n = payload.size
+        val nfrag = maxOf(1, (n + Wire.VPAYLOAD - 1) / Wire.VPAYLOAD)
+        for (f in 0 until nfrag) {
+            val off = f * Wire.VPAYLOAD
+            val len = minOf(Wire.VPAYLOAD, n - off)
+            val m = Wire.packVideoFragment(videoSeq, cap, f, nfrag, payload, off, len, videoScratch)
+            sendSealed(videoScratch, m)
+        }
+        videoSeq++
     }
 
     /** One render block: the jitter buffer's answer for this device callback. */

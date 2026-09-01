@@ -178,6 +178,53 @@ case "$SET" in
   *) say FAIL "settings card is missing something: $SET"; fail=1 ;;
 esac
 
+# ── OPENING THE APP OPENS THE DOOR ───────────────────────────────────────────
+# For ten releases a double-click did not come here at all: with no `--room` and
+# no `--gui`, a bundle launch minted a room and re-exec'd STRAIGHT INTO AN EMPTY
+# CALL, camera on, nobody in it. The front door -- every face, every fix in this
+# file -- was reachable only from a terminal. The condition is the bundle path,
+# so the rig has to launch from a bundle-shaped one; the binary is copied rather
+# than the installed app run, which would relocate and self-update.
+DOOR="$SP/door"; mkdir -p "$DOOR/Kin.app/Contents/MacOS" "$DOOR/kin"
+cp "$TK" "$DOOR/Kin.app/Contents/MacOS/Tokkah"
+[ -f bundle/Info.plist ] && cp bundle/Info.plist "$DOOR/Kin.app/Contents/"
+TK_KIN_DIR="$DOOR/kin" TK_NO_RAISE=1 "$DOOR/Kin.app/Contents/MacOS/Tokkah" \
+  --contacts-fake "meera" --no-update --no-telemetry --no-relocate --no-rings \
+  > "$DOOR/log" 2>&1 & PIDS="$PIDS $!"
+sleep 5
+reap
+if grep -q "home card \[front\]" "$DOOR/log" && ! grep -q "re-exec into" "$DOOR/log"; then
+  say OK "a double-click opens the front door, not an empty call"
+else
+  say FAIL "a bundle launch skipped the door: $(grep -o 're-exec into.*' "$DOOR/log" | head -1)"
+  fail=1
+fi
+
+# ── AND THERE IS A LINK TO HAND SOMEBODY WITHOUT STARTING A CALL ─────────────
+# The only way to invite a person who is not in the list used to be to start a
+# call and copy the link off the waiting screen -- sitting alone in a room with
+# the camera on to obtain a URL.
+#
+# This writes the clipboard, which belongs to whoever is at this Mac, so it is
+# saved and put back. The link's SHAPE is checked, not just that something was
+# copied: a named room and a minted one take different URLs and the wrong one
+# 404s (`roomURL`).
+CLIP="$SP/clip.saved"; pbpaste > "$CLIP" 2>/dev/null || : > "$CLIP"
+export TK_KIN_DIR="$SP/kin"
+"$TK" --contacts-fake "meera" --gui --no-update --no-telemetry --no-relocate \
+  --press invite > "$SP/inv.log" 2>&1 & PIDS="$PIDS $!"
+sleep 4
+GOT="$(pbpaste 2>/dev/null)"
+reap
+pbcopy < "$CLIP" 2>/dev/null || true
+ROOM=$(sed -n 's/.*home: invite link copied for \(.*\)/\1/p' "$SP/inv.log" | head -1)
+case "$GOT" in
+  https://*/"$ROOM")
+    [ -n "$ROOM" ] && say OK "invite row copies a real link: $GOT" \
+                   || { say FAIL "invite row copied nothing"; fail=1; } ;;
+  *) say FAIL "invite link is the wrong shape: '$GOT' for room '$ROOM'"; fail=1 ;;
+esac
+
 # ── CLOSING THE DOOR MID-RING HAS TO UN-RING THE OTHER MAC ───────────────────
 # Reported: "if I'm calling someone and I close the app, it should close the
 # ringing itself". It did not -- the ring sat in their mailbox on a 60 s lease

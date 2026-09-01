@@ -935,7 +935,29 @@ enum Update {
     if swapBundle(from: tmp, at: me) {
       pending = nil
       atStage("installed"); Metrics.fact("update_installed", m.version)
-    fputs("update: installed \(m.version) -- restarting\n", stderr)
+      // ── AND THE WATCHER'S JOB IS PINNED TO THE CODE WE JUST REPLACED ───────
+      //
+      // launchd remembers the code identity a job was bootstrapped with, and
+      // refuses the first launch of a different one: SIGKILL, "Launch
+      // Constraint Violation", a crash report, and a Mac that has silently
+      // stopped listening for calls. `restart` below already re-registers, but
+      // ONLY when the updater IS the watcher (`--watch`, reparented to launchd).
+      // Every update installed by the app you actually look at left the job
+      // pinned -- so the watcher died on its next launch, once per release.
+      // Measured in this Mac's own crash reports: 0.84, 0.85, 0.86, 0.110,
+      // 0.112, 0.113, each one a fresh launch killed ~160 ms in, parent
+      // launchd, and nothing else in the log.
+      //
+      // Not when we are the job ourselves: `restart` does it there with a
+      // detached helper, because a bootout of our own label kills us first.
+      let iAmTheWatcher = CommandLine.arguments.contains("--watch") && getppid() == 1
+      if !iAmTheWatcher, Watch.installed {
+        let ok = Watch.reregister()
+        let said = ok ? "ok" : "FAILED -- the next ring may not reach a closed Mac"
+        fputs("update: re-registered the watcher's launchd job -- \(said)\n", stderr)
+        Metrics.tap("update_watch_reregister", ok: ok)
+      }
+      fputs("update: installed \(m.version) -- restarting\n", stderr)
       restart(into: me)
     }
 

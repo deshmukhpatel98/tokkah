@@ -11,7 +11,7 @@ android {
         minSdk = 29
         targetSdk = 35
         versionCode = 1
-        versionName = "0.111.0-android.0"
+        versionName = "0.113.0-android.1"
     }
     buildFeatures { compose = true }
     compileOptions {

@@ -28,6 +28,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.core.content.ContextCompat
 import com.tokkah.kin.net.CallSession
 import com.tokkah.kin.net.Floor
@@ -50,6 +53,14 @@ fun KinApp(initialRoom: String?) {
     var room by remember { mutableStateOf(initialRoom ?: "") }
     var session by remember { mutableStateOf<CallSession?>(null) }
     var device by remember { mutableStateOf<AudioDevice?>(null) }
+    var vdevice by remember { mutableStateOf<VideoDevice?>(null) }
+    var camGranted by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED)
+    }
+    val askCam = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        camGranted = it
+    }
     var micGranted by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED)
@@ -64,12 +75,14 @@ fun KinApp(initialRoom: String?) {
         s.start()
         val d = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
         d.start()
-        session = s; device = d
+        val v = VideoDevice(ctx, s)
+        s.onKeyframeRequest = { v.requestKeyframe() }
+        session = s; device = d; vdevice = v
     }
 
     fun leave() {
-        device?.stop(); session?.stop()
-        device = null; session = null
+        vdevice?.stop(); device?.stop(); session?.stop()
+        vdevice = null; device = null; session = null
     }
 
     Box(Modifier.fillMaxSize().background(Glass.bg)) {
@@ -77,7 +90,9 @@ fun KinApp(initialRoom: String?) {
         if (s == null) JoinScreen(room, { room = it }, micGranted,
             onAskMic = { askMic.launch(Manifest.permission.RECORD_AUDIO) },
             onJoin = { join(room) })
-        else CallScreen(s, device, onLeave = { leave() })
+        else CallScreen(s, vdevice, camGranted,
+            onAskCam = { askCam.launch(Manifest.permission.CAMERA) },
+            onLeave = { leave() })
     }
 }
 
@@ -131,12 +146,16 @@ private fun JoinScreen(
 }
 
 @Composable
-private fun CallScreen(s: CallSession, d: AudioDevice?, onLeave: () -> Unit) {
+private fun CallScreen(
+    s: CallSession, v: VideoDevice?, camGranted: Boolean,
+    onAskCam: () -> Unit, onLeave: () -> Unit,
+) {
     // No numbers on the consumer surface: plain words only.
     var sentence by remember { mutableStateOf("connecting") }
     var muted by remember { mutableStateOf(false) }
     var turn by remember { mutableStateOf(Floor.State.IDLE) }
     var edge by remember { mutableStateOf(0f) }
+    var camOn by remember { mutableStateOf(false) }
 
     LaunchedEffect(s) {
         while (true) {
@@ -152,7 +171,20 @@ private fun CallScreen(s: CallSession, d: AudioDevice?, onLeave: () -> Unit) {
         }
     }
 
-    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+    Box(Modifier.fillMaxSize()) {
+      AndroidView(
+        factory = { c ->
+            SurfaceView(c).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(h: SurfaceHolder) { v?.attachDisplay(h.surface) }
+                    override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                    override fun surfaceDestroyed(h: SurfaceHolder) {}
+                })
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+      )
+      Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(24.dp))
         // The speaking edge: colour is whose turn, and it is never dark.
         Box(
@@ -177,6 +209,17 @@ private fun CallScreen(s: CallSession, d: AudioDevice?, onLeave: () -> Unit) {
         Spacer(Modifier.weight(1f))
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Button(
+                onClick = {
+                    if (!camGranted) onAskCam()
+                    else if (!camOn) { if (v?.startEncode() == true) { camOn = true; s.camOn = true } }
+                    else { v?.stop(); camOn = false; s.camOn = false }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (camOn) Glass.accent else Glass.fill(0.12f),
+                    contentColor = if (camOn) Glass.bg else Glass.fg),
+                shape = CircleShape, modifier = Modifier.height(56.dp),
+            ) { Text(if (camOn) "Camera" else "Camera off") }
+            Button(
                 onClick = { muted = !muted; s.selfMuted = muted },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (muted) Glass.warn else Glass.fill(0.12f),
@@ -191,5 +234,6 @@ private fun CallScreen(s: CallSession, d: AudioDevice?, onLeave: () -> Unit) {
             ) { Text("Leave") }
         }
         Spacer(Modifier.height(20.dp))
+      }
     }
 }

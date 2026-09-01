@@ -22,8 +22,28 @@ class Playout(val ring: RecvRing) {
     var jitTarget = 2
     var earOpen = true
     var mute = false
-    /** Callback size in frames, for the ahead-hold; set by the device layer. */
+
+    /**
+     * Callback size in frames, set by the device layer.
+     *
+     * ── THE BUFFER FLOOR IS A PROPERTY OF THE DEVICE, NOT A CONSTANT ─────────
+     *
+     * The Mac renders FPP frames per callback, so its jitter target of 2
+     * packets is one device block plus one of margin. Android's fast path never
+     * delivers 0.667 ms callbacks — a 192-frame burst consumes SIX packets in
+     * one go — so a target of 2 is starving by construction: measured against
+     * the shipped Mac app, 36191 packets accepted and 15871 samples concealed
+     * as starved, with 19961 arrivals booked late because the cursor had
+     * already run past their slot. Nothing was wrong with the path.
+     *
+     * So the floor is expressed in DEVICE BLOCKS, which is what it always
+     * meant: one whole block, plus two packets of jitter margin.
+     */
     var devBuf = 192
+        set(v) {
+            field = v
+            jitTarget = max(jitTarget, v / Wire.FPP + 2)
+        }
 
     private val hist = FloatArray(HIST)
     private var histW = 0

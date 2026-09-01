@@ -17,7 +17,19 @@ import javax.crypto.spec.SecretKeySpec
 // Bit-exact with the Mac end (vectors validated against the shipped class).
 class Crypto(roomSalt: String, fixedPrivateRaw: ByteArray? = null) {
     private val salt = ("tk-v1-$roomSalt").toByteArray()
-    private val priv: java.security.PrivateKey
+    /**
+     * The private scalar, raw.
+     *
+     * Held as bytes rather than a provider key object because the providers
+     * disagree: desktop JVM's SunEC takes `NamedParameterSpec.X25519`, and
+     * Android's Conscrypt throws `InvalidAlgorithmParameterException: No
+     * AlgorithmParameterSpec classes are supported` for the same call — which
+     * crashed the app on the first join and is invisible to a JVM-only test.
+     * Key agreement below tries the platform first and falls back to the
+     * scalar multiplication in [X25519]; both are proven against the same
+     * CryptoKit vectors, so the answer cannot differ by platform.
+     */
+    private val privRaw: ByteArray
     val myPublic: ByteArray
     private var sendKey: ByteArray? = null
     private var recvKey: ByteArray? = null
@@ -33,32 +45,24 @@ class Crypto(roomSalt: String, fixedPrivateRaw: ByteArray? = null) {
     var plaintextTx = 0; private set
 
     init {
-        if (fixedPrivateRaw != null) {
-            // PKCS8 wrapping for a raw X25519 scalar (RFC 8410): fixed prefix + 32 bytes.
-            val pkcs8 = hexToBytes("302e020100300506032b656e04220420") + fixedPrivateRaw
-            priv = KeyFactory.getInstance("XDH").generatePrivate(PKCS8EncodedKeySpec(pkcs8))
-        } else {
-            val kpg = KeyPairGenerator.getInstance("XDH")
-            kpg.initialize(NamedParameterSpec.X25519)
-            priv = kpg.generateKeyPair().private
+        privRaw = fixedPrivateRaw?.copyOf()
+            ?: ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        myPublic = X25519.publicFromPrivate(privRaw)
+    }
+
+    /** Platform key agreement where the provider allows it, own ladder otherwise. */
+    private fun agree(peerRaw: ByteArray): ByteArray? {
+        try {
+            val pkcs8 = hexToBytes("302e020100300506032b656e04220420") + privRaw
+            val x509 = hexToBytes("302a300506032b656e032100") + peerRaw
+            val kf = KeyFactory.getInstance("XDH")
+            val ka = KeyAgreement.getInstance("XDH")
+            ka.init(kf.generatePrivate(PKCS8EncodedKeySpec(pkcs8)))
+            ka.doPhase(kf.generatePublic(X509EncodedKeySpec(x509)), true)
+            return ka.generateSecret()
+        } catch (e: Exception) {
+            return try { X25519.sharedSecret(privRaw, peerRaw) } catch (e2: Exception) { null }
         }
-        myPublic = publicRawFromPrivate(priv)
-    }
-
-    private fun publicRawFromPrivate(p: java.security.PrivateKey): ByteArray {
-        // Derive the public key by agreeing with the base point? The JCA has no
-        // direct scalar-mult; instead regenerate via KeyFactory using XECPrivateKeySpec
-        // is not enough. Use the documented route: KeyPairGenerator can't take a
-        // fixed scalar, so compute the public from the private via BigInteger u=9
-        // agreement is unavailable. The portable answer: X509-encode round trip —
-        // JCA exposes the public only on generated pairs, so for fixed keys we
-        // scalar-multiply with our own X25519 (tiny, verified against vectors).
-        return X25519.publicFromPrivate(privateRaw(p))
-    }
-
-    private fun privateRaw(p: java.security.PrivateKey): ByteArray {
-        val enc = p.encoded // PKCS8
-        return enc.copyOfRange(enc.size - 32, enc.size)
     }
 
     /** True only when the peer key was new; derives directional keys. */
@@ -66,16 +70,7 @@ class Crypto(roomSalt: String, fixedPrivateRaw: ByteArray? = null) {
         if (raw.size != 32) return false
         val hex = raw.joinToString("") { "%02x".format(it) }
         if (hex == peerKeyHex) return false
-        val peerX509 = hexToBytes("302a300506032b656e032100") + raw
-        val peerPub = try {
-            KeyFactory.getInstance("XDH").generatePublic(X509EncodedKeySpec(peerX509))
-        } catch (e: Exception) { return false }
-        val secret = try {
-            val ka = KeyAgreement.getInstance("XDH")
-            ka.init(priv)
-            ka.doPhase(peerPub, true)
-            ka.generateSecret()
-        } catch (e: Exception) { return false }
+        val secret = agree(raw) ?: return false
         val iAmA = lexicographicallyPrecedes(myPublic, raw)
         val ka2b = hkdfSha256(secret, salt, "a2b".toByteArray(), 32)
         val kb2a = hkdfSha256(secret, salt, "b2a".toByteArray(), 32)
@@ -187,14 +182,22 @@ internal object X25519 {
     private val P = java.math.BigInteger.TWO.pow(255).subtract(java.math.BigInteger.valueOf(19))
     private val A24 = java.math.BigInteger.valueOf(121665)
 
-    fun publicFromPrivate(scalarRaw: ByteArray): ByteArray {
+    fun publicFromPrivate(scalarRaw: ByteArray): ByteArray = mul(scalarRaw, BASE_U)
+
+    /** RFC 7748 X25519(k, u) with the peer's public u-coordinate. */
+    fun sharedSecret(scalarRaw: ByteArray, peerRaw: ByteArray): ByteArray {
+        val u = java.math.BigInteger(1, peerRaw.reversedArray()).clearBit(255).mod(P)
+        return mul(scalarRaw, u)
+    }
+
+    private val BASE_U = java.math.BigInteger.valueOf(9)
+
+    private fun mul(scalarRaw: ByteArray, u: java.math.BigInteger): ByteArray {
         val k = scalarRaw.copyOf()
         k[0] = (k[0].toInt() and 248).toByte()
         k[31] = ((k[31].toInt() and 127) or 64).toByte()
-        val u = java.math.BigInteger.valueOf(9)
         val kInt = java.math.BigInteger(1, k.reversedArray())
-        val result = montgomeryLadder(kInt, u)
-        val le = result.toByteArray().reversedArray()
+        val le = montgomeryLadder(kInt, u).toByteArray().reversedArray()
         return ByteArray(32) { if (it < le.size) le[it] else 0 }
     }
 

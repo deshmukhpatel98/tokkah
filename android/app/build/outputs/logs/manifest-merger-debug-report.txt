@@ -1,9 +1,9 @@
 -- Merging decision tree log ---
 manifest
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-22:12
-INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-22:12
-INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-22:12
-INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-22:12
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-24:12
+INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-24:12
+INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-24:12
+INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:2:1-24:12
 MERGED from [androidx.compose.material3:material3-android:1.3.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/97c8aeef94ba41b236a6690b0533dc1f/transformed/material3-release/AndroidManifest.xml:17:1-22:12
 MERGED from [androidx.compose.animation:animation-core-android:1.7.6] /Users/deveshpatel/.gradle/caches/8.13/transforms/f99372db1aa57b5d230c5061e4e9b758/transformed/animation-core-release/AndroidManifest.xml:2:1-7:12
 MERGED from [androidx.compose.material:material-ripple-android:1.7.6] /Users/deveshpatel/.gradle/caches/8.13/transforms/573a4007984c9af693d2d45a35ca02b9/transformed/material-ripple-release/AndroidManifest.xml:2:1-7:12
@@ -61,17 +61,27 @@ uses-permission#android.permission.RECORD_AUDIO
 ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:4:5-71
 	android:name
 		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:4:22-68
+uses-permission#android.permission.CAMERA
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:5:5-65
+	android:name
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:5:22-62
+uses-feature#android.hardware.camera
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:6:5-85
+	android:required
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:6:58-82
+	android:name
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:6:19-57
 uses-permission#android.permission.MODIFY_AUDIO_SETTINGS
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:5:5-80
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:5-80
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:5:22-77
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:22-77
 uses-permission#android.permission.ACCESS_NETWORK_STATE
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:6:5-79
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:8:5-79
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:6:22-76
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:8:22-76
 application
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:5-21:19
-INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:5-21:19
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:9:5-23:19
+INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:9:5-23:19
 MERGED from [androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:23:5-33:19
 MERGED from [androidx.emoji2:emoji2:1.3.0] /Users/deveshpatel/.gradle/caches/8.13/transforms/bc91daa8bfe3c73711c115d4bd5f2ed2/transformed/emoji2-1.3.0/AndroidManifest.xml:23:5-33:19
 MERGED from [androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:28:5-89
@@ -89,43 +99,43 @@ MERGED from [androidx.startup:startup-runtime:1.1.1] /Users/deveshpatel/.gradle/
 	android:appComponentFactory
 		ADDED from [androidx.core:core:1.13.1] /Users/deveshpatel/.gradle/caches/8.13/transforms/233c84d0470d3ff195f9f2c9304d0f51/transformed/core-1.13.1/AndroidManifest.xml:28:18-86
 	android:label
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:18-37
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:9:18-37
 	android:theme
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:7:38-95
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:9:38-95
 activity#com.tokkah.kin.MainActivity
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:8:9-20:20
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:10:9-22:20
 	android:exported
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:8:48-71
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:10:48-71
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:8:19-47
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:10:19-47
 intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:9:13-12:29
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:11:13-14:29
 action#android.intent.action.MAIN
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:10:17-69
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:12:17-69
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:10:25-66
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:12:25-66
 category#android.intent.category.LAUNCHER
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:11:17-77
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:13:17-77
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:11:27-74
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:13:27-74
 intent-filter#action:name:android.intent.action.VIEW+category:name:android.intent.category.BROWSABLE+category:name:android.intent.category.DEFAULT+data:scheme:kin+data:scheme:tokkah
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:13:13-19:29
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:15:13-21:29
 action#android.intent.action.VIEW
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:14:17-69
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:17-69
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:14:25-66
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:25-66
 category#android.intent.category.DEFAULT
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:15:17-76
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:17-76
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:15:27-73
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:27-73
 category#android.intent.category.BROWSABLE
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:17-78
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:17-78
 	android:name
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:16:27-75
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:18:27-75
 data
-ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:17-49
+ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:17-49
 	android:scheme
-		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:17:23-46
+		ADDED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml:19:23-46
 uses-sdk
 INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml reason: use-sdk injection requested
 INJECTED from /Users/deveshpatel/Downloads/video calling/android/app/src/main/AndroidManifest.xml

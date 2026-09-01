@@ -10,3 +10,7 @@ sourceSets {
     }
 }
 application { mainClass = "com.tokkah.kin.harness.MainKt" }
+tasks.register<JavaExec>("call") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tokkah.kin.harness.CallMain")
+}

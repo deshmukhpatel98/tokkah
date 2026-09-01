@@ -39,8 +39,25 @@ enum Launcher {
   // So the join window is gone from the default path. It is still reachable with
   // `--join-window` for the case where somebody wants to type a name, but nothing
   // reaches it by default any more.
+  /// True when this process was started by double-clicking the app rather than
+  /// typed at a shell. The two want opposite defaults and always have: `tk` with
+  /// no room is somebody measuring something, and a bundle launch with no room is
+  /// somebody who wants to call a person.
+  static var isBundleLaunch: Bool {
+    (Bundle.main.executableURL?.path ?? CommandLine.arguments[0]).contains("/Contents/MacOS/")
+  }
+
   static func shouldPrompt(hasRoom: Bool, hasPeer: Bool, forced: Bool) -> Bool {
-    forced
+    if forced { return true }
+    // ── THE FRONT DOOR IS THE DEFAULT FOR A DOUBLE-CLICK ──────────────────────
+    //
+    // This was `forced` alone, so the only way to reach the app's own first
+    // screen was `--gui` from a terminal. Opening Kin normally minted a room and
+    // walked into an empty call (see the `awaitURLRoom` block in main.swift).
+    // Nothing about the command line changes: `tk` with no arguments still does
+    // what it did, because a shell is not a double-click.
+    guard !hasRoom, !hasPeer else { return false }
+    return isBundleLaunch
   }
 
   /// `xxx-xxxx-xxx`, lowercase, exactly as `mintRoom()` does it: 26^10 ~ 47 bits,
@@ -355,6 +372,11 @@ enum Launcher {
     /// server saying their Mac had stopped polling -- not a no, just the only
     /// thing anybody can honestly say about whether they are there.
     case calling(room: String, who: String, away: Bool)
+    /// Walk back into a call this Mac was in and did not leave cleanly. Carries
+    /// the whole record, not just the room: the port, the peer's last address and
+    /// the chain field all have to come back or the "rejoin" is a NEW call that
+    /// merely has the same name (`a-final-record-that-isnt-final`).
+    case resume(Resume.Live)
   }
 
   /// Which of the three things this card is currently for. One value, because two
@@ -378,7 +400,11 @@ enum Launcher {
           stderr)
   }
 
-  static func home() -> Intent? {
+  /// `resume` is a call this Mac was in and did not leave cleanly, which the
+  /// launch path has already confirmed still has somebody in it. It is offered as
+  /// a row rather than walked into, because walking into it is what opening the
+  /// app used to do about everything.
+  static func home(resume: Resume.Live? = nil) -> Intent? {
     // NSApplication FIRST, for the same reason the video path does it: AppKit
     // will happily build an NSWindow before the application object exists and
     // then behave as though the window belongs to nothing.
@@ -643,7 +669,11 @@ enum Launcher {
     }
 
     let fieldBack = vibrant(Metric.fieldHeight)
-    let field = plainField("Type a name, or paste a call link", "")
+    // Not "or paste a call link": a call link opens Kin by itself -- it is a
+    // registered scheme and clicking one in a message walks straight into the
+    // room. Telling somebody to copy a link out of a message and paste it into a
+    // box is asking them to do by hand what the link already does.
+    let field = plainField("Type a handle, like meera", "")
     for x in [fieldBack, field] as [NSView] { v.addSubview(x) }
 
     // Validation, on a line that is always reserved. Saying something must not
@@ -699,6 +729,27 @@ enum Launcher {
     let linkRow = SheetRow("")
     linkRow.value = "from your copied link"
     linkRow.valueIsWord = true
+    // ── A LINK TO HAND SOMEBODY, WITHOUT STARTING A CALL FIRST ───────────────
+    //
+    // The only way to invite a person who is not in the list was to start a call
+    // and copy the link off the waiting screen -- so you sat alone in a room with
+    // your camera on in order to get a URL. This mints the room and copies the
+    // link here, and nothing opens until somebody arrives.
+    let inviteRow = SheetRow("Copy a link to invite someone")
+    inviteRow.value = "copy"
+    inviteRow.valueIsWord = true
+    inviteRow.textInset = Metric.rowAvatarInset
+    // ── AND THE CALL THAT NEVER PROPERLY ENDED ───────────────────────────────
+    //
+    // A Mac that lost wifi, slept, or was closed the wrong way leaves a live
+    // room with somebody still sitting in it. The launch path only walked back
+    // in when it happened within 90 s; past that, the record was checked against
+    // the room directory and then nothing was done with the answer that a person
+    // could see. This is that answer, as a row.
+    let resumeRow = SheetRow(resume.map { "Rejoin \($0.room)" } ?? "")
+    resumeRow.value = "still going"
+    resumeRow.valueIsWord = true
+    resumeRow.textInset = Metric.rowAvatarInset
     // Your own name, and the one state that gets a sentence instead of a control:
     // a copy button over an empty value copies nothing, reports success, and
     // teaches the person the feature is broken. Same rule as the People page.
@@ -756,7 +807,7 @@ enum Launcher {
     let moreBtn = IconButton(Glyph.more, size: Metric.controlSmall, help: "settings")
     v.addSubview(moreBtn)
     for r in peopleRows { v.addSubview(r) }
-    for x in [linkRow, mineRow] as [NSView] { v.addSubview(x) }
+    for x in [linkRow, inviteRow, resumeRow, mineRow] as [NSView] { v.addSubview(x) }
     v.addSubview(mineHint)
     v.addSubview(emptyHint)
     // `linkRow` carries no glyph column of its own beside a list of 34 pt faces --
@@ -775,7 +826,7 @@ enum Launcher {
     // wrong here. Observed, before this line: an app launch put the list under a
     // resting pointer and the next click rang @arjun.
     for r in peopleRows { r.acceptsFirstClick = false }
-    for r in [linkRow, mineRow, reachRow] { r.acceptsFirstClick = false }
+    for r in [linkRow, inviteRow, resumeRow, mineRow, reachRow] { r.acceptsFirstClick = false }
 
     // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
@@ -891,6 +942,43 @@ enum Launcher {
       @objc func joinClip() {
         guard !ringing, let room = clipRoom else { return }
         out = .room(room); done = true
+      }
+      /// Mint a room, put its link on the clipboard, and stay on this screen.
+      /// Nothing is joined: the person is getting a link to send, and opening a
+      /// call to produce one is what this row exists to stop.
+      var invited: String?
+      var inviteTimer: Timer?
+      @objc func copyInvite(_ sender: SheetRow) {
+        guard !ringing else { return }
+        // One room per visit to this screen. Pressing copy twice must hand out
+        // the same link, or the second press quietly invalidates the invitation
+        // already sent with the first.
+        let room = invited ?? Launcher.mintRoom()
+        invited = room
+        NSPasteboard.general.clearContents()
+        // `roomURL`, not a second copy of it: a minted room and a named one take
+        // different link shapes, and the named one 404s if you get it wrong.
+        NSPasteboard.general.setString(roomURL(room), forType: .string)
+        // Warmed now: the link is out in the world and the room's first request
+        // is the ~1100 ms one.
+        Warm.room(room, why: "invite copied")
+        sender.setLabel("Link copied — send it to anyone")
+        sender.value = room
+        inviteTimer?.invalidate()
+        let t = Timer(timeInterval: 4, repeats: false) { [weak sender] _ in
+          sender?.setLabel("Copy a link to invite someone")
+          sender?.value = "copy"
+        }
+        RunLoop.main.add(t, forMode: .common)
+        inviteTimer = t
+        fputs("home: invite link copied for \(room)\n", stderr)
+      }
+      /// Walk back into the call that never ended. The whole record travels, not
+      /// just the room -- see `Intent.resume`.
+      var resumable: Resume.Live?
+      @objc func rejoin() {
+        guard !ringing, let l = resumable else { return }
+        out = .resume(l); done = true
       }
       @objc func copyMine(_ sender: SheetRow) {
         guard let row = sender as? ContactRow, !row.handleName.isEmpty else { return }
@@ -1075,11 +1163,15 @@ enum Launcher {
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
         column += [reachRow, reachHint, quietRow, quietHint]
       } else {
-        // The clipboard row first: a link somebody just sent you is the most
-        // recent intent in the room, newer than any name on the list.
+        // A call you are still in comes first: it is the only row on this card
+        // about something already happening. Then a link somebody just sent you,
+        // which is the newest intent in the room. Then the people, the field,
+        // and last the link you hand OUT -- reaching somebody you have talked to
+        // before is the common case, and inviting a stranger is the rare one.
+        if resume != nil { column += [resumeRow] }
         if !linkRow.spokenName.isEmpty { column += [linkRow] }
         column += people.isEmpty ? [emptyHint] : peopleRows
-        column += [fieldBack, status]
+        column += [fieldBack, status, inviteRow]
         // A brand-new install has nobody to call until somebody knows this
         // Mac's name -- so the name stays on the front card exactly until the
         // first person is in the list, then moves behind the `…`.
@@ -1088,8 +1180,8 @@ enum Launcher {
         }
       }
       let shown = Set(column.map { ObjectIdentifier($0) })
-      for x in [fieldBack, status, linkRow, mineRow, mineHint, emptyHint,
-                reachRow, reachHint, quietRow, quietHint] as [NSView] {
+      for x in [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
+                emptyHint, reachRow, reachHint, quietRow, quietHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       moreBtn.on = t?.settingsOpen == true
@@ -1169,6 +1261,8 @@ enum Launcher {
       // happens one well-meaning row at a time.
       let names = column.map { x -> String in
         if x === linkRow { return "link" }
+        if x === inviteRow { return "invite" }
+        if x === resumeRow { return "rejoin" }
         if x === fieldBack { return "field" }
         if x === status { return "status" }
         if x === mineRow { return "mine" }
@@ -1194,6 +1288,12 @@ enum Launcher {
     reachRow.action = #selector(Target.reachable)
     linkRow.target = t; linkRow.action = #selector(Target.joinClip)
     moreBtn.target = t; moreBtn.action = #selector(Target.settings)
+    inviteRow.target = t; inviteRow.action = #selector(Target.copyInvite(_:))
+    t.resumable = resume
+    resumeRow.target = t; resumeRow.action = #selector(Target.rejoin)
+    // The room is known and about to be joined -- the same free second the faces
+    // and the clipboard row get.
+    resumeRow.onHover = { if let r = resume { Warm.room(r.room, why: "hover rejoin") } }
     quietRow.target = t; quietRow.action = #selector(Target.quietPressed)
     // ── A SWITCH THAT MOVES ONLY WHEN THE SERVER SAYS IT DID ─────────────────
     //
@@ -1451,6 +1551,8 @@ enum Launcher {
       case "mine": return mineRow
       case "link": return linkRow
       case "quiet": return quietRow
+      case "invite": return inviteRow
+      case "rejoin": return resumeRow
       default: return peopleRows.first { $0.handleName == n }
       }
     }
@@ -1595,6 +1697,8 @@ enum Launcher {
     dotTimer = nil
     t.copyTimer?.invalidate()
     t.copyTimer = nil
+    t.inviteTimer?.invalidate()
+    t.inviteTimer = nil
     // ── RELEASING THE CAMERA, WHICH USED TO BE EXEC'S JOB ────────────────────
     //
     // `stopRunning()` alone was enough while a re-exec followed: the process

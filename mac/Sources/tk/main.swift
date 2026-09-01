@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.113.0"
+let VERSION = "0.114.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -873,6 +873,10 @@ Launcher.installURLHandler()
 // every `--selftest-*`) need no mention. The list fails towards NOT rejoining,
 // which is the cheap direction: the worst case is a person opening Kin and
 // pressing nothing.
+/// A call this Mac is still in, for the front door to offer. Declared before the
+/// block that fills it: top-level code runs in order, and a `var` assigned above
+/// its own declaration is silently undone by the initialiser.
+var resumable: Resume.Live?
 let namesAnotherJob = isTestRun || flag("stun") || flag("acoustic")
   || arg("call") != nil || arg("shot") != nil
   || flag("cam-picker-test") || flag("vpause-test") || flag("presence-run")
@@ -882,8 +886,20 @@ if arg("room") == nil, arg("peer") == nil, !flag("gui"), !flag("no-rejoin"),
    let live = Resume.pending() {
   let bundled = (Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
     .contains("/Contents/MacOS/")
-  Launcher.remember(live.room)
-  Launcher.reexec(room: live.room, extra: Resume.argv(live, bundled: bundled), why: "rejoin")
+  // ── WALKING BACK IN, OR BEING OFFERED THE DOOR ───────────────────────────
+  //
+  // Inside the walk-in lease this is somebody who closed the window by accident
+  // seconds ago, and putting a screen between them and the call they are still
+  // in would be the wrong kind of careful. Past it, the call is real but the
+  // person's intent is not known -- they opened the app, which is not the same
+  // as asking to be put back into a conversation from an hour ago with their
+  // camera on. `Resume.pending` has already established somebody is still in
+  // there; the front door offers it as a row (see `Intent.resume`).
+  if Resume.now() - live.at <= Double(Resume.walkInMs) {
+    Launcher.remember(live.room)
+    Launcher.reexec(room: live.room, extra: Resume.argv(live, bundled: bundled), why: "rejoin")
+  }
+  resumable = live
 }
 
 // ── A DOUBLE-CLICK STARTS A CALL ────────────────────────────────────────────
@@ -903,9 +919,24 @@ if arg("room") == nil, arg("peer") == nil, !flag("gui"),
   // 0.25 and not 0.7: awaitURLRoom now also returns the instant the LAUNCH event
   // arrives, so this is the backstop for a launch that delivers neither event, not
   // the price of every double-click. Measured AE delivery was 27 ms.
-  let room = Launcher.awaitURLRoom(within: 0.25) ?? Launcher.mintRoom()
-  Launcher.remember(room)
-  Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "gui prompt")
+  // ── A LINK GOES TO ITS CALL; A DOUBLE-CLICK OPENS THE DOOR ────────────────
+  //
+  // This used to be `?? Launcher.mintRoom()`: opening the app with nothing to
+  // join minted a room and re-exec'd STRAIGHT INTO AN EMPTY CALL. The front
+  // door -- the people, the faces, the field -- was reachable only with `--gui`,
+  // which is to say from a terminal, which is to say never. Everything the last
+  // ten releases built was behind a flag no user has ever typed, and what a
+  // person got for double-clicking a video calling app was a call with nobody
+  // in it and their camera on.
+  //
+  // A `tokkah://` link still wins and still goes straight through: somebody
+  // clicking an invite is trying to reach a specific call, not to be shown a
+  // list of other people.
+  if let room = Launcher.awaitURLRoom(within: 0.25) {
+    Launcher.remember(room)
+    Launcher.reexec(room: room, extra: ["--video", "camera", "--window"], why: "invite link")
+  }
+  // No link. Fall through to the front door -- see `shouldPrompt`.
 }
 
 // `--gui` still opens the join window, for typing a name on purpose.
@@ -925,7 +956,7 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   // happened into the image that will wait for the answer -- the same `--calling`
   // flag the in-call dial path uses, which is what puts a name and a cancel
   // button on the waiting card instead of an invite link.
-  guard let intent = Launcher.home() else { exit(0) }   // closed the window
+  guard let intent = Launcher.home(resume: resumable) else { exit(0) }  // closed the window
   // Video on by default here and off for the command line: someone who typed
   // `tk` is measuring something, someone who double-clicked wants a video call.
   // A WINDOW, TOO. Without `--window` nothing ever creates one, so the app that
@@ -986,6 +1017,15 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
       Args.decide("room", room)
       Args.decide("calling", who)
       if away { Args.decide("callee-away", nil) }
+    case .resume(let live):
+      // The re-exec path, even here: a resumed call needs its port, its peer's
+      // last address and its chain field back, and those arrive as argv from
+      // `Resume.argv` rather than as three more `Args.decide` calls that would
+      // be a second copy of the same rule.
+      Launcher.remember(live.room)
+      Launcher.reexec(room: live.room,
+                      extra: Resume.argv(live, bundled: Launcher.isBundleLaunch),
+                      why: "rejoin from the front door")
     }
     // ── WHICH PATH THIS CALL TOOK, ON THE RECORD ─────────────────────────
     //
@@ -1019,6 +1059,13 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
       // no basis to say, which is NOT the same as "they are away".
       if away { extra.append("--callee-away") }
       Launcher.reexec(room: room, extra: extra, why: "called @" + who)
+    case .resume(let live):
+      // Same as the in-process arm above: a rejoin is a re-exec either way,
+      // because what it needs back is argv.
+      Launcher.remember(live.room)
+      Launcher.reexec(room: live.room,
+                      extra: Resume.argv(live, bundled: Launcher.isBundleLaunch),
+                      why: "rejoin from the front door")
     }
   }
 }
