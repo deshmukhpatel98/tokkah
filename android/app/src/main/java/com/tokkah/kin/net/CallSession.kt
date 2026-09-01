@@ -15,6 +15,10 @@ class CallSession(
     val room: String,
     val me: String = "droid-" + (100000..999999).random(),
     val base: String = Server.base,
+    /** Where the call record, telemetry and identity live. */
+    val store: java.io.File? = null,
+    /** The handle on the other end, when a ring told us. */
+    val who: String = "",
 ) {
     val crypto = Crypto(room)
     val ring = RecvRing()
@@ -22,6 +26,10 @@ class CallSession(
     val gate = DuplexGate()
     val floor = Floor()
     val tsync = TimeSync()
+    val held = Held()
+    val vquality = VQuality()
+    val resume: Resume? = store?.let { Resume(it) }
+    val telemetry: Telemetry? = store?.let { Telemetry(it) }
 
     @Volatile var running = false; private set
     @Volatile var locked: InetSocketAddress? = null; private set
@@ -34,6 +42,10 @@ class CallSession(
     @Volatile var speakers = true
     /** Set by the UI: this end has left, so stop sending. */
     @Volatile var ended = false
+
+    /** The honest sentence, or null when there is nothing to say. */
+    @Volatile var heldSentence: String? = null; private set
+    @Volatile var callSeconds = 0; private set
 
     var onState: ((String) -> Unit)? = null
     var onPeerVocal: ((Int) -> Unit)? = null
@@ -78,15 +90,103 @@ class CallSession(
         thread(isDaemon = true, name = "kin-signal") {
             mapped = Stun.discoverAny(s)
             thread(isDaemon = true, name = "kin-rx") { receiveLoop(s) }
+            thread(isDaemon = true, name = "kin-report") { reportLoop(s) }
             signalLoop(s)
         }
     }
 
-    fun stop() {
+    /**
+     * Once a second, off every hot path: the honesty state, the call record on
+     * disk, the quality controller, and the beat.
+     */
+    private fun reportLoop(s: DatagramSocket) {
+        var lastPlayed = 0
+        var lastConceal = 0
+        var lastFrames = 0
+        var lastFrags = 0
+        var t0 = 0L
+        var beatAt = 0L
+        while (running) {
+            Thread.sleep(1000)
+            val played = ring.played - lastPlayed
+            val concealed = ring.concealed - lastConceal
+            val frames = video.framesOut - lastFrames
+            val frags = video.fragsIn - lastFrags
+            lastPlayed = ring.played; lastConceal = ring.concealed
+            lastFrames = video.framesOut; lastFrags = video.fragsIn
+
+            held.beat(concealed, played, frames, frags)
+            heldSentence = held.sentence
+
+            if (crypto.established) {
+                if (t0 == 0L) {
+                    t0 = System.currentTimeMillis()
+                    // The record is written at the TRANSPORT LOCK, not at
+                    // launch: a process that never found anybody was never in
+                    // a call, and a hopeful record sends the next launch into
+                    // an empty room.
+                    resume?.begin(room, s.localPort, locked?.toString() ?: "",
+                        who, telemetry?.call ?: "")
+                }
+                callSeconds = ((System.currentTimeMillis() - t0) / 1000).toInt()
+                resume?.touch(locked?.toString())
+                vquality.tick(callSeconds.toDouble(), 0, concealed, false)
+                    ?.let { onQuality?.invoke(it) }
+
+                val now = System.currentTimeMillis()
+                if (now - beatAt > 5000) {
+                    beatAt = now
+                    telemetry?.post(beatFields())
+                }
+            }
+        }
+    }
+
+    var onQuality: ((Double) -> Unit)? = null
+
+    /** Never the room name: it is the encryption salt and never leaves here. */
+    fun beatFields(): Map<String, Any?> = mapOf(
+        "secs" to callSeconds,
+        "played" to ring.played,
+        "conceal" to ring.concealed,
+        "conceal_lost" to ring.concealLost,
+        "conceal_starved" to ring.concealStarved,
+        "late" to ring.lateArrivals,
+        "dup" to ring.dup,
+        "jumps" to ring.jumps,
+        "snaps_behind" to ring.snapsBehind,
+        "snaps_past" to ring.snapsPast,
+        "rtt_ms" to tsync.bestRttMs,
+        "rtt_spread_ms" to tsync.rttSpreadMs,
+        "sealed" to crypto.sealed,
+        "opened" to crypto.opened,
+        "open_fails" to crypto.openFails,
+        "plaintext_rx" to crypto.plaintextRx,
+        "vframes" to video.framesOut,
+        "vfrags" to video.fragsIn,
+        "vdropped" to video.dropped,
+        "vquality" to vquality.quality,
+        "hold" to (held.sentence ?: "-"),
+        "conceal_frac" to held.lastFrac,
+        "floor_mine" to floor.askedBlocks,
+        "gate_claims" to gate.claims,
+        "gate_backchannels" to gate.backchannels,
+        "peer_played" to peerPlayed,
+        "speakers" to speakers,
+        "send_errors" to sendErrors,
+    )
+
+    /**
+     * A person hung up. THE ONLY thing that ends a call: not the process
+     * ending, not a crash, which is the whole reason the record exists.
+     */
+    fun stop(hungUp: Boolean = true) {
         if (!running) return
         running = false
         repeat(4) { sendSealed(Wire.goodbye()) }
-        Thread.sleep(120)
+        telemetry?.post(beatFields(), phase = "final")
+        if (hungUp) resume?.end()
+        Thread.sleep(150)
         sock?.close()
     }
 

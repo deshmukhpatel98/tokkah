@@ -58,6 +58,17 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     var decodedW = 0; private set
     var decodedH = 0; private set
     var onDecodedSize: ((Int, Int) -> Unit)? = null
+
+    /**
+     * One frame of the far end, for their picture on the front door. Taken from
+     * the DECODED stream on a slow timer, never per frame: the crop and encode
+     * are milliseconds, which is nothing at once-a-minute and an eternity in a
+     * media callback. Null until something asks for one.
+     */
+    var wantFaceFor: String? = null
+    var onFace: ((String, android.graphics.Bitmap) -> Unit)? = null
+    private var lastFaceAt = 0L
+    private var faceReader: android.media.ImageReader? = null
     var lastError: String? = null; private set
     var facingFront = true
 
@@ -207,7 +218,13 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     // ── decode ───────────────────────────────────────────────────────────────
 
     fun attachDisplay(surface: Surface) {
-        session.onVideoFrame = { payload, _ -> decode(payload, surface) }
+        // Chained, not replaced: the face grabber also wants every payload, and
+        // whichever was assigned second would otherwise silently win.
+        val prior = session.onVideoFrame
+        session.onVideoFrame = { payload, cap ->
+            decode(payload, surface)
+            prior?.invoke(payload, cap)
+        }
     }
 
     private fun decode(payload: ByteArray, surface: Surface) {
@@ -259,6 +276,86 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             }
         } catch (e: Exception) { lastError = "decode: ${e.message}" }
     }
+
+    /**
+     * Their face, once a minute at most, and only when the call KNOWS who it is
+     * with — a face filed under a room name would surface under whoever uses
+     * that word next.
+     */
+    private fun maybeTakeFace(surface: Surface) {
+        val who = wantFaceFor ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastFaceAt < 60_000) return
+        if (framesDecoded < 60) return          // let the picture settle first
+        lastFaceAt = now
+        // The decoder renders straight to a SurfaceView, which cannot be read
+        // back — so the face comes from a second, tiny decode target rather
+        // than from stealing the one the person is watching.
+        pendingFaceFor = who
+    }
+
+    /** Set when a face is wanted; the next keyframe payload is decoded twice. */
+    private var pendingFaceFor: String? = null
+
+    /**
+     * Decode one payload into a bitmap, off the display path. Called with a
+     * KEYFRAME so it can stand alone.
+     */
+    fun faceFromKeyframe(payload: ByteArray) {
+        val who = pendingFaceFor ?: return
+        pendingFaceFor = null
+        val f = VideoWire.parse(payload, payload.size) ?: return
+        if (!f.isKeyframe) { pendingFaceFor = who; return }
+        thread@ Thread {
+            try {
+                val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H)
+                for ((i, sps) in f.parameterSets.withIndex()) {
+                    fmt.setByteBuffer("csd-$i", ByteBuffer.wrap(byteArrayOf(0, 0, 0, 1) + sps))
+                }
+                val reader = android.media.ImageReader.newInstance(
+                    W, H, android.graphics.ImageFormat.YUV_420_888, 2,
+                )
+                val d = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                d.configure(fmt, reader.surface, null, 0)
+                d.start()
+                val i = d.dequeueInputBuffer(200_000)
+                if (i >= 0) {
+                    val tmp = ByteArray(f.avcc.size + 64)
+                    val n = VideoWire.avccToAnnexB(f.avcc, tmp)
+                    d.getInputBuffer(i)!!.also { it.clear(); it.put(tmp, 0, n) }
+                    d.queueInputBuffer(i, 0, n, 0, 0)
+                    val info = MediaCodec.BufferInfo()
+                    val o = d.dequeueOutputBuffer(info, 400_000)
+                    if (o >= 0) {
+                        d.releaseOutputBuffer(o, true)
+                        Thread.sleep(80)
+                        reader.acquireLatestImage()?.use { img ->
+                            yuvToBitmap(img)?.let { onFace?.invoke(who, it) }
+                        }
+                    }
+                }
+                d.stop(); d.release(); reader.close()
+            } catch (e: Exception) { lastError = "face: ${e.message}" }
+        }.also { it.isDaemon = true; it.start() }
+    }
+
+    private fun yuvToBitmap(img: android.media.Image): android.graphics.Bitmap? = try {
+        val y = img.planes[0].buffer
+        val u = img.planes[1].buffer
+        val v = img.planes[2].buffer
+        val nv21 = ByteArray(y.remaining() + u.remaining() + v.remaining())
+        y.get(nv21, 0, y.remaining())
+        val chromaAt = nv21.size - u.remaining() - v.remaining()
+        v.get(nv21, chromaAt, v.remaining())
+        u.get(nv21, chromaAt + v.remaining(), u.remaining())
+        val yuv = android.graphics.YuvImage(
+            nv21, android.graphics.ImageFormat.NV21, img.width, img.height, null,
+        )
+        val out = java.io.ByteArrayOutputStream()
+        yuv.compressToJpeg(android.graphics.Rect(0, 0, img.width, img.height), 85, out)
+        val b = out.toByteArray()
+        android.graphics.BitmapFactory.decodeByteArray(b, 0, b.size)
+    } catch (e: Exception) { null }
 
     fun stop() {
         running = false

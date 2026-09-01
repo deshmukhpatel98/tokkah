@@ -74,6 +74,8 @@ fun KinApp(initialRoom: String?) {
     var cardWho by remember { mutableStateOf("") }
     var cardLine by remember { mutableStateOf<String?>(null) }
     var cardBecause by remember { mutableStateOf<String?>(null) }
+    var resumeRoom by remember { mutableStateOf<String?>(null) }
+    var resumeWho by remember { mutableStateOf("") }
 
     val state = remember { KinState(ctx.filesDir) }
     val identity = state.identity
@@ -98,20 +100,30 @@ fun KinApp(initialRoom: String?) {
         }
     }
 
-    fun join(name: String) {
+    fun join(name: String, who: String = "") {
         if (name.isBlank()) return
-        val s = CallSession(name.trim())
+        val s = CallSession(name.trim(), store = ctx.filesDir.resolve("kin"), who = who)
         s.start()
         val a = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
         a.start()
         val v = VideoDevice(ctx, s)
         s.onKeyframeRequest = { v.requestKeyframe() }
+        // Their picture, but only when the call knows WHO it is with: a face
+        // filed under a room name would surface under whoever uses that word
+        // next.
+        if (who.isNotEmpty()) {
+            v.wantFaceFor = who
+            v.onFace = { handle, bmp -> state.faces.save(handle, bmp) }
+            s.onVideoFrame = { payload, _ -> v.faceFromKeyframe(payload) }
+        }
         session = s; audio = a; video = v
     }
 
     fun leave() {
-        video?.stop(); audio?.stop(); session?.stop()
+        video?.stop(); audio?.stop()
+        session?.stop(hungUp = true)
         video = null; audio = null; session = null
+        state.refresh()
     }
 
     // The mailbox, and the panel it fills. One owner, so the poll loop and the
@@ -126,8 +138,10 @@ fun KinApp(initialRoom: String?) {
             cardWho = state.incoming?.from ?: state.outgoingTo ?: ""
             cardLine = state.cardLine
             cardBecause = state.cardBecause
+            resumeRoom = state.pending?.room
+            resumeWho = state.pending?.who ?: ""
         }
-        state.onCall = { room, who -> join(room); state.answered() }
+        state.onCall = { room, who -> join(room, who); state.answered() }
         state.start()
         onDispose { state.stop() }
     }
@@ -141,7 +155,7 @@ fun KinApp(initialRoom: String?) {
                 people = people,
                 myHandle = myHandle,
                 cameraHint = cameraHint,
-                resumeRoom = null,
+                resumeRoom = resumeRoom?.let { if (resumeWho.isNotEmpty()) "@$resumeWho" else it },
                 pastedLink = null,
                 settingsOpen = settingsOpen,
                 onSettings = { settingsOpen = !settingsOpen },
@@ -152,7 +166,10 @@ fun KinApp(initialRoom: String?) {
                     else join(room)
                 },
                 onCall = { handle -> state.call(handle) },
-                onResume = {},
+                onResume = {
+                    state.pending?.let { join(it.room, it.who) }
+                    state.pending = null
+                },
                 onInvite = {
                     val link = "${Server.invite}/${room.ifBlank { myHandle }}"
                     ctx.getSystemService(ClipboardManager::class.java)
@@ -192,6 +209,9 @@ fun KinApp(initialRoom: String?) {
                     sentence = when {
                         !s.crypto.established -> "connecting"
                         s.ended -> "they left"
+                        // paused OUTRANKS everything: if audio is not arriving,
+                        // never put the word "audio" beside the word "live".
+                        s.heldSentence != null -> s.heldSentence!!
                         s.peerMuted -> "they are muted"
                         else -> "connected"
                     }

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.tokkah.kin.FloorVectorTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-01T03:37:58.913Z" hostname="Deveshs-MacBook-Air.local" time="0.022">
+<testsuite name="com.tokkah.kin.FloorVectorTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-09-01T04:09:23.036Z" hostname="Deveshs-MacBook-Air.local" time="0.012">
   <properties/>
-  <testcase name="everyDecisionMatchesTheSwiftOriginal" classname="com.tokkah.kin.FloorVectorTest" time="0.022"/>
+  <testcase name="everyDecisionMatchesTheSwiftOriginal" classname="com.tokkah.kin.FloorVectorTest" time="0.012"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>
 </testsuite>

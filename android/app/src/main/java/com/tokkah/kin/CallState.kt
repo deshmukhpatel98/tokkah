@@ -24,6 +24,10 @@ class KinState(root: File) {
     val identity = Identity(File(root, "kin"))
     val faces = Faces(File(root, "kin"))
     val watcher = RingWatcher(identity)
+    val resume = com.tokkah.kin.net.Resume(File(root, "kin"))
+
+    /** A call this phone never hung up on. Read once, at the front door. */
+    @Volatile var pending: com.tokkah.kin.net.Resume.Live? = null
 
     @Volatile var people: List<Person> = emptyList()
     @Volatile var incoming: Identity.Ring? = null
@@ -60,6 +64,9 @@ class KinState(root: File) {
                 failCall("@${r.from} declined", "maybe later")
             }
         }
+        // A call ends when a human hangs up — so one that is still on disk is
+        // still on, whatever happened to the process that was in it.
+        pending = resume.pending()
         watcher.start()
         refresh()
     }
@@ -122,6 +129,12 @@ class KinState(root: File) {
     }
 
     /** They picked up (or we joined): the card's work is done. */
+    fun forgetPending() {
+        pending = null
+        resume.end()
+        onChanged?.invoke()
+    }
+
     fun answered() {
         outgoingTo = null
         incoming = null
