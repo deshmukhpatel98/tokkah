@@ -407,6 +407,33 @@ echo "  manifest $VER, tarball fetched and hash matches"
 # than "somebody started a release". Nothing below can fail the release: it has
 # already happened, and a script that succeeds at shipping and then exits
 # non-zero teaches the operator to ignore its exit code.
+# ── AND THE TAG HAS TO POINT AT WHAT SHIPPED ────────────────────────────────
+#
+# 0.120.0 was built from the working tree, deployed, verified from the edge, and
+# then tagged -- at the PREVIOUS commit, because nothing here had committed the
+# source. So `v0.120.0` named code that was not in 0.120.0, and the comment above
+# ("a tag means this shipped and was verified") was false for exactly the release
+# that added it. The tarball was right; only the pointer was a lie, which is the
+# worse half: an artifact you can hash, a tag you cannot.
+#
+# The paths a release IS -- the app's source, its rigs, this script, the changelog
+# -- are committed before the tag, and only those. `git add -A` would sweep in the
+# tracked Android build directories this repo carries, so the list is explicit.
+if [ "${NO_COMMIT:-}" != 1 ]; then
+  REL_PATHS="mac/Sources mac/tools mac/release.sh CHANGELOG.md"
+  if ! git -C "$REPO" diff --quiet -- $REL_PATHS \
+     || ! git -C "$REPO" diff --cached --quiet -- $REL_PATHS; then
+    git -C "$REPO" add -- $REL_PATHS
+    if git -C "$REPO" commit -q -m "Kin $VER${NOTES_TEXT:+
+
+$NOTES_TEXT}" -- $REL_PATHS; then
+      echo "  committed the release source: $(git -C "$REPO" log --oneline -1)"
+    else
+      echo "  WARNING: could not commit the release source, so the tag below will"
+      echo "           point at code that is not this release."
+    fi
+  fi
+fi
 if [ "${NO_TAG:-}" = 1 ]; then
   echo "  NO_TAG=1, not tagging"
 elif git rev-parse "v$VER" >/dev/null 2>&1; then

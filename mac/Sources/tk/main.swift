@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.120.0"
+let VERSION = "0.121.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -1432,6 +1432,51 @@ Update.beforeRestart = {
 // circuits and no dialog appears.
 /// 1 granted, 0 denied, -1 still unanswered. Reported, because "they heard
 /// silence" and "the microphone was never allowed" are the same symptom.
+// ── WHAT IS WRONG AT THIS END, IN ONE PLACE ─────────────────────────────────
+//
+// Two things can be denied and both are invisible on a call: the microphone (the
+// far end hears silence) and the camera (they see nothing of you). The sentence
+// is short, plain, and says what to do -- `consumer-app-not-a-lab`: no jargon, no
+// pane paths, no numbers. Clicking it opens the exact pane, which is the whole
+// difference between a warning and an instruction.
+//
+// ── AND IT IS DECLARED HERE, WHERE EVERY LAUNCH REACHES IT ────────────────
+//
+// It sat 2500 lines further down, next to the second microphone check, and never
+// ran: `if let room = arg("room")` pumps AppKit until somebody joins, so
+// everything below that block executes only once a call is up. A probe put on the
+// line proved it -- the line never printed on a launch with nobody at the other
+// end. So the sentence about a denied microphone was unreachable in exactly the
+// state it exists for: the app open, waiting, with no picture and no sound and
+// nothing said. Sibling of `top-level-code-runs-in-order`, one scope out.
+//
+// `TK_FAKE_DENIED=microphone|camera` exists because this state cannot be created
+// on a test machine without changing the owner's privacy settings, which no rig
+// may do. Without it the sentence could only ever be verified by hand, once, by
+// whoever happened to have a denied microphone.
+enum LocalTrouble { case none, microphone, camera }
+nonisolated(unsafe) var gTrouble: LocalTrouble = .none
+func showTrouble() {
+  let words: String
+  let need: Permissions.Need
+  switch gTrouble {
+  case .none:
+    display?.controls?.setTrouble(nil); return
+  case .microphone:
+    words = "Kin can’t hear you — turn on the microphone"; need = .microphone
+  case .camera:
+    words = "Kin can’t see you — turn on the camera"; need = .camera
+  }
+  display?.controls?.onTroubleClick = { _ = Permissions.reveal(need) }
+  display?.controls?.setTrouble(words)
+}
+if let fake = ProcessInfo.processInfo.environment["TK_FAKE_DENIED"] {
+  gTrouble = fake == "camera" ? .camera : .microphone
+  fputs("TK_FAKE_DENIED=\(fake) -- pretending that permission is off, to prove the"
+      + " sentence a person would see\n", stderr)
+  // The window does not exist yet on this path, so it is armed for when it does.
+  DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showTrouble() }
+}
 nonisolated(unsafe) var gMicAccess = -1
 switch AVCaptureDevice.authorizationStatus(for: .audio) {
 // ── AND IT SAYS WHEN ──────────────────────────────────────────────────────────
@@ -1452,6 +1497,7 @@ case .notDetermined:
   fputs("mic: asking for permission (look for a dialog) at \(sinceLaunch()) ms\n", stderr)
   AVCaptureDevice.requestAccess(for: .audio) { ok in
     gMicAccess = ok ? 1 : 0
+    if !ok { gTrouble = .microphone; DispatchQueue.main.async { showTrouble() } }
     Metrics.count(ok ? "mic_granted" : "mic_denied")
     Metrics.fact("mic_access", ok ? "granted" : "denied")
     fputs(ok ? "mic: granted\n"
@@ -1460,6 +1506,10 @@ case .notDetermined:
   }
 case .denied, .restricted:
   gMicAccess = 0
+  // The sentence a person sees. Until this line the denial existed in a stderr
+  // log and two telemetry fields, and the call looked perfectly normal while the
+  // far end heard nothing. See `showTrouble`.
+  gTrouble = .microphone
   fputs("mic: denied -- they will hear silence from this end."
       + " System Settings > Privacy & Security > Microphone\n", stderr)
 @unknown default:
@@ -2052,7 +2102,15 @@ if flag("window") {
            // call outlives its process now, so reopening walks straight back in.
            onClose: { closeWindowKeepingCall() },
            invite: inviteText(room: roomName))
+    // ── AND SAY WHAT IS WRONG AT THIS END, NOW THERE IS SOMEWHERE TO SAY IT ──
+    //
+    // The permission answers arrive ~40 ms into the launch, long before this
+    // window exists, so `showTrouble()` at that moment has nothing to draw on.
+    // Called again here, with the window in hand, so a denied microphone is a
+    // sentence on the first frame a person sees rather than one that waits for
+    // some later event to redraw the pill.
     display = d
+    showTrouble()
     // ── COMING BACK MUST NOT LOOK LIKE STARTING ────────────────────────────────
     //
     // A rejoining image opens the same window every launch does, so for the
@@ -2328,23 +2386,45 @@ if earlyCam == nil, videoArg != "off", !ringPending, display != nil || mdisplay 
     // was built -- a first run, or a refusal -- so this wait is once-ever rather
     // than once per launch. Every other launch took the path above and never
     // touched a semaphore.
-    let gate = DispatchSemaphore(value: 0)
-    var got = CameraSource.Access.denied
+    // ── ASKED WITHOUT FREEZING THE WINDOW ────────────────────────────────────
+    //
+    // The paragraph above said blocking here "is fine and deliberate ... the
+    // window is already on screen". The window is on screen and NOTHING IS
+    // TURNING IT: every line of this file runs before `NSApplication.run()`, so a
+    // `DispatchSemaphore` waited on for up to sixty seconds is sixty seconds of a
+    // window that cannot be dragged, cannot draw, and shows no picture -- on a
+    // FIRST RUN, which is the one launch that has to look alive, for exactly as
+    // long as the person takes to answer a dialog.
+    //
+    // The microphone path forty lines up already knows this and says so: "no
+    // runloop turning, which is a frozen window in the one moment the app most
+    // needs to look alive. The system draws the dialog, not us; we only need to
+    // not be dead when the answer comes back." It was fixed there; the sibling
+    // kept the semaphore. `second-copy-of-a-rule`.
+    //
+    // Nothing below needed the answer -- the semaphore only kept the code in a
+    // straight line -- so the answer now starts the sensor when it arrives.
     fputs("camera: asking for permission at \(sinceLaunch()) ms\n", stderr)
-    CameraSource.requestAccess { a in got = a; gate.signal() }
-    // A minute is longer than anyone takes to answer, and expiring is not fatal:
-    // the call continues without a picture rather than never starting.
-    _ = gate.wait(timeout: .now() + 60)
-    if got != .granted {
+    func cameraDenied(_ got: CameraSource.Access) {
       Metrics.count("cam_denied")
       Metrics.fact("cam_access", "\(got)")
       fputs("camera: not permitted (\(got)) -- continuing with audio only."
           + " System Settings > Privacy & Security > Camera\n", stderr)
-      display?.controls?.setStatus("camera off — check Privacy settings")
+      // NOT `setStatus`. The status pill is overwritten by the next thing that
+      // happens -- "connected", "you are muted" -- so this sentence lasted about a
+      // second and the call then looked entirely normal while no picture left this
+      // Mac. A local fault stays up until it is fixed, and can be clicked.
+      if gTrouble == .none { gTrouble = .camera; showTrouble() }
     }
-    let cam = CameraSource()
-    earlyCam = cam
-    attachCamera(cam)
+    CameraSource.requestAccess { a in
+      DispatchQueue.main.async {
+        guard a == .granted else { cameraDenied(a); return }
+        fputs("camera: granted at \(sinceLaunch()) ms -- starting the sensor now\n", stderr)
+        let cam = CameraSource()
+        earlyCam = cam
+        attachCamera(cam)
+      }
+    }
   } else {
     let f = FileSource(path: videoArg, fps: Double(arg("fps") ?? "30") ?? 30)
     f.onFrame = { pb, _ in
@@ -3938,6 +4018,14 @@ case .denied, .restricted:
   // bundle has owned its own grant since it became a bundle; the message had not
   // noticed. It now names whichever is actually true, and carries the URL that
   // opens the pane rather than a path through three menus.
+  // ── AND ON THE SCREEN, NOT ONLY ON STDERR ─────────────────────────────────
+  //
+  // This branch has printed a good, correct paragraph to stderr for months, into
+  // a stream a person using Kin.app never sees. On screen there was nothing: a
+  // normal-looking call, a running timer, and a far end hearing silence. See
+  // `CallControls.setTrouble`.
+  gTrouble = .microphone
+  showTrouble()
   fputs("microphone: DENIED. You will hear the other person and they will hear silence.\n"
       + "  Switch on \(Bundle.main.bundleIdentifier == nil ? "the app you launched this from (Terminal, iTerm, VS Code...)" : "Kin")"
       + " under System Settings > Privacy & Security > Microphone.\n"

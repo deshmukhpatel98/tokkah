@@ -818,6 +818,43 @@ final class Pill: NSView {
   }
   required init?(coder: NSCoder) { fatalError() }
 
+  // ── THE LABEL INSIDE IT MUST NOT EAT THE CLICK ─────────────────────────────
+  //
+  // The warning pill became a control -- clicking "Kin can't hear you" opens the
+  // right System Settings pane -- and the click did not arrive. The audit said
+  // why: `hit=NSTextField`. The gesture recogniser is on the PILL; the hit was
+  // its label, an NSTextField, which handles mouseDown itself for text selection
+  // and swallowed it. Third instance of `decoration-inside-a-control-eats-clicks`
+  // in this file, after the blur inside a button and the glyph overlay.
+  //
+  // No pill in this app contains text anybody selects -- they are sentences drawn
+  // over a video -- so the whole pill is one target and the label is never
+  // consulted.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    guard !isHidden, alphaValue > 0.01 else { return nil }
+    return super.hitTest(point) == nil ? nil : self
+  }
+
+  // ── AND THE PRESS IS TRACKED BY HAND ───────────────────────────────────────
+  //
+  // `NSClickGestureRecognizer` was the first attempt and it never fired: the
+  // audit showed the click reaching the pill (`hit=Pill`) and the handler not
+  // running. Every other control in this file tracks its own mouseDown/mouseUp
+  // for the same reason -- a recogniser depends on AppKit's own routing, and this
+  // window is parked, not key, and `ignoresMouseEvents` under the harness. A
+  // control that only works when the app is frontmost is a control the harness
+  // can never prove, which is how a dead button gets shipped.
+  var onClick: (() -> Void)?
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+  override func mouseDown(with event: NSEvent) {
+    guard onClick != nil else { super.mouseDown(with: event); return }
+  }
+  override func mouseUp(with event: NSEvent) {
+    guard let go = onClick else { super.mouseUp(with: event); return }
+    let p = convert(event.locationInWindow, from: nil)
+    if bounds.contains(p) { go() }
+  }
+
   var text: String = "" {
     didSet {
       label.stringValue = text
@@ -3609,9 +3646,39 @@ final class CallControls: NSView {
   /// The pill only moves when the WINNER changes, so a slot updating underneath a
   /// higher one costs nothing and cannot re-show the row.
   private var warnPeer = ""
+  @objc private func troubleClicked() {
+    guard !troubleLocal.isEmpty, let go = onTroubleClick else { return }
+    fputs("trouble: the person clicked \"\(troubleLocal)\"\n", stderr)
+    Metrics.count("trouble_click")
+    go()
+  }
   private var warnRoom = ""
   /// What the far end's devices and link are doing. Every existing caller.
   func setWarning(_ line: String) { warnPeer = line; renderWarning() }
+
+  // ── SOMETHING IS WRONG AT THIS END, AND ONLY THIS END KNOWS ────────────────
+  //
+  // Every sentence this pill carried was about the OTHER person: their camera is
+  // off, their connection is weak, they'll be right back. There was no way for it
+  // to say anything about this Mac -- and the worst failure in the app is exactly
+  // that shape.
+  //
+  // A person who has denied the microphone gets a call that looks completely
+  // normal. The timer runs, the picture is there, the controls work, and nobody
+  // can hear them. `gMicAccess` knew; it went into two telemetry fields and
+  // nowhere else, so the only trace was a line on stderr that nobody sees. The
+  // far end hears silence and both people blame the app.
+  //
+  // It takes precedence over the peer sentence because it is actionable and
+  // theirs is not: a weak link mends itself, a permission does not.
+  func setTrouble(_ line: String?) {
+    troubleLocal = line ?? ""
+    renderWarning()
+  }
+  /// What clicking the pill should open, when the trouble is a permission. Set
+  /// beside the sentence so the two cannot disagree.
+  var onTroubleClick: (() -> Void)?
+  private var troubleLocal = ""
 
   // ── AND THE SAME FACT, DRAWN LARGE ────────────────────────────────────────
   //
@@ -3635,13 +3702,25 @@ final class CallControls: NSView {
   func setRoomWarning(_ line: String) { warnRoom = line; renderWarning() }
 
   private func renderWarning() {
-    let line = warnRoom.isEmpty ? warnPeer : warnRoom
+    // Local first, then the room, then the peer. See `setTrouble`.
+    let line = !troubleLocal.isEmpty ? troubleLocal : (warnRoom.isEmpty ? warnPeer : warnRoom)
     guard line != warnText else { return }
     warnText = line
     fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
     onMain { [weak self] in
       guard let self else { return }
       self.warnPill.text = line
+      // ── AND IT IS CLICKABLE WHEN THERE IS SOMETHING TO DO ─────────────────
+      //
+      // "Turn on the microphone in System Settings" is four clicks away through a
+      // pane most people have never opened. The front door already learnt this
+      // for the camera ("Camera access is off — click here to turn it on"); the
+      // call surface had no way to say it at all. The gesture is added once and
+      // its target is swapped, never accumulated -- a recogniser added on every
+      // render is a pill that fires the handler five times.
+      let actionable = !self.troubleLocal.isEmpty && self.onTroubleClick != nil
+      self.warnPill.toolTip = actionable ? "Opens System Settings" : nil
+      self.warnPill.onClick = actionable ? { [weak self] in self?.troubleClicked() } : nil
       guard !line.isEmpty else { return }
       // Re-centre: the pill resizes itself to the sentence, so the origin set at
       // layout time belongs to whatever text was there before.
@@ -5808,6 +5887,10 @@ final class CallControls: NSView {
       // it cannot check the one thing that matters about it. "their camera is off"
       // was invisible to every rig here until this line existed.
       + "  warn=\(warnText.isEmpty ? "-" : warnText)"
+      // Separate from `warn=`: they are two different claims -- one about this
+      // Mac, one about the other person -- and a rig asserting on a local fault
+      // must not be satisfied by a remote one that happens to be showing.
+      + "  trouble=\(troubleLocal.isEmpty ? "-" : troubleLocal)"
       // WHICH card is up, not just whether one is. The link and the name field
       // occupy the same rectangle, so a rig reading frames alone cannot tell the
       // two apart -- and "the button swapped them" is the whole feature.
@@ -6213,6 +6296,15 @@ extension CallControls {
       add("mic", micButton); add("cam", camButton); add("peek", peekButton)
       add("flip", flipButton); add("leave", leaveButton)
       add("more", moreButton)
+      // ── THE WARNING IS A CONTROL WHEN IT CARRIES A FIX ──────────────────────
+      //
+      // "Kin can't hear you -- turn on the microphone" opens System Settings when
+      // clicked, which makes it the only sentence in the app that is also a
+      // button -- and a control the harness cannot reach is a control whose
+      // handler is the only thing ever tested (`handler-tests-cannot-see-
+      // interaction-bugs`). Listed only while it is actionable, because a plain
+      // notice is not something to press.
+      if !troubleLocal.isEmpty, onTroubleClick != nil { add("warning", warnPill) }
     } else {
       // ── NAMED BY WHAT THEY SAY, NOT BY WHERE THEY SIT ─────────────────────
       //

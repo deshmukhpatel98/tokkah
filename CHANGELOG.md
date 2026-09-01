@@ -5,6 +5,57 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.121.0 — 2026-09-01
+
+### Fixed — a denied microphone was completely invisible
+
+The worst failure in the app, and it said nothing at all. A person who has denied
+microphone access got a call that looked entirely normal: the timer ran, the
+picture was there, every control worked, and **nobody could hear them**. The app
+knew — `gMicAccess` — and put it in two telemetry fields and a line on stderr
+that nobody using Kin.app ever sees. The far end hears silence and both people
+blame the app.
+
+There is now a sentence on the call surface, and it is a control: *"Kin can't hear
+you — turn on the microphone"*, clicked, opens the Microphone pane. Same for the
+camera, which was half-handled — the front door drew a clickable hint, the call
+surface set the **status** pill, which the next thing that happens ("connected",
+"you are muted") overwrites within about a second. A local fault now outranks the
+peer sentence in that pill, because a weak link mends itself and a permission does
+not. The front door had never asked about the microphone at all: a missing preview
+is self-evident, silence is not.
+
+Three things had to be fixed before a click on that sentence worked, and none of
+them would have been caught by testing the handler:
+
+- the sentence was declared 2500 lines into `main.swift`, below
+  `if let room = arg("room")`, which pumps AppKit until somebody joins — so it was
+  unreachable in exactly the state it exists for. A probe on the line proved it:
+  it never printed on a launch with nobody at the other end.
+- the pill's own label (an `NSTextField`) swallowed the press. Third instance of
+  decoration-inside-a-control eating clicks in that file.
+- the first attempt used an `NSClickGestureRecognizer`, which never fires for a
+  synthetic event in a window that is not key — so it worked by hand and could
+  never be proved by a rig. Now the pill tracks its own press like every other
+  control here.
+
+`tools/permissions-check.sh` holds all of it, with `TK_FAKE_DENIED=microphone|camera`
+so the state is reachable without touching the privacy settings of the Mac the
+suite runs on, and a control arm: with both permissions in place, it says nothing.
+
+### Fixed — asking for the camera froze the window for up to a minute
+
+The camera permission was requested with a `DispatchSemaphore` waited on for up to
+**60 seconds**, on the main thread, at a point in `main.swift` that runs before
+`NSApplication.run()`. So on a first launch — the one launch that has to look
+alive — the window sat frozen for exactly as long as the person took to answer the
+system's dialog, and a full minute if they walked away. Nothing below it needed
+the answer; the semaphore only kept the code in a straight line.
+
+The microphone path forty lines above has the whole argument written out ("no
+runloop turning, which is a frozen window in the one moment the app most needs to
+look alive"). It was fixed there and the sibling kept the semaphore.
+
 ## Kin 0.120.0 — 2026-09-01
 
 ### Fixed — the settings panel drew itself above the top of its own window

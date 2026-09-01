@@ -285,6 +285,83 @@ grep -q "camera, microphone, localNetwork, ringWhenClosed" "$SP/badname.log" \
   && say "OK" "and lists the four it does accept, rather than only complaining" \
   || say "FAIL" "it refused without saying what it accepts"
 
+# ════════════════════════════════════════════════════════════════════════════
+# ── AND THE SENTENCE A PERSON ACTUALLY SEES ─────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Everything above tests the READER: which pane a URL lands on, how the four
+# answers are told apart. None of it asks the question that matters -- when the
+# answer is "denied", does the person using Kin ever find out?
+#
+# They did not. `gMicAccess` knew, and went into two telemetry fields and a line
+# on stderr. On screen: a normal-looking call, a running timer, working controls,
+# and a far end hearing silence. The camera was half-handled -- the front door
+# drew a clickable hint, the call surface set the STATUS pill, which the next
+# thing that happens overwrites within about a second.
+#
+# This cannot be tested by denying anything: these rigs run on somebody's Mac and
+# may not touch their privacy settings. `TK_FAKE_DENIED` is the switch that makes
+# the state reachable -- `blind-instruments-report-negatives`, from the other end:
+# without it the sentence could only ever be seen by accident, in production, by
+# whoever happened to have said no.
+echo "── the sentence, when a permission is off"
+export TK_NO_RAISE=1 TK_NO_IDENTITY=1
+trouble_arm() {                    # trouble_arm <microphone|camera> <words>
+  local kind="$1" want="$2" log="$SP/trouble-$1.log"
+  TK_FAKE_DENIED="$kind" TK_KIN_DIR="$SP/t-$kind" "$TK" --window --video off --mute \
+    --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+    --room "perm$$$kind" --listen 8112 --peer 127.0.0.1:8199 \
+    --press "?,@warning" --press-after 4 > "$log" 2>&1 &
+  local pid=$!
+  local w=0
+  while [ "$w" -lt 60 ]; do
+    grep -q "presses done" "$log" 2>/dev/null && break
+    perl -e 'select undef,undef,undef,0.5'; w=$(( w + 1 ))
+  done
+  kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # THE STATE DUMP, not the log line: `trouble=` is what the pill is showing, and
+  # a rig that greps the stderr sentence would pass on a build that printed it and
+  # drew nothing.
+  local got
+  got="$(grep -oE 'trouble=[^ ]+( [^ ]+)*  card=' "$log" | tail -1 | sed 's/  card=$//; s/^trouble=//')"
+  if [ "$got" = "$want" ]; then
+    say "OK" "a denied $kind says: \"$got\""
+  else
+    say "FAIL" "a denied $kind shows \"${got:-nothing}\", wanted \"$want\""
+  fi
+}
+trouble_arm microphone "Kin can’t hear you — turn on the microphone"
+trouble_arm camera "Kin can’t see you — turn on the camera"
+# AND IT IS A CONTROL, not a notice: the fix is four clicks into a pane most
+# people have never opened, so the sentence opens it.
+# THE PILL IS A CONTROL, so it is CLICKED, not inspected. Two things had to be
+# fixed before this line could pass, and both were invisible to a handler test:
+# the pill's own label (an NSTextField) swallowed the press, and the first
+# attempt used an NSClickGestureRecognizer, which never fired for a synthetic
+# event in a window that is not key. `handler-tests-cannot-see-interaction-bugs`.
+if grep -q "trouble: the person clicked" "$SP/trouble-microphone.log" 2>/dev/null; then
+  say "OK" "and a real click on it fires"
+  grep -q "permissions: opened Microphone" "$SP/trouble-microphone.log" \
+    && say "OK" "and lands on the Microphone pane, not just anywhere" \
+    || say "FAIL" "the click fired but no pane was opened"
+else
+  say "FAIL" "the sentence is drawn and clicking it does nothing -- the fix it"
+  say "FAIL" "  offers is four clicks into a pane most people never open"
+fi
+# THE CONTROL ARM. Without a denial there must be no sentence -- otherwise the two
+# arms above pass on a build that shows the warning to everybody.
+TK_KIN_DIR="$SP/t-none" "$TK" --window --video off --mute --no-telemetry --no-update \
+  --no-relocate --no-rings --no-subtitles --room "permok$$" --listen 8113 \
+  --peer 127.0.0.1:8199 --press "?" --press-after 4 > "$SP/trouble-none.log" 2>&1 &
+NPID=$!
+w=0; while [ "$w" -lt 60 ]; do grep -q "presses done" "$SP/trouble-none.log" 2>/dev/null && break
+  perl -e 'select undef,undef,undef,0.5'; w=$(( w + 1 )); done
+kill -9 "$NPID" 2>/dev/null; wait "$NPID" 2>/dev/null
+NONE="$(grep -oE 'trouble=[^ ]+' "$SP/trouble-none.log" | tail -1)"
+[ "$NONE" = "trouble=-" ] \
+  && say "OK" "CONTROL: with both permissions in place it says nothing" \
+  || say "FAIL" "a Mac with permissions shows a warning anyway: $NONE"
+
 echo
 if [ "$fail" = 0 ]; then
   echo "PERMISSIONS CHECK PASSED -- the reader tells four answers apart, and every"

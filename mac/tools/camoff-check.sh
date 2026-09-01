@@ -65,8 +65,20 @@ say() { # label, got, want-substring
 # for "connected" somewhere in it. It passed, and it would have passed on a build
 # with no status pill at all. Anchored on a field that carries something now.
 STATUS="$(sed -E 's/.*status=(.*)  who=.*/\1/' <<< "$AUDIT")"
-WARN="$(sed -E 's/.*  warn=(.*)  card=.*/\1/' <<< "$AUDIT")"
-POSTER="$(sed -E 's/.*  poster=(.*)  quality=.*/\1/' <<< "$AUDIT")"
+# ── ONE FIELD, NOT EVERYTHING UP TO A NAMED NEIGHBOUR ───────────────────────
+#
+# These were `sed -E 's/.*  warn=(.*)  card=.*/\1/'` -- greedy, and anchored on
+# whichever field happened to come next in the state dump. The moment a new field
+# was added between them (`trouble=`, which belongs beside `warn=`: they are two
+# sentences for one pill) this captured "-  trouble=-" and the arm reported that
+# the pill was saying something twice. A true statement about a screen that was
+# perfectly correct, from a pattern that had quietly encoded the ORDER of a dump
+# it does not own.
+#
+# Non-greedy, and terminated by "any next key", so adding to the dump cannot
+# break it again. sed has no non-greedy quantifier; perl does.
+WARN="$(perl -pe 's/.*  warn=(.*?)  \w+=.*/$1/' <<< "$AUDIT")"
+POSTER="$(perl -pe 's/.*  poster=(.*?)  \w+=.*/$1/' <<< "$AUDIT")"
 say "the call says it is connected" "$STATUS" "connected"
 # ── AND IT SAYS IT WHERE A PERSON IS LOOKING ────────────────────────────────
 # The pill was the whole of what a camera-off call said, at 12 pt, in a corner,

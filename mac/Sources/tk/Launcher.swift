@@ -117,6 +117,13 @@ enum Launcher {
     static let shared = RevealCamera()
     @objc func go() { Permissions.reveal(.camera) }
   }
+  /// The same, for the microphone. A separate object rather than a parameter
+  /// because `NSClickGestureRecognizer` holds its target weakly and a captured
+  /// closure would be gone by the time anybody clicked.
+  final class RevealMic: NSObject {
+    static let shared = RevealMic()
+    @objc func go() { Permissions.reveal(.microphone) }
+  }
 
   /// The room inside a call link, or nil for text that is not one. One parser
   /// for every place a link can arrive as TEXT -- typed into the field, sitting
@@ -643,6 +650,22 @@ enum Launcher {
     // looking at the window it is about, and each outcome says something
     // different. A denial also OPENS the pane that can fix it, one click, via
     // the same reveal every other permission uses.
+    // ── AND THE MICROPHONE, WHICH NOTHING HERE HAD EVER ASKED ABOUT ──────────
+    //
+    // The front door checked the camera and drew a clickable hint when it was
+    // off, and said nothing at all about the microphone. Those two are not
+    // symmetric: a missing preview is self-evident -- you are looking at where
+    // your face should be -- while a denied microphone is completely invisible
+    // until somebody on a call tells you they cannot hear you. So the mic hint
+    // takes precedence when both are off, and it is the same one-click fix.
+    if AVCaptureDevice.authorizationStatus(for: .audio) == .denied
+        || AVCaptureDevice.authorizationStatus(for: .audio) == .restricted {
+      setHint("Kin can’t hear you — click here to turn on the microphone.")
+      hintPill.addGestureRecognizer(
+        NSClickGestureRecognizer(target: Launcher.RevealMic.shared,
+                                 action: #selector(Launcher.RevealMic.go)))
+      fputs("home: microphone access DENIED -- saying so, with the way to fix it\n", stderr)
+    }
     CameraSource.requestAccess { access in
       DispatchQueue.main.async {
         switch access {
