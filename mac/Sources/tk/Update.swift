@@ -935,28 +935,8 @@ enum Update {
     if swapBundle(from: tmp, at: me) {
       pending = nil
       atStage("installed"); Metrics.fact("update_installed", m.version)
-      // ── AND THE WATCHER'S JOB IS PINNED TO THE CODE WE JUST REPLACED ───────
-      //
-      // launchd remembers the code identity a job was bootstrapped with, and
-      // refuses the first launch of a different one: SIGKILL, "Launch
-      // Constraint Violation", a crash report, and a Mac that has silently
-      // stopped listening for calls. `restart` below already re-registers, but
-      // ONLY when the updater IS the watcher (`--watch`, reparented to launchd).
-      // Every update installed by the app you actually look at left the job
-      // pinned -- so the watcher died on its next launch, once per release.
-      // Measured in this Mac's own crash reports: 0.84, 0.85, 0.86, 0.110,
-      // 0.112, 0.113, each one a fresh launch killed ~160 ms in, parent
-      // launchd, and nothing else in the log.
-      //
-      // Not when we are the job ourselves: `restart` does it there with a
-      // detached helper, because a bootout of our own label kills us first.
-      let iAmTheWatcher = CommandLine.arguments.contains("--watch") && getppid() == 1
-      if !iAmTheWatcher, Watch.installed {
-        let ok = Watch.reregister()
-        let said = ok ? "ok" : "FAILED -- the next ring may not reach a closed Mac"
-        fputs("update: re-registered the watcher's launchd job -- \(said)\n", stderr)
-        Metrics.tap("update_watch_reregister", ok: ok)
-      }
+      // The launchd job is re-registered in `restart` below -- both install
+      // paths end there, and only one of them had it when this was written here.
       fputs("update: installed \(m.version) -- restarting\n", stderr)
       restart(into: me)
     }
@@ -1073,6 +1053,25 @@ enum Update {
   }
 
   static func restart(into path: URL) -> Never {
+    // ── AND launchd HAS TO BE TOLD THE CODE CHANGED ─────────────────────────
+    //
+    // Here, and not at either install site, for the reason this file keeps
+    // learning: there are TWO install paths -- the signed bundle swap and the
+    // legacy binary replace -- and a rule written at one of them is a rule the
+    // other one does not have. The first cut of this fix sat on the bundle
+    // swap, and the rig caught the legacy arm installing without it (6 of 7).
+    // Both paths end here.
+    //
+    // Not when we ARE the job: the branch further down does it with a detached
+    // helper, because a bootout of our own label kills us before we could
+    // bootstrap.
+    let iAmTheWatcher = CommandLine.arguments.contains("--watch") && getppid() == 1
+    if !iAmTheWatcher, Watch.installed {
+      let ok = Watch.reregister()
+      let said = ok ? "ok" : "FAILED -- the next ring may not reach a closed Mac"
+      fputs("update: re-registered the watcher's launchd job -- \(said)\n", stderr)
+      Metrics.tap("update_watch_reregister", ok: ok)
+    }
     // Both restart routes go through this, because both hand the path to
     // something that will exec it: launchd below, execv further down.
     let tries = launchable(path)

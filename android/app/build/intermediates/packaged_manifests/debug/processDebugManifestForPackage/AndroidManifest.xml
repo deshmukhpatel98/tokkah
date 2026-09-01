@@ -18,6 +18,15 @@
 
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+         The card, not a line in a list: the same promise the Mac's window
+         makes when it comes up above every other app.
+    -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <permission
         android:name="com.tokkah.kin.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
@@ -30,6 +39,7 @@
         android:debuggable="true"
         android:extractNativeLibs="false"
         android:label="Kin"
+        android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar" >
         <activity
             android:name="com.tokkah.kin.MainActivity"
@@ -48,7 +58,22 @@
                 <data android:scheme="tokkah" />
                 <data android:scheme="kin" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="kin.tokkah.com"
+                    android:scheme="https" />
+            </intent-filter>
         </activity>
+
+        <service
+            android:name="com.tokkah.kin.RingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.startup.InitializationProvider"

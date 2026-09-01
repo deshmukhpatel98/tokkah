@@ -85,7 +85,9 @@ OUT="${SCRATCH:-${TMPDIR:-/tmp}}"
 mkdir -p "$SP/tmp" "$SP/srv/dl" "$SP/id"
 # The read-only arm below strips the write bit from a whole bundle on purpose, so
 # the cleanup has to put it back before it can delete anything.
-trap 'reap; kill -9 $SRV 2>/dev/null; chmod -R u+w "$SP" 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$SP"; true' EXIT
+trap 'reap; kill -9 $SRV 2>/dev/null; chmod -R u+w "$SP" 2>/dev/null;
+      [ -n "${WPL:-}" ] && { launchctl bootout "gui/$(id -u)/${TK_WATCH_LABEL:-}" 2>/dev/null; rm -f "$WPL"; };
+      [ -n "${KEEP:-}" ] || rm -rf "$SP"; true' EXIT
 
 # ── `stage()` UNPACKS INTO $TMPDIR, AND $TMPDIR IS SHARED ───────────────────
 #
@@ -520,6 +522,27 @@ export TK_NO_IDENTITY=1
 # for a bundle in a temp directory is not a thing to leave to reasoning.
 export TK_WATCH_NO_DELEGATE=1
 export TK_WATCH_LABEL="com.tokkah.tk.updatecheck"
+# ── A JOB FOR THE INSTALLER TO RE-REGISTER ──────────────────────────────────
+#
+# launchd holds a login item to the code identity it was bootstrapped with and
+# refuses the first launch of a different one: SIGKILL, CODESIGNING, "Launch
+# Constraint Violation" -- one crash report per release, and a Mac that stops
+# taking calls until KeepAlive gets a second go. `Watch.reregister` is the
+# remedy and it was wired into ONE path: the updater that IS the watcher. Every
+# update installed by the app the person is looking at left the job pinned, for
+# thirty releases (0.84 through 0.113 in this Mac's own crash reports).
+#
+# `Watch.installed` is a plist FILE existing, so with no plist that whole branch
+# is skipped and this rig ran green over the bug for its entire life. One is
+# planted here, under the rig's own label, booted out in the trap.
+WPL="$HOME/Library/LaunchAgents/$TK_WATCH_LABEL.plist"
+cat > "$WPL" <<WP
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>$TK_WATCH_LABEL</string>
+<key>ProgramArguments</key><array><string>/bin/sleep</string><string>7200</string></array>
+<key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>
+WP
+launchctl bootstrap "gui/$(id -u)" "$WPL" 2>/dev/null || true
 
 ARGS="--video off --mute --no-telemetry --no-relocate --no-rings --no-subtitles"
 # ── A LAUNCH THAT REACHES THE UPDATER AND NEVER OPENS A DEVICE ──────────────
@@ -856,6 +879,43 @@ N=$(hits "nowatch/manifest.json HTTP")
 grep -qE "watch: (resident for|TK_NO_IDENTITY)" "$SP/nowatch.log" \
   && say "OK" "CONTROL: and it was a live watcher, not a process that failed to start" \
   || say "FAIL" "CONTROL: the --no-update watcher never started, so its silence is its own"
+
+# ── 4c. THE INSTALLER TELLS launchd THE CODE CHANGED ───────────────────────
+#
+# Not decoration: without it the watcher's next launch is refused by macOS with
+# a Launch Constraint Violation, once per release, and the person gets a crash
+# report for an app that did nothing wrong. The claim is that ANY install does
+# it -- not only the one performed by the watcher itself, which is the arm that
+# had it and the reason the bug survived thirty releases.
+#
+# Asserted against the arms that really installed (`grace*`, `race-f`), because
+# an arm that installed nothing would satisfy a bare "no failure" check.
+# EVERY installing arm, named. A count that only asks "did any of them" is what
+# let the legacy binary-replace path install thirty releases without telling
+# launchd -- the first cut of this assertion said 6 of 7 and passed.
+MISSED=""; INST=0
+for L in "$SP"/*.log; do
+  # Not the compiler's log: it quotes the source line that PRINTS this, so the
+  # build output reads as an arm that installed and never re-registered.
+  case "$(basename "$L")" in build.log) continue ;; esac
+  grep -q "update: installed" "$L" 2>/dev/null || continue
+  INST=$((INST + 1))
+  grep -q "re-registered the watcher's launchd job -- ok" "$L" 2>/dev/null \
+    || MISSED="$MISSED $(basename "$L")"
+done
+if [ "$INST" -eq 0 ]; then
+  say "FAIL" "no arm installed anything, so the re-register claim is untested"
+elif [ -n "$MISSED" ]; then
+  say "FAIL" "installed without telling launchd:$MISSED -- refused once per release"
+else
+  say "OK" "all $INST installing arms re-registered the launchd job"
+fi
+# And the job is still there afterwards. A bootout that is never followed by a
+# bootstrap leaves the Mac unable to answer a call until the next login, which
+# is the one failure this whole mechanism is not allowed to cause.
+launchctl print "gui/$(id -u)/$TK_WATCH_LABEL" >/dev/null 2>&1 \
+  && say "OK" "and the job survived the re-register" \
+  || say "FAIL" "the re-register booted the job out and never put it back"
 
 # ── 5. THE CADENCE OVERRIDES ARE REAL ──────────────────────────────────────
 echo "5. TK_UPDATE_GRACE and TK_UPDATE_POLL"

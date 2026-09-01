@@ -48,17 +48,22 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // The picture goes edge to edge; the card floats over it.
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        val deep = intent?.data?.let { u ->
+        // A ring notification carries the call it is about, so answering from
+        // the lock screen lands in that call rather than at the front door.
+        val fromRing = intent?.getStringExtra(RingService.EXTRA_ROOM)
+        val ringWho = intent?.getStringExtra(RingService.EXTRA_FROM) ?: ""
+        val deep = fromRing ?: intent?.data?.let { u ->
             (u.pathSegments?.lastOrNull() ?: u.host)?.takeIf { it.isNotBlank() }
         }
-        setContent { KinApp(deep) }
+        RingService.channels(this)
+        setContent { KinApp(deep, if (fromRing != null) ringWho else "") }
     }
 }
 
 @Composable
-fun KinApp(initialRoom: String?) {
+fun KinApp(initialRoom: String?, ringWho: String = "") {
     val ctx = LocalContext.current
-    var room by remember { mutableStateOf(initialRoom ?: "") }
+    var room by remember { mutableStateOf(if (ringWho.isEmpty()) initialRoom ?: "" else "") }
     var session by remember { mutableStateOf<CallSession?>(null) }
     var audio by remember { mutableStateOf<AudioDevice?>(null) }
     var video by remember { mutableStateOf<VideoDevice?>(null) }
@@ -76,6 +81,13 @@ fun KinApp(initialRoom: String?) {
     var cardBecause by remember { mutableStateOf<String?>(null) }
     var resumeRoom by remember { mutableStateOf<String?>(null) }
     var resumeWho by remember { mutableStateOf("") }
+    var listening by remember {
+        mutableStateOf(ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
+            .getBoolean("listening", false))
+    }
+    val askNotify = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { ok -> if (ok) { RingService.start(ctx); listening = true } }
 
     val state = remember { KinState(ctx.filesDir) }
     val identity = state.identity
@@ -142,9 +154,24 @@ fun KinApp(initialRoom: String?) {
             resumeWho = state.pending?.who ?: ""
         }
         state.onCall = { room, who -> join(room, who); state.answered() }
+        // One mailbox, one reader: the service yields while the app is in
+        // front, exactly as the Mac's resident stands down for the window.
+        if (listening) RingService.stop(ctx)
         state.start()
-        onDispose { state.stop() }
+        onDispose {
+            state.stop()
+            if (listening) RingService.start(ctx)
+        }
     }
+
+    // Answering from the lock screen: the notification named the call, so go
+    // straight into it rather than showing a front door nobody asked for.
+    LaunchedEffect(initialRoom, ringWho) {
+        if (ringWho.isNotEmpty() && initialRoom != null && session == null) {
+            join(initialRoom, ringWho)
+        }
+    }
+
 
 
     Box(Modifier.fillMaxSize().background(Palette.bg)) {
@@ -158,6 +185,17 @@ fun KinApp(initialRoom: String?) {
                 resumeRoom = resumeRoom?.let { if (resumeWho.isNotEmpty()) "@$resumeWho" else it },
                 pastedLink = null,
                 settingsOpen = settingsOpen,
+                listening = listening,
+                onListening = { on ->
+                    ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
+                        .edit().putBoolean("listening", on).apply()
+                    if (on) {
+                        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                            !granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
+                            askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else { RingService.start(ctx); listening = true }
+                    } else { RingService.stop(ctx); listening = false }
+                },
                 onSettings = { settingsOpen = !settingsOpen },
                 onJoin = {
                     // A handle rings a person; anything else is a room name.

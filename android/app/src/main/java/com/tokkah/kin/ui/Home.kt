@@ -57,6 +57,8 @@ fun HomeScreen(
     resumeRoom: String?,
     pastedLink: String?,
     settingsOpen: Boolean,
+    listening: Boolean,
+    onListening: (Boolean) -> Unit,
     onSettings: () -> Unit,
     onJoin: () -> Unit,
     onCall: (String) -> Unit,
@@ -113,7 +115,7 @@ fun HomeScreen(
                         verticalArrangement = Arrangement.spacedBy(Metric.s1),
                     ) {
                         if (settingsOpen) {
-                            SettingsRows(myHandle, quiet, onQuiet)
+                            SettingsRows(myHandle, quiet, onQuiet, listening, onListening)
                         } else {
                             resumeRoom?.let {
                                 KinRow("Back to $it", detail = "still going", onClick = onResume)
@@ -202,16 +204,23 @@ private fun RoomField(room: String, onRoom: (String) -> Unit, onJoin: () -> Unit
 }
 
 @Composable
-private fun SettingsRows(myHandle: String, quiet: Boolean, onQuiet: (Boolean) -> Unit) {
+private fun SettingsRows(
+    myHandle: String, quiet: Boolean, onQuiet: (Boolean) -> Unit,
+    listening: Boolean, onListening: (Boolean) -> Unit,
+) {
     if (myHandle.isEmpty()) {
         KinHint("This phone has no name yet, so nobody can call it. It takes one the first time it reaches the server.")
     } else {
         KinRow("@$myHandle", detail = "copy", leading = { Avatar(myHandle) })
         KinHint("Give this to someone and they can call you.")
     }
-    KinRow("Let people reach you when Kin is closed", detail = "off",
-        labelInset = Metric.rowAvatarInset, tone = Palette.muted)
-    KinHint("Not built on Android yet — the phone has to hold a connection for this.")
+    KinRow(
+        "Let people reach you when Kin is closed",
+        detail = if (listening) "on" else "off",
+        labelInset = Metric.rowAvatarInset,
+        onClick = { onListening(!listening) },
+    )
+    KinHint("Kin keeps listening for calls. Android shows a quiet notification while it does — that is the price of a phone that can be rung.")
     KinRow(
         "Don't ring me", detail = if (quiet) "on" else "off",
         labelInset = Metric.rowAvatarInset,
