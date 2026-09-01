@@ -2267,10 +2267,21 @@ const KIN_QUIET_CONTEXT = 'kin-quiet-v1|';
 // Cheap to separate now, impossible to separate after clients ship.
 const KIN_QUIET_KEYS = new Set(['to', 'k', 't', 'sig', 'quiet', 'until']);
 const KIN_QUIET_MAX_BODY = 512;
-// A human presses this a few times a day. Charged only to attempts that already
-// carry the OWNING key, so a stranger cannot lock the owner out of their own
-// toggle (the same split as poll's bad: window, and the same reason).
-const KIN_QUIET_PER_MIN = 6;
+// Charged only to attempts that already carry the OWNING key, so a stranger
+// cannot lock the owner out of their own toggle (the same split as poll's bad:
+// window, and the same reason).
+//
+// It was 6, on the reasoning that "a human presses this a few times a day".
+// A human presses it a few times a day WHEN IT VISIBLY WORKS. On 2026-09-01 the
+// switch gave no feedback while the request was in flight, so it was pressed
+// again, and again -- and the eight lines in that Mac's log are all
+// `silent mode off refused -- 429`: the owner was rate-limited out of turning
+// their OWN silence off, and the only way back was to stop touching it for a
+// minute, which is not something the app ever said. The client no longer lets a
+// second press through while one is in flight and retries a 429 by itself, and
+// this is the belt to that pair of braces: still bounded, still cheap, and no
+// longer a number a frustrated person can cross by hand.
+const KIN_QUIET_PER_MIN = 30;
 // The outer bound on `until`, ~10 years. Its job is not policy — indefinite is
 // spelled `until: 0` — it is to turn "the client sent milliseconds" into a 400
 // instead of into a mute lasting 57,000 years, which is indistinguishable from
