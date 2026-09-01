@@ -31,6 +31,24 @@ class CallSession(
     val resume: Resume? = store?.let { Resume(it) }
     val telemetry: Telemetry? = store?.let { Telemetry(it) }
     private val power = Power()
+    val aec = Aec()
+
+    /**
+     * The camera's verdict about THIS end. Only ever WITHDRAWS the echo veto:
+     * it can open a microphone the correlation would have gagged, and it can
+     * never close one. When the detector is blind it says nothing at all.
+     */
+    @Volatile var visualKnown = false
+    @Volatile var visualVoice = false
+
+    /**
+     * What LEFT the speaker, for the canceller to subtract. Not what the far
+     * end sent: the estimator that aims the filter reads the RAW microphone,
+     * and a canceller keyed on its own success collapses the correlation it
+     * steers by.
+     */
+    val emitRing = FloatArray(1 shl 16)
+    @Volatile var emitW = 0
     @Volatile private var cpuUser = 0.0
     @Volatile private var cpuSys = 0.0
 
@@ -41,6 +59,8 @@ class CallSession(
     @Volatile var peerStatusSeen = false; private set
     @Volatile var peerMuted = false; private set
     @Volatile var peerPlayed = 0; private set
+    @Volatile var peerSeenTalking = false; private set
+    @Volatile var peerSeenTalkingSeen = false; private set
     @Volatile var selfMuted = false
     @Volatile var speakers = true
     /** Set by the UI: this end has left, so stop sending. */
@@ -92,6 +112,10 @@ class CallSession(
     fun start() {
         if (running) return
         running = true
+        playout.emit = { v ->
+            emitRing[emitW % emitRing.size] = v
+            emitW++
+        }
         Rendezvous.warm(room)
         val s = DatagramSocket()
         s.reuseAddress = true
@@ -194,6 +218,11 @@ class CallSession(
         "gate_backchannels" to gate.backchannels,
         "peer_played" to peerPlayed,
         "speakers" to speakers,
+        "erle_db" to aec.erleDb,
+        "aec_residual" to aec.residual,
+        "aec_diverges" to aec.diverges,
+        "seen_talking" to peerSeenTalkingSeen,
+        "visual_known" to visualKnown,
         "send_errors" to sendErrors,
         // Kept apart because they answer different questions: our own
         // arithmetic, and the kernel carrying our packets.
@@ -283,6 +312,10 @@ class CallSession(
             else -> {}
         }
         if (gate.voicingNow) status = status or Wire.ST_VOICING
+        // Their camera's verdict, on the wire beside the voice cue it belongs
+        // with — the earliest evidence anywhere in this system that somebody is
+        // about to speak.
+        if (visualKnown && visualVoice) status = status or Wire.ST_SEEN_TALKING
         if (!camOn) status = status or Wire.ST_CAMOFF
         r.status = status
         r.endProbByte = 0
@@ -333,6 +366,13 @@ class CallSession(
                             floor.noteFar(peerVoice(), transitMs = owd,
                                 voicing = if (r.status and Wire.ST_VOICING != 0) true else false)
                             floor.noteFarEndProb(Wire.endProb(r.endProbByte))
+                            // Consumed only where this end acts on vision at
+                            // all; RECORDED either way, so a live call can say
+                            // whether the bit ever crossed.
+                            peerSeenTalking = r.status and Wire.ST_SEEN_TALKING != 0
+                            floor.farSeenTalking =
+                                if (peerSeenTalkingSeen) peerSeenTalking else null
+                            if (peerSeenTalking) peerSeenTalkingSeen = true
                             val v = if (r.status and Wire.ST_CLAIM != 0) 2
                                     else if (r.status and Wire.ST_BACKCHAN != 0) 1 else 0
                             if (v != lastStatusSent) { lastStatusSent = v; onPeerVocal?.invoke(v) }
@@ -410,10 +450,22 @@ class CallSession(
 
     // ── the audio device's two entry points ──────────────────────────────────
 
-    /** One capture block: classify, apply the floor, and put it on the wire. */
+    /** One capture block: cancel, classify, apply the floor, put it on the wire. */
     fun captureBlock(x: FloatArray, n: Int) {
+        // Subtract before classifying: the bar the classifier builds is made
+        // from what is LEFT after cancellation, so a person under a cancelled
+        // echo is heard rather than explained away.
+        if (speakers) {
+            aec.process(x, n, emitRing, emitW, emitRing.size)
+            gate.echoResidual = aec.residual
+        } else {
+            gate.echoResidual = 1f
+        }
+        // The mouth outranks the correlation, and in one direction only.
+        gate.mouthSays = visualKnown && visualVoice
         gate.process(x, n)
         floor.speakers = speakers
+        floor.nearVisualVoice = visualKnown && visualVoice
         val d = floor.step(n.toDouble() / Wire.SR, gate.toFloorVoice())
         gate.floorMuted = !d.mayTransmit
         gate.floorDucked = d.duckOnly

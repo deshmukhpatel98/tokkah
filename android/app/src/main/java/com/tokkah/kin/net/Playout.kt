@@ -67,6 +67,9 @@ class Playout(val ring: RecvRing) {
     /** True while a sample left the speaker in this block — the fact Floor needs. */
     var playoutLive = false; private set
 
+    /** What actually left the speaker, for the canceller to subtract. */
+    var emit: ((Float) -> Unit)? = null
+
     /** The pitch period of what was just playing, coarse-to-fine autocorrelation. */
     private fun findPeriod(): Int {
         val w = 480                                  // 10 ms of evidence
@@ -235,6 +238,9 @@ class Playout(val ring: RecvRing) {
             gate?.noteFar(played)
             val emitted = played * earGain
             out[i] = if (mute) 0f else emitted
+            // The canceller must see what the SPEAKER plays, which is after the
+            // ear gain — that is the only signal that can become an echo.
+            emit?.invoke(if (mute) 0f else emitted)
             playoutSumSq += played.toDouble() * played
             playoutN++
             if (abs(emitted) > 1e-5f) playoutLive = true

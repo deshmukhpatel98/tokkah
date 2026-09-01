@@ -1,7 +1,7 @@
 {
     "logs": [
         {
-            "outputFile": "com.tokkah.kin.app-mergeDebugResources-39:/values-v30/values-v30.xml",
+            "outputFile": "com.tokkah.kin.app-mergeDebugResources-47:/values-v30/values-v30.xml",
             "map": [
                 {
                     "source": "/Users/deveshpatel/.gradle/caches/8.13/transforms/97c8aeef94ba41b236a6690b0533dc1f/transformed/material3-release/res/values-v30/values-v30.xml",
