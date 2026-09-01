@@ -847,6 +847,15 @@ class SheetRow: NSButton {
   var ruled = false { didSet { needsDisplay = true } }
   /// A fact about this call: nothing to press.
   var inert = false
+  /// Held on by something other than the pointer -- the row you just clicked,
+  /// while the ring it started is still travelling. Drawn exactly like `pressed`,
+  /// because it IS still pressed as far as the person is concerned: the finger
+  /// came off but the thing they asked for has not happened yet.
+  var forcedActive = false { didSet { needsDisplay = true } }
+  /// The keyboard is on this row. Stronger than hover and weaker than a press, so
+  /// a pointer resting on one row and the arrow keys sitting on another read as
+  /// two different things rather than as two rows both half-lit.
+  var keySelected = false { didSet { needsDisplay = true } }
   /// `.sheet .row .code` -- a monospaced value pinned right, for the encryption code.
   var value: String = "" { didSet { needsDisplay = true } }
   /// This value is a WORD, not a code. The code treatment is monospace at 0.09em of
@@ -1018,7 +1027,7 @@ class SheetRow: NSButton {
   }
 
   override func draw(_ dirty: NSRect) {
-    if hovering || pressed {
+    if hovering || pressed || forcedActive || keySelected {
       // A VIBRANT FILL, NOT A SECOND PANE OF GLASS. "Avoid overcrowding or layering
       // Liquid Glass elements on top of each other" -- and a row highlight inside a
       // glass sheet is the most tempting place in the app to break that rule.
@@ -1027,7 +1036,7 @@ class SheetRow: NSButton {
       // inset by `sheetPad` inside a corner of `sheetRadius`, so sharing a centre of
       // curvature means 26 - 10 = 16. It was 12, which is the kind of number that
       // looks deliberate and is off by four.
-      Palette.fill(pressed ? 0.12 : 0.06).setFill()
+      Palette.fill(pressed || forcedActive ? 0.12 : (keySelected ? 0.10 : 0.06)).setFill()
       let r = Metric.sheetRowRadius
       NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
     }

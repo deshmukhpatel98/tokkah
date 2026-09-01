@@ -125,6 +125,57 @@ enum Menu {
     NSApp.mainMenu = main
   }
 
+  // ── THE FRONT DOOR GETS A MENU BAR TOO ──────────────────────────────────────
+  //
+  // `install()` is called from `Display.open` only, so the home window -- the
+  // first screen of the app, and the one a person sits looking at longest -- had
+  // no Command-Q, no Command-W, no Command-M. The reflex fires and nothing
+  // happens.
+  //
+  // Not `install()` itself: half of it is a Call menu whose every item reaches
+  // `Menu.controls`, which is nil here. A greyed Mute is merely useless; a Mute
+  // that LOOKS live (nil target resolves through the responder chain, so several
+  // of those items would validate) is the dead-control defect this file already
+  // carries a scar for. So the front door gets the two menus that mean something
+  // with no call in progress, and `install()` replaces this wholesale when one
+  // starts.
+  static func installHome(appName: String = "Kin") {
+    let main = NSMenu()
+
+    let appItem = NSMenuItem()
+    let app = NSMenu()
+    app.addItem(withTitle: "About \(appName)", action: #selector(Target.about),
+                keyEquivalent: "").target = Target.shared
+    app.addItem(.separator())
+    let check = app.addItem(withTitle: "Check for Updates…", action: #selector(Target.update),
+                            keyEquivalent: "")
+    check.target = Target.shared
+    app.addItem(.separator())
+    app.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)),
+                keyEquivalent: "h")
+    app.addItem(.separator())
+    app.addItem(withTitle: "Quit \(appName)", action: #selector(Target.quit),
+                keyEquivalent: "q").target = Target.shared
+    appItem.submenu = app
+    main.addItem(appItem)
+
+    let winItem = NSMenuItem()
+    let win = NSMenu(title: "Window")
+    win.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)),
+                keyEquivalent: "m")
+    win.addItem(.separator())
+    // Nil target on purpose: this resolves through the responder chain to the key
+    // window's own `performClose`, which is the SAME path the red button takes --
+    // including the pump's exit on `!w.isVisible`.
+    win.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)),
+                keyEquivalent: "w")
+    winItem.submenu = win
+    main.addItem(winItem)
+    NSApp.windowsMenu = win
+
+    NSApp.mainMenu = main
+  }
+
   // ── A MENU ITEM THE HARNESS CAN ACTUALLY CLICK ──────────────────────────────
   //
   // `--press` reaches the in-window bar and nothing else, so every menu item in

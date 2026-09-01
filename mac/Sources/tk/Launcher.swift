@@ -439,12 +439,18 @@ enum Launcher {
     hint.alignment = .center
     hint.backgroundColor = .clear
     hint.isBordered = false
-    func setHint(_ s: String) {
+    // `measuring` is the widest string this pill is about to show, when that is
+    // not the string itself: the ringing ellipsis retitles the pill four times a
+    // second, and a pill sized to each frame grows and shrinks around a fixed
+    // centre -- the sentence would breathe. Sized once to the longest frame, only
+    // the dots move.
+    func setHint(_ s: String, measuring: String? = nil) {
       hint.stringValue = s
       hintPill.isHidden = s.isEmpty
       hint.isHidden = s.isEmpty
       guard !s.isEmpty else { return }
-      let tw = ceil((s as NSString).size(withAttributes: [.font: Type_.status]).width)
+      let tw = ceil(((measuring ?? s) as NSString)
+                      .size(withAttributes: [.font: Type_.status]).width)
       let pw = tw + Metric.s8
       hintPill.frame = NSRect(x: (W - pw) / 2, y: hintY, width: pw, height: Metric.pillHeight)
       hint.frame = NSRect(x: (W - pw) / 2, y: hintY + (Metric.pillHeight - 16) / 2,
@@ -790,6 +796,19 @@ enum Launcher {
       /// `isEnabled` to turn off, so the refusal lives here rather than in six
       /// places that each have to remember to switch back on.
       var ringing = false
+      /// Bumped by every cancel. The ring's completion carries the value it
+      /// started with and drops itself if they differ -- the POST is already gone
+      /// and cannot be recalled, so "cancel" can only mean that THIS process stops
+      /// acting on the answer. Without it, Esc would clear the pill and the
+      /// window would re-exec into the room half a second later anyway
+      /// (`a-final-record-that-isnt-final`, from the other side).
+      var ringGen = 0
+      /// The two-second revert on the mine-row's "copied". Held so teardown can
+      /// kill it: a timer holding a row of a window that has gone away.
+      var copyTimer: Timer?
+      /// Put the screen back the way it was before the ring. Owned by `home()`,
+      /// which is where the pill, the rows and the dots timer all live.
+      var stopRing: () -> Void = {}
       var mode = Mode.people
       let field: NSTextField
       let nameField: NSTextField
@@ -857,6 +876,14 @@ enum Launcher {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("@" + row.handleName, forType: .string)
         row.value = "copied"
+        // And back to "copy" after two seconds, the same revert `WaitingCard`'s
+        // confirmation uses. A row that says "copied" for the rest of the session
+        // stops being a button you can press again: the word is a receipt for one
+        // press, and left standing it reads as a state.
+        copyTimer?.invalidate()
+        let t = Timer(timeInterval: 2, repeats: false) { [weak row] _ in row?.value = "copy" }
+        RunLoop.main.add(t, forMode: .common)
+        copyTimer = t
       }
       @objc func showName() { guard !ringing else { return }; status.stringValue = ""; mode = .name; relayout() }
       @objc func showWord() { guard !ringing else { return }; status.stringValue = ""; mode = .word; relayout() }
@@ -873,9 +900,19 @@ enum Launcher {
       @objc func cancel() { done = true }
     }
     let t = Target(field: field, nameField: nameField, status: status)
-    // With nobody in the list there is no people page to be the default: the card
-    // opens on the room field, which is exactly the screen this used to be.
-    t.mode = people.isEmpty ? .word : .people
+    // ── EMPTY IS STILL THE PEOPLE SCREEN ─────────────────────────────────────
+    //
+    // This was `people.isEmpty ? .word : .people`, on the reasoning that with
+    // nobody in the list there is no people page to show. What it actually did
+    // was hand every first-ever launch the room field -- the one screen the whole
+    // 0.103 rebuild existed to demote -- and with it no "Call someone new" at all.
+    // The very first thing anybody sees of this app was the opposite of what the
+    // app is for, and it fixed itself only after they had somehow already made a
+    // call. The empty people screen is a sentence plus the two things you can do;
+    // that is a better front door than a text box.
+    t.mode = .people
+    fputs("home: mode \(t.mode)\(people.isEmpty ? " (empty)" : "") -- \(people.count) people\n",
+          stderr)
 
     // ── PLACING THE CALL FROM HERE, AND NOT ONE PROCESS LATER ────────────────
     //
@@ -892,16 +929,80 @@ enum Launcher {
     // The hint pill -- already on screen, already the place this window says what
     // it is doing -- carries the news, so there is no second "calling" surface to
     // drift out of agreement with `WaitingCard`'s.
+    // ── AND WHILE IT IS TRAVELLING, SOMETHING THAT IS OBVIOUSLY ALIVE ────────
+    //
+    // The ring used to change the pill once, disable every control, and offer no
+    // way back: a frozen app shows its last caption perfectly, so "Calling
+    // Meera…" over a still screen is the same photograph as a crash. Three things
+    // fix it and they are one state: a moving ellipsis, the clicked row held lit
+    // while the rest of the list steps back, and Esc.
+    //
+    // A timer retitling the pill rather than `WaitingCard`'s three animated
+    // layers: that card is sized to its widest child and could not afford text
+    // that grows: this pill is measured once (see `setHint(measuring:)`) and can.
+    var dotTimer: Timer?
+    var hintBefore = ""
+    let dimOthers: (String?) -> Void = { who in
+      for r in peopleRows {
+        r.forcedActive = who != nil && r.handleName == who
+        // The list does not vanish, it recedes: the one row you chose stays at
+        // full strength and everything else drops back, so the screen says which
+        // name is in flight without a second surface saying it.
+        r.alphaValue = (who == nil || r.handleName == who) ? 1 : 0.4
+      }
+      for r in ([newRow, wordRow, backRow, mineRow, reachRow] + recentRows) {
+        r.alphaValue = who == nil ? 1 : 0.4
+      }
+    }
+    t.stopRing = { [weak t] in
+      guard let t, t.ringing else { return }
+      // The POST may already be gone. All this can do is make sure its answer is
+      // ignored -- see `ringGen`.
+      t.ringGen &+= 1
+      t.ringing = false
+      dotTimer?.invalidate(); dotTimer = nil
+      dimOthers(nil)
+      setHint(hintBefore)
+      fputs("home: ring cancelled by esc\n", stderr)
+    }
     t.ring = { [weak t] who in
       guard let t, !t.done, !t.ringing else { return }
       t.ringing = true
+      let gen = t.ringGen
       let room = t.warmed[who] ?? Launcher.mintRoom()
-      setHint("Calling \(Identity.display(who))…")
+      hintBefore = hint.isHidden ? "" : hint.stringValue
+      dimOthers(who)
+      // "esc to cancel" rides the pill rather than a second line: the pill is
+      // already the one place this window narrates itself, and a way out nobody
+      // is told about is not a way out.
+      let base = "Calling \(Identity.display(who))"
+      let tail = "   ·   esc to cancel"
+      let frames = ["", ".", "..", "…"]
+      // Measured against the widest frame, so only the dots move.
+      let widest = base + ".." + tail
+      setHint(base + "…" + tail, measuring: widest)
+      if !Motion.reduceMotion {
+        var i = 0
+        let d = Timer(timeInterval: 0.4, repeats: true) { _ in
+          i = (i + 1) % frames.count
+          setHint(base + frames[i] + tail, measuring: widest)
+        }
+        RunLoop.main.add(d, forMode: .common)
+        dotTimer = d
+      }
       Thread {
         Metrics.count("ring_sent_try")
         let got = Identity.ring(to: who, room: room)
         let listening = Identity.lastRingListening
         DispatchQueue.main.async {
+          // Cancelled while this was in flight. Not an error and not a call: the
+          // window is back where it was and nothing here may touch it.
+          guard t.ringGen == gen else {
+            Metrics.count("ring_cancelled")
+            return
+          }
+          dotTimer?.invalidate(); dotTimer = nil
+          dimOthers(nil)
           guard let got else {
             Metrics.count("ring_sent_fail")
             // Honest and vague on purpose: a 200 means the ring is in their
@@ -926,7 +1027,19 @@ enum Launcher {
     // padding. Rows are laid out by walking a list top-down rather than by naming
     // a y for each: adding a row to the list is then one line and cannot leave a
     // gap where a hidden view used to be.
-    let relayout = { [weak t] in
+    // ── AND IT MOVES, AFTER THE FIRST TIME ───────────────────────────────────
+    //
+    // Every frame here is assigned directly, so the card changing height and the
+    // rows changing place happened between two paint cycles: the three modes read
+    // as three different screens rather than as one card rearranging itself.
+    // Wrapped in `Motion.run`, which already collapses to nothing under Reduce
+    // Motion.
+    //
+    // NOT the first layout. The rig photographs this window at 4 s from a cold
+    // start and an easing first paint is a screenshot whose contents depend on
+    // when the shutter fell.
+    var animateLayout = false
+    let layout = { [weak t] in
       guard let t else { return }
       let words = t.mode == .people
       title.stringValue = words ? "" : (t.mode == .name ? "Call someone new" : "Join with a word")
@@ -949,13 +1062,16 @@ enum Launcher {
         // reaching somebody.
         if !watchOK { column += [reachRow, reachHint] }
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow, mineHint]
+      // `backRow` unconditionally, both modes: it used to be dropped when the
+      // list was empty, which was correct only while an empty list meant there
+      // was no people screen to go back TO. There always is one now, and a mode
+      // you can enter and not leave is a dead end.
       case .name:
-        column += [nameBack, status]
-        column += people.isEmpty ? [] : [backRow]
+        column += [nameBack, status, backRow]
       case .word:
         column += [fieldBack, status]
         column += recentRows
-        column += people.isEmpty ? [] : [backRow]
+        column += [backRow]
       }
       let shown = Set((heads + column).map { ObjectIdentifier($0) })
       for x in [title, sub, fieldBack, field, newBtn, join, nameBack, nameField, callBtn,
@@ -963,7 +1079,12 @@ enum Launcher {
                 reachRow, reachHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
-      for r in peopleRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
+      for r in peopleRows {
+        r.isHidden = !shown.contains(ObjectIdentifier(r))
+        // A keyboard highlight on a row that is off screen comes back lit when
+        // the mode does, pointing at a selection nothing is tracking.
+        if r.isHidden { r.keySelected = false }
+      }
       for r in recentRows { r.isHidden = !shown.contains(ObjectIdentifier(r)) }
       // The two fields are not in `column` -- they ride inside their `Vibrant`
       // backing -- so their visibility follows the thing they sit in.
@@ -1045,6 +1166,7 @@ enum Launcher {
       card.needsDisplay = true
       v.needsLayout = true
     }
+    let relayout = { if animateLayout { Motion.run { layout() } } else { layout() } }
     t.relayout = relayout
 
     // ── WIRING ────────────────────────────────────────────────────────────────
@@ -1132,6 +1254,97 @@ enum Launcher {
     defer { NotificationCenter.default.removeObserver(typing) }
 
     relayout()
+    animateLayout = true
+
+    // ── THE MENU BAR, WHICH THIS WINDOW NEVER HAD ────────────────────────────
+    //
+    // `Menu.install` is called from `Display.open`, so every Mac reflex --
+    // Command-Q, Command-W, Command-M -- did nothing at all on the FIRST screen
+    // of the app, the one you look at before you have decided to call anybody.
+    // `installHome` is the subset that means something with no call running; the
+    // call replaces it wholesale when it opens.
+    Menu.installHome()
+    fputs("home: menu ready (\(NSApp.mainMenu?.items.count ?? 0) menus,"
+        + " close=\(Menu.find("Close") != nil), quit=\(Menu.find("Quit Kin") != nil))\n", stderr)
+
+    // ── AND THE KEYBOARD ─────────────────────────────────────────────────────
+    //
+    // `makeFirstResponder(nil)` on the people screen, and nothing anywhere
+    // handling a key: the front door was a list of names that could only be
+    // reached with a pointer. Arrows walk it, Return rings, Esc backs out of a
+    // mode or cancels a ring, and a letter typed at the list is taken to mean you
+    // want to call somebody who is not on it.
+    //
+    // A LOCAL monitor, scoped to this window and torn down with it, rather than
+    // an NSWindow subclass: the two text fields on this card are real field
+    // editors and everything they should keep -- every letter, Return, the arrow
+    // keys inside the text -- has to pass through untouched. A monitor can decide
+    // per event; an override has already taken the key.
+    var keySel: Int? = nil
+    // The rows the arrows walk, in the order they are drawn. Recomputed per press
+    // rather than captured: a hidden row is not on screen and must not be
+    // selectable.
+    func liveRows() -> [ContactRow] { peopleRows.filter { !$0.isHidden } }
+    func paintSel() {
+      let rows = liveRows()
+      for (i, r) in rows.enumerated() { r.keySelected = (i == keySel) }
+    }
+    func moveSel(_ d: Int) {
+      let rows = liveRows()
+      guard !rows.isEmpty else { return }
+      // Nowhere yet: the first Down lands on the top row and the first Up on the
+      // bottom one. Clamped rather than wrapped -- a list of five people is short
+      // enough that running off the end and reappearing at the other reads as the
+      // selection having been lost.
+      keySel = keySel.map { min(max($0 + d, 0), rows.count - 1) } ?? (d > 0 ? 0 : rows.count - 1)
+      paintSel()
+    }
+    let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+      guard e.window === w else { return e }
+      let esc = e.keyCode == 53
+      // Esc first and in every mode, including while a field has the caret: it is
+      // the only key this window takes out from under the text editor, and it is
+      // the way out of the one state that has no other one.
+      if esc {
+        if t.ringing { t.stopRing(); return nil }
+        if t.mode != .people { t.showPeople(); w.makeFirstResponder(nil); return nil }
+        return nil
+      }
+      // Ringing owns the keyboard except for Esc: every other key here starts
+      // something, and `Target` refuses all of it anyway.
+      guard !t.ringing, t.mode == .people else { return e }
+      switch e.keyCode {
+      case 125: moveSel(1); return nil                                   // down
+      case 126: moveSel(-1); return nil                                  // up
+      case 36, 76:                                                       // return, enter
+        let rows = liveRows()
+        guard let i = keySel, i < rows.count else { return nil }
+        // Through the row's own target/action, which is the edge a click arrives
+        // on -- so a row with a stale action fails here exactly as under a finger.
+        guard let tgt = rows[i].target, let act = rows[i].action else { return nil }
+        NSApp.sendAction(act, to: tgt, from: rows[i])
+        return nil
+      default: break
+      }
+      // A letter at the list means a name. Straight into the mode that takes one,
+      // carrying the character, so typing "m" never costs a click first.
+      guard let ch = e.charactersIgnoringModifiers, let first = ch.first, first.isLetter,
+            !e.modifierFlags.contains(.command) else { return e }
+      keySel = nil
+      paintSel()
+      t.showName()
+      nameField.stringValue = String(first)
+      w.makeFirstResponder(nameField)
+      // The caret AFTER the character, in the live field editor -- `stringValue`
+      // is the committed value and the editor is what the next keystroke goes to
+      // (`committed-value-is-not-current-value`).
+      if let ed = nameField.currentEditor() {
+        ed.string = String(first)
+        ed.selectedRange = NSRange(location: ed.string.count, length: 0)
+      }
+      return nil
+    }
+    fputs("home: keys ready\n", stderr)
 
     // ── THIS WINDOW HAD NO PRESS PATH, AND NOW IT IS THE FRONT DOOR ──────────
     //
@@ -1251,6 +1464,16 @@ enum Launcher {
     // the server about people whose rows no longer exist.
     presenceTimer?.invalidate()
     presenceTimer = nil
+    // Same rule for the other two, and for the monitor: a local key monitor is
+    // installed on the APPLICATION, so one left behind would keep eating keys for
+    // a window that no longer exists.
+    // `addLocalMonitorForEvents` returns `Any?` -- nil means no monitor was
+    // installed, and handing that to `removeMonitor` is an exception, not a no-op.
+    if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    dotTimer?.invalidate()
+    dotTimer = nil
+    t.copyTimer?.invalidate()
+    t.copyTimer = nil
     // ── RELEASING THE CAMERA, WHICH USED TO BE EXEC'S JOB ────────────────────
     //
     // `stopRunning()` alone was enough while a re-exec followed: the process
