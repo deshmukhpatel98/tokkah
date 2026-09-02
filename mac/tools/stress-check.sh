@@ -81,6 +81,34 @@ run() {                              # run <name> <presses> <after> [extra flags
   PIDS="$PIDS $!"
 }
 
+# ── WAIT FOR THE PRESSES TO BE DONE, NOT FOR A NUMBER OF SECONDS ────────────
+#
+# Arm 1 failed about one run in three, always the same way -- "twenty presses left
+# the controls out of step: mic=on cam=off" -- and it was never the button. The
+# app prints when each press was DUE and when it RAN, and under the load of its
+# own five-way call the tail of a twenty-press sequence queues badly:
+#
+#     press @cam: due at 13132 ms, ran at 18968 ms -- queued 5836 ms
+#     press @cam: due at 14532 ms, ran at 21003 ms -- queued 6471 ms
+#
+# The arm then reaped at a flat 22 s, so the last press was executing as the
+# process was killed: the token fired, `click()` never finished, and the camera
+# was left on the wrong side of an odd number of toggles. 460 clicks soaked by
+# hand -- five idle runs and three under six spinning CPU hogs -- never once
+# dropped a press, because that harness waited for this line instead.
+#
+# `presses done` is printed by the app after the last token. Bounded, because a
+# rig that waits forever for a line that will never come is worse than one that
+# guesses.
+wait_presses() {                     # wait_presses <log> <seconds>
+  local w=0 lim=$(( ${2:-40} * 4 ))
+  while [ "$w" -lt "$lim" ]; do
+    grep -q "presses done" "$1" 2>/dev/null && return 0
+    naptime 0.25; w=$(( w + 1 ))
+  done
+  return 1
+}
+
 # ── 1. A TOGGLE PRESSED TWENTY TIMES ────────────────────────────────────────
 #
 # Ten pairs. The microphone must end ON, because it started on and was pressed an
@@ -91,7 +119,9 @@ SEQ="?"
 for i in $(seq 1 10); do SEQ="$SEQ,@mic,@cam"; done
 SEQ="$SEQ,?"
 run mash "$SEQ" 0.35
-naptime 22
+wait_presses "$SP/mash.log" 60 \
+  || say note "the press sequence never finished in 60 s -- the counts below are partial"
+naptime 1
 reap
 A="$SP/mash.log"
 CLICKS=$(grep -c '^  click mic' "$A" || true)
