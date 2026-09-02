@@ -94,13 +94,36 @@ class KinState(
         pending = resume.pending()
         watcher.start()
         refresh()
+        startPresenceRefresh()
         checkForUpdate()
         // The Mac checks when it is opened; the poll below is for the hours
         // it stays open.
         updateNow("Kin opened")
     }
 
-    fun stop() = watcher.stop()
+    fun stop() {
+        watcher.stop()
+        presenceGen++
+    }
+
+    // ── THE GREEN DOTS, REFRESHED WHILE THE WINDOW IS OPEN (Launcher 796-815) ─
+    private var presenceGen = 0
+    private fun startPresenceRefresh() {
+        val gen = ++presenceGen
+        thread(isDaemon = true, name = "kin-presence") {
+            while (gen == presenceGen) {
+                Thread.sleep(15_000)
+                if (gen != presenceGen) break
+                val list = people
+                if (list.isEmpty()) continue
+                val here = Presence.fetch(list.map { it.handle })
+                if (gen != presenceGen) break
+                // Presence paints a dot and REORDERS NOTHING.
+                people = list.map { Person(it.handle, here[it.handle] == true, it.lastSeen, it.face) }
+                onChanged?.invoke()
+            }
+        }
+    }
 
     // ── UPDATES ─────────────────────────────────────────────────────────────
 
