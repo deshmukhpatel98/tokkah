@@ -74,6 +74,8 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | update poll every 60 s, plus a check when opened and when a call starts | every 30 min | ✅ 0.126.12 |
 | relay (TURN) on the media socket, raced with direct, fail-open | allocates on every live call (turn_ok 1, relay in the beat); the direct path won every race on this LAN, so the relayed media path is exercised only by the harness's KIN_RELAY_ONLY arm | ✅ / 🔧 far-away test |
 | decode off the receive thread | ported (DecodeQueue), v_dq_* in the beat | ✅ |
+| audio redundancy under loss (repair copies, steered on the far end's report) | same rule; phone reports its loss in the probe; the live Mac 0.128 turned FEC on from the phone's report | ✅ 0.128.19 |
+| signed v2 handshake (Mac 0.128 refuses v1) | shipped in lockstep as android.19; seen live: 'signed handshake, first use' | ✅ 0.128.19 |
 | the beat under the Mac's field names (played_ps, floor_held_pct, v_*, route, …); absent where not measured | same names | ✅ 0.126.12 |
 | AEC aimed by a delay estimator every 0.5 s (echoEstimator/corrScan); 0.125 re-aim hold | EchoAim ported + hold; validated on planted delays (EchoAimTest) | ✅ 0.126.12 |
 | AEC clock-drift tracker (0.109 fractional window, carries without shifting taps) and 0.125 skew gate | ported; 30 ppm planted: 3.8 → 10.3 dB, skew 1.42 read vs 1.44 planted (AecDriftTest) | ✅ 0.126.14 |
