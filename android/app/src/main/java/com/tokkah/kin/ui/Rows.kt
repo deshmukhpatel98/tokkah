@@ -3,6 +3,7 @@ package com.tokkah.kin.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
@@ -53,6 +54,7 @@ import androidx.compose.ui.unit.dp
  * A press is a vibrant fill INSIDE the card's glass, never another pane.
  * `inert` rows are facts, not controls: no press fill, no hand.
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun KinRow(
     label: String,
@@ -74,6 +76,10 @@ fun KinRow(
     onClick: (() -> Unit)? = null,
     /** `checked`: the 18 pt green tick, 12 from the edge — "this one is selected". */
     trailingTick: Boolean = false,
+    /** The Mac's right-click, on a phone: a long press. */
+    onLongClick: (() -> Unit)? = null,
+    /** Pressed on the value chip alone (the Mac's `trailingAction`). */
+    onDetailClick: (() -> Unit)? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -86,7 +92,8 @@ fun KinRow(
             .clip(shape)
             .background(if (pressed && pressable) Palette.fill(0.12f) else Color.Transparent, shape)
             .then(
-                if (pressable) Modifier.clickable(interaction, indication = null, onClick = onClick!!)
+                if (pressable) Modifier.combinedClickable(interaction, indication = null,
+                    onClick = onClick!!, onLongClick = onLongClick)
                 else Modifier,
             )
             .drawBehind {
@@ -135,6 +142,7 @@ fun KinRow(
                             .height(24.dp)
                             .clip(chip)
                             .background(Palette.fill(if (pressed) 0.20f else 0.10f), chip)
+                            .then(if (onDetailClick != null) Modifier.clickable(onClick = onDetailClick) else Modifier)
                             .drawBehind {
                                 drawRoundRect(Palette.chipLine, style = Stroke(1f),
                                     cornerRadius = androidx.compose.ui.geometry.CornerRadius(12.dp.toPx()))

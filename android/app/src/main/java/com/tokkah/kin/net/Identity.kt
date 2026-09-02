@@ -246,9 +246,46 @@ class Identity(private val dir: File, private val base: String = Server.base) {
 
     // ── WHO YOU TALK TO, AND WHEN YOU LAST DID ──────────────────────────────
 
+    // ── REMOVING SOMEONE FROM THE LIST (0.126.0) ────────────────────────────
+    //
+    // Their KEY is kept: a removed person is hidden, not forgotten, so a ring
+    // from them still verifies and a new call puts them back. hidden.json is a
+    // sorted list of handles, written atomically.
+    private val hiddenFile get() = File(dir, "hidden.json")
+
+    fun hidden(): Set<String> {
+        if (!hiddenFile.exists()) return emptySet()
+        return Regex("\"([a-z][a-z0-9]{1,31})\"").findAll(hiddenFile.readText())
+            .map { it.groupValues[1] }.toSet()
+    }
+
+    private fun writeHidden(set: Set<String>) {
+        dir.mkdirs()
+        val tmp = File(dir, "hidden.json.tmp")
+        tmp.writeText(set.sorted().joinToString(",", "[", "]") { "\"$it\"" })
+        hiddenFile.delete()
+        if (!tmp.renameTo(hiddenFile)) tmp.delete()
+    }
+
+    fun hide(handle: String) {
+        if (!handleOK(handle)) return
+        val set = hidden()
+        if (handle in set) return
+        writeHidden(set + handle)
+        android.util.Log.i("kin", "contacts: @$handle removed from the list (key kept)")
+    }
+
+    fun unhide(handle: String) {
+        val set = hidden()
+        if (handle !in set) return
+        writeHidden(set - handle)
+        android.util.Log.i("kin", "contacts: @$handle back on the list -- you talked again")
+    }
+
     /** Written at every placed and every answered call. */
     fun noteCallTime(handle: String, at: Double = System.currentTimeMillis() / 1000.0) {
         if (!handleOK(handle)) return
+        unhide(handle)
         val map = lastCallTimes().toMutableMap()
         map[handle] = at
         dir.mkdirs()
@@ -286,7 +323,10 @@ class Identity(private val dir: File, private val base: String = Server.base) {
     }
 
     /** Everyone this phone knows: people who proved a key, plus people we dialled. */
-    fun contactHandles(): List<String> = (contacts().keys + called()).distinct()
+    fun contactHandles(): List<String> {
+        val gone = hidden()
+        return (contacts().keys + called()).distinct().filter { it !in gone }
+    }
 
     /**
      * The list's order: the people you actually talk to, most recent first, then

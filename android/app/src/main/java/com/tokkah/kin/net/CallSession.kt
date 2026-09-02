@@ -32,6 +32,8 @@ class CallSession(
     val telemetry: Telemetry? = store?.let { Telemetry(it) }
     private val power = Power()
     val aec = Aec()
+    /** Aims the canceller: without it `aimSamples` stays -1 and the AEC never runs. */
+    val echoAim = EchoAim(aec)
     val predict = Predict()
 
     /**
@@ -212,6 +214,7 @@ class CallSession(
         playout.emit = { v ->
             emitRing[emitW % emitRing.size] = v
             emitW++
+            echoAim.noteEmit(v)
         }
         Rendezvous.warm(room)
         val s = DatagramSocket()
@@ -254,6 +257,15 @@ class CallSession(
             turn?.readDirectly = false
             thread(isDaemon = true, name = "kin-rx") { receiveLoop(s) }
             thread(isDaemon = true, name = "kin-report") { reportLoop(s) }
+            // The Mac's cadence: a delay estimate every half second, off every
+            // hot path. Only while the sound could be coming back through a
+            // loudspeaker — on headphones there is no echo to aim at.
+            thread(isDaemon = true, name = "kin-echo-aim") {
+                while (running) {
+                    Thread.sleep(500)
+                    if (speakers) runCatching { echoAim.tick() }
+                }
+            }
             signalLoop(s)
         }
     }
@@ -393,8 +405,11 @@ class CallSession(
         f["aec_erle_life_db"] = aec.erleLifetimeDb
         f["aec_residual"] = aec.residual.toDouble()
         f["aec_diverges"] = aec.diverges
+        f["aec_reaims"] = aec.reaims; f["aec_reaims_held"] = aec.reaimsHeld
         f["aec_off_pct"] = if (aec.blocks > 0) 100.0 * aec.offBlocks / aec.blocks else 0.0
         f["aec_delay_ms"] = aec.aimSamples.toDouble() / Wire.SR * 1000
+        f["echo_corr"] = echoAim.echoCorr; f["echo_corr_peak"] = echoAim.echoCorrPeak
+        f["echo_ticks"] = echoAim.scans; f["echo_skips"] = echoAim.skips
         // the ring
         f["played"] = ring.played
         f["conceal_total"] = ring.concealed; f["conceal_lost"] = ring.concealLost
@@ -814,6 +829,8 @@ class CallSession(
         // Subtract before classifying: the bar the classifier builds is made
         // from what is LEFT after cancellation, so a person under a cancelled
         // echo is heard rather than explained away.
+        // The RAW microphone, for the estimator, before anything is subtracted.
+        echoAim.noteCapture(x, n)
         if (speakers) {
             aec.process(x, n, emitRing, emitW, emitRing.size)
             gate.echoResidual = aec.residual

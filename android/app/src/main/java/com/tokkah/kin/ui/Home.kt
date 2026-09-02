@@ -67,6 +67,8 @@ class HomeCard(
     /** null = busy ("…"). */
     val reachOn: Boolean?,
     val reachHint: String,
+    /** The person a long press has offered to remove, if any. */
+    val removing: String? = null,
 )
 
 @Composable
@@ -84,6 +86,9 @@ fun HomeScreen(
     onInvite: () -> Unit,
     onCopyMine: () -> Unit,
     onReach: () -> Unit,
+    /** Long press on a person: offer the ×. Null clears the offer. */
+    onRemoveOffer: (String?) -> Unit = {},
+    onRemove: (String) -> Unit = {},
     preview: @Composable () -> Unit,
 ) {
     GlassBackdrop(
@@ -166,11 +171,18 @@ fun HomeScreen(
                                 KinHint("Talk to someone once and they’ll show up here.")
                             }
                             for (p in card.people) {
+                                // The Mac's right-click / hover-× is a long press here:
+                                // the row offers "remove" in the value slot, one tap
+                                // takes them off, any other tap withdraws the offer.
+                                val offering = card.removing == p.handle
                                 KinRow(
                                     "@" + p.handle,
-                                    detail = p.lastSeen,
+                                    detail = if (offering) "remove" else p.lastSeen,
+                                    valueIsAction = offering,
                                     leading = { Avatar(p.handle, online = p.online, face = faceOf(p)) },
-                                    onClick = { onCall(p.handle) },
+                                    onClick = { if (offering) onRemoveOffer(null) else onCall(p.handle) },
+                                    onLongClick = { onRemoveOffer(p.handle) },
+                                    onDetailClick = if (offering) ({ onRemove(p.handle) }) else null,
                                 )
                             }
                             RoomField(room, onRoom, onJoin)

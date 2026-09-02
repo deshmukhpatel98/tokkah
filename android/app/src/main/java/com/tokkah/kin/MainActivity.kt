@@ -104,6 +104,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     var reachHint by remember { mutableStateOf("") }
     var nameTrouble by remember { mutableStateOf("") }
     var readyVersion by remember { mutableStateOf<String?>(null) }
+    var removing by remember { mutableStateOf<String?>(null) }
     // The notification permission is the one thing "People can call me" cannot
     // do for itself. Asked on the press that needs it; the switch finishes
     // itself when the answer comes back.
@@ -328,6 +329,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     settingsOpen = settingsOpen,
                     reachOn = reachOn,
                     reachHint = reachHint,
+                    removing = removing,
                 ),
                 cameraHint = cameraHint,
                 onUpdate = {
@@ -373,6 +375,8 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     }
                 },
                 onReach = { state.toggleReach() },
+                onRemoveOffer = { removing = it },
+                onRemove = { removing = null; state.remove(it) },
             ) {
                 if (camGranted) SelfPreview { cameraHint = it }
             }

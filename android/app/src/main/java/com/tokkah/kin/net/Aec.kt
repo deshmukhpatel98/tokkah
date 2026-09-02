@@ -51,6 +51,14 @@ class Aec {
         var divergeFloorRms = 0.002
         var promoteMs = 200.0
         var coolMs = 400.0
+        /**
+         * A WORKING FILTER IS NOT RE-AIMED (0.125.0). A disagreeing delay estimate
+         * is held while the filter on the audio is measurably removing this much
+         * echo: three wandering readings in a row used to throw a converged filter
+         * away for a delay the room had never moved to. A room that really moves
+         * collapses the ERLE inside half a second and the re-aim proceeds.
+         */
+        var reaimHoldDb = 6.0
     }
 
     var cfg = Cfg()
@@ -84,6 +92,9 @@ class Aec {
     var freezes = 0; private set
     var diverges = 0; private set
     var promotions = 0; private set
+    /** Re-aims refused because the filter in use was still earning its keep. */
+    var reaimsHeld = 0; private set
+    var reaims = 0; private set
 
     /** Instantaneous echo return loss enhancement, in dB. */
     val erleDb: Double
@@ -136,10 +147,17 @@ class Aec {
         }
         val want = max(0, aimSamples - lead)
         if (abs(want - delay) > (0.002 * Wire.SR).toInt()) {
-            delay = want
-            java.util.Arrays.fill(fFg, 0f)
-            java.util.Arrays.fill(fBg, 0f)
-            cmpFgE = 0.0; cmpBgE = 0.0; cmpMicE = 0.0; betterMs = 0.0
+            if (mix >= 0.5f && erleDb >= cfg.reaimHoldDb) {
+                // Held: the estimator says the room moved; the audio says the
+                // filter still fits. The audio is the thing being subtracted.
+                reaimsHeld++
+            } else {
+                delay = want
+                reaims++
+                java.util.Arrays.fill(fFg, 0f)
+                java.util.Arrays.fill(fBg, 0f)
+                cmpFgE = 0.0; cmpBgE = 0.0; cmpMicE = 0.0; betterMs = 0.0
+            }
         }
 
         val span = t - 1 + n

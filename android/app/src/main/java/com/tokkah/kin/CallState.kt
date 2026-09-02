@@ -203,6 +203,16 @@ class KinState(
         }
     }
 
+    /** Take somebody off the list. Their key is kept; a new call brings them back. */
+    fun remove(handle: String) {
+        if (cardMode == CallCardMode.CALLING) return
+        identity.hide(handle)
+        people = people.filter { it.handle != handle }
+        com.tokkah.kin.net.Metrics.tap("home_remove")
+        android.util.Log.i("kin", "home: removed @$handle")
+        onChanged?.invoke()
+    }
+
     // ── THE ONE FIELD ───────────────────────────────────────────────────────
 
     /** What the field decided. The Mac's `Intent`, minus the window closing. */
