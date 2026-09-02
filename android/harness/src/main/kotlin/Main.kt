@@ -31,7 +31,7 @@ fun main(args: Array<String>) {
     val local = localIPv4()?.let { "$it:${sock.localPort}" }
     val addr = mapped?.let { "${it.ip}:${it.port}" }
 
-    val crypto = Crypto(room)
+    val crypto = Crypto(room, ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })
     val tsync = TimeSync()
     var peerAddrs = listOf<InetSocketAddress>()
     var lockedFrom: InetSocketAddress? = null
@@ -62,26 +62,21 @@ fun main(args: Array<String>) {
             var b = buf
             var n = pkt.length
             var magic = Wire.magic(b, n)
-            if (magic != Wire.HMAGIC) {
-                val opened = crypto.open(buf.copyOf(n))
-                if (opened != null) {
-                    System.arraycopy(opened, 0, plain, 0, opened.size)
-                    b = plain; n = opened.size
-                    magic = Wire.magic(b, n)
-                } else if (crypto.established) {
-                    crypto.notePlaintextRx()
+            if (magic == Wire.HMAGIC) { crypto.noteOldHandshake(); println("harness: UNSIGNED handshake refused"); continue }
+            if (magic == Crypto.HS_MAGIC) {
+                if (crypto.adoptHandshake(b, n) is Crypto.Adopt.Adopted) {
+                    println("harness: peer key adopted (caps=${Crypto.capsOf(b, n)}) — ${crypto.summary}")
+                    sendTo(crypto.handshakePacket()); handshakesSent++
+                    lockedFrom = pkt.socketAddress as InetSocketAddress
                 }
+                continue
             }
+            if (!crypto.established) { crypto.notePlaintextRx(); continue }
+            val opened = crypto.open(buf.copyOf(n)) ?: continue
+            System.arraycopy(opened, 0, plain, 0, opened.size)
+            b = plain; n = opened.size
+            magic = Wire.magic(b, n)
             when (magic) {
-                Wire.HMAGIC -> {
-                    val (key, caps) = Wire.parseHandshake(b, n) ?: continue
-                    val isNew = crypto.adoptPeer(key)
-                    if (isNew) {
-                        println("harness: peer key adopted (caps=$caps) — replying")
-                        sendTo(Wire.handshake(crypto.myPublic)); handshakesSent++
-                        lockedFrom = pkt.socketAddress as InetSocketAddress
-                    }
-                }
                 Wire.TMAGIC -> {
                     val t4 = KinClock.now()
                     val p = Wire.parseT(b, n) ?: continue
@@ -137,7 +132,7 @@ fun main(args: Array<String>) {
         if (peerAddrs.isNotEmpty() || lockedFrom != null) {
             if (!crypto.established && now - lastHello > 300) {
                 lastHello = now
-                sendTo(Wire.handshake(crypto.myPublic)); handshakesSent++
+                sendTo(crypto.handshakePacket()); handshakesSent++
             }
             if (now - lastProbe > 500) {
                 lastProbe = now

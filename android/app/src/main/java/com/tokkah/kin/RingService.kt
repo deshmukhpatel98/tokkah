@@ -87,7 +87,7 @@ class RingService : Service() {
 
     private fun ring(r: Identity.Ring) {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val full = open(r.from, r.room)
+        val full = open(r.from, r.room, r.k)
         val n = NotificationCompat.Builder(this, CH_RING)
             .setContentTitle("@${r.from} is calling")
             .setSmallIcon(android.R.drawable.sym_call_incoming)
@@ -100,7 +100,7 @@ class RingService : Service() {
             .setFullScreenIntent(full, true)
             .setContentIntent(full)
             .addAction(0, "Decline", service(ACTION_DECLINE, r.from, r.room))
-            .addAction(0, "Answer", open(r.from, r.room))
+            .addAction(0, "Answer", open(r.from, r.room, r.k))
             .build()
         nm.notify(RING_ID, n)
         // The sound and the buzz. The notification alone was the SEEING half of
@@ -115,11 +115,14 @@ class RingService : Service() {
         getSystemService(NotificationManager::class.java)?.cancel(RING_ID)
     }
 
-    private fun open(from: String?, room: String?): PendingIntent {
+    private fun open(from: String?, room: String?, key: String? = null): PendingIntent {
         val i = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             if (from != null) putExtra(EXTRA_FROM, from)
             if (room != null) putExtra(EXTRA_ROOM, room)
+            // The key that signed the ring: the answered call requires the
+            // media handshake to come from it.
+            if (!key.isNullOrEmpty()) putExtra(EXTRA_KEY, key)
         }
         return PendingIntent.getActivity(
             this, if (room == null) 0 else 1, i,
@@ -161,6 +164,7 @@ class RingService : Service() {
         const val ACTION_STOP = "com.tokkah.kin.STOP"
         const val EXTRA_FROM = "from"
         const val EXTRA_ROOM = "room"
+        const val EXTRA_KEY = "key"
 
         fun channels(ctx: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return

@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
         // the lock screen lands in that call rather than at the front door.
         val fromRing = intent?.getStringExtra(RingService.EXTRA_ROOM)
         val ringWho = intent?.getStringExtra(RingService.EXTRA_FROM) ?: ""
+        val ringKey = intent?.getStringExtra(RingService.EXTRA_KEY)
         val deep = fromRing ?: intent?.data?.let { u ->
             (u.pathSegments?.lastOrNull() ?: u.host)?.takeIf { it.isNotBlank() }
         }
@@ -77,12 +78,12 @@ class MainActivity : ComponentActivity() {
         Thread { runCatching { com.tokkah.kin.net.Crash.reportPrevious(kinDir, com.tokkah.kin.net.Telemetry(kinDir)) } }
             .apply { isDaemon = true }.start()
         com.tokkah.kin.net.Crash.arm(kinDir, ver)
-        setContent { KinApp(deep, if (fromRing != null) ringWho else "") }
+        setContent { KinApp(deep, if (fromRing != null) ringWho else "", if (fromRing != null) ringKey else null) }
     }
 }
 
 @Composable
-fun KinApp(initialRoom: String?, ringWho: String = "") {
+fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) {
     val ctx = LocalContext.current
     var room by remember { mutableStateOf(if (ringWho.isEmpty()) initialRoom ?: "" else "") }
     var session by remember { mutableStateOf<CallSession?>(null) }
@@ -176,9 +177,16 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         }
     }
 
-    fun join(name: String, who: String = "") {
+    fun join(name: String, who: String = "", key: String? = null) {
         if (name.isBlank()) return
-        val s = CallSession(name.trim(), store = ctx.filesDir.resolve("kin"), who = who)
+        // Who the other end must be: the key handed in (the ring's, or the one
+        // the server bound their name to), else the one pinned from a previous
+        // call. Neither: first use, pinned once the handshake verifies.
+        val expected = key?.let { Identity.b64d(it) }?.takeIf { it.size == 32 }
+            ?: (if (who.isNotEmpty()) identity.contactKey(who) else null)
+        val s = CallSession(name.trim(), store = ctx.filesDir.resolve("kin"), who = who,
+            identitySeed = identity.seedCopy, peerKey = expected)
+        if (who.isNotEmpty()) s.onPeerIdentity = { k -> identity.remember(who, Identity.b64e(k)) }
         s.appVersion = installedVersion
         s.useTurn = ctx.getSharedPreferences("kin", Context.MODE_PRIVATE).getBoolean("turn", true)
         // Rig arms, from the launch intent, so an A/B needs no rebuild.
@@ -243,7 +251,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             nameTrouble = if (identity.claimed) "" else
                 "This phone has no name yet, so nobody can call it. It takes one the first time it reaches the server."
         }
-        state.onCall = { room, who -> join(room, who); state.answered() }
+        state.onCall = { room, who, key -> join(room, who, key); state.answered() }
         // Silent where this copy is its own installer of record, one tap where
         // it is not. Either way the person downloaded Kin once.
         state.onInstall = { f ->
@@ -313,7 +321,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     // straight into it rather than showing a front door nobody asked for.
     LaunchedEffect(initialRoom, ringWho) {
         if (ringWho.isNotEmpty() && initialRoom != null && session == null) {
-            join(initialRoom, ringWho)
+            join(initialRoom, ringWho, ringKey)
         }
     }
 

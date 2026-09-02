@@ -13,7 +13,10 @@ import java.security.SecureRandom
  */
 class Identity(private val dir: File, private val base: String = Server.base) {
 
-    class Ring(val from: String, val room: String, val t: Int, val kind: String?, val verified: Boolean)
+    /** [k] is the caller's device public key, base64 -- the identity the media
+     *  handshake must then present, and what contacts.json pins on answer. */
+    class Ring(val from: String, val room: String, val t: Int, val kind: String?, val verified: Boolean,
+               val k: String = "")
 
     sealed class PollOutcome {
         class Answer(val rings: List<Ring>, val serverHolds: Boolean?, val quiet: Boolean?) : PollOutcome()
@@ -67,6 +70,8 @@ class Identity(private val dir: File, private val base: String = Server.base) {
     }
 
     val publicKey: ByteArray get() = Ed25519.publicFromSeed(seed)
+    /** The Ed25519 seed, for the call's signed handshake. A copy; never logged. */
+    val seedCopy: ByteArray get() = seed.copyOf()
     val publicKeyB64: String get() = b64e(publicKey)
 
     /** `^[a-z][a-z0-9]{1,31}$` — the server's rule, applied here too. */
@@ -122,6 +127,13 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         return post("$base/api/kin/$h/register", body)?.first ?: 0
     }
 
+    /**
+     * The callee's registered identity key (base64) from the last accepted
+     * [ring], or null when the server did not say. Read once, right after.
+     */
+    @Volatile var lastRingPeerKey: String? = null
+        private set
+
     /** Ring [to] into [room]; `kind = "bye"` cancels or declines. */
     fun ring(to: String, room: String, kind: String? = null): Boolean {
         if (!claimed) return false
@@ -129,7 +141,14 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         val sig = sign(ringMessage(to, handle, room, t, kind)) ?: return false
         val k = if (kind != null) ""","kind":"$kind"""" else ""
         val body = """{"to":"$to","from":"$handle","room":"$room","t":$t,"sig":"$sig","k":"$publicKeyB64"$k}"""
+        lastRingPeerKey = null
         val r = post("$base/api/kin/$to/ring", body) ?: return false
+        if (r.first in 200..299 && kind == null) {
+            // The key the server bound @to to when they claimed the name. The
+            // call's handshake will be REQUIRED to come from it (CallSession).
+            val kk = field(r.second, "k")
+            if (kk != null && b64d(kk).size == 32) lastRingPeerKey = kk
+        }
         return r.first in 200..299
     }
 
@@ -166,7 +185,7 @@ class Identity(private val dir: File, private val base: String = Server.base) {
                     val sigD = b64d(sig); val pk = b64d(kb64)
                     if (sigD.size != 64 || pk.size != 32) continue
                     val ok = Ed25519.verify(pk, ringMessage(handle, from, room, t, kind).toByteArray(), sigD)
-                    rings.add(Ring(from, room, t, kind, ok))
+                    rings.add(Ring(from, room, t, kind, ok, kb64))
                 }
                 // "waitedMs" present is the server SAYING it holds — an older
                 // worker ignores the parameter in silence, which is otherwise
@@ -229,13 +248,22 @@ class Identity(private val dir: File, private val base: String = Server.base) {
     // ── contacts: every value is a key somebody PROVED they held ─────────────
 
     fun remember(handle: String, keyB64: String) {
+        // Shape-checked the way pollOnce checks an incoming `k`: a stored value
+        // nothing can equal is a contact that can never be recognised.
+        if (!handleOK(handle) || b64d(keyB64).size != 32) return
         val existing = contacts().toMutableMap()
+        if (existing[handle] == keyB64) return
+        android.util.Log.i("kin", "contacts: @$handle remembered")
         existing[handle] = keyB64
         dir.mkdirs()
         contactsFile.writeText(existing.entries.joinToString(",", "{", "}") {
             "\"${it.key}\":\"${it.value}\""
         })
     }
+
+    /** The pinned key for [handle] as raw bytes, or null when never pinned. */
+    fun contactKey(handle: String): ByteArray? =
+        contacts()[handle]?.let { b64d(it) }?.takeIf { it.size == 32 }
 
     fun contacts(): Map<String, String> {
         if (!contactsFile.exists()) return emptyMap()

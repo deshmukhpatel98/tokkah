@@ -5,6 +5,69 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.128.0 / 0.128.0-android.19 — 2026-09-03
+
+### Changed — the handshake is signed, and there is no plaintext window
+
+The call has been encrypted since 0.9 (X25519, AES-256-GCM, two directional
+keys) and the file said what that did not defeat: an active man in the middle who
+knows the room code. That understated it. The room code travels to the callee
+**through the signalling server**, inside the ring, and the same server hands each
+end the other's address -- so the one party positioned to sit in the middle was
+the one party guaranteed to know the code. Three more things were true of v1 and
+are not any more:
+
+- **Anyone who could reach the port could re-key the call.** A 36-byte packet
+  with the right magic and any X25519 point was adopted, unauthenticated, and
+  every real packet after it failed to open.
+- **Media flowed in the clear until the handshake completed**, deliberately and
+  counted -- which is a downgrade an attacker holds open by dropping handshakes.
+- **A recorded packet could be played back** into a call a minute later; GCM
+  authenticates a packet, it does not stop the same one arriving twice.
+
+Now (`Crypto.swift`, `Crypto.kt`, bit-exact with each other against the Mac's own
+vectors):
+
+- **The ephemeral key travels signed by the install's Ed25519 device key** -- the
+  key that already signs every ring -- over a message that names the room.
+  136 bytes. Refused unless the signature verifies AND the identity is the one
+  this end expected: the key that signed the ring (callee), the key the server
+  bound the handle to at registration, now returned with an accepted ring
+  (caller), or the key pinned in `contacts.json` from a previous call. No
+  expectation (an invite link, a stranger): pinned on first use for the call,
+  remembered under the handle once the call is answered. Both ephemeral keys and
+  both identities are in the HKDF transcript.
+- **Nothing is read or written before a key.** `prekey_drop` counts what was held
+  back; `plaintext_rx` counts what arrived in the clear and was refused.
+- **A 2048-packet replay window** (about 1.4 s of audio). `replay_drop`.
+- **Every refusal has a name in the beat**: `hs_bad_sig`, `hs_wrong_id`,
+  `hs_id_changed`, `hs_old` (the far end still sends the unsigned v1 handshake),
+  `hs_flood` (signature checks are budgeted at 20/s), `hs_weak`. `crypt_v=2`,
+  `crypt_expected`, `crypt_pinned` say which trust path a call took.
+- **`--no-crypt` is gone.** A consumer product with a switch that sends calls in
+  the clear is a product that will one day be run with that switch on.
+- The eight-character code now covers all four keys.
+
+**Cost: none on the media path.** The signature is computed once per call and
+cached; a same-key beat is compared before any arithmetic; verification happens
+once, at connection, off the audio thread. Android tries the platform's Ed25519
+first (API 33+) and counts every fall back to its own arithmetic
+(`ed25519_fallback`, `x25519_fallback`).
+
+**Incompatible on purpose.** A 0.128 end refuses a 0.127 end and says so
+(`hs_old`, "the other end is on an old build"); it does not fall back to an
+unsigned exchange. Both ends must update before they can talk again -- Macs do on
+their own; the phone asks.
+
+Measured: `tk --selftest-crypto` (18 arms, including tampered signatures, tampered
+capability bits, the wrong room, the wrong identity, a second identity mid-call,
+the all-zero point, replay inside and outside the window, and nothing sealed
+before a key) and `mac/tools/crypto-check.sh` -- two real processes on a live
+socket: honest ends key and read one code; an end that expects the other's
+identity reports `crypt_pinned=1`; an end that expects a different identity never
+connects, seals nothing, drops 8,000 packets unsent; the installed 0.127.0 is
+refused (`hs_old=21`) and named. 21 Android unit tests over the Mac's vectors.
+
 ## Kin 0.125.0 — 2026-09-02
 
 ### Fixed — the echo canceller stops throwing itself away

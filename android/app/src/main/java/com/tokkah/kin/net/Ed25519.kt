@@ -11,12 +11,43 @@ import java.security.MessageDigest
  * a raw seed anyway — which is exactly what identity.json holds, and what the
  * server's `k` field and every `kin-*-v1` signature are defined over.
  *
- * BigInteger, not constant-time. That is acceptable here and nowhere else: this
- * key signs ring messages, it never establishes a session secret (X25519 in
- * Crypto.kt does that, through the platform provider), and the signatures it
- * produces are public by construction.
+ * PLATFORM FIRST, since the key now also signs the call's handshake. On API 33+
+ * `Signature.getInstance("Ed25519")` takes the seed as PKCS#8 and the public key
+ * as X.509 SubjectPublicKeyInfo, so both are wrapped and offered to the
+ * provider; the BigInteger arithmetic below is the fallback for phones that
+ * refuse, and `fallbacks` counts every time it was the path taken so the beat
+ * can say which one a fleet is on. Both paths are RFC 8032 and are held to the
+ * same vectors, so the answer cannot differ by platform.
+ *
+ * The BigInteger path is not constant-time. What it signs is public by
+ * construction (a ring, a handshake), it runs once per call, and the session
+ * secret is X25519 in Crypto.kt -- but a phone that always lands here is worth
+ * knowing about, which is what the counter is for.
  */
 object Ed25519 {
+    @Volatile var fallbacks = 0
+    private const val PKCS8_HEAD = "302e020100300506032b657004220420"
+    private const val X509_HEAD = "302a300506032b6570032100"
+
+    private fun platformSign(seed: ByteArray, msg: ByteArray): ByteArray? = try {
+        val kf = java.security.KeyFactory.getInstance("Ed25519")
+        val priv = kf.generatePrivate(java.security.spec.PKCS8EncodedKeySpec(Crypto.hexToBytes(PKCS8_HEAD) + seed))
+        val s = java.security.Signature.getInstance("Ed25519")
+        s.initSign(priv); s.update(msg)
+        s.sign().takeIf { it.size == 64 }
+    } catch (e: Throwable) { null }
+
+    private fun platformVerify(pub: ByteArray, msg: ByteArray, sig: ByteArray): Boolean? = try {
+        val kf = java.security.KeyFactory.getInstance("Ed25519")
+        val pk = kf.generatePublic(java.security.spec.X509EncodedKeySpec(Crypto.hexToBytes(X509_HEAD) + pub))
+        val s = java.security.Signature.getInstance("Ed25519")
+        s.initVerify(pk); s.update(msg)
+        s.verify(sig)
+    } catch (e: java.security.SignatureException) {
+        // The provider ran and said no: that IS the answer.
+        false
+    } catch (e: Throwable) { null }
+
     private val P = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
     private val L = BigInteger("7237005577332262213973186563042994240857116359379907606001950938285454250989")
     private val D = BigInteger("-121665").multiply(BigInteger.valueOf(121666).modInverse(P)).mod(P)
@@ -113,6 +144,8 @@ object Ed25519 {
 
     fun sign(seed: ByteArray, msg: ByteArray): ByteArray {
         require(seed.size == 32) { "seed must be 32 bytes" }
+        platformSign(seed, msg)?.let { return it }
+        fallbacks++
         val h = sha512(seed)
         val a = clamp(h)
         val prefix = h.copyOfRange(32, 64)
@@ -126,6 +159,8 @@ object Ed25519 {
 
     fun verify(pub: ByteArray, msg: ByteArray, sig: ByteArray): Boolean {
         if (pub.size != 32 || sig.size != 64) return false
+        platformVerify(pub, msg, sig)?.let { return it }
+        fallbacks++
         return try {
             val rPoint = decodePoint(sig.copyOf(32)) ?: return false
             val aPoint = decodePoint(pub) ?: return false

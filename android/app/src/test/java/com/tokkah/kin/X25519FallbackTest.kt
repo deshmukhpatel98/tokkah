@@ -54,10 +54,11 @@ class X25519FallbackTest {
     fun twoFreshSessionsAgree() {
         // Whatever path each Crypto instance takes, the pair must derive the
         // same keys and the same safety code.
-        val a = Crypto("a-room")
-        val b = Crypto("a-room")
-        assertTrue(a.adoptPeer(b.myPublic))
-        assertTrue(b.adoptPeer(a.myPublic))
+        val a = Crypto("a-room", ByteArray(32) { 1 })
+        val b = Crypto("a-room", ByteArray(32) { 2 })
+        val pa = a.handshakePacket(); val pb = b.handshakePacket()
+        assertTrue(a.adoptHandshake(pb, pb.size) is Crypto.Adopt.Adopted)
+        assertTrue(b.adoptHandshake(pa, pa.size) is Crypto.Adopt.Adopted)
         assertEquals(a.safetyCode, b.safetyCode)
         val msg = "one voice at a time".toByteArray()
         assertArrayEquals(msg, b.open(a.seal(msg)!!))

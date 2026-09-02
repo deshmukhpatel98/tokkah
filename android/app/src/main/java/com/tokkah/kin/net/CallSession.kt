@@ -19,8 +19,20 @@ class CallSession(
     val store: java.io.File? = null,
     /** The handle on the other end, when a ring told us. */
     val who: String = "",
+    /** This install's Ed25519 seed (identity.json); a throwaway one when absent. */
+    identitySeed: ByteArray? = null,
+    /** The identity the other end MUST present, or null for first use. */
+    peerKey: ByteArray? = null,
 ) {
-    val crypto = Crypto(room)
+    val crypto = Crypto(room,
+        identitySeed ?: ByteArray(32).also { java.security.SecureRandom().nextBytes(it) },
+        peerKey)
+    /**
+     * Fired on the receive thread when a NEW, verified identity keyed the call.
+     * The argument is the peer's Ed25519 identity, raw -- what contacts.json
+     * pins under the handle this call is with.
+     */
+    var onPeerIdentity: ((ByteArray) -> Unit)? = null
     val ring = RecvRing()
     val playout = Playout(ring)
     val gate = DuplexGate()
@@ -438,8 +450,7 @@ class CallSession(
         f["in_lat_ms"] = playout.inLatencyMs; f["out_lat_ms"] = playout.outLatencyMs
         tsync.bestRttMs?.let { f["rtt_ms"] = it }
         tsync.rttSpreadMs?.let { f["rtt_jit_ms"] = it }
-        f["crypt"] = 1; f["crypt_bad"] = crypto.openFails
-        f["sealed"] = crypto.sealed; f["opened"] = crypto.opened; f["plaintext_rx"] = crypto.plaintextRx
+        crypto.beatFields(f)
         f["send_errors"] = sendErrors; f["rx_errors"] = rxErrors
         f["peer_held"] = if (holding) 1 else 0
         // the picture
@@ -516,8 +527,11 @@ class CallSession(
     }
 
     private fun sendSealed(b: ByteArray, n: Int = b.size) {
+        // No key, nothing sent. v1 fell through to plaintext here "until the
+        // handshake completed", which an attacker could hold open by dropping
+        // handshakes. Dropped and counted instead.
         val sealed = crypto.seal(b, n)
-        if (sealed != null) sendRaw(sealed) else { crypto.notePlaintextTx(); sendRaw(b, n) }
+        if (sealed != null) sendRaw(sealed) else crypto.notePreKeyDrop()
     }
 
     private fun signalLoop(s: DatagramSocket) {
@@ -599,7 +613,7 @@ class CallSession(
                 // learns our key again without waiting for us to notice.
                 if (now - lastHello > (if (crypto.established) 5000 else 300)) {
                     lastHello = now
-                    sendRaw(Wire.handshake(crypto.myPublic))
+                    sendRaw(crypto.handshakePacket())
                     handshakesSent++
                 }
                 if (now - lastProbe > 500) {
@@ -695,41 +709,51 @@ class CallSession(
             }
             var magic = Wire.magic(b, n)
             if (locked != null && fromAddr == locked) lastFromPeerMs = System.currentTimeMillis()
-            if (magic != Wire.HMAGIC) {
-                // `b`, NOT `buf`: a relayed datagram has already been
-                // unwrapped out of its 4-byte channel header, and decrypting
-                // from offset 0 would feed the header to AES-GCM. Every
-                // relayed media packet would fail to open, silently, while the
-                // handshake (which is read from `b`) went through — a relay
-                // that connects and then carries nothing.
-                val opened = crypto.open(b.copyOf(n))
-                if (opened != null) {
-                    System.arraycopy(opened, 0, plainBuf, 0, opened.size)
-                    b = plainBuf; n = opened.size
-                    magic = Wire.magic(b, n)
-                } else if (crypto.established) {
-                    crypto.notePlaintextRx()
-                }
-            }
-            when (magic) {
-                Wire.HMAGIC -> {
-                    android.util.Log.i("kin", "rx: handshake")
-                    Metrics.mark("peer_found_ms", Metrics.sinceLaunch())
-                    val parsed = Wire.parseHandshake(b, n) ?: continue
-                    peerCaps = parsed.second
-                    if (crypto.adoptPeer(parsed.first)) {
+            // An UNSIGNED (v1) handshake: the far end is a build from before the
+            // handshake was signed. Refused and counted; never keyed.
+            if (magic == Wire.HMAGIC) { crypto.noteOldHandshake(); continue }
+            if (magic == Crypto.HS_MAGIC) {
+                Metrics.mark("peer_found_ms", Metrics.sinceLaunch())
+                when (val a = crypto.adoptHandshake(b, n)) {
+                    is Crypto.Adopt.Adopted -> {
+                        android.util.Log.i("kin", "rx: handshake -- ${crypto.summary}")
+                        peerCaps = Crypto.capsOf(b, n)
                         // A fresh handshake is somebody ARRIVING: a call that
                         // said "hung up" and then met a new key is live again.
                         ended = false; left = false; holding = false; peerGone = 0
+                        // The address is adopted only from a VERIFIED handshake.
                         locked = pkt.socketAddress as InetSocketAddress
-                        sendRaw(Wire.handshake(crypto.myPublic))
+                        sendRaw(crypto.handshakePacket())
                         Metrics.mark("connected_ms", Metrics.sinceLaunch())
                         // Which path won the race, which is the first question
                         // asked of any call that sounded wrong.
                         Metrics.fact("path", if (locked == relaySocketAddr()) "relay" else "direct")
+                        crypto.peerIdentity?.let { onPeerIdentity?.invoke(it) }
                         onState?.invoke("encrypted")
                     }
+                    is Crypto.Adopt.Unchanged -> { if (locked == null) locked = pkt.socketAddress as InetSocketAddress }
+                    is Crypto.Adopt.Refused -> android.util.Log.i("kin", "rx: handshake refused (${a.why}) from ${pkt.socketAddress}")
                 }
+                continue
+            }
+            // Before a key exists NOTHING else is read: there is no plaintext
+            // window. After it, a datagram that fails to open is not dispatched.
+            if (!crypto.established) { crypto.notePlaintextRx(); continue }
+            // `b`, NOT `buf`: a relayed datagram has already been unwrapped
+            // out of its 4-byte channel header, and decrypting from offset 0
+            // would feed the header to AES-GCM.
+            val opened = crypto.open(b.copyOf(n))
+            if (opened == null) {
+                // A recognised magic in the clear while a key exists: an old
+                // build on the far end, or someone probing. Counted, never used.
+                if (magic == Wire.MAGIC || magic == Wire.VMAGIC || magic == Wire.TMAGIC ||
+                    magic == Wire.KMAGIC || magic == Wire.SMAGIC || magic == Wire.BMAGIC) crypto.notePlaintextRx()
+                continue
+            }
+            System.arraycopy(opened, 0, plainBuf, 0, opened.size)
+            b = plainBuf; n = opened.size
+            magic = Wire.magic(b, n)
+            when (magic) {
                 Wire.TMAGIC -> {
                     val t4 = KinClock.now()
                     val p = Wire.parseT(b, n) ?: continue

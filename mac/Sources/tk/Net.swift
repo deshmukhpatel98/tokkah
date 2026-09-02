@@ -381,16 +381,14 @@ final class Wire {
   /// worth anything to a listener on its own.
   func sendHandshake() {
     guard let c = crypto else { return }
-    var out = [UInt8](repeating: 0, count: HPKTX)
-    out.withUnsafeMutableBytes { p in
-      p.storeBytes(of: HMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
-    }
-    c.myPublic.copyBytes(to: &out[4], count: 32)
-    out.withUnsafeMutableBytes { p in
-      p.storeBytes(of: Wire.myCaps.littleEndian, toByteOffset: HPKT, as: UInt32.self)
-    }
+    // Signed once and cached inside Crypto; this is a 136-byte copy per beat.
+    let out = c.handshakePacket(caps: Wire.myCaps)
     out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
   }
+  /// Fired on the receive thread when a NEW, verified identity keyed the call.
+  /// The argument is the peer's Ed25519 identity, base64 -- what contacts.json
+  /// stores. main.swift pins it under the handle this call is with.
+  var onPeerIdentity: ((String) -> Void)?
   /// Float in [-1,1] to signed 16-bit. Clamped, because a microphone CAN exceed
   /// full scale and a wrapped sample is a click at full amplitude. 32767 both ways
   /// so the round trip is exact rather than off by one part in 32768.
@@ -622,21 +620,12 @@ final class Wire {
       cryptSendFails += 1
       return
     }
-    // No key yet. Plaintext is permitted only in this window, and it is counted
-    // so that a call which never encrypts cannot look like one that did.
-    crypto?.notePlaintextTx()
-    if let im = impair, im.enabled {
-      if im.shouldDrop(bytes: n) { return }
-      if im.capacityQueue, im.capacityMbps > 0 {
-        guard let waitMs = im.queueDelayMs(n) else { return }
-        if waitMs > 0.05, let q = delayQ {
-          q.push(p, n, due: Clock.now() + Clock.ticks(ns: UInt64(waitMs * 1_000_000))); return
-        }
-      }
-      let d = im.delayTicks()
-      if d > 0, let q = delayQ { q.push(p, n, due: Clock.now() + d); return }
-    }
-    wireSend(p, n)
+    // No key yet. NOTHING goes out in the clear -- not audio, not video, not a
+    // clock probe. v1 sent plaintext here "until the handshake completed", which
+    // was a downgrade an attacker could hold open by dropping 136-byte packets.
+    // Dropped and counted; the handshake has its own path (`sendHandshake`).
+    crypto?.notePreKeyDrop()
+    return
   }
 
   private(set) var cryptSendFails = 0
@@ -1233,6 +1222,13 @@ final class Wire {
     adoptFrom(from)
   }
 
+  static func describe(_ from: sockaddr_in) -> String {
+    var ipb = [CChar](repeating: 0, count: 64)
+    var f = from
+    inet_ntop(AF_INET, &f.sin_addr, &ipb, 64)
+    return "\(String(cString: ipb)):\(UInt16(bigEndian: from.sin_port))"
+  }
+
   /// The same move without the "only once" guard, for the one caller that has
   /// already established the lock is pointing somewhere the far end is not
   /// sending from. Kept as a separate entry point rather than relaxing `adopt`,
@@ -1451,34 +1447,42 @@ final class Wire {
       // THE HANDSHAKE, and it is the one thing never encrypted -- it is what
       // creates the key. Answered from this thread so the exchange completes in
       // one round trip.
-      if magic == HMAGIC, Int(n) >= HPKT {
-        if !locked { adopt(src) }
-        if Int(n) >= HPKTX {
-          let c2 = (buf + HPKT).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+      //
+      // An UNSIGNED (v1) handshake is refused and counted: the far end is a build
+      // from before the handshake was signed, and connecting to it would mean
+      // accepting a key nobody vouched for. The beat says `hs_old`, the summary
+      // says "old build", and the call keys the moment they update.
+      if magic == HMAGIC {
+        crypto?.noteOldHandshake()
+        continue
+      }
+      if magic == Crypto.HS_MAGIC, Int(n) >= Crypto.HS_LEN {
+        guard let c = crypto else { continue }
+        // REPLY ONLY WHEN THE KEY WAS NEW. The previous version replied to every
+        // handshake it received, and so did the peer, so a reply provoked a
+        // reply: on loopback that ran at about ten thousand round trips a second.
+        // Liveness does not need the echo. Both ends beat a handshake on a timer
+        // -- fast while unkeyed, every 5 s after -- so a peer that restarts with
+        // a fresh key is adopted on its next beat, that adoption IS a change, and
+        // the single reply that follows completes the exchange in one round trip.
+        switch c.adoptHandshake(buf, Int(n)) {
+        case .adopted:
+          // The address is adopted only from a VERIFIED handshake. Before this,
+          // the first 36 bytes with the right magic pointed the media anywhere.
+          if !locked { adopt(src) }
+          let c2 = Crypto.caps(of: buf, Int(n))
           if c2 != peerCaps {
             peerCaps = c2
             fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\(c2 & CAP_PCM_LP != 0 ? ", lossless-compressed" : "")\n", stderr)
           }
-        }
-        if let c = crypto {
-          // REPLY ONLY WHEN THE KEY WAS NEW. The previous version replied to every
-          // handshake it received, and so did the peer, so a reply provoked a
-          // reply: on loopback that ran at about ten thousand round trips a second
-          // -- 20,000 packets/s sent against 758 captured, 36 bytes each, roughly
-          // 6 Mbps of pure echo per direction. It cost nothing measurable on
-          // loopback, where bandwidth is free and latency stayed at 17 ms, and it
-          // would have swamped the real link between two houses. It shipped in
-          // 0.9.0 and 0.9.1.
-          //
-          // Liveness does not need the echo. Both ends beat a handshake on a timer
-          // -- fast while unkeyed, every 5 s after -- so a peer that restarts with
-          // a fresh key is adopted on its next beat, that adoption IS a change, and
-          // the single reply that follows completes the exchange in one round trip.
-          if c.adoptPeer(Data(bytes: buf + 4, count: 32)) {
-            fputs("crypto: \(c.summary)\n", stderr)
-            sendHandshake()
-            handshakeReplies += 1
-          }
+          fputs("crypto: \(c.summary)\n", stderr)
+          sendHandshake()
+          handshakeReplies += 1
+          if let k = c.peerIdentityB64 { onPeerIdentity?(k) }
+        case .unchanged:
+          if !locked { adopt(src) }
+        case .refused(let why):
+          fputs("crypto: handshake refused (\(why)) from \(Wire.describe(src))\n", stderr)
         }
         continue
       }
@@ -1486,21 +1490,24 @@ final class Wire {
       // Decrypt, then treat the PLAINTEXT as the packet. A datagram that fails to
       // decrypt is not dispatched at all: accepting it as plaintext would let
       // anyone who can reach the port inject audio into a call that believes
-      // itself encrypted.
+      // itself encrypted. And before a key exists NOTHING is dispatched: there is
+      // no plaintext window any more.
       var plain: UnsafeMutablePointer<UInt8> = buf
       var plainN = Int(n)
-      if let c = crypto, c.established {
-        if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
-          // A recognised magic in the clear while a key exists: an old build on
-          // the far end, or someone probing. Counted, never used.
-          c.notePlaintextRx()
-          continue
-        }
-        guard let m = c.open(buf, Int(n), into: dbuf) else { continue }
-        plain = dbuf
-        plainN = m
-        magic = dbuf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+      guard let c = crypto, c.established else {
+        crypto?.notePlaintextRx()
+        continue
       }
+      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC || magic == BMAGIC {
+        // A recognised magic in the clear while a key exists: an old build on
+        // the far end, or someone probing. Counted, never used.
+        c.notePlaintextRx()
+        continue
+      }
+      guard let m = c.open(buf, Int(n), into: dbuf) else { continue }
+      plain = dbuf
+      plainN = m
+      magic = dbuf.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
 
       // ── A GOODBYE IS NOT EVIDENCE OF LIFE ─────────────────────────────────
       //

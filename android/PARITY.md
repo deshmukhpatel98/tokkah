@@ -59,6 +59,7 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | peer video paused: blurred last frame + poster | dimmed frame + 'Reconnecting…' poster (a SurfaceView cannot be blurred without its latency) | ✅ 0.126.16 |
 | Share Invite… (system share) | long-press the invite row → share sheet | ✅ 0.126.16 |
 | a crash is booked with the fleet (Crash.swift) | uncaught exception written to disk, posted on the next launch under the route's fields | ✅ 0.126.15 |
+| signed media handshake (Ed25519 over X25519, room in the signed message), expected identity from the ring / server / contacts, no plaintext window, 2048-packet replay window, `hs_*` + `crypt_v` + `crypt_pinned` in the beat; refuses the unsigned 0.127 handshake as `hs_old` | same class, bit-exact against the Mac's vectors (CryptoTest, 12 arms); platform Ed25519/X25519 first, own arithmetic counted as `ed25519_fallback`/`x25519_fallback` | ✅ 0.128.19 |
 | more sheet: Your name (copy) · People · Change your name · Camera/Microphone/Speaker · Calls when Kin is closed (switch) · Silent (switch) · Encryption code + hint · Version (press = check; "Update ready"/restart) · Licence + hint | same; Microphone is a fact (Android picks it with the route) | ✅ 0.126.12 |
 | People page: faces, mine + copy, "Call someone new" while waiting, Back | same | ✅ 0.126.12 |
 | Rename page: field pre-filled and selected, Save this name / Not now, rule sentence | same | ✅ 0.126.12 |

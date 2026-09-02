@@ -2176,7 +2176,7 @@ enum Launcher {
       // room would send its "can't talk" bye to somebody from a previous call.
       // The answer path passes it explicitly in `extra`, which is not filtered.
       if t == "--gui" || t == "--call" || t == "--incoming" || t == "--calling"
-        || t == "--with" || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
+        || t == "--with" || t == "--peer-key" || t == "--press" || t == "--press-after" || seen.contains(t) { continue }
       seen.insert(t)
       args.append(t)
       if let v = value { args.append(v) }

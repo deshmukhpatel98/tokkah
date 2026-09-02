@@ -1145,12 +1145,23 @@ enum Identity {
     // is deliberately not the same as false. nil here means "no idea", and no
     // idea must never be shown to anybody as "they are offline".
     lastRingListening = nil
+    lastRingPeerKey = nil
     if let d = payload.data(using: .utf8),
-       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-       let live = o["listening"] as? Bool {
-      lastRingListening = live
-      if !live {
-        fputs("\(noun): @\(to) has not been heard from -- their Mac is not listening\n", stderr)
+       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+      if let live = o["listening"] as? Bool {
+        lastRingListening = live
+        if !live {
+          fputs("\(noun): @\(to) has not been heard from -- their Mac is not listening\n", stderr)
+        }
+      }
+      // The identity key the server bound @to to at registration. Shape-checked
+      // here and REQUIRED of the handshake by the image that joins the room, so a
+      // first call to somebody is authenticated against the key that claimed
+      // their name rather than trusted on first use. A key that the server made
+      // up would be a server that could also have handed out the name; the pin
+      // in contacts.json after the call is what makes that a one-shot.
+      if kind == nil, let k = o["k"] as? String, let raw = Data(base64Encoded: k), raw.count == 32 {
+        lastRingPeerKey = k
       }
     }
     fputs("\(noun): @\(to) in room \(room)\n", stderr)
@@ -1161,6 +1172,9 @@ enum Identity {
   /// no basis to say. Read once, right after the call that set it; this is a
   /// report on one ring, not a standing fact about a person.
   nonisolated(unsafe) static var lastRingListening: Bool?
+  /// The callee's registered identity key (base64) from the last `ring()`, or nil
+  /// when the server did not say. Read once, right after the call that set it.
+  nonisolated(unsafe) static var lastRingPeerKey: String?
 
   // ── AN EMPTY MAILBOX AND A DEAD NETWORK ARE THE SAME RETURN VALUE ──────────
   //

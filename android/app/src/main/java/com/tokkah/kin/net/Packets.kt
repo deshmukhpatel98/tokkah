@@ -8,9 +8,10 @@ object Wire {
     const val FPP = 32
     const val RING = 2048
     const val HDR = 20                    // magic(4) seq(4) capHost(8) tag(4)   Net.swift:25
-    const val HMAGIC = 0x544B_0006        // key handshake — the only packet in the clear
-    const val HPKT = 4 + 32
-    const val HPKTX = HPKT + 4            // + capability bits                    Net.swift:34
+    // The UNSIGNED v1 handshake. Never sent, refused on arrival and counted
+    // (`hs_old`): a build still sending it is the only thing this magic means.
+    // The signed handshake lives in Crypto (HS_MAGIC 0x544B_0009, 136 bytes).
+    const val HMAGIC = 0x544B_0006
     const val CAP_PCM16 = 1
     const val CAP_PCM_LP = 2
     const val MAGIC = 0x544B_0001         // audio
@@ -66,22 +67,6 @@ object Wire {
     }
 
     fun magic(b: ByteArray, n: Int): Int = if (n >= 4) u32(b, 0) else 0
-
-    // ── handshake ────────────────────────────────────────────────────────────
-    fun handshake(myPublic: ByteArray, caps: Int = CAP_PCM16 or CAP_PCM_LP): ByteArray {
-        val out = ByteArray(HPKTX)
-        putU32(out, 0, HMAGIC)
-        System.arraycopy(myPublic, 0, out, 4, 32)
-        putU32(out, HPKT, caps)
-        return out
-    }
-    /** Returns (peerKey, caps) or null. Old builds send HPKT bytes: caps read as 0. */
-    fun parseHandshake(b: ByteArray, n: Int): Pair<ByteArray, Int>? {
-        if (n < HPKT || u32(b, 0) != HMAGIC) return null
-        val key = b.copyOfRange(4, 36)
-        val caps = if (n >= HPKTX) u32(b, HPKT) else 0
-        return key to caps
-    }
 
     // ── audio ────────────────────────────────────────────────────────────────
     // Header: magic seq capHost tag; payload per format. Redundant block rides

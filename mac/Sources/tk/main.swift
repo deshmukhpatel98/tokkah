@@ -525,7 +525,7 @@ let KNOWN_FLAGS: Set<String> = [
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
   "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
-  "mute", "no-crypt", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
+  "mute", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
@@ -533,7 +533,7 @@ let KNOWN_FLAGS: Set<String> = [
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
-  "no-ring-preview", "incoming-key", "with",
+  "no-ring-preview", "incoming-key", "with", "peer-key", "selftest-crypto", "crypto-vectors",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "in-process", "no-in-process", "launch-path",
   "callee-away",
@@ -1077,6 +1077,7 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
       Args.decide("room", room)
       Args.decide("calling", who)
       if away { Args.decide("callee-away", nil) }
+      if let k = Identity.lastRingPeerKey { Args.decide("peer-key", k) }
     case .resume(let live):
       // The re-exec path, even here: a resumed call needs its port, its peer's
       // last address and its chain field back, and those arrive as argv from
@@ -1118,6 +1119,7 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
       // Only an explicit false changes a word on screen. nil means the server had
       // no basis to say, which is NOT the same as "they are away".
       if away { extra.append("--callee-away") }
+      if let k = Identity.lastRingPeerKey { extra += ["--peer-key", k] }
       Launcher.reexec(room: room, extra: extra, why: "called @" + who)
     case .resume(let live):
       // Same as the in-process arm above: a rejoin is a re-exec either way,
@@ -1370,6 +1372,9 @@ if flag("resumed"), let p = Resume.rememberedPath() {
 // that would have switched it off had not been reached yet. Same ordering fault
 // as the crash above it: the window can act before the setup below it exists.
 if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
+// The id every beat of this process carries. Said once so a rig -- or a person
+// with two logs and a dashboard -- can find THIS process's beats by name.
+else { fputs("telemetry: call \(Telemetry.call)\n", stderr) }
 // One control, both routes. Setting only `endpoint` would have left a rig's
 // crash reports going to the production server while its beats went to a local
 // sink -- one flag answering one question, unlike the two this project has
@@ -2795,6 +2800,9 @@ display?.controls?.onCall = { who in
       // NEXT process, so the news has to travel with it.
       var extra = ["--video", "camera", "--window", "--calling", who]
       if listening == false { extra.append("--callee-away") }
+      // The key the server bound @who to when they claimed the name. The
+      // handshake must come from it; a first call is no longer first use.
+      if let k = Identity.lastRingPeerKey { extra += ["--peer-key", k] }
       Launcher.reexec(room: got, extra: extra, why: "call placed")
     }
   }.start()
@@ -2845,8 +2853,12 @@ display?.controls?.onAnswerRing = {
   // sat on "Calling…" until the no-answer timeout. Measured live, call
   // 244yp0liz2dio: answered at 13:57:14, closed at 13:57:15, caller deaf for
   // two minutes. A name is a property of the room, not an event.
-  Launcher.reexec(room: o.room, extra: ["--with", o.from, "--video", "camera", "--window"],
-                  why: "ring answered")
+  // And the key that signed the ring, so the answered image REQUIRES the
+  // handshake to come from it. Without this the call would key on first use
+  // against whoever knew the room -- which the server does.
+  var answerExtra = ["--with", o.from, "--video", "camera", "--window"]
+  if !o.k.isEmpty { answerExtra += ["--peer-key", o.k] }
+  Launcher.reexec(room: o.room, extra: answerExtra, why: "ring answered")
 }
 // Cancelling a call nobody has answered yet. `onLeave` still exists and still
 // just leaves; this one exists because there is a person on the other end whose
@@ -5328,6 +5340,13 @@ if let path = arg("vpsnr") {
   exit(compared > 0 ? 0 : 1)
 }
 
+if flag("selftest-crypto") || arg("crypto-vectors") != nil {
+  fputs("crypto selftest:\n", stderr)
+  let ok = Crypto.selftest(vectorsTo: arg("crypto-vectors"))
+  fputs(ok ? "crypto selftest: PASS\n" : "crypto selftest: FAIL\n", stderr)
+  exit(ok ? 0 : 1)
+}
+
 if let path = arg("selftest-lpc") {
   var fail = 0, packets = 0, inBytes = 0, outBytes = 0
   var raws = 0
@@ -5986,9 +6005,45 @@ if impair.enabled {
 // you look for the peer" the same act -- which is also what made the first
 // mismatched-key test measure nothing.
 let cryptoSalt = arg("secret") ?? arg("room") ?? ""
-let crypto: Crypto? = flag("no-crypt") ? nil : Crypto(roomSalt: cryptoSalt)
+// ── WHO THE OTHER END MUST BE ───────────────────────────────────────────────
+//
+// The identity key the handshake has to present, when this end has any basis to
+// expect one. In order:
+//   --peer-key       carried through the re-exec by the answer path (the key that
+//                    signed the ring) and by the calling path (the key the server
+//                    bound the handle to at registration, returned with the ring);
+//   --incoming-key   the pre-answer image of a ring, same key, older spelling;
+//   contacts.json    the key pinned the last time this handle was on a call.
+// None of them (an invite link, a first call): first use, pinned for the call,
+// and remembered under the handle once the call is answered.
+let peerHandle: String? = arg("with") ?? arg("calling") ?? arg("incoming")
+let expectedPeerKey: Data? = {
+  if let k = arg("peer-key") ?? arg("incoming-key"), let d = Data(base64Encoded: k), d.count == 32 { return d }
+  if let who = peerHandle, let k = Identity.contacts()[who], let d = Data(base64Encoded: k), d.count == 32 { return d }
+  return nil
+}()
+// Always on. There is no flag to turn this off: a consumer product with a
+// switch that sends calls in the clear is a product that will one day be run
+// with that switch on. (`--no-crypt` is now refused as an unknown flag.)
+let crypto: Crypto? = Crypto(roomSalt: cryptoSalt, identitySeed: Identity.ensure().seed,
+                             expectedPeer: expectedPeerKey)
 if let c = crypto {
   wire.crypto = c
+  // Both public. The rigs read this end's identity off the log to hand the other
+  // end an expectation; the expectation line is what a "why did it never key"
+  // report is answered from.
+  fputs("crypto: my identity \(c.myIdentity.base64EncodedString()), expecting "
+        + (expectedPeerKey == nil ? "no particular identity (first use)"
+           : "the identity of @\(peerHandle ?? "?") (\(expectedPeerKey!.base64EncodedString().prefix(12))…)") + "\n", stderr)
+  // The far end proved an identity and keyed the call. Pin it under the handle
+  // this call is WITH -- answered (`--with`) or placed (`--calling`) -- so the
+  // next call in either direction expects it. Not for `--incoming`: that image
+  // is a card nobody has accepted yet, and a name must not be bound to a key
+  // before the person says yes.
+  wire.onPeerIdentity = { k in
+    guard let who = arg("with") ?? arg("calling"), !who.isEmpty else { return }
+    Identity.remember(handle: who, key: k)
+  }
   Thread {
     // Fast until a key exists, then slow. The slow beat is not idle chatter: it
     // is how a peer that restarts with a fresh key gets re-keyed without anyone
@@ -5998,8 +6053,6 @@ if let c = crypto {
       Thread.sleep(forTimeInterval: c.established ? 5.0 : 0.25)
     }
   }.start()
-} else {
-  fputs("crypto: DISABLED by --no-crypt -- audio and video go out in the clear\n", stderr)
 }
 
 // Clock sync, before the receive loop exists to answer probes.
@@ -7086,7 +7139,7 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   if let v = r.slack.p(0.01) { f["slack_p01"] = v }
   if let v = tsync.bestRttMs { f["rtt_ms"] = v }
   if let v = tsync.rttSpreadMs { f["rtt_jit_ms"] = v }
-  if let c = crypto { f["crypt"] = c.established ? 1 : 0; f["crypt_bad"] = c.openFails }
+  if let c = crypto { c.beatFields(into: &f) }
   if let v = vg2g.p(0.50) { f["g2g_p50"] = v }
   if let v = vg2g.p(0.95) { f["g2g_p95"] = v }
   if vDecoded > 0 { f["v_decoded"] = vDecoded; f["v_sent"] = vSentFrames }
@@ -7147,8 +7200,9 @@ func reportLoop() {
       + " (\(tsync.samples) probes)"
       + (crypto.map { c in c.established
            ? "  crypt on (\(c.sealed)/\(c.opened) sealed/opened, \(c.openFails) bad"
-             + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "") + ")"
-           : "  CRYPT PENDING (plaintext \(c.plaintextTx) sent)" } ?? "  crypt off")
+             + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "")
+             + (c.replayDrops > 0 ? ", \(c.replayDrops) replays refused" : "") + ")"
+           : "  NO KEY (\(c.preKeyDrops) dropped unsent" + (c.hsOld > 0 ? ", other end on an OLD BUILD" : "") + ")" } ?? "  crypt off")
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)

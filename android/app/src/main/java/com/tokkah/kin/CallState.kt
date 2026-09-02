@@ -59,7 +59,8 @@ class KinState(
 
     var onChanged: (() -> Unit)? = null
     /** Somebody answered, or we answered: go to the call in this room. */
-    var onCall: ((room: String, who: String) -> Unit)? = null
+    /** [key] is the identity the call's handshake must present (base64), or null. */
+    var onCall: ((room: String, who: String, key: String?) -> Unit)? = null
 
     private var ringTimeoutAt = 0L
 
@@ -495,7 +496,9 @@ class KinState(
             identity.noteCallTime(handle)
             // Join our own end immediately: the call exists from here on, and
             // their answering is them arriving in it.
-            onCall?.invoke(room, handle)
+            // The key the server bound @handle to at registration, returned with
+            // the ring; the pinned key from a previous call otherwise.
+            onCall?.invoke(room, handle, identity.lastRingPeerKey ?: identity.contacts()[handle])
             while (outgoingTo == handle && System.currentTimeMillis() < ringTimeoutAt) {
                 Thread.sleep(250)
             }
@@ -533,8 +536,11 @@ class KinState(
         cardMode = CallCardMode.INVITE
         identity.rememberCalled(r.from)
         identity.noteCallTime(r.from)
+        // Bind the name to the key that rang -- on ANSWER, not on arrival, or
+        // anyone who rings once would own the name (Identity.swift `remember`).
+        if (r.k.isNotEmpty()) identity.remember(r.from, r.k)
         onChanged?.invoke()
-        onCall?.invoke(r.room, r.from)
+        onCall?.invoke(r.room, r.from, r.k.ifEmpty { null })
     }
 
     /** A decline is a signed `bye`, not silence. */

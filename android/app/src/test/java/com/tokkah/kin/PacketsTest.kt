@@ -22,27 +22,25 @@ class PacketsTest {
         assertEquals(32, Wire.TPKT)
         assertEquals(40, Wire.TPKTX)
         assertEquals(48, Wire.TPKTY)
-        assertEquals(36, Wire.HPKT)
-        assertEquals(40, Wire.HPKTX)
+        assertEquals(0x544B0009, com.tokkah.kin.net.Crypto.HS_MAGIC)
+        assertEquals(136, com.tokkah.kin.net.Crypto.HS_LEN)
     }
 
     @Test
-    fun handshakeRoundtrip() {
-        val key = ByteArray(32) { it.toByte() }
-        val pkt = Wire.handshake(key)
-        assertEquals(Wire.HPKTX, pkt.size)
-        // Little-endian magic on the wire: 06 00 4B 54 (Net.swift:386).
-        assertEquals(0x06, pkt[0].toInt())
+    fun signedHandshakeLayout() {
+        val c = com.tokkah.kin.net.Crypto("room-x", ByteArray(32) { 7 })
+        val pkt = c.handshakePacket(Wire.CAP_PCM16 or Wire.CAP_PCM_LP)
+        assertEquals(com.tokkah.kin.net.Crypto.HS_LEN, pkt.size)
+        // Little-endian magic on the wire: 09 00 4B 54.
+        assertEquals(0x09, pkt[0].toInt())
         assertEquals(0x00, pkt[1].toInt())
         assertEquals(0x4B, pkt[2].toInt())
         assertEquals(0x54, pkt[3].toInt())
-        val (k, caps) = Wire.parseHandshake(pkt, pkt.size)!!
-        assertTrue(k.contentEquals(key))
-        assertEquals(Wire.CAP_PCM16 or Wire.CAP_PCM_LP, caps)
-        // An old build's 36-byte handshake parses with caps 0.
-        val (k2, caps2) = Wire.parseHandshake(pkt, Wire.HPKT)!!
-        assertTrue(k2.contentEquals(key))
-        assertEquals(0, caps2)
+        assertTrue(pkt.copyOfRange(4, 36).contentEquals(c.myPublic))
+        assertEquals(Wire.CAP_PCM16 or Wire.CAP_PCM_LP, com.tokkah.kin.net.Crypto.capsOf(pkt, pkt.size))
+        assertTrue(pkt.copyOfRange(40, 72).contentEquals(c.myIdentity))
+        // A same-key beat is the cached packet, byte for byte.
+        assertTrue(pkt.contentEquals(c.handshakePacket(Wire.CAP_PCM16 or Wire.CAP_PCM_LP)))
     }
 
     @Test

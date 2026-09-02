@@ -2244,7 +2244,16 @@ const DEV2 = await device('dev2');
       const s = await hit(`ring ${i + 1}: -> SILENT handle`, 'POST', `/api/kin/${SILENT}/ring`, mk(SILENT));
       const a = await hit(`ring ${i + 1}: -> ABSENT handle`, 'POST', `/api/kin/${ABSENT}/ring`, mk(ABSENT));
       eq(s.status, a.status, `(k2) ring ${i + 1}: same status`);
-      eq(s.txt, a.txt, `(k2) ring ${i + 1}: BYTE-IDENTICAL body (${s.txt})`);
+      // Since the signed media handshake, an accepted ring to a REGISTERED handle
+      // carries `k`, the key that claimed the name, so the caller can require the
+      // call's handshake to come from it. A never-registered handle has no key
+      // and cannot carry one. That difference says only "registered", which
+      // /api/kin/presence already says to anyone who asks -- so the invariant
+      // here is: identical except for `k`, and `k` is exactly the stored key.
+      const strip = (t) => JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(t)).filter(([k]) => k !== 'k')));
+      eq(strip(s.txt), strip(a.txt), `(k2) ring ${i + 1}: BYTE-IDENTICAL body apart from \`k\` (${s.txt})`);
+      eq(s.body.k, S1.k, `(k2) ring ${i + 1}: the silent handle's answer carries the key that claimed it`);
+      eq(a.body.k, undefined, `(k2) ring ${i + 1}: a never-registered handle has no key to carry`);
       eq(s.ctype, a.ctype, `(k2) ring ${i + 1}: same content-type`);
       eq(s.body.queued, i + 1, `(k2) ring ${i + 1}: and \`queued\` really climbed to ${i + 1} on BOTH — the fabricated-body implementation reads 1,1 here`);
     }

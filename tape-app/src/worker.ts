@@ -398,7 +398,22 @@ export class Room implements DurableObject {
     // out of the silence switch. This line is also completely invisible to the
     // caller: the response was already decided above.
     if (d.status === 200 && !d.muted) this.kinWake(to);
-    return json(d.body, d.status);
+    // ── THE KEY THAT CLAIMED THIS NAME ────────────────────────────────────────
+    //
+    // Handed back to the CALLER with an accepted ring, so the image that joins
+    // the room can require the media handshake to come from it. Until now the
+    // caller had no basis to expect any identity on a first call and keyed on
+    // first use -- against whoever knew the room, which includes this server.
+    // This is the key `kinRegisterDecide` bound on first claim and never let
+    // change; the callee already proves possession of it every time it polls.
+    // A server that lied here could also have handed out the name, and the
+    // client pins what it saw into contacts.json after the call, so a lie is a
+    // one-shot rather than a standing position.
+    // Loaded unconditionally (cached after the first), so an accepted and a
+    // refused ring cost the same read.
+    const k = await this.kinKeyLoad();
+    const body = d.status === 200 && k ? { ...(d.body as Record<string, unknown>), k } : d.body;
+    return json(body, d.status);
   }
 
   // ── IS ANYBODY LISTENING FOR THIS HANDLE, RIGHT NOW ─────────────────────────

@@ -166,7 +166,7 @@ numbers are and are not, and it matters more than any single figure in them.
 | Mouth to ear | **9.23 ms**, fully attributed with 0.08 ms unaccounted: `cap→send 1.67 · recv→play 3.01 · mic 1.88 · spk 2.58`. **4.46 ms of that 9.23 is the microphone and the speaker** — hardware nobody can optimise | [DESIGN.md](DESIGN.md) §17.108 |
 | Audio format | 48 kHz **16-bit PCM, losslessly compressed 2.6×** by fixed-order prediction + Rice coding (the FLAC/Shorten subset, no lookahead, so it costs no latency by construction): **1.16 Mbps** each way, was 1.64 uncompressed. 137,005 packets round-tripped with **0 mismatches** | [`mac/Sources/tk/Lpc.swift`](mac/Sources/tk/Lpc.swift), `tk --selftest-lpc` |
 | Packet cadence | 32 samples per packet = **0.667 ms** of audio per datagram, 1511 packets/s. One UDP socket carries audio and video, so there is one port and one hole to punch | [`mac/Sources/tk/Net.swift`](mac/Sources/tk/Net.swift) |
-| Encryption costs nothing | X25519 + AES-256-GCM per packet: **0.78 µs** to seal 276 bytes, worst of 300,000 at 15 µs, against a 1333 µs deadline — 0.06% typical | [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift) |
+| Encryption costs nothing | X25519 + AES-256-GCM per packet, handshake signed by the device key, replay window: **0.78 µs** to seal 276 bytes, worst of 300,000 at 15 µs, against a 1333 µs deadline — 0.06% typical | [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift) |
 | Your voice is untouched | duplex gate: **19.3 dB** of attenuation while only the far end is talking, **0.0001%** worst-sample difference while you talk — bit-for-bit | `tk --gate-test` |
 | Video | H.264 High through VideoToolbox: **45.5 dB PSNR at ~1.19 Mbps, 30 fps sustained**. Glass-to-glass **~34.8 ms** in the shipping default (5.6 ms capture→decoded, 29.2 ms decoded→glass) | [DESIGN.md](DESIGN.md), [`mac/Sources/tk/Video.swift`](mac/Sources/tk/Video.swift) |
 | Loss repair | a second copy of each packet, offset in time: **94.8% recovered at 1% uniform loss for 1.2 ms** of added buffer — and it switches itself off under bursts, where it does not work | [DESIGN.md](DESIGN.md) §17.86 |
@@ -270,13 +270,15 @@ Named here rather than discovered later:
 - **No real two-machine latency measurement.** Every media figure above is
   loopback or injected impairment (see
   [What these numbers are not](#what-these-numbers-are-not)).
-- **An active man in the middle who knows the room code is not defeated.** The
-  room code is mixed into key derivation and travels out of band, so it
-  authenticates the exchange against anyone who does not have it — but fixing the
-  case where they do needs identity that outlives a call, which does not exist
-  here yet. This is written out in full at the top of
-  [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift), and the app shows
-  an eight-character code the two of you can read aloud.
+- **A first call between two strangers, through a server that also lies about
+  their keys, is the one man-in-the-middle case left.** The media handshake is
+  signed by each install's device key and checked against the key that rang, the
+  key the server bound the name to, or the key pinned from the last call — so a
+  substituted key is refused, not merely detectable, everywhere an expectation
+  exists. Where none does (an invite link, a first call), the eight-character
+  code the two of you can read aloud is the check, and the pin written after
+  that call closes the window. Written out in full at the top of
+  [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift).
 - **The window is invisible to accessibility tooling.** Kin reports zero
   accessibility elements, so screen readers and window automation cannot see it
   ([LAUNCH.md](LAUNCH.md)). That is a real defect, not a design choice.

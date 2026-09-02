@@ -38,9 +38,10 @@ signing and rendezvous design. Reports about the retired browser client in
 
 Out of scope: anything requiring physical access to an unlocked Mac; the
 one-time Gatekeeper prompt (there is no Apple Developer ID, by decision — see
-the README); and the man-in-the-middle case named as unfixed in
-[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift), which is already
-documented rather than unknown.
+the README); and the one residual named at the top of
+[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift) -- a first call
+between two strangers through a server that also lies about their keys -- which
+is documented, visible in the safety code, and closed by the pin after that call.
 
 ---
 
@@ -52,15 +53,35 @@ because it is accurate about the browser client, which is still in the
 repository, and because its final section is a list of things that are *not* yet
 true — a security document that only lists strengths is marketing.
 
-**The Mac app has a different trust model and it is documented in the source
-rather than here.** In short: X25519 + AES-256-GCM per packet over raw UDP, two
-keys (one per direction), the room code mixed into key derivation so it
-authenticates the exchange, and an eight-character code the two people can read
-aloud. What it explicitly does **not** defeat is an active man in the middle who
-already knows the room code — fixing that needs identity that outlives a call,
-which does not exist yet. The precise statement, including what happens while a
-handshake is outstanding, is at the top of
-[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift).
+**The Mac and Android apps have a different trust model and it is documented in
+the source rather than here.** Since Kin 0.128.0 / 0.128.0-android.19:
+
+- **X25519 + AES-256-GCM per packet over raw UDP, two keys (one per direction),
+  a sliding replay window** of 2048 packets. Nothing is read or written before a
+  key exists: there is no plaintext window.
+- **The handshake is signed by each install's Ed25519 device key** -- the same
+  key that already signs and verifies every ring -- over a message that names the
+  room. A handshake is refused unless the signature verifies, AND the identity is
+  the one this end expected: the key that signed the ring (callee), the key the
+  server bound the handle to at registration and returns with the ring (caller),
+  or the key pinned in `contacts.json` from a previous call. With no expectation
+  (an invite link, a first call to a stranger) the first identity is pinned for
+  the call, and remembered under the handle once the call is answered.
+- **What the signalling server can and cannot do.** It still sees who calls whom
+  and when. It can no longer read or alter a call, and it can no longer sit in
+  the middle of one between two people who have called each other before, or of
+  a Kin-to-Kin call at all unless it also lied about the callee's key on the very
+  first call -- in which case the two eight-character codes differ, and the pin
+  written after that call makes it a one-shot. The precise statement, including
+  every counter the beat carries for a refused handshake, is at the top of
+  [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift); the Android port
+  is [`android/app/src/main/java/com/tokkah/kin/net/Crypto.kt`](android/app/src/main/java/com/tokkah/kin/net/Crypto.kt)
+  and is held to the Mac's own vectors.
+- **Measured, not asserted:** `tk --selftest-crypto` (18 arms, including the
+  inputs that must be refused) and [`mac/tools/crypto-check.sh`](mac/tools/crypto-check.sh),
+  which runs two real processes and proves an end that expects a different
+  identity never keys, seals nothing and sends nothing, and that a build still
+  sending the unsigned 0.127 handshake is refused and named as old.
 
 ---
 
