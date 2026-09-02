@@ -70,6 +70,13 @@ class MainActivity : ComponentActivity() {
             intent?.getStringExtra(k)?.let { rigFlags[k] = it == "1" || it == "true" }
         }
         RingService.channels(this)
+        // An unexplained death is a bug, and one nobody is told about is not
+        // even that: book the last run's death, then arm the handler for this one.
+        val kinDir = filesDir.resolve("kin")
+        val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName ?: "0" }.getOrDefault("0")
+        Thread { runCatching { com.tokkah.kin.net.Crash.reportPrevious(kinDir, com.tokkah.kin.net.Telemetry(kinDir)) } }
+            .apply { isDaemon = true }.start()
+        com.tokkah.kin.net.Crash.arm(kinDir, ver)
         setContent { KinApp(deep, if (fromRing != null) ringWho else "") }
     }
 }
@@ -430,6 +437,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             var peeking by remember { mutableStateOf(false) }
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
+            var loud by remember { mutableStateOf(0f) }
             var caption by remember { mutableStateOf<String?>(null) }
             var bloom by remember { mutableStateOf<String?>(null) }
             var cueLevel by remember { mutableStateOf(0f) }
@@ -517,6 +525,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     noPicture = if (here && pCam) (if (pMuted) "Camera and microphone off" else "Camera off") else null
                     turn = s.floor.state
                     voicing = s.gate.voicingNow
+                    loud = s.gate.nearLoudNow
                     cueLevel = s.cue.level
                     // The words cross exactly while the voice cannot: muted by
                     // hand, or muted by the floor because it is not your turn.
@@ -707,6 +716,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     turnMine = turn == Floor.State.MINE,
                     turnTheirs = turn == Floor.State.THEIRS,
                     voicing = voicing,
+                    loud = loud,
                     muted = muted,
                     camOn = camOn,
                     canFlip = cameraCount > 1 && camGranted,

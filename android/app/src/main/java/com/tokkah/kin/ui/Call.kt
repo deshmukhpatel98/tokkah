@@ -103,6 +103,8 @@ class CallUi(
     val turnMine: Boolean,
     val turnTheirs: Boolean,
     val voicing: Boolean,
+    /** How audible this end is right now, 0..1 (`Audio.sharedGate.nearLoudNow`). */
+    val loud: Float = 0f,
     val muted: Boolean,
     val camOn: Boolean,
     val canFlip: Boolean,
@@ -163,26 +165,37 @@ fun CallScreen(
                 .fillMaxSize()
                 .pointerInput(Unit) { detectTapGestures(onTap = { lastTouch++ }) },
         ) {
-            // ── the speaking edge: colour is whose turn, never dark ──────────
+            // ── the speaking edge: colour is whose turn, thickness is how ────
+            //    audible you are, and it is never dark (`layoutEdge`, `floorTick`)
+            //
+            // The Mac strokes the whole window's rounded rectangle: green is
+            // speaking (this mic reaching them), blue is listening, and the
+            // width breathes with the voice — 4.5 + 3.5 × loudness speaking,
+            // 3 listening, 1.5 at rest. A bar along one edge was this app's
+            // first draft; the Mac's edge is a frame, and so is this.
+            val wTarget = when {
+                ui.turnMine -> 4.5f + 3.5f * ui.loud.coerceIn(0f, 1f)
+                ui.turnTheirs -> 3f
+                else -> 1.5f
+            }
+            val edgeW by animateFloatAsState(wTarget, tween(if (wTarget > 3f) 50 else 200), label = "edgeW")
+            val edgeHue by animateFloatAsState(if (ui.turnMine) 1f else 0f, tween(160), label = "edgeHue")
             val edgeAlpha by animateFloatAsState(
-                if (ui.voicing) 1f else 0.35f, tween(120), label = "edge",
+                if (ui.turnMine || ui.turnTheirs) 1f else 0.35f, tween(120), label = "edge",
             )
-            Box(
-                Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .fillMaxWidth()
-                    .padding(horizontal = Metric.gutter)
-                    .height(if (ui.turnMine) 5.dp else 3.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(
-                        when {
-                            ui.turnMine -> Palette.ok.copy(alpha = edgeAlpha)
-                            ui.turnTheirs -> Palette.accent.copy(alpha = 0.9f)
-                            else -> Palette.fill(0.12f)
-                        },
-                    ),
-            )
+            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                val w = edgeW.dp.toPx()
+                val ins = w / 2
+                val r = Metric.windowRadius.toPx() - ins
+                val tint = androidx.compose.ui.graphics.lerp(Palette.accent, Palette.ok, edgeHue)
+                drawRoundRect(
+                    tint.copy(alpha = edgeAlpha),
+                    topLeft = Offset(ins, ins),
+                    size = Size(size.width - w, size.height - w),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(r.coerceAtLeast(0f)),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = w),
+                )
+            }
 
             // ── THE POSTER: their face where their picture would be ─────────
             if (ui.noPicture != null) {

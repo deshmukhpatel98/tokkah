@@ -1,6 +1,7 @@
 package com.tokkah.kin.net
 
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
@@ -42,6 +43,20 @@ class DuplexGate {
     private var vocalSamples = 0
     private var quietSamples = 0
     var gain = 1f; private set
+
+    /**
+     * How audible this end is right now, 0..1: dB above twice the noise floor,
+     * 24 dB to full — `Audio.loud(_:over:)`, the number the speaking edge's
+     * thickness breathes with.
+     */
+    val nearLoudNow: Float get() = loud(nearEnv, floorLevel)
+    val farLoudNow: Float get() = loud(farEnv, floorLevel)
+    private fun loud(env: Float, noise: Float): Float {
+        val ref = maxOf(noise * 2, 0.0015f)
+        if (env <= ref) return 0f
+        val db = 20 * (ln(env / ref) / ln(10f))
+        return minOf(1f, maxOf(0f, db / 24))
+    }
     private var floorGain = 1f
     private var yieldGain = 1f
 

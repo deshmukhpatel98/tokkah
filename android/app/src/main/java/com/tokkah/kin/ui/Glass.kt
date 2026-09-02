@@ -57,6 +57,82 @@ import androidx.compose.ui.unit.dp
  */
 val LocalBackdrop = staticCompositionLocalOf<GraphicsLayer?> { null }
 
+/**
+ * ── THE SURFACES MEASURE THE PICTURE BEHIND THEM (Backdrop.swift) ───────────
+ *
+ * A fixed dim is right over a dark picture and wrong over a bright one: on the
+ * Mac, glyphs measured 1.3:1 over a lit room until the panes started reading
+ * the backdrop under themselves and dimming to reach 4.5:1. The rule is the
+ * Mac's `Backdrop.dim`: over a backdrop of luminance L above 0.42, dim by
+ * (L − 0.42) / (L − 0.03), never below the base dim and never above 0.72.
+ *
+ * The backdrop layer is read into a coarse grid a few times a second — a
+ * pane then averages the cells under its own rectangle. Sampling is the only
+ * cost; every draw pass reads a float.
+ */
+class BackdropMeter {
+    val cols = 12; val rows = 20
+    @Volatile var grid = FloatArray(cols * rows) { 0f }
+    @Volatile var everSampled = false
+    var width = 1; var height = 1
+
+    /** Mean luminance (0..1) under a rectangle in root pixels. */
+    fun luma(left: Float, top: Float, right: Float, bottom: Float): Float {
+        if (!everSampled || width <= 1 || height <= 1) return 0f
+        val c0 = (left / width * cols).toInt().coerceIn(0, cols - 1)
+        val c1 = (right / width * cols).toInt().coerceIn(0, cols - 1)
+        val r0 = (top / height * rows).toInt().coerceIn(0, rows - 1)
+        val r1 = (bottom / height * rows).toInt().coerceIn(0, rows - 1)
+        var sum = 0f; var n = 0
+        val g = grid
+        for (r in r0..r1) for (c in c0..c1) { sum += g[r * cols + c]; n++ }
+        return if (n == 0) 0f else sum / n
+    }
+
+    fun sample(bmp: androidx.compose.ui.graphics.ImageBitmap) {
+        val w = bmp.width; val h = bmp.height
+        if (w < 2 || h < 2) return
+        width = w; height = h
+        val px = IntArray(w * h)
+        bmp.readPixels(px)
+        val next = FloatArray(cols * rows)
+        val cnt = IntArray(cols * rows)
+        // Every 4th pixel each way is plenty for a mean over a cell.
+        var y = 0
+        while (y < h) {
+            var x = 0
+            val row = (y * rows / h).coerceAtMost(rows - 1)
+            while (x < w) {
+                val p = px[y * w + x]
+                val l = (0.2126f * ((p shr 16) and 255) + 0.7152f * ((p shr 8) and 255) + 0.0722f * (p and 255)) / 255f
+                val i = row * cols + (x * cols / w).coerceAtMost(cols - 1)
+                next[i] += l; cnt[i]++
+                x += 4
+            }
+            y += 4
+        }
+        val g = grid.copyOf()
+        for (i in g.indices) if (cnt[i] > 0) {
+            val v = next[i] / cnt[i]
+            g[i] = if (everSampled) g[i] + (v - g[i]) * 0.25f else v
+        }
+        grid = g
+        everSampled = true
+    }
+
+    companion object {
+        /** `Backdrop.dim(base:backdrop:want:)`, number for number. */
+        fun dim(base: Float, l: Float, want: Float = 0.42f): Float {
+            if (base <= 0f) return 0f
+            if (l <= want) return base
+            val need = (l - want) / maxOf(0.05f, l - 0.03f)
+            return maxOf(base, minOf(0.72f, need))
+        }
+    }
+}
+
+val LocalBackdropMeter = staticCompositionLocalOf<BackdropMeter?> { null }
+
 /** How much light the material adds, measured off the Mac's own card. */
 private const val LIFT = 0.13f
 
@@ -67,6 +143,17 @@ fun GlassBackdrop(
     content: @Composable BoxScope.() -> Unit,
 ) {
     val layer = rememberGraphicsLayer()
+    val meter = remember { BackdropMeter() }
+    // Three reads a second: enough to follow a person moving into the light,
+    // cheap enough to be invisible. Off the draw pass; the read is a suspend.
+    LaunchedEffect(layer) {
+        while (true) {
+            kotlinx.coroutines.delay(330)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching { meter.sample(layer.toImageBitmap()) }
+            }
+        }
+    }
     Box(modifier) {
         Box(
             Modifier
@@ -76,7 +163,7 @@ fun GlassBackdrop(
                     drawLayer(layer)
                 },
         ) { backdrop() }
-        CompositionLocalProvider(LocalBackdrop provides layer) {
+        CompositionLocalProvider(LocalBackdrop provides layer, LocalBackdropMeter provides meter) {
             Box(Modifier.matchParentSize()) { content() }
         }
     }
@@ -92,9 +179,11 @@ fun GlassSurface(
     content: @Composable BoxScope.() -> Unit = {},
 ) {
     val backdrop = LocalBackdrop.current
+    val meter = LocalBackdropMeter.current
     val shape = RoundedCornerShape(radius)
     val density = LocalDensity.current
     var origin by remember { mutableStateOf(Offset.Zero) }
+    var extent by remember { mutableStateOf(Offset.Zero) }
     val canRefract = backdrop != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val pane = rememberGraphicsLayer()
 
@@ -109,7 +198,10 @@ fun GlassSurface(
 
     Box(
         modifier
-            .onGloballyPositioned { origin = it.positionInRoot() }
+            .onGloballyPositioned {
+                origin = it.positionInRoot()
+                extent = Offset(it.size.width.toFloat(), it.size.height.toFloat())
+            }
             .clip(shape)
             .drawWithContent {
                 if (canRefract) {
@@ -128,7 +220,10 @@ fun GlassSurface(
                     // alpha the Mac ships, so both paths — refracting and
                     // fallback — land on the same colour, and the blur shows
                     // through it as the movement that makes it glass.
-                    drawRect(Palette.glass.copy(alpha = Palette.glass.alpha * dim / Palette.dimAlpha))
+                    // The dim this pane needs for the picture under it, right now.
+                    val l = meter?.luma(origin.x, origin.y, origin.x + extent.x, origin.y + extent.y) ?: 0f
+                    val dimNow = BackdropMeter.dim(dim, l)
+                    drawRect(Palette.glass.copy(alpha = Palette.glass.alpha * dimNow / Palette.dimAlpha))
                     // ── AND THE MATERIAL ADDS LIGHT ──────────────────────────
                     //
                     // A HUD material is vibrant: it does not only darken, it

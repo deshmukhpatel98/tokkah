@@ -84,6 +84,33 @@ class Telemetry(private val root: File, private val base: String = Server.base) 
     }
 
     /** The same JSON the server gets, appended here first. */
+    /**
+     * A record that is not a beat: the crash report. Same install id, same
+     * version, a different door (`/api/mac/crash`, the Mac's `crashEndpoint`).
+     * Blocking, because the caller is about to die or has just come back to
+     * life and wants to know it was booked.
+     */
+    fun postCrash(fields: Map<String, Any?>, version: String = VERSION): Boolean {
+        val f = LinkedHashMap<String, Any?>(fields)
+        f["install"] = install
+        f["version"] = version
+        f["model"] = model
+        f["platform"] = "android"
+        f["reporter"] = "crash"
+        val body = json(f)
+        return try {
+            val c = URL("$base/api/mac/crash").openConnection() as HttpURLConnection
+            c.requestMethod = "POST"
+            c.setRequestProperty("content-type", "application/json")
+            c.doOutput = true
+            c.connectTimeout = 6000; c.readTimeout = 6000
+            c.outputStream.use { it.write(body.toByteArray()) }
+            c.responseCode < 300
+        } catch (e: Exception) { lastError = e.message; false }
+    }
+
+    fun encode(m: Map<String, Any?>): String = json(m)
+
     private fun keep(body: String) {
         runCatching {
             root.mkdirs()
