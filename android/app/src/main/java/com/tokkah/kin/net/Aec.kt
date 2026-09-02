@@ -39,8 +39,22 @@ class Aec {
     class Cfg {
         var on = true
         var taps = 1024
-        /** The NLMS step. One BLOCK step made of n per-sample steps. */
+        /** The NLMS step, PER MAC BLOCK — see [muBlock]. */
         var mu = 0.10f
+        /**
+         * ── PER-BLOCK CONSTANTS HIDE BLOCK SIZE ─────────────────────────────
+         *
+         * The Mac runs this filter once per HAL callback of 16 frames: 3000
+         * updates a second at `mu`. A phone's capture burst is 160–480 frames,
+         * so the SAME `mu` adapted 10–30× slower here — measured in the drift
+         * rig, a white-noise echo reached 1.7 dB in 30 s at a 480 block and
+         * 10 dB at 192 — and the port's "slower convergence" was nothing but
+         * the block size wearing the Mac's coefficient. The step is scaled by
+         * n / muBlock so a second of adaptation is a second, capped at 1.0 for
+         * stability (the window this normalises by is ~1.5 taps' worth at 480).
+         */
+        var muBlock = 16f
+        var muStepMax = 1.0f
         var leadMs = 2.0
         var minCorr = 0.35
         /** Below this the filter neither adapts nor subtracts. */
@@ -59,6 +73,29 @@ class Aec {
          * collapses the ERLE inside half a second and the re-aim proceeds.
          */
         var reaimHoldDb = 6.0
+
+        // ── THE CANCELLER TRACKS THE CLOCKS (0.109.0; 0.125.0 gate) ─────────
+        //
+        // Capture and render are two crystals; the echo's delay drifts (30 ppm
+        // is 1.44 samples/s), and a filter aimed at a fixed integer delay
+        // converges and loses its target over and over. The reference window
+        // is read at a FRACTIONAL delay advancing at the measured skew; whole
+        // samples carry into the integer delay WITHOUT shifting the taps
+        // (delay+1 / frac−1 is the identical window — shifting was the bug that
+        // hid the whole win, see `aec-limited-by-clock-drift`).
+        //
+        // The sensor is the estimator's readings regressed over signal time:
+        // ground truth outside the loop, which cannot oscillate. Fits are
+        // believed only under `skewMaxSe` of error and a physically possible
+        // slope; a wandering estimator is not a drifting clock.
+        var driftTrack = true
+        var skewMinReads = 8
+        var skewMinSpanS = 6f
+        var skewGain = 0.6f
+        var skewMin = 0.15f
+        var dllSkewMax = 6f
+        var skewMaxSe = 1.0f
+        var dllResetMs = 2000.0
     }
 
     var cfg = Cfg()
@@ -72,6 +109,22 @@ class Aec {
     var aimCorr = 0.0
 
     private var delay = 0
+    /** The fractional part of the delay, 0 ≤ frac < 1, advanced by the skew. */
+    private var frac = 0f
+    var skewSps = 0f; private set
+    private var sigSec = 0f
+    private val aimT = FloatArray(64)
+    private val aimD = FloatArray(64)
+    private var aimN = 0
+    private var notHelpingMs = 0.0
+    var dllSteps = 0; private set
+    var dllResets = 0; private set
+    var skewRejects = 0; private set
+    var carries = 0; private set
+    /** For rigs: where the window is read from right now. */
+    val delayNow: Int get() = delay
+    val fracNow: Float get() = frac
+    private var rawWin = FloatArray(0)
     private var mix = 0f
     private var micE = 0.0
     private var eE = 0.0
@@ -94,6 +147,7 @@ class Aec {
     var promotions = 0; private set
     /** Re-aims refused because the filter in use was still earning its keep. */
     var reaimsHeld = 0; private set
+    private var holdingReaim = false
     var reaims = 0; private set
 
     /** Instantaneous echo return loss enhancement, in dB. */
@@ -132,7 +186,49 @@ class Aec {
     private fun log10(x: Double) = ln(x) / ln(10.0)
     private fun Double.pow(p: Double) = Math.pow(this, p)
 
+    /**
+     * The estimator's reading: where in the reference the echo is, and how
+     * sure. Records the reading against signal time and, with eight readings
+     * over six seconds, fits a line: the slope is the clock skew in samples per
+     * second. `Aec.aim` in Aec.swift, number for number.
+     */
+    fun aim(delaySamples: Int, corr: Double) {
+        aimSamples = delaySamples
+        aimCorr = corr
+        if (!cfg.driftTrack || corr < cfg.minCorr) return
+        val t = sigSec
+        if (aimN > 0 && t - aimT[aimN - 1] < 0.25f) return
+        if (aimN == aimT.size) {
+            for (i in 1 until aimN) { aimT[i - 1] = aimT[i]; aimD[i - 1] = aimD[i] }
+            aimN--
+        }
+        aimT[aimN] = t; aimD[aimN] = delaySamples.toFloat(); aimN++
+        if (aimN < cfg.skewMinReads || aimT[aimN - 1] - aimT[0] < cfg.skewMinSpanS) return
+        var st = 0f; var sd = 0f
+        for (i in 0 until aimN) { st += aimT[i]; sd += aimD[i] }
+        val mt = st / aimN; val md = sd / aimN
+        var stt = 0f; var std = 0f
+        for (i in 0 until aimN) { stt += (aimT[i] - mt) * (aimT[i] - mt); std += (aimT[i] - mt) * (aimD[i] - md) }
+        if (stt <= 1e-3f) return
+        val slope = std / stt
+        var rss = 0f
+        for (i in 0 until aimN) { val r = aimD[i] - md - slope * (aimT[i] - mt); rss += r * r }
+        val se = if (aimN > 2) sqrt(rss / (aimN - 2) / stt) else 1e9f
+        if (se > cfg.skewMaxSe || abs(slope) > cfg.dllSkewMax * 1.5f) {
+            // A fit with 17 samples of error, or −40 sps: no crystal pair does
+            // that. Refused, counted.
+            skewRejects++
+        } else if (abs(slope) > max(cfg.skewMin, 1.5f * se) || (slope == 0f && se < cfg.skewMin)) {
+            val target = max(-cfg.dllSkewMax, min(cfg.dllSkewMax, slope))
+            skewSps += (target - skewSps) * cfg.skewGain
+            dllSteps++
+        } else if (abs(slope) < cfg.skewMin && se < cfg.skewMin && skewSps != 0f) {
+            skewSps += (0 - skewSps) * cfg.skewGain
+        }
+    }
+
     fun reset() {
+        skewSps = 0f; frac = 0f; aimN = 0; notHelpingMs = 0.0
         java.util.Arrays.fill(fFg, 0f)
         java.util.Arrays.fill(fBg, 0f)
         micE = 0.0; eE = 0.0; refE = 0.0; mix = 0f; divergeMsRun = 0.0
@@ -160,13 +256,17 @@ class Aec {
             rampMix(0f, dt); offBlocks++; return
         }
         val want = max(0, aimSamples - lead)
+        if (abs(want - delay) <= (0.002 * Wire.SR).toInt()) holdingReaim = false
         if (abs(want - delay) > (0.002 * Wire.SR).toInt()) {
             if (mix >= 0.5f && erleDb >= cfg.reaimHoldDb) {
                 // Held: the estimator says the room moved; the audio says the
                 // filter still fits. The audio is the thing being subtracted.
-                reaimsHeld++
+                // Counted once per disagreement, not once per block.
+                if (!holdingReaim) { holdingReaim = true; reaimsHeld++ }
             } else {
                 delay = want
+                frac = 0f
+                holdingReaim = false
                 reaims++
                 java.util.Arrays.fill(fFg, 0f)
                 java.util.Arrays.fill(fBg, 0f)
@@ -174,14 +274,35 @@ class Aec {
             }
         }
 
+        val track = cfg.driftTrack
         val span = t - 1 + n
         val endIdx = refW - delay
-        if (endIdx - span < 0) { rampMix(0f, dt); offBlocks++; return }
+        if (endIdx - span - (if (track) 2 else 0) < 0 || (track && delay < 1)) { rampMix(0f, dt); offBlocks++; return }
 
-        // The reference window, oldest first.
+        // The reference window, oldest first — read at a FRACTIONAL delay when
+        // tracking: four raw neighbours per output sample through a cubic
+        // Lagrange kernel whose phase is `frac` (`buildWindow`, Aec.swift 1318).
         val xwin = FloatArray(span)
         val start = endIdx - span
-        for (i in 0 until span) xwin[i] = ref[(((start + i) % refCap) + refCap) % refCap]
+        if (track) {
+            val r = span + 3
+            if (rawWin.size < r) rawWin = FloatArray(r)
+            for (i in 0 until r) rawWin[i] = ref[(((start - 2 + i) % refCap) + refCap) % refCap]
+            val tt = 1 - frac
+            if (tt >= 0.9999f) {
+                System.arraycopy(rawWin, 2, xwin, 0, span)
+            } else {
+                val c0 = -tt * (tt - 1) * (tt - 2) / 6
+                val c1 = (tt + 1) * (tt - 1) * (tt - 2) / 2
+                val c2 = -tt * (tt + 1) * (tt - 2) / 2
+                val c3 = tt * (tt + 1) * (tt - 1) / 6
+                for (i in 0 until span) {
+                    xwin[i] = c0 * rawWin[i] + c1 * rawWin[i + 1] + c2 * rawWin[i + 2] + c3 * rawWin[i + 3]
+                }
+            }
+        } else {
+            for (i in 0 until span) xwin[i] = ref[(((start + i) % refCap) + refCap) % refCap]
+        }
 
         var refSq = 0f
         for (v in xwin) refSq += v * v
@@ -248,7 +369,8 @@ class Aec {
 
         // The background filter always adapts; the foreground is copied from it
         // only once it has been measurably better for long enough.
-        val scale = cfg.mu / (n * max(refSq, span * cfg.refRmsFloor * cfg.refRmsFloor))
+        val step = min(cfg.muStepMax, cfg.mu * n / cfg.muBlock)
+        val scale = step / (n * max(refSq, span * cfg.refRmsFloor * cfg.refRmsFloor))
         if (cfg.leakTau > 0) {
             val keep = exp(-dt / cfg.leakTau).toFloat()
             for (j in 0 until t) fBg[j] *= keep
@@ -270,8 +392,25 @@ class Aec {
             }
         } else betterMs = 0.0
 
+        if (track) {
+            sigSec += dt.toFloat()
+            frac += skewSps * dt.toFloat()
+            // A carry is the SAME window written differently: the taps stay.
+            while (frac >= 1f) { frac -= 1f; delay += 1; carries++ }
+            while (frac < 0f) { frac += 1f; delay -= 1; carries++ }
+        }
+
         val helping = erleDb >= cfg.helpDb && coolMsLeft <= 0
         rampMix(if (helping) 1f else 0f, dt)
+        if (track) {
+            // Two seconds of not helping: the skew being applied is not the
+            // room's. Drop it and let the fit start over.
+            notHelpingMs = if (mix < 0.05f) notHelpingMs + dt * 1000 else 0.0
+            if (notHelpingMs >= cfg.dllResetMs && (skewSps != 0f || frac != 0f)) {
+                skewSps = 0f; frac = 0f; aimN = 0; notHelpingMs = 0.0
+                dllResets++
+            }
+        }
 
         // Apply what was earned, and only that.
         for (i in 0 until n) x[i] = x[i] - mix * y[i]
@@ -289,6 +428,6 @@ class Aec {
     }
 
     val describe: String
-        get() = "erle %.1f dB (mix %.2f, %d updates, %d diverges, %d promotions)"
-            .format(erleDb, mix, updates, diverges, promotions)
+        get() = "erle %.1f dB (mix %.2f, %d updates, %d diverges, %d promotions, skew %.2f sps, %d carries)"
+            .format(erleDb, mix, updates, diverges, promotions, skewSps, carries)
 }

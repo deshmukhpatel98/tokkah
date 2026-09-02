@@ -408,6 +408,9 @@ class CallSession(
         f["aec_residual"] = aec.residual.toDouble()
         f["aec_diverges"] = aec.diverges
         f["aec_reaims"] = aec.reaims; f["aec_reaims_held"] = aec.reaimsHeld
+        f["aec_skew_sps"] = aec.skewSps.toDouble(); f["aec_carries"] = aec.carries
+        f["aec_skew_updates"] = aec.dllSteps; f["aec_track_resets"] = aec.dllResets
+        f["aec_skew_rejects"] = aec.skewRejects
         f["aec_off_pct"] = if (aec.blocks > 0) 100.0 * aec.offBlocks / aec.blocks else 0.0
         f["aec_delay_ms"] = aec.aimSamples.toDouble() / Wire.SR * 1000
         f["echo_corr"] = echoAim.echoCorr; f["echo_corr_peak"] = echoAim.echoCorrPeak

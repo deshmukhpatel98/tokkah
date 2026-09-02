@@ -89,8 +89,7 @@ class EchoAim(private val aec: Aec) {
         echoCorr = score.toDouble()
         if (echoCorr > echoCorrPeak) echoCorrPeak = echoCorr
         echoDelayMs = ((MAX_LAG - best) * D).toDouble() / Wire.SR * 1000.0
-        aec.aimSamples = (echoDelayMs / 1000.0 * Wire.SR).toInt()
-        aec.aimCorr = echoCorr
+        aec.aim((echoDelayMs / 1000.0 * Wire.SR).toInt(), echoCorr)
     }
 
     /**

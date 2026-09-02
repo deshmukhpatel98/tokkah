@@ -68,7 +68,9 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | decode off the receive thread | ported (DecodeQueue), v_dq_* in the beat | ✅ |
 | the beat under the Mac's field names (played_ps, floor_held_pct, v_*, route, …); absent where not measured | same names | ✅ 0.126.12 |
 | AEC aimed by a delay estimator every 0.5 s (echoEstimator/corrScan); 0.125 re-aim hold | EchoAim ported + hold; validated on planted delays (EchoAimTest) | ✅ 0.126.12 |
-| AEC clock-drift tracker (0.109 DLL) and 0.125 skew gate | no drift tracker at all | 🔧 later |
+| AEC clock-drift tracker (0.109 fractional window, carries without shifting taps) and 0.125 skew gate | ported; 30 ppm planted: 3.8 → 10.3 dB, skew 1.42 read vs 1.44 planted (AecDriftTest) | ✅ 0.126.14 |
+| AEC re-aim hold under wandering readings (0.125 rig: 10 ms off 2 s in 6) | clean 19.9 dB, held 19.9 dB / 1 re-aim, unguarded 3.6 dB / 10 re-aims | ✅ 0.126.14 |
+| NLMS step per second the same as the Mac's | the Mac's `mu` is per 16-frame block; the phone's 160–480-frame bursts adapted 10–30× slower with the same number — step now scales with block size (white-noise echo 4.8 → 30.9 dB at 192) | ✅ 0.126.14 |
 | remove a person from the home list (hover ×, right-click; key kept) — 0.126.0 | long-press → "remove" chip; hidden.json | ✅ 0.126.12 |
 | self-update: silent where installer of record, else one tap | same; seen live android.11 → android.12 on the emulator | ✅ 0.126.12 |
 | speaker duplex behind the −26 dB gate, ON | same; the gate is fed from the canceller (it had been declared and fed by nothing) | ✅ 0.126.13 |
