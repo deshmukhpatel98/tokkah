@@ -74,6 +74,7 @@ class Crypto(
     var openFails = 0; private set
     var replayDrops = 0; private set
     var preKeyDrops = 0; private set
+    var preKeyRx = 0; private set
     var plaintextRx = 0; private set
     var hsBadSig = 0; private set
     var hsWrongId = 0; private set
@@ -259,6 +260,9 @@ class Crypto(
 
     fun notePlaintextRx() { plaintextRx++ }
     fun notePreKeyDrop() { preKeyDrops++ }
+    /** Not a handshake, and this end has no key yet: the far end's first sealed
+     *  probes, usually. Ciphertext, not plaintext -- its own name. */
+    fun notePreKeyRx() { preKeyRx++ }
 
     /** What the beat carries: every refusal has its own name. */
     fun beatFields(f: MutableMap<String, Any?>) {
@@ -270,6 +274,7 @@ class Crypto(
         f["sealed"] = sealed; f["opened"] = opened
         if (replayDrops > 0) f["replay_drop"] = replayDrops
         if (preKeyDrops > 0) f["prekey_drop"] = preKeyDrops
+        if (preKeyRx > 0) f["prekey_rx"] = preKeyRx
         if (plaintextRx > 0) f["plaintext_rx"] = plaintextRx
         if (hsBadSig > 0) f["hs_bad_sig"] = hsBadSig
         if (hsWrongId > 0) f["hs_wrong_id"] = hsWrongId

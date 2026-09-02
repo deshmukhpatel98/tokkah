@@ -80,13 +80,29 @@ object Wire {
             tag and TAG_PCM16 != 0, tag and TAG_LP != 0)
     }
     /** Packs header + payload; [samples] as pcm16+lp when caps allow, exactly like Net.send. */
+    /**
+     * REDUNDANCY THAT NEEDS NO FORMAT CHANGE (Net.swift 475-535). Under loss,
+     * each packet also carries the PREVIOUS block after its own payload:
+     * capHost(8) + payload, encoded the same way. An old peer parses its own
+     * payload length and ignores the tail; a new one recovers seq-1 from it.
+     */
     fun packAudio(seq: Int, capHost: Long, samples: ShortArray, n: Int,
-                  pcm16: Boolean, lp: Boolean, out: ByteArray): Int {
+                  pcm16: Boolean, lp: Boolean, out: ByteArray,
+                  redundant: ShortArray? = null, redundantCap: Long = 0L): Int {
         putU32(out, 0, MAGIC)
         putU32(out, 4, seq)
         putU64(out, 8, capHost)
         putU32(out, 16, n or (if (pcm16) TAG_PCM16 else 0) or (if (lp) TAG_LP else 0))
-        var at = HDR
+        var at = putPayload(samples, n, pcm16, lp, out, HDR)
+        if (redundant != null) {
+            putU64(out, at, redundantCap)
+            at = putPayload(redundant, n, pcm16, lp, out, at + 8)
+        }
+        return at
+    }
+
+    private fun putPayload(samples: ShortArray, n: Int, pcm16: Boolean, lp: Boolean, out: ByteArray, start: Int): Int {
+        var at = start
         if (lp) {
             // A compressed block is variable length, so it carries its own length
             // byte, exactly as Net.send does (Net.swift:516-527).
@@ -108,6 +124,13 @@ object Wire {
             at += n * 4
         }
         return at
+    }
+
+    /** Where this packet's own payload ends, so a redundant tail can be found. */
+    fun audioPayloadEnd(b: ByteArray, n: Int, h: AudioHeader): Int = when {
+        h.lp -> if (n > HDR) HDR + 1 + (b[HDR].toInt() and 0xff) else n
+        h.pcm16 -> HDR + h.frames * 2
+        else -> HDR + h.frames * 4
     }
     private val lpcScratch = ByteArray(1 + Lpc.MAXN * 2)
 

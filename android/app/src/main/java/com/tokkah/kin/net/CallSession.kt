@@ -192,6 +192,23 @@ class CallSession(
     private val bound = HashSet<String>()
     private var handshakesSent = 0
     private var lastStatusSent = -1
+    // ── AUDIO REDUNDANCY (main.swift 6380-6440) ─────────────────────────────
+    //
+    // Turned on when the far end reports loss, off after 30 s without any, and
+    // switched off with a backoff when what it recovers is under 40% of what is
+    // lost -- bursts a one-packet offset cannot reach, not worth the bandwidth.
+    @Volatile var redundancy = false; private set
+    private val prevBlock = ShortArray(Wire.FPP)
+    private var prevCap = 0L
+    private var havePrev = false
+    @Volatile var peerRxLost = 0; private set
+    @Volatile var peerRxRecovered = 0; private set
+    @Volatile var peerReportsLoss = false; private set
+    private var lastLostForFec = 0
+    private var fecRecovered0 = 0; private var fecLost0 = 0
+    private var fecWindows = 0; private var fecCalm = 0
+    private var fecUselessUntil = 0.0; private var fecBackoff = 60.0
+    var redundantSent = 0; private set
     // ── THE BEAT'S DENOMINATORS ─────────────────────────────────────────────
     @Volatile private var txBytes = 0L
     @Volatile private var rxBytes = 0L
@@ -304,6 +321,31 @@ class CallSession(
             capPs = ((capFrames - lastCap) / Wire.FPP).toInt(); lastCap = capFrames
             upMbps = (txBytes - lastTx) * 8 / 1e6; lastTx = txBytes
             downMbps = (rxBytes - lastRx) * 8 / 1e6; lastRx = rxBytes
+            // ── REDUNDANCY, STEERED ON THE FAR END'S LOSS ────────────────────
+            if (crypto.established && callSeconds % 2 == 0) {
+                val t = callSeconds.toDouble()
+                val lostTotal = if (peerReportsLoss) peerRxLost else ring.concealLost
+                val recTotal = if (peerReportsLoss) peerRxRecovered else ring.recovered
+                var lostNow = lostTotal - lastLostForFec
+                if (lostNow < 0) { lostNow = 0; fecRecovered0 = recTotal; fecLost0 = lostTotal }
+                lastLostForFec = lostTotal
+                if (lostNow > 0 && !redundancy && t >= fecUselessUntil) {
+                    redundancy = true; fecRecovered0 = recTotal; fecLost0 = lostTotal; fecWindows = 0; fecCalm = 0
+                    Metrics.count("fec_on")
+                    android.util.Log.i("kin", "redundancy ON ($lostNow lost in 2 s) -- each packet now carries the previous one")
+                } else if (redundancy) {
+                    fecWindows++
+                    val rec = maxOf(0, recTotal - fecRecovered0); val lost = maxOf(0, lostTotal - fecLost0)
+                    if (fecWindows >= 5 && rec + lost >= 20 && rec.toDouble() / (rec + lost) < 0.4) {
+                        redundancy = false; fecUselessUntil = t + fecBackoff; fecBackoff = minOf(fecBackoff * 2, 600.0); fecCalm = 0
+                        Metrics.count("fec_useless")
+                        android.util.Log.i("kin", "redundancy OFF -- recovered only $rec of ${rec + lost}; retrying in ${(fecBackoff / 2).toInt()} s")
+                    } else if (lostNow > 0) fecCalm = 0 else if (++fecCalm >= 15) {
+                        redundancy = false; fecCalm = 0; fecBackoff = 60.0
+                        android.util.Log.i("kin", "redundancy OFF (30 s without a lost packet)")
+                    }
+                }
+            }
             // peer − mine, refreshed once a beat for the playout's ear stamp.
             playout.thetaMs = tsync.thetaNs?.let { it / 1e6 }
             videoStats?.invoke()?.let { v ->
@@ -437,6 +479,10 @@ class CallSession(
         f["dup"] = ring.dup; f["too_old"] = ring.tooOld; f["jumps"] = ring.jumps
         f["recv"] = ring.recv; f["accepted"] = ring.accepted
         f["peer_restarts"] = ring.restarts
+        f["fec_on"] = if (redundancy) 1 else 0; f["fec_sent"] = redundantSent
+        f["recovered"] = ring.recovered
+        f["peer_rx_lost"] = peerRxLost; f["peer_rx_recovered"] = peerRxRecovered
+        f["peer_reports"] = if (peerReportsLoss) 1 else 0
         f["hold"] = held.sentence ?: "-"
         f["conceal_frac"] = held.lastFrac
         // the wire
@@ -738,7 +784,7 @@ class CallSession(
             }
             // Before a key exists NOTHING else is read: there is no plaintext
             // window. After it, a datagram that fails to open is not dispatched.
-            if (!crypto.established) { crypto.notePlaintextRx(); continue }
+            if (!crypto.established) { crypto.notePreKeyRx(); continue }
             // `b`, NOT `buf`: a relayed datagram has already been unwrapped
             // out of its 4-byte channel header, and decrypting from offset 0
             // would feed the header to AES-GCM.
@@ -764,6 +810,8 @@ class CallSession(
                             peerStatus = r.status
                             peerMuted = r.muted
                             peerPlayed = r.played
+                            peerRxLost = r.lost; peerRxRecovered = r.recovered
+                            peerReportsLoss = true
                             val owd = (tsync.bestRttMs ?: 0.0) / 2
                             floor.noteFar(peerVoice(), transitMs = owd,
                                 voicing = if (r.status and Wire.ST_VOICING != 0) true else false)
@@ -812,6 +860,37 @@ class CallSession(
                         }
                     }
                     ring.write(h.seq, h.capHost, fbuf, frames)
+                    // The redundant tail, if the sender carried one: seq-1.
+                    val redOff = Wire.audioPayloadEnd(b, n, h)
+                    if (h.seq > 0 && n > redOff + 8 && !ring.present(h.seq - 1)) {
+                        val rCap = Wire.u64(b, redOff)
+                        val at = redOff + 8
+                        var ok = false
+                        if (h.lp) {
+                            val m = b[at].toInt() and 0xff
+                            if (n >= at + 1 + m) {
+                                val block = b.copyOfRange(at + 1, at + 1 + m)
+                                if (Lpc.decode(block, m, frames, lpcOut)) {
+                                    for (i in 0 until frames) fbuf[i] = lpcOut[i] / 32767.0f; ok = true
+                                }
+                            }
+                        } else if (h.pcm16) {
+                            if (n >= at + frames * 2) {
+                                for (i in 0 until frames) {
+                                    val v = ((b[at + 2 * i].toInt() and 0xff) or (b[at + 2 * i + 1].toInt() shl 8)).toShort()
+                                    fbuf[i] = v / 32767.0f
+                                }
+                                ok = true
+                            }
+                        } else if (n >= at + frames * 4) {
+                            for (i in 0 until frames) fbuf[i] = java.lang.Float.intBitsToFloat(Wire.u32(b, at + 4 * i))
+                            ok = true
+                        }
+                        if (ok) {
+                            ring.write(h.seq - 1, rCap, fbuf, frames)
+                            if (ring.present(h.seq - 1)) ring.recovered++
+                        }
+                    }
                 }
                 Wire.VMAGIC -> {
                     val h = Wire.videoHeader(b, n) ?: continue
@@ -906,9 +985,13 @@ class CallSession(
                 val v = x[at + i]
                 pcmScratch[i] = (maxOf(-1f, minOf(1f, v)) * 32767f).toInt().toShort()
             }
+            val carry = redundancy && havePrev
             val len = Wire.packAudio(seq, cap, pcmScratch, Wire.FPP,
-                pcm16 = sendPcm16, lp = sendLp, out = sendScratch)
+                pcm16 = sendPcm16, lp = sendLp, out = sendScratch,
+                redundant = if (carry) prevBlock else null, redundantCap = prevCap)
+            if (carry) redundantSent++
             sendSealed(sendScratch, len)
+            System.arraycopy(pcmScratch, 0, prevBlock, 0, Wire.FPP); prevCap = cap; havePrev = true
             seq++
             at += Wire.FPP
         }
