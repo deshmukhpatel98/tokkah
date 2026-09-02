@@ -48,6 +48,11 @@ crashes() { ls "$CRASHDIR" 2>/dev/null | grep -c '^tk-' || true; }
 CRASH0="$(crashes)"
 
 MEDIA="$SP/m.mp4"
+# Real speech for the long-call arm, if this checkout has the recordings.
+WAV_A=""; WAV_B=""
+for d in ../testbed/media/real ../testbed/peer/media testbed/media/real; do
+  [ -f "$d/realA.wav" ] && { WAV_A="$d/realA.wav"; WAV_B="$d/realB.wav"; break; }
+done
 if command -v ffmpeg >/dev/null; then
   ffmpeg -y -f lavfi -i "testsrc2=s=1280x720:r=30" -t 40 -c:v libx264 -pix_fmt yuv420p \
          "$MEDIA" >/dev/null 2>&1
@@ -283,6 +288,78 @@ else
   say FAIL "$NEW crash report(s) written during this run -- read them, do not rerun past them:"
   ls -t "$CRASHDIR" | grep '^tk-' | head -"$NEW" | sed 's/^/         /'
   fail=1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# ── 6. ONE LONG CALL, WHICH IS THE ONLY KIND PEOPLE ACTUALLY HAVE ───────────
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Every arm above is seconds long, and arm 5 is five short calls. Nothing here has
+# ever watched ONE call go on -- and an hour is an ordinary length for the thing
+# this app is for. A leak of a megabyte a minute is invisible in a 40-second rig
+# and is 60 MB by the end of a real conversation; a CPU cost that climbs is a fan
+# that comes on and a laptop that gets hot in somebody's hands.
+#
+# Both ends run real speech AND a picture, so every stage is working: capture,
+# encode, wire, decode, playout, the floor, the recogniser. RSS is read from the
+# minute mark, not from launch: the first minute is warm-up (buffers, the
+# recogniser's model, the first keyframes) and counting it as growth would make an
+# honest plateau look like a leak.
+echo "── 6. one long call, watched for drift"
+LONG_S="${LONG_S:-150}"
+LR="stlong$$"
+reap; naptime 0.5
+"$TK" --window --video "$MEDIA" ${WAV_B:+--audio "$WAV_B"} --no-telemetry --no-update \
+      --no-relocate --no-rings --room "$LR" --listen 7907 --peer 127.0.0.1:7908 \
+      > "$SP/long-b.log" 2>&1 &
+LB=$!; PIDS="$PIDS $LB"
+"$TK" --window --video "$MEDIA" ${WAV_A:+--audio "$WAV_A"} --no-telemetry --no-update \
+      --no-relocate --no-rings --room "$LR" --listen 7908 --peer 127.0.0.1:7907 \
+      > "$SP/long-a.log" 2>&1 &
+LA=$!; PIDS="$PIDS $LA"
+W=0; V=0
+while [ "$W" -lt 120 ]; do
+  V="$(grep -oE 'recv [0-9]+/s' "$SP/long-a.log" | tail -1 | grep -oE '[0-9]+')"
+  [ "${V:-0}" -gt 500 ] && break
+  naptime 0.5; W=$(( W + 1 ))
+done
+if [ "${V:-0}" -le 500 ]; then
+  say note "the long-call arm never got a call (recv ${V:-0}/s) -- not asserted"
+else
+  rss() { ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%.0f", $1/1024}'; }
+  naptime 60
+  RSS0="$(rss $LA)"                       # after warm-up
+  naptime "$LONG_S"
+  RSS1="$(rss $LA)"
+  CPU1="$(ps -o %cpu= -p $LA 2>/dev/null | tr -d ' ')"
+  ALIVE=$(kill -0 $LA 2>/dev/null && kill -0 $LB 2>/dev/null && echo yes || echo no)
+  LATE="$(grep -oE 'conceal [0-9]+/s' "$SP/long-a.log" | tail -1 | grep -oE '[0-9]+')"
+  RECV="$(grep -oE 'recv [0-9]+/s' "$SP/long-a.log" | tail -1 | grep -oE '[0-9]+')"
+  reap
+  # 1. IT IS STILL THERE. A call that died is not a call that held steady.
+  [ "$ALIVE" = yes ] \
+    && say OK "both ends were still up after $(( 60 + LONG_S ))s of continuous call" \
+    || { say FAIL "an end died during a long call -- everything below is meaningless"; fail=1; }
+  # 2. AND STILL CARRYING MEDIA at the end, not merely alive.
+  [ "${RECV:-0}" -gt 500 ] \
+    && say OK "and still carrying media at the end (${RECV}/s, concealment ${LATE:-?}/s)" \
+    || { say FAIL "media had stopped by the end: ${RECV:-0}/s"; fail=1; }
+  # 3. THE DRIFT. Measured from the minute mark, so warm-up is not counted as a
+  #    leak. 20 MB over this window is far above the 1-3 MB a healthy call moves
+  #    and far below what a real leak does.
+  GROW=$(( ${RSS1:-0} - ${RSS0:-0} ))
+  if [ "${RSS0:-0}" -gt 0 ] && [ "$GROW" -le 20 ]; then
+    say OK "memory held: ${RSS0} MB -> ${RSS1} MB over ${LONG_S}s (${GROW} MB)"
+  else
+    say FAIL "memory grew ${GROW} MB over ${LONG_S}s (${RSS0:-?} -> ${RSS1:-?} MB)."
+    say FAIL "  At that rate an hour-long call costs $(( GROW * 3600 / LONG_S )) MB."
+    fail=1
+  fi
+  # 4. AND THE CPU DID NOT CLIMB. One core is 100% here; a 720p call is about a
+  #    quarter of one, and anything near a whole core is a fan in somebody's room.
+  python3 -c "import sys; sys.exit(0 if ${CPU1:-999} <= 70 else 1)" \
+    && say OK "and the CPU stayed reasonable (${CPU1}% of one core at the end)" \
+    || { say FAIL "the CPU was at ${CPU1}% of a core after ${LONG_S}s"; fail=1; }
 fi
 
 [ "$fail" = 0 ] && echo "STRESS CHECK PASSED -- every control survived being mashed, on a live call" \
