@@ -35,14 +35,22 @@ object Crash {
             for (f in cause.stackTrace.take(12)) frames.add("$f")
             cause = cause.cause; depth++
         }
+        // The worker's route (worker.ts `/mac/crash`) keys a report on
+        // `incident` and `install`, and files `exc`, `where`, `os`, `ran_ms`
+        // in their own columns; everything else rides in `fields`.
+        val incident = (1..16).joinToString("") { "0123456789abcdef".random().toString() }
         val f = linkedMapOf<String, Any?>(
+            "incident" to incident,
             "kind" to "crash",
             "app_version" to version,
             "proc" to "kin-android",
+            "os" to "Android ${android.os.Build.VERSION.RELEASE}",
+            "exc" to e.javaClass.simpleName,
+            "where" to (e.stackTrace.firstOrNull()?.toString() ?: "").take(160),
             "thread" to t.name,
             "reason" to "${e.javaClass.name}: ${e.message}".take(400),
             "frames" to frames,
-            "uptime_s" to Metrics.sinceLaunch() / 1000,
+            "ran_ms" to Metrics.sinceLaunch(),
             "at" to System.currentTimeMillis() / 1000.0,
             "facts" to Metrics.snapshot().facts,
         )
@@ -80,6 +88,9 @@ object Crash {
             out["frames"] = Regex("\"((?:[^\"\\\\]|\\\\.)*)\"").findAll(m.groupValues[1]).map { it.groupValues[1] }.toList()
         }
         out["kind"] = "crash"
+        // A report written by an older build had no incident id; the route
+        // refuses one without. Better booked under a fresh id than kept forever.
+        if (out["incident"] !is String) out["incident"] = (1..16).joinToString("") { "0123456789abcdef".random().toString() }
         return out
     }
 }

@@ -51,7 +51,9 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | paused sentence in warn pill ("their microphone is off", "their connection is weak — video paused, audio is still on", …) | same (seen live: "their camera is off") | ✅ 0.126.12 |
 | leave: tap arms "tap to leave", hold 0.6 s fills and leaves, disarms after 3 s | same | ✅ 0.126.12 |
 | bar hides after stillness, pinned while armed / alone / holding | hides after 4 s | ✅ close |
-| speaking edge: colour = whose turn, thickness = how audible | same | ✅ |
+| speaking edge: a frame round the whole window, colour = whose turn, width 4.5+3.5×loudness / 3 / 1.5 | same (was a bar along the top) | ✅ 0.126.15 |
+| glass reads the picture under it and dims to Backdrop.dim (4.5:1 over a lit room) | same rule, 3 Hz grid sample of the backdrop layer | ✅ 0.126.15 |
+| a crash is booked with the fleet (Crash.swift) | uncaught exception written to disk, posted on the next launch under the route's fields | ✅ 0.126.15 |
 | more sheet: Your name (copy) · People · Change your name · Camera/Microphone/Speaker · Calls when Kin is closed (switch) · Silent (switch) · Encryption code + hint · Version (press = check; "Update ready"/restart) · Licence + hint | same; Microphone is a fact (Android picks it with the route) | ✅ 0.126.12 |
 | People page: faces, mine + copy, "Call someone new" while waiting, Back | same | ✅ 0.126.12 |
 | Rename page: field pre-filled and selected, Save this name / Not now, rule sentence | same | ✅ 0.126.12 |

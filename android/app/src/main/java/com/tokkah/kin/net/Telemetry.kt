@@ -131,6 +131,22 @@ class Telemetry(private val root: File, private val base: String = Server.base) 
             when (v) {
                 is Number, is Boolean -> append(v.toString())
                 is Map<*, *> -> append(json(v.entries.associate { it.key.toString() to it.value }))
+                // A list is a list, not the string of one: the crash report's
+                // frames arrived as "[android.app..." and the dashboard could
+                // not read a single line of them.
+                is List<*> -> {
+                    append('[')
+                    v.forEachIndexed { i, e ->
+                        if (i > 0) append(',')
+                        when (e) {
+                            null -> append("null")
+                            is Number, is Boolean -> append(e.toString())
+                            is Map<*, *> -> append(json(e.entries.associate { it.key.toString() to it.value }))
+                            else -> append('"').append(esc(e.toString())).append('"')
+                        }
+                    }
+                    append(']')
+                }
                 else -> append('"').append(esc(v.toString())).append('"')
             }
         }
