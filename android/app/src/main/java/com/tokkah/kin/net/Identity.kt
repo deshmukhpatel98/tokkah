@@ -227,7 +227,10 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         if (!claimed) { lastQuietStatus = 0; return false }
         val t = (System.currentTimeMillis() / 1000).toInt()
         val sig = sign("kin-quiet-v1|$handle|$on|$until|$t") ?: return false
-        val body = """{"to":"$handle","tok":"$tok","t":$t,"sig":"$sig","quiet":$on,"until":$until}"""
+        // EXACTLY the server's key set (worker.ts KIN_QUIET_KEYS): to, k, t, sig,
+        // quiet, until. It sent `tok` here and got 400 'bad fields' on every
+        // press -- the switch drew 'on' and could change nothing.
+        val body = """{"to":"$handle","k":"$publicKeyB64","t":$t,"sig":"$sig","quiet":$on,"until":$until}"""
         val r = post("$base/api/kin/$handle/quiet", body)
         lastQuietStatus = r?.first ?: 0
         val ok = lastQuietStatus in 200..299

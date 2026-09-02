@@ -38,6 +38,22 @@ export JAVA_HOME="${JAVA_HOME:-$HOME/android-sdk/jdk/Contents/Home}"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
 
 echo "== version =="
+# ── NEVER RELEASE BACKWARDS ─────────────────────────────────────────────────
+# Two sessions once shipped 0.128.1-android.20 and 0.128.0-android.21 within
+# minutes of each other. The phone orders versions numerically per segment, so
+# every phone on the first could never see the second. The edge is the
+# authority: refuse a version that does not compare greater than what is live.
+LIVE="$(curl -fsS "https://room.tokkah.com/android/manifest.json?cb=$$" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
+if [ -n "$LIVE" ]; then
+  python3 - "$VER" "$LIVE" <<'PY' || { echo "FAILED: $VER is not newer than the live $LIVE -- a phone on $LIVE would never take it"; exit 1; }
+import re, sys
+def parts(v): return [int(x) for x in re.split(r'[.-]', v) if x.isdigit()]
+a, b = parts(sys.argv[1]), parts(sys.argv[2])
+n = max(len(a), len(b)); a += [0] * (n - len(a)); b += [0] * (n - len(b))
+sys.exit(0 if a > b else 1)
+PY
+  echo "  live is $LIVE"
+fi
 GR="$REPO/android/app/build.gradle.kts"
 sed -i '' -E "s/versionCode = [0-9]+/versionCode = $CODE/; s/versionName = \"[^\"]+\"/versionName = \"$VER\"/" "$GR"
 grep -E "versionCode = $CODE|versionName = \"$VER\"" "$GR" | wc -l | grep -q 2 || { echo "FAILED: build.gradle.kts did not take the version"; exit 1; }
