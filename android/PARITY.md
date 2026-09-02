@@ -81,8 +81,8 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | remove a person from the home list (hover ×, right-click; key kept) — 0.126.0 | long-press → "remove" chip; hidden.json | ✅ 0.126.12 |
 | self-update: silent where installer of record, else one tap | same; seen live android.11 → android.12 on the emulator | ✅ 0.126.12 |
 | speaker duplex behind the −26 dB gate, ON | same; the gate is fed from the canceller (it had been declared and fed by nothing) | ✅ 0.126.13 |
-| turn-end prior with the on-device model | heuristic half | ⛔ no model on Android |
-| ringing with the app closed costs a notification | — | ⛔ platform |
+| turn-end prior's model term (Apple Intelligence via FoundationModels; the Mac itself runs without it when the model is absent or not ready) | heuristic half — the same path the Mac takes on a Mac without Apple Intelligence | ⛔ platform; behaviour identical to a Mac without the model |
+| ringing with the app closed costs a notification | Android requires a foreground service notification; the only route without one is push (FCM), which needs a Firebase project the owner would have to create | ⛔ platform |
 | own mouth-to-ear (m2e_p50/95/99) | same names; basis = device buffer, said in the facts | ✅ 0.126.13 |
 
 ## Found on the way (fixed 0.126.0-android.12)
