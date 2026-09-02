@@ -45,6 +45,30 @@ class Playout(val ring: RecvRing) {
             jitTarget = max(jitTarget, v / Wire.FPP + 2)
         }
 
+    // ── MOUTH TO EAR, ON THIS END (Audio.swift 5020-5040) ───────────────────
+    //
+    // Every latency number for the phone had been measured at the Mac. The
+    // packet carries the far end's capture stamp in the far end's clock;
+    // TimeSync gives peer − mine; the first good sample of each render block is
+    // stamped when it reaches the device buffer. What the device adds after
+    // that is not measured by Android's API — the buffer this render fills is
+    // the honest lower bound, and `m2e_basis` in the facts says so.
+    /** peer clock − my clock, in ms; null until TimeSync has three samples. */
+    @Volatile var thetaMs: Double? = null
+    /** The device's own buffers, in ms, added the way the Mac adds its HAL latencies. */
+    @Volatile var outLatencyMs = 0.0
+    @Volatile var inLatencyMs = 0.0
+    private val m2eRing = DoubleArray(600)
+    private var m2eN = 0
+    @Volatile var m2eLast = Double.NaN; private set
+    /** Sorted copy for the beat; p in 0..1. Null until anything was measured. */
+    fun m2eP(p: Double): Double? {
+        val n = minOf(m2eN, m2eRing.size)
+        if (n == 0) return null
+        val a = m2eRing.copyOf(n); a.sort()
+        return a[((n - 1) * p).toInt().coerceIn(0, n - 1)]
+    }
+
     private val hist = FloatArray(HIST)
     private var histW = 0
     private var plcPeriod = 0
@@ -212,6 +236,17 @@ class Playout(val ring: RecvRing) {
                 concealRun = 0
                 ring.playedS++
                 if (seq.toLong() > ring.maxPlayedSeq) ring.maxPlayedSeq = seq.toLong()
+                if (i == 0) {
+                    val th = thetaMs
+                    if (th != null) {
+                        val slot = seq % Wire.RING
+                        val capOfs = (off.toDouble() / Wire.SR * 1e9).toLong() * 3 / 125
+                        val ms = KinClock.msSigned(KinClock.now(), ring.capHost[slot] + capOfs) +
+                            th + outLatencyMs + inLatencyMs
+                        m2eLast = ms
+                        m2eRing[m2eN % m2eRing.size] = ms; m2eN++
+                    }
+                }
             } else {
                 if (!wasConcealing) {
                     // The period is decided ONCE, from the sound that was playing.

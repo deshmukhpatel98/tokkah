@@ -292,6 +292,8 @@ class CallSession(
             capPs = ((capFrames - lastCap) / Wire.FPP).toInt(); lastCap = capFrames
             upMbps = (txBytes - lastTx) * 8 / 1e6; lastTx = txBytes
             downMbps = (rxBytes - lastRx) * 8 / 1e6; lastRx = rxBytes
+            // peer − mine, refreshed once a beat for the playout's ear stamp.
+            playout.thetaMs = tsync.thetaNs?.let { it / 1e6 }
             videoStats?.invoke()?.let { v ->
                 vEncPs = v[0] - lastVideoStats[0]; vDecPs = v[1] - lastVideoStats[1]
                 lastVideoStats = v
@@ -427,6 +429,10 @@ class CallSession(
         f["turn_ok"] = if (turn != null) 1 else 0
         f["relay"] = turn?.relay ?: "-"
         f["probes"] = tsync.samples
+        playout.m2eP(0.50)?.let { f["m2e_p50"] = it }
+        playout.m2eP(0.95)?.let { f["m2e_p95"] = it }
+        playout.m2eP(0.99)?.let { f["m2e_p99"] = it }
+        f["in_lat_ms"] = playout.inLatencyMs; f["out_lat_ms"] = playout.outLatencyMs
         tsync.bestRttMs?.let { f["rtt_ms"] = it }
         tsync.rttSpreadMs?.let { f["rtt_jit_ms"] = it }
         f["crypt"] = 1; f["crypt_bad"] = crypto.openFails

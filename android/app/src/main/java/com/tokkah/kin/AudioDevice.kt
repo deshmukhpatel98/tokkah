@@ -89,6 +89,12 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
         inBurst = maxOf(Wire.FPP, (minIn / 4 / Wire.FPP) * Wire.FPP)
         outBurst = maxOf(Wire.FPP, (minOut / 4 / Wire.FPP) * Wire.FPP)
         session.playout.devBuf = outBurst
+        // The device's buffers, as ms, for the phone's own mouth-to-ear. What
+        // Android does not expose (the DAC path) is not invented: the basis is
+        // named in the facts so the number is read as the bound it is.
+        session.playout.outLatencyMs = outBurst * 1000.0 / Wire.SR
+        session.playout.inLatencyMs = inBurst * 1000.0 / Wire.SR
+        Metrics.fact("m2e_basis", "devbuf")
         session.speakers = isOnSpeakers()
 
         trk.play()
