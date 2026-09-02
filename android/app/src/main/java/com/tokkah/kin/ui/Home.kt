@@ -140,7 +140,7 @@ fun HomeScreen(
             ) {
                 // The pill sits in the SKY above the card, in the picture,
                 // with a clear band between them.
-                if (cameraHint != null) {
+                if (!cameraHint.isNullOrEmpty()) {
                     HintPill(cameraHint, onClick = onHintClick)
                     Spacer(Modifier.height(Metric.s8))
                 }

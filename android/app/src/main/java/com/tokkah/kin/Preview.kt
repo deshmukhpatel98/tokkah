@@ -98,7 +98,7 @@ class CameraPreview(ctx: Context) : TextureView(ctx), TextureView.SurfaceTexture
                 else f == CameraMetadata.LENS_FACING_BACK
             } ?: cm.cameraIdList.firstOrNull()
         } catch (e: Exception) { null }
-        if (id == null) { onHint?.invoke("no camera on this phone"); return }
+        if (id == null) { onHint?.invoke("No camera found — this call will be audio only."); return }
         sensorOrientation = try {
             cm.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         } catch (e: Exception) { 0 }
@@ -120,13 +120,13 @@ class CameraPreview(ctx: Context) : TextureView(ctx), TextureView.SurfaceTexture
                             override fun onConfigured(s: android.hardware.camera2.CameraCaptureSession) {
                                 try {
                                     s.setRepeatingRequest(req.build(), null, handler)
-                                    onHint?.invoke("this is you")
+                                    onHint?.invoke("")
                                 } catch (e: Exception) {
-                                    onHint?.invoke("the camera would not start")
+                                    onHint?.invoke("The camera did not start — this call will be audio only.")
                                 }
                             }
                             override fun onConfigureFailed(s: android.hardware.camera2.CameraCaptureSession) {
-                                onHint?.invoke("the camera would not start")
+                                onHint?.invoke("The camera did not start — this call will be audio only.")
                             }
                         }, handler,
                     )
@@ -134,13 +134,13 @@ class CameraPreview(ctx: Context) : TextureView(ctx), TextureView.SurfaceTexture
                 override fun onDisconnected(dev: CameraDevice) { dev.close(); camera = null }
                 override fun onError(dev: CameraDevice, err: Int) {
                     dev.close(); camera = null
-                    onHint?.invoke("the camera is busy in another app")
+                    onHint?.invoke("Kin can’t use your camera — another app may have it")
                 }
             }, handler)
         } catch (e: SecurityException) {
-            onHint?.invoke("Kin has not been allowed the camera")
+            onHint?.invoke("Camera access is off — tap here to turn it on.")
         } catch (e: Exception) {
-            onHint?.invoke("the camera would not start")
+            onHint?.invoke("The camera did not start — this call will be audio only.")
         }
     }
 
