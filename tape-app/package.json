@@ -13,8 +13,8 @@
     "test": "node turntaking.test.mjs && node public/core/pcmsw.test.mjs && node diagnose.test.mjs && node contacts.test.mjs && node routing.test.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260812.1",
-    "typescript": "^5.7.0",
-    "wrangler": "^4.121.0"
+    "@cloudflare/workers-types": "^5.20260829.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.127.1"
   }
 }
