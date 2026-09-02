@@ -190,6 +190,9 @@ class KinState(
         } finally { updateChecking = false }
     }
 
+    private var offeredFile: String? = null
+    private var offeredAt = 0L
+
     private fun offerInstall() {
         val f = readyFile ?: return
         // Never mid-call, and never while a call is being offered either: a
@@ -198,6 +201,16 @@ class KinState(
             android.util.Log.i("kin", "update: ready, deferred until the call ends")
             return
         }
+        // ONE offer per staged file, then a long pause: the minute poll offered
+        // the same APK again while the first session was waiting on the
+        // person's tap, and the system refused BOTH --
+        // INSTALL_FAILED_VERIFICATION_FAILURE, seen live on the emulator.
+        val now = System.currentTimeMillis()
+        if (offeredFile == f.name && now - offeredAt < 10 * 60 * 1000) {
+            android.util.Log.i("kin", "update: ${f.name} already offered; not again yet")
+            return
+        }
+        offeredFile = f.name; offeredAt = now
         onInstall?.invoke(f)
     }
 
