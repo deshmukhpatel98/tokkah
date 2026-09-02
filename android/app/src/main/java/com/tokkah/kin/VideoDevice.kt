@@ -10,6 +10,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import com.tokkah.kin.net.Metrics
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
@@ -113,6 +114,13 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             codecThread = ct
             val ch = Handler(ct.looper)
             val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            // WHAT the picture was made with, not just how it went: a software
+            // encoder and a hardware one produce the same counters and very
+            // different calls, and the name is the only way to tell from a beat.
+            Metrics.fact("venc", runCatching { enc.name }.getOrDefault("?"))
+            Metrics.fact("venc_bps", BITRATE.toString())
+            Metrics.fact("cam_mode", "${W}x$H@$FPS")
+            Metrics.fact("cam_kind", if (facingFront) "front" else "back")
             // setCallback BEFORE configure: that is the documented order for
             // asynchronous mode, and getting it wrong is silent — the codec
             // starts, the camera fills its surface, and no output callback ever
@@ -209,6 +217,10 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             // Every camera frame becomes one encoder frame, turned. On the
             // camera's own thread, so the draw never sits on the UI.
             r.inputTexture.setOnFrameAvailableListener({
+                // The platform floor everything else is measured against: on a
+                // Mac this is ~670 ms cold, ~300 ms warm, and a phone that is
+                // slower here is slow for a reason nothing downstream can fix.
+                Metrics.mark("cam_first_frame_ms", Metrics.sinceLaunch())
                 try { r.draw(System.nanoTime()) }
                 catch (e: Exception) { lastError = "rotator: ${e.message}" }
             }, h)

@@ -8,6 +8,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import com.tokkah.kin.net.CallSession
+import com.tokkah.kin.net.Metrics
 import com.tokkah.kin.net.Wire
 import kotlin.concurrent.thread
 
@@ -92,6 +93,13 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
 
         trk.play()
         rec.startRecording()
+        // The devices actually in use. "They could not hear me" is answerable
+        // from a beat only if the beat says which microphone was open.
+        Metrics.fact("mic_dev", runCatching {
+            rec.routedDevice?.productName?.toString() ?: "default"
+        }.getOrDefault("?"))
+        Metrics.fact("spk_dev", if (isOnSpeakers()) "speaker" else "headset")
+        Metrics.fact("io", "$inBurst/$outBurst")
         thread(isDaemon = true, name = "kin-capture") { captureLoop(rec) }
         thread(isDaemon = true, name = "kin-render") { renderLoop(trk) }
         return true
@@ -129,6 +137,9 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
 
     private fun renderLoop(trk: AudioTrack) {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        // Identifies itself so every Metrics entry point can refuse to lock
+        // here. A counter is never worth a glitch in somebody's ear.
+        Metrics.claimAudioThread()
         val buf = FloatArray(outBurst)
         while (running) {
             session.renderBlock(buf, buf.size)

@@ -86,7 +86,44 @@ class CallSession(
     }
 
     /** A whole far-end video frame, reassembled. */
+    /**
+     * A completed video frame. Delivered on the DECODE thread, not the receive
+     * thread — see [DecodeQueue]. The array handed over is the queue's own slot
+     * and is valid only for the length of the call, which is why the handler
+     * must not retain it.
+     */
     var onVideoFrame: ((ByteArray, Long) -> Unit)? = null
+        set(v) {
+            field = v
+            // The queue exists only while somebody is decoding, and it holds
+            // 768 KiB of slots: on an audio-only call that is memory for nothing.
+            //
+            // It reads `onVideoFrame` at DECODE time rather than capturing the
+            // handler here. This callback is deliberately chained — VideoDevice
+            // wraps whatever MainActivity installed — so a queue built around
+            // the first assignment would have pinned the face-detector and
+            // silently dropped the decoder that replaced it. A handler that is
+            // assigned and never invoked reads as finished and does nothing.
+            if (v != null && decodeQueue == null && useDecodeQueue) {
+                decodeQueue = DecodeQueue { buf, n, host ->
+                    onVideoFrame?.invoke(if (n == buf.size) buf else buf.copyOf(n), host)
+                }
+            }
+        }
+
+    @Volatile private var decodeQueue: DecodeQueue? = null
+
+    /**
+     * RIG ONLY. Off puts the decode back inline on the receive thread, which is
+     * the behaviour this replaced — so a video call that goes wrong can be
+     * attributed to the queue or cleared of it in one arm, instead of being
+     * argued about.
+     */
+    @Volatile var useDecodeQueue = true
+
+    /** Frames that had to decode inline anyway, for the beat. */
+    val decodeInline: Int get() = (decodeQueue?.inlineFull ?: 0) + (decodeQueue?.inlineTooBig ?: 0)
+    val decodeDepth: Int get() = decodeQueue?.maxDepth ?: 0
     /** The far end asked for a keyframe (KMAGIC): make one now. */
     var onKeyframeRequest: (() -> Unit)? = null
 
@@ -104,6 +141,17 @@ class CallSession(
     private val pcmScratch = ShortArray(Wire.FPP)
     private val lpcOut = ShortArray(Wire.FPP)
     private var mapped: Stun.Mapped? = null
+    /**
+     * The relay. FAIL-OPEN: every failure leaves the direct paths racing
+     * exactly as they were, because a relay that cannot be allocated must never
+     * stop a call that would have worked without it.
+     */
+    @Volatile var turn: Turn? = null; private set
+    /** Control arm: prove what the relay costs before believing it is free. */
+    @Volatile var useTurn = true
+    /** Only once a peer is actually bound is the channel worth sending into. */
+    @Volatile private var turnBound = false
+    private val bound = HashSet<String>()
     private var handshakesSent = 0
     private var lastStatusSent = -1
 
@@ -129,6 +177,34 @@ class CallSession(
         // can only find us by LAN candidate (measured: 28 s to connect).
         thread(isDaemon = true, name = "kin-signal") {
             mapped = Stun.discoverAny(s)
+            Metrics.mark("stun_ms", Metrics.sinceLaunch())
+            // On the SAME socket as the media and STUN, before the receive loop
+            // starts: an allocation on another socket relays that socket, and
+            // the round trips here would be eaten by the reader.
+            if (useTurn) runCatching {
+                val t = Turn.mint(base)
+                android.util.Log.i("kin", "turn: mint ${if (t == null) "failed" else "ok"}")
+                if (t != null) {
+                    // Reads for itself only here, before the loop exists.
+                    t.readDirectly = true
+                    val okA = t.allocate(s)
+                    android.util.Log.i("kin", "turn: allocate=$okA relay=${t.relay} err=${t.lastError}")
+                    if (okA) {
+                        turn = t
+                        Metrics.mark("turn_ms", Metrics.sinceLaunch())
+                    } else {
+                        // Named, not merely absent: a relay that could not be
+                        // allocated and a relay nobody asked for read the same
+                        // on a dashboard, and only one of them is a fault.
+                        Metrics.mark("turn_blocked_ms", Metrics.sinceLaunch())
+                        Metrics.fact("turn_blocked", t.lastError ?: "?")
+                    }
+                }
+                android.util.Log.i("kin", "turn: soTimeout after = ${s.soTimeout}")
+            }
+            // From here the receive loop owns the socket, and TURN's replies
+            // come through it.
+            turn?.readDirectly = false
             thread(isDaemon = true, name = "kin-rx") { receiveLoop(s) }
             thread(isDaemon = true, name = "kin-report") { reportLoop(s) }
             signalLoop(s)
@@ -184,7 +260,7 @@ class CallSession(
                 val now = System.currentTimeMillis()
                 if (now - beatAt > 5000) {
                     beatAt = now
-                    telemetry?.post(beatFields())
+                    telemetry?.post(beatFields(), version = appVersion)
                 }
             }
         }
@@ -196,6 +272,8 @@ class CallSession(
     @Volatile var geoLat: Double? = null
     @Volatile var geoLon: Double? = null
     @Volatile var geoErr: String? = null
+    /** What is actually installed, so a beat cannot claim a version it is not. */
+    @Volatile var appVersion: String = Telemetry.VERSION
 
     /** Never the room name: it is the encryption salt and never leaves here. */
     fun beatFields(): Map<String, Any?> = mapOf(
@@ -240,11 +318,15 @@ class CallSession(
         // instrument reporting a negative.
         "geo_err" to geoErr,
         "send_errors" to sendErrors,
+        "rx_errors" to rxErrors,
+        "dec_inline" to decodeInline,
+        "dec_depth" to decodeDepth,
+        "relay" to (turn?.relay ?: "-"),
         // Kept apart because they answer different questions: our own
         // arithmetic, and the kernel carrying our packets.
         "cpu_usr" to cpuUser,
         "cpu_sys" to cpuSys,
-    )
+    ) + Metrics.beatFields()
 
     /**
      * A person hung up. THE ONLY thing that ends a call: not the process
@@ -253,24 +335,44 @@ class CallSession(
     fun stop(hungUp: Boolean = true) {
         if (!running) return
         running = false
+        Metrics.fact("outcome", if (hungUp) "hung_up" else "ended")
         repeat(4) { sendSealed(Wire.goodbye()) }
-        telemetry?.post(beatFields(), phase = "final")
+        telemetry?.post(beatFields(), phase = "final", version = appVersion)
         if (hungUp) resume?.end()
         Thread.sleep(150)
+        decodeQueue?.stop()
         sock?.close()
     }
 
     // ── the wire ─────────────────────────────────────────────────────────────
 
     var sendErrors = 0; private set
+    var rxErrors = 0; private set
+    var rxPackets = 0; private set
+    private var rvLogs = 0
     var lastSendError: String? = null; private set
     var videoPacketsSent = 0; private set
 
+    /**
+     * RIG ONLY. Suppresses the direct sends so every packet has to ride the
+     * relay, because a relayed path that is never exercised is a path nobody
+     * has tested: on a LAN both ends lock to each other in a tenth of a
+     * millisecond and the channel data is ignored, so "the relay did not break
+     * the call" is not the same claim as "the relay works".
+     */
+    @Volatile var relayOnly = false
+
     private fun sendRaw(b: ByteArray, n: Int = b.size) {
         val s = sock ?: return
-        val targets = locked?.let { listOf(it) } ?: candidates
+        val targets = if (relayOnly && turnBound) emptyList()
+                      else locked?.let { listOf(it) } ?: candidates
         for (t in targets) try { s.send(DatagramPacket(b, n, t)) }
         catch (e: Exception) { sendErrors++; lastSendError = "${e.javaClass.simpleName}: ${e.message}" }
+        // And through our own allocation, so the relayed path is in the same
+        // race rather than a thing we fall back to after failing. ADDITIVE:
+        // never instead of the direct send, so a relay that is wrong about
+        // anything cannot cost a call that would have worked without it.
+        if (turnBound) turn?.let { runCatching { it.sendChannel(s, b, n) } }
     }
 
     private fun sendSealed(b: ByteArray, n: Int = b.size) {
@@ -281,6 +383,10 @@ class CallSession(
     private fun signalLoop(s: DatagramSocket) {
         val local = localIPv4()?.let { "$it:${s.localPort}" }
         val addr = mapped?.let { "${it.ip}:${it.port}" }
+        // Published beside the direct ones, and raced by measured round trip
+        // rather than preferred or avoided: on a long route the relay's
+        // backbone is sometimes genuinely shorter than the public internet.
+        val relay = turn?.relay
         var lastRv = 0L
         var lastProbe = 0L
         var lastHello = 0L
@@ -288,7 +394,7 @@ class CallSession(
             val now = System.currentTimeMillis()
             if (now - lastRv > 1000) {
                 lastRv = now
-                val peers = Rendezvous.exchange(room, me, addr, local, base = base)
+                val peers = Rendezvous.exchange(room, me, addr, local, relay, base = base)
                 if (peers != null) {
                     candidates = peers.filter { it.id != me }.flatMap { p ->
                         listOfNotNull(
@@ -297,6 +403,25 @@ class CallSession(
                             p.relayIP?.let { InetSocketAddress(it, p.relayPort!!) },
                         )
                     }
+                    // Permission and a channel for each peer candidate, so the
+                    // relay will actually carry to them — ONCE per peer, not on
+                    // every rendezvous tick. The channel is a standing binding,
+                    // and re-issuing it every second is work that buys nothing.
+                    turn?.let { t ->
+                        for (p in peers.filter { it.id != me }) {
+                            val k = "${p.ip}:${p.port}"
+                            if (k in bound) continue
+                            if (runCatching { t.bindPeer(s, p.ip, p.port) }.getOrDefault(false)) {
+                                bound.add(k)
+                                turnBound = true
+                            }
+                        }
+                    }
+                }
+                if (rvLogs < 4) {
+                    rvLogs++
+                    android.util.Log.i("kin", "rv: addr=$addr local=$local relay=$relay " +
+                        "peers=${peers?.size ?: -1} cands=${candidates.size} bound=$turnBound")
                 }
             }
             if (candidates.isNotEmpty() || locked != null) {
@@ -313,6 +438,10 @@ class CallSession(
             Thread.sleep(50)
         }
     }
+
+    /** The address our own allocation would appear as, for the `path` fact. */
+    private fun relaySocketAddr(): InetSocketAddress? =
+        turn?.let { if (it.relayIP.isEmpty()) null else InetSocketAddress(it.relayIP, it.relayPort) }
 
     private fun rxReport(): Wire.RxReport {
         val r = Wire.RxReport()
@@ -342,17 +471,64 @@ class CallSession(
     }
 
     private fun receiveLoop(s: DatagramSocket) {
+        android.util.Log.i("kin", "rx: loop started")
+        try {
+            receiveLoopInner(s)
+        } catch (t: Throwable) {
+            // A receive loop that dies takes the whole call with it and says
+            // nothing: every counter stays healthy and the audio simply never
+            // arrives. It must never end silently.
+            rxErrors++
+            android.util.Log.e("kin", "rx: loop died — ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun receiveLoopInner(s: DatagramSocket) {
         val buf = ByteArray(4096)
         val plainBuf = ByteArray(4096)
         val fbuf = FloatArray(Wire.FPP)
         while (running) {
             val pkt = DatagramPacket(buf, buf.size)
-            try { s.receive(pkt) } catch (_: Exception) { break }
+            try {
+                s.receive(pkt)
+            } catch (e: java.net.SocketTimeoutException) {
+                // A DEADLINE IS NOT A DEAD SOCKET. This loop used to break on
+                // any exception, so one leftover SO_TIMEOUT — set by STUN or by
+                // a TURN round trip and restored a moment later — killed the
+                // receive path for the whole call. The symptom was total
+                // silence with every other counter healthy, and it looked
+                // exactly like the relay being at fault.
+                continue
+            } catch (e: Exception) {
+                if (s.isClosed || !running) break
+                // Anything else: count it and carry on rather than ending the
+                // call on one bad datagram.
+                rxErrors++
+                continue
+            }
             var b = buf
             var n = pkt.length
+            // A relayed datagram arrives wrapped in a 4-byte channel header.
+            val fromAddr = pkt.socketAddress as? InetSocketAddress
+            // A TURN control reply belongs to whoever asked for it, not here.
+            if (fromAddr != null && turn?.offerReply(buf, n, fromAddr) == true) continue
+            if (fromAddr != null) turn?.unwrap(buf, n, fromAddr)?.let { (o, len) ->
+                n = len
+                b = buf.copyOfRange(o, o + len)
+            }
+            rxPackets++
+            if (rxPackets % 500 == 1) {
+                android.util.Log.i("kin", "rx: $rxPackets packets, established=${crypto.established}")
+            }
             var magic = Wire.magic(b, n)
             if (magic != Wire.HMAGIC) {
-                val opened = crypto.open(buf.copyOf(n))
+                // `b`, NOT `buf`: a relayed datagram has already been
+                // unwrapped out of its 4-byte channel header, and decrypting
+                // from offset 0 would feed the header to AES-GCM. Every
+                // relayed media packet would fail to open, silently, while the
+                // handshake (which is read from `b`) went through — a relay
+                // that connects and then carries nothing.
+                val opened = crypto.open(b.copyOf(n))
                 if (opened != null) {
                     System.arraycopy(opened, 0, plainBuf, 0, opened.size)
                     b = plainBuf; n = opened.size
@@ -363,11 +539,17 @@ class CallSession(
             }
             when (magic) {
                 Wire.HMAGIC -> {
+                    android.util.Log.i("kin", "rx: handshake")
+                    Metrics.mark("peer_found_ms", Metrics.sinceLaunch())
                     val parsed = Wire.parseHandshake(b, n) ?: continue
                     peerCaps = parsed.second
                     if (crypto.adoptPeer(parsed.first)) {
                         locked = pkt.socketAddress as InetSocketAddress
                         sendRaw(Wire.handshake(crypto.myPublic))
+                        Metrics.mark("connected_ms", Metrics.sinceLaunch())
+                        // Which path won the race, which is the first question
+                        // asked of any call that sounded wrong.
+                        Metrics.fact("path", if (locked == relaySocketAddr()) "relay" else "direct")
                         onState?.invoke("encrypted")
                     }
                 }
@@ -436,7 +618,12 @@ class CallSession(
                     if (len <= 0) continue
                     video.offer(h, b, Wire.VHDR, len)?.let { (payload, cap) ->
                         firstVideoSeen = true
-                        onVideoFrame?.invoke(payload, cap)
+                        // Off this thread. Invoking the decoder here stopped
+                        // audio being received for the length of every video
+                        // frame — the jitter buffer grew and was right to.
+                        val q = decodeQueue
+                        if (q != null) q.submit(payload, payload.size, cap)
+                        else onVideoFrame?.invoke(payload, cap)
                     }
                     // Nothing decodable yet: ask for a keyframe, rate-limited.
                     // Parameter sets ride only with keyframes, so a receiver

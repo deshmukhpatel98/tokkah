@@ -20,7 +20,17 @@ import kotlin.random.Random
  * and travels inside the signed ring, so the two ends never have to agree on a
  * word out of band.
  */
-class KinState(root: File) {
+class KinState(
+    root: File,
+    private val installedVersion: String = "0",
+    /**
+     * Only ever used to make a noise. A ring that arrives while Kin is OPEN
+     * never reaches RingService — the mailbox hands over to the activity at
+     * ON_START — so without this the in-app ring was the one that stayed
+     * silent, which is the opposite of the case that needs the sound least.
+     */
+    private val ctx: android.content.Context? = null,
+) {
     val identity = Identity(File(root, "kin"))
     val faces = Faces(File(root, "kin"))
     val watcher = RingWatcher(identity)
@@ -57,6 +67,7 @@ class KinState(root: File) {
                 incoming = r
                 cardMode = CallCardMode.RINGING
                 cardLine = null; cardBecause = null
+                ctx?.let { Ringer.start(it) }
                 onChanged?.invoke()
             }
         }
@@ -65,6 +76,7 @@ class KinState(root: File) {
             if (incoming?.from == r.from) {
                 incoming = null
                 cardMode = CallCardMode.INVITE
+                Ringer.stop()
                 onChanged?.invoke()
             } else if (outgoingTo == r.from) {
                 failCall("@${r.from} declined", "maybe later")
@@ -92,7 +104,7 @@ class KinState(root: File) {
      * about it again. Where it cannot, the row on the front door is the one tap,
      * and that difference is stated rather than hidden.
      */
-    fun checkForUpdate(installed: String = com.tokkah.kin.net.Telemetry.VERSION) {
+    fun checkForUpdate(installed: String = installedVersion) {
         if (updateThread != null) return
         updateThread = thread(isDaemon = true, name = "kin-update") {
             while (true) {
@@ -207,6 +219,7 @@ class KinState(root: File) {
     }
 
     fun answered() {
+        Ringer.stop()
         outgoingTo = null
         incoming = null
         cardMode = CallCardMode.INVITE
@@ -215,6 +228,7 @@ class KinState(root: File) {
     }
 
     fun answerIncoming() {
+        Ringer.stop()
         val r = incoming ?: return
         incoming = null
         cardMode = CallCardMode.INVITE
@@ -226,6 +240,7 @@ class KinState(root: File) {
 
     /** A decline is a signed `bye`, not silence. */
     fun declineIncoming() {
+        Ringer.stop()
         val r = incoming ?: return
         incoming = null
         cardMode = CallCardMode.INVITE

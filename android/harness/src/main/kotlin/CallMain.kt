@@ -50,6 +50,11 @@ object CallMain {
 
         val speech = wavPath?.let { readWav(it) }
         val s = CallSession(room)
+        // Both arms of the relay experiment, from the same binary: the control
+        // arm is the whole reason the relay's cost was ever attributable.
+        s.useTurn = (System.getenv("KIN_TURN") ?: "0") == "1"
+        s.relayOnly = (System.getenv("KIN_RELAY_ONLY") ?: "0") == "1"
+        println("harness: turn=${s.useTurn} relayOnly=${s.relayOnly}")
         s.onState = { println("harness: state -> $it") }
         s.start()
 

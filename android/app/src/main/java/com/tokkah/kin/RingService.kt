@@ -103,9 +103,15 @@ class RingService : Service() {
             .addAction(0, "Answer", open(r.from, r.room))
             .build()
         nm.notify(RING_ID, n)
+        // The sound and the buzz. The notification alone was the SEEING half of
+        // a ring; a phone face-down on a table is the case the watcher exists
+        // for, and it never made a noise.
+        Ringer.start(this)
+        Ringer.checkReachedFront(this)
     }
 
     private fun cancelRing() {
+        Ringer.stop()
         getSystemService(NotificationManager::class.java)?.cancel(RING_ID)
     }
 
@@ -170,6 +176,13 @@ class RingService : Service() {
                     NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "Someone calling you."
                     setBypassDnd(false)
+                    // SILENT ON PURPOSE. The ringtone is played and looped by
+                    // Ringer, on the ringer stream. Leaving the channel's own
+                    // sound on would put a one-shot notification chime over the
+                    // top of it — two sounds for one call, and the wrong one
+                    // arriving first.
+                    setSound(null, null)
+                    enableVibration(false)
                 },
             )
         }

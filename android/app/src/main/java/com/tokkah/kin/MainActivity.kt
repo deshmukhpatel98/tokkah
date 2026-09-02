@@ -33,6 +33,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.tokkah.kin.net.CallSession
 import com.tokkah.kin.net.Floor
+import com.tokkah.kin.net.Metrics
 import com.tokkah.kin.net.Identity
 import com.tokkah.kin.net.Server
 import com.tokkah.kin.ui.CallScreen
@@ -42,6 +43,9 @@ import com.tokkah.kin.ui.Person
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+
+/** Rig overrides read off the launch intent. Empty on every real launch. */
+private val rigFlags = HashMap<String, Boolean>()
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,6 +58,16 @@ class MainActivity : ComponentActivity() {
         val ringWho = intent?.getStringExtra(RingService.EXTRA_FROM) ?: ""
         val deep = fromRing ?: intent?.data?.let { u ->
             (u.pathSegments?.lastOrNull() ?: u.host)?.takeIf { it.isNotBlank() }
+        }
+        // ── RIG ARMS, FROM THE LAUNCH INTENT ────────────────────────────────
+        //
+        // Every production cadence and every default gets an override the
+        // harness can set, because an A/B that needs a rebuild between arms is
+        // an A/B nobody runs twice. Read here and NOT from a build flag, so the
+        // arms are the same binary — a rebuild between arms is a second
+        // variable.
+        for (k in listOf("turn", "decodeq")) {
+            intent?.getStringExtra(k)?.let { rigFlags[k] = it == "1" || it == "true" }
         }
         RingService.channels(this)
         setContent { KinApp(deep, if (fromRing != null) ringWho else "") }
@@ -90,7 +104,17 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         ActivityResultContracts.RequestPermission(),
     ) { ok -> if (ok) { RingService.start(ctx); listening = true } }
 
-    val state = remember { KinState(ctx.filesDir) }
+    // The version that is ACTUALLY INSTALLED, asked of the package manager.
+    // A hardcoded constant here re-downloaded the release forever: 64 MB every
+    // half hour of something already installed, on somebody else's battery and
+    // data, while the app looked perfectly healthy — the same shape as the
+    // failure Update.swift records for a copy that cannot write /Applications.
+    val installedVersion = remember {
+        runCatching {
+            ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "0"
+        }.getOrDefault("0")
+    }
+    val state = remember { KinState(ctx.filesDir, installedVersion, ctx.applicationContext) }
     val identity = state.identity
 
     var micGranted by remember {
@@ -116,6 +140,11 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     fun join(name: String, who: String = "") {
         if (name.isBlank()) return
         val s = CallSession(name.trim(), store = ctx.filesDir.resolve("kin"), who = who)
+        s.appVersion = installedVersion
+        s.useTurn = ctx.getSharedPreferences("kin", Context.MODE_PRIVATE).getBoolean("turn", true)
+        // Rig arms, from the launch intent, so an A/B needs no rebuild.
+        rigFlags["turn"]?.let { s.useTurn = it }
+        rigFlags["decodeq"]?.let { s.useDecodeQueue = it }
         s.start()
         val a = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
         a.start()
@@ -258,25 +287,28 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                         } else { RingService.start(ctx); listening = true }
                     } else { RingService.stop(ctx); listening = false }
                 },
-                onSettings = { settingsOpen = !settingsOpen },
+                onSettings = { Metrics.tap("settings"); settingsOpen = !settingsOpen },
                 onJoin = {
                     // A handle rings a person; anything else is a room name.
                     val typed = room.trim().removePrefix("@")
                     if (identity.handleOK(typed) && typed != myHandle) state.call(typed)
                     else join(room)
                 },
-                onCall = { handle -> state.call(handle) },
+                onCall = { handle -> Metrics.tap("call_person"); state.call(handle) },
                 onResume = {
                     state.pending?.let { join(it.room, it.who) }
                     state.pending = null
                 },
                 onInvite = {
                     val link = "${Server.invite}/${room.ifBlank { myHandle }}"
-                    ctx.getSystemService(ClipboardManager::class.java)
-                        ?.setPrimaryClip(ClipData.newPlainText("kin", link))
+                    val cb = ctx.getSystemService(ClipboardManager::class.java)
+                    cb?.setPrimaryClip(ClipData.newPlainText("kin", link))
+                    // A copy that did not land is a real failure mode and a
+                    // silent one: the person pastes the last thing they copied.
+                    Metrics.tap("invite_copy", ok = cb != null)
                 },
                 quiet = quiet,
-                onQuiet = { on -> quiet = on },
+                onQuiet = { on -> Metrics.tap("quiet"); quiet = on },
             ) {
                 if (camGranted) SelfPreview { cameraHint = it }
             }
@@ -355,13 +387,31 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                 voicing = voicing,
                 muted = muted,
                 camOn = camOn,
-                onMute = { muted = !muted; s.selfMuted = muted },
-                onCamera = {
-                    if (!camOn) { if (video?.startEncode() == true) { camOn = true; s.camOn = true } }
-                    else { video?.stop(); camOn = false; s.camOn = false }
+                // ok = the flag actually moved. A control that is pressed and
+                // does nothing must be distinguishable from one nobody pressed.
+                onMute = {
+                    muted = !muted; s.selfMuted = muted
+                    Metrics.tap("mute", ok = s.selfMuted == muted)
                 },
-                onFlip = { video?.let { it.facingFront = !it.facingFront } },
-                onLeave = { leave() },
+                onCamera = {
+                    if (!camOn) {
+                        val started = video?.startEncode() == true
+                        if (started) { camOn = true; s.camOn = true }
+                        // A camera button that fails to bring the camera up is
+                        // the single most reported thing in this app, and until
+                        // now it looked identical to not pressing it.
+                        Metrics.tap("camera_on", ok = started)
+                    } else {
+                        video?.stop(); camOn = false; s.camOn = false
+                        Metrics.tap("camera_off")
+                    }
+                },
+                onFlip = {
+                    val v = video
+                    v?.let { it.facingFront = !it.facingFront }
+                    Metrics.tap("flip", ok = v != null)
+                },
+                onLeave = { Metrics.tap("leave"); leave() },
                 peeking = peeking,
                 onPeek = { peeking = it },
                 caption = caption,

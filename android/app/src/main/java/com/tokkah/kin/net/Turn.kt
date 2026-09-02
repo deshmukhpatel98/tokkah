@@ -128,6 +128,37 @@ class Turn(
         if (nonce.isNotEmpty()) attrs.add(0x0015 to nonce.toByteArray())
     }
 
+    /**
+     * ── ONE READER OF THE SOCKET ────────────────────────────────────────────
+     *
+     * These round trips used to read the socket themselves. Once the media
+     * receive loop is running that is TWO readers of one socket, and they steal
+     * from each other: a `bindPeer` on the signal thread swallowed the peer's
+     * handshakes for up to 800 ms every second, and the call went completely
+     * silent with every counter healthy and the relay looking like the culprit.
+     *
+     * So the reply arrives the same way media does — through the receive loop,
+     * which hands it here by transaction id. Before that loop exists (the first
+     * allocate, on a fresh socket) [readDirectly] is set and this reads for
+     * itself, because there is nobody else to.
+     */
+    @Volatile var readDirectly = true
+    private val waiters = HashMap<String, java.util.concurrent.ArrayBlockingQueue<Reply>>()
+
+    /** Called by the receive loop for anything from the TURN server. */
+    fun offerReply(buf: ByteArray, n: Int, from: InetSocketAddress): Boolean {
+        if (!isTurnServer(from) || n < 20) return false
+        // Channel data has its top two bits set; a STUN/TURN message does not.
+        if ((buf[0].toInt() and 0xC0) != 0) return false
+        val key = txKey(buf, 8)
+        val q = synchronized(waiters) { waiters[key] } ?: return false
+        q.offer(parse(buf, n))
+        return true
+    }
+
+    private fun txKey(b: ByteArray, off: Int) =
+        (0 until 12).joinToString("") { "%02x".format(b[off + it]) }
+
     private fun roundTrip(
         sock: DatagramSocket, method: Int,
         extra: List<Pair<Int, ByteArray>>, integrity: Boolean, timeoutMs: Int = 800,
@@ -135,21 +166,33 @@ class Turn(
         val a = turnAddr ?: return null
         val txid = Random.nextBytes(12)
         val pkt = build(method, txid, extra, integrity)
-        val prev = sock.soTimeout
-        return try {
+        val key = txKey(txid, 0)
+        val q = java.util.concurrent.ArrayBlockingQueue<Reply>(2)
+        synchronized(waiters) { waiters[key] = q }
+        try {
             sock.send(DatagramPacket(pkt, pkt.size, a))
-            sock.soTimeout = timeoutMs
-            val buf = ByteArray(1500)
-            val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-            while (System.nanoTime() < deadline) {
-                val p = DatagramPacket(buf, buf.size)
-                try { sock.receive(p) } catch (e: Exception) { return null }
-                if (p.length < 20) continue
-                if ((0 until 12).any { buf[8 + it] != txid[it] }) continue
-                return parse(buf, p.length)
+            if (!readDirectly) {
+                return q.poll(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
             }
-            null
-        } catch (e: Exception) { null } finally { sock.soTimeout = prev }
+            val prev = sock.soTimeout
+            try {
+                sock.soTimeout = timeoutMs
+                val buf = ByteArray(1500)
+                val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+                while (System.nanoTime() < deadline) {
+                    val p = DatagramPacket(buf, buf.size)
+                    try { sock.receive(p) } catch (e: Exception) { return null }
+                    if (p.length < 20) continue
+                    if ((0 until 12).any { buf[8 + it] != txid[it] }) continue
+                    return parse(buf, p.length)
+                }
+                return null
+            } finally { sock.soTimeout = prev }
+        } catch (e: Exception) {
+            return null
+        } finally {
+            synchronized(waiters) { waiters.remove(key) }
+        }
     }
 
     private fun parse(buf: ByteArray, n: Int): Reply {
