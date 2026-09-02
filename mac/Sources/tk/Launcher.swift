@@ -1187,7 +1187,9 @@ enum Launcher {
       // "esc to cancel" rides the pill rather than a second line: the pill is
       // already the one place this window narrates itself, and a way out nobody
       // is told about is not a way out.
-      let base = "Calling \(Identity.display(who))"
+      // `var`: the check below may find their Mac quiet, and the line changes
+      // while the dots keep moving.
+      var base = "Calling \(Identity.display(who))"
       let tail = "   ·   esc to cancel"
       let frames = ["", ".", "..", "…"]
       // Measured against the widest frame, so only the dots move.
@@ -1203,6 +1205,34 @@ enum Launcher {
         dotTimer = d
       }
       Thread {
+        // ── IS THERE ANYBODY TO RING ───────────────────────────────────────
+        //
+        // Asked first, so the answer is on THIS card rather than in a call
+        // window that has already opened with the camera on. A name nobody
+        // has claimed ends here; a quiet Mac is said out loud and rung anyway,
+        // because a queued ring wakes it if it comes back within the lease.
+        let pre = Presence.ask(who)
+        if pre.registered == false {
+          DispatchQueue.main.async {
+            t.ringSettled = true
+            guard t.ringGen == gen else { Metrics.count("ring_cancelled"); return }
+            dotTimer?.invalidate(); dotTimer = nil
+            dimOthers(nil)
+            Metrics.count("ring_unregistered")
+            fputs("ring: @\(who) is not registered -- not rung\n", stderr)
+            setHint("Nobody has the name \(Identity.display(who)) on Kin yet — check the spelling.")
+            t.ringing = false
+          }
+          return
+        }
+        if pre.here == false {
+          DispatchQueue.main.async {
+            guard t.ringGen == gen else { return }
+            fputs("ring: @\(who) is registered but their Mac is quiet -- ringing anyway\n", stderr)
+            base = "\(Identity.display(who))’s Mac is off right now — ringing it anyway"
+            setHint(base + "…" + tail, measuring: base + ".." + tail)
+          }
+        }
         Metrics.count("ring_sent_try")
         let got = Identity.ring(to: who, room: room)
         let listening = Identity.lastRingListening

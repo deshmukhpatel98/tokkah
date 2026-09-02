@@ -203,6 +203,30 @@ else
   say FAIL "a plain row click removed somebody: $(grep 'home: removed' "$SP/rm.log" | tr '\n' ' ')"; fail=1
 fi
 
+# ── IS THERE ANYBODY TO RING ─────────────────────────────────────────────────
+# Type a name nobody has claimed and the ring used to be ACCEPTED: a call window
+# opened, camera on, saying "calling @meeraa…" for as long as you watched. The
+# card now asks the server first. Three answers, and each has to be seen: a name
+# nobody owns is refused on the card (no call window, no ring sent); a claimed
+# name whose Mac is quiet is said out loud and rung anyway; a name that is here
+# rings with no remark. `TK_PRESENCE_FAKE` spells them 'x', '0' and '1'.
+export TK_KIN_DIR="$SP/kin-pre"
+mkdir -p "$TK_KIN_DIR"
+TK_PRESENCE_FAKE="nobody=x,arjun=0,meera=1" "$TK" --contacts-fake "arjun,meera" --gui \
+  --no-update --no-telemetry --no-relocate --press "type:nobody,?,@arjun" --press-after 2 \
+  > "$SP/pre.log" 2>&1 & PIDS="$PIDS $!"
+sleep 8
+reap
+if grep -q "ring: @nobody is not registered -- not rung" "$SP/pre.log" \
+   && ! grep -q "ring: @nobody in room" "$SP/pre.log"; then
+  say OK "a name nobody has claimed is refused on the card, no ring sent"
+else
+  say FAIL "an unclaimed name was rung: $(grep -E '^ring:' "$SP/pre.log" | head -2 | tr '\n' ' ')"; fail=1
+fi
+grep -q "ring: @arjun is registered but their Mac is quiet -- ringing anyway" "$SP/pre.log" \
+  && say OK "a quiet Mac is said out loud and still rung" \
+  || { say FAIL "quiet Mac not announced: $(grep -E '^ring:' "$SP/pre.log" | tail -1)"; fail=1; }
+
 # ── THE CARD IS SHORT, AND STAYS SHORT ───────────────────────────────────────
 # This card floats over the person's own face and every row on it covers part of
 # that face -- the report that started this was "I really can't see my face".

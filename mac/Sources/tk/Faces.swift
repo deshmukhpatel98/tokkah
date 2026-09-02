@@ -106,6 +106,48 @@ enum Presence {
   /// real server hold polls for pretend people, and a presence dot that has
   /// only ever been audited grey is an instrument blind to its own positive
   /// (`feature-behind-a-flag-nobody-runs`).
+  // ── ONE PERSON, ASKED BEFORE THE RING, WITH THE ANSWER IN HAND ─────────────
+  //
+  // `fetch` paints dots and is allowed to be wrong for a moment; this decides
+  // whether a call happens at all, so it is synchronous (call it off main, like
+  // `Identity.ring`) and it keeps its three states apart. `registered == false`
+  // is the only answer that STOPS a ring: a name nobody has claimed is not a
+  // person, and ringing it opened a call window that said "calling @meeraa…"
+  // for ever. `here == false` merely changes what the card says while the ring
+  // goes out -- a quiet Mac may still wake to it. Any transport failure is
+  // `nil` twice and the ring proceeds exactly as it did before this existed
+  // (`blind-instruments-report-negatives`).
+  struct Answer { var registered: Bool?; var here: Bool? }
+  static func ask(_ handle: String) -> Answer {
+    if let fake = ProcessInfo.processInfo.environment["TK_PRESENCE_FAKE"] {
+      // `name=1` here, `name=0` registered and quiet, `name=x` never claimed.
+      for pair in fake.split(separator: ",") {
+        let kv = pair.split(separator: "=")
+        guard kv.count == 2, kv[0] == handle[...] else { continue }
+        if kv[1] == "x" { return Answer(registered: false, here: false) }
+        return Answer(registered: true, here: kv[1] == "1")
+      }
+      return Answer()
+    }
+    guard let who = Identity.sanitize(handle),
+          let url = URL(string: Server.base + "/api/kin/presence?who=" + who) else { return Answer() }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 4
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    var out = Answer()
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+      defer { sem.signal() }
+      guard let data,
+            let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]],
+            let v = o[who] else { return }
+      out.registered = v["registered"] as? Bool
+      out.here = v["here"] as? Bool
+    }.resume()
+    _ = sem.wait(timeout: .now() + 5)
+    return out
+  }
+
   static func fetch(_ handles: [String], done: @escaping ([String: Bool]) -> Void) {
     if let fake = ProcessInfo.processInfo.environment["TK_PRESENCE_FAKE"] {
       var out: [String: Bool] = [:]
