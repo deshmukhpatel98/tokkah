@@ -178,6 +178,17 @@ class KinState(
         onInstall?.invoke(f)
     }
 
+    /**
+     * The call ended: the promise "update ready — restarts when the call ends"
+     * is kept HERE. Until this existed the install was offered only by the
+     * poll that found the update, which had already run and been refused for
+     * being mid-call — a deferral with nothing to resume it.
+     */
+    fun callEnded() {
+        inCall = false
+        if (readyFile != null) thread(isDaemon = true) { Thread.sleep(400); offerInstall() }
+    }
+
     /** The UI is listening for changes; publish what we already know. */
     fun onChangedReady() { onChanged?.invoke() }
 

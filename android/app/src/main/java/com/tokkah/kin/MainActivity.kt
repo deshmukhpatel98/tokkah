@@ -207,7 +207,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         video?.stop(); audio?.stop()
         session?.stop(hungUp = true)
         video = null; audio = null; session = null
-        state.inCall = false
+        state.callEnded()
         state.refresh()
     }
 
