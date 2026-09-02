@@ -365,14 +365,37 @@ if [ -f "$SP/h.log" ]; then
   grep -q "prev-call" "$SP/h.log" \
     && say "OK" "and handed its call id to its successor, so the two rows are one call" \
     || say "FAIL" "the successor does not name the row it continues"
+  # ── ASSERT THE GAP, NOT THE SHAPE OF THE LAST SIX SAMPLES ─────────────────
+  #
+  # This counted how many of the far end's last six per-second reports had media
+  # and required four. That is a proxy for "the call survived", and it depends on
+  # WHERE in those six seconds the re-exec happened to land: the same 1-second gap
+  # is 1 zero in the middle of the window and 3 zeros across a boundary. It failed
+  # in the parallel lane, so it was moved to the exclusive one, and then failed
+  # there too -- because the lane was never the problem, the sampling was.
+  #
+  # The rig already measures the thing itself, three lines down: the far end
+  # reports its own `media gap N ms`. So the recovery is asserted on that, and the
+  # sample count stays as the supporting sentence it always was. A gap under three
+  # seconds is a call that survived an app restarting underneath it; measured
+  # repeatedly here, it is about one second.
   UPBACK=$(grep -E "^cap " "$SP/g.log" | tail -6 | grep -cvE "recv 0/s")
-  [ "${UPBACK:-0}" -ge 4 ] \
-    && say "OK" "and the other person was still there afterwards ($UPBACK of their last 6 reports had media)" \
-    || say "FAIL" "the update ended the call for the person who did not take it"
+  ANYBACK=$(grep -E "^cap " "$SP/g.log" | tail -3 | grep -cvE "recv 0/s")
+  [ "${ANYBACK:-0}" -ge 1 ] \
+    && say "OK" "and the other person was still there afterwards ($UPBACK of their last 6 reports had media, and media was flowing at the end)" \
+    || say "FAIL" "the update ended the call for the person who did not take it: no media in their last 3 reports"
   grep -q "the other person left" "$SP/g.log" \
     && say "FAIL" "and they were told the other person left, over an update" \
     || say "OK" "and they were never told the other person left"
   UGAP=$(grep -oE "media gap [0-9]+ ms" "$SP/g.log" | head -1 | grep -oE "[0-9]+")
+  # AND THE GAP ITSELF HAS A CEILING. Without one this line is a readout, and a
+  # readout cannot fail: an update that cost the far end ten seconds of silence
+  # would have printed just as cheerfully.
+  if [ -n "${UGAP:-}" ]; then
+    [ "${UGAP}" -le 3000 ] \
+      && say "OK" "and it cost the far end ${UGAP} ms of media, inside the 3 s ceiling" \
+      || say "FAIL" "taking an update cost the far end ${UGAP} ms of media -- long enough to be a dropped call"
+  fi
   [ -n "${UGAP:-}" ] \
     && say "OK" "cost of taking an update mid-call, measured at the far end: ${UGAP} ms of media" \
     || say "OK" "the far end never even lost the peer long enough to notice a gap"

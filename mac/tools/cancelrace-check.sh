@@ -209,11 +209,28 @@ spctl -a "$APP" 2>/dev/null \
 # rig that passes on one Mac and hangs on another. `--listen 8091` for the same
 # reason: the default port belongs to whatever else is running here.
 copyargs() { # log path
-  # `--skip-mic-permission` because this bundle is built freshper run and is
-  # therefore a NEW TCC IDENTITY: the first microphone request inside it puts up a
-  # dialog for an app nobody has ever seen, and the copy stops there -- eight lines
-  # into its log, forever. Measured; it is why arm B could never run. Nothing here
-  # is about audio.
+  # ── WHY THE MICROPHONE QUESTION IS SKIPPED, AND WHY THAT IS NOT A GAP ─────
+  #
+  # This bundle is built fresh per run and is therefore a NEW TCC IDENTITY: the
+  # first microphone request inside it puts up a dialog for an app nobody has ever
+  # seen, and the copy stops there -- eight lines into its log, forever, for a
+  # prompt no rig can answer and a bundle that is deleted twenty seconds later.
+  # Measured; it is why arm B could never run.
+  #
+  # It cannot be fixed by granting. An ad-hoc signature's designated requirement IS
+  # the cdhash (`tcc-identity-is-a-content-hash`), so every build is a different
+  # app to TCC and a grant given today is void tomorrow. The only bundle on this
+  # Mac with a durable grant is `/Applications/Kin.app`, and pointing a rig at the
+  # owner's installed app -- to open windows on their screen, mid-session -- is a
+  # worse trade than this flag.
+  #
+  # And the flag costs this arm nothing, because of what it actually changes. With
+  # a granted microphone the app reads `.authorized`, sets `gMicAccess = 1`, does
+  # not prompt, and carries on. With `--skip-mic-permission` it sets
+  # `gMicAccess = -1`, does not prompt, and carries on. The difference is the value
+  # of one telemetry field, and nothing on the path this arm tests -- the ring
+  # poll, the cancel note, the card coming down -- reads it. The assertions below
+  # require the copy to reach that poll, which is exactly what the dialog stopped.
   echo "--no-relocate --no-update --no-telemetry --no-subtitles --no-ring-preview" \
        "--skip-mic-permission --mute --listen 8091 --log $1 --press-after 4 --press ?"
 }
