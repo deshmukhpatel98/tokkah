@@ -25,7 +25,8 @@ class Floor {
         var predictCooldownMs = 250.0
         var idleTakesAnyVoice = true
         var headphoneDuplex = true
-        var speakerDuplex = false
+        /** 0.125.0: ON, behind the measured −26 dB gate below. `speakerDuplexPath` is the gate. */
+        var speakerDuplex = true
         var speakerDuplexPath = 0.05f
     }
 

@@ -77,6 +77,8 @@ fun HomeScreen(
     onRoom: (String) -> Unit,
     card: HomeCard,
     cameraHint: String?,
+    /** The pill is pressable when the sentence names a way out (a denied permission). */
+    onHintClick: (() -> Unit)? = null,
     onUpdate: () -> Unit,
     onSettings: () -> Unit,
     onJoin: () -> Unit,
@@ -129,7 +131,7 @@ fun HomeScreen(
                 // The pill sits in the SKY above the card, in the picture,
                 // with a clear band between them.
                 if (cameraHint != null) {
-                    HintPill(cameraHint)
+                    HintPill(cameraHint, onClick = onHintClick)
                     Spacer(Modifier.height(Metric.s8))
                 }
                 GlassSurface(Modifier.fillMaxWidth(), radius = Metric.cardRadius) {

@@ -585,7 +585,10 @@ class CallSession(
                 }
             }
             if (candidates.isNotEmpty() || locked != null) {
-                if (!crypto.established && now - lastHello > 300) {
+                // The Mac's cadence: every 250 ms until the key is agreed, then
+                // every 5 s as a keepalive of the key -- a peer that restarts
+                // learns our key again without waiting for us to notice.
+                if (now - lastHello > (if (crypto.established) 5000 else 300)) {
                     lastHello = now
                     sendRaw(Wire.handshake(crypto.myPublic))
                     handshakesSent++
@@ -834,9 +837,17 @@ class CallSession(
         if (speakers) {
             aec.process(x, n, emitRing, emitW, emitRing.size)
             gate.echoResidual = aec.residual
+            // The floor's speaker-duplex gate reads the canceller (Audio.swift
+            // 1116-1119). These two were declared on the floor and fed by
+            // nothing, so the gate could never open.
+            floor.aecErleDb = aec.erleDb
+            floor.aecEchoPath = aec.echoPathNow
         } else {
             gate.echoResidual = 1f
+            floor.aecErleDb = 0.0
+            floor.aecEchoPath = 1f
         }
+        floor.speakers = speakers
         // The mouth outranks the correlation, and in one direction only.
         gate.mouthSays = visualKnown && visualVoice
         // The prior is computed on THIS machine's own voice, and travels: it

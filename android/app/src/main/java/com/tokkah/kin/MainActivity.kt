@@ -270,6 +270,8 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
             when (e) {
                 androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    micGranted = granted(ctx, Manifest.permission.RECORD_AUDIO)
+                    camGranted = granted(ctx, Manifest.permission.CAMERA)
                     // The clipboard is readable only by the focused app, and
                     // focus lands a moment after resume.
                     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -331,7 +333,24 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     reachHint = reachHint,
                     removing = removing,
                 ),
-                cameraHint = cameraHint,
+                // A denied permission is said, with the way to fix it, the way
+                // the Mac's pill does: the mic first (0.121: "a denied microphone
+                // was completely invisible"), then the camera. Pressing the pill
+                // opens this app's settings page, which is where the switch is.
+                cameraHint = when {
+                    !micGranted -> "Kin can’t hear you — tap here to turn on the microphone."
+                    !camGranted -> "Camera access is off — tap here to turn it on."
+                    else -> cameraHint
+                },
+                onHintClick = if (micGranted && camGranted) null else ({
+                    Metrics.tap("permissions_open")
+                    runCatching {
+                        ctx.startActivity(android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.fromParts("package", ctx.packageName, null),
+                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    }
+                }),
                 onUpdate = {
                     // The bytes were checked against a signature we control
                     // before this row ever appeared; the system installer is

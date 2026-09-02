@@ -115,6 +115,20 @@ class Aec {
             return max(0.02f, min(1f, 10.0.pow(-e / 20.0).toFloat()))
         }
 
+    /**
+     * `Aec.echoPathNow`: how much of what the speaker played is still in the
+     * microphone after subtraction, as an amplitude ratio (1 = nothing removed).
+     * The floor's speaker-duplex gate opens only under 0.05 (−26 dB). The Mac
+     * measures this over far-only speech; here the smoothed energies include
+     * near speech, which can only make the path read HIGHER — a gate that stays
+     * shut when it could open, never one that opens on a lie.
+     */
+    val echoPathNow: Float
+        get() {
+            if (!cfg.on || mix <= 0.05f || refE <= 1e-12 || eE <= 1e-12) return 1f
+            return min(1f, max(0.0005f, sqrt(eE / refE).toFloat()))
+        }
+
     private fun log10(x: Double) = ln(x) / ln(10.0)
     private fun Double.pow(p: Double) = Math.pow(this, p)
 
