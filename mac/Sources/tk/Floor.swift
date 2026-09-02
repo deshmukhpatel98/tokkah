@@ -301,7 +301,18 @@ final class Floor {
     ///
     /// `--speaker-duplex` turns it on for exactly that call. The beat then carries
     /// `aec_erle_db` and `floor_duplex_pct`, so one real two-room call answers it.
-    var speakerDuplex = false
+    /// ── 0.125.0: ON, BECAUSE THE GATE IS THE MEASUREMENT ─────────────────────
+    ///
+    /// Everything above about why it shipped off was about the RISK of opening
+    /// two microphones on a room the canceller cannot hold. The gate below opens
+    /// them only in the moments the remaining path is MEASURED under -26 dB, and
+    /// the floor re-engages within one window when it is not -- so on such a room
+    /// this is exactly 0.124.0 and on a room the canceller does hold, both people
+    /// can talk. The user's rule for it: the voice must never be touched, and
+    /// nothing may be lost. Linear subtraction cannot touch the voice; the floor
+    /// is what stands ready to close. `--no-speaker-duplex` is the arm, and
+    /// `floor_aec_duplex_pct` in the beat says how much of a real call it bought.
+    var speakerDuplex = true
     /// ── AND THE BAR IS WHAT IS LEFT, NOT WHAT WAS REMOVED ────────────────────
     ///
     /// The first version of this gated on the canceller's ERLE, and ERLE is the

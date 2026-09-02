@@ -144,6 +144,22 @@ final class Aec {
     /// up, changed device. Zeroing a converged filter on a twitch costs more
     /// than the twitch.
     var reaimHits = 3
+    /// ── AND A FILTER THAT IS WORKING IS NOT RE-AIMED ─────────────────────────
+    ///
+    /// Live calls on 0.124.0 read 21-32 re-aims in 140 s, 5 divergences, and an
+    /// ERLE under 2 dB. Every re-aim zeroes both filters. The estimator's
+    /// reading is an 8-sample-quantised cross-correlation over 400 ms and on an
+    /// intermittent playout it wanders; three wandering readings in a row and a
+    /// converged filter was thrown away for a delay the room had not moved to.
+    ///
+    /// So a disagreeing estimate is HELD while the filter on the audio is
+    /// measurably removing echo -- `mix` at or near 1 and the far-only ERLE at
+    /// least this -- because a filter removing 6 dB at the old delay is stronger
+    /// evidence about the delay than a correlation peak is. Not a one-way door:
+    /// if the path really moved the ERLE collapses within its 0.5 s window, the
+    /// hold lapses, and the re-aim proceeds on the next block. `reaimsHeld`
+    /// counts how often this fired.
+    var reaimHoldDb: Double = 6
     /// ERLE above which the subtraction is applied in full. Not zero: a filter
     /// achieving half a decibel is inside the measurement's own noise, and
     /// subtracting on that basis is taking a risk for nothing.
@@ -207,6 +223,17 @@ final class Aec {
     /// crystal pair this could plausibly meet, and small enough that even a skew
     /// stuck at the rail cannot outrun the recovery door below.
     var dllSkewMax: Float = 6
+    /// ── A WANDERING ESTIMATOR IS NOT A DRIFTING CLOCK ────────────────────────
+    ///
+    /// Traced with readings 10 ms off for 2 s in every 6: the regression fitted
+    /// slopes of -40 samples/s with a standard error of 17, the 1.5x-se gate
+    /// passed, the skew railed at -6 and the window walked a converged filter
+    /// off its target -- 24.5 dB to 8.1 in five seconds. Two crystals cannot
+    /// drift at 830 ppm, and a real 30 ppm fit here reads ±0.14-0.33 sps. So a
+    /// fit is believed only when its residual error is under this AND its slope
+    /// is physically possible; anything else is the estimator wandering, which
+    /// the re-aim hold above already deals with. Counted as `skewRejects`.
+    var skewMaxSe: Float = 1.0
     /// The recovery door: the canceller not helping (`mix` at zero) for this long
     /// while aimed resets the alignment AND the skew. Its evidence is the mix,
     /// which is measured every block whether or not the steering runs -- a
@@ -268,8 +295,111 @@ final class Aec {
     /// The background being this much worse than the foreground means it has run
     /// away. Restarted FROM the foreground, never from zero.
     var bgResetRatio: Float = 2.0
+    /// ── THE LOUDSPEAKER IS NOT LINEAR, AND THIS IS STILL SUBTRACTION ─────────
+    ///
+    /// A laptop's speaker driven at conversation volume compresses its peaks and
+    /// adds harmonics the reference does not contain. No linear filter can
+    /// predict what is not a linear function of its input, and `mac/ECHO.md`
+    /// names this as the largest term left after 0.109.0.
+    ///
+    /// The answer that keeps the head-of-file promise is a Hammerstein model:
+    /// memoryless nonlinear BASIS signals built from the reference alone --
+    /// x|x|, x^3, x^5 -- each through its own short adaptive FIR at the same
+    /// delay, summed into the same prediction and subtracted. Every term is still
+    /// a function of what THIS machine played, so the near voice passes through
+    /// as exactly as before, and `--aec-test` asserts it on the same identity.
+    /// Odd powers fit a symmetric soft clip (tanh's series is x - x^3/3 + ...),
+    /// and x|x| fits the asymmetry a real cone has.
+    ///
+    /// The branches adapt only while the reference is loud enough for a speaker
+    /// to be distorting at all (`nlMinRms`, -40 dBFS): below that the basis
+    /// signals are vanishingly small and a normalised step on them would be a
+    /// step on noise -- the same arithmetic that killed the deleted canceller.
+    ///
+    /// ── AND IT SHIPS OFF, WHICH IS A MEASURED NEGATIVE ───────────────────────
+    ///
+    /// The sweep (`--aec-sweep`, real speech, far-only / conversation):
+    ///
+    ///     speaker         linear only     with branches
+    ///     clean           18.8 / 10.4     19.5 /  9.1
+    ///     drive 3         19.0 / 10.1     19.4 /  9.3
+    ///     drive 12        14.0 /  8.5     17.5 /  8.5
+    ///     drive 24        10.6 /  5.8     13.5 /  6.6
+    ///
+    /// On a speaker distorting hard it wins 3 dB with the far end alone. On a
+    /// clean speaker it costs 1.3 dB in the conversation column, which is the
+    /// product, and the rule for this feature is that nothing may be lost. So
+    /// `--aec-nl` turns it on for a call and the beat carries `aec_nl_share_db`;
+    /// a real loud laptop is the only thing that can overturn this.
+    var nlOn = false
+    var nlTaps = 512
+    var nlMinRms: Float = 0.01
+    /// The step for the nonlinear branches, per sample, same units as `mu`.
+    var nlMu: Float = 0.10
+    /// The branches adapt only once the linear branch is removing this much: the
+    /// distortion is what is left AFTER the linear echo, and a branch fitted
+    /// before that echo is gone is fitted to the wrong thing.
+    var nlMinErleDb: Double = 6
   }
   var cfg = Cfg()
+  /// ── THE BASIS SIGNALS, AND WHY THEY ARE BOUNDED ──────────────────────────
+  ///
+  /// The first version used x|x|, x^3 and x^5, and the trace of a far-only run
+  /// on a LINEAR speaker read: x^5 window energy from 1e-26 to 1e-8 across
+  /// seconds, x^5 weights of 27,000, and a branch output six times the
+  /// microphone. A power basis normalised to its own energy learns enormous
+  /// weights in a quiet passage and detonates them in the next loud one; the
+  /// eigenvalue spread of x^5 is the level to the tenth power and no step size
+  /// survives that.
+  ///
+  /// So every basis here is BOUNDED by |x| for |x| <= 1 and vanishes faster than
+  /// x at small levels, which is the shape of distortion itself:
+  ///
+  ///   0  x|x|                    the cone's asymmetry (even order)
+  ///   1  x - tanh(2x)/2          a gentle soft clip's residual (odd order)
+  ///   2  x - tanh(5x)/5          a hard one's
+  ///
+  /// Weights stay O(1), and the normaliser below is a PEAK HOLD over ~2 s
+  /// rather than the instantaneous window, so a quiet window cannot manufacture
+  /// a large weight -- the branches learn at the levels where a speaker
+  /// distorts and hold still everywhere else.
+  static let nlBases = 3
+  static func nlBasisScalar(_ j: Int, _ x: Float) -> Float {
+    switch j {
+    case 0: return x * abs(x)
+    case 1: return x - tanh(2 * x) / 2
+    default: return x - tanh(5 * x) / 5
+    }
+  }
+  static func nlBasis(_ j: Int, _ x: UnsafePointer<Float>, _ n: Int,
+                      into b: UnsafeMutablePointer<Float>) {
+    switch j {
+    case 0:
+      vDSP_vabs(x, 1, b, 1, vDSP_Length(n))
+      vDSP_vmul(b, 1, x, 1, b, 1, vDSP_Length(n))
+    default:
+      let d: Float = j == 1 ? 2 : 5
+      var dd = d
+      var cnt = Int32(n)
+      vDSP_vsmul(x, 1, &dd, b, 1, vDSP_Length(n))
+      vvtanhf(b, b, &cnt)
+      var inv = -1 / d
+      vDSP_vsmul(b, 1, &inv, b, 1, vDSP_Length(n))
+      vDSP_vadd(b, 1, x, 1, b, 1, vDSP_Length(n))
+    }
+  }
+  static func nlBuild(_ xs: UnsafePointer<Float>, _ spanN: Int, into bws: inout [[Float]],
+                      bSq: inout [Float]) {
+    for j in 0..<nlBases {
+      bws[j].withUnsafeMutableBufferPointer { b in
+        nlBasis(j, xs, spanN, into: b.baseAddress!)
+        vDSP_svesq(b.baseAddress!, 1, &bSq[j], vDSP_Length(spanN))
+      }
+    }
+  }
+  /// What basis `j` reads at a reference level `r` -- the floor under its
+  /// normaliser is this at `nlMinRms`.
+  static func nlBasisLevel(_ j: Int, _ r: Float) -> Float { abs(nlBasisScalar(j, r)) }
 
   // ── STATE ──────────────────────────────────────────────────────────────────
   //
@@ -297,6 +427,22 @@ final class Aec {
   /// The raw (uninterpolated) reference copy, with two older samples and one
   /// newer so the interpolated window can sit anywhere inside a whole sample.
   private var rawWin: [Float]
+  /// The nonlinear branches: one foreground and one background filter per basis,
+  /// the basis window for this block, and a scratch for its convolutions. Sized
+  /// for the largest `nlTaps` allowed (1024).
+  fileprivate var fFgNl: [[Float]]
+  fileprivate var fBgNl: [[Float]]
+  private var bwins: [[Float]]
+  private var yNlBuf: [Float]
+  private var gNlBuf: [Float]
+  /// Energy of the nonlinear branches' own prediction over the far-only blocks,
+  /// beside the linear branch's, so a beat can say how much of the echo was
+  /// distortion. Same 0.5 s constant as `farMicE`.
+  private var farYLinE: Double = 0
+  private var farYNlE: Double = 0
+  private(set) var nlUpdates = 0
+  /// Peak-held basis energies, the normaliser for the branches' steps.
+  private var bPeak = [Float](repeating: 0, count: Aec.nlBases)
   private let maxBlock: Int
 
   /// Where the estimator says the echo is, in samples, and how sure it is.
@@ -384,6 +530,7 @@ final class Aec {
   private var notHelpingMs: Double = 0
   private(set) var dllSteps = 0
   private(set) var dllResets = 0
+  private(set) var skewRejects = 0
   private(set) var carries = 0
   private var lastTraceSec: Float = 0
   /// Lifetime energies, for the honest "what did this whole call get" figure.
@@ -406,6 +553,7 @@ final class Aec {
   private(set) var updates = 0
   private(set) var freezes = 0
   private(set) var reaims = 0
+  private(set) var reaimsHeld = 0
   private(set) var diverges = 0
   /// How many times a measurably better background filter took over the audio,
   /// and how many times the background had to be restarted. The pair says which
@@ -432,6 +580,18 @@ final class Aec {
     eBgBuf = [Float](repeating: 0, count: maxBlock)
     gBuf = [Float](repeating: 0, count: 4096)
     rawWin = [Float](repeating: 0, count: 4096 + maxBlock + 3)
+    fFgNl = Array(repeating: [Float](repeating: 0, count: 1024), count: Aec.nlBases)
+    fBgNl = Array(repeating: [Float](repeating: 0, count: 1024), count: Aec.nlBases)
+    bwins = Array(repeating: [Float](repeating: 0, count: 1024 + maxBlock), count: Aec.nlBases)
+    yNlBuf = [Float](repeating: 0, count: maxBlock)
+    gNlBuf = [Float](repeating: 0, count: 1024)
+  }
+  /// How much of the predicted echo, over far-only blocks, came from the
+  /// nonlinear branches: 0 on a linear path, and the number that says whether a
+  /// real speaker was distorting. -60 when the branches are off or cold.
+  var nlShareDb: Double {
+    guard farYNlE > 1e-20, farYLinE + farYNlE > 1e-20 else { return -60 }
+    return 10 * log10(farYNlE / (farYLinE + farYNlE))
   }
 
   /// ── WHAT IT IS DOING NOW, AND WHAT THE CALL GOT ───────────────────────────
@@ -564,7 +724,10 @@ final class Aec {
     // No feedback anywhere: the estimator cannot see the skew, so this cannot
     // oscillate -- the failure mode is only "not confident yet", which is the
     // untracked behaviour this whole feature improves on.
-    if abs(slope) > max(cfg.skewMin, 1.5 * se) || (slope == 0 && se < cfg.skewMin) {
+    if se > cfg.skewMaxSe || abs(slope) > cfg.dllSkewMax * 1.5 {
+      // Not a clock. See `skewMaxSe`.
+      skewRejects += 1
+    } else if abs(slope) > max(cfg.skewMin, 1.5 * se) || (slope == 0 && se < cfg.skewMin) {
       let target = max(-cfg.dllSkewMax, min(cfg.dllSkewMax, slope))
       skewSps += (target - skewSps) * cfg.skewGain
       dllSteps += 1
@@ -613,9 +776,15 @@ final class Aec {
     let want = max(0, aimSamples - lead)
     if abs(want - delay) > Int(cfg.reaimMs / 1000 * SR) {
       disagree += 1
-      if disagree >= cfg.reaimHits {
+      if disagree >= cfg.reaimHits, mix >= 0.5, erleDb >= cfg.reaimHoldDb {
+        // Held: the filter at the current delay is demonstrably right. Counted
+        // once per streak; `disagree` keeps running so the move happens the
+        // block the evidence lapses.
+        if disagree == cfg.reaimHits { reaimsHeld += 1 }
+      } else if disagree >= cfg.reaimHits {
         delay = want
         for j in 0..<fFg.count { fFg[j] = 0; fBg[j] = 0 }
+        zeroNl(fg: true, bg: true)
         cmpFgE = 0; cmpBgE = 0; cmpMicE = 0; betterMs = 0; worseMs = 0
         // The alignment restarts with the aim; the SKEW does not -- it is a
         // property of two crystals, not of one echo path, and it survives a
@@ -762,6 +931,51 @@ final class Aec {
         }
       }
     }
+    // ── THE NONLINEAR BRANCHES, ADDED INTO THE SAME PREDICTION ───────────────
+    //
+    // Each basis is built from the SAME interpolated window the linear branch
+    // reads -- `xwin[T-1+k]` pairs with `x[k]` -- over the last `Tn-1+n` samples
+    // of it, so a shorter filter sits at the same zero-lag position. Everything
+    // downstream (residual, transfer rule, divergence guard, mix) sees the sum,
+    // so a branch that hurts is judged and switched out with the rest.
+    var yLinSq: Float = 0
+    yBuf.withUnsafeBufferPointer { y in vDSP_svesq(y.baseAddress!, 1, &yLinSq, vDSP_Length(n)) }
+    let nlOn = cfg.nlOn
+    let Tn = min(max(cfg.nlTaps, 16), 1024)
+    let spanN = Tn - 1 + n
+    var bSq = [Float](repeating: 0, count: Aec.nlBases)
+    if nlOn, T >= Tn {
+      xwin.withUnsafeBufferPointer { w in
+        let xs = w.baseAddress! + (T - Tn)
+        Aec.nlBuild(xs, spanN, into: &bwins, bSq: &bSq)
+        for j in 0..<Aec.nlBases {
+          bwins[j].withUnsafeMutableBufferPointer { b in
+            fFgNl[j].withUnsafeBufferPointer { fp in
+              yNlBuf.withUnsafeMutableBufferPointer { y in
+                vDSP_conv(b.baseAddress!, 1, fp.baseAddress!, 1, y.baseAddress!, 1,
+                          vDSP_Length(n), vDSP_Length(Tn))
+              }
+            }
+            yNlBuf.withUnsafeBufferPointer { y in
+              yBuf.withUnsafeMutableBufferPointer { acc in
+                vDSP_vadd(acc.baseAddress!, 1, y.baseAddress!, 1, acc.baseAddress!, 1, vDSP_Length(n))
+              }
+            }
+            fBgNl[j].withUnsafeBufferPointer { fp in
+              yNlBuf.withUnsafeMutableBufferPointer { y in
+                vDSP_conv(b.baseAddress!, 1, fp.baseAddress!, 1, y.baseAddress!, 1,
+                          vDSP_Length(n), vDSP_Length(Tn))
+              }
+            }
+            yNlBuf.withUnsafeBufferPointer { y in
+              yBgBuf.withUnsafeMutableBufferPointer { acc in
+                vDSP_vadd(acc.baseAddress!, 1, y.baseAddress!, 1, acc.baseAddress!, 1, vDSP_Length(n))
+              }
+            }
+          }
+        }
+      }
+    }
     var eSq: Float = 0, eBgSq: Float = 0, ySq: Float = 0
     yBuf.withUnsafeBufferPointer { y in
       eBuf.withUnsafeMutableBufferPointer { e in
@@ -813,6 +1027,7 @@ final class Aec {
         worseMs = 0
         if betterMs >= cfg.transferMs {
           for j in 0..<T { fFg[j] = fBg[j] }
+          for b in 0..<Aec.nlBases { for j in 0..<Tn { fFgNl[b][j] = fBgNl[b][j] } }
           transfers += 1
           betterMs = 0
           // The foreground just changed, so every measurement OF the foreground
@@ -829,6 +1044,7 @@ final class Aec {
         betterMs = 0
         if worseMs >= cfg.divergeMs {
           for j in 0..<T { fBg[j] = fFg[j] }
+          for b in 0..<Aec.nlBases { for j in 0..<Tn { fBgNl[b][j] = fFgNl[b][j] } }
           cmpBgE = cmpFgE
           bgResets += 1
           worseMs = 0
@@ -855,8 +1071,10 @@ final class Aec {
         // protect anybody from by clearing it. The comparison state IS cleared --
         // it describes a foreground that no longer exists.
         for j in 0..<fFg.count { fFg[j] = 0 }
+        zeroNl(fg: true, bg: false)
         mix = 0
         micE = 0; eE = 0; farMicE = 0; farEE = 0; farRefE = 0; cmpFgE = 0; cmpBgE = 0; cmpMicE = 0
+        farYLinE = 0; farYNlE = 0
         diverges += 1
         divergeMsRun = 0
         coolMsLeft = cfg.coolMs
@@ -903,6 +1121,12 @@ final class Aec {
       farMicE += (Double(micSq) / Double(n) - farMicE) * kf
       farEE += (Double(eSq) / Double(n) - farEE) * kf
       farRefE += (Double(refAlnSq) / Double(n) - farRefE) * kf
+      // The prediction split into its linear and nonlinear halves. `ySq` is the
+      // sum's energy; the cross term is folded into the nonlinear share, which
+      // is the honest place for it -- it is energy the linear branch alone did
+      // not predict.
+      farYLinE += (Double(yLinSq) / Double(n) - farYLinE) * kf
+      farYNlE += (max(0, Double(ySq) - Double(yLinSq)) / Double(n) - farYNlE) * kf
     }
 
     // ── THE FEED-FORWARD ─────────────────────────────────────────────────────
@@ -956,6 +1180,58 @@ final class Aec {
         }
       }
       updates += 1
+      // ── AND THE SAME STEP ON EACH NONLINEAR BRANCH, NORMALISED TO ITSELF ────
+      //
+      // Each basis has its own energy scale (x^5 of a 0.1 signal is 1e-5), so
+      // each gets its own normaliser, floored at what that basis reads at
+      // `nlMinRms`. Below the floor the branch does not adapt: a speaker at -40
+      // dBFS is not distorting, and a normalised step on a vanishing basis is a
+      // step on noise.
+      // And only while the LINEAR branch is on the audio and helping: the
+      // distortion is a small residual on top of the linear echo, and a branch
+      // adapting before that echo is gone is adapting to the wrong target. Not a
+      // one-way door -- the linear background adapts regardless, so `mix`
+      // returns on its own and the branches resume.
+      if nlOn, T >= Tn, refAlnRms >= cfg.nlMinRms, mix >= 0.5, erleDb >= cfg.nlMinErleDb {
+        var stepped = false
+        eBgBuf.withUnsafeBufferPointer { e in
+          for j in 0..<Aec.nlBases {
+            let lvl = Aec.nlBasisLevel(j, cfg.nlMinRms)
+            let floorSq = Float(spanN) * lvl * lvl
+            // Peak hold with a ~2 s decay: the step is set by the loudest recent
+            // window, never by this one.
+            bPeak[j] = max(bSq[j], bPeak[j] * Float(exp(-dt / 2.0)))
+            guard bSq[j] > floorSq else { continue }
+            var s = cfg.nlMu / (Float(n) * max(bPeak[j], floorSq))
+            bwins[j].withUnsafeBufferPointer { b in
+              gNlBuf.withUnsafeMutableBufferPointer { g in
+                vDSP_conv(b.baseAddress!, 1, e.baseAddress!, 1, g.baseAddress!, 1,
+                          vDSP_Length(Tn), vDSP_Length(n))
+                fBgNl[j].withUnsafeMutableBufferPointer { fp in
+                  vDSP_vsma(g.baseAddress!, 1, &s, fp.baseAddress!, 1,
+                            fp.baseAddress!, 1, vDSP_Length(Tn))
+                }
+              }
+            }
+            stepped = true
+          }
+        }
+        if stepped { nlUpdates += 1 }
+      }
+      if Aec.trace, nlOn, blocks % 3000 == 0 {
+        var norms = [Float](repeating: 0, count: Aec.nlBases)
+        var normsFg = [Float](repeating: 0, count: Aec.nlBases)
+        for j in 0..<Aec.nlBases {
+          for p in 0..<Tn { norms[j] += fBgNl[j][p] * fBgNl[j][p]; normsFg[j] += fFgNl[j][p] * fFgNl[j][p] }
+        }
+        var linN: Float = 0
+        for p in 0..<T { linN += fBg[p] * fBg[p] }
+        fputs(String(format: "    nl t %.1fs mix %.2f yLin %.5f y %.5f eBg %.5f mic %.5f | bSq %.2e %.2e %.2e | |wBg| %.2e %.2e %.2e |wFg| %.2e %.2e %.2e lin %.3f\n",
+                     Double(blocks) * dt, mix, (yLinSq / Float(n)).squareRoot(), (ySq / Float(n)).squareRoot(),
+                     (eBgSq / Float(n)).squareRoot(), (micSq / Float(n)).squareRoot(),
+                     bSq[0], bSq[1], bSq[2], norms[0].squareRoot(), norms[1].squareRoot(), norms[2].squareRoot(),
+                     normsFg[0].squareRoot(), normsFg[1].squareRoot(), normsFg[2].squareRoot(), linN.squareRoot()), stderr)
+      }
     } else {
       freezes += 1
     }
@@ -1070,6 +1346,13 @@ final class Aec {
   /// other gain in this app and correct for the same reason: there, the fast
   /// direction is the one that restores hearing; here, it is the one that
   /// restores the untouched microphone.
+  private func zeroNl(fg: Bool, bg: Bool) {
+    for b in 0..<Aec.nlBases {
+      if fg { for j in 0..<fFgNl[b].count { fFgNl[b][j] = 0 } }
+      if bg { for j in 0..<fBgNl[b].count { fBgNl[b][j] = 0 } }
+    }
+  }
+
   private func rampMix(toward target: Float, dt: Double) {
     if target < mix {
       mix = max(target, mix - Float(dt / 0.004))
@@ -1127,8 +1410,38 @@ extension Aec {
   /// The room `armEchoSim` builds: a direct path and three early reflections out
   /// to 13 ms. A pure delay is the one echo path no room produces, and a filter
   /// that only ever meets a single tap can pass a test it would fail in a room.
-  static func roomTaps() -> [(Int, Float)] {
-    [(0, 1.0), (Int(0.0031 * SR), 0.55), (Int(0.0072 * SR), 0.33), (Int(0.0131 * SR), 0.18)]
+  static func roomTaps(tailMs: Double = 0) -> [(Int, Float)] {
+    var taps: [(Int, Float)] = [(0, 1.0), (Int(0.0031 * SR), 0.55), (Int(0.0072 * SR), 0.33), (Int(0.0131 * SR), 0.18)]
+    // ── A ROOM DOES NOT END AT 13 MS ─────────────────────────────────────────
+    //
+    // Past the early reflections a real room has a diffuse tail: dense, random
+    // in sign, decaying exponentially. Built here as one reflection every ~0.7 ms
+    // from 13 ms out to `tailMs`, falling 60 dB from the last early reflection
+    // to the end of the tail -- an RT60 that ends at `tailMs`. The signs come
+    // from a fixed-seed LCG so every run builds the same room.
+    guard tailMs > 13.1 else { return taps }
+    var seed: UInt32 = 0x9E3779B9
+    var t = 13.1 + 0.7
+    while t < tailMs {
+      seed = seed &* 1664525 &+ 1013904223
+      let u = Double(seed >> 8) / Double(1 << 24)
+      let sign: Float = (seed & 1) == 0 ? 1 : -1
+      let g = 0.18 * pow(10, -3 * (t - 13.1) / (tailMs - 13.1))
+      taps.append((Int(t / 1000 * SR), sign * Float(g) * Float(0.6 + 0.8 * u)))
+      t += 0.5 + 0.4 * u
+    }
+    return taps
+  }
+
+  /// The rig's loudspeaker: a symmetric soft clip at `drive` (0 = a linear
+  /// speaker) plus an even-order asymmetry `asym`. tanh is NOT one of the
+  /// canceller's basis functions -- its series is, at every order, so the rig is
+  /// a shape the model can approach and never match exactly
+  /// (`fixture-is-not-the-real-shape`).
+  static func speaker(_ x: Float, drive: Float, asym: Float) -> Float {
+    var y = drive > 0 ? tanh(drive * x) / drive : x
+    y += asym * x * abs(x)
+    return y
   }
 
   struct Result {
@@ -1194,6 +1507,13 @@ extension Aec {
     var costUsP50 = 0.0
     var costUsP99 = 0.0
     var convergeMs = -1.0      // when the leaky ERLE first passed 10 dB
+    /// How much of the predicted echo the nonlinear branches supplied, and how
+    /// many blocks they adapted on. -60 and 0 on a linear path with the
+    /// branches doing nothing, which is what they must do there.
+    var nlShareDb = -60.0
+    var nlUpdates = 0
+    var reaimsHeld = 0
+    var skewRejects = 0
   }
 
   /// One run. `near` is what the person says, `far` is what the far end sent (the
@@ -1208,12 +1528,19 @@ extension Aec {
   /// `SubtitleCleaner.clean(probe:)` already makes.
   static func run(near: [Float], far: [Float], delayMs: Double, echoGain: Float,
                   cfg: Cfg, blockN: Int = 16, aimErrMs: Double = 0,
-                  corr: Double = 0.8, echoOn: Bool = true, skewPpm: Double = 0)
+                  corr: Double = 0.8, echoOn: Bool = true, skewPpm: Double = 0,
+                  tailMs: Double = 0, spkDrive: Float = 0, spkAsym: Float = 0,
+                  aimJitterMs: Double = 0, pathStepAtS: Double = 0, pathStepMs: Double = 0)
       -> (r: Result, out: [Float], nearOut: [Float]) {
     let n = min(near.count, far.count)
     let a = Aec()
     a.cfg = cfg
-    let taps = roomTaps()
+    let taps = roomTaps(tailMs: tailMs)
+    // What the loudspeaker actually put into the room. The REFERENCE the
+    // canceller sees is still `far` -- the clean signal this machine sent to the
+    // device -- because that is all a real canceller ever has.
+    let spk: [Float] = (spkDrive > 0 || spkAsym != 0)
+      ? far.map { speaker($0, drive: spkDrive, asym: spkAsym) } : far
     let d = max(1, Int(delayMs / 1000 * SR))
     // The real circular playout history, at its real size, so the wrapping copy
     // in `process` is the code under test rather than a straight line.
@@ -1239,11 +1566,27 @@ extension Aec {
     // smooth truth would be testing a sensor nobody has
     // (`fixture-is-not-the-real-shape`).
     let aimEvery = Int(0.5 * SR)
+    // A step in the true path at `pathStepAtS` (the laptop was picked up), and
+    // an estimator whose readings wander ±`aimJitterMs` around the truth on
+    // alternate readings -- the live signature that produced 32 re-aims.
+    let stepAt = Int(pathStepAtS * SR)
+    let stepS = Int(pathStepMs / 1000 * SR)
+    var aimCount = 0
     var i = 0
     while i + blockN <= n {
       if i > 0, i % aimEvery < blockN {
-        let dNow = Double(d) + skewPpm * 1e-6 * Double(i)
-        a.aim(delaySamples: (Int(dNow) / 8) * 8, corr: corr)
+        let dNow = Double(d) + skewPpm * 1e-6 * Double(i) + Double(stepAt > 0 && i >= stepAt ? stepS : 0)
+        aimCount += 1
+        // The live shape: the estimator settles on a WRONG delay for ~2 s (four
+        // readings) out of every ~6 s, alternating which side it errs to. Not a
+        // reading wrong every time -- under that no filter could ever converge
+        // and there would be nothing to hold.
+        // Wrong stretches begin at 4 s, after the filter has had a chance to
+        // converge -- a filter that has learned nothing has nothing to hold.
+        let episode = aimCount / 12
+        let wrong = aimJitterMs > 0 && aimCount % 12 >= 8
+        let jit = wrong ? (episode % 2 == 0 ? 1.0 : -1.0) * aimJitterMs / 1000 * SR : 0
+        a.aim(delaySamples: (Int(dNow + jit) / 8) * 8, corr: corr)
       }
       // Play this block, then capture it: the same order the two callbacks run in.
       for k in 0..<blockN { ring[(i + k) % cap] = far[i + k] }
@@ -1269,14 +1612,14 @@ extension Aec {
           // cancel and no real clock produces (`fixture-is-not-the-real-shape`).
           // And it must not be the same cubic the window uses, or the two kernels
           // cancel exactly and the rig flatters the tracker instead.
-          let dEff = Double(d) + skewPpm * 1e-6 * Double(i + k)
+          let dEff = Double(d) + skewPpm * 1e-6 * Double(i + k) + Double(stepAt > 0 && i + k >= stepAt ? stepS : 0)
           for (t, g) in taps {
             let pos = Double(i + k) - dEff - Double(t)
             let fl = Int(pos.rounded(.down))
-            if fl >= 4, fl + 4 < far.count {
+            if fl >= 4, fl + 4 < spk.count {
               let tt = pos - Double(fl)
               if tt < 1e-9 {
-                e += g * far[fl]
+                e += g * spk[fl]
               } else {
                 var acc: Double = 0
                 for m in -3...4 {
@@ -1284,7 +1627,7 @@ extension Aec {
                   let sinc = sin(Double.pi * u) / (Double.pi * u)
                   // Hann window over the 8-tap support.
                   let w = 0.5 + 0.5 * cos(Double.pi * u / 4)
-                  acc += Double(far[fl + m]) * sinc * w
+                  acc += Double(spk[fl + m]) * sinc * w
                 }
                 e += g * Float(acc)
               }
@@ -1375,20 +1718,36 @@ extension Aec {
     r.normEnd = Double(a.normNow)
     r.skewSps = Double(a.skewSps)
     r.dllSteps = a.dllSteps
+    r.nlShareDb = a.nlShareDb
+    r.nlUpdates = a.nlUpdates
+    r.reaimsHeld = a.reaimsHeld
+    r.skewRejects = a.skewRejects
     r.echoErleDb = echoInE > 1e-12
       ? (echoOutE > 1e-12 ? 10 * log10(echoInE / echoOutE) : 120)
       : -120
     return (r, out, nearOut)
   }
 
-  /// A copy of the current weights, for the probe.
-  func snapshotFilter() -> [Float] { Array(fFg[0..<min(cfg.taps, fFg.count)]) }
+  /// A copy of the current weights, for the probe: the linear filter and the
+  /// nonlinear branches, so the probe replicates the whole prediction.
+  struct Snapshot {
+    var lin: [Float]
+    var nl: [[Float]]
+    var nlTaps: Int
+  }
+  func snapshotFilter() -> Snapshot {
+    let Tn = min(max(cfg.nlTaps, 16), 1024)
+    return Snapshot(lin: Array(fFg[0..<min(cfg.taps, fFg.count)]),
+                    nl: cfg.nlOn ? fFgNl.map { Array($0[0..<Tn]) } : [],
+                    nlTaps: Tn)
+  }
 
   /// Apply a FIXED filter with no adaptation and no measurement. The probe path
   /// only -- nothing in production calls this.
-  static func applyOnly(_ f: [Float], mix: Float, delay: Int, frac: Float = 0,
+  static func applyOnly(_ snap: Snapshot, mix: Float, delay: Int, frac: Float = 0,
                         x: UnsafeMutablePointer<Float>, n: Int,
                         ref: UnsafeMutablePointer<Float>, refW: Int, refCap: Int) {
+    let f = snap.lin
     guard mix > 0, !f.isEmpty else { return }
     let T = f.count
     let span = T - 1 + n
@@ -1435,6 +1794,27 @@ extension Aec {
         y.withUnsafeMutableBufferPointer { yp in
           vDSP_conv(wp.baseAddress!, 1, fp.baseAddress!, 1, yp.baseAddress!, 1,
                     vDSP_Length(n), vDSP_Length(T))
+        }
+      }
+      // The nonlinear branches, from the same window, the same way `process`
+      // builds them.
+      let Tn = snap.nlTaps
+      if !snap.nl.isEmpty, T >= Tn {
+        let spanN = Tn - 1 + n
+        var bws = Array(repeating: [Float](repeating: 0, count: spanN), count: Aec.nlBases)
+        var bSq = [Float](repeating: 0, count: Aec.nlBases)
+        Aec.nlBuild(wp.baseAddress! + (T - Tn), spanN, into: &bws, bSq: &bSq)
+        var yn = [Float](repeating: 0, count: n)
+        for j in 0..<snap.nl.count {
+          bws[j].withUnsafeBufferPointer { bp in
+            snap.nl[j].withUnsafeBufferPointer { fp in
+              yn.withUnsafeMutableBufferPointer { yp in
+                vDSP_conv(bp.baseAddress!, 1, fp.baseAddress!, 1, yp.baseAddress!, 1,
+                          vDSP_Length(n), vDSP_Length(Tn))
+              }
+            }
+          }
+          for k in 0..<n { y[k] += yn[k] }
         }
       }
     }
@@ -1673,6 +2053,107 @@ extension Aec {
         String(format: "100 ppm -- a genuinely bad pair -- still holds %.1f dB",
                drift100.r.echoErleDb))
 
+    if trace {
+      Aec.trace = true
+      fputs("  == trace: far-only, linear speaker, branches on ==\n", stderr)
+      _ = run(near: [Float](repeating: 0, count: n), far: far, delayMs: 31, echoGain: 0.5,
+              cfg: cfg0, blockN: blockN)
+      Aec.trace = false
+    }
+    // ── 8. THE LOUDSPEAKER DISTORTS, AND THE RULER MUST SEE IT FIRST ─────────
+    //
+    // A soft clip at drive 12 plus 60% even-order asymmetry: a laptop speaker
+    // driven hard. At drive 3 the planted distortion cost the linear filter 0.6 dB
+    // and the rig was blind to the question; the REJECT row comes first and must
+    // show a real cost, or nothing after it is proven
+    // (`validate-the-ruler-against-known-inputs`). The branches are OFF by
+    // default (see `Cfg.nlOn`), so this arm switches them on.
+    let silence = [Float](repeating: 0, count: n)
+    var withNl = cfg0
+    withNl.nlOn = true
+    let nlOff = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: cfg0,
+                    blockN: blockN, spkDrive: 12, spkAsym: 0.6)
+    let nlOn = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: withNl,
+                   blockN: blockN, spkDrive: 12, spkAsym: 0.6)
+    say(nlOff.r.echoErleDb < m.r.echoErleDb - 3,
+        String(format: "REJECT: a hard-driven speaker costs the linear filter %.1f dB (%.1f -> %.1f)"
+             + " -- the rig can see nonlinearity",
+               m.r.echoErleDb - nlOff.r.echoErleDb, m.r.echoErleDb, nlOff.r.echoErleDb))
+    say(nlOn.r.echoErleDb > nlOff.r.echoErleDb + 2,
+        String(format: "--aec-nl wins %.1f dB of it back (%.1f dB, share %.1f dB, %d steps)",
+               nlOn.r.echoErleDb - nlOff.r.echoErleDb, nlOn.r.echoErleDb,
+               nlOn.r.nlShareDb, nlOn.r.nlUpdates))
+    say(nlOn.r.diverges == 0, "and the branches never diverge")
+    // Off by default, so the default config on the linear room IS arm 1. Switched
+    // on against a clean speaker, the branches must stay close to a wash: the
+    // sweep read -1.3 dB in conversation and that negative is why they ship off.
+    let linNl = run(near: convNear, far: convFar, delayMs: 31, echoGain: 0.5,
+                    cfg: withNl, blockN: blockN)
+    say(linNl.r.echoErleDb > cv.r.echoErleDb - 2.5,
+        String(format: "on a clean speaker --aec-nl costs the conversation %.1f dB (%.1f vs %.1f) -- the recorded negative",
+               cv.r.echoErleDb - linNl.r.echoErleDb, linNl.r.echoErleDb, cv.r.echoErleDb))
+    // And the voice, through a distorting speaker with both talking: still exact.
+    let nlConv = run(near: convNear, far: convFar, delayMs: 31, echoGain: 0.5,
+                     cfg: withNl, blockN: blockN, spkDrive: 12, spkAsym: 0.6)
+    say(nlConv.r.linearityDb < -100,
+        String(format: "a conversation through a hard-driven speaker with --aec-nl: voice exact (%.0f dB), %.1f dB removed",
+               nlConv.r.linearityDb, nlConv.r.echoErleDb))
+
+    // ── 10. AN ESTIMATOR THAT WANDERS, AND A ROOM THAT ACTUALLY MOVES ─────────
+    //
+    // Readings 10 ms off the truth for 2 s in every 6, the live shape. With the
+    // hold disabled (the 0.124.0 behaviour) this zeroes both filters at the
+    // start and end of every wrong stretch; the REJECT row proves the rig can
+    // see that. With it, the filter
+    // keeps its convergence. Then the path really steps 15 ms at 8 s and the
+    // aim follows: the hold must lapse and the re-aim must happen.
+    var noHold = cfg0
+    noHold.reaimHoldDb = 1e9
+    let jitOff = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: noHold,
+                     blockN: blockN, aimJitterMs: 10)
+    if trace { Aec.trace = true; fputs("  == trace: wandering estimator, hold on ==\n", stderr) }
+    let jitOn = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: cfg0,
+                    blockN: blockN, aimJitterMs: 10)
+    Aec.trace = false
+    say(jitOff.r.echoErleDb < m.r.echoErleDb - 4 && jitOff.r.reaims >= 4,
+        String(format: "REJECT: a wandering estimator costs an unguarded filter %.1f dB (%d re-aims)"
+             + " -- the rig can see it",
+               m.r.echoErleDb - jitOff.r.echoErleDb, jitOff.r.reaims))
+    say(jitOn.r.echoErleDb > m.r.echoErleDb - 2,
+        String(format: "held: the same estimator costs a working filter %.1f dB (%.1f dB, %d re-aims, %d held)",
+               m.r.echoErleDb - jitOn.r.echoErleDb, jitOn.r.echoErleDb, jitOn.r.reaims, jitOn.r.reaimsHeld))
+    say(jitOn.r.reaimsHeld > 0, "and the hold is what did it (\(jitOn.r.reaimsHeld) holds) -- the meter can see")
+    // The drift tracker must not mistake the wandering for a clock: traced
+    // before this row existed, it railed at -6 samples/s and walked the filter
+    // off its target.
+    say(abs(jitOn.r.skewSps) < 0.5 && jitOn.r.skewRejects > 0,
+        String(format: "and the clock tracker does not mistake it for drift (skew %.2f sps, %d fits rejected)",
+               jitOn.r.skewSps, jitOn.r.skewRejects))
+    let moved = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: cfg0,
+                    blockN: blockN, pathStepAtS: 8, pathStepMs: 15)
+    say(moved.r.reaims >= 1 && moved.r.erleDb > 10,
+        String(format: "a room that MOVES 15 ms at 8 s is followed: %d re-aim(s), %.1f dB at the end",
+               moved.r.reaims, moved.r.erleDb))
+
+    // ── 9. A ROOM WITH A TAIL ────────────────────────────────────────────────
+    //
+    // 80 ms of diffuse reverberation past the early reflections. Printed, and
+    // the one assertion is that the tail is VISIBLE to the rig: the same 1024
+    // taps must lose something to it, or a longer filter could never be
+    // justified here.
+    let tail = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: cfg0,
+                   blockN: blockN, tailMs: 80)
+    var longCfg = cfg0
+    longCfg.taps = 4096
+    let tailLong = run(near: silence, far: far, delayMs: 31, echoGain: 0.5, cfg: longCfg,
+                       blockN: blockN, tailMs: 80)
+    fputs(String(format: "  tail arm: 80 ms room -- 1024 taps %.1f dB, 4096 taps %.1f dB (conv %.0f / %.0f ms, p99 %.1f / %.1f us)\n",
+                 tail.r.echoErleDb, tailLong.r.echoErleDb, tail.r.convergeMs, tailLong.r.convergeMs,
+                 tail.r.costUsP99, tailLong.r.costUsP99), stderr)
+    say(tail.r.echoErleDb < m.r.echoErleDb - 1,
+        String(format: "REJECT: an 80 ms tail costs 1024 taps %.1f dB -- the rig can see the tail",
+               m.r.echoErleDb - tail.r.echoErleDb))
+
     // ── 7. COST ──────────────────────────────────────────────────────────────
     //
     // Per block, on the audio thread. A block is 0.33 ms of real time at this
@@ -1696,8 +2177,48 @@ extension Aec {
       // A canceller scoring 30 dB in the first column and -6 dB of damage in the
       // second is unshippable, and one scoring 0 dB in both is a no-op wearing a
       // passing grade.
+      // The speaker table first: drive x branches, far-only and conversation.
+      fputs("\n  drive  asym   nl   far-erle  conv-erle  share   nlsteps  p99us\n", stderr)
+      for (drive, asym) in [(Float(0), Float(0)), (1.5, 0.1), (3, 0.15), (6, 0.2), (12, 0.6), (24, 1.0)] {
+        for on in [false, true] {
+          var c = cfg0
+          c.nlOn = on
+          let f1 = run(near: silence, far: far, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, spkDrive: drive, spkAsym: asym)
+          let b1 = run(near: convNear, far: convFar, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, spkDrive: drive, spkAsym: asym)
+          fputs(String(format: "  %5.1f  %4.2f  %@  %8.1f  %9.1f  %5.1f  %7d  %6.1f\n",
+                       drive, asym, (on ? "on " : "off") as NSString, f1.r.echoErleDb, b1.r.echoErleDb,
+                       f1.r.nlShareDb, f1.r.nlUpdates, b1.r.costUsP99), stderr)
+        }
+      }
+      fputs("\n  nltaps  nlmu   far-erle(d3)  conv-erle(d3)\n", stderr)
+      for nt in [128, 256, 512, 1024] {
+        for nmu in [Float(0.03), 0.1, 0.3] {
+          var c = cfg0
+          c.nlTaps = nt; c.nlMu = nmu
+          let f1 = run(near: silence, far: far, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, spkDrive: 3, spkAsym: 0.15)
+          let b1 = run(near: convNear, far: convFar, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, spkDrive: 3, spkAsym: 0.15)
+          fputs(String(format: "  %6d  %.2f  %12.1f  %13.1f\n", nt, nmu,
+                       f1.r.echoErleDb, b1.r.echoErleDb), stderr)
+        }
+      }
+      fputs("\n  tail-ms  taps    far-erle  conv-erle   conv-ms  p99us\n", stderr)
+      for tailMs in [Double(0), 40, 80, 150] {
+        for taps in [1024, 2048, 4096] {
+          var c = cfg0
+          c.taps = taps
+          let f1 = run(near: silence, far: far, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, tailMs: tailMs)
+          let b1 = run(near: convNear, far: convFar, delayMs: 31, echoGain: 0.5,
+                       cfg: c, blockN: blockN, tailMs: tailMs)
+          fputs(String(format: "  %7.0f  %4d  %10.1f  %9.1f  %8.0f  %6.1f\n", tailMs, taps,
+                       f1.r.echoErleDb, b1.r.echoErleDb, f1.r.convergeMs, b1.r.costUsP99), stderr)
+        }
+      }
       fputs("\n  taps    mu  leak   far-erle  conv-erle  fgdiv  norm    conv    p99us\n", stderr)
-      let silence = [Float](repeating: 0, count: n)
       for taps in [256, 512, 1024, 2048] {
         for mu in [Float(0.03), 0.06, 0.1, 0.25, 1.0] {
           for leak in [Double(0), 5.0] {

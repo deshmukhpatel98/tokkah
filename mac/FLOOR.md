@@ -94,7 +94,7 @@ no rig on one machine can produce (`same-room-is-a-test-artifact`). If headphone
 calls feel like a conversation and speaker calls do not, the gap is echo, in
 milliseconds, not in theory.
 
-## Loudspeakers, on evidence rather than on a route (0.107.0, off by default)
+## Loudspeakers, on evidence rather than on a route (0.107.0; on by default since 0.125.0)
 
 `--speaker-duplex` applies the same stand-down to loudspeakers, but only while a
 linear canceller (`mac/Sources/tk/Aec.swift`) has the remaining echo path measured
@@ -102,7 +102,15 @@ below `speakerDuplexPath` (−26 dB). The floor re-engages within one contest wi
 of the measurement going away, and nothing here can be entombed by its own action:
 the canceller keeps measuring whether the floor is standing down or not.
 
-**It ships off, and that is a deliberate exception** to this project's rule that
+**Since 0.125.0 it ships on.** The gate is the measurement: both microphones open
+only in the moments the canceller has the remaining path measured under −26 dB, and
+the floor re-engages within one window when it is not — so on a room the canceller
+cannot hold this is exactly 0.124.0, and `floor_aec_duplex_pct` in the beat says
+how much of a real call it bought. `--no-speaker-duplex` is the arm. The paragraph
+below is the reasoning that kept it off through 0.124.0, kept because the risk it
+names is still the risk the gate exists to bound.
+
+**It shipped off through 0.124.0, a deliberate exception** to this project's rule that
 new audio features go out on by default. The reason is that the evidence does not
 exist yet: both ends of any rig on this machine share one speaker and one
 microphone, so ~19 dB against a *simulated* room is all there is, and a simulated

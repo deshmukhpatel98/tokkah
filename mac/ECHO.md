@@ -306,6 +306,77 @@ planted a morphing colouration no canceller could fit and no real clock produces
 because the tracker sweeps the kernel phase continuously and a linear kernel's
 response morphs by decibels across the sweep.
 
+## A filter that is working is not re-aimed, and a wandering estimator is not a clock (0.125.0)
+
+Three live calls on 0.124.0, read out of the beats rather than guessed at:
+**21, 17 and 32 re-aims** in about 140 s each, 5–6 divergence resets, `aec_mix` at 0
+for 82–97% of the call and an ERLE under 2 dB. Every re-aim zeroes both filters.
+The estimator's reading is a 400 ms cross-correlation quantised to 8 samples, and
+on an intermittent playout it wanders; three wandering readings in a row and a
+converged filter was thrown away for a delay the room had never moved to.
+
+Two changes, both gated on evidence the filter cannot manufacture:
+
+1. **The hold.** A disagreeing estimate is held while the filter on the audio is
+   measurably removing echo (`mix` ≥ 0.5 and far-only ERLE ≥ `reaimHoldDb`, 6 dB).
+   A filter removing 6 dB at the old delay is stronger evidence about the delay
+   than a correlation peak is. Not a one-way door: a room that really moves
+   collapses the ERLE inside its 0.5 s window, the hold lapses, the re-aim
+   proceeds. Counted as `aec_reaims_held`.
+2. **The skew gate.** The drift regression believed slopes of −40 samples/s with a
+   standard error of 17 — 830 ppm, which no pair of crystals does — railed the
+   skew at −6 and walked a converged filter off its target: **24.5 → 8.1 dB in five
+   seconds**, traced. A real 30 ppm fit reads ±0.14–0.33 sps. A fit is believed
+   only when its error is under `skewMaxSe` (1.0) and its slope is physically
+   possible. Counted as `aec_skew_rejects`.
+
+The rig plants the live shape — readings 10 ms off for 2 s in every 6 — and the
+rows fail in both directions:
+
+    unguarded (0.124.0):  −12.5 dB, 7 re-aims
+    held:                   0.0 dB, 1 re-aim (the first), 3 holds, skew 0.00, 26 fits rejected
+    a room that MOVES 15 ms at 8 s: followed, 2 re-aims, 22.6 dB at the end
+
+Through the real device (`tools/aec-check.sh`, 40 s, three runs each, alternated):
+0.124.0 read **19, 21, 14 dB** p50; 0.125.0 read **10, 14, 17**. The ranges overlap
+and the deterministic rig is identical on every pre-existing arm, so that rig's
+noise is about ±4 dB p50 and it cannot see this change either way
+(`measure-the-rigs-noise-first`). The live beats can: `aec_reaims` against
+`aec_reaims_held` on a real call is the verdict.
+
+### The loudspeaker model, measured and shipped off
+
+`--aec-nl` adds a Hammerstein model: bounded nonlinear basis signals built from
+the reference alone (x|x|, x − tanh(2x)/2, x − tanh(5x)/5), each through its own
+short FIR at the same delay, summed into the same subtraction. Still a function of
+what this machine played, so the near voice is still exact (−158 dB, asserted). The
+first version used x³ and x⁵ and detonated: window energies spanning 18 orders of
+magnitude, weights of 27,000, a branch output six times the microphone. Bounded
+bases and a 2 s peak-hold normaliser fixed that; the trace is in `Aec.swift`.
+
+    speaker         linear only     with branches      (far-only / conversation, dB)
+    clean           18.8 / 10.4     19.5 /  9.1
+    drive 3         19.0 / 10.1     19.4 /  9.3
+    drive 12        14.0 /  8.5     17.5 /  8.5
+    drive 24        10.6 /  5.8     13.5 /  6.6
+
+On a speaker distorting hard it wins 3.5 dB with the far end alone. On a clean
+speaker it costs 1.3 dB in the conversation column, which is the product. The rule
+for this feature is that nothing may be lost, so it ships **off**; the beat carries
+`aec_nl_share_db` when it is on, and a real loud laptop is the only thing that can
+overturn the reading.
+
+### Where the remaining decibels actually are
+
+The tail sweep answers the question the 0.107.0 note left open. An 80 ms diffuse
+tail costs 1024 taps 5.6 dB — and 4096 taps win back **1.2 dB** of it, while on a
+room with no tail at all 2048 taps score 15.1 against 1024's 19.0. The filter is
+not short; it is **slow**. Speech is coloured, NLMS converges at the rate of the
+least-excited direction, and the far-only leaky ERLE is still climbing (25.5 dB)
+when the 20 s recording ends. The next real gain is convergence speed — a
+frequency-domain or subband update that normalises per band — not more taps and
+not a speaker model. That is a separate release.
+
 ## Through the real audio device
 
 `tools/aec-check.sh` runs two real ends of a real call with the echo path in

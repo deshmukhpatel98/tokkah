@@ -547,7 +547,7 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft", "no-headphone-duplex",
-  "speaker-duplex", "speaker-duplex-path",
+  "speaker-duplex", "no-speaker-duplex", "speaker-duplex-path",
   "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
@@ -558,7 +558,7 @@ let KNOWN_FLAGS: Set<String> = [
   // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
   // correlation alone.
   "no-aec", "aec-test", "aec-sweep", "aec-taps", "aec-mu", "aec-media", "aec-block",
-  "aec-trace", "no-aec-drift",
+  "aec-trace", "no-aec-drift", "no-aec-nl", "aec-nl",
   "no-overload-guard",
   "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-far-test",
@@ -4675,6 +4675,11 @@ func applyGateFlags() {
   // Ships off -- see `Floor.Cfg.speakerDuplex` for why this one is the exception
   // to "new audio features go out on by default".
   if flag("speaker-duplex") { Audio.sharedFloor.cfg.speakerDuplex = true }
+  // 0.125.0: the gate ships ON. It opens both microphones only in the moments the
+  // canceller has MEASURED the remaining echo path under -26 dB, and re-engages
+  // the floor within one window when it has not -- so on a room the canceller
+  // cannot hold, this is the 0.124.0 behaviour. `--no-speaker-duplex` is the arm.
+  if flag("no-speaker-duplex") { Audio.sharedFloor.cfg.speakerDuplex = false }
   if let v = arg("speaker-duplex-path"), let d = Float(v) {
     Audio.sharedFloor.cfg.speakerDuplexPath = d
   }
@@ -4685,6 +4690,11 @@ func applyGateFlags() {
   // The control arm for the drift tracker (0.109.0): the filter is aimed at a
   // fixed integer delay again, which is 0.108.0.
   if flag("no-aec-drift") { Audio.aecDrift = false }
+  // The nonlinear loudspeaker branches (0.125.0). Off by default: measured a
+  // wash at every realistic level in the rig (see `Aec.Cfg.nlOn`); `--aec-nl`
+  // turns them on for a call so a real loud laptop can answer it.
+  if flag("aec-nl") { Audio.aecNl = true }
+  if flag("no-aec-nl") { Audio.aecNl = false }
   if let v = arg("aec-taps"), let d = Int(v) { Audio.aecTaps = d }
   if let v = arg("aec-mu"), let d = Float(v) { Audio.aecMu = d }
   // The arm for the overload cut. See `Audio.overloadGuard`.
@@ -6863,6 +6873,14 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "aec_bg_resets": audio.aec.bgResets,
     "aec_diverges": audio.aec.diverges,
     "aec_reaims": audio.aec.reaims,
+    // 0.125.0: re-aims the hold refused because the filter was measurably
+    // working, and drift fits rejected as an estimator wandering rather than a
+    // clock. Both were zero-cost in the rig and both are what 21-32 re-aims a
+    // call on 0.124.0 looked like from the inside.
+    "aec_reaims_held": audio.aec.reaimsHeld,
+    "aec_skew_rejects": audio.aec.skewRejects,
+    "aec_nl_on": Audio.aecNl ? 1 : 0,
+    "aec_nl_share_db": audio.aec.nlShareDb,
     "aec_cost_us_p99": audio.aec.cost.p(0.99) ?? -1,
     // ── THE CLOCKS (0.109.0) ─────────────────────────────────────────────────
     //

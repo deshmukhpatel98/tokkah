@@ -5,6 +5,61 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.125.0 — 2026-09-02
+
+### Fixed — the echo canceller stops throwing itself away
+
+Three live calls on 0.124.0, read from their beats: **21, 17 and 32 re-aims** in
+about 140 s each, 5–6 resets, the subtraction switched off for 82–97% of the call,
+under 2 dB of echo removed. Every re-aim zeroes both filters. The delay estimator's
+reading wanders on an intermittent playout, and three wandering readings in a row
+threw a converged filter away for a delay the room had never moved to.
+
+Two changes, both gated on evidence the filter cannot manufacture:
+
+- **A working filter is not re-aimed.** A disagreeing estimate is held while the
+  filter on the audio is measurably removing echo (6 dB, far-only). A room that
+  really moves collapses that reading inside half a second and the re-aim
+  proceeds. `aec_reaims_held` in the beat.
+- **A wandering estimator is not a drifting clock.** The drift tracker believed
+  slopes of −40 samples/s with an error of 17 — 830 ppm, which no crystal pair
+  does — railed at −6 and walked a converged filter off its target: 24.5 → 8.1 dB
+  in five seconds, traced. Fits are believed only under 1.0 sps of error and a
+  physically possible slope. `aec_skew_rejects` in the beat.
+
+Rig, with the live shape planted (readings 10 ms off for 2 s in every 6):
+unguarded −12.5 dB and 7 re-aims; held 0.0 dB, 1 re-aim, 3 holds, skew 0.00;
+a room that moves 15 ms at 8 s is followed to 22.6 dB. Drift arms unchanged
+(1.45 sps read against 1.44 planted; 18.6 dB under 30 ppm). Near voice exact.
+
+### Changed — both microphones may open on loudspeakers, when it is measured safe
+
+`--speaker-duplex` (0.107.0) ships **on**. The floor stands down only in the
+moments the canceller has the remaining echo path measured under −26 dB and
+re-engages within one window when it has not — on a room the canceller cannot
+hold this is exactly 0.124.0. `--no-speaker-duplex` is the arm;
+`floor_aec_duplex_pct` says how much of a real call it bought. The voice is
+never filtered, shaped or suppressed anywhere in this path: linear subtraction of
+what this machine played, or the floor.
+
+### Added — a loudspeaker distortion model, measured and left off
+
+`--aec-nl`: bounded nonlinear basis signals from the reference (x|x|, two soft-clip
+residuals) through their own short filters, summed into the same subtraction.
+Still a function of what this machine played, so the near voice is still exact.
+Measured (far-only / conversation): clean speaker 18.8/10.4 → 19.5/9.1; a speaker
+driven hard 14.0/8.5 → 17.5/8.5. It wins 3.5 dB on a distorting speaker and
+costs 1.3 dB in ordinary conversation, and the rule here is that nothing may be
+lost — so it ships off, with the negative recorded in `mac/ECHO.md`. The first
+version (x³, x⁵) detonated in the rig; that trace is in `Aec.swift`.
+
+The tail sweep is also recorded: 4096 taps win 1.2 dB of the 5.6 dB an 80 ms
+room costs. The filter is not short, it is slow — convergence on coloured speech
+is where the remaining decibels are, and that is a separate release.
+
+The telemetry reader gains a `CANCELLER` line (removed, path left, re-aims and
+holds, drift fits rejected, resets, both-mics-open share).
+
 ## Kin 0.124.0 — 2026-09-02
 
 ### Added — the turn prediction is measured on a real call for the first time

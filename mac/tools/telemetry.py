@@ -1,5 +1,6 @@
 """Reads what tools/telemetry.sh fetches. Prints the numbers a call is judged on
 rather than the whole beat: a 80 KB JSON dump is data nobody looks at twice."""
+import math
 import json, sys, datetime
 
 def num(b, k, d=None):
@@ -47,6 +48,31 @@ def call_summary(bs, label=""):
     ov = last(bs, "strict_overlap_pct", -1)
     if st == 1 and ov >= 0:
         mode += f", overlap {ov:.1f}%"
+    # The canceller (0.107.0+), as a ranked story: how much it removed, how much
+    # path is LEFT (the number the duplex gate reads), and whether the aim held.
+    # 0.125.0 added the last three: re-aims the hold refused, drift fits rejected
+    # as a wandering estimator, and how much of the call both mics were open on
+    # loudspeakers because the canceller had earned it.
+    erle = series(bs, "aec_erle_db")
+    if erle:
+        import statistics
+        res = series(bs, "aec_residual")
+        path_db = 20 * math.log10(max(1e-4, statistics.median(res))) if res else 0
+        held = last(bs, "aec_reaims_held", -1)
+        rej = last(bs, "aec_skew_rejects", -1)
+        dup = last(bs, "floor_aec_duplex_pct", -1)
+        nl = last(bs, "aec_nl_share_db", None)
+        print(f"  CANCELLER removed p50 {statistics.median(erle):.1f} dB peak {max(erle):.1f}"
+              f"  ·  call {last(bs,'aec_erle_life_db'):.1f} dB"
+              f"  ·  path left {path_db:.0f} dB"
+              f"  ·  subtracting {100-last(bs,'aec_off_pct',100):.0f}% of the call"
+              f"  ·  re-aims {last(bs,'aec_reaims',0):.0f}"
+              + (f" (held {held:.0f})" if held >= 0 else " (hold: not in this build)")
+              + f"  ·  drift {last(bs,'aec_skew_sps',0):.2f} sps"
+              + (f" ({rej:.0f} fits rejected)" if rej >= 0 else "")
+              + f"  ·  resets {last(bs,'aec_diverges',0):.0f}"
+              + (f"  ·  both mics open on speakers {dup:.0f}%" if dup >= 0 else "")
+              + (f"  ·  distortion share {nl:.0f} dB" if nl is not None and last(bs,'aec_nl_on',0) else ""))
     print(f"  MIC       {mode}"
           f"  ·  floor muted {last(bs,'floor_muted_pct'):.0f}%"
           f"  ·  {guard}"
