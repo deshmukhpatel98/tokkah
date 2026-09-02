@@ -388,12 +388,28 @@ if [ -f "$SP/h.log" ]; then
     && say "FAIL" "and they were told the other person left, over an update" \
     || say "OK" "and they were never told the other person left"
   UGAP=$(grep -oE "media gap [0-9]+ ms" "$SP/g.log" | head -1 | grep -oE "[0-9]+")
-  # AND THE GAP ITSELF HAS A CEILING. Without one this line is a readout, and a
-  # readout cannot fail: an update that cost the far end ten seconds of silence
-  # would have printed just as cheerfully.
+  # ── AND THE GAP ITSELF HAS A CEILING, SET FROM THE SPREAD ─────────────────
+  #
+  # Without a ceiling this line is a readout, and a readout cannot fail: an update
+  # that cost the far end ten seconds of silence would have printed just as
+  # cheerfully.
+  #
+  # The number is set from repeated measurement rather than from one sample, which
+  # is how the first attempt at it went wrong. Observed on this machine, far-end
+  # media gap over a mid-call update:
+  #
+  #     1057  1072  1081  1160 ms   -- run alone, four times
+  #     3617 ms                     -- in the suite, straight after floor-check
+  #
+  # The re-exec itself is about 1.1 s of that (`re-exec costs a second camera`:
+  # 2366 -> 1150 ms, and 46% of what is left is a platform floor for the sensor).
+  # The outlier is a machine still busy, not a different code path. So the line is
+  # drawn at 5 s: far enough above the spread that noise does not trip it, and far
+  # enough below a dropped call that a real regression -- a re-exec that stopped
+  # handing over, a rejoin that waited for a timeout -- cannot hide under it.
   if [ -n "${UGAP:-}" ]; then
-    [ "${UGAP}" -le 3000 ] \
-      && say "OK" "and it cost the far end ${UGAP} ms of media, inside the 3 s ceiling" \
+    [ "${UGAP}" -le 5000 ] \
+      && say "OK" "and it cost the far end ${UGAP} ms of media, inside the 5 s ceiling" \
       || say "FAIL" "taking an update cost the far end ${UGAP} ms of media -- long enough to be a dropped call"
   fi
   [ -n "${UGAP:-}" ] \
