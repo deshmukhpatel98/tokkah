@@ -327,6 +327,25 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) 
 
 
 
+    // ── THE CALL IS ALL PICTURE ─────────────────────────────────────────────
+    //
+    // The Mac's call window hides its title bar and runs the picture to every
+    // edge. A phone's equivalent is the status bar and gesture bar out of the
+    // way for the length of the call, brought back by a swipe from the edge
+    // (transient, never gone for good). The front door keeps them: a clock is
+    // useful there and the Mac's front door has a title bar to match.
+    val view = androidx.compose.ui.platform.LocalView.current
+    LaunchedEffect(session != null) {
+        val window = (view.context as? android.app.Activity)?.window ?: return@LaunchedEffect
+        val c = androidx.core.view.WindowInsetsControllerCompat(window, view)
+        if (session != null) {
+            c.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            c.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        } else {
+            c.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
     Box(Modifier.fillMaxSize().background(Palette.bg)) {
         val s = session
         if (s == null) {
