@@ -895,6 +895,7 @@ enum Identity {
   }
   static func noteCallTime(_ handle: String, at t: Double = Date().timeIntervalSince1970) {
     guard sanitize(handle) == handle else { return }
+    unhide(handle)
     var map = lastCallTimes()
     map[handle] = t
     guard let d = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
@@ -906,6 +907,57 @@ enum Identity {
       try? FileManager.default.removeItem(at: lastCallFile)
       try? FileManager.default.moveItem(at: tmp, to: lastCallFile)
     }
+  }
+
+  // ── PEOPLE YOU HAVE ASKED NOT TO SEE ──────────────────────────────────────
+  //
+  // A THIRD FILE, and again the reason is the invariant on the first one.
+  // "Remove @meera" from the front door could delete her key from
+  // `contacts.json` -- and the next time she rings, `known` is false, the
+  // pre-answer preview does not open, and `keyChanged` can no longer say
+  // whether the key on the wire is the one she has always held. Forgetting a
+  // person's KEY is a trust decision the person at this Mac did not ask to
+  // make; they asked for a shorter list. So the row goes and the key stays.
+  //
+  // A set of handles the list skips. Cleared for one person the moment there
+  // is a new call with them, placed or answered (`noteCallTime` is the one
+  // place both paths already meet): the list is "people you talk to", and
+  // talking to somebody is the strongest possible statement that they belong
+  // on it. Nothing here is ever sent anywhere.
+  private static var hiddenFile: URL { dir.appendingPathComponent("hidden.json") }
+  static func hidden() -> Set<String> {
+    guard let d = try? Data(contentsOf: hiddenFile),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String]
+    else { return [] }
+    return Set(o.filter { sanitize($0) == $0 })
+  }
+  private static func writeHidden(_ set: Set<String>) {
+    guard let d = try? JSONSerialization.data(withJSONObject: Array(set).sorted()) else { return }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let tmp = hiddenFile.appendingPathExtension("tmp")
+    if (try? d.write(to: tmp, options: .atomic)) != nil {
+      _ = try? FileManager.default.replaceItemAt(hiddenFile, withItemAt: tmp)
+    }
+  }
+  /// Take somebody off the list. Their key, if we hold one, is untouched.
+  static func hide(_ handle: String) {
+    guard sanitize(handle) == handle else { return }
+    var set = hidden()
+    guard !set.contains(handle) else { return }
+    set.insert(handle)
+    writeHidden(set)
+    fputs("contacts: @\(handle) removed from the list (key kept)\n", stderr)
+  }
+  /// Put them back. Called by `noteCallTime`, so a new call always restores a
+  /// person you removed -- there is no other way back, by design: the list is
+  /// who you talk to, not who you once talked to.
+  static func unhide(_ handle: String) {
+    var set = hidden()
+    guard set.contains(handle) else { return }
+    set.remove(handle)
+    writeHidden(set)
+    fputs("contacts: @\(handle) back on the list -- you talked again\n", stderr)
   }
 
   /// The home list's order: the people you actually talk to, most recent first,
@@ -976,9 +1028,15 @@ enum Identity {
         fputs("contacts: --contacts-fake is on -- \(list.count) pretend"
             + " (\(list.joined(separator: ", "))), the real list is not read\n", stderr)
       }
-      return list
+      // The fake list is filtered too, or the rig could only ever audit removal
+      // against a real person's real file.
+      return list.filter { !hidden().contains($0) }
     }
-    return Set(contacts().keys).union(called()).sorted()
+    // Minus the people asked away. `hidden()` is read here and nowhere else in
+    // the read path, so every list in the app -- the front door and the People
+    // panel in a call -- agrees about who is on it.
+    let gone = hidden()
+    return Set(contacts().keys).union(called()).filter { !gone.contains($0) }.sorted()
   }
 
   /// Bind a handle to the key that actually rang. Called when a call is accepted,

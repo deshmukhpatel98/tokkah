@@ -170,6 +170,39 @@ grep -q "home card \[front\]:.*mine" "$SP/empty.log" \
   && say OK "empty door still shows your handle" \
   || { say FAIL "empty door hid the handle: $(grep -o 'home card.*' "$SP/empty.log" | tail -1)"; fail=1; }
 
+# ── REMOVING SOMEBODY FROM THE LIST ──────────────────────────────────────────
+# A person's row RINGS them on a click, and the × at its right end is the one
+# point on that row where a click does not. Two things can silently go wrong
+# with that and each is a real click here: the × could ring (the strip is
+# judged inside the row's own tracking loop, at the point the finger lifted),
+# and the row could vanish from the screen but not from the file (a relayout
+# with no write, back on the next launch). So: click the ×, read the card, read
+# the file through the binary's own list function, and a control click on the
+# NAME of a different row which must NOT remove anybody.
+export TK_KIN_DIR="$SP/kin-rm"
+mkdir -p "$TK_KIN_DIR"
+cp "$SP/kin/lastcall.json" "$TK_KIN_DIR/"
+"$TK" --contacts-fake "arjun,meera,dad" --gui --no-update --no-telemetry \
+  --no-relocate --press "@meera:x,?,@dad" --press-after 2 > "$SP/rm.log" 2>&1 & PIDS="$PIDS $!"
+sleep 9
+reap
+if grep -q "home: removed @meera" "$SP/rm.log" \
+   && grep -q 'home card \[front\]: @arjun @dad field' "$SP/rm.log"; then
+  say OK "the × took @meera off the card"
+else
+  say FAIL "the × did not remove: $(grep -E 'click meera|home card' "$SP/rm.log" | tail -2 | tr '\n' ' ')"; fail=1
+fi
+RMORDER=$(TK_KIN_DIR="$TK_KIN_DIR" "$TK" --contacts-fake "arjun,meera,dad" --order-audit 2>/dev/null)
+[ "$RMORDER" = "arjun dad" ] && say OK "and off the list on disk: $RMORDER" \
+  || { say FAIL "removal did not persist: order is '$RMORDER', want 'arjun dad'"; fail=1; }
+# The control: a click on @dad's NAME rings (the identity path starts) and
+# removes nobody else. One removal in the whole log, and it is meera's.
+if [ "$(grep -c 'home: removed' "$SP/rm.log")" = "1" ]; then
+  say OK "a click on a name did not remove anybody"
+else
+  say FAIL "a plain row click removed somebody: $(grep 'home: removed' "$SP/rm.log" | tr '\n' ' ')"; fail=1
+fi
+
 # ── THE CARD IS SHORT, AND STAYS SHORT ───────────────────────────────────────
 # This card floats over the person's own face and every row on it covers part of
 # that face -- the report that started this was "I really can't see my face".

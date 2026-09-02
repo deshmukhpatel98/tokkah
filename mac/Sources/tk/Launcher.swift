@@ -726,7 +726,10 @@ enum Launcher {
     // person you are most likely opening the app to reach, and burying them
     // under whoever's name starts with 'a' is the list optimising for a phone
     // book nobody is reading top to bottom.
-    let people = Array(Identity.contactHandlesByRecency().prefix(5))
+    // `var`, because a row can be removed while the window is up: `layout` reads
+    // this list every time it runs, so a name taken out of it is a row that is
+    // hidden on the next pass and, once nobody is left, the empty hint.
+    var people = Array(Identity.contactHandlesByRecency().prefix(5))
     let pad = Metric.cardPad
     let cardW = W - Metric.gutter * 2
     let rowW = cardW - pad * 2
@@ -1286,7 +1289,7 @@ enum Launcher {
         // before is the common case, and inviting a stranger is the rare one.
         if resume != nil { column += [resumeRow] }
         if !linkRow.spokenName.isEmpty { column += [linkRow] }
-        column += people.isEmpty ? [emptyHint] : peopleRows
+        column += people.isEmpty ? [emptyHint] : peopleRows.filter { people.contains($0.handleName) }
         column += [fieldBack, status, inviteRow]
         // A brand-new install has nobody to call until somebody knows this
         // Mac's name -- so the name stays on the front card exactly until the
@@ -1705,6 +1708,26 @@ enum Launcher {
       keySel = keySel.map { min(max($0 + d, 0), rows.count - 1) } ?? (d > 0 ? 0 : rows.count - 1)
       paintSel()
     }
+    // ── REMOVE, WIRED HERE BECAUSE IT TOUCHES THE KEYBOARD SELECTION ────────
+    //
+    // The arrows walk `liveRows()`, which is recomputed from `isHidden` on every
+    // press -- so a removed row leaves the walk by itself, but a selection INDEX
+    // held across the removal would now name the row that moved up into its
+    // place. Cleared, and repainted. Refused while a ring is in flight, like every
+    // other change to this card: the row being rung is lit, and a list that
+    // changes under a call being placed is a call to the wrong person.
+    for r in peopleRows {
+      r.onRemove = { [weak t] in
+        guard let t, !t.ringing else { return }
+        Identity.hide(r.handleName)
+        people.removeAll { $0 == r.handleName }
+        keySel = nil
+        paintSel()
+        Metrics.tap("home_remove")
+        fputs("home: removed @\(r.handleName)\n", stderr)
+        t.relayout()
+      }
+    }
     let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
       guard e.window === w else { return e }
       let editing = field.currentEditor() != nil
@@ -1865,7 +1888,11 @@ enum Launcher {
             fputs("click: no row named " + want + " on this screen\n", stderr)
             return
           }
-          let mid = NSPoint(x: r.bounds.midX, y: r.bounds.midY)
+          // `@meera:x` lands on the remove strip rather than the name -- the one
+          // point on a person's row where a click is NOT a call.
+          let onX = bits.count > 1 && bits[1] == "x"
+          let mid = onX ? NSPoint(x: r.trailingRect.midX, y: r.bounds.midY)
+                        : NSPoint(x: r.bounds.midX, y: r.bounds.midY)
           let pt = r.convert(mid, to: nil)
           let hit = w.contentView?.hitTest(pt)
           var reached = false

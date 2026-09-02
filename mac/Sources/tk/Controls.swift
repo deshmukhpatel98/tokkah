@@ -911,7 +911,7 @@ final class Pill: NSView {
 class SheetRow: NSButton {
   private let glyph: Glyph.Shape?
   private let text: NSTextField
-  private var hovering = false
+  private(set) var hovering = false
   var checked = false { didSet { needsDisplay = true } }
   /// Held down. Drawn like hover, a shade stronger -- feedback under the finger.
   private var pressed = false { didSet { needsDisplay = true } }
@@ -964,6 +964,26 @@ class SheetRow: NSButton {
   /// expression it replaces, so a subclass drawing a WIDER mark than a glyph can
   /// move the text without overriding `layout` and re-deriving the rest of it.
   var textInset: CGFloat = Metric.s3 { didSet { needsLayout = true } }
+  // ── A SECOND THING TO PRESS, INSIDE THE ONE BUTTON ──────────────────────────
+  //
+  // The whole row is one `NSButton` and `hitTest` returns `self` for every point
+  // in it, on purpose: a subview in front of a row is how this file has eaten
+  // clicks before (`decoration-inside-a-control-eats-clicks`). So a row that
+  // needs a second action -- "remove" on a person's row, where the row itself
+  // RINGS them -- gets it as a strip at the right end that the tracking loop
+  // checks on release, not as a view. `trailingReserve` is width the value word
+  // moves left to leave free, RESERVED WHETHER OR NOT anything is drawn in it:
+  // the strip appears on hover, and a word that shifts when the pointer arrives
+  // is a target moving under a finger already travelling towards it.
+  var trailingReserve: CGFloat = 0 { didSet { needsLayout = true; needsDisplay = true } }
+  var trailingAction: (() -> Void)?
+  var trailingRect: NSRect {
+    guard trailingReserve > 0 else { return .zero }
+    // Wider than what is drawn: the strip runs to the row's edge and takes the
+    // full row height, so a press that is roughly on the × is on the ×.
+    return NSRect(x: bounds.width - trailingReserve - Metric.s3, y: 0,
+                  width: trailingReserve + Metric.s3, height: bounds.height)
+  }
 
   /// Change what the row says after it has been built. A row whose words are
   /// fixed at `init` forces anything with two states -- a switch that reports what
@@ -1081,15 +1101,22 @@ class SheetRow: NSButton {
   override func mouseDown(with event: NSEvent) {
     pressed = true
     var inside = true
+    var at = convert(event.locationInWindow, from: nil)
     while let e = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
-      inside = bounds.contains(convert(e.locationInWindow, from: nil))
+      at = convert(e.locationInWindow, from: nil)
+      inside = bounds.contains(at)
       pressed = inside
       if e.type == .leftMouseUp { break }
     }
     pressed = false
     // Released outside the row is a cancelled press, the way every Mac button
     // behaves: you can slide off a row you did not mean to hit.
-    guard inside, let t = target, let a = action else { return }
+    guard inside else { return }
+    // Judged where the finger LIFTED, like the row itself: a press that starts
+    // on the name and slides onto the × removes, and the reverse rings, which
+    // is what every button on this Mac does with a slide.
+    if let go = trailingAction, trailingRect.contains(at) { go(); return }
+    guard let t = target, let a = action else { return }
     NSApp.sendAction(a, to: t, from: self)
   }
 
@@ -1155,6 +1182,7 @@ class SheetRow: NSButton {
              // A chevron sits outside the value, so it is not one or the other.
              + (chevron ? Metric.s4 : 0)
     } else if chevron { gutter = 28 }
+    gutter += trailingReserve
     text.frame = NSRect(x: x, y: (bounds.height - 18) / 2,
                         width: max(20, bounds.width - x - gutter), height: 18)
   }
@@ -1248,7 +1276,7 @@ class SheetRow: NSButton {
       // both -- Microphone, Speaker, Camera -- the device name ran underneath the
       // chevron: "MacBook Air Microphon>". The whole point of naming the device on
       // the row is that you can read which one it is.
-      let rightEdge = bounds.width - Metric.s3 - (chevron ? Metric.s4 : 0)
+      let rightEdge = bounds.width - Metric.s3 - (chevron ? Metric.s4 : 0) - trailingReserve
       var tx = rightEdge - sz.width
       if valueIsAction {
         let padX: CGFloat = 10, h: CGFloat = 24
@@ -1326,6 +1354,33 @@ final class ContactRow: SheetRow {
   }
   required init?(coder: NSCoder) { fatalError() }
 
+  // ── TAKING SOMEBODY OFF THE LIST ───────────────────────────────────────────
+  //
+  // Two ways in, because each covers the other's blind spot. An × at the right
+  // end of the row, shown while the pointer is over it, is the one a person can
+  // FIND; a right-click "Remove @meera" is the one a Mac user REACHES FOR, and
+  // it is also the only one of the two that works with the pointer never
+  // having to cross the name of somebody the row will ring on a click.
+  //
+  // Set by the owner; a row with no `onRemove` draws no × and reserves nothing,
+  // so the rows inside a call are exactly what they were.
+  var onRemove: (() -> Void)? {
+    didSet {
+      trailingReserve = onRemove == nil ? 0 : Metric.s6
+      trailingAction = onRemove
+    }
+  }
+  @objc private func removeSelf() { onRemove?() }
+  override func menu(for event: NSEvent) -> NSMenu? {
+    guard onRemove != nil else { return super.menu(for: event) }
+    let m = NSMenu()
+    let item = NSMenuItem(title: "Remove @" + handle, action: #selector(removeSelf),
+                          keyEquivalent: "")
+    item.target = self
+    m.addItem(item)
+    return m
+  }
+
   // ── DRAWN, NOT LAYERED ─────────────────────────────────────────────────────
   //
   // `Display.snapshot` is `cacheDisplay`-based and cannot see a layer-only
@@ -1351,6 +1406,22 @@ final class ContactRow: SheetRow {
       NSGraphicsContext.current?.restoreGraphicsState()
       Palette.ok.setFill()
       NSBezierPath(ovalIn: at).fill()
+    }
+    // The ×, only while the pointer is on the row: at rest the row is a name and
+    // a day, and a delete control on every row of a list of friends is a list
+    // that looks like a to-do. Drawn, not a subview, for the reason the avatar is.
+    if onRemove != nil, hovering {
+      let d: CGFloat = 20
+      let r = trailingRect
+      let box = NSRect(x: r.maxX - Metric.s3 - d + 2, y: (bounds.height - d) / 2, width: d, height: d)
+      Palette.fill(0.14).setFill()
+      NSBezierPath(ovalIn: box).fill()
+      let x = NSBezierPath()
+      let c = NSPoint(x: box.midX, y: box.midY), k: CGFloat = 3.5
+      x.move(to: NSPoint(x: c.x - k, y: c.y - k)); x.line(to: NSPoint(x: c.x + k, y: c.y + k))
+      x.move(to: NSPoint(x: c.x - k, y: c.y + k)); x.line(to: NSPoint(x: c.x + k, y: c.y - k))
+      x.lineWidth = 1.6; x.lineCapStyle = .round
+      Palette.fg.setStroke(); x.stroke()
     }
   }
 }
