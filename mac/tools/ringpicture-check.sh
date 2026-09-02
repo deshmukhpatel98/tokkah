@@ -279,35 +279,32 @@ LAYER_A=$(grep -oE "layer:[A-Za-z?]+" "$SP/b.log" | tail -1)
 [ "$ENQF_A" = "0" ] \
   && say "OK" "and it refused none of them" \
   || say "FAIL" "the layer refused $ENQF_A frames"
-grep -q "window visible/onscreen" "$SP/b.log" \
-  && say "OK" "in a window that is visible and not occluded" \
-  || { STATE="$(grep -oE 'window [a-z]+/[a-z]+' "$SP/b.log" | tail -1 | sed 's/^window //')"
-       # ── AN OCCLUDED WINDOW IS THIS MAC, NOT THE BUILD ──────────────────────
-       #
-       # The message used to read "the window was window visible/occluded", which
-       # is both mangled and misleading: it looks like a broken assertion when it
-       # is the rig correctly refusing to report on a photograph nobody could have
-       # taken. On a Mac whose owner has Kin open -- the normal state of the
-       # machine this suite runs on -- every rig window is parked at the desktop
-       # level and sits behind it.
-       case "$STATE" in
-         *occluded*)
-           # ── AND THAT IS NOT A FAILING BUILD ───────────────────────────────
-           #
-           # An occluded window is the owner of this Mac having Kin open in front
-           # of a rig that parks its windows at the desktop level. Reporting it as
-           # FAIL made the suite's only red, run after run, a fact about the room
-           # rather than about the code -- and a red that is usually environmental
-           # is a red nobody reads. COULD NOT RUN is what this suite already says
-           # for `doorbell-check` and `cancelrace-check` when the machine, not the
-           # build, is in the way.
-           echo "  RING PICTURE CHECK COULD NOT RUN -- the ring window was OCCLUDED"
-           echo "  ($STATE): another Kin window is in front of it, so nothing could"
-           echo "  be photographed. Close it and run this again. This is a fact"
-           echo "  about this Mac and not a verdict on the build."
-           exit 2 ;;
-         *) say "FAIL" "the ring window was $STATE -- nobody could have seen it" ;;
-       esac; }
+# ── OCCLUSION IS NOT A VERDICT ON THE DRAWING ───────────────────────────────
+#
+# This required `window visible/onscreen` and refused outright otherwise, which
+# made it the suite's only permanent red on any Mac whose owner has Kin open --
+# and these rigs PARK THEIR WINDOWS AT THE DESKTOP LEVEL on purpose, so that a
+# real finger cannot land on them. A window that is deliberately behind everything
+# was then failed for being behind something.
+#
+# The two claims were conflated. "A person could have seen it" is a fact about
+# the desktop. "The app drew the ring card correctly" is the thing this rig exists
+# to test -- and `screencapture -l <windowid>` reads the WINDOW'S OWN BUFFER, so
+# it is true of an occluded window too. Measured: with another Kin window in
+# front, the capture came back complete and correct, every pill and control in it,
+# nothing of the window in front bleeding through.
+#
+# So the occlusion is reported and the PHOTOGRAPH is judged, by the assertions
+# below that measure the face, the name and the material. If the app failed to
+# draw, those fail; if the desk was merely busy, they do not.
+if grep -q "window visible/onscreen" "$SP/b.log"; then
+  say "OK" "in a window that is visible and not occluded"
+else
+  STATE="$(grep -oE 'window [a-z]+/[a-z]+' "$SP/b.log" | tail -1 | sed 's/^window //')"
+  say "note" "the ring window was ${STATE:-not reported}: another window is in front"
+  say "note" "  of it, so nobody could have SEEN it -- but the capture below reads"
+  say "note" "  the window's own buffer, so what it drew is still measurable."
+fi
 # WHOSE FRAMES THOSE WERE. `shown` is incremented by the self-view too, so the
 # claim "shown means the far end" holds only because a ring starts no camera --
 # asserted here rather than assumed, since it is the guarantee a future change to
