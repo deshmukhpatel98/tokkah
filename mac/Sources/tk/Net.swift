@@ -1495,7 +1495,7 @@ final class Wire {
       var plain: UnsafeMutablePointer<UInt8> = buf
       var plainN = Int(n)
       guard let c = crypto, c.established else {
-        crypto?.notePlaintextRx()
+        crypto?.notePreKeyRx()
         continue
       }
       if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC || magic == BMAGIC {

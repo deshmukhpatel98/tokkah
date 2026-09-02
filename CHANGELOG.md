@@ -5,7 +5,7 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
-## Kin 0.128.0 / 0.128.0-android.19 — 2026-09-03
+## Kin 0.128.0–0.128.1 / 0.128.1-android.20 — 2026-09-03
 
 ### Changed — the handshake is signed, and there is no plaintext window
 
@@ -38,7 +38,9 @@ vectors):
   remembered under the handle once the call is answered. Both ephemeral keys and
   both identities are in the HKDF transcript.
 - **Nothing is read or written before a key.** `prekey_drop` counts what was held
-  back; `plaintext_rx` counts what arrived in the clear and was refused.
+  back; `prekey_rx` what arrived before this end had a key (the far end's first
+  sealed probes, usually -- 0.128.0 miscounted those as `plaintext_rx`, fixed in
+  0.128.1); `plaintext_rx` counts a recognised packet in the clear, refused.
 - **A 2048-packet replay window** (about 1.4 s of audio). `replay_drop`.
 - **Every refusal has a name in the beat**: `hs_bad_sig`, `hs_wrong_id`,
   `hs_id_changed`, `hs_old` (the far end still sends the unsigned v1 handshake),

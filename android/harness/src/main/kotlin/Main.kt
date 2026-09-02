@@ -71,7 +71,7 @@ fun main(args: Array<String>) {
                 }
                 continue
             }
-            if (!crypto.established) { crypto.notePlaintextRx(); continue }
+            if (!crypto.established) { crypto.notePreKeyRx(); continue }
             val opened = crypto.open(buf.copyOf(n)) ?: continue
             System.arraycopy(opened, 0, plain, 0, opened.size)
             b = plain; n = opened.size

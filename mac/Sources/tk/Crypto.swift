@@ -136,7 +136,7 @@ final class Crypto {
   /// between "verified" and "trusted for now".
   private(set) var pinned = false
   private(set) var sealed = 0, opened = 0, openFails = 0
-  private(set) var replayDrops = 0, preKeyDrops = 0, plaintextRx = 0
+  private(set) var replayDrops = 0, preKeyDrops = 0, preKeyRx = 0, plaintextRx = 0
   private(set) var hsBadSig = 0, hsWrongId = 0, hsIdChanged = 0, hsOld = 0, hsFlood = 0, hsWeak = 0
 
   // ── a budget on signature checks ───────────────────────────────────────────
@@ -372,6 +372,11 @@ final class Crypto {
 
   /// A recognised media magic arrived in the clear. Never dispatched; counted.
   func notePlaintextRx() { plaintextRx += 1 }
+  /// Something other than a handshake arrived before THIS end had a key. Almost
+  /// always the far end's first sealed probes, sent the moment it keyed and
+  /// before our adoption of its reply -- ciphertext, not plaintext, so it has
+  /// its own name. Dropped either way.
+  func notePreKeyRx() { preKeyRx += 1 }
   /// Something wanted to send before a key existed. Dropped; counted.
   func notePreKeyDrop() { preKeyDrops += 1 }
 
@@ -385,6 +390,7 @@ final class Crypto {
     f["crypt_expected"] = expected != nil ? 1 : 0
     if replayDrops > 0 { f["replay_drop"] = replayDrops }
     if preKeyDrops > 0 { f["prekey_drop"] = preKeyDrops }
+    if preKeyRx > 0 { f["prekey_rx"] = preKeyRx }
     if plaintextRx > 0 { f["plaintext_rx"] = plaintextRx }
     if hsBadSig > 0 { f["hs_bad_sig"] = hsBadSig }
     if hsWrongId > 0 { f["hs_wrong_id"] = hsWrongId }
