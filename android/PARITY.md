@@ -35,6 +35,8 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | ring gives up at 45 s → "Meera didn’t answer" / "they might be away" | 30 s | ✅ 0.126.12 |
 | ringtone stops itself at 40 s | same | ✅ |
 | answer / decline / cancel / close / call again | same | ✅ |
+| before ringing: Presence.ask — unregistered → "Nobody has the name X on Kin yet — check the spelling"; asleep → "X’s Mac is off right now — ringing it anyway"; refused → "Couldn’t reach X — check the name, and try again" | same; seen live with a name nobody has | ✅ 0.126.17 |
+| three pulsing dots while the ring travels | same | ✅ 0.126.17 |
 | their face on the card only if they have called before | same | ✅ |
 
 ## In a call (M: Controls.swift `CallControls`, Display.swift)
