@@ -72,7 +72,7 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | Mac | Android | State |
 |---|---|---|
 | update poll every 60 s, plus a check when opened and when a call starts | every 30 min | ✅ 0.126.12 |
-| relay (TURN) on the media socket, raced with direct, fail-open | allocates on every live call (turn_ok 1, relay in the beat); the direct path won every race on this LAN, so the relayed media path is exercised only by the harness's KIN_RELAY_ONLY arm | ✅ / 🔧 far-away test |
+| relay (TURN) on the media socket, raced with direct, fail-open | same; proven live 2026-09-03: harness KIN_RELAY_ONLY arm vs the live Mac 0.128 — Mac 'connected via 104.30.148.97:25666' (the phone's relay), audio 99.9% played both ways, rtt 8.4 ms (the Mac took 30 s to lock when its own allocation failed — a Mac-side wait) | ✅ 0.128.19 |
 | decode off the receive thread | ported (DecodeQueue), v_dq_* in the beat | ✅ |
 | audio redundancy under loss (repair copies, steered on the far end's report) | same rule; phone reports its loss in the probe; the live Mac 0.128 turned FEC on from the phone's report | ✅ 0.128.19 |
 | signed v2 handshake (Mac 0.128 refuses v1) | shipped in lockstep as android.19; seen live: 'signed handshake, first use' | ✅ 0.128.19 |
