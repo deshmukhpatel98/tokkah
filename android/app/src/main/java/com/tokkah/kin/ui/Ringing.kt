@@ -14,6 +14,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -80,6 +83,9 @@ fun CallCard(
                     Text(because, color = Palette.muted, textAlign = TextAlign.Center,
                         fontSize = Type.row.first, fontWeight = Type.row.second)
                 }
+                // While the ring travels, something that is obviously alive:
+                // the Mac's three dots, pulsing in turn (`startDots`).
+                if (mode == CallCardMode.CALLING) Dots()
                 Spacer(Modifier.height(Metric.s1))
                 when (mode) {
                     CallCardMode.RINGING -> Row(
@@ -104,6 +110,29 @@ fun CallCard(
                 }
                 Spacer(Modifier.height(Metric.s1))
             }
+        }
+    }
+}
+
+/** Three 6 pt dots, 7 apart, each breathing on its own phase. */
+@Composable
+private fun Dots() {
+    val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "dots")
+    val phase by t.animateFloat(
+        0f, 1f,
+        androidx.compose.animation.core.infiniteRepeatable(
+            androidx.compose.animation.core.tween(1200, easing = androidx.compose.animation.core.LinearEasing),
+        ),
+        label = "dotPhase",
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+        for (i in 0 until 3) {
+            val k = ((phase - i / 3f + 1f) % 1f)
+            val a = 0.25f + 0.75f * (0.5f + 0.5f * kotlin.math.sin(k * 2 * Math.PI).toFloat())
+            Box(
+                Modifier.padding(vertical = Metric.s1).height(6.dp).width(6.dp)
+                    .background(Palette.fg.copy(alpha = a), androidx.compose.foundation.shape.CircleShape),
+            )
         }
     }
 }

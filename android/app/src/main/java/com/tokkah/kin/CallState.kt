@@ -422,15 +422,39 @@ class KinState(
         com.tokkah.kin.net.Metrics.fact("outcome", "calling")
         onChanged?.invoke()
         thread(isDaemon = true) {
+            // ── ASK BEFORE RINGING (Launcher.swift `t.ring`) ────────────────
+            //
+            // A name typed wrong used to ring forever: the server accepted it,
+            // the card said "Calling @meeraa" for as long as anyone watched.
+            // Presence now says whether the name is CLAIMED, and whether their
+            // Kin is awake — the first is a refusal in the Mac's words, the
+            // second only a sentence, because a sleeping Mac is still rung.
+            val pre = Presence.ask(handle)
+            if (outgoingTo != handle) return@thread          // cancelled while asking
+            if (pre.registered == false) {
+                com.tokkah.kin.net.Metrics.count("ring_unregistered")
+                failCall("Nobody has the name ${Identity.display(handle)} on Kin yet", "check the spelling")
+                return@thread
+            }
+            if (pre.here == false) {
+                cardLine = "${Identity.display(handle)}’s Mac is off right now — ringing it anyway"
+                onChanged?.invoke()
+            }
             // Warm the room while the ring travels, never before it: warming is
             // itself a stateful hop, and spending it in front of the ring moves
             // the delay onto the callee's phone instead of removing it.
             com.tokkah.kin.net.Rendezvous.warm(room)
+            com.tokkah.kin.net.Metrics.count("ring_sent_try")
             val sent = identity.ring(handle, room)
+            if (outgoingTo != handle) return@thread
             if (!sent) {
-                failCall("Couldn’t reach ${Identity.display(handle)}", "they may not have Kin yet")
+                com.tokkah.kin.net.Metrics.count("ring_sent_fail")
+                failCall("Couldn’t reach ${Identity.display(handle)}", "check the name, and try again")
                 return@thread
             }
+            com.tokkah.kin.net.Metrics.count("ring_sent_ok")
+            cardLine = null
+            onChanged?.invoke()
             identity.rememberCalled(handle)
             identity.noteCallTime(handle)
             // Join our own end immediately: the call exists from here on, and

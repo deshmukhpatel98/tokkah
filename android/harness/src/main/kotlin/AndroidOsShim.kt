@@ -8,6 +8,7 @@ package android.os
 object Build {
     @JvmField val MANUFACTURER: String = "jvm-harness"
     @JvmField val MODEL: String = System.getProperty("os.name") ?: "jvm"
+    object VERSION { @JvmField val RELEASE: String = System.getProperty("java.version") ?: "jvm" }
 }
 
 /** Thread priorities are a phone's concern; on the JVM they are a no-op. */

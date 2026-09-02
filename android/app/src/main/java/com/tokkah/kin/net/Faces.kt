@@ -82,6 +82,22 @@ class Faces(private val root: File) {
  * so the order is fixed and presence only ever changes a colour.
  */
 object Presence {
+    /** `Presence.ask`: is this name claimed at all, and is their Kin awake. */
+    class Answer(val registered: Boolean?, val here: Boolean?)
+
+    fun ask(handle: String, base: String = Server.base): Answer {
+        if (!Regex("^[a-z][a-z0-9]{1,31}$").matches(handle)) return Answer(null, null)
+        val body = httpGet("$base/api/kin/presence?who=$handle", 4000) ?: return Answer(null, null)
+        val m = Regex("\"" + handle + "\"\\s*:\\s*\\{([^}]*)\\}").find(body) ?: return Answer(null, null)
+        val v = m.groupValues[1]
+        fun flag(k: String): Boolean? = when {
+            v.contains("\"" + k + "\":true") || v.contains("\"" + k + "\": true") -> true
+            v.contains("\"" + k + "\":false") || v.contains("\"" + k + "\": false") -> false
+            else -> null
+        }
+        return Answer(flag("registered"), flag("here"))
+    }
+
     fun fetch(handles: List<String>, base: String = Server.base): Map<String, Boolean> {
         val who = handles.filter { Regex("^[a-z][a-z0-9]{1,31}$").matches(it) }.take(12)
         if (who.isEmpty()) return emptyMap()
