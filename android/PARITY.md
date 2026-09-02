@@ -19,7 +19,7 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | invite row → "Link copied — send it to anyone" + room for 4 s; one minted room per visit; warmed | copies, no feedback | ✅ 0.126.12 |
 | mine row copies `@handle`, says "copied" for 2 s | copied the invite link | ✅ 0.126.12 |
 | minted room `xxx-xxxx-xxx` | `word-word-NN` | ✅ 0.126.12 |
-| settings: mine row/hint · ONE switch "People can call me" · hint only on trouble (only-when-open / 429 / unreachable), 12 s retry after 429, busy state "…" | two rows, two toggles | ✅ 0.126.12 |
+| settings: mine row/hint · ONE switch "People can call me" · hint only on trouble (only-when-open / 429 / unreachable), 12 s retry after 429, busy state "…" | two rows, two toggles | ✅ 0.126.12; the server refused the quiet request (400, old `tok` field) from the v2 identity port until 0.128.22 — verified 200 both ways |
 | `…` top-right of the window, `on` while settings open | same | ✅ |
 | hint pill "this is you" in the sky above the card | same | ✅ |
 | camera / mic asked on arrival, sentence when denied (pill opens Settings) | same; seen on the emulator with the camera revoked | ✅ 0.126.13 |
