@@ -93,6 +93,26 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         return false
     }
 
+    /** `Identity.renamed`: the name you asked for, or why not. */
+    enum class Renamed { OK, NOT_A_NAME, TAKEN, NO_ANSWER }
+
+    /**
+     * Change this phone's name. The same register call as a claim, under the
+     * same key: 200 is ours, 403 belongs to somebody else, and anything else is
+     * about us (a 429, a timeout) and is not a reason to think the name is gone.
+     */
+    fun rename(raw: String): Renamed {
+        val want = raw.trim().removePrefix("@").lowercase()
+        if (!handleOK(want)) return Renamed.NOT_A_NAME
+        if (want == handle && claimed) return Renamed.OK
+        return when (attempt(want)) {
+            200 -> { handle = want; claimed = true; save()
+                     android.util.Log.i("kin", "identity: you are now @$want"); Renamed.OK }
+            403 -> Renamed.TAKEN
+            else -> Renamed.NO_ANSWER
+        }
+    }
+
     private fun attempt(h: String): Int {
         // INTEGER seconds: the timestamp is stringified into the signed message,
         // so its spelling is part of the contract.

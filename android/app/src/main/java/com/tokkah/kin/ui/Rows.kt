@@ -72,6 +72,8 @@ fun KinRow(
     ruled: Boolean = false,
     inert: Boolean = false,
     onClick: (() -> Unit)? = null,
+    /** `checked`: the 18 pt green tick, 12 from the edge — "this one is selected". */
+    trailingTick: Boolean = false,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -154,6 +156,12 @@ fun KinRow(
                 if (chevron) Chevron(Modifier.padding(end = Metric.s3))
             }
             chevron -> Chevron(Modifier.padding(end = Metric.s3))
+            trailingTick -> Canvas(Modifier.padding(end = Metric.s3).size(18.dp)) {
+                val y = size.height / 2
+                drawPath(Path().apply {
+                    moveTo(0f, y); lineTo(4.5f.dp.toPx(), y + 4.5f.dp.toPx()); lineTo(14.dp.toPx(), y - 6.dp.toPx())
+                }, Palette.ok, style = Stroke(2.2f.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
         }
     }
 }

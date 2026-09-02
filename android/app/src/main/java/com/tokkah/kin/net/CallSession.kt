@@ -59,6 +59,11 @@ class CallSession(
     @Volatile var peerStatus = 0; private set
     @Volatile var peerStatusSeen = false; private set
     @Volatile var peerMuted = false; private set
+    /** The two reasons a picture stops, kept apart (Net.swift 917-918). */
+    val peerVideoPaused: Boolean get() = peerStatus and Wire.ST_VPAUSED != 0
+    val peerCamOff: Boolean get() = peerStatus and Wire.ST_CAMOFF != 0
+    /** Our own video, stopped because the link could not carry it. */
+    val selfVideoPaused: Boolean get() = vquality.paused
     @Volatile var peerPlayed = 0; private set
     @Volatile var peerSeenTalking = false; private set
     @Volatile var peerSeenTalkingSeen = false; private set
@@ -66,6 +71,25 @@ class CallSession(
     @Volatile var speakers = true
     /** Set by the UI: this end has left, so stop sending. */
     @Volatile var ended = false
+    // ── A BLIP AND A DEPARTURE ARE NOT THE SAME THING (main.swift 3915-4000) ─
+    //
+    // From the media side they are identical: silence. From the DIRECTORY they
+    // are not: a peer that has left stops republishing, and every entry carries
+    // `ageMs`. While a call is open this end HOLDS — the timer keeps running,
+    // the picture stays — until the room forgets them (90 s with nobody
+    // republishing), which is the shared fact both ends read.
+    /** Rendezvous ticks in a row with no fresh peer entry (< 4 s old). */
+    @Volatile var peerGone = 0; private set
+    /** The far end went quiet without a goodbye; the call is being held open. */
+    @Volatile var holding = false; private set
+    /** The room's lease on them expired: they are gone, not paused. */
+    @Volatile var left = false; private set
+    /** Host ms of the last packet that came from the peer, 0 before any. */
+    @Volatile var lastFromPeerMs = 0L; private set
+    /** Media silent for a moment while the directory still has them. */
+    val reconnecting: Boolean get() =
+        crypto.established && !ended && !left && !holding && lastFromPeerMs != 0L &&
+            System.currentTimeMillis() - lastFromPeerMs > 2000
 
     /** The honest sentence, or null when there is nothing to say. */
     @Volatile var heldSentence: String? = null; private set
@@ -158,6 +182,11 @@ class CallSession(
     val sendPcm16 get() = peerCaps and Wire.CAP_PCM16 != 0
     val sendLp get() = sendPcm16 && (peerCaps and Wire.CAP_PCM_LP != 0)
     val safetyCode get() = crypto.safetyCode
+
+    companion object {
+        /** worker.ts: short enough that a stale mapping is never offered as a live one. */
+        const val ROOM_LEASE_MS = 90_000L
+    }
 
     fun start() {
         if (running) return
@@ -396,7 +425,29 @@ class CallSession(
                 lastRv = now
                 val peers = Rendezvous.exchange(room, me, addr, local, relay, base = base)
                 if (peers != null) {
-                    candidates = peers.filter { it.id != me }.flatMap { p ->
+                    val others = peers.filter { it.id != me }
+                    if (others.any { it.ageMs < 4000 }) {
+                        peerGone = 0
+                        if (holding) { holding = false; Metrics.count("peer_back") }
+                    } else if (crypto.established && !ended) {
+                        peerGone++
+                        if (peerGone >= 4 && !holding && !left) {
+                            holding = true
+                            Metrics.count("peer_held")
+                            android.util.Log.i("kin", "room $room: they went quiet without hanging up -- holding the call open")
+                        }
+                        // The room has forgotten them: nobody publishing for
+                        // the lease. Only a REAL answer with an empty list
+                        // counts; null is this end failing to ask.
+                        if (others.isEmpty() && lastFromPeerMs != 0L &&
+                            System.currentTimeMillis() - lastFromPeerMs > ROOM_LEASE_MS && !left) {
+                            left = true; holding = false
+                            Metrics.count("peer_left")
+                            android.util.Log.i("kin", "room $room: nobody has been here for ${ROOM_LEASE_MS / 1000} s -- treating that as gone")
+                            resume?.end()
+                        }
+                    }
+                    candidates = others.flatMap { p ->
                         listOfNotNull(
                             InetSocketAddress(p.ip, p.port),
                             p.localIP?.let { InetSocketAddress(it, p.localPort!!) },
@@ -521,6 +572,7 @@ class CallSession(
                 android.util.Log.i("kin", "rx: $rxPackets packets, established=${crypto.established}")
             }
             var magic = Wire.magic(b, n)
+            if (locked != null && fromAddr == locked) lastFromPeerMs = System.currentTimeMillis()
             if (magic != Wire.HMAGIC) {
                 // `b`, NOT `buf`: a relayed datagram has already been
                 // unwrapped out of its 4-byte channel header, and decrypting
@@ -544,6 +596,9 @@ class CallSession(
                     val parsed = Wire.parseHandshake(b, n) ?: continue
                     peerCaps = parsed.second
                     if (crypto.adoptPeer(parsed.first)) {
+                        // A fresh handshake is somebody ARRIVING: a call that
+                        // said "hung up" and then met a new key is live again.
+                        ended = false; left = false; holding = false; peerGone = 0
                         locked = pkt.socketAddress as InetSocketAddress
                         sendRaw(Wire.handshake(crypto.myPublic))
                         Metrics.mark("connected_ms", Metrics.sinceLaunch())
@@ -642,7 +697,7 @@ class CallSession(
                     onText?.invoke(t.text, t.final, t.listening)
                 }
                 Wire.KMAGIC -> onKeyframeRequest?.invoke()
-                Wire.BMAGIC -> { onState?.invoke("peer left"); ended = true }
+                Wire.BMAGIC -> { onState?.invoke("peer left"); ended = true; holding = false; Metrics.count("peer_bye") }
                 else -> {}
             }
         }

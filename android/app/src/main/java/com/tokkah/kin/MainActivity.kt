@@ -392,19 +392,17 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                 )
             }
         } else {
-            var sentence by remember { mutableStateOf("connecting") }
+            var sentence by remember { mutableStateOf("waiting for the other person") }
+            var warning by remember { mutableStateOf("") }
+            var noPicture by remember { mutableStateOf<String?>(null) }
+            var peerPresent by remember { mutableStateOf(false) }
+            var elapsed by remember { mutableStateOf<Int?>(null) }
+            var startedAt by remember { mutableStateOf(0L) }
             var muted by remember { mutableStateOf(false) }
             // ON when the call starts, the Mac's default (`camOff = false`): the
             // front door already showed your face, and a call that opens with
             // your camera off is a different product.
             var camOn by remember { mutableStateOf(false) }
-            LaunchedEffect(s) {
-                if (camGranted && !camOn) {
-                    val started = withContext(Dispatchers.IO) { video?.startEncode() == true }
-                    if (started) { camOn = true; s.camOn = true }
-                    Metrics.tap("camera_auto", ok = started)
-                }
-            }
             var peeking by remember { mutableStateOf(false) }
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
@@ -412,6 +410,38 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             var bloom by remember { mutableStateOf<String?>(null) }
             var cueLevel by remember { mutableStateOf(0f) }
             var subsRef by remember { mutableStateOf<Subtitles?>(null) }
+            // The sheet: null closed, else the page.
+            var page by remember { mutableStateOf<String?>(null) }
+            var renameText by remember { mutableStateOf(identity.handle) }
+            // A transient sentence in the status pill (`setStatus` from a row),
+            // and when it stops being true.
+            var note by remember { mutableStateOf<String?>(null) }
+            var noteUntil by remember { mutableStateOf(0L) }
+            var silentBusy by remember { mutableStateOf(false) }
+            var settingsNote by remember { mutableStateOf("") }
+            var updateChecking by remember { mutableStateOf(false) }
+            var updateNote by remember { mutableStateOf("") }
+            var speakerName by remember { mutableStateOf("") }
+            var micName by remember { mutableStateOf("") }
+            var dialFocus by remember { mutableStateOf(0) }
+            var peerHandle by remember { mutableStateOf(s.who) }
+            val cameraCount = remember {
+                runCatching {
+                    val cm = ctx.getSystemService(android.hardware.camera2.CameraManager::class.java)
+                    cm.cameraIdList.map {
+                        cm.getCameraCharacteristics(it).get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
+                    }.distinct().size
+                }.getOrDefault(1)
+            }
+            fun say(line: String, forMs: Long = 4000) { note = line; noteUntil = System.currentTimeMillis() + forMs }
+
+            LaunchedEffect(s) {
+                if (camGranted && !camOn) {
+                    val started = withContext(Dispatchers.IO) { video?.startEncode() == true }
+                    if (started) { camOn = true; s.camOn = true }
+                    Metrics.tap("camera_auto", ok = started)
+                }
+            }
 
             DisposableEffect(s) {
                 val subs = Subtitles(ctx, s)
@@ -428,10 +458,19 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
 
             LaunchedEffect(s) {
                 while (true) {
+                    val now = System.currentTimeMillis()
+                    val here = s.crypto.established && !s.ended && !s.left
+                    if (here && startedAt == 0L) startedAt = now
+                    peerPresent = here
+                    elapsed = if (startedAt == 0L) null else ((now - startedAt) / 1000).toInt()
+                    val name = if (peerHandle.isEmpty()) "They" else Identity.display(peerHandle)
                     // The Mac's sentences, in the Mac's order of precedence.
-                    sentence = when {
+                    val computed = when {
                         s.ended -> "the other person hung up"
+                        s.left -> "the other person left"
                         !s.crypto.established -> "waiting for the other person"
+                        s.holding -> "$name’ll be right back…"
+                        s.reconnecting -> "reconnecting…"
                         // paused OUTRANKS everything: if audio is not arriving,
                         // never put the word "audio" beside the word "live".
                         s.heldSentence != null -> s.heldSentence!!
@@ -439,6 +478,19 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                         muted -> "you are muted"
                         else -> "connected"
                     }
+                    sentence = if (note != null && now < noteUntil) note!! else { note = null; computed }
+                    // `Display.setPaused`: what is wrong with THEIR picture, in words.
+                    val pMuted = s.peerMuted; val pCam = s.peerCamOff; val pPaused = s.peerVideoPaused
+                    warning = if (!here) "" else when {
+                        pMuted && pCam -> "their microphone and camera are off"
+                        pMuted -> "their microphone is off"
+                        pPaused && pCam -> "their camera is off and their connection is weak"
+                        pPaused -> "their connection is weak — video paused, audio is still on"
+                        pCam -> "their camera is off"
+                        s.selfVideoPaused -> "your connection is weak — your video is paused, audio is still on"
+                        else -> ""
+                    }
+                    noPicture = if (here && pCam) (if (pMuted) "Camera and microphone off" else "Camera off") else null
                     turn = s.floor.state
                     voicing = s.gate.voicingNow
                     cueLevel = s.cue.level
@@ -449,19 +501,198 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                     // outlives the sentence is furniture over somebody's face.
                     if (s.cue.idle && caption != null && !voicing) caption = null
                     if (s.cue.idle) bloom = null
+                    if (page != null) { speakerName = audio?.speakerName() ?: ""; micName = audio?.micName() ?: "" }
                     delay(100)
                 }
             }
 
+            val inviteLink = "${Server.invite}/${s.room}"
+
+            // ── ringing somebody INTO this call ─────────────────────────────
+            fun dialInto(raw: String) {
+                val who = raw.trim().removePrefix("@").lowercase()
+                if (!identity.handleOK(who)) { say("that is not a name"); Metrics.tap("call", ok = false); return }
+                Metrics.tap("call")
+                say("ringing ${Identity.display(who)}…", 30_000)
+                peerHandle = who
+                Thread {
+                    val ok = identity.ring(who, s.room)
+                    if (ok) { identity.rememberCalled(who); identity.noteCallTime(who) }
+                    else say("couldn’t reach ${Identity.display(who)}")
+                }.apply { isDaemon = true }.start()
+            }
+
+            fun commitRename() {
+                val want = renameText.trim().removePrefix("@")
+                if (!identity.handleOK(want.lowercase())) { Metrics.tap("rename", ok = false); say("that is not a name"); return }
+                Metrics.tap("rename")
+                say("asking for @${want.lowercase()}…", 15_000)
+                Thread {
+                    val r = identity.rename(want)
+                    when (r) {
+                        Identity.Renamed.OK -> { say("you are @${identity.handle}"); myHandle = identity.handle; page = "settings" }
+                        Identity.Renamed.TAKEN -> say("@${want.lowercase()} belongs to someone else")
+                        Identity.Renamed.NOT_A_NAME -> say("that is not a name")
+                        Identity.Renamed.NO_ANSWER -> say("could not reach the internet — try again")
+                    }
+                }.apply { isDaemon = true }.start()
+            }
+
+            // ── THE SHEET'S PAGES, AS LISTS ─────────────────────────────────
+            val sheet: List<com.tokkah.kin.ui.SheetItem>? = when (page) {
+                null -> null
+                "settings" -> buildList {
+                    val h = identity.handle
+                    if (h.isNotEmpty()) add(com.tokkah.kin.ui.SheetItem.Row("Your name", detail = "@$h",
+                        valueIsAction = true, glyph = com.tokkah.kin.ui.GlyphKind.PERSON, onClick = {
+                            ctx.getSystemService(ClipboardManager::class.java)
+                                ?.setPrimaryClip(ClipData.newPlainText("kin", "@$h"))
+                            Metrics.tap("copy_handle"); say("copied @$h")
+                        }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("People", chevron = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.PERSON, onClick = { Metrics.tap("people"); page = "people" }))
+                    add(com.tokkah.kin.ui.SheetItem.Row(if (h.isEmpty()) "Choose your name" else "Change your name",
+                        chevron = true, glyph = com.tokkah.kin.ui.GlyphKind.PENCIL,
+                        onClick = { Metrics.tap("rename_open"); renameText = identity.handle; page = "rename" }))
+                    // A choice between one thing is not a choice.
+                    if (cameraCount > 1) add(com.tokkah.kin.ui.SheetItem.Row("Camera",
+                        detail = if (video?.facingFront != false) "Front" else "Back", chevron = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.CAMERA, onClick = { page = "camera" }))
+                    // Android picks the microphone with the route: a fact, not a door.
+                    add(com.tokkah.kin.ui.SheetItem.Row("Microphone", detail = micName.ifEmpty { "…" },
+                        glyph = com.tokkah.kin.ui.GlyphKind.MIC, inert = true))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Speaker", detail = speakerName.ifEmpty { "…" }, chevron = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.SPEAKER, onClick = { page = "speaker" }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Calls when Kin is closed", switchState = state.listening,
+                        glyph = com.tokkah.kin.ui.GlyphKind.PHONE, onClick = {
+                            Metrics.tap("watch_row")
+                            if (state.listening) { state.listenOff?.invoke(); state.listening = false
+                                say("Kin will only ring while it’s open") }
+                            else { state.listening = state.listenOn?.invoke() ?: false
+                                say(if (state.listening) "people can reach you even when Kin is closed" else "setting up…") }
+                            state.onChangedReady()
+                        }))
+                    if (!state.listening) add(com.tokkah.kin.ui.SheetItem.Hint("Right now Kin only rings while it’s open."))
+                    val silent = identity.quietOn
+                    add(com.tokkah.kin.ui.SheetItem.Row("Silent", switchState = if (silentBusy) null else silent,
+                        detail = if (silentBusy) "…" else null, inert = silentBusy,
+                        glyph = com.tokkah.kin.ui.GlyphKind.BELL, onClick = {
+                            Metrics.tap("silent")
+                            val want = !silent
+                            say(if (want) "going silent…" else "turning silence off…")
+                            silentBusy = true; settingsNote = ""
+                            Thread {
+                                val ok = identity.setQuiet(want)
+                                silentBusy = false
+                                if (ok) say(if (want) "silent" else "you can be reached")
+                                else { say("could not change that"); settingsNote =
+                                    if (identity.lastQuietStatus == 429) "Too many changes at once — try again in a moment."
+                                    else "Couldn’t reach the server — nothing changed." }
+                                state.onChangedReady()
+                            }.apply { isDaemon = true }.start()
+                        }))
+                    if (settingsNote.isNotEmpty()) add(com.tokkah.kin.ui.SheetItem.Hint(settingsNote))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Encryption code", detail = s.safetyCode ?: "…",
+                        valueIsWord = false, inert = true, glyph = com.tokkah.kin.ui.GlyphKind.LOCK))
+                    add(com.tokkah.kin.ui.SheetItem.Hint(if (silent) "Silent: nobody can ring you. To them you simply look away."
+                        else "Read it aloud. Same code on both screens means nobody is in the middle."))
+                    val ready = state.readyFile
+                    when {
+                        ready != null -> add(com.tokkah.kin.ui.SheetItem.Row("Update ready", detail = "install",
+                            valueIsAction = true, glyph = com.tokkah.kin.ui.GlyphKind.MORE, onClick = {
+                                Metrics.tap("restart_for_update_row"); say("the update installs when the call ends") }))
+                        updateChecking -> add(com.tokkah.kin.ui.SheetItem.Row("Version", detail = "checking…",
+                            inert = true, glyph = com.tokkah.kin.ui.GlyphKind.MORE))
+                        else -> add(com.tokkah.kin.ui.SheetItem.Row("Version", detail = installedVersion,
+                            valueIsAction = true, glyph = com.tokkah.kin.ui.GlyphKind.MORE, onClick = {
+                                Metrics.tap("check_update_row")
+                                updateChecking = true; updateNote = ""
+                                state.updateNow("asked from the panel")
+                                Thread {
+                                    Thread.sleep(6000)
+                                    updateChecking = false
+                                    updateNote = if (state.readyFile != null) "" else "This is the newest version."
+                                    Thread.sleep(6000)
+                                    if (updateNote.isNotEmpty()) updateNote = ""
+                                }.apply { isDaemon = true }.start()
+                            }))
+                    }
+                    if (updateNote.isNotEmpty()) add(com.tokkah.kin.ui.SheetItem.Hint(updateNote))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Licence", detail = "AGPL-3.0", inert = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.MORE))
+                    add(com.tokkah.kin.ui.SheetItem.Hint("Free software. The source, and your right to run your own: github.com/deshmukhpatel98/tokkah"))
+                }
+                "people" -> buildList {
+                    val list = identity.contactHandles().take(6)
+                    if (list.isEmpty()) add(com.tokkah.kin.ui.SheetItem.Hint("Talk to someone once and they’ll show up here."))
+                    for (h in list) add(com.tokkah.kin.ui.SheetItem.Row("@$h", avatar = h, onClick = {
+                        Metrics.tap("call_contact"); page = null; dialInto(h) }))
+                    val h = identity.handle
+                    if (h.isEmpty()) add(com.tokkah.kin.ui.SheetItem.Hint(nameTrouble.ifEmpty { "Your name on Kin isn’t set up yet." }))
+                    else {
+                        add(com.tokkah.kin.ui.SheetItem.Row("@$h", avatar = h, detail = "copy", valueIsAction = true,
+                            ruled = list.isNotEmpty(), onClick = {
+                                ctx.getSystemService(ClipboardManager::class.java)
+                                    ?.setPrimaryClip(ClipData.newPlainText("kin", "@$h"))
+                                Metrics.tap("copy_handle"); say("copied @$h")
+                            }))
+                        add(com.tokkah.kin.ui.SheetItem.Hint("Give this to someone and they can call you."))
+                    }
+                    // Only where it can work: mid-call there is no name field to hand over to.
+                    if (!peerPresent) add(com.tokkah.kin.ui.SheetItem.Row("Call someone new", onClick = {
+                        Metrics.tap("call_new"); page = null; dialFocus++ }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { Metrics.tap("people_back"); page = "settings" }))
+                }
+                "rename" -> listOf(
+                    com.tokkah.kin.ui.SheetItem.Hint("This is the name people type to call you."),
+                    com.tokkah.kin.ui.SheetItem.Field("a name", renameText, { renameText = it }, { commitRename() }),
+                    com.tokkah.kin.ui.SheetItem.Row("Save this name", onClick = { commitRename() }),
+                    com.tokkah.kin.ui.SheetItem.Row("Not now", onClick = { page = "settings" }),
+                    com.tokkah.kin.ui.SheetItem.Hint("Letters and numbers, starting with a letter."),
+                )
+                "camera" -> buildList {
+                    val front = video?.facingFront != false
+                    for ((label, isFront) in listOf("Front camera" to true, "Back camera" to false)) {
+                        add(com.tokkah.kin.ui.SheetItem.Row(label, checked = front == isFront, onClick = {
+                            if (front != isFront) { val ok = video?.flip() == true; Metrics.tap("cam_pick", ok = ok) }
+                            page = "settings"
+                        }))
+                    }
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
+                }
+                "speaker" -> buildList {
+                    val routes = audio?.routes() ?: emptyList()
+                    for (r in routes) add(com.tokkah.kin.ui.SheetItem.Row(r.name, checked = r.name == speakerName, onClick = {
+                        audio?.setRoute(r); page = "settings"
+                    }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
+                }
+                else -> null
+            }
+
             CallScreen(
-                room = s.room,
-                sentence = sentence,
-                safetyCode = s.safetyCode,
-                turnMine = turn == Floor.State.MINE,
-                turnTheirs = turn == Floor.State.THEIRS,
-                voicing = voicing,
-                muted = muted,
-                camOn = camOn,
+                ui = com.tokkah.kin.ui.CallUi(
+                    peerHandle = peerHandle,
+                    elapsed = elapsed,
+                    sentence = sentence,
+                    warning = warning,
+                    peerPresent = peerPresent,
+                    noPicture = noPicture,
+                    inviteLink = inviteLink,
+                    safetyCode = s.safetyCode,
+                    turnMine = turn == Floor.State.MINE,
+                    turnTheirs = turn == Floor.State.THEIRS,
+                    voicing = voicing,
+                    muted = muted,
+                    camOn = camOn,
+                    canFlip = cameraCount > 1 && camGranted,
+                    peeking = peeking,
+                    caption = caption,
+                    bloom = bloom,
+                    cueLevel = cueLevel,
+                    sheet = sheet,
+                    dialFocus = dialFocus,
+                ),
                 // ok = the flag actually moved. A control that is pressed and
                 // does nothing must be distinguishable from one nobody pressed.
                 onMute = {
@@ -477,21 +708,26 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                         // now it looked identical to not pressing it.
                         Metrics.tap("camera_on", ok = started)
                     } else {
-                        video?.stop(); camOn = false; s.camOn = false
+                        video?.stopEncode(); camOn = false; s.camOn = false
                         Metrics.tap("camera_off")
                     }
                 },
                 onFlip = {
-                    val v = video
-                    v?.let { it.facingFront = !it.facingFront }
-                    Metrics.tap("flip", ok = v != null)
+                    val ok = video?.flip() == true
+                    Metrics.tap("flip", ok = ok)
                 },
                 onLeave = { Metrics.tap("leave"); leave() },
-                peeking = peeking,
                 onPeek = { peeking = it },
-                caption = caption,
-                bloom = bloom,
-                cueLevel = cueLevel,
+                onPeople = { Metrics.tap("peek_people"); page = if (page == "people") null else "people" },
+                onMore = { Metrics.tap("more"); page = if (page == null) "settings" else null },
+                onCloseSheet = { page = null },
+                onCopyInvite = {
+                    val cb = ctx.getSystemService(ClipboardManager::class.java)
+                    cb?.setPrimaryClip(ClipData.newPlainText("kin", inviteLink))
+                    Metrics.tap("invite_copy", ok = cb != null)
+                    cb != null
+                },
+                onDial = { dialInto(it) },
                 farVideo = { FarVideo(video) },
                 selfVideo = { if (camGranted) SelfPreview {} },
             )

@@ -113,6 +113,74 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
         record = null; track = null
     }
 
+    // ── THE SPEAKER PAGE ────────────────────────────────────────────────────
+    //
+    // The Mac's sheet has a Speaker row naming the device in use, with a page
+    // to pick another. A phone has the same question with different answers:
+    // the earpiece, the loudspeaker, and whatever is plugged in or paired.
+    // Read off the live audio graph (`getDevices`), never off what was asked
+    // for — a route change mid-call must show up as the row, not the memory.
+    class Route(val id: Int, val name: String, val kind: Int)
+
+    fun routes(): List<Route> {
+        val devs = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: return emptyList()
+        val out = ArrayList<Route>()
+        for (d in devs) {
+            val name = when (d.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Phone"
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Speaker"
+                AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Headphones"
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ->
+                    d.productName?.toString()?.ifBlank { null } ?: "Bluetooth"
+                AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE ->
+                    d.productName?.toString()?.ifBlank { null } ?: "USB"
+                else -> continue
+            }
+            if (out.none { it.name == name }) out.add(Route(d.id, name, d.type))
+        }
+        return out
+    }
+
+    /** The device the call is actually playing through, by name. */
+    fun speakerName(): String {
+        val t = track ?: return ""
+        val d = runCatching { t.routedDevice }.getOrNull() ?: return ""
+        return routes().firstOrNull { it.id == d.id }?.name ?: (d.productName?.toString() ?: "")
+    }
+
+    /** The microphone actually open, by name. Android chooses it with the route. */
+    fun micName(): String {
+        val r = record ?: return ""
+        val d = runCatching { r.routedDevice }.getOrNull() ?: return ""
+        return when (d.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Headphones"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> d.productName?.toString() ?: "Bluetooth"
+            AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE -> d.productName?.toString() ?: "USB"
+            else -> d.productName?.toString() ?: "Phone"
+        }
+    }
+
+    /** Switch the call's output to [r]. Returns whether the platform took it. */
+    fun setRoute(r: Route): Boolean {
+        val a = am ?: return false
+        val ok = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            val dev = a.availableCommunicationDevices.firstOrNull { it.id == r.id }
+                ?: a.availableCommunicationDevices.firstOrNull { it.type == r.kind }
+            dev != null && a.setCommunicationDevice(dev)
+        } else {
+            @Suppress("DEPRECATION")
+            when (r.kind) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> { a.isSpeakerphoneOn = true; true }
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> { a.isSpeakerphoneOn = false; true }
+                else -> false
+            }
+        }
+        if (ok) { session.speakers = isOnSpeakers(); Metrics.tap("speaker_pick", ok = true) }
+        else Metrics.tap("speaker_pick", ok = false)
+        return ok
+    }
+
     /** Headphones have no echo path, and the floor stands down on them. */
     fun isOnSpeakers(): Boolean {
         val devs = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: return true

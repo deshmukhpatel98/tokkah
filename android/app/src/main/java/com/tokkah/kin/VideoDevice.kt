@@ -83,6 +83,38 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     var facingFront = true
     private var sensorOrientation = 90
 
+    /**
+     * Switch cameras on a LIVE call. `facingFront` alone chose the camera for
+     * the NEXT bring-up, so the flip button on a running call did nothing —
+     * a control declared and never wired. The Mac restarts its session on the
+     * new device; this does the same, and reports where it LANDED.
+     */
+    fun flip(): Boolean {
+        val was = encoding
+        facingFront = !facingFront
+        if (!was) return true
+        stopEncode()
+        return startEncode()
+    }
+
+    /** Whether the camera is currently up and feeding the encoder. */
+    val encoding: Boolean get() = encoder != null
+
+    /**
+     * Camera off — and ONLY the camera. `stop()` also released the decoder,
+     * so pressing the camera button blanked the OTHER person's picture: their
+     * frames kept arriving and nothing was left to draw them. The decoder is
+     * theirs; it ends with the call, not with your camera.
+     */
+    fun stopEncode() {
+        try { camera?.close() } catch (_: Exception) {}
+        try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
+        rotator?.release(); rotator = null
+        camThread?.quitSafely()
+        codecThread?.quitSafely()
+        camera = null; encoder = null; camThread = null; codecThread = null
+    }
+
     fun startEncode(): Boolean {
         return try {
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H).apply {
