@@ -181,6 +181,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         a.start()
         val v = VideoDevice(ctx, s)
         s.onKeyframeRequest = { v.requestKeyframe() }
+        s.videoStats = { intArrayOf(v.framesEncoded, v.framesDecoded, v.decodedW, v.decodedH) }
         val geo = Geo(ctx)
         s.onTransportLock = {
             geo.onTransportLock()

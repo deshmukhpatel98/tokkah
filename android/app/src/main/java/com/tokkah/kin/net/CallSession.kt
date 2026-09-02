@@ -178,6 +178,24 @@ class CallSession(
     private val bound = HashSet<String>()
     private var handshakesSent = 0
     private var lastStatusSent = -1
+    // ── THE BEAT'S DENOMINATORS ─────────────────────────────────────────────
+    @Volatile private var txBytes = 0L
+    @Volatile private var rxBytes = 0L
+    @Volatile private var capFrames = 0L
+    @Volatile private var floorBlocks = 0
+    @Volatile private var floorHeldBlocks = 0
+    @Volatile private var keyAsksIn = 0
+    /** Per-second rates, computed once a beat in [reportLoop]. */
+    @Volatile private var upMbps = 0.0
+    @Volatile private var downMbps = 0.0
+    @Volatile private var playedPs = 0
+    @Volatile private var concealPs = 0
+    @Volatile private var capPs = 0
+    /** What the video device knows and this class does not: enc/dec fps, size. */
+    var videoStats: (() -> IntArray)? = null   // [encoded, decoded, w, h]
+    private var lastVideoStats = IntArray(4)
+    @Volatile private var vEncPs = 0
+    @Volatile private var vDecPs = 0
 
     val sendPcm16 get() = peerCaps and Wire.CAP_PCM16 != 0
     val sendLp get() = sendPcm16 && (peerCaps and Wire.CAP_PCM_LP != 0)
@@ -251,10 +269,21 @@ class CallSession(
         var lastFrags = 0
         var t0 = 0L
         var beatAt = 0L
+        var lastTx = 0L; var lastRx = 0L; var lastCap = 0L
         while (running) {
             Thread.sleep(1000)
             val played = ring.played - lastPlayed
             val concealed = ring.concealed - lastConceal
+            // Per-second, the Mac's units: packets played and concealed, frames
+            // captured, megabits each way.
+            playedPs = played; concealPs = concealed
+            capPs = ((capFrames - lastCap) / Wire.FPP).toInt(); lastCap = capFrames
+            upMbps = (txBytes - lastTx) * 8 / 1e6; lastTx = txBytes
+            downMbps = (rxBytes - lastRx) * 8 / 1e6; lastRx = rxBytes
+            videoStats?.invoke()?.let { v ->
+                vEncPs = v[0] - lastVideoStats[0]; vDecPs = v[1] - lastVideoStats[1]
+                lastVideoStats = v
+            }
             val frames = video.framesOut - lastFrames
             val frags = video.fragsIn - lastFrags
             lastPlayed = ring.played; lastConceal = ring.concealed
@@ -304,58 +333,116 @@ class CallSession(
     /** What is actually installed, so a beat cannot claim a version it is not. */
     @Volatile var appVersion: String = Telemetry.VERSION
 
-    /** Never the room name: it is the encryption salt and never leaves here. */
-    fun beatFields(): Map<String, Any?> = mapOf(
-        "secs" to callSeconds,
-        "played" to ring.played,
-        "conceal" to ring.concealed,
-        "conceal_lost" to ring.concealLost,
-        "conceal_starved" to ring.concealStarved,
-        "late" to ring.lateArrivals,
-        "dup" to ring.dup,
-        "jumps" to ring.jumps,
-        "snaps_behind" to ring.snapsBehind,
-        "snaps_past" to ring.snapsPast,
-        "rtt_ms" to tsync.bestRttMs,
-        "rtt_spread_ms" to tsync.rttSpreadMs,
-        "sealed" to crypto.sealed,
-        "opened" to crypto.opened,
-        "open_fails" to crypto.openFails,
-        "plaintext_rx" to crypto.plaintextRx,
-        "vframes" to video.framesOut,
-        "vfrags" to video.fragsIn,
-        "vdropped" to video.dropped,
-        "vquality" to vquality.quality,
-        "hold" to (held.sentence ?: "-"),
-        "conceal_frac" to held.lastFrac,
-        "floor_mine" to floor.askedBlocks,
-        "gate_claims" to gate.claims,
-        "gate_backchannels" to gate.backchannels,
-        "peer_played" to peerPlayed,
-        "speakers" to speakers,
-        "erle_db" to aec.erleDb,
-        "aec_residual" to aec.residual,
-        "aec_diverges" to aec.diverges,
-        "seen_talking" to peerSeenTalkingSeen,
-        "visual_known" to visualKnown,
-        "end_prob" to predict.probability(System.currentTimeMillis().toDouble()),
-        "pred_syntax" to predict.lastSyntax,
-        "pred_fall" to predict.lastFall,
-        "geo_lat" to geoLat,
-        "geo_lon" to geoLon,
-        // An absent number that cannot be told from "never asked" is a blind
-        // instrument reporting a negative.
-        "geo_err" to geoErr,
-        "send_errors" to sendErrors,
-        "rx_errors" to rxErrors,
-        "dec_inline" to decodeInline,
-        "dec_depth" to decodeDepth,
-        "relay" to (turn?.relay ?: "-"),
-        // Kept apart because they answer different questions: our own
-        // arithmetic, and the kernel carrying our packets.
-        "cpu_usr" to cpuUser,
-        "cpu_sys" to cpuSys,
-    ) + Metrics.beatFields()
+    /**
+     * The beat, under the MAC'S FIELD NAMES. The fleet dashboard reads one
+     * schema, and a phone that invented its own showed up in `telemetry.sh
+     * recent` as a row of -1s: a call with no floor, no echo and no turns, which
+     * is not what happened on it. Every number here is one the phone actually
+     * measures; a quantity this build does not measure is ABSENT, never zero
+     * (`blind-instruments-report-negatives`). The room name is never here: it
+     * is the encryption salt.
+     */
+    fun beatFields(): Map<String, Any?> {
+        val f = LinkedHashMap<String, Any?>()
+        val vs = lastVideoStats
+        f["platform"] = "android"
+        f["uptime_s"] = Metrics.sinceLaunch() / 1000
+        f["up_mbps"] = upMbps; f["down_mbps"] = downMbps
+        f["played_ps"] = playedPs; f["conceal_ps"] = concealPs; f["cap_ps"] = capPs
+        f["mic_muted"] = if (selfMuted) 1 else 0
+        f["mic_access"] = 1
+        f["io"] = "hal"
+        if (!crypto.established) { f["pre_connect"] = 1; f.putAll(Metrics.beatFields()); return f }
+        f["jit"] = playout.jitTarget
+        f["devbuf"] = playout.devBuf
+        f["secs"] = callSeconds
+        f["ended"] = if (ended) 1 else 0
+        // the far end, as it reports itself
+        f["peer_played"] = peerPlayed
+        f["mute"] = if (peerMuted) 1 else 0; f["a_peer_muted"] = if (peerMuted) 1 else 0
+        f["peer_status"] = peerStatus
+        f["peer_state_reports"] = if (peerStatusSeen) 1 else 0
+        f["peer_seen_talking"] = if (!peerSeenTalkingSeen) -1 else if (peerSeenTalking) 1 else 0
+        f["v_peer_cam_off"] = if (peerCamOff) 1 else 0
+        f["v_peer_paused_now"] = if (peerVideoPaused) 1 else 0
+        // the floor and the gate
+        f["floor_blocks"] = floorBlocks
+        f["floor_held_pct"] = if (floorBlocks > 0) 100.0 * floorHeldBlocks / floorBlocks else 0.0
+        f["floor_muted_pct"] = if (floorBlocks > 0) 100.0 * floorHeldBlocks / floorBlocks else 0.0
+        f["floor_strict"] = 1
+        f["floor_duplex_pct"] = if (floor.askedBlocks > 0) 100.0 * floor.duplexBlocks / floor.askedBlocks else 0.0
+        f["floor_aec_duplex_pct"] = if (floor.askedBlocks > 0) 100.0 * floor.aecDuplexBlocks / floor.askedBlocks else 0.0
+        f["floor_spk_duplex"] = if (floor.cfg.speakerDuplex) 1 else 0
+        f["floor_hp_duplex"] = if (floor.cfg.headphoneDuplex) 1 else 0
+        f["echo_guard_pct"] = if (floor.guardableBlocks > 0) 100.0 * floor.echoGuardBlocks / floor.guardableBlocks else 0.0
+        f["turn_claims"] = gate.claims; f["turn_backchannels"] = gate.backchannels
+        f["backchannels"] = gate.backchannels
+        f["turn_grace_onsets"] = floor.graceOnsets; f["turn_fast_takes"] = floor.fastTakes
+        f["turn_visual_takes"] = floor.visualTakes; f["turn_seen_releases"] = floor.seenReleases
+        f["predict_releases"] = floor.predictedReleases
+        f["predict_saved_ms"] = floor.predictedSavedMs
+        f["predict_far_releases"] = floor.farPredictedReleases
+        f["predict_far_saved_ms"] = floor.farPredictedSavedMs
+        f["predict_p_now"] = predict.probability(System.currentTimeMillis().toDouble())
+        f["predict_peer_p_peak"] = floor.farEndProbPeak
+        f["pred_syntax"] = predict.lastSyntax; f["pred_fall"] = predict.lastFall
+        f["speakers"] = if (speakers) 1 else 0
+        // the canceller
+        f["aec_on"] = 1
+        f["aec_erle_db"] = aec.erleDb
+        f["aec_erle_life_db"] = aec.erleLifetimeDb
+        f["aec_residual"] = aec.residual.toDouble()
+        f["aec_diverges"] = aec.diverges
+        f["aec_off_pct"] = if (aec.blocks > 0) 100.0 * aec.offBlocks / aec.blocks else 0.0
+        f["aec_delay_ms"] = aec.aimSamples.toDouble() / Wire.SR * 1000
+        // the ring
+        f["played"] = ring.played
+        f["conceal_total"] = ring.concealed; f["conceal_lost"] = ring.concealLost
+        f["conceal_starved"] = ring.concealStarved
+        f["a_conceal_ms_max"] = playout.concealMaxRun * 1000.0 / Wire.SR
+        f["late"] = ring.lateArrivals; f["near_late"] = ring.nearLate
+        f["snaps"] = ring.snaps; f["snaps_behind"] = ring.snapsBehind; f["snaps_past"] = ring.snapsPast
+        f["dup"] = ring.dup; f["too_old"] = ring.tooOld; f["jumps"] = ring.jumps
+        f["recv"] = ring.recv; f["accepted"] = ring.accepted
+        f["peer_restarts"] = ring.restarts
+        f["hold"] = held.sentence ?: "-"
+        f["conceal_frac"] = held.lastFrac
+        // the wire
+        f["route"] = if (locked == null) 0 else if (locked == relaySocketAddr()) 2 else 1
+        f["turn_ok"] = if (turn != null) 1 else 0
+        f["relay"] = turn?.relay ?: "-"
+        f["probes"] = tsync.samples
+        tsync.bestRttMs?.let { f["rtt_ms"] = it }
+        tsync.rttSpreadMs?.let { f["rtt_jit_ms"] = it }
+        f["crypt"] = 1; f["crypt_bad"] = crypto.openFails
+        f["sealed"] = crypto.sealed; f["opened"] = crypto.opened; f["plaintext_rx"] = crypto.plaintextRx
+        f["send_errors"] = sendErrors; f["rx_errors"] = rxErrors
+        f["peer_held"] = if (holding) 1 else 0
+        // the picture
+        f["v_enc_ps"] = vEncPs; f["v_dec_ps"] = vDecPs
+        f["v_rx_w"] = vs[2]; f["v_rx_h"] = vs[3]
+        f["v_frags"] = video.fragsIn; f["v_partial_drops"] = video.dropped
+        f["vframes"] = video.framesOut
+        f["v_key_asks_in"] = keyAsksIn
+        f["v_q_level"] = vquality.level; f["vquality"] = vquality.quality
+        f["v_q_downs"] = vquality.stepDowns; f["v_q_ups"] = vquality.stepUps
+        f["v_paused_now"] = if (vquality.paused) 1 else 0; f["v_pauses"] = vquality.pauses
+        f["v_paused_s"] = vquality.pausedTicks
+        f["v_dq_inline_full"] = decodeQueue?.inlineFull ?: 0
+        f["v_dq_inline_big"] = decodeQueue?.inlineTooBig ?: 0
+        f["v_dq_depth_max"] = decodeDepth
+        // vision, and where
+        f["seen_talking"] = peerSeenTalkingSeen
+        f["visual_known"] = visualKnown
+        f["geo_lat"] = geoLat; f["geo_lon"] = geoLon
+        f["geo_err"] = geoErr
+        // the machine
+        f["cpu"] = cpuUser + cpuSys; f["cpu_usr"] = cpuUser; f["cpu_sys"] = cpuSys
+        f["cpu_valid"] = 1
+        f["tel_hot_refused"] = Metrics.refusedOnAudioThread
+        f.putAll(Metrics.beatFields())
+        return f
+    }
 
     /**
      * A person hung up. THE ONLY thing that ends a call: not the process
@@ -395,7 +482,7 @@ class CallSession(
         val s = sock ?: return
         val targets = if (relayOnly && turnBound) emptyList()
                       else locked?.let { listOf(it) } ?: candidates
-        for (t in targets) try { s.send(DatagramPacket(b, n, t)) }
+        for (t in targets) try { s.send(DatagramPacket(b, n, t)); txBytes += n + 28 }
         catch (e: Exception) { sendErrors++; lastSendError = "${e.javaClass.simpleName}: ${e.message}" }
         // And through our own allocation, so the relayed path is in the same
         // race rather than a thing we fall back to after failing. ADDITIVE:
@@ -426,7 +513,14 @@ class CallSession(
                 val peers = Rendezvous.exchange(room, me, addr, local, relay, base = base)
                 if (peers != null) {
                     val others = peers.filter { it.id != me }
-                    if (others.any { it.ageMs < 4000 }) {
+                    // The directory is consulted only while the MEDIA is silent,
+                    // the way the Mac only refreshes it once unlocked: a peer that
+                    // is talking to us is here whatever its entry's age says (a
+                    // locked Mac stops republishing, and its entry goes stale
+                    // while its voice keeps arriving).
+                    val mediaFresh = lastFromPeerMs != 0L &&
+                        System.currentTimeMillis() - lastFromPeerMs < 2000
+                    if (mediaFresh || others.any { it.ageMs < 4000 }) {
                         peerGone = 0
                         if (holding) { holding = false; Metrics.count("peer_back") }
                     } else if (crypto.established && !ended) {
@@ -568,6 +662,7 @@ class CallSession(
                 b = buf.copyOfRange(o, o + len)
             }
             rxPackets++
+            rxBytes += pkt.length + 28
             if (rxPackets % 500 == 1) {
                 android.util.Log.i("kin", "rx: $rxPackets packets, established=${crypto.established}")
             }
@@ -696,7 +791,7 @@ class CallSession(
                     val t = Wire.parseText(b, n) ?: continue
                     onText?.invoke(t.text, t.final, t.listening)
                 }
-                Wire.KMAGIC -> onKeyframeRequest?.invoke()
+                Wire.KMAGIC -> { keyAsksIn++; onKeyframeRequest?.invoke() }
                 Wire.BMAGIC -> { onState?.invoke("peer left"); ended = true; holding = false; Metrics.count("peer_bye") }
                 else -> {}
             }
@@ -713,6 +808,9 @@ class CallSession(
 
     /** One capture block: cancel, classify, apply the floor, put it on the wire. */
     fun captureBlock(x: FloatArray, n: Int) {
+        capFrames += n
+        floorBlocks++
+        if (floor.state == Floor.State.THEIRS) floorHeldBlocks++
         // Subtract before classifying: the bar the classifier builds is made
         // from what is LEFT after cancellation, so a person under a cancelled
         // echo is heard rather than explained away.

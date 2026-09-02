@@ -9,3 +9,10 @@ object Build {
     @JvmField val MANUFACTURER: String = "jvm-harness"
     @JvmField val MODEL: String = System.getProperty("os.name") ?: "jvm"
 }
+
+/** Thread priorities are a phone's concern; on the JVM they are a no-op. */
+object Process {
+    const val THREAD_PRIORITY_DISPLAY = -4
+    const val THREAD_PRIORITY_URGENT_AUDIO = -19
+    @JvmStatic fun setThreadPriority(p: Int) {}
+}
