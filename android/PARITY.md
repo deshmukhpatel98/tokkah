@@ -22,8 +22,8 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | settings: mine row/hint · ONE switch "People can call me" · hint only on trouble (only-when-open / 429 / unreachable), 12 s retry after 429, busy state "…" | two rows, two toggles | ✅ 0.126.12 |
 | `…` top-right of the window, `on` while settings open | same | ✅ |
 | hint pill "this is you" in the sky above the card | same | ✅ |
-| camera / mic asked on arrival, sentence when denied | asked; no sentence when denied | 🔧 next |
-| warm the room on hover / typed `-` room | warm on press only | 🔧 this pass (typed) |
+| camera / mic asked on arrival, sentence when denied (pill opens Settings) | same; seen on the emulator with the camera revoked | ✅ 0.126.13 |
+| warm the room on hover / typed `-` room | warm on press (no hover on a phone) | ✅ close |
 | glyphs are the Mac's paths (mic, cam, peek, flip, handset, more, lock, person, pencil, bell, phone, speaker) | approximations, cross for leave | ✅ 0.126.12 |
 | row: glyph column, switch, chevron, action chip, rule | label + word only | ✅ 0.126.12 |
 
@@ -64,17 +64,17 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | Mac | Android | State |
 |---|---|---|
 | update poll every 60 s, plus a check when opened and when a call starts | every 30 min | ✅ 0.126.12 |
-| relay (TURN) on the media socket, raced with direct, fail-open | ported, not yet proven on a live call | 🔧 test |
-| decode off the receive thread | ported (DecodeQueue) | 🔧 test |
+| relay (TURN) on the media socket, raced with direct, fail-open | allocates on every live call (turn_ok 1, relay in the beat); the direct path won every race on this LAN, so the relayed media path is exercised only by the harness's KIN_RELAY_ONLY arm | ✅ / 🔧 far-away test |
+| decode off the receive thread | ported (DecodeQueue), v_dq_* in the beat | ✅ |
 | the beat under the Mac's field names (played_ps, floor_held_pct, v_*, route, …); absent where not measured | same names | ✅ 0.126.12 |
 | AEC aimed by a delay estimator every 0.5 s (echoEstimator/corrScan); 0.125 re-aim hold | EchoAim ported + hold; validated on planted delays (EchoAimTest) | ✅ 0.126.12 |
 | AEC clock-drift tracker (0.109 DLL) and 0.125 skew gate | no drift tracker at all | 🔧 later |
 | remove a person from the home list (hover ×, right-click; key kept) — 0.126.0 | long-press → "remove" chip; hidden.json | ✅ 0.126.12 |
 | self-update: silent where installer of record, else one tap | same; seen live android.11 → android.12 on the emulator | ✅ 0.126.12 |
-| speaker duplex behind the −26 dB gate, ON | floor only | 🔧 later |
+| speaker duplex behind the −26 dB gate, ON | same; the gate is fed from the canceller (it had been declared and fed by nothing) | ✅ 0.126.13 |
 | turn-end prior with the on-device model | heuristic half | ⛔ no model on Android |
 | ringing with the app closed costs a notification | — | ⛔ platform |
-| own mouth-to-ear instrumented | not measured | 🔧 later |
+| own mouth-to-ear (m2e_p50/95/99) | same names; basis = device buffer, said in the facts | ✅ 0.126.13 |
 
 ## Found on the way (fixed 0.126.0-android.12)
 

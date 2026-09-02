@@ -10,8 +10,8 @@ android {
         applicationId = "com.tokkah.kin"
         minSdk = 29
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.126.0-android.12"
+        versionCode = 13
+        versionName = "0.126.0-android.13"
     }
     buildFeatures { compose = true }
     compileOptions {
