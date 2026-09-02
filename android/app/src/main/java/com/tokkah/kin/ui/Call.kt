@@ -53,6 +53,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
@@ -198,6 +203,14 @@ fun CallScreen(
             }
 
             // ── THE POSTER: their face where their picture would be ─────────
+            //
+            // The Mac blurs the last frame under the poster (`pauseLayer`); a
+            // SurfaceView cannot be blurred without giving up the latency it is
+            // there for, so the frozen frame is dimmed instead and the poster
+            // says why.
+            if (ui.noPicture != null) {
+                Box(Modifier.fillMaxSize().background(Palette.dimInk.copy(alpha = 0.55f)))
+            }
             if (ui.noPicture != null) {
                 Column(
                     Modifier.align(Alignment.Center),
@@ -241,7 +254,8 @@ fun CallScreen(
                     .align(Alignment.TopEnd)
                     .statusBarsPadding()
                     .padding(Metric.gutter)
-                    .size(Metric.controlSmall),
+                    .size(Metric.controlSmall)
+                    .semantics { contentDescription = "more"; role = Role.Button },
                 radius = Metric.capsule(Metric.controlSmall),
                 tint = if (ui.sheet != null) Palette.fill(0.14f) else Color.Transparent,
                 blurRadius = 20.dp,
@@ -330,12 +344,14 @@ fun CallScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (!leaveArmed) {
-                        ControlButton(GlyphKind.MIC, on = !ui.muted, slashed = ui.muted,
-                            tone = if (ui.muted) Palette.bad else Palette.fg) {
+                        ControlButton(GlyphKind.MIC, on = !ui.muted, name = "microphone",
+                            state = if (ui.muted) "muted" else "on",
+                            slashed = ui.muted, tone = if (ui.muted) Palette.bad else Palette.fg) {
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                             lastTouch++; onMute()
                         }
-                        ControlButton(GlyphKind.CAMERA, on = ui.camOn,
+                        ControlButton(GlyphKind.CAMERA, on = ui.camOn, name = "camera",
+                            state = if (ui.camOn) "on" else "off",
                             slashed = !ui.camOn, tone = if (ui.camOn) Palette.fg else Palette.muted) {
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                             lastTouch++; onCamera()
@@ -344,7 +360,7 @@ fun CallScreen(
                         // a mirror you can leave on by accident is the thing the
                         // research says to remove.
                         PeekButton(onPeek, onTap = { lastTouch++; onPeople() }) { lastTouch++ }
-                        if (ui.canFlip) ControlButton(GlyphKind.FLIP, on = false) { lastTouch++; onFlip() }
+                        if (ui.canFlip) ControlButton(GlyphKind.FLIP, on = false, name = "switch camera") { lastTouch++; onFlip() }
                     }
                     LeaveButton(
                         armed = leaveArmed,
@@ -426,6 +442,7 @@ private fun WaitingRow(
             } else {
                 Box(
                     Modifier.fillMaxSize().clickable { if (onCopy()) copied = true }
+                        .semantics { contentDescription = "Invite link $link, tap to copy"; role = Role.Button }
                         .padding(horizontal = Metric.s3),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -444,6 +461,8 @@ private fun WaitingRow(
                 Modifier.fillMaxSize().clickable {
                     if (dialing && name.isNotBlank()) { onDial(name); name = ""; dialing = false }
                     else dialing = !dialing
+                }.semantics {
+                    contentDescription = if (dialing) "Call this name" else "Call someone by name"; role = Role.Button
                 },
                 contentAlignment = Alignment.Center,
             ) { Glyph(GlyphKind.PHONE, Palette.fg, size = 20.dp) }
@@ -451,16 +470,27 @@ private fun WaitingRow(
     }
 }
 
+/**
+ * Every control announces itself. A control with no name announces as "button"
+ * — the same thing every other unnamed control announces as — so a screen
+ * reader met a row of identical buttons (Kin 0.123.0). The names are the Mac's
+ * `help` strings, and a switch-like control also says which way it is.
+ */
 @Composable
 private fun ControlButton(
     glyph: GlyphKind,
     on: Boolean,
+    name: String,
+    state: String? = null,
     tone: Color = Palette.fg,
     slashed: Boolean = false,
     onClick: () -> Unit,
 ) {
     GlassSurface(
-        Modifier.size(Metric.control),
+        Modifier.size(Metric.control).semantics {
+            contentDescription = name; role = Role.Button
+            if (state != null) stateDescription = state
+        },
         radius = Metric.capsule(Metric.control),
         tint = if (on) Palette.fill(0.10f) else Color.Transparent,
         blurRadius = 20.dp,
@@ -487,7 +517,9 @@ private fun ControlButton(
 @Composable
 private fun PeekButton(onPeek: (Boolean) -> Unit, onTap: () -> Unit, onTouch: () -> Unit) {
     GlassSurface(
-        Modifier.size(Metric.control),
+        Modifier.size(Metric.control).semantics {
+            contentDescription = "tap for people · hold to see yourself"; role = Role.Button
+        },
         radius = Metric.capsule(Metric.control),
         blurRadius = 20.dp,
     ) {
@@ -537,7 +569,9 @@ private fun LeaveButton(
         }
     }
     GlassSurface(
-        Modifier.height(Metric.control).width(if (armed) 150.dp else Metric.control),
+        Modifier.height(Metric.control).width(if (armed) 150.dp else Metric.control).semantics {
+            contentDescription = if (armed) "tap again to leave" else "leave call"; role = Role.Button
+        },
         radius = Metric.capsule(Metric.control),
         tint = Palette.destructiveTint,
         blurRadius = 20.dp,

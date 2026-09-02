@@ -403,6 +403,18 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                 onReach = { state.toggleReach() },
                 onRemoveOffer = { removing = it },
                 onRemove = { removing = null; state.remove(it) },
+                onShareInvite = {
+                    // The system share sheet with the same link the copy makes.
+                    val link = state.invite()
+                    Metrics.tap("invite_share")
+                    runCatching {
+                        val send = android.content.Intent(android.content.Intent.ACTION_SEND)
+                            .setType("text/plain")
+                            .putExtra(android.content.Intent.EXTRA_TEXT, link)
+                        ctx.startActivity(android.content.Intent.createChooser(send, "Invite someone to Kin")
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    }
+                },
             ) {
                 if (camGranted) SelfPreview { cameraHint = it }
             }
@@ -522,7 +534,12 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                         s.selfVideoPaused -> "your connection is weak — your video is paused, audio is still on"
                         else -> ""
                     }
-                    noPicture = if (here && pCam) (if (pMuted) "Camera and microphone off" else "Camera off") else null
+                    noPicture = when {
+                        !here -> null
+                        pCam -> if (pMuted) "Camera and microphone off" else "Camera off"
+                        pPaused -> "Reconnecting…"
+                        else -> null
+                    }
                     turn = s.floor.state
                     voicing = s.gate.voicingNow
                     loud = s.gate.nearLoudNow

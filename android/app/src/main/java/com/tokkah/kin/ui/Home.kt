@@ -28,6 +28,10 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
@@ -91,6 +95,8 @@ fun HomeScreen(
     /** Long press on a person: offer the ×. Null clears the offer. */
     onRemoveOffer: (String?) -> Unit = {},
     onRemove: (String) -> Unit = {},
+    /** The Mac's "Share Invite…": here, a long press on the invite row. */
+    onShareInvite: () -> Unit = {},
     preview: @Composable () -> Unit,
 ) {
     GlassBackdrop(
@@ -108,7 +114,11 @@ fun HomeScreen(
                 Modifier
                     .align(Alignment.TopEnd)
                     .padding(Metric.gutter)
-                    .size(Metric.controlSmall),
+                    .size(Metric.controlSmall)
+                    .semantics {
+                        contentDescription = "settings"
+                        role = Role.Button
+                    },
                 radius = Metric.capsule(Metric.controlSmall),
                 tint = if (card.settingsOpen) Palette.fill(0.14f) else androidx.compose.ui.graphics.Color.Transparent,
                 blurRadius = 20.dp,
@@ -198,7 +208,8 @@ fun HomeScreen(
                             )
                             KinRow(card.inviteLabel, detail = card.inviteValue,
                                 valueIsAction = card.inviteValue == "copy",
-                                labelInset = Metric.rowAvatarInset, onClick = onInvite)
+                                labelInset = Metric.rowAvatarInset, onClick = onInvite,
+                                onLongClick = onShareInvite)
                             // A brand-new install has nobody to call until
                             // somebody knows this phone's name — so the name
                             // stays on the front card exactly until the first

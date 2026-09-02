@@ -36,6 +36,10 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
@@ -85,10 +89,17 @@ fun KinRow(
     val pressed by interaction.collectIsPressedAsState()
     val shape = RoundedCornerShape(Metric.sheetRowRadius)
     val pressable = onClick != null && !inert
+    // `SheetRow.spoken`: the label, then the switch's state or the value.
+    val spoken = label + (switchState?.let { if (it) " = on" else " = off" } ?: (detail?.let { " = $it" } ?: ""))
     Row(
         modifier
             .fillMaxWidth()
             .height(Metric.sheetRow)
+            .semantics(mergeDescendants = true) {
+                contentDescription = spoken
+                if (switchState != null) role = Role.Switch
+                else if (pressable) role = Role.Button
+            }
             .clip(shape)
             .background(if (pressed && pressable) Palette.fill(0.12f) else Color.Transparent, shape)
             .then(
