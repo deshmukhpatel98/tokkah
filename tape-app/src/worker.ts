@@ -415,12 +415,15 @@ export class Room implements DurableObject {
   // door can show a green dot instead of making people discover reachability by
   // ringing someone who left. What it leaks beyond ring is polling cadence
   // ("their Mac is on"), which is the trade a green dot IS.
-  private kinPresence(url: URL): Response {
+  private async kinPresence(url: URL): Promise<Response> {
     const to = url.searchParams.get('to') ?? '';
     const held = (this.kinWaiters.get(to)?.size ?? 0) > 0;
     const last = this.kinLastPoll.get(to);
     const heardMs = held ? 0 : (last === undefined ? null : Date.now() - last);
-    return json(kinPresenceBody(heardMs));
+    // The credential is durable; presence is not. A handle with a stored token
+    // is somebody's, whatever this isolate has or has not heard since it woke.
+    const registered = (await this.kinTokLoad()) !== null;
+    return json(kinPresenceBody(heardMs, registered));
   }
 
   private async kinPoll(url: URL, signal?: AbortSignal): Promise<Response> {
@@ -2476,9 +2479,21 @@ export function kinWindow(
 // exported number typechecks, passes every test, and refuses to deploy. The
 // test reads it out of the source text, like the signing contexts.
 const KIN_PRESENCE_FRESH_MS = 45_000;
-export function kinPresenceBody(heardMs: number | null): { here: boolean; ageS: number | null } {
-  if (heardMs === null) return { here: false, ageS: null };
-  return { here: heardMs < KIN_PRESENCE_FRESH_MS, ageS: Math.round(heardMs / 1000) };
+// ── AND WHETHER THE NAME IS ANYBODY'S AT ALL ──────────────────────────────────
+//
+// `registered` is a deliberate change of policy, decided 2026-09-03. Until now
+// "never claimed" and "claimed, Mac off" were the same answer everywhere, so
+// nobody could enumerate handles through this route. The cost was a caller who
+// typed a name wrong: the ring was accepted, the call window opened, and it
+// said "calling @meeraa…" for as long as they cared to watch. The oracle it
+// protected already existed -- claiming a name returns 403 "taken" -- so the
+// price was paid for nothing. Whoever knows a handle may ring it; whoever
+// guesses one learns it exists, which they could already learn by asking for it.
+export function kinPresenceBody(heardMs: number | null, registered?: boolean):
+    { here: boolean; ageS: number | null; registered?: boolean } {
+  const base = heardMs === null ? { here: false, ageS: null }
+    : { here: heardMs < KIN_PRESENCE_FRESH_MS, ageS: Math.round(heardMs / 1000) };
+  return registered === undefined ? base : { ...base, registered };
 }
 
 export function kinBoxSweep(box: Map<string, KinStored[]>, now: number): void {

@@ -2500,6 +2500,13 @@ deep(kinPresenceBody(FRESH), { here: false, ageS: Math.round(FRESH / 1000) },
 deep(kinPresenceBody(600_000), { here: false, ageS: 600 }, 'ten minutes quiet is gone');
 deep(kinPresenceBody(null), { here: false, ageS: null },
      'never heard of: not here, and the age stays null rather than becoming a number');
+// `registered` rides along only when the caller knows it, so every older
+// reader sees exactly the body it always saw.
+deep(kinPresenceBody(null, false), { here: false, ageS: null, registered: false },
+     'a name nobody claimed says so -- the front door refuses to ring it');
+deep(kinPresenceBody(600_000, true), { here: false, ageS: 600, registered: true },
+     'claimed and quiet: registered, not here -- "their Mac is off"');
+deep(kinPresenceBody(0, true), { here: true, ageS: 0, registered: true }, 'claimed and parked');
 ok(FRESH > 30_000,
    'the threshold clears the server hold ceiling (30 s), or every held listener flickers');
 
