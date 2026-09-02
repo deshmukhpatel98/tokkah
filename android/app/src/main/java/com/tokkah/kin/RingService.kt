@@ -74,13 +74,23 @@ class RingService : Service() {
         super.onDestroy()
     }
 
+    /**
+     * The one notification Android insists on. Made as small as the platform
+     * allows: MIN importance, so there is no status-bar icon and it sits
+     * collapsed at the bottom of the shade; no badge; and deferred, so it does
+     * not pop when the service starts. The Mac's resident is silent; this is
+     * the closest a phone gets, and the difference is now a line in the shade
+     * rather than an icon over every screen.
+     */
     private fun listeningNotification(): Notification =
         NotificationCompat.Builder(this, CH_ONGOING)
             .setContentTitle("Kin is listening")
             .setContentText("So somebody can call this phone.")
             .setSmallIcon(android.R.drawable.sym_call_incoming)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
             .setContentIntent(open(null, null))
             .addAction(0, "Stop", service(ACTION_STOP, null, null))
             .build()
@@ -156,7 +166,7 @@ class RingService : Service() {
 
         @Volatile private var live: RingService? = null
 
-        const val CH_ONGOING = "kin.listening"
+        const val CH_ONGOING = "kin.listening.quiet"
         const val CH_RING = "kin.ring"
         const val ONGOING_ID = 1
         const val RING_ID = 2
@@ -169,10 +179,14 @@ class RingService : Service() {
         fun channels(ctx: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            // A channel's importance cannot be lowered once it exists, so the
+            // quiet one is a NEW id and the old LOW channel is removed.
+            nm.deleteNotificationChannel("kin.listening")
             nm.createNotificationChannel(
                 NotificationChannel(CH_ONGOING, "Listening for calls",
-                    NotificationManager.IMPORTANCE_LOW).apply {
+                    NotificationManager.IMPORTANCE_MIN).apply {
                     description = "The quiet notification that lets somebody call this phone."
+                    setShowBadge(false)
                 },
             )
             nm.createNotificationChannel(
