@@ -83,7 +83,6 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     var video by remember { mutableStateOf<VideoDevice?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
     var cameraHint by remember { mutableStateOf<String?>(null) }
-    var quiet by remember { mutableStateOf(false) }
     var myHandle by remember { mutableStateOf("") }
     var people by remember { mutableStateOf(listOf<Person>()) }
     // Mirrored into Compose state, not read off the state object: a @Volatile
@@ -96,13 +95,28 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     var resumeRoom by remember { mutableStateOf<String?>(null) }
     var resumeWho by remember { mutableStateOf("") }
     var updateVersion by remember { mutableStateOf<String?>(null) }
-    var listening by remember {
-        mutableStateOf(ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
-            .getBoolean("listening", false))
-    }
+    var clipRoom by remember { mutableStateOf<String?>(null) }
+    var inviteLabel by remember { mutableStateOf("Copy a link to invite someone") }
+    var inviteValue by remember { mutableStateOf("copy") }
+    var mineValue by remember { mutableStateOf("copy") }
+    var fieldStatus by remember { mutableStateOf("") }
+    var reachOn by remember { mutableStateOf<Boolean?>(false) }
+    var reachHint by remember { mutableStateOf("") }
+    var nameTrouble by remember { mutableStateOf("") }
+    var readyVersion by remember { mutableStateOf<String?>(null) }
+    // The notification permission is the one thing "People can call me" cannot
+    // do for itself. Asked on the press that needs it; the switch finishes
+    // itself when the answer comes back.
+    lateinit var stateRef: KinState
     val askNotify = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { ok -> if (ok) { RingService.start(ctx); listening = true } }
+    ) { ok ->
+        if (ok) {
+            RingService.start(ctx)
+            ctx.getSharedPreferences("kin", Context.MODE_PRIVATE).edit().putBoolean("listening", true).apply()
+            stateRef.listeningGranted()
+        } else stateRef.onChangedReady()
+    }
 
     // The version that is ACTUALLY INSTALLED, asked of the package manager.
     // A hardcoded constant here re-downloaded the release forever: 64 MB every
@@ -115,7 +129,24 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         }.getOrDefault("0")
     }
     val state = remember { KinState(ctx.filesDir, installedVersion, ctx.applicationContext) }
+    stateRef = state
     val identity = state.identity
+    val prefs = ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
+    // Listening = the service is up. It is up whenever the person asked for it
+    // and the permission allows it.
+    state.listening = prefs.getBoolean("listening", false) &&
+        (android.os.Build.VERSION.SDK_INT < 33 || granted(ctx, Manifest.permission.POST_NOTIFICATIONS))
+    state.listenOn = {
+        prefs.edit().putBoolean("listening", true).apply()
+        if (android.os.Build.VERSION.SDK_INT >= 33 && !granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
+            askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+            false
+        } else { RingService.start(ctx); true }
+    }
+    state.listenOff = {
+        prefs.edit().putBoolean("listening", false).apply()
+        RingService.stop(ctx)
+    }
 
     var micGranted by remember {
         mutableStateOf(granted(ctx, Manifest.permission.RECORD_AUDIO))
@@ -165,6 +196,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         }
         session = s; audio = a; video = v
         state.inCall = true
+        // The Mac checks for a new version when a call starts, and installs
+        // it when the call ends.
+        state.updateNow("a call started")
     }
 
     fun leave() {
@@ -190,6 +224,15 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
             resumeRoom = state.pending?.room
             resumeWho = state.pending?.who ?: ""
             updateVersion = state.ready?.version
+            readyVersion = state.ready?.version
+            clipRoom = state.clipRoom
+            inviteLabel = state.inviteLabel
+            inviteValue = state.inviteValue
+            mineValue = state.mineValue
+            reachOn = state.reachOn
+            reachHint = state.reachHint
+            nameTrouble = if (identity.claimed) "" else
+                "This phone has no name yet, so nobody can call it. It takes one the first time it reaches the server."
         }
         state.onCall = { room, who -> join(room, who); state.answered() }
         // Silent where this copy is its own installer of record, one tap where
@@ -224,6 +267,17 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
     DisposableEffect(owner) {
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
             when (e) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    // The clipboard is readable only by the focused app, and
+                    // focus lands a moment after resume.
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        val cb = ctx.getSystemService(ClipboardManager::class.java)
+                        val text = runCatching {
+                            cb?.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString()
+                        }.getOrNull()
+                        state.scanClipboard(text)
+                    }, 350)
+                }
                 androidx.lifecycle.Lifecycle.Event.ON_START -> {
                     RingService.appInFront = true
                     // Started HERE, in the foreground, where Android allows it:
@@ -258,12 +312,23 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         val s = session
         if (s == null) {
             HomeScreen(
-                room = room, onRoom = { room = it },
-                people = people,
-                myHandle = myHandle,
+                room = room, onRoom = { room = it; if (fieldStatus.isNotEmpty()) fieldStatus = "" },
+                card = com.tokkah.kin.ui.HomeCard(
+                    people = people,
+                    myHandle = myHandle,
+                    nameTrouble = nameTrouble,
+                    resumeLabel = resumeRoom?.let { if (resumeWho.isNotEmpty()) "@$resumeWho" else it },
+                    updateVersion = updateVersion,
+                    clipRoom = clipRoom,
+                    inviteLabel = inviteLabel,
+                    inviteValue = inviteValue,
+                    mineValue = mineValue,
+                    status = fieldStatus,
+                    settingsOpen = settingsOpen,
+                    reachOn = reachOn,
+                    reachHint = reachHint,
+                ),
                 cameraHint = cameraHint,
-                resumeRoom = resumeRoom?.let { if (resumeWho.isNotEmpty()) "@$resumeWho" else it },
-                updateVersion = updateVersion,
                 onUpdate = {
                     // The bytes were checked against a signature we control
                     // before this row ever appeared; the system installer is
@@ -274,41 +339,39 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
                         else Installer.installWithPrompt(ctx, f)
                     }
                 },
-                pastedLink = null,
-                settingsOpen = settingsOpen,
-                listening = listening,
-                onListening = { on ->
-                    ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
-                        .edit().putBoolean("listening", on).apply()
-                    if (on) {
-                        if (android.os.Build.VERSION.SDK_INT >= 33 &&
-                            !granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
-                            askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        } else { RingService.start(ctx); listening = true }
-                    } else { RingService.stop(ctx); listening = false }
-                },
                 onSettings = { Metrics.tap("settings"); settingsOpen = !settingsOpen },
                 onJoin = {
-                    // A handle rings a person; anything else is a room name.
-                    val typed = room.trim().removePrefix("@")
-                    if (identity.handleOK(typed) && typed != myHandle) state.call(typed)
-                    else join(room)
+                    // What was typed decides what happens: a link joins its
+                    // room, a word with - or _ joins as a room, a name rings.
+                    when (val v = state.commit(room)) {
+                        is KinState.Verdict.Room -> { fieldStatus = ""; Metrics.tap("join"); join(v.name) }
+                        is KinState.Verdict.Ring -> { fieldStatus = ""; Metrics.tap("call"); state.call(v.handle) }
+                        is KinState.Verdict.Say -> { fieldStatus = v.status; Metrics.tap("join", ok = false) }
+                    }
                 },
                 onCall = { handle -> Metrics.tap("call_person"); state.call(handle) },
                 onResume = {
                     state.pending?.let { join(it.room, it.who) }
                     state.pending = null
                 },
+                onJoinClip = { state.clipRoom?.let { Metrics.tap("join_clip"); join(it) } },
                 onInvite = {
-                    val link = "${Server.invite}/${room.ifBlank { myHandle }}"
+                    val link = state.invite()
                     val cb = ctx.getSystemService(ClipboardManager::class.java)
                     cb?.setPrimaryClip(ClipData.newPlainText("kin", link))
                     // A copy that did not land is a real failure mode and a
                     // silent one: the person pastes the last thing they copied.
                     Metrics.tap("invite_copy", ok = cb != null)
                 },
-                quiet = quiet,
-                onQuiet = { on -> Metrics.tap("quiet"); quiet = on },
+                onCopyMine = {
+                    if (myHandle.isNotEmpty()) {
+                        val cb = ctx.getSystemService(ClipboardManager::class.java)
+                        cb?.setPrimaryClip(ClipData.newPlainText("kin", "@$myHandle"))
+                        state.copiedMine()
+                        Metrics.tap("copy_mine", ok = cb != null)
+                    }
+                },
+                onReach = { state.toggleReach() },
             ) {
                 if (camGranted) SelfPreview { cameraHint = it }
             }
@@ -331,7 +394,17 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
         } else {
             var sentence by remember { mutableStateOf("connecting") }
             var muted by remember { mutableStateOf(false) }
+            // ON when the call starts, the Mac's default (`camOff = false`): the
+            // front door already showed your face, and a call that opens with
+            // your camera off is a different product.
             var camOn by remember { mutableStateOf(false) }
+            LaunchedEffect(s) {
+                if (camGranted && !camOn) {
+                    val started = withContext(Dispatchers.IO) { video?.startEncode() == true }
+                    if (started) { camOn = true; s.camOn = true }
+                    Metrics.tap("camera_auto", ok = started)
+                }
+            }
             var peeking by remember { mutableStateOf(false) }
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
@@ -355,13 +428,15 @@ fun KinApp(initialRoom: String?, ringWho: String = "") {
 
             LaunchedEffect(s) {
                 while (true) {
+                    // The Mac's sentences, in the Mac's order of precedence.
                     sentence = when {
-                        !s.crypto.established -> "connecting"
-                        s.ended -> "they left"
+                        s.ended -> "the other person hung up"
+                        !s.crypto.established -> "waiting for the other person"
                         // paused OUTRANKS everything: if audio is not arriving,
                         // never put the word "audio" beside the word "live".
                         s.heldSentence != null -> s.heldSentence!!
-                        s.peerMuted -> "they are muted"
+                        readyVersion != null -> "update $readyVersion ready — restarts when the call ends"
+                        muted -> "you are muted"
                         else -> "connected"
                     }
                     turn = s.floor.state

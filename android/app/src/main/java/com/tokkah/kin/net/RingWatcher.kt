@@ -32,6 +32,8 @@ class RingWatcher(private val identity: Identity) {
 
     var onRing: ((Identity.Ring) -> Unit)? = null
     var onBye: ((Identity.Ring) -> Unit)? = null
+    /** The server's own word on silent mode, once per poll that carries it. */
+    var onQuiet: ((Boolean) -> Unit)? = null
 
     private var t: Thread? = null
 
@@ -54,7 +56,7 @@ class RingWatcher(private val identity: Identity) {
                 is Identity.PollOutcome.Answer -> {
                     backoff = 1000
                     serverHolds = r.serverHolds
-                    r.quiet?.let { quiet = it }
+                    r.quiet?.let { quiet = it; identity.noteQuiet(it); onQuiet?.invoke(it) }
                     if (r.rings.isNotEmpty()) {
                         android.util.Log.i("kin", "mailbox: ${r.rings.size} ring(s), holds=${r.serverHolds}")
                     }

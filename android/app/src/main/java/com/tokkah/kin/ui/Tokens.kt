@@ -51,6 +51,10 @@ object Metric {
         (outer - inset).coerceAtLeast(0.dp)
 
     fun capsule(height: androidx.compose.ui.unit.Dp) = height / 2
+
+    /** Glass.Metric.sheetRowRadius / cardFieldRadius: inner corners of the sheet and card. */
+    val sheetRowRadius get() = concentric(sheetRadius, sheetPad)
+    val cardFieldRadius get() = concentric(cardRadius, cardPad)
 }
 
 object Palette {
@@ -73,6 +77,14 @@ object Palette {
     const val dimAlpha = 0.35f
     val dimInk = Color(red = 6 / 255f, green = 8 / 255f, blue = 13 / 255f, alpha = 1f)
     val opaqueSurface = Color(red = 18 / 255f, green = 21 / 255f, blue = 28 / 255f, alpha = 1f)
+
+    /** The switch on a row: Palette.switchOn / switchOff() in Glass.swift. */
+    val switchOn = Color(0xFF30D158)
+    val switchOff = Color(1f, 1f, 1f, 0.22f)
+    /** The hairline round a chip or a switch. */
+    val chipLine = Color(1f, 1f, 1f, 0.28f)
+    /** SheetRow's label ink: white 232 at 0.86. */
+    val rowInk = Color(232 / 255f, 232 / 255f, 232 / 255f, 0.86f)
 
     /** A press inside glass: a vibrant fill, never a second pane of glass. */
     fun fill(alpha: Float) = Color(1f, 1f, 1f, alpha)

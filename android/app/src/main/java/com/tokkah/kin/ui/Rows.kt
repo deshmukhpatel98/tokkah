@@ -21,25 +21,37 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /**
- * The rows on the front card, from `SheetRow` / `PersonRow` in Controls.swift
- * (1130-1200) and the layout walk in Launcher.swift.
+ * The rows on a card or a sheet, from `SheetRow` / `ContactRow` in
+ * Controls.swift (911-1360) and the layout walk in Launcher.swift.
  *
- * A row is `sheetRow` tall; its avatar sits at `s3` from the row's left edge
- * and its label at `rowAvatarInset`; a press is a vibrant fill INSIDE the
- * card's glass, never another pane. The label of a person row is "@" + handle,
- * and the right-hand column is when you last spoke.
+ * A row is `sheetRow` tall. On the left, one of: a glyph at 12 from the edge
+ * with the label at `rowGlyphInset`; an avatar at `s3` with the label at
+ * `rowAvatarInset`; or the label alone at `labelInset`. On the right, exactly
+ * one of: a switch, a chevron, or a value — and a value is either a WORD
+ * ("yesterday", "copy", "on") in the button face or a CODE in monospace; an
+ * ACTION word ("copy") sits in a chip so it is visibly something you press,
+ * because "copy" drawn exactly like "yesterday" was the first thing photographs
+ * of the Mac's own card taught this port.
+ *
+ * A press is a vibrant fill INSIDE the card's glass, never another pane.
+ * `inert` rows are facts, not controls: no press fill, no hand.
  */
 @Composable
 fun KinRow(
@@ -47,31 +59,54 @@ fun KinRow(
     modifier: Modifier = Modifier,
     detail: String? = null,
     detailTone: Color = Palette.muted,
+    /** The value is a WORD ("copy", "on"), not a code — drawn in the button face. */
+    valueIsWord: Boolean = true,
+    /** The value is something you press: drawn as a chip in the foreground ink. */
+    valueIsAction: Boolean = false,
+    switchState: Boolean? = null,
+    chevron: Boolean = false,
+    glyph: GlyphKind? = null,
     leading: (@Composable () -> Unit)? = null,
     labelInset: Dp = Metric.s3,
-    tone: Color = Palette.fg,
+    tone: Color = Palette.rowInk,
+    ruled: Boolean = false,
+    inert: Boolean = false,
     onClick: (() -> Unit)? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val shape = RoundedCornerShape(Metric.concentric(Metric.cardRadius, Metric.cardPad))
+    val shape = RoundedCornerShape(Metric.sheetRowRadius)
+    val pressable = onClick != null && !inert
     Row(
         modifier
             .fillMaxWidth()
             .height(Metric.sheetRow)
             .clip(shape)
-            .background(if (pressed) Palette.fill(0.12f) else Color.Transparent, shape)
+            .background(if (pressed && pressable) Palette.fill(0.12f) else Color.Transparent, shape)
             .then(
-                if (onClick != null) Modifier.clickable(interaction, indication = null, onClick = onClick)
+                if (pressable) Modifier.clickable(interaction, indication = null, onClick = onClick!!)
                 else Modifier,
-            ),
+            )
+            .drawBehind {
+                // `ruled`: a hairline along the TOP edge, separating this row
+                // from the list above it.
+                if (ruled) drawLine(Palette.fill(0.09f), Offset(0f, 0.5f), Offset(size.width, 0.5f), 1f)
+            },
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (leading != null) {
-            Box(Modifier.padding(start = Metric.s3), contentAlignment = Alignment.Center) { leading() }
-            Spacer(Modifier.width(Metric.rowAvatarInset - Metric.s3 - Metric.avatar))
-        } else {
-            Spacer(Modifier.width(labelInset))
+        when {
+            leading != null -> {
+                Box(Modifier.padding(start = Metric.s3), contentAlignment = Alignment.Center) { leading() }
+                Spacer(Modifier.width(Metric.rowAvatarInset - Metric.s3 - Metric.avatar))
+            }
+            glyph != null -> {
+                // 18 pt, 12 from the edge — the Mac's glyph column.
+                Box(Modifier.padding(start = 12.dp), contentAlignment = Alignment.Center) {
+                    Glyph(glyph, Palette.rowInk, size = 18.dp)
+                }
+                Spacer(Modifier.width(Metric.rowGlyphInset - 12.dp - 18.dp))
+            }
+            else -> Spacer(Modifier.width(labelInset))
         }
         Text(
             label, color = tone,
@@ -79,14 +114,78 @@ fun KinRow(
             maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (detail != null) {
-            Spacer(Modifier.width(Metric.s2))
-            Text(
-                detail, color = detailTone,
-                fontSize = Type.row.first, fontWeight = Type.row.second, maxLines = 1,
-                modifier = Modifier.padding(end = Metric.s3),
-            )
+        when {
+            switchState != null -> {
+                Spacer(Modifier.width(Metric.s2))
+                RowSwitch(switchState, Modifier.padding(end = Metric.s3))
+            }
+            detail != null -> {
+                Spacer(Modifier.width(Metric.s2))
+                val pending = detail == "…"
+                val ink = if (valueIsAction) Palette.fg else if (pending || valueIsWord) detailTone else Palette.fg
+                val style = if (valueIsWord) Type.button else Type.code
+                if (valueIsAction) {
+                    // The chip: fill 0.10, a hairline, 24 tall, 10 of padding.
+                    val chip = RoundedCornerShape(12.dp)
+                    Box(
+                        Modifier
+                            .padding(end = Metric.s3 + if (chevron) Metric.s4 else 0.dp)
+                            .height(24.dp)
+                            .clip(chip)
+                            .background(Palette.fill(if (pressed) 0.20f else 0.10f), chip)
+                            .drawBehind {
+                                drawRoundRect(Palette.chipLine, style = Stroke(1f),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(12.dp.toPx()))
+                            }
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(detail, color = ink, fontSize = style.first, fontWeight = style.second, maxLines = 1)
+                    }
+                } else {
+                    Text(
+                        detail, color = ink, maxLines = 1,
+                        fontSize = style.first, fontWeight = style.second,
+                        fontFamily = if (valueIsWord || pending) FontFamily.Default else FontFamily.Monospace,
+                        letterSpacing = if (valueIsWord || pending) 0.sp else (13 * 0.09).sp,
+                        modifier = Modifier.padding(end = Metric.s3 + if (chevron) Metric.s4 else 0.dp),
+                    )
+                }
+                if (chevron) Chevron(Modifier.padding(end = Metric.s3))
+            }
+            chevron -> Chevron(Modifier.padding(end = Metric.s3))
         }
+    }
+}
+
+private val Int.sp get() = androidx.compose.ui.unit.TextUnit(this.toFloat(), androidx.compose.ui.unit.TextUnitType.Sp)
+private val Double.sp get() = androidx.compose.ui.unit.TextUnit(this.toFloat(), androidx.compose.ui.unit.TextUnitType.Sp)
+
+/** SheetRow's switch: 34 × 20, a white knob 2 in from the end it is on. */
+@Composable
+private fun RowSwitch(on: Boolean, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(34.dp, 20.dp)) {
+        val th = size.height
+        val r = androidx.compose.ui.geometry.CornerRadius(th / 2, th / 2)
+        drawRoundRect(if (on) Palette.switchOn else Palette.switchOff, cornerRadius = r)
+        drawRoundRect(Palette.chipLine, topLeft = Offset(0.5f, 0.5f),
+            size = Size(size.width - 1f, th - 1f), cornerRadius = r, style = Stroke(1f))
+        val k = th - 4.dp.toPx()
+        val kx = if (on) size.width - k - 2.dp.toPx() else 2.dp.toPx()
+        drawCircle(Color.White, radius = k / 2, center = Offset(kx + k / 2, th / 2))
+    }
+}
+
+/** SheetRow's chevron: a 5-high caret, 4 in from the right pad. */
+@Composable
+private fun Chevron(modifier: Modifier = Modifier) {
+    Canvas(modifier.size(10.dp, 12.dp)) {
+        val cx = size.width - 4.dp.toPx(); val cy = size.height / 2
+        drawPath(Path().apply {
+            moveTo(cx - 4.dp.toPx(), cy - 5.dp.toPx()); lineTo(cx + 1.dp.toPx(), cy)
+            lineTo(cx - 4.dp.toPx(), cy + 5.dp.toPx())
+        }, Palette.rowInk.copy(alpha = 0.55f),
+            style = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
     }
 }
 
@@ -127,7 +226,7 @@ fun Avatar(
             val rw = ring.toPx()
             if (face != null) {
                 // Clipped to the same circle the initial lived in.
-                clipPath(androidx.compose.ui.graphics.Path().apply {
+                clipPath(Path().apply {
                     addOval(androidx.compose.ui.geometry.Rect(Offset.Zero, Size(d, d)))
                 }) {
                     drawImage(face, dstSize = androidx.compose.ui.unit.IntSize(d.toInt(), d.toInt()))
@@ -152,9 +251,10 @@ fun Avatar(
     }
 }
 
-/** The small explanatory line under a row: `SheetHint`. */
+/** The small explanatory line under a row: `SheetHint`. Nothing when empty. */
 @Composable
 fun KinHint(text: String, modifier: Modifier = Modifier, tone: Color = Palette.muted) {
+    if (text.isEmpty()) return
     Text(
         text, color = tone,
         fontSize = Type.row.first, fontWeight = Type.row.second,
@@ -164,7 +264,7 @@ fun KinHint(text: String, modifier: Modifier = Modifier, tone: Color = Palette.m
 
 /** The pill that says what the camera is doing, over the picture. */
 @Composable
-fun HintPill(text: String, modifier: Modifier = Modifier, onClick: (() -> Unit)? = null) {
+fun HintPill(text: String, modifier: Modifier = Modifier, tone: Color = Palette.fg, onClick: (() -> Unit)? = null) {
     GlassSurface(
         modifier.height(Metric.pillHeight + Metric.s2),
         radius = Metric.capsule(Metric.pillHeight + Metric.s2),
@@ -177,7 +277,7 @@ fun HintPill(text: String, modifier: Modifier = Modifier, onClick: (() -> Unit)?
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text, color = Palette.fg,
+                text, color = tone,
                 fontSize = Type.field.first, fontWeight = Type.status.second, maxLines = 1,
             )
         }

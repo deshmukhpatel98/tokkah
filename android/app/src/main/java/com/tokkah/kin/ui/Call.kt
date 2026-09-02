@@ -314,7 +314,7 @@ private fun PeekButton(onPeek: (Boolean) -> Unit, onTouch: () -> Unit) {
                 },
             contentAlignment = Alignment.Center,
         ) {
-            Glyph(GlyphKind.EYE, Palette.fg)
+            Glyph(GlyphKind.PEEK, Palette.fg)
         }
     }
 }
@@ -345,7 +345,7 @@ private fun LeaveButton(armed: Boolean, onClick: () -> Unit) {
                     fontSize = Type.button.first, fontWeight = Type.buttonProminent.second,
                     maxLines = 1)
             } else {
-                Glyph(GlyphKind.CROSS, Palette.fg)
+                Glyph(GlyphKind.LEAVE, Palette.fg)
             }
         }
     }

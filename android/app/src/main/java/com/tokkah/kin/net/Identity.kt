@@ -163,12 +163,38 @@ class Identity(private val dir: File, private val base: String = Server.base) {
         }
     }
 
+    /**
+     * Silent mode, as the SERVER holds it — the Mac's `quietOn`. Cached from the
+     * last answer (a set, or a poll that carried `quiet`), so the switch on the
+     * front door can draw a state before anybody presses it, and persisted so a
+     * cold launch draws the right one too.
+     */
+    @Volatile var quietOn: Boolean =
+        runCatching { File(dir, "quiet").readText().trim() == "1" }.getOrDefault(false)
+        private set
+    /** The HTTP status of the last `setQuiet`: a 429 is "not yet", not "no". */
+    @Volatile var lastQuietStatus = 0
+        private set
+
+    /** A poll said what the server believes; believe it. */
+    fun noteQuiet(on: Boolean) {
+        if (on == quietOn) return
+        quietOn = on
+        quietFile.writeText(if (on) "1" else "0")
+    }
+    private val quietFile get() = File(dir, "quiet")
+
     fun setQuiet(on: Boolean, until: Int = 0): Boolean {
-        if (!claimed) return false
+        if (!claimed) { lastQuietStatus = 0; return false }
         val t = (System.currentTimeMillis() / 1000).toInt()
         val sig = sign("kin-quiet-v1|$handle|$on|$until|$t") ?: return false
         val body = """{"to":"$handle","tok":"$tok","t":$t,"sig":"$sig","quiet":$on,"until":$until}"""
-        return (post("$base/api/kin/$handle/quiet", body)?.first ?: 0) in 200..299
+        val r = post("$base/api/kin/$handle/quiet", body)
+        lastQuietStatus = r?.first ?: 0
+        val ok = lastQuietStatus in 200..299
+        if (ok) noteQuiet(on)
+        else android.util.Log.i("kin", "identity: silent mode ${if (on) "on" else "off"} refused -- $lastQuietStatus")
+        return ok
     }
 
     fun presence(who: String): Boolean? {
@@ -286,6 +312,10 @@ class Identity(private val dir: File, private val base: String = Server.base) {
     } catch (e: Exception) { null }
 
     companion object {
+        /** `Identity.display`: "meera" → "Meera". The card's register, never the row's. */
+        fun display(handle: String): String =
+            if (handle.isEmpty()) handle else handle.substring(0, 1).uppercase() + handle.substring(1)
+
         fun b64e(b: ByteArray): String = java.util.Base64.getEncoder().encodeToString(b)
         fun b64d(s: String): ByteArray = try { java.util.Base64.getDecoder().decode(s) }
             catch (e: Exception) { ByteArray(0) }

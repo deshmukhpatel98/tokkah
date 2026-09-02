@@ -8,8 +8,8 @@ import com.tokkah.kin.net.RingWatcher
 import com.tokkah.kin.ui.CallCardMode
 import com.tokkah.kin.ui.Person
 import java.io.File
+import java.security.SecureRandom
 import kotlin.concurrent.thread
-import kotlin.random.Random
 
 /**
  * The front door's own state: who you know, who is reachable, and whether
@@ -19,6 +19,10 @@ import kotlin.random.Random
  * A ring is a PERSON and a room: the room is minted by whoever places the call
  * and travels inside the signed ring, so the two ends never have to agree on a
  * word out of band.
+ *
+ * Everything the Mac's `home()` (Launcher.swift) keeps in its `Target` lives
+ * here: the field's verdict, the clipboard's room, the invite that was minted,
+ * the two-second "copied", and the one switch.
  */
 class KinState(
     root: File,
@@ -79,25 +83,38 @@ class KinState(
                 Ringer.stop()
                 onChanged?.invoke()
             } else if (outgoingTo == r.from) {
-                failCall("@${r.from} declined", "maybe later")
+                failCall("${Identity.display(r.from)} declined", "maybe later")
             }
         }
+        // The server's word on silent mode arrives with every poll; the
+        // switch draws it.
+        watcher.onQuiet = { if (!reachBusy) onChanged?.invoke() }
         // A call ends when a human hangs up — so one that is still on disk is
         // still on, whatever happened to the process that was in it.
         pending = resume.pending()
         watcher.start()
         refresh()
         checkForUpdate()
+        // The Mac checks when it is opened; the poll below is for the hours
+        // it stays open.
+        updateNow("Kin opened")
     }
 
     fun stop() = watcher.stop()
 
+    // ── UPDATES ─────────────────────────────────────────────────────────────
+
     /**
-     * Look for a newer build, verify it, and install it — every 30 minutes,
-     * the Mac's own cadence, for the lifetime of the app.
+     * Look for a newer build, verify it, and install it — every 60 s, the
+     * Mac's cadence (`TK_UPDATE_POLL` defaults to 60), plus a check when Kin
+     * is opened and when a call starts. The half-hour poll this replaced was
+     * the bug `update-poll-was-half-an-hour` records: "updates not working".
      *
-     * DEFERRED WHILE IN A CALL, always: an update that interrupts the thing the
-     * app exists to do is worse than an update that waits half an hour.
+     * The DOWNLOAD may happen during a call; the INSTALL never does — an
+     * update that interrupts the thing the app exists to do is worse than one
+     * that waits. `ready` is set the moment the bytes are verified, so a call
+     * can say "update ready — restarts when the call ends" the way the Mac's
+     * status pill does.
      *
      * Where this copy is its own installer of record it replaces itself with no
      * prompt at all, which is the Mac's promise — download once and never think
@@ -108,60 +125,71 @@ class KinState(
         if (updateThread != null) return
         updateThread = thread(isDaemon = true, name = "kin-update") {
             while (true) {
-                runCatching { updateOnce(installed) }
                 Thread.sleep(CHECK_EVERY_MS)
+                runCatching { updateOnce(installed) }
             }
         }
     }
 
+    /** One check now, off the caller's thread, if none is already running. */
+    fun updateNow(why: String) {
+        if (updateChecking) return
+        android.util.Log.i("kin", "update: checking now -- $why")
+        thread(isDaemon = true, name = "kin-update-now") { runCatching { updateOnce(installedVersion) } }
+    }
+
     private var updateThread: Thread? = null
+    @Volatile private var updateChecking = false
     var onInstall: ((java.io.File) -> Unit)? = null
 
     private fun updateOnce(installed: String) {
-        // Never mid-call, and never while a call is being offered either: a
-        // process replaced under a ringing phone is a missed call.
-        if (inCall || cardMode != CallCardMode.INVITE) {
-            android.util.Log.i("kin", "update: deferred, in a call")
-            return
-        }
-        val r = updater.check()
-        if (r == null) {
-            android.util.Log.i("kin", "update: no release (${updater.lastError})")
-            return
-        }
-        if (!updater.isNewer(r, installed)) {
-            android.util.Log.i("kin", "update: ${r.version} is not newer than $installed")
-            return
-        }
-        android.util.Log.i("kin", "update: ${r.version} is newer than $installed, fetching")
-        if (readyFile?.name?.contains(r.version) == true) { offerInstall(); return }
-        val f = updater.download(r)
-        if (f == null) {
-            android.util.Log.i("kin", "update: download failed (${updater.lastError})")
-            return
-        }
-        android.util.Log.i("kin", "update: staged ${f.name}, ${f.length()} bytes")
-        ready = r
-        readyFile = f
-        onChanged?.invoke()
-        offerInstall()
+        if (updateChecking) return
+        updateChecking = true
+        try {
+            val r = updater.check()
+            if (r == null) {
+                android.util.Log.i("kin", "update: no release (${updater.lastError})")
+                return
+            }
+            if (!updater.isNewer(r, installed)) return
+            if (readyFile?.name?.contains(r.version) == true) { offerInstall(); return }
+            android.util.Log.i("kin", "update: ${r.version} is newer than $installed, fetching")
+            val f = updater.download(r)
+            if (f == null) {
+                android.util.Log.i("kin", "update: download failed (${updater.lastError})")
+                return
+            }
+            android.util.Log.i("kin", "update: staged ${f.name}, ${f.length()} bytes")
+            ready = r
+            readyFile = f
+            onChanged?.invoke()
+            offerInstall()
+        } finally { updateChecking = false }
     }
 
     private fun offerInstall() {
         val f = readyFile ?: return
-        if (inCall || cardMode != CallCardMode.INVITE) return
+        // Never mid-call, and never while a call is being offered either: a
+        // process replaced under a ringing phone is a missed call.
+        if (inCall || cardMode != CallCardMode.INVITE) {
+            android.util.Log.i("kin", "update: ready, deferred until the call ends")
+            return
+        }
         onInstall?.invoke(f)
     }
 
     /** The UI is listening for changes; publish what we already know. */
     fun onChangedReady() { onChanged?.invoke() }
 
+    // ── THE PEOPLE ──────────────────────────────────────────────────────────
+
     /** The people panel: known handles, most recent first, with faces and dots. */
     fun refresh() {
         thread(isDaemon = true) {
             if (!identity.claimed) identity.claim(android.os.Build.MODEL ?: "kin")
             val times = identity.lastCallTimes()
-            val handles = identity.contactHandlesByRecency()
+            // Five, by recency, the Mac's own cap for the front card.
+            val handles = identity.contactHandlesByRecency().take(5)
             var list = handles.map {
                 Person(it, lastSeen = times[it]?.let { t -> Relative.time(t) },
                     face = faces.path(it))
@@ -175,16 +203,202 @@ class KinState(
         }
     }
 
+    // ── THE ONE FIELD ───────────────────────────────────────────────────────
+
+    /** What the field decided. The Mac's `Intent`, minus the window closing. */
+    sealed class Verdict {
+        class Room(val name: String) : Verdict()
+        class Ring(val handle: String) : Verdict()
+        class Say(val status: String) : Verdict()
+    }
+
+    /**
+     * Return in the one field — `Target.commit`. What was typed decides what
+     * happens: a call link joins its room, a word with `-` or `_` (every
+     * suggested room, and no legal handle) joins as a room, and anything else
+     * is a name to ring. The messages are the Mac's, word for word.
+     */
+    fun commit(raw0: String): Verdict {
+        val raw = raw0.trim()
+        if (raw.isEmpty()) return Verdict.Say("Type a name, or paste a call link.")
+        roomFromLink(raw)?.let { return Verdict.Room(it) }
+        if (raw.contains("-") || raw.contains("_")) {
+            return validateRoom(raw)?.let { Verdict.Room(it) }
+                ?: Verdict.Say(if (raw.length > 64 || !raw.all { it.isLetterOrDigit() || it == '-' || it == '_' })
+                    "Letters, numbers, - and _ only." else "Type a room name.")
+        }
+        val bare = raw.removePrefix("@").lowercase()
+        if (!identity.handleOK(bare)) return Verdict.Say("Names are letters and numbers, starting with a letter.")
+        if (bare == identity.handle) return Verdict.Say("That’s you.")
+        return Verdict.Ring(bare)
+    }
+
+    /** Refuse rather than normalise: the room name is the rendezvous key AND the salt. */
+    private fun validateRoom(raw: String): String? {
+        val name = raw.trim()
+        if (name.isEmpty() || name.length > 64) return null
+        if (!name.all { it.isLetterOrDigit() || it == '-' || it == '_' }) return null
+        return name
+    }
+
+    // ── THE CLIPBOARD ───────────────────────────────────────────────────────
+
+    /** The room parsed off the clipboard, when the clipboard holds a call link. */
+    @Volatile var clipRoom: String? = null
+
+    /**
+     * A link on the clipboard is a knock on the door. Checked when the window
+     * comes forward, which is the only moment the copy could have changed.
+     * The row names the room it would join; what fires is what was on screen.
+     */
+    fun scanClipboard(text: String?) {
+        if (cardMode == CallCardMode.CALLING) return
+        val room = text?.let { roomFromLink(it) }
+        if (room == clipRoom) return
+        clipRoom = room
+        android.util.Log.i("kin", "home: clipboard link ${room ?: "none"}")
+        onChanged?.invoke()
+    }
+
+    // ── THE INVITE, AND YOUR OWN NAME ───────────────────────────────────────
+
+    /** One room per visit to this screen: pressing copy twice hands out the same link. */
+    private var invited: String? = null
+    @Volatile var inviteLabel = "Copy a link to invite someone"
+    @Volatile var inviteValue = "copy"
+    @Volatile var mineValue = "copy"
+
+    /**
+     * Mint a room, put its link on the clipboard, and stay on this screen —
+     * `Target.copyInvite`. Returns the link so the caller can set the clipboard.
+     * Warmed now: the link is out in the world and the room's first request is
+     * the ~1100 ms one.
+     */
+    fun invite(): String {
+        val room = invited ?: mintRoom()
+        invited = room
+        com.tokkah.kin.net.Rendezvous.warm(room)
+        inviteLabel = "Link copied — send it to anyone"
+        inviteValue = room
+        onChanged?.invoke()
+        revert(4000) {
+            inviteLabel = "Copy a link to invite someone"
+            inviteValue = "copy"
+        }
+        android.util.Log.i("kin", "home: invite link copied for $room")
+        return "${com.tokkah.kin.net.Server.invite}/$room"
+    }
+
+    /** `Target.copyMine`: the word is a receipt for one press, so it reverts. */
+    fun copiedMine() {
+        mineValue = "copied"
+        onChanged?.invoke()
+        revert(2000) { mineValue = "copy" }
+    }
+
+    private var revertGen = 0
+    private fun revert(afterMs: Long, then: () -> Unit) {
+        val gen = ++revertGen
+        thread(isDaemon = true) {
+            Thread.sleep(afterMs)
+            if (gen == revertGen) { then(); onChanged?.invoke() }
+        }
+    }
+
+    // ── ONE SWITCH: "PEOPLE CAN CALL ME" ────────────────────────────────────
+    //
+    // Two mechanisms, one question. Whether a call MAY reach this phone is a
+    // server flag (silent mode); whether it CAN with Kin closed is the
+    // listening service and the notification permission it needs. Three honest
+    // states, the Mac's:
+    //
+    //   on              silence lifted AND listening
+    //   only when open  silence lifted, not listening — named, because it is
+    //                   the state somebody would otherwise read as "on"
+    //   off             silenced at the server
+    //
+    // The rate limit is part of this feature: a press that looks like it did
+    // nothing gets pressed again, and pressing again is what guarantees the
+    // 429 keeps coming. `reachBusy` refuses the second press, the sentence
+    // says which failure this is, and a 429 retries itself once.
+
+    /** Whether the phone is listening (service up, permission granted). Set by the UI. */
+    @Volatile var listening = false
+    @Volatile var reachBusy = false; private set
+    @Volatile var reachTrouble: String? = null; private set
+    /** null while busy; otherwise the switch position. */
+    val reachOn: Boolean? get() = if (reachBusy) null else !identity.quietOn
+    val reachHint: String get() = reachTrouble
+        ?: if (!identity.quietOn && !listening)
+            "Only while Kin is open. Allow notifications so Kin can be reached when it’s closed."
+        else ""
+
+    /** Start listening. Returns false when a permission has to be asked first. */
+    var listenOn: (() -> Boolean)? = null
+    var listenOff: (() -> Unit)? = null
+
+    /** The press: the other way from wherever it is now. */
+    fun toggleReach() {
+        if (reachBusy || cardMode == CallCardMode.CALLING) return
+        attemptReach(turningOn = identity.quietOn)
+    }
+
+    private var retryGen = 0
+    private fun attemptReach(turningOn: Boolean) {
+        if (reachBusy) return
+        reachBusy = true
+        reachTrouble = null
+        retryGen++
+        onChanged?.invoke()
+        thread(isDaemon = true, name = "kin-reach") {
+            // The listening half first: with the silence lifted and no way to
+            // hear a ring, "on" would be a lie for every moment Kin is not open.
+            if (turningOn) listening = listenOn?.invoke() ?: false
+            val ok = identity.setQuiet(!turningOn)
+            val status = identity.lastQuietStatus
+            if (!ok) {
+                reachTrouble = if (status == 429) "Too many changes at once — trying again in a moment."
+                               else "Couldn’t reach the server — nothing changed."
+            } else if (!turningOn) {
+                // Off means off: a "Kin is listening" notification while
+                // nobody can call you is a notification that lies.
+                listenOff?.invoke(); listening = false
+            }
+            reachBusy = false
+            val on = !identity.quietOn
+            com.tokkah.kin.net.Metrics.tap(if (turningOn) "reach_on" else "reach_off", ok = ok && on == turningOn)
+            android.util.Log.i("kin", "home: people-can-call-me asked ${if (turningOn) "on" else "off"}," +
+                " now ${if (on) (if (listening) "on" else "only-when-open") else "off"} quiet_http=$status")
+            onChanged?.invoke()
+            // A 429 is a "not yet", not a "no". One retry, after the window.
+            if (!ok && status == 429) {
+                val gen = retryGen
+                Thread.sleep(12_000)
+                if (gen == retryGen) attemptReach(turningOn)
+            }
+        }
+    }
+
+    /** The permission came back granted after a press: finish the "on". */
+    fun listeningGranted() {
+        listening = true
+        onChanged?.invoke()
+    }
+
+    // ── PLACING AND TAKING CALLS ────────────────────────────────────────────
+
     /** Place a call: mint the room, ring them, and wait. */
     fun call(who: String) {
         val handle = who.removePrefix("@").lowercase()
         if (!identity.handleOK(handle)) return
+        if (cardMode == CallCardMode.CALLING) return
         val room = mintRoom()
         outgoingTo = handle
         outgoingRoom = room
         cardMode = CallCardMode.CALLING
         cardLine = null; cardBecause = null
         ringTimeoutAt = System.currentTimeMillis() + RING_TIMEOUT_MS
+        com.tokkah.kin.net.Metrics.fact("outcome", "calling")
         onChanged?.invoke()
         thread(isDaemon = true) {
             // Warm the room while the ring travels, never before it: warming is
@@ -193,7 +407,7 @@ class KinState(
             com.tokkah.kin.net.Rendezvous.warm(room)
             val sent = identity.ring(handle, room)
             if (!sent) {
-                failCall("Could not reach @$handle", "they may not have Kin yet")
+                failCall("Couldn’t reach ${Identity.display(handle)}", "they may not have Kin yet")
                 return@thread
             }
             identity.rememberCalled(handle)
@@ -206,7 +420,9 @@ class KinState(
             }
             if (outgoingTo == handle && cardMode == CallCardMode.CALLING) {
                 // Not an error — a person who was not at their phone.
-                failCall("@$handle didn’t answer", "they might be away")
+                com.tokkah.kin.net.Metrics.count("ring_timed_out")
+                com.tokkah.kin.net.Metrics.fact("outcome", "no answer")
+                failCall("${Identity.display(handle)} didn’t answer", "they might be away")
             }
         }
     }
@@ -224,6 +440,8 @@ class KinState(
         incoming = null
         cardMode = CallCardMode.INVITE
         cardLine = null; cardBecause = null
+        // A new visit to the front door mints a new invite.
+        invited = null
         onChanged?.invoke()
     }
 
@@ -261,33 +479,63 @@ class KinState(
         }
     }
 
+    private var lastCalled: String? = null
     fun callAgain() {
-        val who = outgoingTo ?: cardLine?.substringAfter("@")?.substringBefore(" ") ?: return
+        val who = outgoingTo ?: lastCalled ?: return
+        outgoingTo = null
         call(who)
     }
 
     private fun failCall(line: String, why: String) {
+        lastCalled = outgoingTo
         cardMode = CallCardMode.NO_ANSWER
         cardLine = line
         cardBecause = why
         onChanged?.invoke()
     }
 
-    /** The same shape the Mac mints: three words a person can say out loud. */
-    private fun mintRoom(): String {
-        val w = WORDS
-        return "${w.random()}-${w.random()}-${Random.nextInt(10, 99)}"
-    }
-
     companion object {
-        const val RING_TIMEOUT_MS = 30_000L
-        /** The Mac's cadence, for the same reason: often enough to matter, rare
-         *  enough to be free on somebody else's battery and data. */
-        const val CHECK_EVERY_MS = 30L * 60 * 1000
-        private val WORDS = listOf(
-            "amber", "basil", "cedar", "delta", "ember", "fable", "grove", "hazel",
-            "indigo", "jasper", "kite", "lilac", "mango", "nectar", "olive", "pearl",
-            "quartz", "raven", "sage", "tulip", "umber", "violet", "willow", "yarrow",
-        )
+        /** The Mac's `WaitingCard.startRingTimeout`: 45 s. */
+        const val RING_TIMEOUT_MS = 45_000L
+        /** The Mac's `TK_UPDATE_POLL` default: once a minute. */
+        const val CHECK_EVERY_MS = 60_000L
+
+        /**
+         * `xxx-xxxx-xxx`, lowercase, exactly as `Launcher.mintRoom()` does it:
+         * 26^10 ≈ 47 bits, the same budget Meet spends, and short enough to read
+         * down a phone. One shape for both apps, because the shape is what
+         * `commit` uses to tell a room from a name.
+         */
+        fun mintRoom(): String {
+            val b = ByteArray(10).also { SecureRandom().nextBytes(it) }
+            val c = b.map { ('a' + ((it.toInt() and 0xff) % 26)) }.joinToString("")
+            return c.substring(0, 3) + "-" + c.substring(3, 7) + "-" + c.substring(7, 10)
+        }
+
+        /**
+         * `Launcher.roomFromLink`: tokkah://join/<room>, tokkah://<room>,
+         * kin://…, and the https links people actually send each other
+         * (kin.tokkah.com/<room>, room.tokkah.com/<room>, with or without the
+         * scheme typed). Anything else is not a link.
+         */
+        fun roomFromLink(s: String): String? {
+            val raw = s.trim()
+            val lower = raw.lowercase()
+            if (!lower.contains("://") && !lower.contains("tokkah.com")) return null
+            val u = runCatching { java.net.URI(if (raw.contains("://")) raw else "https://$raw") }.getOrNull()
+                ?: return null
+            var name = (u.path ?: "").removePrefix("/")
+            val scheme = u.scheme?.lowercase()
+            if (scheme == "tokkah" || scheme == "kin") {
+                if (name.isEmpty()) name = u.host ?: ""
+                if (name == "join") name = ""
+            } else {
+                val h = u.host?.lowercase() ?: return null
+                if (h != "tokkah.com" && !h.endsWith(".tokkah.com")) return null
+            }
+            val ok = name.isNotEmpty() && name.length <= 64 &&
+                name.all { it.isLetterOrDigit() || it == '-' || it == '_' }
+            return if (ok) name else null
+        }
     }
 }

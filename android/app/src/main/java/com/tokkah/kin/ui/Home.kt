@@ -31,13 +31,15 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 
 /**
- * The front door, laid out from Launcher.swift (0.113.0, "one field, one card").
+ * The front door, laid out from Launcher.swift `home()` (0.125.0).
  *
  * Your own camera fills the window; ONE pane of glass floats at the bottom,
  * inset by `gutter`, and everything that is not the picture lives on it. Rows
  * are walked top-down in one list, so adding one is a line and cannot leave a
- * gap where a hidden view used to be — the order is: a call still running, a
- * link somebody sent, the people, the field, the invite.
+ * gap where a hidden view used to be. The order is the Mac's, and the ordering
+ * is the whole design: a call you are still in, a link somebody just sent you,
+ * the people, the one field, and last the link you hand OUT — reaching somebody
+ * you have talked to before is the common case, inviting a stranger the rare one.
  */
 class Person(
     val handle: String,
@@ -47,27 +49,41 @@ class Person(
     val face: java.io.File? = null,
 )
 
+/** Everything the card shows, in one value, so a state cannot be half-drawn. */
+class HomeCard(
+    val people: List<Person>,
+    val myHandle: String,
+    /** Why this phone has no name, when it has none. */
+    val nameTrouble: String,
+    val resumeLabel: String?,
+    val updateVersion: String?,
+    val clipRoom: String?,
+    val inviteLabel: String,
+    val inviteValue: String,
+    val mineValue: String,
+    /** The field's last verdict that was a sentence, in the warn colour. */
+    val status: String,
+    val settingsOpen: Boolean,
+    /** null = busy ("…"). */
+    val reachOn: Boolean?,
+    val reachHint: String,
+)
+
 @Composable
 fun HomeScreen(
     room: String,
     onRoom: (String) -> Unit,
-    people: List<Person>,
-    myHandle: String,
+    card: HomeCard,
     cameraHint: String?,
-    resumeRoom: String?,
-    updateVersion: String?,
     onUpdate: () -> Unit,
-    pastedLink: String?,
-    settingsOpen: Boolean,
-    listening: Boolean,
-    onListening: (Boolean) -> Unit,
     onSettings: () -> Unit,
     onJoin: () -> Unit,
     onCall: (String) -> Unit,
     onResume: () -> Unit,
+    onJoinClip: () -> Unit,
     onInvite: () -> Unit,
-    quiet: Boolean,
-    onQuiet: (Boolean) -> Unit,
+    onCopyMine: () -> Unit,
+    onReach: () -> Unit,
     preview: @Composable () -> Unit,
 ) {
     GlassBackdrop(
@@ -87,7 +103,7 @@ fun HomeScreen(
                     .padding(Metric.gutter)
                     .size(Metric.controlSmall),
                 radius = Metric.capsule(Metric.controlSmall),
-                tint = if (settingsOpen) Palette.fill(0.14f) else androidx.compose.ui.graphics.Color.Transparent,
+                tint = if (card.settingsOpen) Palette.fill(0.14f) else androidx.compose.ui.graphics.Color.Transparent,
                 blurRadius = 20.dp,
             ) {
                 Box(Modifier.fillMaxSize().clickable(onClick = onSettings),
@@ -116,21 +132,40 @@ fun HomeScreen(
                         Modifier.padding(Metric.cardPad),
                         verticalArrangement = Arrangement.spacedBy(Metric.s1),
                     ) {
-                        if (settingsOpen) {
-                            SettingsRows(myHandle, quiet, onQuiet, listening, onListening)
+                        if (card.settingsOpen) {
+                            // The card about YOU: your name and the one switch.
+                            MineRows(card, onCopyMine, ruled = false)
+                            KinRow(
+                                "People can call me",
+                                detail = if (card.reachOn == null) "…" else null,
+                                switchState = card.reachOn,
+                                labelInset = Metric.rowAvatarInset,
+                                inert = card.reachOn == null,
+                                onClick = onReach,
+                            )
+                            KinHint(card.reachHint)
                         } else {
-                            resumeRoom?.let {
-                                KinRow("Back to $it", detail = "still going", onClick = onResume)
+                            // A call you are still in comes first: it is the only
+                            // row on this card about something already happening.
+                            card.resumeLabel?.let {
+                                KinRow("Rejoin $it", detail = "still going",
+                                    labelInset = Metric.rowAvatarInset, onClick = onResume)
                             }
                             // Checked and downloaded already; this row is the
                             // person's one tap, and it only appears off a call.
-                            updateVersion?.let {
-                                KinRow("Update Kin", detail = it, onClick = onUpdate)
+                            card.updateVersion?.let {
+                                KinRow("Update Kin", detail = it, valueIsAction = true,
+                                    labelInset = Metric.rowAvatarInset, onClick = onUpdate)
                             }
-                            pastedLink?.let {
-                                KinRow("Join $it", detail = "from a link", onClick = { onRoom(it); onJoin() })
+                            // A link on the clipboard is a knock on the door.
+                            card.clipRoom?.let {
+                                KinRow("Join $it", detail = "from your copied link",
+                                    labelInset = Metric.rowAvatarInset, onClick = onJoinClip)
                             }
-                            for (p in people) {
+                            if (card.people.isEmpty()) {
+                                KinHint("Talk to someone once and they’ll show up here.")
+                            }
+                            for (p in card.people) {
                                 KinRow(
                                     "@" + p.handle,
                                     detail = p.lastSeen,
@@ -139,22 +174,42 @@ fun HomeScreen(
                                 )
                             }
                             RoomField(room, onRoom, onJoin)
-                            KinRow("Copy a link to invite someone", detail = "copy",
-                                onClick = onInvite)
+                            // The status line: 14 high, caption, warn. Only ever
+                            // a refusal, and gone the moment the field commits.
+                            Text(
+                                card.status, color = Palette.warn,
+                                fontSize = Type.caption.first, fontWeight = Type.caption.second,
+                                maxLines = 1,
+                                modifier = Modifier.fillMaxWidth().height(14.dp).padding(start = Metric.s3),
+                            )
+                            KinRow(card.inviteLabel, detail = card.inviteValue,
+                                valueIsAction = card.inviteValue == "copy",
+                                labelInset = Metric.rowAvatarInset, onClick = onInvite)
                             // A brand-new install has nobody to call until
                             // somebody knows this phone's name — so the name
                             // stays on the front card exactly until the first
                             // person is in the list, then moves behind the `…`.
-                            if (people.isEmpty()) {
-                                KinRow("@$myHandle", detail = "copy",
-                                    leading = { Avatar(myHandle) }, onClick = onInvite)
-                                KinHint("Give this to someone and they can call you.")
-                            }
+                            if (card.people.isEmpty()) MineRows(card, onCopyMine, ruled = true)
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * Your own name, and the one state that gets a sentence instead of a control:
+ * a copy button over an empty value copies nothing, reports success, and
+ * teaches the person the feature is broken.
+ */
+@Composable
+private fun MineRows(card: HomeCard, onCopyMine: () -> Unit, ruled: Boolean) {
+    if (card.myHandle.isEmpty()) {
+        KinHint(card.nameTrouble)
+    } else {
+        KinRow("@" + card.myHandle, detail = card.mineValue, valueIsAction = true,
+            leading = { Avatar(card.myHandle) }, ruled = ruled, onClick = onCopyMine)
     }
 }
 
@@ -176,7 +231,7 @@ private fun RoomField(room: String, onRoom: (String) -> Unit, onJoin: () -> Unit
     // elements on top of each other" — and it is not only a rule: a pane inside
     // a pane re-blurred the card's own blur and photographed as dark blobs
     // smeared across the field.
-    val shape = RoundedCornerShape(Metric.capsule(Metric.fieldHeight))
+    val shape = RoundedCornerShape(Metric.cardFieldRadius)
     Box(
         Modifier
             .fillMaxWidth()
@@ -208,30 +263,4 @@ private fun RoomField(room: String, onRoom: (String) -> Unit, onJoin: () -> Unit
             )
         }
     }
-}
-
-@Composable
-private fun SettingsRows(
-    myHandle: String, quiet: Boolean, onQuiet: (Boolean) -> Unit,
-    listening: Boolean, onListening: (Boolean) -> Unit,
-) {
-    if (myHandle.isEmpty()) {
-        KinHint("This phone has no name yet, so nobody can call it. It takes one the first time it reaches the server.")
-    } else {
-        KinRow("@$myHandle", detail = "copy", leading = { Avatar(myHandle) })
-        KinHint("Give this to someone and they can call you.")
-    }
-    KinRow(
-        "Let people reach you when Kin is closed",
-        detail = if (listening) "on" else "off",
-        labelInset = Metric.rowAvatarInset,
-        onClick = { onListening(!listening) },
-    )
-    KinHint("Kin keeps listening for calls. Android shows a quiet notification while it does — that is the price of a phone that can be rung.")
-    KinRow(
-        "Don't ring me", detail = if (quiet) "on" else "off",
-        labelInset = Metric.rowAvatarInset,
-        onClick = { onQuiet(!quiet) },
-    )
-    KinHint("Calls to you are quietly declined until you turn this off.")
 }
