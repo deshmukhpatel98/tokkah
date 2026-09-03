@@ -529,7 +529,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size",
+  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
@@ -896,6 +896,59 @@ nonisolated(unsafe) var gCalling: (who: String, room: String)?
 // audio or camera device, so the user's one permission prompt is not spent on a
 // bundle that is about to move -- macOS ties those grants to the signature at the
 // path that asked.
+// ── Record the sensor, unencoded, for the ruler ──────────────────────────────
+//
+//   tk --camrec <out.mov> [--camrec-secs 20]
+//
+// `--vpsnr` on a QuickTime recording measures a picture that H.264 has already
+// smoothed once. The encoder in a call never sees that picture; it sees the raw
+// sensor, noise included, and the noise is the thing under test. ProRes 422 HQ
+// keeps it: ~110 Mbps at 720p, near-lossless, exactly the frames the camera gave.
+if let recPath = arg("camrec") {
+  let secs = Double(arg("camrec-secs") ?? "20") ?? 20
+  let url = URL(fileURLWithPath: recPath)
+  try? FileManager.default.removeItem(at: url)
+  guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else {
+    fputs("camrec: cannot open \(recPath) for writing\n", stderr); exit(1)
+  }
+  let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+    AVVideoCodecKey: AVVideoCodecType.proRes422HQ, AVVideoWidthKey: 1280, AVVideoHeightKey: 720])
+  input.expectsMediaDataInRealTime = true
+  let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+  writer.add(input)
+  let cam = CameraSource()
+  var n = 0, notReady = 0, t0: UInt64 = 0
+  let done = DispatchSemaphore(value: 0)
+  cam.onFrame = { pb, host in
+    if t0 == 0 {
+      t0 = host
+      writer.startWriting()
+      writer.startSession(atSourceTime: .zero)
+      fputs("camrec: first frame \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
+          + "\(CameraSource.fourCC(CVPixelBufferGetPixelFormatType(pb)))\n", stderr)
+    }
+    let ms = Clock.ms(host - t0)
+    guard input.isReadyForMoreMediaData else { notReady += 1; return }
+    if adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(ms * 1000), timescale: 1_000_000)) { n += 1 }
+    if ms >= secs * 1000 { done.signal() }
+  }
+  cam.startOffMain { err in
+    if let err { fputs("camrec: camera failed: \(err)\n", stderr); exit(1) }
+  }
+  if done.wait(timeout: .now() + secs + 20) == .timedOut, n == 0 {
+    fputs("camrec: no frames in \(Int(secs + 20)) s -- camera permission or bring-up\n", stderr); exit(1)
+  }
+  cam.onFrame = nil
+  input.markAsFinished()
+  let fin = DispatchSemaphore(value: 0)
+  writer.finishWriting { fin.signal() }
+  fin.wait()
+  let size = (try? FileManager.default.attributesOfItem(atPath: recPath)[.size] as? Int) ?? 0
+  fputs("camrec: \(n) frames in \(Int(secs)) s -> \(recPath) (\(size / 1_048_576) MiB"
+      + (notReady > 0 ? ", \(notReady) frames dropped: writer not ready" : "") + ")\n", stderr)
+  exit(writer.status == .completed ? 0 : 1)
+}
+
 Install.relocateIfHomeless()
 
 Launcher.installURLHandler()
@@ -5253,17 +5306,35 @@ audio.stallOutAfterS = Double(arg("stall-out") ?? "0") ?? 0
 // PSNR on the luma plane. Rough reading: above ~45 dB is visually lossless, 40-45
 // is very good, 35-40 shows on detail, below 30 is visible. Reported with the p05
 // as well as the p50, because the frame people notice is the worst one.
+// ── The denoise stage, one constructor for the ruler and the live call ───────
+//
+// Default ON (see Denoise.swift for why). `--no-vdenoise` is the control arm;
+// `--vdenoise-t` is the motion threshold in luma levels and `--vdenoise-floor`
+// the share of a perfectly still pixel that is still taken fresh each frame.
+func makeDenoise() -> VDenoise? {
+  if flag("no-vdenoise") { return nil }
+  return VDenoise(threshold: arg("vdenoise-t").flatMap { Int($0) },
+                  floorWeight: Double(arg("vdenoise-floor") ?? "0.25") ?? 0.25)
+}
+
 if let path = arg("vpsnr") {
   let want = Int(arg("vpsnr-frames") ?? "300") ?? 300
   let br = Int(arg("vbitrate") ?? "3000000") ?? 3_000_000
   var psnr = Quantiles(cap: 4096)
+  // Against the FILTERED frame (what the encoder was actually asked to keep), and
+  // the filter's own distance from the raw sensor. Three numbers, because "the
+  // PSNR fell" after a denoiser is expected -- noise is signal to a PSNR -- and
+  // only the split says whether the codec or the filter moved it.
+  var psnrF = Quantiles(cap: 4096), psnrDn = Quantiles(cap: 4096)
   var bytes = 0, frames = 0, compared = 0, sizeMismatch = 0
   var worst = (db: 1e9, at: 0)
   // capHost -> the source luma, so a decoded frame is compared against the exact
   // frame it came from rather than a neighbouring one.
   var srcLuma = [UInt64: (buf: [UInt8], w: Int, h: Int)]()
+  var filtLuma = [UInt64: [UInt8]]()
   let lock = NSLock()
   let done = DispatchSemaphore(value: 0)
+  let dn = makeDenoise()
 
   func luma(_ pb: CVPixelBuffer) -> (buf: [UInt8], w: Int, h: Int)? {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
@@ -5286,20 +5357,40 @@ if let path = arg("vpsnr") {
       guard let pb = img as CVPixelBuffer?, let got = luma(pb) else { return }
       lock.lock()
       let original = srcLuma.removeValue(forKey: capHost)
+      let filtered = filtLuma.removeValue(forKey: capHost)
       lock.unlock()
       guard let a = original else { return }
       // REFUSE rather than resample. Comparing a scaled picture to an unscaled one
       // measures the scaler, and would report the codec as far worse than it is.
       guard a.w == got.w, a.h == got.h else { sizeMismatch += 1; return }
-      var sum = 0.0
-      for i in 0..<(a.w * a.h) {
-        let d = Double(Int(a.buf[i]) - Int(got.buf[i]))
-        sum += d * d
+      func psnrDb(_ x: [UInt8], _ y: [UInt8]) -> Double {
+        var sum = 0.0
+        for i in 0..<(a.w * a.h) {
+          let d = Double(Int(x[i]) - Int(y[i]))
+          sum += d * d
+        }
+        let mse = sum / Double(a.w * a.h)
+        // Identical frames give MSE 0 and infinite PSNR; cap it so a run of perfect
+        // frames does not poison a percentile with infinities.
+        return mse <= 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 / mse)
       }
-      let mse = sum / Double(a.w * a.h)
-      // Identical frames give MSE 0 and infinite PSNR; cap it so a run of perfect
-      // frames does not poison a percentile with infinities.
-      let db = mse <= 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 / mse)
+      let db = psnrDb(a.buf, got.buf)
+      if let f = filtered { psnrF.add(psnrDb(f, got.buf)); psnrDn.add(psnrDb(a.buf, f)) }
+      // `--vpsnr-dump <dir>`: the middle frame, three ways, for a pair of eyes.
+      if compared == want / 2, let dir = arg("vpsnr-dump") {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        writeGrayPNG(a.buf, w: a.w, h: a.h, path: dir + "/raw.png")
+        writeGrayPNG(got.buf, w: a.w, h: a.h, path: dir + "/decoded.png")
+        if let f = filtered {
+          writeGrayPNG(f, w: a.w, h: a.h, path: dir + "/filtered.png")
+          // What the filter changed, x8: noise removal is an even haze, ghosting
+          // is a trail behind every moving edge. The one picture that tells them apart.
+          var diff = [UInt8](repeating: 0, count: a.w * a.h)
+          for i in 0..<diff.count { diff[i] = UInt8(min(255, abs(Int(a.buf[i]) - Int(f[i])) * 8)) }
+          writeGrayPNG(diff, w: a.w, h: a.h, path: dir + "/diff.png")
+        }
+        fputs("vpsnr: dumped frame \(compared) to \(dir)\n", stderr)
+      }
       psnr.add(db)
       compared += 1
       if db < worst.db { worst = (db, compared) }
@@ -5313,10 +5404,19 @@ if let path = arg("vpsnr") {
     src.onFrame = { pb, host in
       guard frames < want else { return }
       frames += 1
-      if let l = luma(pb) { lock.lock(); srcLuma[host] = l; lock.unlock() }
-      enc.encode(pb, hostTime: host)
+      // The filter runs HERE rather than inside the encoder so both the raw and
+      // the filtered luma can be kept for the split above.
+      let fpb = dn?.filter(pb) ?? pb
+      if let l = luma(pb) {
+        lock.lock()
+        srcLuma[host] = l
+        if dn != nil, let f = luma(fpb) { filtLuma[host] = f.buf }
+        lock.unlock()
+      }
+      enc.encode(fpb, hostTime: host)
     }
-    fputs("vpsnr: \(path) -> H.264 1280x720 @ \(br / 1000) kbps, \(want) frames\n", stderr)
+    fputs("vpsnr: \(path) -> H.264 1280x720 @ \(br / 1000) kbps, \(want) frames"
+        + (dn.map { ", denoise t\($0.threshold) floor \($0.floorWeight)" } ?? ", denoise OFF") + "\n", stderr)
     try src.start()
     // The file plays in real time, so bound the wait by that plus slack rather
     // than spinning: 300 frames at 30 fps is ten seconds.
@@ -5332,6 +5432,13 @@ if let path = arg("vpsnr") {
       + "\n  PSNR p50 \(psnr.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
       + "  p05 \(psnr.p(0.05).map { String(format: "%.1f", $0) } ?? "-") dB"
       + "  worst \(String(format: "%.1f", worst.db)) dB at frame \(worst.at)"
+      + (dn.map { d in
+          "\n  vs filtered p50 \(psnrF.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
+          + "  filter-vs-raw p50 \(psnrDn.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
+          + "  noise \(String(format: "%.2f", Double(d.noiseX100) / 100)) lvl, still \(d.stillPct)%"
+          + "  cost p50 \(d.cost.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
+          + " p99 \(d.cost.p(0.99).map { String(format: "%.2f", $0) } ?? "-") ms"
+          + (d.bypassed > 0 ? "  BYPASSED \(d.bypassed) frames" : "") } ?? "")
       + "\n  \(bytes / 1024) KiB in \(String(format: "%.1f", secs)) s"
       + " = \(String(format: "%.3f", Double(bytes) * 8 / 1e6 / max(secs, 0.001))) Mbps"
       + ", \(compared > 0 ? bytes / max(frames, 1) : 0) B/frame\n", stderr)
@@ -5461,7 +5568,10 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) }, hold: flag("vq-hold"),
                   pause: !flag("no-vpause"),
                   pauseAfter: arg("vpause-after").flatMap { Int($0) } ?? 3,
-                  resumeQuiet: arg("vpause-quiet").flatMap { Int($0) } ?? 8)
+                  resumeQuiet: arg("vpause-quiet").flatMap { Int($0) } ?? 8,
+                  heavyCap: arg("vbytes-cap").flatMap { Int($0) } ?? 12_000)
+/// Bytes and frames the ladder last saw, so it is told this second's bytes per frame.
+var vqBytesPrev = 0, vqFramesPrev = 0
 // ── Prove a live encoder property, or do not believe it ─────────────────────
 //
 // `--vq-step 30:400000` drops the bitrate ceiling to 400 kbps at t=30 s on an
@@ -5661,6 +5771,7 @@ if videoArg != "off", !ringPreview {
       if camOff { return }
       // ── PAUSED: STILL YOUR CAMERA, JUST NOT THEIR PROBLEM ────────────────────
       //
+    e.denoise = makeDenoise()
       // The frame is dropped BEFORE the encoder, not after it: encoding a picture
       // and then discarding it would burn the same CPU and the same battery for a
       // packet nobody sends, on a machine whose link is already in trouble.
@@ -5691,7 +5802,8 @@ if videoArg != "off", !ringPreview {
     // throws.
     if !reusing { try src.start() }
     vsource = src; venc = e
-    fputs("video: \(src.describe) -> H.264 1280x720, no B-frames, realtime\n", stderr)
+    fputs("video: \(src.describe) -> H.264 1280x720, no B-frames, realtime"
+        + (e.denoise.map { ", denoise t\($0.threshold)" } ?? ", denoise OFF") + "\n", stderr)
   } catch {
     fputs("video: disabled (\(error))\n", stderr)
   }
@@ -7661,6 +7773,7 @@ func reportLoop() {
     if let q = venc?.qualityNow { vb["v_quality"] = q }
     vb["v_dq_queued"] = dq.queued
     vb["v_dq_inline_full"] = dq.inlineFull
+    vb["v_q_heavy_downs"] = vq.heavyDowns
     vb["v_dq_inline_big"] = dq.inlineTooBig
     vb["v_dq_depth_max"] = dq.maxDepth
     if let d = display { vb["v_shown"] = d.shown; vb["v_enq_fail"] = d.enqueueFails }
@@ -7682,6 +7795,20 @@ func reportLoop() {
         + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
         // Say how many frames took the INLINE path anyway. A queue whose whole
         // purpose is to keep decode off the receive thread, and which quietly
+    // The denoise stage: its cost, what it measured the sensor's noise to be, and
+    // whether it was actually running (a bypass count that is not zero means the
+    // camera handed over a format it does not handle, and every bitrate number in
+    // this beat is the unfiltered one).
+    if let c = vsource as? CameraSource, c.frameW > 0 { vb["v_cap_w"] = c.frameW; vb["v_cap_h"] = c.frameH }
+    if let d = venc?.denoise {
+      vb["v_dn_on"] = 1
+      vb["v_dn_bypassed"] = d.bypassed
+      vb["v_noise"] = Double(d.noiseX100) / 100
+      vb["v_dn_t"] = d.threshold
+      vb["v_still_pct"] = d.stillPct
+      if let v = d.cost.p(0.50) { vb["v_dn_ms_p50"] = v }
+      if let v = d.cost.p(0.99) { vb["v_dn_ms_p99"] = v }
+    } else { vb["v_dn_on"] = 0 }
         // falls back to doing it there when full, is a queue that looks like it is
         // working while the defect continues.
         + "  picture \(vq.describe)"
@@ -7931,7 +8058,12 @@ func reportLoop() {
     let changed = vq.tick(now: Double(beatTick),
                           pictureHarmed: harmIsVideo ? harmed : false,
                           voiceHarmed: voiceHarmed,
-                          voiceHarmRaw: voiceDelta)
+                          voiceHarmRaw: voiceDelta,
+                          bytesPerFrame: sentFrames > 0 ? sentBytes / sentFrames : 0)
+    if vq.level < wasLevel, !harmed, sentFrames > 0 {
+      fputs("  picture: frames of \(sentBytes / sentFrames) B are over the \(vq.heavyCap) B cap"
+          + " -- stepping down without waiting for loss\n", stderr)
+    }
     // ── STOPPING THE PICTURE, AND SAYING SO IN THREE PLACES ───────────────────
     //
     // The decision is made here and has to reach three separate consumers, none
@@ -7951,6 +8083,9 @@ func reportLoop() {
     if vq.paused != wasPaused {
       Metrics.count(vq.paused ? "video_pause" : "video_resume")
       fputs("  picture: video \(vq.paused ? "PAUSED -- the link could not carry the floor" : "resumed")"
+    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
+    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
+    let wasLevel = vq.level
           + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)"
           + (vq.pauseVerdict.isEmpty ? "" : " -- \(vq.pauseVerdict)") + "\n", stderr)
     }

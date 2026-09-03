@@ -46,6 +46,7 @@ import kotlinx.coroutines.withContext
 
 /** Rig overrides read off the launch intent. Empty on every real launch. */
 private val rigFlags = HashMap<String, Boolean>()
+private var rigSaid: String? = null
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,6 +76,9 @@ class MainActivity : ComponentActivity() {
         // variable.
         for (k in listOf("turn", "decodeq")) {
             intent?.getStringExtra(k)?.let { rigFlags[k] = it == "1" || it == "true" }
+        }
+        run {
+            rigSaid = intent?.getStringExtra("said")?.takeIf { it.isNotBlank() }
         }
         RingService.channels(this)
         // An unexplained death is a bug, and one nobody is told about is not
@@ -493,7 +497,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
             var loud by remember { mutableStateOf(0f) }
-            var caption by remember { mutableStateOf<String?>(null) }
+            // `--press said` on the Mac: a rig arm that shows a caption so the
+            // pill can be photographed without a second person talking.
+            var caption by remember { mutableStateOf(rigSaid) }
             var bloom by remember { mutableStateOf<String?>(null) }
             var cueLevel by remember { mutableStateOf(0f) }
             var subsRef by remember { mutableStateOf<Subtitles?>(null) }
@@ -592,7 +598,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     subsRef?.setMuted(muted || s.floor.state == Floor.State.THEIRS)
                     // Nothing to read once they have stopped: a caption that
                     // outlives the sentence is furniture over somebody's face.
-                    if (s.cue.idle && caption != null && !voicing) caption = null
+                    if (s.cue.idle && caption != null && !voicing && caption != rigSaid) caption = null
                     if (s.cue.idle) bloom = null
                     if (page != null) { speakerName = audio?.speakerName() ?: ""; micName = audio?.micName() ?: "" }
                     delay(100)
@@ -651,9 +657,8 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     if (cameraCount > 1) add(com.tokkah.kin.ui.SheetItem.Row("Camera",
                         detail = if (video?.facingFront != false) "Front" else "Back", chevron = true,
                         glyph = com.tokkah.kin.ui.GlyphKind.CAMERA, onClick = { page = "camera" }))
-                    // Android picks the microphone with the route: a fact, not a door.
-                    add(com.tokkah.kin.ui.SheetItem.Row("Microphone", detail = micName.ifEmpty { "…" },
-                        glyph = com.tokkah.kin.ui.GlyphKind.MIC, inert = true))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Microphone", detail = micName.ifEmpty { "…" }, chevron = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.MIC, onClick = { page = "mic" }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Speaker", detail = speakerName.ifEmpty { "…" }, chevron = true,
                         glyph = com.tokkah.kin.ui.GlyphKind.SPEAKER, onClick = { page = "speaker" }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Calls when Kin is closed", switchState = state.listening,
@@ -732,9 +737,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                         add(com.tokkah.kin.ui.SheetItem.Hint("Give this to someone and they can call you."))
                     }
                     // Only where it can work: mid-call there is no name field to hand over to.
-                    if (!peerPresent) add(com.tokkah.kin.ui.SheetItem.Row("Call someone new", onClick = {
+                    if (!peerPresent) add(com.tokkah.kin.ui.SheetItem.Row("Call someone new", indent = true, onClick = {
                         Metrics.tap("call_new"); page = null; dialFocus++ }))
-                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { Metrics.tap("people_back"); page = "settings" }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", indent = true, onClick = { Metrics.tap("people_back"); page = "settings" }))
                 }
                 "rename" -> listOf(
                     com.tokkah.kin.ui.SheetItem.Hint("This is the name people type to call you."),
@@ -751,6 +756,13 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                             page = "settings"
                         }))
                     }
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
+                }
+                "mic" -> buildList {
+                    val mics = audio?.mics() ?: emptyList()
+                    for (m in mics) add(com.tokkah.kin.ui.SheetItem.Row(m.name, checked = m.name == micName, onClick = {
+                        audio?.setMic(m); page = "settings"
+                    }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
                 }
                 "speaker" -> buildList {

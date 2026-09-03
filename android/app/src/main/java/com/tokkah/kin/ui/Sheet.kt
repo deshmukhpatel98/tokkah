@@ -57,6 +57,12 @@ sealed class SheetItem {
     class Row(
         val label: String,
         val detail: String? = null,
+        /**
+         * The Mac indents ONLY the People page's glyph-less rows to the avatar
+         * column so "Call someone new" lines up with the names above it
+         * (Controls.swift 5446). Every other row starts at the sheet's s3.
+         */
+        val indent: Boolean = false,
         val valueIsWord: Boolean = true,
         val valueIsAction: Boolean = false,
         val switchState: Boolean? = null,
@@ -136,7 +142,7 @@ private fun SheetRowView(r: SheetItem.Row) {
         chevron = r.chevron,
         glyph = r.glyph,
         leading = r.avatar?.let { h -> { Avatar(h) } },
-        labelInset = if (r.glyph == null && r.avatar == null) Metric.rowAvatarInset else Metric.s3,
+        labelInset = if (r.indent && r.glyph == null && r.avatar == null) Metric.rowAvatarInset else Metric.s3,
         tone = if (r.checked) Palette.fg else Palette.rowInk,
         ruled = r.ruled,
         inert = r.inert,

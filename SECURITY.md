@@ -77,6 +77,9 @@ the source rather than here.** Since Kin 0.128.0 / 0.128.0-android.19:
   [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift); the Android port
   is [`android/app/src/main/java/com/tokkah/kin/net/Crypto.kt`](android/app/src/main/java/com/tokkah/kin/net/Crypto.kt)
   and is held to the Mac's own vectors.
+- **Nothing about a call is written to disk by the HTTP layer** (since 0.129.0):
+  one ephemeral session, no URL cache, no cookies. Earlier builds left room codes
+  and addresses in `~/Library/Caches/com.tokkah.tk/Cache.db`; 0.129.0 deletes it.
 - **Bounds and overflow checks are on** (`-O`, since 0.129.0), and the parsers a
   stranger reaches before any key exists are fuzzed in-process by
   `tk --fuzz-parsers`; the ones a peer reaches after the key are fuzzed by a

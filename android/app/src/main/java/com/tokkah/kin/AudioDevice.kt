@@ -167,6 +167,39 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
         }
     }
 
+    // ── THE MICROPHONE PAGE ─────────────────────────────────────────────────
+    //
+    // The Mac's Microphone row opens a page of input devices. Android has the
+    // same list (`GET_DEVICES_INPUTS`) and, since API 23, a way to ask the
+    // recorder for one of them (`setPreferredDevice`) -- so the row is a door
+    // here too, not a fact. The name shown stays what is ACTUALLY open
+    // (`routedDevice`), so a request the platform declined shows as declined.
+    fun mics(): List<Route> {
+        val devs = am?.getDevices(AudioManager.GET_DEVICES_INPUTS) ?: return emptyList()
+        val out = ArrayList<Route>()
+        for (d in devs) {
+            val name = when (d.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone"
+                AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Headphones"
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> d.productName?.toString()?.ifBlank { null } ?: "Bluetooth"
+                AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE ->
+                    d.productName?.toString()?.ifBlank { null } ?: "USB"
+                else -> continue
+            }
+            if (out.none { it.name == name }) out.add(Route(d.id, name, d.type))
+        }
+        return out
+    }
+
+    /** Ask the recorder to capture from [m]. Returns whether the platform took it. */
+    fun setMic(m: Route): Boolean {
+        val r = record ?: return false
+        val dev = am?.getDevices(AudioManager.GET_DEVICES_INPUTS)?.firstOrNull { it.id == m.id } ?: return false
+        val ok = runCatching { r.setPreferredDevice(dev) }.getOrDefault(false)
+        Metrics.tap("mic_pick", ok = ok)
+        return ok
+    }
+
     /** Switch the call's output to [r]. Returns whether the platform took it. */
     fun setRoute(r: Route): Boolean {
         val a = am ?: return false
