@@ -46,6 +46,7 @@ import kotlinx.coroutines.withContext
 
 /** Rig overrides read off the launch intent. Empty on every real launch. */
 private val rigFlags = HashMap<String, Boolean>()
+private var rigSaid: String? = null
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,6 +76,9 @@ class MainActivity : ComponentActivity() {
         // variable.
         for (k in listOf("turn", "decodeq")) {
             intent?.getStringExtra(k)?.let { rigFlags[k] = it == "1" || it == "true" }
+        }
+        run {
+            rigSaid = intent?.getStringExtra("said")?.takeIf { it.isNotBlank() }
         }
         RingService.channels(this)
         // An unexplained death is a bug, and one nobody is told about is not
@@ -493,7 +497,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
             var turn by remember { mutableStateOf(Floor.State.IDLE) }
             var voicing by remember { mutableStateOf(false) }
             var loud by remember { mutableStateOf(0f) }
-            var caption by remember { mutableStateOf<String?>(null) }
+            // `--press said` on the Mac: a rig arm that shows a caption so the
+            // pill can be photographed without a second person talking.
+            var caption by remember { mutableStateOf(rigSaid) }
             var bloom by remember { mutableStateOf<String?>(null) }
             var cueLevel by remember { mutableStateOf(0f) }
             var subsRef by remember { mutableStateOf<Subtitles?>(null) }
@@ -592,7 +598,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     subsRef?.setMuted(muted || s.floor.state == Floor.State.THEIRS)
                     // Nothing to read once they have stopped: a caption that
                     // outlives the sentence is furniture over somebody's face.
-                    if (s.cue.idle && caption != null && !voicing) caption = null
+                    if (s.cue.idle && caption != null && !voicing && caption != rigSaid) caption = null
                     if (s.cue.idle) bloom = null
                     if (page != null) { speakerName = audio?.speakerName() ?: ""; micName = audio?.micName() ?: "" }
                     delay(100)

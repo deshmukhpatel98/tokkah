@@ -115,6 +115,10 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   private let session = AVCaptureSession()
   /// Written only by the capture queue, read only by it. One-shot.
   private var firstFrameLogged = false
+  /// The size the sensor is actually delivering, for the beat. Plain ints,
+  /// written on the capture queue, read by the 1 Hz beat: a torn read is a
+  /// nonsense number once, never a crash.
+  nonisolated(unsafe) private(set) var frameW = 0, frameH = 0
   /// When `startRunning()` returned. Written on `sessionQ` before any frame can
   /// arrive (the delegate is only called after the session is running), read on
   /// the capture queue -- a plain UInt64, so the worst case is a stale zero and a
@@ -335,7 +339,21 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     session.beginConfiguration()
     guard session.canAddInput(input) else { throw Err.e("cannot add camera input") }
     session.addInput(input)
-    out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+    // SIZE, NOT JUST FORMAT. The device was put in its 1280x720 mode and read
+    // back 1920x1080 -- and delivered 1920x1080, with the preset at 720p too. So
+    // the encoder configured for 720p was handed 2.25x the pixels on every frame
+    // and VideoToolbox scaled each one on the way in, silently. Asking the output
+    // for 1280x720 makes the capture pipeline deliver that size, so what reaches
+    // the denoiser, the mouth detector, the self-view and the encoder is the
+    // picture that is actually being sent.
+    // `--cam-native-size` is the control arm: the sensor's own size, scaled later
+    // by VideoToolbox, exactly as every release before this one.
+    var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+    if !CommandLine.arguments.contains("--cam-native-size") {
+      settings[kCVPixelBufferWidthKey as String] = 1280
+      settings[kCVPixelBufferHeightKey as String] = 720
+    }
+    out.videoSettings = settings
     // Drop, never queue. A late frame is worthless on a call and a queue of them
     // is just latency with extra steps.
     out.alwaysDiscardsLateVideoFrames = true
@@ -378,6 +396,13 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       // feed it the wrong size. It exists to attribute the cost, nothing else.
       session.commitConfiguration()
     } else {
+      // EXPLICIT. Assigning `activeFormat` is documented to flip the preset to
+      // `.inputPriority` by itself (an iOS-only preset); on this MacBook Air the
+      // delivered frames did not follow the format: the log
+      // said "mode 1280x720" and the first frame measured 1920x1080 -- the
+      // encoder was being fed 2.25x the pixels it was configured for and
+      // VideoToolbox quietly scaled every one. `readback-is-not-in-effect`.
+      if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
       configure(dev)
       session.commitConfiguration()
     }
@@ -386,6 +411,8 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     let end = Clock.now()
     runReturnedAt = end
     started = true
+    // What the device is in NOW, after the graph is built -- not what was asked.
+    fputs("camera: running in \(CameraSource.describe(dev.activeFormat)) preset \(session.sessionPreset.rawValue)\n", stderr)
     // Broken out because "the camera took 150 ms" is not actionable and
     // "AVCaptureDeviceInput took 96 ms of it" is. Discovery, opening the sensor,
     // negotiating the format, and starting the graph fail and stall for entirely
@@ -579,7 +606,7 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       // dyld mapping AVFoundation, AppKit and VideoToolbox before main.swift's
       // first statement -- and without it "process start to first frame" is a
       // claim made against a clock that starts late.
-      fputs("camera: FIRST FRAME at \(sinceLaunch()) ms"
+      fputs("camera: FIRST FRAME \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) at \(sinceLaunch()) ms"
           + " (\(Int(Clock.sinceExec())) ms since exec"
           + ", sensor \(Int(Clock.msSigned(Clock.now(), runReturnedAt))) ms after startRunning)\n",
             stderr)
@@ -588,6 +615,7 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     // the audio path stamps with. This is the whole reason for being native.
     let pts = CMSampleBufferGetPresentationTimeStamp(sb)
     let host = CMClockConvertHostTimeToSystemUnits(pts)
+    frameW = CVPixelBufferGetWidth(pb); frameH = CVPixelBufferGetHeight(pb)
     onFrame?(pb, host == 0 ? Clock.now() : host)
   }
 }
@@ -603,6 +631,9 @@ final class VEncoder {
   /// A unit in a name is a claim; this project has now been wrong about one
   /// four times.
   var encLatMs = Quantiles()
+  /// Runs on every frame before it is handed to VideoToolbox, on this same
+  /// thread. Nil means the sensor's noise is encoded as if it were detail.
+  var denoise: VDenoise?
 
   /// Change the quality target on a live session. The controller in VQuality
   /// drives this, so the picture can retreat without tearing down the encoder --
@@ -848,6 +879,9 @@ final class VEncoder {
       if q != cfgQuality { rebuild(quality: q) }
     }
     guard let sess = session else { return }
+    // The encoder sees the filtered frame; everything else (mouth, self-view)
+    // still gets the raw one from the caller.
+    let pb = denoise?.filter(pb) ?? pb
     probeLuma(pb)
     let t0 = Clock.now()
     var props: CFDictionary?

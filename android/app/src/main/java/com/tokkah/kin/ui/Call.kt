@@ -317,7 +317,7 @@ fun CallScreen(
                     Text(
                         ui.caption, color = Palette.fg,
                         fontSize = Type.said.first, fontWeight = Type.said.second,
-                        textAlign = TextAlign.Center,
+                        textAlign = TextAlign.Start,
                         modifier = Modifier.fillMaxWidth().padding(Metric.s4),
                     )
                 }
