@@ -5,7 +5,61 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
-## Unreleased (Kin, video) — 2026-09-03
+## Kin 0.129.0 — 2026-09-03
+
+### Changed — bounds and overflow checks on, and what the fuzzers found under them
+
+The Mac binary was built `-Ounchecked` from its first commit: no array bounds
+checks, no integer overflow traps. Inside the encryption that costs nothing in
+safety, since only the authenticated peer feeds those parsers. The STUN and TURN
+reply parsers run **before any authentication** on bytes from anyone on the path,
+where an out-of-bounds read is memory corruption rather than a crash. `-O` now.
+
+**Cost: none the rig can see.** `mac/tools/bounds-ab.sh`, two binaries on live
+loopback with real speech, null pair first: m2e p50 18.7 / 17.9 ms for the same
+binary twice, 17.3 / 19.3 ms checked vs 17.1 / 20.4 ms unchecked; CPU 0.06–0.10
+s/s on both. The cipher, timed on every self-test now: seal 276 B p50 0.71 µs
+checked vs 0.79 µs unchecked.
+
+**What turning the checks on found, before the fuzzers even ran:** the beat
+literal had `aec_on` twice. Swift traps on a duplicate key; `-Ounchecked`
+compiled the trap out and the stale second entry silently overwrote the
+canceller's field on every beat. `mac/tools/dupkey-check.sh` scans every literal.
+
+### Added — two fuzzers, built into the binary that ships
+
+- `tk --fuzz-parsers <secs>` mutates valid templates and garbage into every
+  pre-authentication parser in-process: STUN binding reply, TURN replies
+  (success, error, realm/nonce/ERROR-CODE), ChannelData unwrap, the signed
+  handshake -- plus video reassembly and the lossless audio decoder. 1.9 million
+  inputs in 20 s, seeded and replayable.
+- `tk --fuzz-send <count>` turns one end into a **hostile peer**: it completes the
+  signed handshake honestly, then seals and sends mutated audio, video, probe,
+  subtitle and keyframe packets at the other end beside its real speech.
+  `mac/tools/fuzz-check.sh` runs both and requires the target alive, keyed and
+  crash-free, reading the crash-report folder rather than trusting exit codes.
+
+**Three real findings, all reachable by a peer holding a valid key, all fixed:**
+
+1. **A time probe crashed the app.** Three of a probe's four timestamps come from
+   the far end; a tick count near 2^64 overflowed the clock conversion
+   (`ticks * 125 / 3`). One packet, one trap. Probes with impossible timestamps or
+   a round trip over ten seconds are refused (`TimeSync.refused`), and the
+   conversion saturates instead of wrapping or trapping.
+2. **A video fragment longer than its slot was a heap write.** The datagram can be
+   1400 bytes, the slot 1150, and the copy was `memcpy`, which no compiler flag
+   checks; on the last fragment it wrote past the whole frame buffer. A negative
+   frame number indexed the ring negatively. Both refused (`VideoAssembler.oversize`).
+3. **Parity repair read a slot while writing it** -- an exclusivity violation the
+   unchecked builds never enforced, so every parity repair since it landed ran on
+   undefined behaviour. The parity block is copied out before the buffer opens.
+4. **Room codes were on disk.** Every HTTP call used `URLSession.shared`, whose
+   disk cache (`~/Library/Caches/com.tokkah.tk/Cache.db`) held the rendezvous URL
+   of every call this Mac ever made: room code, public address, LAN address. Two
+   instances writing that SQLite file at once is also what segfaulted the fuzz
+   target inside CFNetwork. One ephemeral session now (`Http.session`), no cache,
+   no cookies; the legacy database is deleted at launch.
+### Also in 0.129.0 — the picture (the video line, merged)
 
 ### Changed — the sensor's noise is taken out before the encoder sees it
 

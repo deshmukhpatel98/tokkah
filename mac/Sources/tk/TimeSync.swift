@@ -101,6 +101,10 @@ final class TimeSync {
   private let lock = NSLock()
 
   private(set) var samples = 0
+
+  /// Probes refused for carrying a timestamp no clock could have produced.
+
+  private(set) var refused = 0
   private(set) var lastDelayNs: Int64 = 0
 
   /// peer clock - my clock, from the least-queued sample in the window.
@@ -132,18 +136,37 @@ final class TimeSync {
   }
 
   func note(t1: UInt64, t2: UInt64, t3: UInt64, t4: UInt64) {
+    // ── FOUR NUMBERS, TWO OF WHICH THE OTHER END CHOSE ────────────────────────
+    //
+    // t1 and t3 (or t2, on a reply) arrive on the wire from a peer that holds a
+    // valid key -- and a valid key is not a promise of a sane clock. A tick count
+    // near 2^64 overflows `Clock.ns` (ticks * 125 / 3) and, once signed, the sums
+    // below. Under -Ounchecked that wrapped silently into the estimator; under -O
+    // it is a trap, and the hostile-peer fuzzer (tools/fuzz-check.sh) crashed the
+    // app with one probe on its first run. A real mach_absolute_time is under
+    // 2^50 for decades of uptime; anything at or past 2^56 is not a clock reading.
+    // 2^56, not 2^62: in nanoseconds a tick count is x 125/3, and the SIGNED
+    // sums below need every operand under 2^62 -- seeds 2 and 3 of the same
+    // fuzzer found 2^62 ticks still overflowing at the addition.
+    let sane: UInt64 = 1 << 56
+    guard t1 < sane, t2 < sane, t3 < sane, t4 < sane else { refused += 1; return }
     // Signed throughout. These are four numbers from two unrelated epochs, and
     // an unsigned subtraction that wraps to 18 quintillion is how an estimator
     // learns a value it will never recover from.
     let a = Int64(bitPattern: Clock.ns(t2)) - Int64(bitPattern: Clock.ns(t1))
     let b = Int64(bitPattern: Clock.ns(t3)) - Int64(bitPattern: Clock.ns(t4))
-    let theta = (a + b) / 2
+    let theta = a / 2 + b / 2     // never a + b: each is under 2^62, their sum is not
     let delay = (Int64(bitPattern: Clock.ns(t4)) - Int64(bitPattern: Clock.ns(t1)))
               - (Int64(bitPattern: Clock.ns(t3)) - Int64(bitPattern: Clock.ns(t2)))
     // A negative round trip is not a slow path, it is a corrupt sample: the
     // peer's turnaround cannot exceed the round trip. Refuse it rather than let
     // it win the minimum and poison theta for the whole window.
     guard delay >= 0 else { return }
+    // And an impossibly LONG one: nothing on this planet takes ten seconds to
+    // come back, so a sample that says so is a peer's clock reading no clock
+    // produced, and letting it win the window's maximum put the spread at
+    // 7,835,771,615,854 ms on the hostile-peer rig.
+    guard delay <= 10_000_000_000 else { refused += 1; return }
     lock.lock()
     win.append(S(delayNs: delay, thetaNs: theta))
     if win.count > cap { win.removeFirst() }

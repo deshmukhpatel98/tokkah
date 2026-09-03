@@ -152,6 +152,9 @@ final class VideoAssembler {
   //
   // Sequence gaps are the answer, and they are exact.
   private(set) var missing = 0
+  /// Fragments refused for a length no sender of ours produces, or a negative
+  /// frame number. Zero on every honest call.
+  private(set) var oversize = 0
   private var staleRun = 0
   private(set) var restarts = 0
   private(set) var lastDone: Int32 = -1
@@ -185,6 +188,16 @@ final class VideoAssembler {
   func take(seq: Int32, frag: Int, nfrag: Int, capHost: UInt64, bytes: UnsafePointer<UInt8>, n: Int,
             parity: Bool = false, parLastLen: Int = 0) {
     fragsIn += 1
+    // ── THE TWO BOUNDS NOTHING ELSE CHECKS ────────────────────────────────────
+    //
+    // `n` is the datagram's length minus the header, and a datagram can be 1400
+    // bytes: 250 more than a slot holds. The copy below is memcpy, which no
+    // compiler flag bounds-checks, so an oversize fragment was a heap write past
+    // the slot -- past the whole frame buffer, on the last fragment. And `seq` is
+    // a signed 32-bit number off the wire; a negative one survives the staleness
+    // filter after a restart and indexes the ring negatively. Both found by
+    // tools/fuzz-check.sh's hostile peer, both reachable by anyone holding a key.
+    guard n >= 0, n <= VPAYLOAD, seq >= 0 else { oversize += 1; return }
     // ── A LATE PARITY FRAGMENT IS NOT A RESTARTED SENDER ──────────────────────
     //
     // Parity is sent after the data, so on a healthy frame it arrives once the
@@ -263,10 +276,20 @@ final class VideoAssembler {
     // zero-padding appended to the frame, which the decoder would refuse.
     let len = miss == last ? slots[idx].parLastLen : VPAYLOAD
     guard len > 0, len <= VPAYLOAD else { parityWasted += 1; return }
+    // Copied OUT before the buffer is opened for writing. `slots[idx].buf` under
+    // `withUnsafeMutableBufferPointer` is a modification of `slots[idx]`, and
+    // reading `slots[idx].par` or `.nfrag` inside that closure is a second access
+    // to the same element: an exclusivity violation, which the in-process fuzzer
+    // found on its first run ("Fatal access conflict", tools/fuzz-check.sh). The
+    // shipped -Ounchecked builds never enforced it, so a parity repair had been
+    // running on undefined behaviour since the day it landed.
+    let par = slots[idx].par
+    let nfrag = slots[idx].nfrag
+    guard par.count >= VPAYLOAD, slots[idx].buf.count >= nfrag * VPAYLOAD else { parityWasted += 1; return }
     slots[idx].buf.withUnsafeMutableBufferPointer { b in
       let dst = b.baseAddress! + miss * VPAYLOAD
-      slots[idx].par.withUnsafeBufferPointer { pb in memcpy(dst, pb.baseAddress!, VPAYLOAD) }
-      for f in 0..<slots[idx].nfrag where f != miss {
+      par.withUnsafeBufferPointer { pb in memcpy(dst, pb.baseAddress!, VPAYLOAD) }
+      for f in 0..<nfrag where f != miss {
         let srcp = b.baseAddress! + f * VPAYLOAD
         for i in 0..<VPAYLOAD { dst[i] ^= srcp[i] }
       }

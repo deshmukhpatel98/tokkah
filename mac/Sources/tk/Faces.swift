@@ -136,7 +136,7 @@ enum Presence {
     req.cachePolicy = .reloadIgnoringLocalCacheData
     var out = Answer()
     let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, _, _ in
+    Http.session.dataTask(with: req) { data, _, _ in
       defer { sem.signal() }
       guard let data,
             let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]],
@@ -164,7 +164,7 @@ enum Presence {
                         + who.joined(separator: ",")) else { return }
     var req = URLRequest(url: url)
     req.timeoutInterval = 6
-    URLSession.shared.dataTask(with: req) { data, _, _ in
+    Http.session.dataTask(with: req) { data, _, _ in
       guard let data,
             let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]]
       else { return }

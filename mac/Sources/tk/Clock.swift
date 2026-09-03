@@ -29,7 +29,15 @@ enum Clock {
   @inline(__always) static func now() -> UInt64 { mach_absolute_time() }
 
   @inline(__always) static func ns(_ ticks: UInt64) -> UInt64 {
-    ticks * UInt64(tb.numer) / UInt64(tb.denom)
+    // Full-width, then saturate. `ticks * numer` overflows 64 bits for any tick
+    // count past 2^64/125, and tick counts arrive ON THE WIRE in time probes.
+    // A caller that has validated its input pays one extra multiply here; one
+    // that has not gets UInt64.max instead of a trap (-O) or a wrapped value
+    // (-Ounchecked), and both are easier to see than either of those.
+    let (hi, lo) = ticks.multipliedFullWidth(by: UInt64(tb.numer))
+    let d = UInt64(tb.denom)
+    guard hi < d else { return UInt64.max }
+    return d.dividingFullWidth((hi, lo)).quotient
   }
 
   // The inverse. Needed because a host timestamp has to be OFFSET by a duration

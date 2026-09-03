@@ -42,7 +42,7 @@ final class TurnClient {
     req.cachePolicy = .reloadIgnoringLocalCacheData
     let sem = DispatchSemaphore(value: 0)
     var parsed: (String, UInt16, String, String)?
-    URLSession.shared.dataTask(with: req) { d, _, _ in
+    Http.session.dataTask(with: req) { d, _, _ in
       defer { sem.signal() }
       guard let d,
             let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -187,7 +187,7 @@ final class TurnClient {
 
   // ── STUN over this allocation ──────────────────────────────────────────────
 
-  private struct Reply {
+  struct Reply {
     var ok = false
     var relayed: (String, UInt16)?
     /// ERROR-CODE as the wire spells it: 400, 401, 403, 437, 486.
@@ -229,7 +229,9 @@ final class TurnClient {
     return nil
   }
 
-  private func parse(_ buf: [UInt8], _ n: Int) -> Reply {
+  /// Internal rather than private so `Fuzz.parsers` can reach it: these are
+  /// bytes anyone on the path can send before a key exists.
+  func parse(_ buf: [UInt8], _ n: Int) -> Reply {
     var out = Reply()
     let type = UInt16(buf[0]) << 8 | UInt16(buf[1])
     let cls = type & 0x0110

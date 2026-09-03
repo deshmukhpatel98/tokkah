@@ -222,7 +222,7 @@ enum Update {
     var req = URLRequest(url: u)
     req.timeoutInterval = timeout
     req.cachePolicy = .reloadIgnoringLocalCacheData
-    URLSession.shared.dataTask(with: req) { d, r, _ in
+    Http.session.dataTask(with: req) { d, r, _ in
       if let h = r as? HTTPURLResponse, h.statusCode == 200 { out = d }
       sem.signal()
     }.resume()

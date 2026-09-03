@@ -155,7 +155,7 @@ enum Telemetry {
     // Short timeout: this is a report about a live call, and one that takes ten
     // seconds to deliver is describing the past.
     req.timeoutInterval = final ? 6 : 4
-    URLSession.shared.dataTask(with: req) { _, resp, err in
+    Http.session.dataTask(with: req) { _, resp, err in
       var ok = false
       if let err {
         failed += 1

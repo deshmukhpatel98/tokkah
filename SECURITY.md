@@ -77,6 +77,13 @@ the source rather than here.** Since Kin 0.128.0 / 0.128.0-android.19:
   [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift); the Android port
   is [`android/app/src/main/java/com/tokkah/kin/net/Crypto.kt`](android/app/src/main/java/com/tokkah/kin/net/Crypto.kt)
   and is held to the Mac's own vectors.
+- **Nothing about a call is written to disk by the HTTP layer** (since 0.129.0):
+  one ephemeral session, no URL cache, no cookies. Earlier builds left room codes
+  and addresses in `~/Library/Caches/com.tokkah.tk/Cache.db`; 0.129.0 deletes it.
+- **Bounds and overflow checks are on** (`-O`, since 0.129.0), and the parsers a
+  stranger reaches before any key exists are fuzzed in-process by
+  `tk --fuzz-parsers`; the ones a peer reaches after the key are fuzzed by a
+  hostile-peer mode, `tk --fuzz-send`, on a live socket.
 - **Measured, not asserted:** `tk --selftest-crypto` (18 arms, including the
   inputs that must be refused) and [`mac/tools/crypto-check.sh`](mac/tools/crypto-check.sh),
   which runs two real processes and proves an end that expects a different
@@ -240,7 +247,8 @@ Auditable in the console rather than asserted here: `__tape.safetyCode()`,
 - `style-src 'unsafe-inline'` weakens the CSP against injected styles. Low
   severity given `script-src 'self'`, but it is not nothing.
 
-Also not done: no third-party security audit, no penetration test, and no formal
-review of the custom lanes' parsing paths (the FEC and fragment reassembly code
-handles attacker-influenced lengths and indices, which is exactly the shape of
-code that repays fuzzing).
+Also not done: no third-party security audit and no penetration test. The Mac
+app's parsers are fuzzed by two harnesses built into the binary
+(`tk --fuzz-parsers`, `tk --fuzz-send`; see `mac/tools/fuzz-check.sh` and the
+0.129.0 changelog for the three findings they produced on their first run); the
+retired browser client's FEC and reassembly code was never fuzzed.
