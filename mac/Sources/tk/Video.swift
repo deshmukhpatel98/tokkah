@@ -795,7 +795,7 @@ final class VEncoder {
     fputs("encoder: DataRateLimits readback \(drl.map { String(describing: $0 as NSArray) } ?? "nil")"
         + "  Quality readback \(q.map { "\($0 as NSNumber)" } ?? "nil")\n", stderr)
     let gotBps = (got as? NSNumber)?.intValue ?? -1
-    fputs("encoder: H.264 \(cfgW)x\(cfgH) bitrate asked \(cfgBitrate) got \(gotBps), B-frames off\n", stderr)
+    fputs("encoder: \(hevc ? "HEVC" : "H.264") \(cfgW)x\(cfgH) bitrate asked \(cfgBitrate) got \(gotBps), B-frames off\n", stderr)
     // An encoder that quietly gave us a different bitrate than we asked for is a
     // fact about the call, not a line in a log. Same for the codec: the day this
     // is ever anything but H.264, every picture number moves and nothing else
