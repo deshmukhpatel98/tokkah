@@ -64,18 +64,25 @@ class KinState(
 
     private var ringTimeoutAt = 0L
 
-    fun start() {
-        watcher.onRing = { r ->
-            // A ring that arrives while we are already showing one is not a
-            // second card: the first one is still the call being offered.
-            if (incoming == null && cardMode != CallCardMode.RINGING) {
-                incoming = r
-                cardMode = CallCardMode.RINGING
-                cardLine = null; cardBecause = null
-                ctx?.let { Ringer.start(it) }
-                onChanged?.invoke()
-            }
+    /**
+     * Show a call being offered. From the in-app poll, or from the service
+     * that opened this screen for it (the Mac's `gOffered`: one variable, two
+     * routes in, one Answer button that works for both).
+     */
+    fun offer(r: Identity.Ring) {
+        // A ring that arrives while we are already showing one is not a
+        // second card: the first one is still the call being offered.
+        if (incoming == null && cardMode != CallCardMode.RINGING) {
+            incoming = r
+            cardMode = CallCardMode.RINGING
+            cardLine = null; cardBecause = null
+            ctx?.let { Ringer.start(it) }
+            onChanged?.invoke()
         }
+    }
+
+    fun start() {
+        watcher.onRing = { r -> offer(r) }
         watcher.onBye = { r ->
             // They hung up before we answered, or declined our call.
             if (incoming?.from == r.from) {
@@ -388,7 +395,7 @@ class KinState(
     val reachOn: Boolean? get() = if (reachBusy) null else !identity.quietOn
     val reachHint: String get() = reachTrouble
         ?: if (!identity.quietOn && !listening)
-            "Only while Kin is open. Allow notifications so Kin can be reached when it’s closed."
+            "Only while Kin is open. Allow Kin to show over other apps so a call can reach you when it’s closed."
         else ""
 
     /** Start listening. Returns false when a permission has to be asked first. */

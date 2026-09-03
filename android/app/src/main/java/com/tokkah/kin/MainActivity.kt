@@ -56,7 +56,13 @@ class MainActivity : ComponentActivity() {
         // the lock screen lands in that call rather than at the front door.
         val fromRing = intent?.getStringExtra(RingService.EXTRA_ROOM)
         val ringWho = intent?.getStringExtra(RingService.EXTRA_FROM) ?: ""
+        // A ring opened directly by the service (no notification) must still
+        // come up over the lock screen and light it, as the Mac's window does.
+        if (ringWho.isNotEmpty() && android.os.Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(true); setTurnScreenOn(true)
+        }
         val ringKey = intent?.getStringExtra(RingService.EXTRA_KEY)
+        val ringOffer = intent?.getBooleanExtra(RingService.EXTRA_OFFER, false) == true
         val deep = fromRing ?: intent?.data?.let { u ->
             (u.pathSegments?.lastOrNull() ?: u.host)?.takeIf { it.isNotBlank() }
         }
@@ -78,12 +84,12 @@ class MainActivity : ComponentActivity() {
         Thread { runCatching { com.tokkah.kin.net.Crash.reportPrevious(kinDir, com.tokkah.kin.net.Telemetry(kinDir)) } }
             .apply { isDaemon = true }.start()
         com.tokkah.kin.net.Crash.arm(kinDir, ver)
-        setContent { KinApp(deep, if (fromRing != null) ringWho else "", if (fromRing != null) ringKey else null) }
+        setContent { KinApp(deep, if (fromRing != null) ringWho else "", if (fromRing != null) ringKey else null, ringOffer) }
     }
 }
 
 @Composable
-fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) {
+fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, ringOffer: Boolean = false) {
     val ctx = LocalContext.current
     var room by remember { mutableStateOf(if (ringWho.isEmpty()) initialRoom ?: "" else "") }
     var session by remember { mutableStateOf<CallSession?>(null) }
@@ -117,10 +123,12 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) 
     // do for itself. Asked on the press that needs it; the switch finishes
     // itself when the answer comes back.
     lateinit var stateRef: KinState
-    val askNotify = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { ok ->
-        if (ok) {
+    // The grant is "display over other apps" -- a Settings page with one
+    // switch, not a dialog -- and the answer is read on the way back.
+    val askOverlay = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { _ ->
+        if (RingService.canRing(ctx)) {
             RingService.start(ctx)
             ctx.getSharedPreferences("kin", Context.MODE_PRIVATE).edit().putBoolean("listening", true).apply()
             stateRef.listeningGranted()
@@ -143,12 +151,16 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) 
     val prefs = ctx.getSharedPreferences("kin", Context.MODE_PRIVATE)
     // Listening = the service is up. It is up whenever the person asked for it
     // and the permission allows it.
-    state.listening = prefs.getBoolean("listening", false) &&
-        (android.os.Build.VERSION.SDK_INT < 33 || granted(ctx, Manifest.permission.POST_NOTIFICATIONS))
+    state.listening = prefs.getBoolean("listening", false) && RingService.canRing(ctx)
     state.listenOn = {
         prefs.edit().putBoolean("listening", true).apply()
-        if (android.os.Build.VERSION.SDK_INT >= 33 && !granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
-            askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (!RingService.canRing(ctx)) {
+            askOverlay.launch(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:" + ctx.packageName),
+                ),
+            )
             false
         } else { RingService.start(ctx); true }
     }
@@ -321,7 +333,11 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null) 
     // straight into it rather than showing a front door nobody asked for.
     LaunchedEffect(initialRoom, ringWho) {
         if (ringWho.isNotEmpty() && initialRoom != null && session == null) {
-            join(initialRoom, ringWho, ringKey)
+            // Opened by the service with nobody having answered: this is the
+            // Mac's `--incoming` -- the card asks, the ringtone keeps going,
+            // and no room, socket or camera exists until Answer is pressed.
+            if (ringOffer) state.offer(com.tokkah.kin.net.Identity.Ring(ringWho, initialRoom, 0, null, true, ringKey ?: ""))
+            else join(initialRoom, ringWho, ringKey)
         }
     }
 

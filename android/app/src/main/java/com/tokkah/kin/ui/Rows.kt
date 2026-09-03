@@ -84,6 +84,13 @@ fun KinRow(
     onLongClick: (() -> Unit)? = null,
     /** Pressed on the value chip alone (the Mac's `trailingAction`). */
     onDetailClick: (() -> Unit)? = null,
+    /**
+     * The Mac's ×: a 20 pt disc, fill 0.14, an × of half-width 3.5 at 1.6,
+     * at the row's right end (Controls.swift 1413). The Mac shows it while the
+     * pointer hovers; a phone has no hover, so the owner shows it while the
+     * row's menu is up.
+     */
+    removeMark: Boolean = false,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -138,6 +145,23 @@ fun KinRow(
             switchState != null -> {
                 Spacer(Modifier.width(Metric.s2))
                 RowSwitch(switchState, Modifier.padding(end = Metric.s3))
+            }
+            removeMark -> {
+                Spacer(Modifier.width(Metric.s2))
+                Box(
+                    Modifier.padding(end = Metric.s3).size(20.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Palette.fill(0.14f), RoundedCornerShape(10.dp))
+                        .then(if (onDetailClick != null) Modifier.clickable(onClick = onDetailClick) else Modifier)
+                        .semantics { contentDescription = "remove" },
+                ) {
+                    Canvas(Modifier.size(20.dp)) {
+                        val c = size.width / 2; val k = 3.5f.dp.toPx()
+                        val st = Stroke(1.6f.dp.toPx(), cap = StrokeCap.Round)
+                        drawLine(Palette.fg, androidx.compose.ui.geometry.Offset(c - k, c - k), androidx.compose.ui.geometry.Offset(c + k, c + k), strokeWidth = st.width, cap = StrokeCap.Round)
+                        drawLine(Palette.fg, androidx.compose.ui.geometry.Offset(c - k, c + k), androidx.compose.ui.geometry.Offset(c + k, c - k), strokeWidth = st.width, cap = StrokeCap.Round)
+                    }
+                }
             }
             detail != null -> {
                 Spacer(Modifier.width(Metric.s2))

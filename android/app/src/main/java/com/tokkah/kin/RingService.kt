@@ -97,6 +97,29 @@ class RingService : Service() {
 
     private fun ring(r: Identity.Ring) {
         val nm = getSystemService(NotificationManager::class.java) ?: return
+        // ── THE MAC'S WAY: THE WINDOW COMES UP, NO NOTIFICATION ──────────────
+        //
+        // With "display over other apps" granted, a background service may
+        // start an activity outright (the one exemption that needs no
+        // notification), so the call's card comes up above whatever is open --
+        // which is exactly what the Mac's ring does. This is also what lets
+        // Kin never hold the notification permission: without it Android shows
+        // NO "Kin is listening" line at all (measured: 0 records, "No
+        // notifications" in the shade, service foreground), and the phone is
+        // finally as silent as the Mac while it listens.
+        if (canOpenOverOthers(this)) {
+            startActivity(Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_FROM, r.from); putExtra(EXTRA_ROOM, r.room)
+                if (r.k.isNotEmpty()) putExtra(EXTRA_KEY, r.k)
+                // Launched to ASK, not to talk (main.swift `--incoming`): the
+                // card says who is calling, and nothing joins until they answer.
+                putExtra(EXTRA_OFFER, true)
+            })
+            Ringer.start(this)
+            Ringer.checkReachedFront(this)
+            return
+        }
         val full = open(r.from, r.room, r.k)
         val n = NotificationCompat.Builder(this, CH_RING)
             .setContentTitle("@${r.from} is calling")
@@ -175,6 +198,7 @@ class RingService : Service() {
         const val EXTRA_FROM = "from"
         const val EXTRA_ROOM = "room"
         const val EXTRA_KEY = "key"
+        const val EXTRA_OFFER = "offer"
 
         fun channels(ctx: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -210,6 +234,16 @@ class RingService : Service() {
                 },
             )
         }
+
+        /** Settings' "Display over other apps", the grant a ring uses to come up. */
+        fun canOpenOverOthers(ctx: Context): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.M || android.provider.Settings.canDrawOverlays(ctx)
+
+        /** Either way a ring can reach the screen: over other apps, or as a full-screen notification. */
+        fun canRing(ctx: Context): Boolean =
+            canOpenOverOthers(ctx) ||
+                (Build.VERSION.SDK_INT < 33 || androidx.core.content.ContextCompat.checkSelfPermission(
+                    ctx, android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED)
 
         fun start(ctx: Context) {
             val i = Intent(ctx, RingService::class.java)

@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -183,19 +185,36 @@ fun HomeScreen(
                                 KinHint("Talk to someone once and they’ll show up here.")
                             }
                             for (p in card.people) {
-                                // The Mac's right-click / hover-× is a long press here:
-                                // the row offers "remove" in the value slot, one tap
-                                // takes them off, any other tap withdraws the offer.
+                                // TAKING SOMEBODY OFF THE LIST, the Mac's two ways
+                                // (Controls.swift 1357): a right-click menu that says
+                                // "Remove @meera", and an × at the row's right end
+                                // while the pointer is over it. A phone's right-click
+                                // is a long press, and the long press is also the only
+                                // "hover" it has -- so the press opens the menu AND
+                                // shows the ×, and either one takes the person off.
                                 val offering = card.removing == p.handle
-                                KinRow(
-                                    "@" + p.handle,
-                                    detail = if (offering) "remove" else p.lastSeen,
-                                    valueIsAction = offering,
-                                    leading = { Avatar(p.handle, online = p.online, face = faceOf(p)) },
-                                    onClick = { if (offering) onRemoveOffer(null) else onCall(p.handle) },
-                                    onLongClick = { onRemoveOffer(p.handle) },
-                                    onDetailClick = if (offering) ({ onRemove(p.handle) }) else null,
-                                )
+                                Box {
+                                    KinRow(
+                                        "@" + p.handle,
+                                        detail = if (offering) null else p.lastSeen,
+                                        leading = { Avatar(p.handle, online = p.online, face = faceOf(p)) },
+                                        onClick = { if (offering) onRemoveOffer(null) else onCall(p.handle) },
+                                        onLongClick = { onRemoveOffer(p.handle) },
+                                        removeMark = offering,
+                                        onDetailClick = if (offering) ({ onRemove(p.handle) }) else null,
+                                    )
+                                    DropdownMenu(
+                                        expanded = offering, onDismissRequest = { onRemoveOffer(null) },
+                                        containerColor = Palette.opaqueSurface,
+                                        shape = RoundedCornerShape(Metric.sheetRowRadius),
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Remove @" + p.handle, color = Palette.fg,
+                                                fontSize = Type.button.first, fontWeight = Type.button.second) },
+                                            onClick = { onRemove(p.handle) },
+                                        )
+                                    }
+                                }
                             }
                             RoomField(room, onRoom, onJoin)
                             // The status line: 14 high, caption, warn. Only ever

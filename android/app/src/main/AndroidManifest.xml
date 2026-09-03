@@ -11,7 +11,15 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- NOT asked for any more. Without it Android shows no "Kin is listening"
+         line at all while the service runs (measured on API 35), which is the
+         Mac's silence. Kept declared so copies that granted it keep ringing
+         the old way. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The Mac's ring is a window coming up above every other app. This is
+         the one grant that lets a background service do that with no
+         notification in between. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- The card, not a line in a list: the same promise the Mac's window
          makes when it comes up above every other app. -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />

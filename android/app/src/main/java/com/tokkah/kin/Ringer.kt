@@ -211,7 +211,8 @@ object Ringer {
      * counted rather than assumed.
      */
     fun checkReachedFront(ctx: Context) {
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        val ok = if (RingService.canOpenOverOthers(ctx)) true
+        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             runCatching {
                 ctx.getSystemService(android.app.NotificationManager::class.java)
                     ?.canUseFullScreenIntent() == true

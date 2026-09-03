@@ -229,8 +229,16 @@ fun CallScreen(
             }
 
             // ── the pills in the sky ────────────────────────────────────────
+            //
+            // The Mac centres the sentence on the top edge, beside the who-pill
+            // and the `…`, because a Mac window is wide enough for all three on
+            // one line. A phone is not: "waiting for the other person" centred
+            // at the top ran INTO the who-pill. So the phone has one top line --
+            // who on the left, `…` on the right, both centred on the same 48 pt
+            // line -- and the sentence sits centred on the line below it.
             Column(
-                Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = Metric.s4),
+                Modifier.align(Alignment.TopCenter).statusBarsPadding()
+                    .padding(top = Metric.gutter + Metric.controlSmall + Metric.s2),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 if (ui.sentence.isNotEmpty()) HintPill(ui.sentence)
@@ -244,7 +252,8 @@ fun CallScreen(
             val who = whoLine(ui.peerHandle, ui.elapsed)
             AnimatedVisibility(
                 chromeShown && who.isNotEmpty(),
-                Modifier.align(Alignment.TopStart).statusBarsPadding().padding(start = Metric.gutter, top = Metric.topInset),
+                Modifier.align(Alignment.TopStart).statusBarsPadding()
+                    .padding(start = Metric.gutter, top = Metric.gutter + (Metric.controlSmall - Metric.pillHeight - Metric.s2) / 2),
                 enter = fadeIn(tween(140)), exit = fadeOut(tween(220)),
             ) { HintPill(who) }
 

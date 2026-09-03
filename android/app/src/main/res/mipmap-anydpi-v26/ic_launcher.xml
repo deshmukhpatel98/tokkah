@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The Mac icon (mac/bundle/AppIcon.icns, built by mkicon.swift): the Material
+     "conversation" glyph, two faces talking, on the plate gradient. The foreground
+     is the plate itself fitted to the 72dp safe zone, so the launcher mask shows
+     the same picture the Dock does. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Kin's own ground, so the icon reads as the app rather than as a
-         cut-out on whatever the launcher paints behind it. -->
-    <background android:drawable="@color/icon_bg" />
+    <background android:drawable="@drawable/ic_launcher_bg" />
     <foreground android:drawable="@mipmap/ic_launcher_foreground" />
-    <monochrome android:drawable="@mipmap/ic_launcher_foreground" />
+    <monochrome android:drawable="@mipmap/ic_launcher_monochrome" />
 </adaptive-icon>
