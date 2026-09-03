@@ -381,9 +381,11 @@ final class Wire {
   /// worth anything to a listener on its own.
   func sendHandshake() {
     guard let c = crypto else { return }
-    // Signed once and cached inside Crypto; this is a 136-byte copy per beat.
-    let out = c.handshakePacket(caps: Wire.myCaps)
-    out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
+    // HS3 (signed once, cached), the two ML-KEM key halves while unkeyed, and B's
+    // ciphertext until A has proved it holds the key. Each under 1200 bytes.
+    for out in c.handshakePackets(caps: Wire.myCaps) {
+      out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
+    }
   }
   /// Fired on the receive thread when a NEW, verified identity keyed the call.
   /// The argument is the peer's Ed25519 identity, base64 -- what contacts.json
@@ -1452,37 +1454,48 @@ final class Wire {
       // from before the handshake was signed, and connecting to it would mean
       // accepting a key nobody vouched for. The beat says `hs_old`, the summary
       // says "old build", and the call keys the moment they update.
-      if magic == HMAGIC {
+      if magic == HMAGIC || magic == Crypto.HS_V2_MAGIC {
         crypto?.noteOldHandshake()
         continue
       }
-      if magic == Crypto.HS_MAGIC, Int(n) >= Crypto.HS_LEN {
+      if magic == Crypto.HS_MAGIC || magic == Crypto.HSK_MAGIC || magic == Crypto.HSC_MAGIC {
         guard let c = crypto else { continue }
-        // REPLY ONLY WHEN THE KEY WAS NEW. The previous version replied to every
-        // handshake it received, and so did the peer, so a reply provoked a
-        // reply: on loopback that ran at about ten thousand round trips a second.
-        // Liveness does not need the echo. Both ends beat a handshake on a timer
-        // -- fast while unkeyed, every 5 s after -- so a peer that restarts with
-        // a fresh key is adopted on its next beat, that adoption IS a change, and
-        // the single reply that follows completes the exchange in one round trip.
-        switch c.adoptHandshake(buf, Int(n)) {
+        let verdict: Crypto.Adopt
+        switch magic {
+        case Crypto.HS_MAGIC: verdict = c.adoptHandshake(buf, Int(n))
+        case Crypto.HSK_MAGIC: verdict = c.takeKemHalf(buf, Int(n))
+        default: verdict = c.takeCiphertext(buf, Int(n))
+        }
+        switch verdict {
         case .adopted:
-          // The address is adopted only from a VERIFIED handshake. Before this,
-          // the first 36 bytes with the right magic pointed the media anywhere.
+          // A VERIFIED offer (or a key half completing one). The address is
+          // adopted only here and at .keyed -- never from an unverified packet.
           if !locked { adopt(src) }
-          let c2 = Crypto.caps(of: buf, Int(n))
-          if c2 != peerCaps {
-            peerCaps = c2
-            fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\(c2 & CAP_PCM_LP != 0 ? ", lossless-compressed" : "")\n", stderr)
+          if magic == Crypto.HS_MAGIC {
+            let c2 = c.peerCaps
+            if c2 != peerCaps {
+              peerCaps = c2
+              fputs("peer can receive: \(c2 & CAP_PCM16 != 0 ? "16-bit pcm" : "32-bit float only")\(c2 & CAP_PCM_LP != 0 ? ", lossless-compressed" : "")\n", stderr)
+            }
+            // Reply with our own beat now, so the exchange completes in one round
+            // trip rather than at the next 300 ms tick. Only on a NEW offer: a
+            // reply to every beat was a 20,000 packet/s echo in 0.9.0.
+            sendHandshake()
+            handshakeReplies += 1
+            if let k = c.peerIdentityB64 { onPeerIdentity?(k) }
           }
+        case .keyed:
+          if !locked { adopt(src) }
           fputs("crypto: \(c.summary)\n", stderr)
+          // B has a ciphertext to deliver; A has a key to prove. Either way, beat.
           sendHandshake()
           handshakeReplies += 1
-          if let k = c.peerIdentityB64 { onPeerIdentity?(k) }
         case .unchanged:
-          if !locked { adopt(src) }
+          if !locked, magic == Crypto.HS_MAGIC { adopt(src) }
         case .refused(let why):
-          fputs("crypto: handshake refused (\(why)) from \(Wire.describe(src))\n", stderr)
+          if why != "unknown eph" {   // a half or ciphertext for an offer we never verified: routine noise
+            fputs("crypto: handshake refused (\(why)) from \(Wire.describe(src))\n", stderr)
+          }
         }
         continue
       }

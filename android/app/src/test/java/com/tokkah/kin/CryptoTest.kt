@@ -11,18 +11,27 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // Vectors in /vectors/crypto.json are written by the Mac's own self-test
-// (`tk --crypto-vectors <path>`): the handshake packets the shipped Crypto.swift
-// signed and the packets it sealed. This port must VERIFY the former and open the
-// latter byte for byte, and its own handshakes must be accepted by the same rules.
-// (CryptoKit's Ed25519 is randomised, so the Mac's handshakes are checked, not
-// compared; the derived keys are deterministic, so the sealed packets ARE compared.)
+// (`tk --crypto-vectors <path>`, v3): the three handshake packets each end
+// sends, from fixed ephemeral, identity and ML-KEM seeds and a fixed
+// encapsulation m, plus the packets the Mac sealed under the resulting key.
+// This port must VERIFY the Mac's signed packets (CryptoKit's Ed25519 is
+// randomised, so they are checked, not compared), reproduce B's ciphertext
+// byte for byte (the fixed m makes it deterministic), derive the same key, and
+// open the Mac's sealed packets. Two implementations of X25519, Ed25519,
+// HKDF, AES-GCM AND FIPS 203 held to each other.
 class CryptoTest {
     private val text by lazy { javaClass.getResourceAsStream("/vectors/crypto.json")!!.reader().readText() }
     private fun top(k: String) = Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(text)!!.groupValues[1]
     private fun side(side: String, k: String): String {
         val block = Regex("\"$side\"\\s*:\\s*\\{").find(text)!!
-        val sub = text.substring(block.range.last, minOf(text.length, block.range.last + 4000))
+        val sub = text.substring(block.range.last, minOf(text.length, block.range.last + 12000))
         return Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(sub)!!.groupValues[1]
+    }
+    private fun sideList(side: String, k: String): List<ByteArray> {
+        val block = Regex("\"$side\"\\s*:\\s*\\{").find(text)!!
+        val sub = text.substring(block.range.last, minOf(text.length, block.range.last + 12000))
+        val arr = Regex("\"$k\"\\s*:\\s*\\[([^\\]]*)\\]").find(sub)!!.groupValues[1]
+        return Regex("\"([0-9a-f]+)\"").findAll(arr).map { hex(it.groupValues[1]) }.toList()
     }
     private fun list(k: String): List<String> {
         val arr = Regex("\"$k\"\\s*:\\s*\\[([^\\]]*)\\]").find(text)!!.groupValues[1]
@@ -32,11 +41,13 @@ class CryptoTest {
     private val room get() = top("room")
     private val caps = Wire.CAP_PCM16 or Wire.CAP_PCM_LP
 
-    private fun a(expected: ByteArray? = null) =
-        Crypto(room, hex(side("a", "idSeedHex")), expected, hex(side("a", "privHex")))
-    private fun b(expected: ByteArray? = null) =
-        Crypto(room, hex(side("b", "idSeedHex")), expected, hex(side("b", "privHex")))
-    private fun adopt(c: Crypto, p: ByteArray) = c.adoptHandshake(p, p.size)
+    private fun a(expected: ByteArray? = null) = Crypto(room, hex(side("a", "idSeedHex")), expected,
+        hex(side("a", "privHex")), hex(side("a", "kemSeedHex")))
+    private fun b(expected: ByteArray? = null) = Crypto(room, hex(side("b", "idSeedHex")), expected,
+        hex(side("b", "privHex")), hex(side("b", "kemSeedHex")), hex(side("b", "kemMHex")))
+    private fun feed(c: Crypto, pkts: List<ByteArray>) = pkts.map { c.take(it, it.size) }
+    private fun keyed(r: List<Crypto.Adopt>) = r.any { it is Crypto.Adopt.Keyed }
+    private fun refused(r: List<Crypto.Adopt>) = r.count { it is Crypto.Adopt.Refused }
 
     @Test
     fun publicKeysMatchCryptoKit() {
@@ -44,122 +55,127 @@ class CryptoTest {
         assertArrayEquals(hex(side("b", "pubHex")), b().myPublic)
         assertArrayEquals(hex(side("a", "idPubHex")), a().myIdentity)
         assertArrayEquals(hex(side("b", "idPubHex")), b().myIdentity)
+        assertArrayEquals(hex(side("a", "kemPkHex")), a().myKemPk)
     }
 
     @Test
-    fun macHandshakesVerifyAndKeyTheCall() {
-        val a = a(); val b = b()
-        // B adopts the Mac-signed A handshake; A adopts the Mac-signed B one.
-        assertTrue(adopt(b, hex(side("a", "handshakeHex"))) is Crypto.Adopt.Adopted)
-        assertTrue(adopt(a, hex(side("b", "handshakeHex"))) is Crypto.Adopt.Adopted)
-        assertTrue(a.established && b.established)
+    fun macPacketsKeyBothEnds() {
+        // The Mac's A beat (HS3 + halves) keys this B; the Mac's B beat (HS3 + halves + HSC) keys this A.
+        val b = b(); val a = a()
+        assertTrue(keyed(feed(b, sideList("a", "packetsHex"))))
+        assertTrue(keyed(feed(a, sideList("b", "packetsHex"))))
         assertEquals(top("safetyCode"), a.safetyCode)
         assertEquals(top("safetyCode"), b.safetyCode)
     }
 
     @Test
+    fun ownCiphertextMatchesTheMacsByteForByte() {
+        // Same A key, same m: this B's HSC carries the Mac B's ciphertext.
+        val b = b()
+        feed(b, sideList("a", "packetsHex"))
+        val mine = b.handshakePackets(caps)
+        val macB = sideList("b", "packetsHex")
+        assertEquals(4, mine.size); assertEquals(4, macB.size)
+        val ctMine = mine[3].copyOfRange(36, 36 + 1088)
+        val ctMac = macB[3].copyOfRange(36, 36 + 1088)
+        assertArrayEquals(ctMac, ctMine)
+    }
+
+    @Test
     fun openMacSealedPacketsByteExact() {
-        val a = a(); val b = b()
-        assertTrue(adopt(b, hex(side("a", "handshakeHex"))) is Crypto.Adopt.Adopted)
-        assertTrue(adopt(a, hex(side("b", "handshakeHex"))) is Crypto.Adopt.Adopted)
+        val b = b(); val a = a()
+        feed(b, sideList("a", "packetsHex")); feed(a, sideList("b", "packetsHex"))
         val plains = list("plaintexts"); val pk = list("aToB")
         for ((i, msg) in plains.withIndex()) {
             assertEquals("packet $i", msg, String(b.open(hex(pk[i]))!!))
-            // And this port seals the same bytes the Mac did: same key, same counter.
             assertArrayEquals("seal $i", hex(pk[i]), a.seal(msg.toByteArray()))
         }
     }
 
     @Test
-    fun ownHandshakesKeyBothWays() {
-        val a = a(); val b = b()
-        assertTrue(adopt(b, a.handshakePacket(caps)) is Crypto.Adopt.Adopted)
-        assertTrue(adopt(a, b.handshakePacket(caps)) is Crypto.Adopt.Adopted)
+    fun ownHandshakesKeyBothWaysEitherOrder() {
+        // A first.
+        var a = a(); var b = b()
+        assertTrue(keyed(feed(b, a.handshakePackets(caps))))
+        assertTrue(keyed(feed(a, b.handshakePackets(caps))))
         assertEquals(top("safetyCode"), a.safetyCode)
-        val p = a.seal("hello".toByteArray())!!
-        assertEquals("hello", String(b.open(p)!!))
+        assertEquals("hello", String(b.open(a.seal("hello".toByteArray())!!)!!))
+        assertEquals("reply", String(a.open(b.seal("reply".toByteArray())!!)!!))
+        // B first: A holds the offer, cannot key until the ciphertext.
+        a = a(); b = b()
+        assertFalse(keyed(feed(a, b.handshakePackets(caps))))
+        assertFalse(a.established)
+        assertTrue(keyed(feed(b, a.handshakePackets(caps))))
+        assertTrue(keyed(feed(a, b.handshakePackets(caps))))
+        assertEquals(a.safetyCode, b.safetyCode)
         // Same-key beat: unchanged, no verify spent.
-        assertTrue(adopt(b, a.handshakePacket(caps)) is Crypto.Adopt.Unchanged)
+        assertTrue(b.take(a.handshakePacket(caps), Crypto.HS_LEN) is Crypto.Adopt.Unchanged)
         assertEquals(0, b.hsBadSig + b.hsWrongId + b.hsIdChanged)
+    }
+
+    @Test
+    fun keyedEndsBeatHs3Alone() {
+        val a = a(); val b = b()
+        feed(b, a.handshakePackets(caps)); feed(a, b.handshakePackets(caps))
+        assertEquals(4, b.handshakePackets(caps).size)          // A has not proved the key yet
+        assertNotNull(b.open(a.seal("x".toByteArray())!!))
+        assertEquals(1, b.handshakePackets(caps).size)
     }
 
     @Test
     fun replayIsRefused() {
         val a = a(); val b = b()
-        adopt(b, a.handshakePacket(caps)); adopt(a, b.handshakePacket(caps))
+        feed(b, a.handshakePackets(caps)); feed(a, b.handshakePackets(caps))
         val p1 = a.seal("one".toByteArray())!!
-        assertNotNull(b.open(p1))
-        assertNull("the same packet again", b.open(p1))
-        assertEquals(1, b.replayDrops)
-        // 2100 more; deliver the last, then the second-to-last (unseen, in the
-        // window) and the first (older than the window).
+        assertNotNull(b.open(p1)); assertNull(b.open(p1)); assertEquals(1, b.replayDrops)
         val late = (0 until 2100).map { a.seal("tick".toByteArray())!! }
-        assertNotNull(b.open(late.last()))
-        assertNotNull(b.open(late[late.size - 2]))
-        assertNull(b.open(late[0]))
+        assertNotNull(b.open(late.last())); assertNotNull(b.open(late[late.size - 2])); assertNull(b.open(late[0]))
     }
 
     @Test
-    fun wrongRoomIsRefused() {
+    fun wrongRoomWrongIdentityRightIdentity() {
+        val fresh = a().handshakePackets(caps)
         val c = Crypto("another-room", hex(side("b", "idSeedHex")), null, hex(side("b", "privHex")))
-        val r = adopt(c, hex(side("a", "handshakeHex")))
-        assertTrue(r is Crypto.Adopt.Refused)
-        assertEquals(1, c.hsBadSig)
-        assertFalse(c.established)
-    }
-
-    @Test
-    fun unexpectedIdentityIsRefused() {
+        assertEquals(1, refused(feed(c, listOf(fresh[0])))); assertEquals(1, c.hsBadSig)
         val d = b(ByteArray(32) { 0x33 })
-        assertTrue(adopt(d, hex(side("a", "handshakeHex"))) is Crypto.Adopt.Refused)
-        assertEquals(1, d.hsWrongId)
-        assertFalse(d.established)
-        assertNull(d.seal("x".toByteArray()))
-    }
-
-    @Test
-    fun expectedIdentityIsPinned() {
+        assertTrue(refused(feed(d, fresh)) >= 1); assertEquals(1, d.hsWrongId); assertFalse(d.established)
         val e = b(a().myIdentity)
-        assertTrue(adopt(e, hex(side("a", "handshakeHex"))) is Crypto.Adopt.Adopted)
-        assertTrue(e.pinned)
-    }
-
-    @Test
-    fun secondIdentityMidCallIsRefused() {
-        val b = b()
-        adopt(b, hex(side("a", "handshakeHex")))
+        assertTrue(keyed(feed(e, fresh))); assertTrue(e.pinned)
         val imp = Crypto(room, ByteArray(32) { 0x44 }, null, ByteArray(32) { 0x05 })
-        assertTrue(adopt(b, imp.handshakePacket(caps)) is Crypto.Adopt.Refused)
-        assertEquals(1, b.hsIdChanged)
-        assertFalse(b.pinned)
+        val bb = b(); feed(bb, fresh)
+        assertEquals(1, refused(feed(bb, listOf(imp.handshakePacket(caps))))); assertEquals(1, bb.hsIdChanged)
     }
 
     @Test
-    fun tamperedHandshakeIsRefused() {
-        val bad = hex(side("a", "handshakeHex")); bad[100] = (bad[100].toInt() xor 1).toByte()
-        val c1 = b(); assertTrue(adopt(c1, bad) is Crypto.Adopt.Refused); assertEquals(1, c1.hsBadSig)
-        val badCaps = hex(side("a", "handshakeHex")); badCaps[36] = (badCaps[36].toInt() xor 1).toByte()
-        val c2 = b(); assertTrue(adopt(c2, badCaps) is Crypto.Adopt.Refused); assertEquals(1, c2.hsBadSig)
+    fun tamperingIsRefused() {
+        val fresh = a().handshakePackets(caps)
+        val bad = fresh[0].copyOf(); bad[130] = (bad[130].toInt() xor 1).toByte()
+        val f = b(); assertEquals(1, refused(feed(f, listOf(bad)))); assertEquals(1, f.hsBadSig)
+        val badHalf = fresh.map { it.copyOf() }; badHalf[1][100] = (badHalf[1][100].toInt() xor 1).toByte()
+        val h = b(); assertFalse(keyed(feed(h, badHalf))); assertEquals(1, h.hsKemHashBad); assertFalse(h.established)
+        // A tampered ciphertext fails its signature.
+        val a2 = a(); val b2 = b()
+        feed(b2, a2.handshakePackets(caps))
+        val bPk = b2.handshakePackets(caps).map { it.copyOf() }
+        bPk[3][200] = (bPk[3][200].toInt() xor 1).toByte()
+        assertFalse(keyed(feed(a2, bPk))); assertFalse(a2.established); assertEquals(1, a2.hsCtRefused)
+        // Old handshakes are refused by magic.
         val old = ByteArray(40); Wire.putU32(old, 0, Wire.HMAGIC)
-        val c3 = b(); assertTrue(adopt(c3, old) is Crypto.Adopt.Refused)
+        assertTrue(b().take(old, old.size) is Crypto.Adopt.Refused)
     }
 
     @Test
     fun nothingBeforeAKey() {
         val h = b()
-        assertNull(h.seal("x".toByteArray()))
-        assertNull(h.open(ByteArray(64)))
-        assertNull(h.safetyCode)
+        assertNull(h.seal("x".toByteArray())); assertNull(h.open(ByteArray(64))); assertNull(h.safetyCode)
     }
 
     @Test
     fun tamperedPacketFailsOpen() {
         val a = a(); val b = b()
-        adopt(b, a.handshakePacket(caps)); adopt(a, b.handshakePacket(caps))
+        feed(b, a.handshakePackets(caps)); feed(a, b.handshakePackets(caps))
         val p = a.seal("hello".toByteArray())!!
         p[p.size - 1] = (p[p.size - 1].toInt() xor 1).toByte()
-        assertNull(b.open(p))
-        assertEquals(1, b.openFails)
-        assertEquals(0, b.replayDrops)
+        assertNull(b.open(p)); assertEquals(1, b.openFails); assertEquals(0, b.replayDrops)
     }
 }

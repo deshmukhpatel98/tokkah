@@ -32,6 +32,13 @@ CODE="${VER##*-android.}"
 [ -f "$REPO/tape-app/wrangler.prod.jsonc" ] || {
   echo "FAILED: no tape-app/wrangler.prod.jsonc -- it is gitignored, so this is not the main checkout"; exit 1; }
 [ -x "$REPO/mac/tools/sign" ] || { echo "FAILED: mac/tools/sign missing -- build it from mac/tools/sign.swift"; exit 1; }
+[ -x "$REPO/mac/tools/sign2" ] || { echo "FAILED: mac/tools/sign2 missing -- build it: (cd mac/tools && swiftc -O sign2.swift -o sign2)"; exit 1; }
+# The second signer's key lives in the kin-signing keychain; unlock it the way
+# mac/release.sh does, so the signature is made without a dialog.
+: "${KIN_SIGNING_ENV:=$HOME/.config/kin-signing/env}"
+[ -f "$KIN_SIGNING_ENV" ] || { echo "FAILED: no signing identity at $KIN_SIGNING_ENV"; exit 1; }
+set -a; . "$KIN_SIGNING_ENV"; set +a
+security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_NAME" 2>/dev/null || { echo "FAILED: cannot unlock $KEYCHAIN_NAME"; exit 1; }
 [ -f "$HOME/.android/debug.keystore" ] || { echo "FAILED: no debug keystore -- every installed copy is signed with it"; exit 1; }
 
 export JAVA_HOME="${JAVA_HOME:-$HOME/android-sdk/jdk/Contents/Home}"
@@ -86,6 +93,8 @@ json.dump({"version": ver, "url": f"https://room.tokkah.com/android/dl/{apk}", "
            "size": int(size), "appName": "Kin", "notes": notes}, open(p, "w"), separators=(",", ":"))
 PY
 (cd "$REPO/mac" && ./tools/sign "$OUT/manifest.json" > "$OUT/manifest.json.sig")
+(cd "$REPO/mac" && ./tools/sign2 "$OUT/manifest.json" > "$OUT/manifest.json.sig2")
+[ -s "$OUT/manifest.json.sig2" ] || { echo "FAILED: second signature missing -- is the kin-signing keychain unlocked and sign2 built?"; exit 1; }
 echo "  signed ($(wc -c < "$OUT/manifest.json.sig" | tr -d ' ') bytes)"
 
 echo "== page =="

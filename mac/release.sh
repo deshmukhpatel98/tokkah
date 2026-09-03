@@ -328,7 +328,10 @@ mkdir -p "$OUT"
 cat > "$OUT/manifest.json" <<JSON
 {"version":"$VER","url":"https://room.tokkah.com/macos/dl/$TAR","sha256":"$SHA","size":$SIZE,"appName":"Kin","notes":"$NOTES","dmg":"https://room.tokkah.com/macos/dl/$DMG","dmgSha256":"$DMGSHA"}
 JSON
+[ -x ./tools/sign2 ] || { echo "FAILED: tools/sign2 missing -- build it: (cd tools && swiftc -O sign2.swift -o sign2)"; exit 1; }
 ./tools/sign "$OUT/manifest.json" > "$OUT/manifest.json.sig"
+./tools/sign2 "$OUT/manifest.json" > "$OUT/manifest.json.sig2"
+[ -s "$OUT/manifest.json.sig2" ] || { echo "FAILED: second signature missing -- is the kin-signing keychain unlocked and sign2 built?"; exit 1; }
 echo "  signed ($(wc -c < "$OUT/manifest.json.sig" | tr -d ' ') bytes)"
 
 # ── keep the no-JS floor honest ──────────────────────────────────────────────

@@ -661,7 +661,7 @@ class CallSession(
                 // learns our key again without waiting for us to notice.
                 if (now - lastHello > (if (crypto.established) 5000 else 300)) {
                     lastHello = now
-                    sendRaw(crypto.handshakePacket())
+                    for (p in crypto.handshakePackets()) sendRaw(p)
                     handshakesSent++
                 }
                 if (now - lastProbe > 500) {
@@ -759,28 +759,32 @@ class CallSession(
             if (locked != null && fromAddr == locked) lastFromPeerMs = System.currentTimeMillis()
             // An UNSIGNED (v1) handshake: the far end is a build from before the
             // handshake was signed. Refused and counted; never keyed.
-            if (magic == Wire.HMAGIC) { crypto.noteOldHandshake(); continue }
-            if (magic == Crypto.HS_MAGIC) {
+            if (magic == Wire.HMAGIC || magic == Crypto.HS_V2_MAGIC) { crypto.noteOldHandshake(); continue }
+            if (Crypto.isHandshake(magic)) {
                 Metrics.mark("peer_found_ms", Metrics.sinceLaunch())
-                when (val a = crypto.adoptHandshake(b, n)) {
+                when (val a = crypto.take(b, n)) {
                     is Crypto.Adopt.Adopted -> {
+                        if (magic == Crypto.HS_MAGIC) {
+                            peerCaps = crypto.peerCaps
+                            // A fresh offer is somebody ARRIVING: a call that said
+                            // "hung up" and then met a new key is live again.
+                            ended = false; left = false; holding = false; peerGone = 0
+                            if (locked == null) locked = pkt.socketAddress as InetSocketAddress
+                            // Reply with our own beat now: one round trip, not the next tick.
+                            for (p in crypto.handshakePackets()) sendRaw(p)
+                            crypto.peerIdentity?.let { onPeerIdentity?.invoke(it) }
+                        } else if (locked == null) locked = pkt.socketAddress as InetSocketAddress
+                    }
+                    is Crypto.Adopt.Keyed -> {
                         android.util.Log.i("kin", "rx: handshake -- ${crypto.summary}")
-                        peerCaps = Crypto.capsOf(b, n)
-                        // A fresh handshake is somebody ARRIVING: a call that
-                        // said "hung up" and then met a new key is live again.
-                        ended = false; left = false; holding = false; peerGone = 0
-                        // The address is adopted only from a VERIFIED handshake.
                         locked = pkt.socketAddress as InetSocketAddress
-                        sendRaw(crypto.handshakePacket())
+                        for (p in crypto.handshakePackets()) sendRaw(p)
                         Metrics.mark("connected_ms", Metrics.sinceLaunch())
-                        // Which path won the race, which is the first question
-                        // asked of any call that sounded wrong.
                         Metrics.fact("path", if (locked == relaySocketAddr()) "relay" else "direct")
-                        crypto.peerIdentity?.let { onPeerIdentity?.invoke(it) }
                         onState?.invoke("encrypted")
                     }
-                    is Crypto.Adopt.Unchanged -> { if (locked == null) locked = pkt.socketAddress as InetSocketAddress }
-                    is Crypto.Adopt.Refused -> android.util.Log.i("kin", "rx: handshake refused (${a.why}) from ${pkt.socketAddress}")
+                    is Crypto.Adopt.Unchanged -> { if (locked == null && magic == Crypto.HS_MAGIC) locked = pkt.socketAddress as InetSocketAddress }
+                    is Crypto.Adopt.Refused -> if (a.why != "unknown eph") android.util.Log.i("kin", "rx: handshake refused (${a.why}) from ${pkt.socketAddress}")
                 }
                 continue
             }

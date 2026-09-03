@@ -62,11 +62,12 @@ fun main(args: Array<String>) {
             var b = buf
             var n = pkt.length
             var magic = Wire.magic(b, n)
-            if (magic == Wire.HMAGIC) { crypto.noteOldHandshake(); println("harness: UNSIGNED handshake refused"); continue }
-            if (magic == Crypto.HS_MAGIC) {
-                if (crypto.adoptHandshake(b, n) is Crypto.Adopt.Adopted) {
-                    println("harness: peer key adopted (caps=${Crypto.capsOf(b, n)}) — ${crypto.summary}")
-                    sendTo(crypto.handshakePacket()); handshakesSent++
+            if (magic == Wire.HMAGIC || magic == Crypto.HS_V2_MAGIC) { crypto.noteOldHandshake(); println("harness: pre-v3 handshake refused"); continue }
+            if (Crypto.isHandshake(magic)) {
+                val a = crypto.take(b, n)
+                if (a is Crypto.Adopt.Adopted || a is Crypto.Adopt.Keyed) {
+                    println("harness: handshake ${if (a is Crypto.Adopt.Keyed) "KEYED" else "adopted"} — ${crypto.summary}")
+                    for (p in crypto.handshakePackets()) sendTo(p); handshakesSent++
                     lockedFrom = pkt.socketAddress as InetSocketAddress
                 }
                 continue
@@ -132,7 +133,7 @@ fun main(args: Array<String>) {
         if (peerAddrs.isNotEmpty() || lockedFrom != null) {
             if (!crypto.established && now - lastHello > 300) {
                 lastHello = now
-                sendTo(crypto.handshakePacket()); handshakesSent++
+                for (p in crypto.handshakePackets()) sendTo(p); handshakesSent++
             }
             if (now - lastProbe > 500) {
                 lastProbe = now

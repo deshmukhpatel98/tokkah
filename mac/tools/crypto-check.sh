@@ -99,7 +99,7 @@ grep -q "signed handshake" "$SP/honest.b.log" && say ok "B: $(grep -oE 'encrypte
 [ -n "$codeA" ] && [ "$codeA" = "$codeB" ] && say ok "same safety code both ends ($codeA)" || say FAIL "safety codes differ: A '$codeA' B '$codeB'"
 grep -q "first use" "$SP/honest.b.log" && say ok "B: first use (no expectation)" || say FAIL "B did not say first use"
 [ "$(beat_of "$SP/honest.b.log" crypt)" = 1 ] && say ok "beat crypt=1" || say FAIL "beat crypt=$(beat_of "$SP/honest.b.log" crypt)"
-[ "$(beat_of "$SP/honest.b.log" crypt_v)" = 2 ] && say ok "beat crypt_v=2" || say FAIL "beat crypt_v=$(beat_of "$SP/honest.b.log" crypt_v)"
+[ "$(beat_of "$SP/honest.b.log" crypt_v)" = 3 ] && say ok "beat crypt_v=3 (x25519 + ml-kem-768)" || say FAIL "beat crypt_v=$(beat_of "$SP/honest.b.log" crypt_v)"
 [ "$(beat_of "$SP/honest.b.log" crypt_pinned)" = 0 ] && say ok "beat crypt_pinned=0" || say FAIL "beat crypt_pinned=$(beat_of "$SP/honest.b.log" crypt_pinned)"
 [ "$(beat_of "$SP/honest.b.log" plaintext_rx)" = null ] && say ok "nothing arrived in the clear" || say FAIL "plaintext_rx=$(beat_of "$SP/honest.b.log" plaintext_rx)"
 [ "$(beat_of "$SP/honest.b.log" replay_drop)" = null ] && say ok "no replay drops on an honest path" || say FAIL "replay_drop=$(beat_of "$SP/honest.b.log" replay_drop) on a clean loopback"

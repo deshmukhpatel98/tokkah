@@ -37,6 +37,24 @@ class Update(
          * signature of has no update security at all.
          */
         const val PUBLIC_KEY_HEX = "d07822edb36c8692c83f3478c26683102cd3cf6fb1d0c263496404c15fd95b2a"
+        /** The SECOND signer: ECDSA P-256 (X9.63), whose private half lives only in
+         *  the release Mac's keychain, non-extractable. Both signatures are required
+         *  from 0.130 on; see mac/tools/sign2.swift. */
+        const val PUBLIC_KEY2_HEX = "046d23c6357c65f99e67ce916fb10cdeb8210f53526bf016ea9cb45aa93de1e31ab248829117052654978a2b48247316e2861a5b99fc2e77fa3187c1de1474ee3b"
+
+        /** ECDSA-SHA256 over [msg] with the X9.63 P-256 key [pubX963]; [sigDer] is DER. */
+        fun verifyP256(pubX963: ByteArray, msg: ByteArray, sigDer: ByteArray): Boolean = try {
+            val params = org.bouncycastle.crypto.ec.CustomNamedCurves.getByName("secp256r1")
+            val dp = org.bouncycastle.crypto.params.ECDomainParameters(params.curve, params.g, params.n, params.h)
+            val q = params.curve.decodePoint(pubX963)
+            val signer = org.bouncycastle.crypto.signers.ECDSASigner()
+            signer.init(false, org.bouncycastle.crypto.params.ECPublicKeyParameters(q, dp))
+            val seq = org.bouncycastle.asn1.ASN1Sequence.getInstance(sigDer)
+            val r = org.bouncycastle.asn1.ASN1Integer.getInstance(seq.getObjectAt(0)).positiveValue
+            val sv = org.bouncycastle.asn1.ASN1Integer.getInstance(seq.getObjectAt(1)).positiveValue
+            val h = java.security.MessageDigest.getInstance("SHA-256").digest(msg)
+            signer.verifySignature(h, r, sv)
+        } catch (e: Exception) { false }
     }
 
     var lastError: String? = null; private set
@@ -58,6 +76,16 @@ class Update(
             // Silent to the person, loud in the log: a manifest that does not
             // verify is not an update that failed, it is one that was never ours.
             lastError = "the manifest's signature does not verify — ignoring it"
+            return null
+        }
+        // And the second signature, from the key that cannot leave the release Mac.
+        val sig2B64 = fetch("$base/manifest.json.sig2")?.trim() ?: run {
+            lastError = "manifest.json.sig2 is missing — refusing a manifest with only one of the two signatures"
+            return null
+        }
+        val sig2 = Identity.b64d(sig2B64)
+        if (sig2.isEmpty() || !verifyP256(Crypto.hexToBytes(PUBLIC_KEY2_HEX), manifest.toByteArray(), sig2)) {
+            lastError = "the manifest's second signature does not verify — ignoring it"
             return null
         }
         fun s(k: String) = Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(manifest)?.groupValues?.get(1)

@@ -22,8 +22,8 @@ class PacketsTest {
         assertEquals(32, Wire.TPKT)
         assertEquals(40, Wire.TPKTX)
         assertEquals(48, Wire.TPKTY)
-        assertEquals(0x544B0009, com.tokkah.kin.net.Crypto.HS_MAGIC)
-        assertEquals(136, com.tokkah.kin.net.Crypto.HS_LEN)
+        assertEquals(0x544B000A, com.tokkah.kin.net.Crypto.HS_MAGIC)
+        assertEquals(168, com.tokkah.kin.net.Crypto.HS_LEN)
     }
 
     @Test
@@ -31,8 +31,8 @@ class PacketsTest {
         val c = com.tokkah.kin.net.Crypto("room-x", ByteArray(32) { 7 })
         val pkt = c.handshakePacket(Wire.CAP_PCM16 or Wire.CAP_PCM_LP)
         assertEquals(com.tokkah.kin.net.Crypto.HS_LEN, pkt.size)
-        // Little-endian magic on the wire: 09 00 4B 54.
-        assertEquals(0x09, pkt[0].toInt())
+        // Little-endian magic on the wire: 0A 00 4B 54.
+        assertEquals(0x0A, pkt[0].toInt())
         assertEquals(0x00, pkt[1].toInt())
         assertEquals(0x4B, pkt[2].toInt())
         assertEquals(0x54, pkt[3].toInt())

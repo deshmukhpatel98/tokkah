@@ -24,6 +24,17 @@ enum Update {
   /// installed by a copy of it. Still compiled in, still the default, and still
   /// the only key in play unless this run was launched with `--update-key`.
   static let publicKeyHex = "d07822edb36c8692c83f3478c26683102cd3cf6fb1d0c263496404c15fd95b2a"
+  /// THE SECOND SIGNER (0.130.0). ECDSA P-256, X9.63 public key. Its private half
+  /// lives only in the kin-signing keychain, marked non-extractable: no keychain
+  /// API can copy it off the release Mac. A manifest now needs BOTH signatures --
+  /// the Ed25519 file key alone, which anyone who copies the file holds, is no
+  /// longer enough to ship an update. Older clients ignore manifest.json.sig2, so
+  /// requiring it here strands nobody. See mac/tools/sign2.swift.
+  static let publicKey2Hex = "046d23c6357c65f99e67ce916fb10cdeb8210f53526bf016ea9cb45aa93de1e31ab248829117052654978a2b48247316e2861a5b99fc2e77fa3187c1de1474ee3b"
+  static let publicKey2: P256.Signing.PublicKey? = {
+    guard let raw = hex(publicKey2Hex) else { return nil }
+    return try? P256.Signing.PublicKey(x963Representation: raw)
+  }()
 
   /// The key THIS RUN verifies with: a self-hoster's, if they supplied one, and
   /// the shipped one otherwise.
@@ -307,6 +318,22 @@ enum Update {
       atStage("bad-signature"); Metrics.count("update_fail")
       tell("manifest signature INVALID -- ignoring",
            "an update was refused because it wasn’t signed by Kin", .act)
+      return nil
+    }
+    // ── AND THE SECOND SIGNATURE, from the key that cannot leave the release Mac ──
+    guard let sig2B64 = get("\(base)/manifest.json.sig2") else {
+      atStage("no-sig2"); Metrics.count("update_fail")
+      tell("manifest.json.sig2 is missing -- a release from before the second signer, or a half-published one; refusing",
+           "an update was refused because it carried only one of Kin's two signatures", .act)
+      return nil
+    }
+    guard let pk2 = publicKey2,
+          let sig2 = Data(base64Encoded: String(decoding: sig2B64, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)),
+          let ecdsa = try? P256.Signing.ECDSASignature(derRepresentation: sig2),
+          pk2.isValidSignature(ecdsa, for: mData) else {
+      atStage("bad-signature2"); Metrics.count("update_fail")
+      tell("manifest second signature INVALID -- ignoring",
+           "an update was refused because it wasn’t signed by Kin’s release Mac", .act)
       return nil
     }
     guard let m = try? JSONDecoder().decode(Manifest.self, from: mData) else {
@@ -768,8 +795,14 @@ enum Update {
             .trimmingCharacters(in: .whitespacesAndNewlines)),
           let pk = publicKey,
           pk.isValidSignature(sig, for: mData),
+          // The second signature is required here too: a repair is an install.
+          let sig2B64 = get("\(base)/manifest.json.sig2"),
+          let sig2 = Data(base64Encoded: String(decoding: sig2B64, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)),
+          let pk2 = publicKey2, let ecdsa = try? P256.Signing.ECDSASignature(derRepresentation: sig2),
+          pk2.isValidSignature(ecdsa, for: mData),
           let m = try? JSONDecoder().decode(Manifest.self, from: mData)
-    else { fputs("update: cannot verify manifest -- leaving the bundle alone\n", stderr); return }
+    else { fputs("update: cannot verify manifest (both signatures are required) -- leaving the bundle alone\n", stderr); return }
     // Only repair to the version this binary IS. If the manifest has moved on, the
     // normal update path will bring both halves in one step and this would be a
     // wasted download of the wrong thing.

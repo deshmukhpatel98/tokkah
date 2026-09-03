@@ -5,6 +5,50 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.130.0 / 0.130.0-android.32 — 2026-09-03
+
+### Changed — the key exchange is post-quantum, and a release needs two signatures
+
+**Hybrid key exchange: X25519 + ML-KEM-768 (FIPS 203).** A recording of a call
+made today could be opened by whoever, one day, has a quantum computer large
+enough to break the curve. The two ends now agree the call key twice, and both
+agreements would have to fall. ML-KEM is implemented in Swift on the Mac
+(`MlKem.swift`; CryptoKit has it only from macOS 26 and the floor is 14, and a
+key exchange that is post-quantum on some Macs is a downgrade waiting to be
+negotiated) and through BouncyCastle on Android. The two are held to each other:
+the same seed produces the same key, a ciphertext made on either end decapsulates
+on the other to the same secret, and the Android tests open the Mac's sealed
+packets byte for byte.
+
+The handshake is three packets, none over 1200 bytes: the signed offer (168 B,
+now carrying the hash of the ML-KEM key), the key in two halves (629 B each,
+bound by that signed hash), and the signed ciphertext (1188 B). Roles fall out of
+the ephemeral keys with no extra message. **One round trip when the lower key's
+packets land first, one and a half otherwise** -- the only latency this adds, at
+connection, never on the media path. Measured: keygen 103 µs, encapsulate 110 µs,
+decapsulate 116 µs, each once per call; seal still 0.67 µs.
+
+Incompatible on purpose, again: 0.130 refuses v2 (0.128–0.129) handshakes as
+`hs_old`. Both ends update, or neither talks. Beat: `crypt_v=3`, `crypt_pq=1`,
+`crypt_role`, `hs_kem_bad`, `hs_ct_refused`.
+
+**Two signatures on every release.** The Ed25519 release key is a file; whoever
+copies it could ship an update to every Mac and phone. A second key -- ECDSA
+P-256, created inside the kin-signing keychain and marked non-extractable, so no
+keychain API can copy it off the release Mac -- now signs every manifest too
+(`manifest.json.sig2`, `mac/tools/sign2`), and both apps require both signatures.
+Older clients ignore the second file, so nothing is stranded. The Secure Enclave
+would be stronger; a command-line tool cannot create enclave keys without an
+Apple-provisioned entitlement (measured, `errSecMissingEntitlement`), and this is
+the strongest thing a self-signed toolchain can hold. **Losing that keychain means
+enrolling a new key in a release signed by the old one first** -- back it up, and
+enroll a second Mac.
+
+Also: the kin-signing keychain had stopped accepting its recorded password (it had
+stayed unlocked since August, which masked the drift until the Mac slept). Rebuilt
+from the saved certificate as `kin-signing2`; same certificate, same designated
+requirement, no user re-prompted.
+
 ## Kin 0.129.0 — 2026-09-03
 
 ### Changed — bounds and overflow checks on, and what the fuzzers found under them

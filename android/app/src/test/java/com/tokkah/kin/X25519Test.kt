@@ -16,7 +16,7 @@ class X25519Test {
     private fun top(k: String) = Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(text)!!.groupValues[1]
     private fun side(s: String, k: String): String {
         val b = Regex("\"$s\"\\s*:\\s*\\{").find(text)!!
-        val sub = text.substring(b.range.last, minOf(text.length, b.range.last + 4000))
+        val sub = text.substring(b.range.last, minOf(text.length, b.range.last + 20000))
         return Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(sub)!!.groupValues[1]
     }
     private fun hex(s: String) = Crypto.hexToBytes(s)
@@ -54,9 +54,11 @@ class X25519Test {
         // same keys and the same safety code.
         val a = Crypto("a-room", ByteArray(32) { 1 })
         val b = Crypto("a-room", ByteArray(32) { 2 })
-        val pa = a.handshakePacket(); val pb = b.handshakePacket()
-        assertTrue(a.adoptHandshake(pb, pb.size) is Crypto.Adopt.Adopted)
-        assertTrue(b.adoptHandshake(pa, pa.size) is Crypto.Adopt.Adopted)
+        // v3: offer + key halves one way, then offer + halves + ciphertext back.
+        for (p in a.handshakePackets()) b.take(p, p.size)
+        for (p in b.handshakePackets()) a.take(p, p.size)
+        for (p in a.handshakePackets()) b.take(p, p.size)
+        assertTrue(a.established && b.established)
         assertEquals(a.safetyCode, b.safetyCode)
         val msg = "one voice at a time".toByteArray()
         assertArrayEquals(msg, b.open(a.seal(msg)!!))

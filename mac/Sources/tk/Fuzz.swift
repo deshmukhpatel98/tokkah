@@ -139,7 +139,7 @@ enum Fuzz {
 
   static func garbage(_ r: inout Rng) -> [UInt8] {
     var p = (0..<(1 + r.int(200))).map { _ in r.byte() }
-    if r.chance(50) { put32(&p, 0, [MAGIC, VMAGIC, KMAGIC, TMAGIC, SMAGIC, HMAGIC, Crypto.HS_MAGIC, 0x544B_0004, 0x544B_00FF][r.int(9)]) }
+    if r.chance(50) { put32(&p, 0, [MAGIC, VMAGIC, KMAGIC, TMAGIC, SMAGIC, HMAGIC, Crypto.HS_V2_MAGIC, Crypto.HS_MAGIC, Crypto.HSK_MAGIC, Crypto.HSC_MAGIC, 0x544B_0004, 0x544B_00FF][r.int(12)]) }
     return p
   }
 
@@ -206,7 +206,8 @@ enum Fuzz {
     let seedA = Data(repeating: 0x11, count: 32)
     let hs = Crypto(roomSalt: "fuzz-room", identitySeed: seedA)
     let hsPeer = Crypto(roomSalt: "fuzz-room", identitySeed: Data(repeating: 0x22, count: 32))
-    let goodHs = hsPeer.handshakePacket(caps: CAP_PCM16 | CAP_PCM_LP)
+    let goodSet = hsPeer.handshakePackets(caps: CAP_PCM16 | CAP_PCM_LP)   // HS3 + two halves
+    let goodHs = goodSet[0]
     let asm = VideoAssembler()
     var vseq: Int32 = 0
     var lpcOut = [Int16](repeating: 0, count: Lpc.MAXN + 8)
@@ -237,18 +238,25 @@ enum Fuzz {
           return turn.unwrap(base, bp.count, from: from) != nil
         }
         counts[got ? "unwrap-yes" : "unwrap-no", default: 0] += 1
-      case 3:  // the signed handshake, mutated from a valid one and from garbage
-        var p = r.chance(60) ? goodHs : (0..<(r.int(200))).map { _ in r.byte() }
+      case 3:  // the three handshake packets, mutated from valid ones and from garbage
+        var p = r.chance(60) ? goodSet[r.int(goodSet.count)] : (0..<(r.int(1300))).map { _ in r.byte() }
         if r.chance(80) { mutate(&p, &r) }
         let a = p.withUnsafeBufferPointer { bp -> Crypto.Adopt in
-          guard let base = bp.baseAddress else { return .refused("empty") }
-          return hs.adoptHandshake(base, bp.count)
+          guard let base = bp.baseAddress, bp.count >= 4 else { return .refused("empty") }
+          let magic = UInt32(p[0]) | UInt32(p[1]) << 8 | UInt32(p[2]) << 16 | UInt32(p[3]) << 24
+          switch magic {
+          case Crypto.HSK_MAGIC: return hs.takeKemHalf(base, bp.count)
+          case Crypto.HSC_MAGIC: return hs.takeCiphertext(base, bp.count)
+          default: return hs.adoptHandshake(base, bp.count)
+          }
         }
         switch a {
         case .adopted: counts["hs-adopted", default: 0] += 1
+        case .keyed: counts["hs-keyed", default: 0] += 1
         case .unchanged: counts["hs-same", default: 0] += 1
         case .refused: counts["hs-refused", default: 0] += 1
         }
+        _ = goodHs
       case 4:  // video reassembly with the header fields the receive loop admits
         let p = videoPacket(&r, seq: &vseq)
         guard p.count >= VHDR else { continue }

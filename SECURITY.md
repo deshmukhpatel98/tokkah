@@ -56,8 +56,9 @@ true — a security document that only lists strengths is marketing.
 **The Mac and Android apps have a different trust model and it is documented in
 the source rather than here.** Since Kin 0.128.0 / 0.128.0-android.19:
 
-- **X25519 + AES-256-GCM per packet over raw UDP, two keys (one per direction),
-  a sliding replay window** of 2048 packets. Nothing is read or written before a
+- **X25519 + ML-KEM-768 (hybrid, post-quantum) + AES-256-GCM per packet over raw
+  UDP, two keys (one per direction), a sliding replay window** of 2048 packets.
+  Both key agreements would have to fall for a recording to be opened. Nothing is read or written before a
   key exists: there is no plaintext window.
 - **The handshake is signed by each install's Ed25519 device key** -- the same
   key that already signs and verifies every ring -- over a message that names the
@@ -77,6 +78,9 @@ the source rather than here.** Since Kin 0.128.0 / 0.128.0-android.19:
   [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift); the Android port
   is [`android/app/src/main/java/com/tokkah/kin/net/Crypto.kt`](android/app/src/main/java/com/tokkah/kin/net/Crypto.kt)
   and is held to the Mac's own vectors.
+- **Every release carries two signatures** (since 0.130.0): the Ed25519 file key
+  and a P-256 key that lives non-extractably in the release Mac's keychain. Both
+  apps require both; a copied key file alone can no longer ship an update.
 - **Nothing about a call is written to disk by the HTTP layer** (since 0.129.0):
   one ephemeral session, no URL cache, no cookies. Earlier builds left room codes
   and addresses in `~/Library/Caches/com.tokkah.tk/Cache.db`; 0.129.0 deletes it.

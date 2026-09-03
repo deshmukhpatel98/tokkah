@@ -3,13 +3,10 @@ import Foundation
 
 // ── Encryption on the wire ───────────────────────────────────────────────────
 //
-// X25519 over the media socket, AES-256-GCM per packet. Measured on this machine
-// at the real packet size: **0.78 us to seal 276 bytes, worst of 300,000 at
-// 15 us, against a 1333 us audio deadline** -- 0.06% typical, 1.1% worst. So this
-// runs on the capture callback without a thread hop, and the latency cost is
-// nothing. That measurement is why CryptoKit was acceptable here despite
-// allocating: the allocator's worst case is still two orders of magnitude inside
-// the budget.
+// X25519 + ML-KEM-768 over the media socket, AES-256-GCM per packet. Measured on
+// this machine at the real packet size: **0.7 us to seal 276 bytes**, against a
+// 1333 us audio deadline. So this runs on the capture callback without a thread
+// hop, and the latency cost is nothing.
 //
 // TWO KEYS, ONE PER DIRECTION, and this is not decoration. Both ends derive the
 // same shared secret, so if both used one key and a counter starting at zero,
@@ -18,109 +15,83 @@ import Foundation
 // HKDF gives two keys from the one secret and the ends agree on who uses which by
 // comparing public keys, which needs no extra message.
 //
-// ── THE HANDSHAKE IS SIGNED (v2) ─────────────────────────────────────────────
+// ── THE HANDSHAKE IS SIGNED, AND HYBRID (v3) ─────────────────────────────────
 //
-// The first version of this file exchanged bare X25519 keys and mixed the room
-// code into the key derivation, and said plainly what that did not defeat: an
-// active man in the middle who knows the room code. That sentence understated
-// it. The room code is minted by the caller and sent to the callee THROUGH THE
-// SIGNALLING SERVER, inside the ring; the same server hands each end the other's
-// address. So the one party positioned to sit in the middle was also the one
-// party guaranteed to know the code. "End to end" with a caveat that size is
-// transport encryption to us.
+// v1 exchanged bare X25519 keys "authenticated" by the room code -- which travels
+// to the callee THROUGH the signalling server, so the one party positioned to sit
+// in the middle was the one party guaranteed to hold the secret. v2 (0.128) signed
+// the ephemeral key with each install's Ed25519 identity, the key that signs every
+// ring, and checked it against the identity this end expected. v3 (0.130) keeps
+// all of that and adds a second, post-quantum key agreement, ML-KEM-768 (FIPS
+// 203), so that a recording made today cannot be opened by a quantum computer
+// built later: BOTH X25519 and ML-KEM would have to fall.
 //
-// Every install already has an identity that outlives a call: the Ed25519 device
-// key in identity.json, the one that signs every ring and that the callee already
-// verifies before a card is shown. So the ephemeral X25519 key now travels signed
-// by it, over a message that also names the room:
+// Three packets, none over 1200 bytes (the datagram size every path carries):
 //
-//   packet:  magic(4) || eph(32) || caps(4 LE) || id(32) || sig(64)      136 bytes
-//   signed:  "kin-hs-v2|" + room + "|" || eph(32) || caps(4 LE)
+//   HS3  magic | eph(32) | caps(4) | id(32) | kemHash(32) | sig(64)          168 B
+//        sig = Ed25519(id) over "kin-hs-v3|" room "|" eph caps kemHash
+//   HSK  magic | eph(32) | half(1) | 592 bytes of the ML-KEM public key       629 B
+//        two of these carry the 1184-byte key; SHA-256 of the whole must equal
+//        the kemHash that was SIGNED in HS3, so the halves are unsigned but bound
+//   HSC  magic | eph(32) | ct(1088) | sig(64)                                1188 B
+//        sig = Ed25519(id) over "kin-hs-v3c|" room "|" ephSender ephRecipient ct
 //
-// and the receiver refuses a handshake unless ALL of these hold:
+// Roles fall out of the two ephemeral keys, with no extra message: whoever's
+// sorts lower is A and owns the ML-KEM key that gets used; the other, B,
+// encapsulates to it. Flow: both beat HS3 + HSK every 300 ms until keyed. B, on
+// holding A's verified HS3 and both halves, encapsulates, derives the call key,
+// and beats HSC (until it has opened a packet from A, which proves A has the key
+// too). A, on a verified HSC, decapsulates and derives. One round trip when A's
+// packets land first; one and a half when B's do. Nothing on the media path.
 //
-//   1. the signature verifies under the identity key carried in the packet -- so
-//      the sender holds that key AND knows this room (an attacker who does not
-//      know the room cannot even make this end adopt a key, which closes the
-//      old "anyone who can reach the port can re-key the call" denial of service);
-//   2. the identity key is the one this end EXPECTED, when it expected one: the
-//      key that signed the ring (callee side), the key the server bound the
-//      handle to at registration (caller side, carried in the ring's answer), or
-//      the key pinned in contacts.json from a previous call. A different key is
-//      refused and counted -- it is never a call;
-//   3. with no expectation (an invite link, a first call to a stranger), the
-//      first identity seen is pinned FOR THIS CALL and every later handshake must
-//      match it. Trust-on-first-use, and the safety code below is how two people
-//      check that first use. The caller of `adoptHandshake` pins it in
-//      contacts.json once the call is answered, so the second call is no longer
-//      first-use.
-//
-// The derived keys are bound to the whole transcript -- both ephemeral keys and
-// both identity keys sit in the HKDF info -- so two sessions that share a secret
-// by accident can never share a key, and a key belongs to exactly one pair of
-// identities.
-//
-// ── NO PLAINTEXT WINDOW ──────────────────────────────────────────────────────
-//
-// v1 accepted media in the clear while the handshake was outstanding, as an
-// interop choice, and counted it. That is a downgrade path: an attacker who can
-// drop 136-byte packets holds the call in plaintext for as long as they like.
-// Nothing but a handshake is read or written before a key exists now. The cost
-// is nothing: the handshake completes in one round trip during rendezvous,
-// before the first media packet would have been useful to anybody.
-//
-// ── REPLAY ───────────────────────────────────────────────────────────────────
-//
-// GCM authenticates a packet; it does not stop the same packet arriving twice.
-// A recorded second of somebody saying "yes" could be played back into the call
-// a minute later. A sliding window over the packet counter (2048 packets, about
-// 1.4 s of audio) refuses anything already seen and anything older than the
-// window. Marked AFTER the tag verifies, never before, or a stranger could poison
-// the window with garbage counters.
+// The call key is HKDF(X25519 secret || ML-KEM secret) with the whole transcript
+// -- both ephemerals, both identities, the ML-KEM key's hash and the ciphertext's
+// -- in the info, so a key belongs to exactly one exchange between exactly two
+// identities. Everything that was refused in v2 is still refused: an identity this
+// end did not expect, a second identity mid-call, an unsigned or v2 handshake
+// (counted hs_old), replays (2048-packet window), and anything before a key.
 //
 // ── WHAT THIS PROTECTS AGAINST, precisely ────────────────────────────────────
 //
-//  - a passive listener on any hop: yes, completely.
-//  - the signalling server, or anyone who compromises it: it can still see WHO
-//    calls WHOM and when (metadata); it can no longer read or alter a call, and it
-//    can no longer substitute keys without the substitution being refused
-//    (pinned/expected key) or visible (safety code, first call to a stranger).
-//  - an attacker on the path who knows the room code: same as above.
-//  - an attacker who can suppress packets: they can stop the call. They can no
-//    longer hold it in plaintext.
-//  - replay of recorded packets: refused.
-//  - a stranger reaching the port: cannot re-key, cannot inject, cannot end the
-//    call (the goodbye is inside the encryption too).
-//  - a first call between two people neither of whom has any prior knowledge of
-//    the other's key: an attacker who ALSO controls the server can substitute
-//    both identities on that one call. The safety code differs on the two screens
-//    when that happens; the call after it is pinned. This is the same residual
-//    Signal, WhatsApp and Zoom's E2EE mode carry, and the honest place to stop
-//    claiming.
+//  - a passive listener on any hop, now or with a quantum computer later: yes.
+//  - the signalling server, or anyone who compromises it: sees who calls whom;
+//    cannot read, alter, or sit inside a call between two ends that expect each
+//    other's identity -- which is every Kin-to-Kin call after the first.
+//  - a stranger reaching the port: cannot re-key, inject, or end a call.
+//  - a first call between two strangers through a server that also lies about
+//    their keys: the residual. The eight-character code differs on the two
+//    screens; the pin after the call closes it.
 final class Crypto {
-  /// The signed handshake. 0x0006 was the unsigned one and is REFUSED, counted
-  /// as `hsOld`, so a build from before this change is visible in the beat rather
-  /// than silently connecting in the clear.
-  static let HS_MAGIC: UInt32 = 0x544B_0009
-  static let HS_LEN = 4 + 32 + 4 + 32 + 64
-  static let HS_CONTEXT = "kin-hs-v2|"
+  /// v3 magics. 0x0006 (v1, unsigned) and 0x0009 (v2, classical) are REFUSED and
+  /// counted as `hsOld`, so a build from before this change is visible in the
+  /// beat rather than silently connecting.
+  static let HS_MAGIC: UInt32 = 0x544B_000A    // HS3: the signed offer
+  static let HSK_MAGIC: UInt32 = 0x544B_000B   // HSK: half of the ML-KEM public key
+  static let HSC_MAGIC: UInt32 = 0x544B_000C   // HSC: the signed ciphertext
+  static let HS_V2_MAGIC: UInt32 = 0x544B_0009
+  static let HS_LEN = 4 + 32 + 4 + 32 + 32 + 64      // 168
+  static let HSK_HALF = MlKem.PK_BYTES / 2            // 592
+  static let HSK_LEN = 4 + 32 + 1 + HSK_HALF          // 629
+  static let HSC_LEN = 4 + 32 + MlKem.CT_BYTES + 64   // 1188
+  static let HS_CONTEXT = "kin-hs-v3|"
+  static let HSC_CONTEXT = "kin-hs-v3c|"
 
   private let mine: Curve25519.KeyAgreement.PrivateKey
+  private let kem: MlKem.PrivateKey
   private let idKey: Curve25519.Signing.PrivateKey
   private let room: String
   private let salt: Data
   /// The identity this end expects on the other side, or nil for first-use.
   private let expected: Data?
+  /// Vectors only: a fixed m for the encapsulation makes the ciphertext reproducible.
+  private let fixedKemM: [UInt8]?
   private var sendKey: SymmetricKey?
   private var recvKey: SymmetricKey?
   private var sendCtr: UInt64 = 0
-  // rawSend is reached from THREE threads -- the audio capture callback, the
-  // video encoder's callback and the probe thread. A raced counter would hand two
-  // packets the same nonce, and under GCM a repeated nonce does not weaken the
-  // cipher, it forfeits it. The seal is ~0.8 us, so holding a lock across the
-  // whole thing costs about 0.6 ms per second of wall time and removes the
-  // question entirely. `open` takes the same lock: it is one thread today, and
-  // a key swap under it from a handshake must never race a packet mid-open.
+  // rawSend is reached from THREE threads. A raced counter would hand two packets
+  // the same nonce, and under GCM a repeated nonce forfeits the cipher. The seal
+  // is ~0.7 us, so one lock costs nothing. `open` and every handshake state change
+  // take the same lock.
   private let lock = NSLock()
 
   // ── replay window ──────────────────────────────────────────────────────────
@@ -128,42 +99,41 @@ final class Crypto {
   private var rxHigh: UInt64 = 0
   private var rxBits = [UInt64](repeating: 0, count: Crypto.replayWindow / 64)
 
+  // ── the peer, as far as it has proved itself ───────────────────────────────
   private(set) var established = false
-  private(set) var peerKeyHex = ""      // peer's ephemeral X25519 key
+  private(set) var peerKeyHex = ""      // peer's ephemeral X25519 key (verified HS3)
   private(set) var peerIdHex = ""       // peer's Ed25519 identity
-  /// True when the peer's identity matched a key this end already expected;
-  /// false when it was accepted on first use. A beat field, and the difference
-  /// between "verified" and "trusted for now".
+  private var peerEph = Data()
+  private var peerId = Data()
+  private var peerKemHash = Data()
+  private(set) var peerCaps: UInt32 = 0
+  private var peerKemHalves: [[UInt8]?] = [nil, nil]
+  private var peerKemPk: [UInt8]?
+  /// B's ciphertext, once made: re-sent on every beat until A proves it has the key.
+  private var myCt: [UInt8]?
+  private var iAmA = false
+  /// True when the peer's identity matched a key this end already expected.
   private(set) var pinned = false
   private(set) var sealed = 0, opened = 0, openFails = 0
   private(set) var replayDrops = 0, preKeyDrops = 0, preKeyRx = 0, plaintextRx = 0
   private(set) var hsBadSig = 0, hsWrongId = 0, hsIdChanged = 0, hsOld = 0, hsFlood = 0, hsWeak = 0
+  private(set) var hsKemHashBad = 0, hsCtRefused = 0, hsCtSeen = 0
 
   // ── a budget on signature checks ───────────────────────────────────────────
-  // A verify is ~60 us here and tens of milliseconds on a phone doing it in
-  // BigInteger. The legitimate cadence is one handshake per 300 ms, and a
-  // same-key beat costs nothing (compared before verifying). So a flood of fresh
-  // keys is the only way to make this end spend, and it is capped: 20 verifies a
-  // second, the rest counted and dropped.
   private var verifyTokens = 20.0
   private var verifyRefill = Date()
 
   var myPublic: Data { mine.publicKey.rawRepresentation }
   var myIdentity: Data { idKey.publicKey.rawRepresentation }
+  var myKemPk: [UInt8] { kem.publicKey }
   var peerIdentityB64: String? {
     guard !peerIdHex.isEmpty, let d = Crypto.hex(peerIdHex) else { return nil }
     return d.base64EncodedString()
   }
+  /// The peer has proved it holds the call key: at least one packet opened.
+  var peerConfirmed: Bool { opened > 0 }
 
   // ── THE CODE YOU READ ALOUD ─────────────────────────────────────────────────
-  //
-  // Encryption without a way to verify the other end's key is protection against
-  // a passive listener only; the only defence anybody has ever found against a
-  // machine that substitutes keys is two humans comparing a short string out loud.
-  // Hash all four public keys SORTED -- so both ends compute the same string
-  // without agreeing who is first -- and take 8 characters of 5 bits. 40 bits is
-  // not brute-forceable inside a live handshake and is short enough to say. The
-  // alphabet leaves out 0/O/1/I because this gets read down a phone line.
   static let codeAlphabet = Array("23456789ABCDEFGHJKLMNPQRSTUVWXYZ")
   var safetyCode: String? {
     guard established, !peerKeyHex.isEmpty, !peerIdHex.isEmpty else { return nil }
@@ -173,35 +143,26 @@ final class Crypto {
     return String(out.prefix(4)) + " " + String(out.suffix(4))
   }
 
-  /// `roomSalt` is the room code. `identitySeed` is this install's Ed25519 seed
-  /// (identity.json). `expectedPeer` is the 32-byte identity the other end must
-  /// present, or nil to trust the first one seen. `fixedPrivate` exists for the
-  /// vector generator only: a fixed ephemeral key makes a run reproducible.
-  init(roomSalt: String, identitySeed: Data, expectedPeer: Data? = nil, fixedPrivate: Data? = nil) {
+  init(roomSalt: String, identitySeed: Data, expectedPeer: Data? = nil,
+       fixedPrivate: Data? = nil, fixedKemSeed: [UInt8]? = nil, fixedKemM: [UInt8]? = nil) {
     room = roomSalt
-    salt = Data(("tk-v2-" + roomSalt).utf8)
-    if let f = fixedPrivate, let k = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: f) {
-      mine = k
-    } else {
-      mine = Curve25519.KeyAgreement.PrivateKey()
-    }
-    if let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: identitySeed) {
-      idKey = k
-    } else {
-      // A seed that does not parse is an identity.json that was damaged. A fresh
-      // key still gives a working, first-use call; the beat says so through
-      // `pinned == false` on a call that carried an expectation.
+    salt = Data(("tk-v3-" + roomSalt).utf8)
+    if let f = fixedPrivate, let k = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: f) { mine = k }
+    else { mine = Curve25519.KeyAgreement.PrivateKey() }
+    kem = fixedKemSeed.map { MlKem.PrivateKey(seed: $0) } ?? MlKem.PrivateKey()
+    if let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: identitySeed) { idKey = k }
+    else {
       fputs("crypto: identity seed did not parse -- this call uses a throwaway identity\n", stderr)
       idKey = Curve25519.Signing.PrivateKey()
     }
     expected = (expectedPeer?.count == 32) ? expectedPeer : nil
+    self.fixedKemM = fixedKemM
   }
 
-  // ── the handshake packet ───────────────────────────────────────────────────
+  // ── the packets this end sends ─────────────────────────────────────────────
 
   private var hsCache: (caps: UInt32, pkt: [UInt8])?
-  /// Signed once per (key, caps) and reused: the beat sends this every 300 ms
-  /// until keyed and every 5 s after, and a signature per beat would be waste.
+  /// HS3, signed once per (key, caps) and reused.
   func handshakePacket(caps: UInt32) -> [UInt8] {
     lock.lock(); defer { lock.unlock() }
     if let c = hsCache, c.caps == caps { return c.pkt }
@@ -210,21 +171,66 @@ final class Crypto {
     myPublic.copyBytes(to: &out[4], count: 32)
     out.withUnsafeMutableBytes { $0.storeBytes(of: caps.littleEndian, toByteOffset: 36, as: UInt32.self) }
     myIdentity.copyBytes(to: &out[40], count: 32)
-    let msg = Crypto.signedMessage(room: room, eph: myPublic, caps: caps)
-    if let sig = try? idKey.signature(for: msg) {
-      sig.copyBytes(to: &out[72], count: 64)
-    }
+    let kh = Crypto.kemHash(myKemPk)
+    kh.copyBytes(to: &out[72], count: 32)
+    let msg = Crypto.signedMessage(room: room, eph: myPublic, caps: caps, kemHash: kh)
+    if let sig = try? idKey.signature(for: msg) { sig.copyBytes(to: &out[104], count: 64) }
     hsCache = (caps, out)
     return out
   }
 
-  static func signedMessage(room: String, eph: Data, caps: UInt32) -> Data {
+  /// The two HSK halves, built once.
+  private lazy var kemHalves: [[UInt8]] = (0..<2).map { h in
+    var out = [UInt8](repeating: 0, count: Crypto.HSK_LEN)
+    out.withUnsafeMutableBytes { $0.storeBytes(of: Crypto.HSK_MAGIC.littleEndian, toByteOffset: 0, as: UInt32.self) }
+    myPublic.copyBytes(to: &out[4], count: 32)
+    out[36] = UInt8(h)
+    let pk = myKemPk
+    for i in 0..<Crypto.HSK_HALF { out[37 + i] = pk[h * Crypto.HSK_HALF + i] }
+    return out
+  }
+
+  private var hscCache: [UInt8]?
+  /// Everything this end should send on a handshake beat, in order: HS3, the two
+  /// key halves, and -- when this end is B and has encapsulated -- the ciphertext.
+  /// Once the peer has proved it holds the key, only HS3 (the liveness beat).
+  func handshakePackets(caps: UInt32) -> [[UInt8]] {
+    var out = [handshakePacket(caps: caps)]
+    lock.lock()
+    let done = established && opened > 0
+    let ct = myCt
+    lock.unlock()
+    if done { return out }
+    out += kemHalves
+    if let ct { out.append(hscPacket(ct)) }
+    return out
+  }
+
+  private func hscPacket(_ ct: [UInt8]) -> [UInt8] {
+    if let c = hscCache { return c }
+    var out = [UInt8](repeating: 0, count: Crypto.HSC_LEN)
+    out.withUnsafeMutableBytes { $0.storeBytes(of: Crypto.HSC_MAGIC.littleEndian, toByteOffset: 0, as: UInt32.self) }
+    myPublic.copyBytes(to: &out[4], count: 32)
+    for i in 0..<MlKem.CT_BYTES { out[36 + i] = ct[i] }
+    let msg = Crypto.ctMessage(room: room, sender: myPublic, recipient: peerEph, ct: ct)
+    if let sig = try? idKey.signature(for: msg) { sig.copyBytes(to: &out[36 + MlKem.CT_BYTES], count: 64) }
+    hscCache = out
+    return out
+  }
+
+  static func kemHash(_ pk: [UInt8]) -> Data { Data(SHA256.hash(data: Data(pk))) }
+  static func signedMessage(room: String, eph: Data, caps: UInt32, kemHash: Data) -> Data {
     var m = Data((HS_CONTEXT + room + "|").utf8)
     m.append(eph)
     withUnsafeBytes(of: caps.littleEndian) { m.append(contentsOf: $0) }
+    m.append(kemHash)
     return m
   }
-
+  static func ctMessage(room: String, sender: Data, recipient: Data, ct: [UInt8]) -> Data {
+    var m = Data((HSC_CONTEXT + room + "|").utf8)
+    m.append(sender); m.append(recipient); m.append(contentsOf: ct)
+    return m
+  }
   static func caps(of p: UnsafePointer<UInt8>, _ n: Int) -> UInt32 {
     guard n >= HS_LEN else { return 0 }
     return (p + 36).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
@@ -233,84 +239,137 @@ final class Crypto {
   enum Adopt {
     /// Same peer, same key: a keepalive beat. Nothing changed.
     case unchanged
-    /// A new verified key was adopted; the caller replies with its own handshake.
+    /// A new verified offer was adopted (the address may be adopted; reply with our beat).
     case adopted
+    /// The call key now exists on this end.
+    case keyed
     /// Refused, and already counted under the field named.
     case refused(String)
   }
 
-  /// Consider a received handshake. The signature is only checked when the key
-  /// is new to us -- a same-key beat is compared and returned without any
-  /// arithmetic -- and the rules above decide whether a new key is adopted.
+  private func spendVerify() -> Bool {
+    let now = Date()
+    verifyTokens = min(20, verifyTokens + now.timeIntervalSince(verifyRefill) * 20)
+    verifyRefill = now
+    if verifyTokens < 1 { hsFlood += 1; return false }
+    verifyTokens -= 1
+    return true
+  }
+
+  /// HS3: the signed offer. Rules 1-3 of the header.
   func adoptHandshake(_ p: UnsafePointer<UInt8>, _ n: Int) -> Adopt {
     guard n >= Crypto.HS_LEN else { return .refused("short") }
     let eph = Data(bytes: p + 4, count: 32)
     let caps = Crypto.caps(of: p, n)
     let id = Data(bytes: p + 40, count: 32)
-    let sig = Data(bytes: p + 72, count: 64)
+    let kh = Data(bytes: p + 72, count: 32)
+    let sig = Data(bytes: p + 104, count: 64)
     let ephHex = Crypto.hexString(eph), idHex = Crypto.hexString(id)
     if ephHex == peerKeyHex && idHex == peerIdHex { return .unchanged }
-
-    // The budget, before the expensive operation.
-    let now = Date()
-    verifyTokens = min(20, verifyTokens + now.timeIntervalSince(verifyRefill) * 20)
-    verifyRefill = now
-    if verifyTokens < 1 { hsFlood += 1; return .refused("flood") }
-    verifyTokens -= 1
-
-    // 1. Proof of the identity key AND of the room.
+    guard spendVerify() else { return .refused("flood") }
     guard let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: id),
-          pk.isValidSignature(sig, for: Crypto.signedMessage(room: room, eph: eph, caps: caps))
+          pk.isValidSignature(sig, for: Crypto.signedMessage(room: room, eph: eph, caps: caps, kemHash: kh))
     else { hsBadSig += 1; return .refused("bad signature") }
-    // 2. The identity we were told to expect.
     if let e = expected, e != id { hsWrongId += 1; return .refused("wrong identity") }
-    // 3. First-use pin for the call: a different identity mid-call is refused.
     if expected == nil, !peerIdHex.isEmpty, idHex != peerIdHex { hsIdChanged += 1; return .refused("identity changed") }
-    // The shared secret, refused if it is the all-zero point (a low-order public
-    // key), which would make the "secret" something anybody can compute.
+    // A low-order X25519 point yields an all-zero secret; refuse it now rather
+    // than at derivation.
     guard let ppk = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: eph),
           let secret = try? mine.sharedSecretFromKeyAgreement(with: ppk),
           secret.withUnsafeBytes({ $0.contains { $0 != 0 } })
     else { hsWeak += 1; return .refused("weak key") }
 
-    // Deterministic, symmetric, and needs no negotiation: whoever's ephemeral
-    // key sorts lower uses the "a" key to send.
-    let iAmA = myPublic.lexicographicallyPrecedes(eph)
-    let transcript = Crypto.transcript(ephA: myPublic, ephB: eph, idA: myIdentity, idB: id)
-    let ka = secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt,
-                                            sharedInfo: Data("a2b".utf8) + transcript, outputByteCount: 32)
-    let kb = secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt,
-                                            sharedInfo: Data("b2a".utf8) + transcript, outputByteCount: 32)
+    // A NEW peer offer: everything derived from the old one is gone.
     lock.lock()
-    sendKey = iAmA ? ka : kb
-    recvKey = iAmA ? kb : ka
-    sendCtr = 0
-    rxHigh = 0
-    for i in rxBits.indices { rxBits[i] = 0 }
-    peerKeyHex = ephHex
-    peerIdHex = idHex
+    peerEph = eph; peerId = id; peerKemHash = kh; peerCaps = caps
+    peerKeyHex = ephHex; peerIdHex = idHex
+    peerKemHalves = [nil, nil]; peerKemPk = nil
+    myCt = nil; hscCache = nil
+    iAmA = myPublic.lexicographicallyPrecedes(eph)
+    established = false; sendKey = nil; recvKey = nil
     pinned = expected != nil
-    established = true
     lock.unlock()
     return .adopted
   }
 
-  /// Both ephemeral keys then both identity keys, each pair sorted, so the two
-  /// ends build the same 128 bytes from opposite viewpoints.
-  static func transcript(ephA: Data, ephB: Data, idA: Data, idB: Data) -> Data {
-    let e = [ephA, ephB].sorted { $0.lexicographicallyPrecedes($1) }
-    let i = [idA, idB].sorted { $0.lexicographicallyPrecedes($1) }
-    return e[0] + e[1] + i[0] + i[1]
+  /// HSK: half of the peer's ML-KEM key. Accepted only for the eph this end has a
+  /// verified offer from, and only if the assembled key hashes to what was signed.
+  func takeKemHalf(_ p: UnsafePointer<UInt8>, _ n: Int) -> Adopt {
+    guard n >= Crypto.HSK_LEN else { return .refused("short") }
+    let eph = Data(bytes: p + 4, count: 32)
+    guard !peerEph.isEmpty, eph == peerEph else { return .refused("unknown eph") }
+    let h = Int(p[36])
+    guard h == 0 || h == 1 else { return .refused("bad half") }
+    lock.lock()
+    if peerKemPk != nil { lock.unlock(); return .unchanged }
+    peerKemHalves[h] = Array(UnsafeBufferPointer(start: p + 37, count: Crypto.HSK_HALF))
+    guard let a = peerKemHalves[0], let b = peerKemHalves[1] else { lock.unlock(); return .unchanged }
+    let pk = a + b
+    guard Crypto.kemHash(pk) == peerKemHash else {
+      peerKemHalves = [nil, nil]; hsKemHashBad += 1; lock.unlock()
+      return .refused("kem key does not match the signed hash")
+    }
+    peerKemPk = pk
+    let amA = iAmA
+    lock.unlock()
+    // B, holding A's key, encapsulates now and derives.
+    if !amA {
+      guard let enc = MlKem.encapsulate(pk, m: fixedKemM) else { hsKemHashBad += 1; return .refused("kem key invalid") }
+      lock.lock(); myCt = enc.ciphertext; hscCache = nil; lock.unlock()
+      derive(kemSecret: enc.sharedSecret, ct: enc.ciphertext)
+      return .keyed
+    }
+    return .adopted
   }
 
-  /// An unsigned (v1) handshake arrived. Refused, always; counted so the beat
-  /// can say "the other end is on an old build" rather than "never connected".
+  /// HSC: B's ciphertext for A's key. Signed by the identity that made the offer.
+  func takeCiphertext(_ p: UnsafePointer<UInt8>, _ n: Int) -> Adopt {
+    guard n >= Crypto.HSC_LEN else { return .refused("short") }
+    let sender = Data(bytes: p + 4, count: 32)
+    guard !peerEph.isEmpty, sender == peerEph else { return .refused("unknown eph") }
+    lock.lock()
+    let amA = iAmA, done = established
+    lock.unlock()
+    guard amA else { return .refused("not the decapsulator") }
+    if done { return .unchanged }
+    let ct = Array(UnsafeBufferPointer(start: p + 36, count: MlKem.CT_BYTES))
+    let sig = Data(bytes: p + 36 + MlKem.CT_BYTES, count: 64)
+    guard spendVerify() else { return .refused("flood") }
+    guard let pk = try? Curve25519.Signing.PublicKey(rawRepresentation: peerId),
+          pk.isValidSignature(sig, for: Crypto.ctMessage(room: room, sender: sender, recipient: myPublic, ct: ct))
+    else { hsCtRefused += 1; return .refused("ciphertext bad signature") }
+    hsCtSeen += 1
+    guard let ss = kem.decapsulate(ct) else { hsCtRefused += 1; return .refused("ciphertext bad length") }
+    derive(kemSecret: ss, ct: ct)
+    return .keyed
+  }
+
+  private func derive(kemSecret: [UInt8], ct: [UInt8]) {
+    guard let ppk = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerEph),
+          let secret = try? mine.sharedSecretFromKeyAgreement(with: ppk) else { return }
+    let aEph = iAmA ? myPublic : peerEph, bEph = iAmA ? peerEph : myPublic
+    let aId = iAmA ? myIdentity : peerId, bId = iAmA ? peerId : myIdentity
+    let aKemHash = iAmA ? Crypto.kemHash(myKemPk) : peerKemHash
+    let transcript = aEph + bEph + aId + bId + aKemHash + Data(SHA256.hash(data: Data(ct)))
+    var ikm = secret.withUnsafeBytes { Data($0) }
+    ikm.append(contentsOf: kemSecret)
+    let prk = HKDF<SHA256>.extract(inputKeyMaterial: SymmetricKey(data: ikm), salt: salt)
+    let ka = HKDF<SHA256>.expand(pseudoRandomKey: prk, info: Data("a2b".utf8) + transcript, outputByteCount: 32)
+    let kb = HKDF<SHA256>.expand(pseudoRandomKey: prk, info: Data("b2a".utf8) + transcript, outputByteCount: 32)
+    lock.lock()
+    sendKey = iAmA ? ka : kb
+    recvKey = iAmA ? kb : ka
+    sendCtr = 0; rxHigh = 0
+    for i in rxBits.indices { rxBits[i] = 0 }
+    established = true
+    lock.unlock()
+  }
+
+  /// A v1 or v2 handshake arrived. Refused, always; counted.
   func noteOldHandshake() { hsOld += 1 }
 
   // ── the packets ────────────────────────────────────────────────────────────
 
-  /// `counter(8) || ciphertext || tag(16)`. The counter travels because packets
-  /// are lost and reordered, so the receiver cannot infer it.
   func seal(_ p: UnsafePointer<UInt8>, _ n: Int, into out: UnsafeMutablePointer<UInt8>) -> Int? {
     lock.lock(); defer { lock.unlock() }
     guard let k = sendKey else { return nil }
@@ -335,8 +394,6 @@ final class Crypto {
     var ctr: UInt64 = 0
     withUnsafeMutableBytes(of: &ctr) { memcpy($0.baseAddress!, p, 8) }
     ctr = UInt64(littleEndian: ctr)
-    // Replay, judged before the arithmetic: a counter already seen, or one
-    // that fell out of the window, is not decrypted at all.
     guard ctr > 0 else { replayDrops += 1; return nil }
     if ctr <= rxHigh {
       let back = rxHigh - ctr
@@ -351,17 +408,10 @@ final class Crypto {
     let tag = Data(bytes: p + 8 + bodyLen, count: 16)
     guard let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ct, tag: tag),
           let pt = try? AES.GCM.open(box, using: k) else { openFails += 1; return nil }
-    // Authenticated: now, and only now, it counts as seen.
     if ctr > rxHigh {
-      // Clear every slot the window slides past. A jump wider than the window
-      // clears everything.
       let jump = ctr - rxHigh
-      if jump >= UInt64(Crypto.replayWindow) {
-        for i in rxBits.indices { rxBits[i] = 0 }
-      } else {
-        var c = rxHigh + 1
-        while c <= ctr { rxBits[Int(c >> 6) % rxBits.count] &= ~(1 << UInt64(c & 63)); c += 1 }
-      }
+      if jump >= UInt64(Crypto.replayWindow) { for i in rxBits.indices { rxBits[i] = 0 } }
+      else { var c = rxHigh + 1; while c <= ctr { rxBits[Int(c >> 6) % rxBits.count] &= ~(1 << UInt64(c & 63)); c += 1 } }
       rxHigh = ctr
     }
     rxBits[Int(ctr >> 6) % rxBits.count] |= (1 << UInt64(ctr & 63))
@@ -370,24 +420,18 @@ final class Crypto {
     return pt.count
   }
 
-  /// A recognised media magic arrived in the clear. Never dispatched; counted.
   func notePlaintextRx() { plaintextRx += 1 }
-  /// Something other than a handshake arrived before THIS end had a key. Almost
-  /// always the far end's first sealed probes, sent the moment it keyed and
-  /// before our adoption of its reply -- ciphertext, not plaintext, so it has
-  /// its own name. Dropped either way.
-  func notePreKeyRx() { preKeyRx += 1 }
-  /// Something wanted to send before a key existed. Dropped; counted.
   func notePreKeyDrop() { preKeyDrops += 1 }
+  func notePreKeyRx() { preKeyRx += 1 }
 
-  /// What the beat carries. Every refusal has its own name so the dashboard can
-  /// say WHY a call never keyed, not just that it did not.
   func beatFields(into f: inout [String: Any]) {
     f["crypt"] = established ? 1 : 0
-    f["crypt_v"] = 2
+    f["crypt_v"] = 3
+    f["crypt_pq"] = 1
     f["crypt_bad"] = openFails
     f["crypt_pinned"] = pinned ? 1 : 0
     f["crypt_expected"] = expected != nil ? 1 : 0
+    if !peerEph.isEmpty { f["crypt_role"] = iAmA ? "a" : "b" }
     if replayDrops > 0 { f["replay_drop"] = replayDrops }
     if preKeyDrops > 0 { f["prekey_drop"] = preKeyDrops }
     if preKeyRx > 0 { f["prekey_rx"] = preKeyRx }
@@ -398,19 +442,23 @@ final class Crypto {
     if hsOld > 0 { f["hs_old"] = hsOld }
     if hsFlood > 0 { f["hs_flood"] = hsFlood }
     if hsWeak > 0 { f["hs_weak"] = hsWeak }
+    if hsKemHashBad > 0 { f["hs_kem_bad"] = hsKemHashBad }
+    if hsCtRefused > 0 { f["hs_ct_refused"] = hsCtRefused }
   }
 
   var summary: String {
     if established {
-      return "encrypted (aes-256-gcm, signed handshake, peer id \(peerIdHex.prefix(8))… "
+      return "encrypted (aes-256-gcm, x25519 + ml-kem-768, signed handshake, role \(iAmA ? "A" : "B"), peer id \(peerIdHex.prefix(8))… "
         + (pinned ? "verified" : "first use") + ", code \(safetyCode ?? "-"))"
         + (replayDrops > 0 ? ", \(replayDrops) replays refused" : "")
         + (plaintextRx > 0 ? ", \(plaintextRx) plaintext refused" : "")
     }
     var why = ""
-    if hsOld > 0 { why += " -- the other end is on an old build (\(hsOld) unsigned handshakes refused)" }
+    if hsOld > 0 { why += " -- the other end is on an old build (\(hsOld) pre-v3 handshakes refused)" }
     if hsWrongId > 0 { why += " -- \(hsWrongId) handshakes from the WRONG identity refused" }
     if hsBadSig > 0 { why += " -- \(hsBadSig) handshakes with bad signatures refused" }
+    if hsKemHashBad > 0 { why += " -- \(hsKemHashBad) ML-KEM keys did not match their signed hash" }
+    if !peerEph.isEmpty { why += " -- offer verified, waiting for the \(iAmA ? "ciphertext" : "key halves")" }
     return "NO KEY YET -- nothing sent or read" + why
   }
 
@@ -429,31 +477,42 @@ final class Crypto {
   }
 
   // ── SELF-TEST, and the vectors the Android port is held to ─────────────────
-  //
-  // Validate the ruler on known answers INCLUDING inputs it must refuse. Each
-  // arm below is one of the properties the header claims; a claim without an arm
-  // here is marketing.
   static func selftest(vectorsTo path: String?) -> Bool {
     var ok = true
-    func check(_ c: Bool, _ what: String) {
-      fputs("  \(c ? "ok  " : "FAIL") \(what)\n", stderr); if !c { ok = false }
-    }
+    func check(_ c: Bool, _ what: String) { fputs("  \(c ? "ok  " : "FAIL") \(what)\n", stderr); if !c { ok = false } }
     let room = "sunset-otter-42"
     let seedA = Data(repeating: 0x11, count: 32), seedB = Data(repeating: 0x22, count: 32)
     let ephA = Data(repeating: 0x01, count: 32), ephB = Data(repeating: 0x02, count: 32)
-    func pkt(_ c: Crypto) -> [UInt8] { c.handshakePacket(caps: CAP_PCM16 | CAP_PCM_LP) }
-    func adopt(_ c: Crypto, _ p: [UInt8]) -> Adopt { p.withUnsafeBufferPointer { c.adoptHandshake($0.baseAddress!, $0.count) } }
-    func isAdopted(_ a: Adopt) -> Bool { if case .adopted = a { return true }; return false }
-    func isRefused(_ a: Adopt) -> Bool { if case .refused = a { return true }; return false }
+    let kemA = [UInt8](repeating: 0x41, count: 64), kemB = [UInt8](repeating: 0x42, count: 64)
+    let mB = [UInt8](repeating: 0x24, count: 32)
+    let caps = CAP_PCM16 | CAP_PCM_LP
+    func feed(_ c: Crypto, _ pkts: [[UInt8]]) -> [Adopt] {
+      pkts.map { p in p.withUnsafeBufferPointer { bp -> Adopt in
+        let base = bp.baseAddress!, n = bp.count
+        let magic = UInt32(p[0]) | UInt32(p[1]) << 8 | UInt32(p[2]) << 16 | UInt32(p[3]) << 24
+        switch magic {
+        case HS_MAGIC: return c.adoptHandshake(base, n)
+        case HSK_MAGIC: return c.takeKemHalf(base, n)
+        case HSC_MAGIC: return c.takeCiphertext(base, n)
+        default: return .refused("magic")
+        } } }
+    }
+    func isKeyed(_ a: [Adopt]) -> Bool { a.contains { if case .keyed = $0 { return true }; return false } }
+    func refusedCount(_ a: [Adopt]) -> Int { a.filter { if case .refused = $0 { return true }; return false }.count }
+    func mk(_ seed: Data, _ eph: Data, _ kem: [UInt8], expected: Data? = nil, m: [UInt8]? = nil) -> Crypto {
+      Crypto(roomSalt: room, identitySeed: seed, expectedPeer: expected, fixedPrivate: eph, fixedKemSeed: kem, fixedKemM: m)
+    }
 
-    // 1. Two honest ends, no expectation: both key, same code, both directions open.
-    let a = Crypto(roomSalt: room, identitySeed: seedA, fixedPrivate: ephA)
-    let b = Crypto(roomSalt: room, identitySeed: seedB, fixedPrivate: ephB)
-    check(isAdopted(adopt(b, pkt(a))) && isAdopted(adopt(a, pkt(b))), "two honest ends key")
+    // 1. A's packets land first (one round trip).
+    var a = mk(seedA, ephA, kemA), b = mk(seedB, ephB, kemB, m: mB)
+    var rb = feed(b, a.handshakePackets(caps: caps))          // B: offer + halves -> encapsulates, keyed
+    check(isKeyed(rb) && b.established, "B keys on A's offer and halves (encapsulates)")
+    var ra = feed(a, b.handshakePackets(caps: caps))          // A: B's offer, halves, ciphertext -> keyed
+    check(isKeyed(ra) && a.established, "A keys on B's ciphertext (decapsulates)")
     check(a.safetyCode != nil && a.safetyCode == b.safetyCode, "safety code agrees: \(a.safetyCode ?? "-")")
-    var sealedA: [[UInt8]] = []
-    let plains = ["hello", "a second packet, longer than the first one by a fair margin", "x"]
     var buf = [UInt8](repeating: 0, count: 512), out = [UInt8](repeating: 0, count: 512)
+    let plains = ["hello", "a second packet, longer than the first one by a fair margin", "x"]
+    var sealedA: [[UInt8]] = []
     for s in plains {
       let bytes = Array(s.utf8)
       let m = bytes.withUnsafeBufferPointer { bp in a.seal(bp.baseAddress!, bp.count, into: &buf) }!
@@ -463,105 +522,143 @@ final class Crypto {
       let n = s.withUnsafeBufferPointer { b.open($0.baseAddress!, $0.count, into: &out) }
       check(n == plains[i].utf8.count && Array(out[0..<(n ?? 0)]) == Array(plains[i].utf8), "A->B packet \(i) opens")
     }
-    // 2. Replay: the same packet again is refused; an old one inside the window
-    //    that was never seen still opens; one beyond the window does not.
-    let again = sealedA[0].withUnsafeBufferPointer { b.open($0.baseAddress!, $0.count, into: &out) }
-    check(again == nil && b.replayDrops == 1, "replayed packet refused")
-    // Seal 2100 more, deliver only the last, then try the first of them (out of window)
-    // and the second-to-last (in window, unseen).
+    let pB = "reply".withCString { b.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 5, into: &buf) }!
+    check(Array(buf[0..<pB]).withUnsafeBufferPointer { a.open($0.baseAddress!, $0.count, into: &out) } == 5, "B->A opens")
+    check(b.handshakePackets(caps: caps).count == 1, "once A has proved the key, B's beat is HS3 alone")
+    let vecA = a, vecB = b, vecSealed = sealedA
+
+    // 2. B's packets land first (one and a half round trips): B cannot key yet.
+    a = mk(seedA, ephA, kemA); b = mk(seedB, ephB, kemB, m: mB)
+    ra = feed(a, b.handshakePackets(caps: caps))
+    check(!isKeyed(ra) && !a.established, "A holds B's offer but is not keyed (no ciphertext yet)")
+    rb = feed(b, a.handshakePackets(caps: caps))
+    check(isKeyed(rb), "B keys once A's offer arrives")
+    ra = feed(a, b.handshakePackets(caps: caps))
+    check(isKeyed(ra) && a.safetyCode == b.safetyCode, "A keys on B's next beat, codes agree")
+
+    // 3. Replay.
+    let again = vecSealed[0].withUnsafeBufferPointer { vecB.open($0.baseAddress!, $0.count, into: &out) }
+    check(again == nil && vecB.replayDrops == 1, "replayed packet refused")
     var late: [[UInt8]] = []
     for _ in 0..<2100 {
-      let m = "tick".withCString { a.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 4, into: &buf) }!
+      let m = "tick".withCString { vecA.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 4, into: &buf) }!
       late.append(Array(buf[0..<m]))
     }
-    check(late.last!.withUnsafeBufferPointer { b.open($0.baseAddress!, $0.count, into: &out) } != nil, "newest packet opens")
-    check(late[late.count - 2].withUnsafeBufferPointer { b.open($0.baseAddress!, $0.count, into: &out) } != nil, "unseen packet inside the window opens")
-    check(late[0].withUnsafeBufferPointer { b.open($0.baseAddress!, $0.count, into: &out) } == nil, "packet older than the window refused")
-    // 3. The wrong room: same keys, different salt and signed message.
-    let c = Crypto(roomSalt: "another-room", identitySeed: seedB, fixedPrivate: ephB)
-    check(isRefused(adopt(c, pkt(a))) && c.hsBadSig == 1, "handshake for another room refused")
-    // 4. The wrong identity when one is expected.
-    let d = Crypto(roomSalt: room, identitySeed: seedB, expectedPeer: Data(repeating: 0x33, count: 32), fixedPrivate: ephB)
-    check(isRefused(adopt(d, pkt(a))) && d.hsWrongId == 1 && !d.established, "unexpected identity refused")
-    // 5. The right identity when one is expected: pinned.
-    let e = Crypto(roomSalt: room, identitySeed: seedB, expectedPeer: a.myIdentity, fixedPrivate: ephB)
-    check(isAdopted(adopt(e, pkt(a))) && e.pinned, "expected identity accepted and pinned")
-    // 6. First-use pin: a second identity mid-call is refused.
-    let imp = Crypto(roomSalt: room, identitySeed: Data(repeating: 0x44, count: 32), fixedPrivate: Data(repeating: 0x05, count: 32))
-    check(isRefused(adopt(b, pkt(imp))) && b.hsIdChanged == 1, "a second identity mid-call refused")
-    // 7. A same-key beat is unchanged, and costs no verify.
-    let before = b.hsBadSig + b.hsWrongId
-    if case .unchanged = adopt(b, pkt(a)) { check(before == b.hsBadSig + b.hsWrongId, "same-key beat is a no-op") } else { check(false, "same-key beat is a no-op") }
-    // 8. A tampered signature is refused; a tampered caps byte too (it is signed).
-    var bad = pkt(a); bad[100] ^= 1
-    check(isRefused(adopt(c, bad)), "tampered signature refused")
-    var badCaps = pkt(a); badCaps[36] ^= 1
-    let f = Crypto(roomSalt: room, identitySeed: seedB, fixedPrivate: ephB)
-    check(isRefused(adopt(f, badCaps)) && f.hsBadSig == 1, "tampered caps refused")
-    // 9. The low-order point is refused.
-    var weak = pkt(a)
-    for i in 4..<36 { weak[i] = 0 }
-    let g = Crypto(roomSalt: room, identitySeed: seedB, fixedPrivate: ephB)
-    check(isRefused(adopt(g, weak)), "all-zero ephemeral refused (bad signature, as it must be)")
-    // 10. Nothing seals before a key.
-    let h = Crypto(roomSalt: room, identitySeed: seedB)
-    check("x".withCString { h.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 1, into: &buf) } == nil, "no seal before a key")
+    check(late.last!.withUnsafeBufferPointer { vecB.open($0.baseAddress!, $0.count, into: &out) } != nil, "newest packet opens")
+    check(late[late.count - 2].withUnsafeBufferPointer { vecB.open($0.baseAddress!, $0.count, into: &out) } != nil, "unseen packet inside the window opens")
+    check(late[0].withUnsafeBufferPointer { vecB.open($0.baseAddress!, $0.count, into: &out) } == nil, "packet older than the window refused")
 
-    // ── THE COST, on this build, at the real packet size ─────────────────────
-    //
-    // The header's "0.78 us to seal 276 bytes" was measured once. A build flag
-    // (-O vs -Ounchecked), a CryptoKit update, or an allocator change can move
-    // it, so every self-test prints it again. Informational, never a FAIL: the
-    // deadline it is judged against (1333 us per audio packet) is the caller's.
+    // A keyed end beats HS3 alone, so arms that need the halves use a fresh,
+    // unkeyed A (same seeds, same keys) -- the first draft of this indexed
+    // vecA's one-packet beat at [1] and trapped.
+    let fresh = mk(seedA, ephA, kemA)
+    let freshSet = fresh.handshakePackets(caps: caps)   // HS3 + two halves
+
+    // 4. Wrong room, wrong identity, right identity, second identity.
+    let c = Crypto(roomSalt: "another-room", identitySeed: seedB, fixedPrivate: ephB)
+    check(refusedCount(feed(c, [freshSet[0]])) == 1 && c.hsBadSig == 1, "offer for another room refused")
+    let d = mk(seedB, ephB, kemB, expected: Data(repeating: 0x33, count: 32))
+    check(refusedCount(feed(d, freshSet)) >= 1 && d.hsWrongId == 1 && !d.established, "unexpected identity refused")
+    let e = mk(seedB, ephB, kemB, expected: fresh.myIdentity)
+    check(isKeyed(feed(e, freshSet)) && e.pinned, "expected identity accepted and pinned")
+    let imp = mk(Data(repeating: 0x44, count: 32), Data(repeating: 0x05, count: 32), kemB)
+    let bb = mk(seedB, ephB, kemB); _ = feed(bb, freshSet)
+    check(refusedCount(feed(bb, [imp.handshakePacket(caps: caps)])) == 1 && bb.hsIdChanged == 1, "a second identity mid-call refused")
+
+    // 5. Tampering: signature, caps, kem hash, a key half, the ciphertext.
+    var bad = freshSet[0]; bad[130] ^= 1
+    let f = mk(seedB, ephB, kemB); check(refusedCount(feed(f, [bad])) == 1 && f.hsBadSig == 1, "tampered signature refused")
+    var badCaps = freshSet[0]; badCaps[36] ^= 1
+    let g = mk(seedB, ephB, kemB); check(refusedCount(feed(g, [badCaps])) == 1, "tampered caps refused")
+    var badHalf = freshSet; badHalf[1][100] ^= 1
+    let h = mk(seedB, ephB, kemB)
+    let rh = feed(h, badHalf)
+    check(!isKeyed(rh) && h.hsKemHashBad == 1 && !h.established, "tampered ML-KEM key half refused (hash does not match the signed one)")
+    // A fresh A that first sees B's offer, then B's tampered ciphertext.
+    let a2 = mk(seedA, ephA, kemA); let b2 = mk(seedB, ephB, kemB, m: mB)
+    _ = feed(b2, a2.handshakePackets(caps: caps))
+    var bPk = b2.handshakePackets(caps: caps)
+    bPk[3][200] ^= 1
+    let r2 = feed(a2, bPk)
+    check(!isKeyed(r2) && !a2.established && a2.hsCtRefused == 1, "tampered ciphertext refused (signature)")
+    // The ciphertext re-signed by somebody else is refused too.
+    let b3 = mk(Data(repeating: 0x55, count: 32), ephB, kemB, m: mB)
+    _ = feed(b3, a2.handshakePackets(caps: caps))
+    let r3 = feed(a2, [b3.handshakePackets(caps: caps)[3]])
+    check(!isKeyed(r3) && !a2.established, "ciphertext signed by a different identity refused")
+    // 6. Nothing seals before a key; a same-key beat is a no-op.
+    let hh = mk(seedB, ephB, kemB)
+    check("x".withCString { hh.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 1, into: &buf) } == nil, "no seal before a key")
+    let before = vecB.hsBadSig + vecB.hsWrongId
+    if case .unchanged = feed(vecB, [vecA.handshakePacket(caps: caps)])[0] { check(before == vecB.hsBadSig + vecB.hsWrongId, "same-key beat is a no-op") }
+    else { check(false, "same-key beat is a no-op") }
+    check(vecA.handshakePackets(caps: caps).count == 1 && vecB.handshakePackets(caps: caps).count == 1, "keyed ends beat HS3 only")
+
+    // ── ML-KEM-768 on its own ────────────────────────────────────────────────
+    let kseed = [UInt8](repeating: 0x42, count: 64)
+    let kk = MlKem.PrivateKey(seed: kseed)
+    check(kk.publicKey.count == MlKem.PK_BYTES, "ml-kem ek is \(kk.publicKey.count) B")
+    let fixedM = [UInt8](repeating: 0x24, count: 32)
+    let ke = MlKem.encapsulate(kk.publicKey, m: fixedM)!
+    check(ke.ciphertext.count == MlKem.CT_BYTES, "ml-kem ct is \(ke.ciphertext.count) B")
+    check(kk.decapsulate(ke.ciphertext) == ke.sharedSecret, "ml-kem decaps agrees with encaps")
+    var badCt = ke.ciphertext; badCt[100] ^= 1
+    let kbad = kk.decapsulate(badCt)
+    check(kbad != nil && kbad != ke.sharedSecret, "ml-kem tampered ct gives an implicit-rejection secret, never a failure")
+    check(MlKem.encapsulate([UInt8](repeating: 0xff, count: MlKem.PK_BYTES)) == nil, "ml-kem refuses an ek that fails the modulus check")
     do {
+      var tg = [Double](), te = [Double](), td = [Double]()
+      for _ in 0..<50 {
+        let t0 = Clock.now(); let k = MlKem.PrivateKey(); let t1 = Clock.now()
+        let en = MlKem.encapsulate(k.publicKey)!; let t2 = Clock.now()
+        _ = k.decapsulate(en.ciphertext); let t3 = Clock.now()
+        tg.append(Double(Clock.ns(t1 - t0)) / 1000); te.append(Double(Clock.ns(t2 - t1)) / 1000); td.append(Double(Clock.ns(t3 - t2)) / 1000)
+      }
+      tg.sort(); te.sort(); td.sort()
+      fputs(String(format: "  ml-kem-768 x 50: keygen p50 %.0f us  encaps p50 %.0f us  decaps p50 %.0f us  (max %.0f/%.0f/%.0f)\n",
+                   tg[25], te[25], td[25], tg[49], te[49], td[49]), stderr)
       var pkt = [UInt8](repeating: 0x5a, count: 276), o = [UInt8](repeating: 0, count: 400)
       var samples = [Double](repeating: 0, count: 300_000)
       for i in samples.indices {
         let t0 = Clock.now()
-        _ = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }
+        _ = pkt.withUnsafeBufferPointer { vecA.seal($0.baseAddress!, 276, into: &o) }
         samples[i] = Double(Clock.ns(Clock.now() - t0)) / 1000
       }
       samples.sort()
-      fputs(String(format: "  seal 276 B x 300k: p50 %.2f us  p99 %.2f us  max %.1f us\n",
-                   samples[150_000], samples[297_000], samples[299_999]), stderr)
-      var oo = [UInt8](repeating: 0, count: 400)
-      let m = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }!
-      var os = [Double](repeating: 0, count: 100_000)
-      for i in os.indices {
-        // Fresh counter each time so the replay window does not refuse it.
-        let mm = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }!
-        let t0 = Clock.now()
-        _ = o.withUnsafeBufferPointer { b.open($0.baseAddress!, mm, into: &oo) }
-        os[i] = Double(Clock.ns(Clock.now() - t0)) / 1000
-      }
-      _ = m
-      os.sort()
-      fputs(String(format: "  open 276 B x 100k: p50 %.2f us  p99 %.2f us  max %.1f us\n",
-                   os[50_000], os[99_000], os[99_999]), stderr)
+      fputs(String(format: "  seal 276 B x 300k: p50 %.2f us  p99 %.2f us  max %.1f us\n", samples[150_000], samples[297_000], samples[299_999]), stderr)
+      _ = pkt
     }
 
     if let path {
       // Vectors for the Android port. Ed25519 in CryptoKit is randomised, so the
-      // handshake packets are not byte-exact between runs -- the port VERIFIES
-      // them -- but the derived keys are, so the sealed packets are.
+      // signed packets are VERIFIED there rather than compared; the ML-KEM
+      // encapsulation uses a fixed m, so the ciphertext, the transcript and every
+      // sealed packet are byte-exact.
+      let hexs: ([UInt8]) -> String = { $0.map { String(format: "%02x", $0) }.joined() }
       let shared: String = {
-        guard let pk = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: b.myPublic),
-              let s = try? a.mine.sharedSecretFromKeyAgreement(with: pk) else { return "" }
+        guard let pk = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: vecB.myPublic),
+              let s = try? vecA.mine.sharedSecretFromKeyAgreement(with: pk) else { return "" }
         return s.withUnsafeBytes { Data($0) }.map { String(format: "%02x", $0) }.joined()
       }()
+      let aPk = vecA.handshakePackets(caps: caps)   // keyed: HS3 only -- rebuild the full set from a fresh A
+      let fa = mk(seedA, ephA, kemA), fb = mk(seedB, ephB, kemB, m: mB)
+      _ = feed(fb, fa.handshakePackets(caps: caps))
       let v: [String: Any] = [
-        "room": room,
+        "room": room, "version": 3,
         "sharedSecretHex": shared,
-        "a": ["idSeedHex": hexString(seedA), "privHex": hexString(ephA),
-              "pubHex": hexString(a.myPublic), "idPubHex": hexString(a.myIdentity),
-              "handshakeHex": pkt(a).map { String(format: "%02x", $0) }.joined()],
-        "b": ["idSeedHex": hexString(seedB), "privHex": hexString(ephB),
-              "pubHex": hexString(b.myPublic), "idPubHex": hexString(b.myIdentity),
-              "handshakeHex": pkt(b).map { String(format: "%02x", $0) }.joined()],
-        "safetyCode": a.safetyCode ?? "",
+        "a": ["idSeedHex": hexString(seedA), "privHex": hexString(ephA), "kemSeedHex": hexs(kemA),
+              "pubHex": hexString(vecA.myPublic), "idPubHex": hexString(vecA.myIdentity), "kemPkHex": hexs(vecA.myKemPk),
+              "packetsHex": fa.handshakePackets(caps: caps).map(hexs)],
+        "b": ["idSeedHex": hexString(seedB), "privHex": hexString(ephB), "kemSeedHex": hexs(kemB), "kemMHex": hexs(mB),
+              "pubHex": hexString(vecB.myPublic), "idPubHex": hexString(vecB.myIdentity),
+              "packetsHex": fb.handshakePackets(caps: caps).map(hexs)],
+        "safetyCode": vecA.safetyCode ?? "",
         "plaintexts": plains,
-        "aToB": sealedA.map { $0.map { String(format: "%02x", $0) }.joined() },
+        "aToB": vecSealed.map(hexs),
+        "mlkem": ["seedHex": hexs(kseed), "ekHex": hexs(kk.publicKey), "mHex": hexs(fixedM),
+                  "ctHex": hexs(ke.ciphertext), "ssHex": hexs(ke.sharedSecret)],
       ]
+      _ = aPk
       if let d = try? JSONSerialization.data(withJSONObject: v, options: [.prettyPrinted, .sortedKeys]) {
         do { try d.write(to: URL(fileURLWithPath: path)); fputs("  vectors -> \(path)\n", stderr) }
         catch { fputs("  FAIL could not write \(path): \(error)\n", stderr); ok = false }

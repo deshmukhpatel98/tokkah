@@ -7,58 +7,60 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Port of mac/Sources/tk/Crypto.swift, v2 — the SIGNED handshake.
+ * Port of mac/Sources/tk/Crypto.swift, v3 — the SIGNED, HYBRID handshake.
  *
- * X25519 + HKDF-SHA256 + AES-256-GCM, two directional keys, packet =
- * counter(8 LE) || ciphertext || tag(16). Bit-exact with the Mac end: the
- * vectors in /vectors/crypto.json are the Mac's own sealed packets.
+ * X25519 + ML-KEM-768 (FIPS 203, BouncyCastle) agree the call key; AES-256-GCM
+ * per packet, two directional keys, a 2048-packet replay window. Bit-exact with
+ * the Mac end: /vectors/crypto.json holds the Mac's packets and sealed bytes.
  *
- * What changed from v1, and why (the long version is at the top of the Swift):
+ * Three handshake packets, all under 1200 bytes:
  *
- *  - the ephemeral X25519 key travels SIGNED by this phone's Ed25519 identity
- *    (identity.json), over a message that names the room. A stranger who does
- *    not know the room cannot make this end adopt a key; the signalling server,
- *    which does know the room, can no longer substitute one without presenting
- *    an identity — and the identity is checked against the one this end EXPECTS
- *    (the key that signed the ring, the key the server bound the handle to, or
- *    the key pinned from a previous call), or pinned on first use for the call;
- *  - both ephemeral and both identity keys are in the HKDF info, so a key
- *    belongs to exactly one transcript;
- *  - there is no plaintext window: nothing is read or written before a key;
- *  - a sliding window over the counter refuses replayed packets.
+ *   HS3  magic | eph(32) | caps(4) | id(32) | kemHash(32) | sig(64)         168 B
+ *   HSK  magic | eph(32) | half(1) | 592 B of the ML-KEM public key           629 B
+ *   HSC  magic | eph(32) | ct(1088) | sig(64)                                1188 B
  *
- *   packet:  magic(4) || eph(32) || caps(4 LE) || id(32) || sig(64)      136 bytes
- *   signed:  "kin-hs-v2|" + room + "|" || eph(32) || caps(4 LE)
+ * Whoever's ephemeral key sorts lower is A and owns the ML-KEM key that gets
+ * used; B encapsulates to it and sends HSC. The call key is
+ * HKDF(x25519 || kemSecret) over the whole transcript. See the Swift header for
+ * the threat model, which is unchanged from v2 except that a recording can no
+ * longer be opened by a quantum computer built later.
  */
 class Crypto(
     private val room: String,
-    /** This install's Ed25519 seed (identity.json). */
     identitySeed: ByteArray,
-    /** The 32-byte identity the other end must present, or null for first use. */
     expectedPeer: ByteArray? = null,
-    /** Vector generation only: a fixed ephemeral key makes a run reproducible. */
     fixedPrivateRaw: ByteArray? = null,
+    fixedKemSeed: ByteArray? = null,
+    /** Vectors only: a fixed m makes B's ciphertext reproducible. */
+    private val fixedKemM: ByteArray? = null,
 ) {
-    private val salt = ("tk-v2-$room").toByteArray()
+    private val salt = ("tk-v3-$room").toByteArray()
     private val idSeed: ByteArray = identitySeed.copyOf()
     private val expected: ByteArray? = expectedPeer?.takeIf { it.size == 32 }?.copyOf()
-    /** The private scalar, raw. Proven against the CryptoKit vectors. */
     private val privRaw: ByteArray
     val myPublic: ByteArray
     val myIdentity: ByteArray
+    private val kem: MlKem
+    val myKemPk: ByteArray get() = kem.publicKey
     private var sendKey: ByteArray? = null
     private var recvKey: ByteArray? = null
     private var sendCtr = 0L
     private val lock = Object()
 
-    // ── replay window ─────────────────────────────────────────────────────
     private var rxHigh = 0L
     private val rxBits = LongArray(REPLAY_WINDOW / 64)
 
     @Volatile var established = false; private set
     var peerKeyHex = ""; private set
     var peerIdHex = ""; private set
-    /** The peer's identity matched a key this end already expected. */
+    var peerCaps = 0; private set
+    private var peerEph = ByteArray(0)
+    private var peerId = ByteArray(0)
+    private var peerKemHash = ByteArray(0)
+    private val peerKemHalves = arrayOfNulls<ByteArray>(2)
+    private var peerKemPk: ByteArray? = null
+    private var myCt: ByteArray? = null
+    private var iAmA = false
     var pinned = false; private set
     var sealed = 0; private set
     var opened = 0; private set
@@ -73,11 +75,9 @@ class Crypto(
     var hsOld = 0; private set
     var hsFlood = 0; private set
     var hsWeak = 0; private set
+    var hsKemHashBad = 0; private set
+    var hsCtRefused = 0; private set
 
-    // A budget on signature checks: 20 a second. The legitimate cadence is one
-    // handshake per 300 ms and a same-key beat is compared before any arithmetic,
-    // so only a flood of fresh keys can spend this, and on a phone verifying in
-    // BigInteger a verify is tens of milliseconds on the receive thread.
     private var verifyTokens = 20.0
     private var verifyRefill = System.nanoTime()
 
@@ -85,21 +85,15 @@ class Crypto(
     val peerIdentity: ByteArray? get() = if (peerIdHex.isEmpty()) null else hexToBytes(peerIdHex)
 
     init {
-        privRaw = fixedPrivateRaw?.copyOf()
-            ?: ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        privRaw = fixedPrivateRaw?.copyOf() ?: ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
         myPublic = X25519.publicFromPrivate(privRaw)
         myIdentity = Ed25519.publicFromSeed(idSeed)
+        kem = if (fixedKemSeed != null) MlKem.fromSeed(fixedKemSeed) else MlKem.generate()
     }
 
-    /** X25519(mine, peer), constant-time, one implementation on every phone. */
-    private fun agree(peerRaw: ByteArray): ByteArray? =
-        try { X25519.sharedSecret(privRaw, peerRaw) } catch (e: Exception) { null }
-
-    // ── the handshake packet ──────────────────────────────────────────────
+    // ── the packets this end sends ────────────────────────────────────────
 
     private var hsCache: Pair<Int, ByteArray>? = null
-
-    /** Signed once per (key, caps) and reused; a beat is a 136-byte copy. */
     fun handshakePacket(caps: Int = Wire.CAP_PCM16 or Wire.CAP_PCM_LP): ByteArray = synchronized(lock) {
         hsCache?.takeIf { it.first == caps }?.let { return it.second }
         val out = ByteArray(HS_LEN)
@@ -107,70 +101,167 @@ class Crypto(
         System.arraycopy(myPublic, 0, out, 4, 32)
         Wire.putU32(out, 36, caps)
         System.arraycopy(myIdentity, 0, out, 40, 32)
-        val sig = Ed25519.sign(idSeed, signedMessage(room, myPublic, caps))
-        System.arraycopy(sig, 0, out, 72, 64)
+        val kh = kemHash(myKemPk)
+        System.arraycopy(kh, 0, out, 72, 32)
+        val sig = Ed25519.sign(idSeed, signedMessage(room, myPublic, caps, kh))
+        System.arraycopy(sig, 0, out, 104, 64)
         hsCache = caps to out
         out
+    }
+
+    private val kemHalves: List<ByteArray> by lazy {
+        (0 until 2).map { h ->
+            val out = ByteArray(HSK_LEN)
+            Wire.putU32(out, 0, HSK_MAGIC)
+            System.arraycopy(myPublic, 0, out, 4, 32)
+            out[36] = h.toByte()
+            System.arraycopy(myKemPk, h * HSK_HALF, out, 37, HSK_HALF)
+            out
+        }
+    }
+
+    private var hscCache: ByteArray? = null
+    /** HS3, then (while unkeyed or unconfirmed) the two halves and, for B, the ciphertext. */
+    fun handshakePackets(caps: Int = Wire.CAP_PCM16 or Wire.CAP_PCM_LP): List<ByteArray> {
+        val out = mutableListOf(handshakePacket(caps))
+        val done: Boolean; val ct: ByteArray?
+        synchronized(lock) { done = established && opened > 0; ct = myCt }
+        if (done) return out
+        out.addAll(kemHalves)
+        if (ct != null) out.add(hscPacket(ct))
+        return out
+    }
+
+    private fun hscPacket(ct: ByteArray): ByteArray {
+        hscCache?.let { return it }
+        val out = ByteArray(HSC_LEN)
+        Wire.putU32(out, 0, HSC_MAGIC)
+        System.arraycopy(myPublic, 0, out, 4, 32)
+        System.arraycopy(ct, 0, out, 36, MlKem.CT_BYTES)
+        val sig = Ed25519.sign(idSeed, ctMessage(room, myPublic, peerEph, ct))
+        System.arraycopy(sig, 0, out, 36 + MlKem.CT_BYTES, 64)
+        hscCache = out
+        return out
     }
 
     sealed class Adopt {
         object Unchanged : Adopt()
         object Adopted : Adopt()
+        object Keyed : Adopt()
         class Refused(val why: String) : Adopt()
     }
 
-    /**
-     * Consider a received handshake. The signature is only checked when the key
-     * is new to us; a same-key beat is compared and returned without arithmetic.
-     */
+    private fun spendVerify(): Boolean {
+        val now = System.nanoTime()
+        verifyTokens = minOf(20.0, verifyTokens + (now - verifyRefill) / 1e9 * 20)
+        verifyRefill = now
+        if (verifyTokens < 1) { hsFlood++; return false }
+        verifyTokens -= 1
+        return true
+    }
+
+    /** Any of the three handshake packets, by magic. */
+    fun take(b: ByteArray, n: Int): Adopt = when (Wire.magic(b, n)) {
+        HS_MAGIC -> adoptHandshake(b, n)
+        HSK_MAGIC -> takeKemHalf(b, n)
+        HSC_MAGIC -> takeCiphertext(b, n)
+        else -> Adopt.Refused("magic")
+    }
+
     fun adoptHandshake(b: ByteArray, n: Int): Adopt {
         if (n < HS_LEN || Wire.u32(b, 0) != HS_MAGIC) return Adopt.Refused("short")
         val eph = b.copyOfRange(4, 36)
         val caps = Wire.u32(b, 36)
         val id = b.copyOfRange(40, 72)
-        val sig = b.copyOfRange(72, 136)
+        val kh = b.copyOfRange(72, 104)
+        val sig = b.copyOfRange(104, 168)
         val ephHex = hex(eph); val idHex = hex(id)
         if (ephHex == peerKeyHex && idHex == peerIdHex) return Adopt.Unchanged
-
-        val now = System.nanoTime()
-        verifyTokens = minOf(20.0, verifyTokens + (now - verifyRefill) / 1e9 * 20)
-        verifyRefill = now
-        if (verifyTokens < 1) { hsFlood++; return Adopt.Refused("flood") }
-        verifyTokens -= 1
-
-        // 1. Proof of the identity key AND of the room.
-        if (!Ed25519.verify(id, signedMessage(room, eph, caps), sig)) { hsBadSig++; return Adopt.Refused("bad signature") }
-        // 2. The identity we were told to expect.
+        if (!spendVerify()) return Adopt.Refused("flood")
+        if (!Ed25519.verify(id, signedMessage(room, eph, caps, kh), sig)) { hsBadSig++; return Adopt.Refused("bad signature") }
         if (expected != null && !expected.contentEquals(id)) { hsWrongId++; return Adopt.Refused("wrong identity") }
-        // 3. First-use pin for the call.
         if (expected == null && peerIdHex.isNotEmpty() && idHex != peerIdHex) { hsIdChanged++; return Adopt.Refused("identity changed") }
-        val secret = agree(eph)
+        val secret = try { X25519.sharedSecret(privRaw, eph) } catch (e: Exception) { null }
         if (secret == null || secret.all { it == 0.toByte() }) { hsWeak++; return Adopt.Refused("weak key") }
-
-        val iAmA = lexicographicallyPrecedes(myPublic, eph)
-        val transcript = transcript(myPublic, eph, myIdentity, id)
-        val ka2b = hkdfSha256(secret, salt, "a2b".toByteArray() + transcript, 32)
-        val kb2a = hkdfSha256(secret, salt, "b2a".toByteArray() + transcript, 32)
         synchronized(lock) {
-            sendKey = if (iAmA) ka2b else kb2a
-            recvKey = if (iAmA) kb2a else ka2b
-            sendCtr = 0
-            rxHigh = 0
-            rxBits.fill(0)
-            peerKeyHex = ephHex
-            peerIdHex = idHex
+            peerEph = eph; peerId = id; peerKemHash = kh; peerCaps = caps
+            peerKeyHex = ephHex; peerIdHex = idHex
+            peerKemHalves[0] = null; peerKemHalves[1] = null; peerKemPk = null
+            myCt = null; hscCache = null
+            iAmA = lexicographicallyPrecedes(myPublic, eph)
+            established = false; sendKey = null; recvKey = null
             pinned = expected != null
-            established = true
         }
         return Adopt.Adopted
     }
 
-    /** An unsigned (v1) handshake arrived: refused, always; counted. */
+    fun takeKemHalf(b: ByteArray, n: Int): Adopt {
+        if (n < HSK_LEN || Wire.u32(b, 0) != HSK_MAGIC) return Adopt.Refused("short")
+        val eph = b.copyOfRange(4, 36)
+        if (peerEph.isEmpty() || !eph.contentEquals(peerEph)) return Adopt.Refused("unknown eph")
+        val h = b[36].toInt()
+        if (h != 0 && h != 1) return Adopt.Refused("bad half")
+        val pk: ByteArray; val amA: Boolean
+        synchronized(lock) {
+            if (peerKemPk != null) return Adopt.Unchanged
+            peerKemHalves[h] = b.copyOfRange(37, 37 + HSK_HALF)
+            val a = peerKemHalves[0] ?: return Adopt.Unchanged
+            val c = peerKemHalves[1] ?: return Adopt.Unchanged
+            pk = a + c
+            if (!kemHash(pk).contentEquals(peerKemHash)) {
+                peerKemHalves[0] = null; peerKemHalves[1] = null; hsKemHashBad++
+                return Adopt.Refused("kem key does not match the signed hash")
+            }
+            peerKemPk = pk; amA = iAmA
+        }
+        if (!amA) {
+            val enc = (if (fixedKemM != null) MlKem.encapsulateWith(pk, fixedKemM) else MlKem.encapsulate(pk))
+                ?: run { hsKemHashBad++; return Adopt.Refused("kem key invalid") }
+            synchronized(lock) { myCt = enc.ciphertext; hscCache = null }
+            derive(enc.sharedSecret, enc.ciphertext)
+            return Adopt.Keyed
+        }
+        return Adopt.Adopted
+    }
+
+    fun takeCiphertext(b: ByteArray, n: Int): Adopt {
+        if (n < HSC_LEN || Wire.u32(b, 0) != HSC_MAGIC) return Adopt.Refused("short")
+        val sender = b.copyOfRange(4, 36)
+        if (peerEph.isEmpty() || !sender.contentEquals(peerEph)) return Adopt.Refused("unknown eph")
+        val amA: Boolean; val done: Boolean
+        synchronized(lock) { amA = iAmA; done = established }
+        if (!amA) return Adopt.Refused("not the decapsulator")
+        if (done) return Adopt.Unchanged
+        val ct = b.copyOfRange(36, 36 + MlKem.CT_BYTES)
+        val sig = b.copyOfRange(36 + MlKem.CT_BYTES, 36 + MlKem.CT_BYTES + 64)
+        if (!spendVerify()) return Adopt.Refused("flood")
+        if (!Ed25519.verify(peerId, ctMessage(room, sender, myPublic, ct), sig)) { hsCtRefused++; return Adopt.Refused("ciphertext bad signature") }
+        val ss = kem.decapsulate(ct) ?: run { hsCtRefused++; return Adopt.Refused("ciphertext bad length") }
+        derive(ss, ct)
+        return Adopt.Keyed
+    }
+
+    private fun derive(kemSecret: ByteArray, ct: ByteArray) {
+        val secret = X25519.sharedSecret(privRaw, peerEph)
+        val aEph = if (iAmA) myPublic else peerEph; val bEph = if (iAmA) peerEph else myPublic
+        val aId = if (iAmA) myIdentity else peerId; val bId = if (iAmA) peerId else myIdentity
+        val aKemHash = if (iAmA) kemHash(myKemPk) else peerKemHash
+        val transcript = aEph + bEph + aId + bId + aKemHash + sha256(ct)
+        val ikm = secret + kemSecret
+        val ka2b = hkdfSha256(ikm, salt, "a2b".toByteArray() + transcript, 32)
+        val kb2a = hkdfSha256(ikm, salt, "b2a".toByteArray() + transcript, 32)
+        synchronized(lock) {
+            sendKey = if (iAmA) ka2b else kb2a
+            recvKey = if (iAmA) kb2a else ka2b
+            sendCtr = 0; rxHigh = 0; rxBits.fill(0)
+            established = true
+        }
+    }
+
     fun noteOldHandshake() { hsOld++ }
 
     // ── the packets ───────────────────────────────────────────────────────
 
-    /** counter(8 LE) || ciphertext || tag(16), or null before the handshake. */
     fun seal(plain: ByteArray, n: Int = plain.size): ByteArray? = synchronized(lock) {
         val k = sendKey ?: return null
         sendCtr += 1
@@ -187,13 +278,11 @@ class Crypto(
         return out
     }
 
-    /** Opens a sealed packet; null on failure, on replay, or before a key. */
     fun open(packet: ByteArray, n: Int = packet.size): ByteArray? = synchronized(lock) {
         val k = recvKey ?: return null
         if (n <= 8 + 16) return null
         var ctr = 0L
         for (i in 0 until 8) ctr = ctr or ((packet[i].toLong() and 0xff) shl (8 * i))
-        // Replay, judged before the arithmetic. Counters are compared unsigned.
         if (ctr == 0L) { replayDrops++; return null }
         if (java.lang.Long.compareUnsigned(ctr, rxHigh) <= 0) {
             val back = rxHigh - ctr
@@ -206,11 +295,7 @@ class Crypto(
             val c = Cipher.getInstance("AES/GCM/NoPadding")
             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), GCMParameterSpec(128, nonce))
             c.doFinal(packet, 8, n - 8)
-        } catch (e: Exception) {
-            openFails++
-            return null
-        }
-        // Authenticated: now, and only now, it counts as seen.
+        } catch (e: Exception) { openFails++; return null }
         if (java.lang.Long.compareUnsigned(ctr, rxHigh) > 0) {
             val jump = ctr - rxHigh
             if (java.lang.Long.compareUnsigned(jump, REPLAY_WINDOW.toLong()) >= 0) rxBits.fill(0)
@@ -239,17 +324,16 @@ class Crypto(
 
     fun notePlaintextRx() { plaintextRx++ }
     fun notePreKeyDrop() { preKeyDrops++ }
-    /** Not a handshake, and this end has no key yet: the far end's first sealed
-     *  probes, usually. Ciphertext, not plaintext -- its own name. */
     fun notePreKeyRx() { preKeyRx++ }
 
-    /** What the beat carries: every refusal has its own name. */
     fun beatFields(f: MutableMap<String, Any?>) {
         f["crypt"] = if (established) 1 else 0
-        f["crypt_v"] = 2
+        f["crypt_v"] = 3
+        f["crypt_pq"] = 1
         f["crypt_bad"] = openFails
         f["crypt_pinned"] = if (pinned) 1 else 0
         f["crypt_expected"] = if (expected != null) 1 else 0
+        if (peerEph.isNotEmpty()) f["crypt_role"] = if (iAmA) "a" else "b"
         f["sealed"] = sealed; f["opened"] = opened
         if (replayDrops > 0) f["replay_drop"] = replayDrops
         if (preKeyDrops > 0) f["prekey_drop"] = preKeyDrops
@@ -261,47 +345,49 @@ class Crypto(
         if (hsOld > 0) f["hs_old"] = hsOld
         if (hsFlood > 0) f["hs_flood"] = hsFlood
         if (hsWeak > 0) f["hs_weak"] = hsWeak
+        if (hsKemHashBad > 0) f["hs_kem_bad"] = hsKemHashBad
+        if (hsCtRefused > 0) f["hs_ct_refused"] = hsCtRefused
     }
 
     val summary: String
         get() = if (established)
-            "encrypted (aes-256-gcm, signed handshake, peer id ${peerIdHex.take(8)}… " +
+            "encrypted (aes-256-gcm, x25519 + ml-kem-768, signed handshake, role ${if (iAmA) "A" else "B"}, peer id ${peerIdHex.take(8)}… " +
                 (if (pinned) "verified" else "first use") + ", code ${safetyCode ?: "-"})"
         else "NO KEY YET" +
-            (if (hsOld > 0) " -- the other end is on an old build ($hsOld unsigned handshakes refused)" else "") +
+            (if (hsOld > 0) " -- the other end is on an old build ($hsOld pre-v3 handshakes refused)" else "") +
             (if (hsWrongId > 0) " -- $hsWrongId handshakes from the WRONG identity refused" else "") +
             (if (hsBadSig > 0) " -- $hsBadSig bad signatures refused" else "")
 
     companion object {
-        /** The signed handshake. 0x544B0006 (unsigned) is refused and counted. */
-        const val HS_MAGIC = 0x544B_0009
-        const val HS_LEN = 4 + 32 + 4 + 32 + 64
-        const val HS_CONTEXT = "kin-hs-v2|"
+        const val HS_MAGIC = 0x544B_000A
+        const val HSK_MAGIC = 0x544B_000B
+        const val HSC_MAGIC = 0x544B_000C
+        const val HS_V2_MAGIC = 0x544B_0009
+        const val HS_LEN = 4 + 32 + 4 + 32 + 32 + 64
+        const val HSK_HALF = MlKem.PK_BYTES / 2
+        const val HSK_LEN = 4 + 32 + 1 + HSK_HALF
+        const val HSC_LEN = 4 + 32 + MlKem.CT_BYTES + 64
+        const val HS_CONTEXT = "kin-hs-v3|"
+        const val HSC_CONTEXT = "kin-hs-v3c|"
         const val REPLAY_WINDOW = 2048
         const val CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
-        fun signedMessage(room: String, eph: ByteArray, caps: Int): ByteArray {
-            val head = (HS_CONTEXT + room + "|").toByteArray()
+        fun isHandshake(magic: Int) = magic == HS_MAGIC || magic == HSK_MAGIC || magic == HSC_MAGIC
+        fun sha256(b: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(b)
+        fun kemHash(pk: ByteArray) = sha256(pk)
+        fun signedMessage(room: String, eph: ByteArray, caps: Int, kemHash: ByteArray): ByteArray {
             val c = ByteArray(4); Wire.putU32(c, 0, caps)
-            return head + eph + c
+            return (HS_CONTEXT + room + "|").toByteArray() + eph + c + kemHash
         }
-
-        /** Both ephemeral keys then both identities, each pair sorted. */
-        fun transcript(ephA: ByteArray, ephB: ByteArray, idA: ByteArray, idB: ByteArray): ByteArray {
-            val e = listOf(ephA, ephB).sortedWith { x, y -> if (lexicographicallyPrecedes(x, y)) -1 else if (x.contentEquals(y)) 0 else 1 }
-            val i = listOf(idA, idB).sortedWith { x, y -> if (lexicographicallyPrecedes(x, y)) -1 else if (x.contentEquals(y)) 0 else 1 }
-            return e[0] + e[1] + i[0] + i[1]
-        }
-
+        fun ctMessage(room: String, sender: ByteArray, recipient: ByteArray, ct: ByteArray): ByteArray =
+            (HSC_CONTEXT + room + "|").toByteArray() + sender + recipient + ct
         fun capsOf(b: ByteArray, n: Int): Int = if (n >= HS_LEN) Wire.u32(b, 36) else 0
-
         fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
 
         fun lexicographicallyPrecedes(a: ByteArray, b: ByteArray): Boolean {
             val n = minOf(a.size, b.size)
             for (i in 0 until n) {
-                val x = a[i].toInt() and 0xff
-                val y = b[i].toInt() and 0xff
+                val x = a[i].toInt() and 0xff; val y = b[i].toInt() and 0xff
                 if (x != y) return x < y
             }
             return a.size < b.size
@@ -312,19 +398,14 @@ class Crypto(
             mac.init(SecretKeySpec(if (salt.isEmpty()) ByteArray(32) else salt, "HmacSHA256"))
             val prk = mac.doFinal(ikm)
             val out = ByteArray(len)
-            var t = ByteArray(0)
-            var pos = 0
-            var i = 1
+            var t = ByteArray(0); var pos = 0; var i = 1
             while (pos < len) {
                 mac.init(SecretKeySpec(prk, "HmacSHA256"))
-                mac.update(t)
-                mac.update(info)
-                mac.update(i.toByte())
+                mac.update(t); mac.update(info); mac.update(i.toByte())
                 t = mac.doFinal()
                 val c = minOf(t.size, len - pos)
                 System.arraycopy(t, 0, out, pos, c)
-                pos += c
-                i++
+                pos += c; i++
             }
             return out
         }
@@ -335,10 +416,6 @@ class Crypto(
 }
 
 // X25519 (RFC 7748): BouncyCastle's constant-time implementation, called directly.
-// One path on every phone and in every JVM test. The BigInteger ladder that used
-// to live here was the fallback for a platform provider that might refuse a raw
-// key; a fallback that is not constant-time is a second, weaker implementation
-// chosen by the phone, invisibly. Gone.
 internal object X25519 {
     fun publicFromPrivate(scalarRaw: ByteArray): ByteArray {
         require(scalarRaw.size == 32)
@@ -346,8 +423,6 @@ internal object X25519 {
         org.bouncycastle.math.ec.rfc7748.X25519.scalarMultBase(scalarRaw, 0, out, 0)
         return out
     }
-
-    /** RFC 7748 X25519(k, u) with the peer's public u-coordinate. */
     fun sharedSecret(scalarRaw: ByteArray, peerRaw: ByteArray): ByteArray {
         require(scalarRaw.size == 32 && peerRaw.size == 32)
         val out = ByteArray(32)
