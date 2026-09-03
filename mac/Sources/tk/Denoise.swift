@@ -195,31 +195,31 @@ final class VDenoise {
     // samples one lane in sixteen -- 57k samples a frame is plenty for a median.
     let wf = Int32(floorWeight * 256)
     let slope = Int32(((256 - Int(wf)) * 256) / threshold)     // Q8 per level
-    let vWf = SIMD16<Int32>(repeating: wf), vSlope = SIMD16<Int32>(repeating: slope)
-    let v256 = SIMD16<Int32>(repeating: 256), v255 = SIMD16<Int32>(repeating: 255)
-    let v128 = SIMD16<Int32>(repeating: 128), v8 = SIMD16<Int32>(repeating: 8)
-    let vZero = SIMD16<Int32>(repeating: 0), vT = SIMD16<Int32>(repeating: T)
+    // ── EIGHT 16-BIT LANES, NOT SIXTEEN 32-BIT ONES ────────────────────────────
+    //
+    // Measured standalone (swiftc -O, 1280x720): SIMD16<Int32> 1.00 ms, scalar
+    // 0.34 ms, SIMD8<Int16> 0.25 ms. The values fit 16 bits (Q4 <= 4080); only
+    // the weight multiply needs 32, so only it widens. The in-app version of the
+    // 32-bit loop read 3.2 ms because the histogram branch sat inside it; the
+    // statistics are now a separate pass over every fourth row.
+    let vWf = SIMD8<Int32>(repeating: wf), vSlope = SIMD8<Int32>(repeating: slope)
+    let v256 = SIMD8<Int32>(repeating: 256), v255 = SIMD8<Int32>(repeating: 255)
+    let v128 = SIMD8<Int32>(repeating: 128), v8 = SIMD8<Int16>(repeating: 8)
     @inline(__always)
-    func run(_ s: UnsafePointer<UInt8>, _ p: UnsafeMutablePointer<Int16>, _ d: UnsafeMutablePointer<UInt8>,
-             _ n: Int, _ H: UnsafeMutableBufferPointer<Int32>?) -> Int32 {
+    func run(_ s: UnsafePointer<UInt8>, _ p: UnsafeMutablePointer<Int16>, _ d: UnsafeMutablePointer<UInt8>, _ n: Int) {
       var x = 0
-      var still: Int32 = 0
-      while x + 16 <= n {
-        let cur = SIMD16<Int32>(truncatingIfNeeded: UnsafeRawPointer(s + x).loadUnaligned(as: SIMD16<UInt8>.self)) &<< 4
-        let prev = SIMD16<Int32>(truncatingIfNeeded: UnsafeRawPointer(p + x).loadUnaligned(as: SIMD16<Int16>.self))
-        let diff = cur &- prev
-        let ad = pointwiseMin((diff.replacing(with: vZero &- diff, where: diff .< vZero)) &>> 4, v255)
+      while x + 8 <= n {
+        let cur = SIMD8<Int16>(truncatingIfNeeded: UnsafeRawPointer(s + x).loadUnaligned(as: SIMD8<UInt8>.self)) &<< 4
+        let prev = UnsafeRawPointer(p + x).loadUnaligned(as: SIMD8<Int16>.self)
+        let diff = SIMD8<Int32>(truncatingIfNeeded: cur &- prev)
+        let ad = pointwiseMin(pointwiseMax(diff, 0 &- diff) &>> 4, v255)
         let w = pointwiseMin(vWf &+ ((ad &* vSlope) &>> 8), v256)
-        let v = prev &+ ((diff &* w &+ v128) &>> 8)
-        UnsafeMutableRawPointer(p + x).storeBytes(of: SIMD16<Int16>(truncatingIfNeeded: v), as: SIMD16<Int16>.self)
-        UnsafeMutableRawPointer(d + x).storeBytes(of: SIMD16<UInt8>(truncatingIfNeeded: (v &+ v8) &>> 4), as: SIMD16<UInt8>.self)
-        if let H {
-          H[Int(ad[0])] &+= 1
-          still &+= vZero.replacing(with: 1, where: ad .< vT).wrappedSum()
-        }
-        x &+= 16
+        let v = SIMD8<Int16>(truncatingIfNeeded: (diff &* w &+ v128) &>> 8) &+ prev
+        UnsafeMutableRawPointer(p + x).storeBytes(of: v, as: SIMD8<Int16>.self)
+        UnsafeMutableRawPointer(d + x).storeBytes(of: SIMD8<UInt8>(truncatingIfNeeded: (v &+ v8) &>> 4), as: SIMD8<UInt8>.self)
+        x &+= 8
       }
-      // Tail (widths that are not a multiple of 16), scalar.
+      // Tail (widths that are not a multiple of 8), scalar.
       while x < n {
         let cur = Int32(s[x]) << 4, prev = Int32(p[x])
         let diff = cur &- prev
@@ -230,27 +230,43 @@ final class VDenoise {
         d[x] = UInt8(truncatingIfNeeded: (v &+ 8) >> 4)
         x &+= 1
       }
+    }
+    /// The noise statistics for one row, BEFORE it is filtered: |raw - reference|
+    /// per pixel, one in eight sampled into the histogram, all counted for still.
+    @inline(__always)
+    func stats(_ s: UnsafePointer<UInt8>, _ p: UnsafePointer<Int16>, _ n: Int, _ H: UnsafeMutableBufferPointer<Int32>) -> Int32 {
+      var x = 0, still: Int32 = 0
+      while x + 8 <= n {
+        let cur = SIMD8<Int16>(truncatingIfNeeded: UnsafeRawPointer(s + x).loadUnaligned(as: SIMD8<UInt8>.self)) &<< 4
+        let prev = UnsafeRawPointer(p + x).loadUnaligned(as: SIMD8<Int16>.self)
+        let diff = cur &- prev
+        let ad = pointwiseMin(pointwiseMax(diff, 0 &- diff) &>> 4, SIMD8<Int16>(repeating: 255))
+        H[Int(ad[0])] &+= 1
+        still &+= Int32(SIMD8<Int16>(repeating: 0).replacing(with: 1, where: ad .< SIMD8<Int16>(repeating: Int16(T))).wrappedSum())
+        x &+= 8
+      }
       return still
     }
     hist.withUnsafeMutableBufferPointer { H in
-      // The histogram and the still count are sampled on every fourth row: the
-      // scatter store made the luma pass 3x slower per pixel than the chroma
-      // pass without it (0.78 vs 0.15 ms for half the pixels), and a median
-      // over 14k samples is the same median.
+      // Statistics on every fourth row, taken before that row is filtered (the
+      // reference is still last frame's). A median over 14k samples is the same
+      // median, and this keeps the scatter store out of the hot loop entirely.
       for y in 0..<h {
-        stillN &+= run(sy.assumingMemoryBound(to: UInt8.self) + y * ssY, py + y * w,
-                       dy.assumingMemoryBound(to: UInt8.self) + y * dsY, w, y & 3 == 0 ? H : nil)
-      }
-      costLuma.add(Clock.ms(Clock.now() - t0))
-      // Chroma, same rule. Chroma noise is where the colour speckle lives and it
-      // is as expensive to the encoder as the luma kind.
-      for y in 0..<hC {
-        _ = run(sc.assumingMemoryBound(to: UInt8.self) + y * ssC, pc + y * cw,
-                dc.assumingMemoryBound(to: UInt8.self) + y * dsC, cw, nil)
+        let s = sy.assumingMemoryBound(to: UInt8.self) + y * ssY
+        if y & 3 == 0 { stillN &+= stats(s, py + y * w, w, H) }
+        run(s, py + y * w, dy.assumingMemoryBound(to: UInt8.self) + y * dsY, w)
       }
     }
+    let tL = Clock.now()
+    costLuma.add(Clock.ms(tL - t0))
+    // Chroma, same rule. Chroma noise is where the colour speckle lives and it
+    // is as expensive to the encoder as the luma kind.
+    for y in 0..<hC {
+      run(sc.assumingMemoryBound(to: UInt8.self) + y * ssC, pc + y * cw,
+          dc.assumingMemoryBound(to: UInt8.self) + y * dsC, cw)
+    }
     frames += 1
-    costChroma.add(Clock.ms(Clock.now() - t0) - (costLuma.p(1.0) ?? 0))
+    costChroma.add(Clock.ms(Clock.now() - tL))
     stillPct = Int(stillN) * 100 / max(1, (w / 16) * 16 * ((h + 3) / 4))
     // Median of |difference| from the histogram. The bins are whole levels, so
     // interpolate within the median bin for a number that moves smoothly.
