@@ -5762,6 +5762,7 @@ if videoArg != "off", !ringPreview {
     let e = try VEncoder(width: 1280, height: 720,
                          bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000,
                          quality: vq.quality)
+    e.denoise = makeDenoise()
     e.requestKeyframe()
     src.onFrame = { pb, host in
       // Camera off: stop encoding entirely rather than sending black. Black frames
@@ -5771,7 +5772,6 @@ if videoArg != "off", !ringPreview {
       if camOff { return }
       // ── PAUSED: STILL YOUR CAMERA, JUST NOT THEIR PROBLEM ────────────────────
       //
-    e.denoise = makeDenoise()
       // The frame is dropped BEFORE the encoder, not after it: encoding a picture
       // and then discarding it would burn the same CPU and the same battery for a
       // packet nobody sends, on a machine whose link is already in trouble.
@@ -7771,6 +7771,20 @@ func reportLoop() {
     // an A/B.
     if flag("no-vpause") { vb["v_pause_armed"] = 0 }
     if let q = venc?.qualityNow { vb["v_quality"] = q }
+    // The denoise stage: its cost, what it measured the sensor's noise to be, and
+    // whether it was actually running (a bypass count that is not zero means the
+    // camera handed over a format it does not handle, and every bitrate number in
+    // this beat is the unfiltered one).
+    if let c = vsource as? CameraSource, c.frameW > 0 { vb["v_cap_w"] = c.frameW; vb["v_cap_h"] = c.frameH }
+    if let d = venc?.denoise {
+      vb["v_dn_on"] = 1
+      vb["v_dn_bypassed"] = d.bypassed
+      vb["v_noise"] = Double(d.noiseX100) / 100
+      vb["v_dn_t"] = d.threshold
+      vb["v_still_pct"] = d.stillPct
+      if let v = d.cost.p(0.50) { vb["v_dn_ms_p50"] = v }
+      if let v = d.cost.p(0.99) { vb["v_dn_ms_p99"] = v }
+    } else { vb["v_dn_on"] = 0 }
     vb["v_dq_queued"] = dq.queued
     vb["v_dq_inline_full"] = dq.inlineFull
     vb["v_q_heavy_downs"] = vq.heavyDowns
@@ -7795,20 +7809,6 @@ func reportLoop() {
         + "  repairKeys \(keyAsksOnLoss) decLuma \(String(format: "%.0f", gDecLuma))"
         // Say how many frames took the INLINE path anyway. A queue whose whole
         // purpose is to keep decode off the receive thread, and which quietly
-    // The denoise stage: its cost, what it measured the sensor's noise to be, and
-    // whether it was actually running (a bypass count that is not zero means the
-    // camera handed over a format it does not handle, and every bitrate number in
-    // this beat is the unfiltered one).
-    if let c = vsource as? CameraSource, c.frameW > 0 { vb["v_cap_w"] = c.frameW; vb["v_cap_h"] = c.frameH }
-    if let d = venc?.denoise {
-      vb["v_dn_on"] = 1
-      vb["v_dn_bypassed"] = d.bypassed
-      vb["v_noise"] = Double(d.noiseX100) / 100
-      vb["v_dn_t"] = d.threshold
-      vb["v_still_pct"] = d.stillPct
-      if let v = d.cost.p(0.50) { vb["v_dn_ms_p50"] = v }
-      if let v = d.cost.p(0.99) { vb["v_dn_ms_p99"] = v }
-    } else { vb["v_dn_on"] = 0 }
         // falls back to doing it there when full, is a queue that looks like it is
         // working while the defect continues.
         + "  picture \(vq.describe)"
@@ -8055,6 +8055,9 @@ func reportLoop() {
     lastVqVoiceLost = pLost; lastVqVoiceRec = pRec
     let voiceRate = Double(voiceDelta) / Double(sentNow)
     let voiceHarmed = voiceRate * 100.0 > HARM_RETREAT
+    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
+    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
+    let wasLevel = vq.level
     let changed = vq.tick(now: Double(beatTick),
                           pictureHarmed: harmIsVideo ? harmed : false,
                           voiceHarmed: voiceHarmed,
@@ -8083,9 +8086,6 @@ func reportLoop() {
     if vq.paused != wasPaused {
       Metrics.count(vq.paused ? "video_pause" : "video_resume")
       fputs("  picture: video \(vq.paused ? "PAUSED -- the link could not carry the floor" : "resumed")"
-    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
-    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
-    let wasLevel = vq.level
           + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)"
           + (vq.pauseVerdict.isEmpty ? "" : " -- \(vq.pauseVerdict)") + "\n", stderr)
     }
