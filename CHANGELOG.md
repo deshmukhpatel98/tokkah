@@ -111,6 +111,35 @@ q0.6 at 13 s → 11,300 B/frame for the rest of the call, `v_q_heavy_downs 1`. T
 lit clip on the other end stayed at q0.7 (7–10 KB). The live calls this month that
 read 18–19 KB/frame (dim rooms) would take this step; the 4.7–5.6 KB ones would not.
 
+### Measured negative — HEVC does not buy the lossless rung anything
+
+`--vpsnr --vcodec hevc` puts the same frames through Apple's hardware HEVC encoder
+with the same realtime, no-B-frame settings. At equal PSNR against the filtered
+source (interpolated across q0.5–0.8), bytes per frame relative to H.264:
+
+| target | lit room | dark room |
+|---|---|---|
+| 40 dB | 0.86 | 1.14 |
+| 43–44 dB | 0.93–0.98 | — |
+| 45–46 dB (the lossless rung) | **1.15–1.26** | — |
+| 36–37 dB | — | 0.73–0.74 |
+
+So HEVC saves bytes only where the picture is already being given up, and costs
+15–26% MORE at the quality a call actually runs at. Encode latency was lower
+(1.4 vs 2.0 ms p50). Not wired into the call; the ruler option stays so the
+result can be re-checked on a future chip.
+
+### Measured negative — pinning the camera to 30 fps in the dark
+
+`--camrec` showed the sensor delivering 16.7 fps in a dim room (exposure
+stretched to keep the face visible), a 60 ms frame interval. Pinning
+`activeVideoMaxFrameDuration` to 1/30 held 30 fps (298 frames in 10 s vs 170) and
+the picture went from mean luma 8.6 to 3.0: near black, 428 B/frame, nothing to
+see. The exposure stretch IS the picture in a dark room. Real calls this month all
+encoded at 30–31 fps, so the auto behaviour already gives 30 in a lit room and the
+only rooms this would have changed are the ones it would have blacked out. Not
+shipped; the camera keeps its own pacing.
+
 ### Fixed — the camera delivered 1080p to a 720p encoder
 
 `camera: mode 1280x720` was logged and the first frame measured 1920×1080: the

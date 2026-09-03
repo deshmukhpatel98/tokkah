@@ -479,6 +479,8 @@ class CallSession(
         f["dup"] = ring.dup; f["too_old"] = ring.tooOld; f["jumps"] = ring.jumps
         f["recv"] = ring.recv; f["accepted"] = ring.accepted
         f["peer_restarts"] = ring.restarts
+        f["a_mic_peak"] = micPeak; f["a_mic_rms"] = micRms
+        f["a_clip_pct"] = if (micSamples > 0) micClipped * 100.0 / micSamples else 0.0
         f["fec_on"] = if (redundancy) 1 else 0; f["fec_sent"] = redundantSent
         f["recovered"] = ring.recovered
         f["peer_rx_lost"] = peerRxLost; f["peer_rx_recovered"] = peerRxRecovered
@@ -937,9 +939,29 @@ class CallSession(
     // ── the audio device's two entry points ──────────────────────────────────
 
     /** One capture block: cancel, classify, apply the floor, put it on the wire. */
+    // ── THE MICROPHONE'S LEVEL (Audio.swift 4510-4520, main.swift 6970) ──────
+    //
+    // "Was I too loud / distorted" is the one question about the mic nothing
+    // downstream can answer later. These were never written on the phone, so
+    // the reader printed peak 0.00 / rms 0.000 on a call whose gate was open
+    // 59% of the time -- a blind instrument reporting a negative.
+    @Volatile var micPeak = 0f; private set
+    private var micSumSq = 0.0
+    @Volatile var micSamples = 0L; private set
+    @Volatile var micClipped = 0L; private set
+    val micRms: Float get() = if (micSamples > 0) kotlin.math.sqrt(micSumSq / micSamples).toFloat() else 0f
+
     fun captureBlock(x: FloatArray, n: Int) {
         capFrames += n
         floorBlocks++
+        var sq = 0.0
+        for (i in 0 until n) {
+            val a = kotlin.math.abs(x[i])
+            if (a > micPeak) micPeak = a
+            if (a >= 0.997f) micClipped++
+            sq += x[i].toDouble() * x[i]
+        }
+        micSumSq += sq; micSamples += n
         if (floor.state == Floor.State.THEIRS) floorHeldBlocks++
         // Subtract before classifying: the bar the classifier builds is made
         // from what is LEFT after cancellation, so a person under a cancelled
