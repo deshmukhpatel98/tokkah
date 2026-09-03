@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.136.0"
+let VERSION = "0.137.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -576,6 +576,7 @@ let KNOWN_FLAGS: Set<String> = [
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
   "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto", "no-lan-upgrade",
+  "record", "record-path",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -1781,6 +1782,7 @@ func postFinalBeat(why: String) -> Bool {
 /// would leave a stray call running after a test.
 func leaveCall() -> Never {
   shuttingDown = true
+  CallRecorder.shared.stopSync()
   // Guarded the same way `hangUpAndExit` is, and for the same reason: leaving
   // while still waiting for somebody has nobody to tell, and a goodbye sent to a
   // ring that has not been answered would quit the caller's app instead of
@@ -1939,6 +1941,7 @@ func hangUpAndExit(to who: String, room: String, why: String, capMs: Int = 2000)
     // because a link invite has no handles to address.
     if Resume.holding { wire.sendGoodbye() }
     Resume.end(why: why)
+    CallRecorder.shared.stopSync()
     postFinalBeat(why: why)
     exit(0)
   }
@@ -3982,6 +3985,7 @@ if let room = arg("room") {
           display?.controls?.setStatus("reconnecting…")
           gone = 0
         }
+        wire.probeAllCandidates()
         Thread.sleep(forTimeInterval: 0.5)
         continue
       }
@@ -5739,6 +5743,7 @@ vdec.onDecoded = { img, capHost in
       fputs("metal dump: \(m.dumpRendered(pb, to: mp))\n", stderr)
     }
   }
+  CallRecorder.shared.recordVideo(img, at: Clock.now())
   if let path = dumpTo, !dumped, vDecoded > 30 {
     dumped = true
     let ci = CIImage(cvImageBuffer: img)
@@ -5749,6 +5754,11 @@ vdec.onDecoded = { img, capHost in
       fputs("dumped a decoded frame to \(path)\n", stderr)
     }
   }
+}
+
+if let recPath = arg("record") ?? arg("record-path") ?? (flag("record") ? CallRecorder.defaultRecordingURL().path : nil) {
+  let url = URL(fileURLWithPath: recPath)
+  _ = CallRecorder.shared.start(to: url)
 }
 
 // ── THE THIRD CAMERA BRING-UP, AND THE ONE THE PARK USED TO HIDE ──────────
@@ -8304,12 +8314,14 @@ for sig in [SIGINT, SIGTERM] {
     // code path. `audioBeat` is safe here even before the audio engine exists: it
     // checks `beatReady` and sends the pre-connect beat instead.
     postFinalBeat(why: sig == SIGINT ? "interrupt" : "terminated")
+    CallRecorder.shared.stopSync()
     fputs("\nbye\n", stderr)
     exit(0)
   }
   src.resume()
   signalSources.append(src)
 }
+atexit { CallRecorder.shared.stopSync() }
 
 if display != nil || mdisplay != nil {
   Thread { reportLoop() }.start()

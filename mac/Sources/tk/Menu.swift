@@ -131,6 +131,8 @@ enum Menu {
     mute.keyEquivalentModifierMask = [.command, .shift]; mute.target = Target.shared
     let cam = call.addItem(withTitle: "Turn Camera Off", action: #selector(Target.cam), keyEquivalent: "v")
     cam.keyEquivalentModifierMask = [.command, .shift]; cam.target = Target.shared
+    let rec = call.addItem(withTitle: "Record Call", action: #selector(Target.record), keyEquivalent: "r")
+    rec.keyEquivalentModifierMask = [.command, .shift]; rec.target = Target.shared
     call.addItem(.separator())
     // ── THE THIRD DOOR TO THE PEOPLE PANEL ────────────────────────────────────
     //
@@ -288,6 +290,19 @@ enum Menu {
     @objc func more() { Menu.controls?.nudgeBar(); Menu.controls?.openMore() }
     @objc func people() { Menu.controls?.nudgeBar(); Menu.controls?.openPeople() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }
+    @objc func record() {
+      if CallRecorder.shared.isRecording {
+        let summary = CallRecorder.shared.stop()
+        Menu.controls?.setStatus("recording saved")
+        fputs("\(summary)\n", stderr)
+      } else {
+        let url = CallRecorder.defaultRecordingURL()
+        if CallRecorder.shared.start(to: url) {
+          Menu.controls?.setStatus("recording call")
+        }
+      }
+      Menu.controls?.nudgeBar()
+    }
     @objc func quit() { Menu.onQuit?(); NSApp.terminate(nil) }
     /// The front door's own `…` button, from the keyboard. Set by `Launcher` while
     /// its window is up and cleared when it goes, so `⌘,` is greyed rather than
@@ -324,6 +339,10 @@ enum Menu {
       // this file already carries two scars for.
       if item.action == #selector(Target.homeSettings) { return Menu.onHomeSettings != nil }
       if item.action == #selector(Target.more) { return Menu.controls != nil }
+      if item.action == #selector(Target.record) {
+        item.title = CallRecorder.shared.isRecording ? "Stop Recording" : "Record Call"
+        return true
+      }
       return true
     }
     @objc func about() {

@@ -5,6 +5,27 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.137.0 — 2026-09-03
+
+### Added — in-call recorder (⌘⇧R and in-call More sheet)
+
+Records the call exactly as perceived and rendered: decoded audio with concealment
+breaks directly from the CoreAudio playback buffer, and decoded video with freezes
+and stalls directly onto a 30 fps movie file. Saved to `~/Movies/Kin/Kin-<timestamp>.mov`.
+Toggled via `⌘⇧R`, the More sheet, or `--record`.
+
+### Fixed — LAN candidate probes are dispatched while locked and sealed under crypto
+
+0.136.0 fixed the probe reply path (`rawSendTo`), but the 19-minute live test call
+remained on `lock_lan 0` with `path_priv_ms -1` because probe *requests* were never
+delivered:
+1. In `main.swift`, the rediscovery loop called `continue` when `wire.locked == true`,
+   bypassing `wire.probeAllCandidates()`. Probes were never sent once locked.
+2. In `Net.swift`, probe requests were sent unsealed via raw `sendto()`. The receiver
+   drops all unsealed non-handshake packets once crypto is established.
+Now `wire.probeAllCandidates()` runs periodically in the locked loop, and requests
+are sealed via `rawSendTo`.
+
 ## Kin 0.136.0 — 2026-09-03
 
 ### Fixed — a path probe is answered on the path it arrived on

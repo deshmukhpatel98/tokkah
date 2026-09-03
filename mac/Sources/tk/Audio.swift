@@ -4704,9 +4704,21 @@ final class Audio {
     // the deliberate buffer -- never from a remembered anchor. If the stream has
     // run past the cursor by more than the ring, jump; do not argue with it.
     let hi = Int64(ring.hiSeq)
-    if hi < 0 { for i in 0..<Int(n) { out[i] = 0 }; return }
+    if hi < 0 {
+      for i in 0..<Int(n) {
+        out[i] = 0
+        CallRecorder.shared.recordAudioSample(0)
+      }
+      return
+    }
     if ring.pos < 0 {
-      guard hi >= Int64(jitTarget) else { for i in 0..<Int(n) { out[i] = 0 }; return }
+      guard hi >= Int64(jitTarget) else {
+        for i in 0..<Int(n) {
+          out[i] = 0
+          CallRecorder.shared.recordAudioSample(0)
+        }
+        return
+      }
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
     }
     // FAULT INJECTION, because the recovery path above is the kind that only ever
@@ -4930,6 +4942,7 @@ final class Audio {
         // because that is what the speaker actually plays into the microphone.
         let played = presence(val)
         noteFar(played)
+        CallRecorder.shared.recordAudioSample(played)
         // ── SILENCED WHERE `mute` IS SILENCED, AND FOR THE SAME REASON ────────
         //
         // `roomSpeakerOff` turns this Mac's speaker off when both people are in
@@ -5080,6 +5093,7 @@ final class Audio {
         }
         let played = presence(val)
         noteFar(played)
+        CallRecorder.shared.recordAudioSample(played)
         // The concealment path silences too, or a room that has been detected
         // still leaks every invented sample out of the speaker. Same placement,
         // same reason: `echoHist` below is written either way.

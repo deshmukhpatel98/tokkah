@@ -791,9 +791,13 @@ final class Wire {
     for c in targets {
       var a = c
       out.withUnsafeBufferPointer { b in
-        _ = withUnsafePointer(to: &a) { pp in
-          pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            sendto(fd, b.baseAddress!, b.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        if crypto?.established == true {
+          rawSendTo(b.baseAddress!, b.count, .probe, to: a)
+        } else {
+          _ = withUnsafePointer(to: &a) { pp in
+            pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+              sendto(fd, b.baseAddress!, b.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
           }
         }
       }

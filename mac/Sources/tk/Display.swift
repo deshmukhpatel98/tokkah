@@ -652,6 +652,7 @@ final class Display {
       if peer != self.peerPaused || camOff != self.peerCamOff {
         self.peerPaused = peer
         self.peerCamOff = camOff
+        CallRecorder.shared.setPaused(peer, peerCamOff: camOff)
         if hideBlur {
           self.pauseLayer.isHidden = true
           self.pauseLayer.contents = nil

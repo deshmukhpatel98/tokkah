@@ -106,6 +106,10 @@ enum Glyph {
     p.close()
   } }, filled: false)
 
+  static let record = Shape(build: { box in path(box) { p, k in
+    p.appendOval(in: NSRect(x: 6 * k, y: 6 * k, width: 12 * k, height: 12 * k))
+  } }, filled: true)
+
   /// <circle cx=12 cy=9 r=3.2/><path d="M5.5 19c1.2-3 3.6-4.5 6.5-4.5s5.3 1.5 6.5 4.5"/>
   /// <rect x=2.8 y=3.2 width=18.4 height=17.6 rx=4.5/>  -- "hold to see yourself"
   static let peek = Shape(build: { box in path(box) { p, k in
@@ -5282,6 +5286,13 @@ final class CallControls: NSView {
     rename.chevron = true
     rename.target = self; rename.action = #selector(renameRow(_:))
     items.append(rename)
+    let recRow = SheetRow(CallRecorder.shared.isRecording ? "Stop recording" : "Record call", glyph: Glyph.record)
+    recRow.target = self; recRow.action = #selector(recordRow(_:))
+    if CallRecorder.shared.isRecording {
+      recRow.value = "recording"
+      recRow.valueIsWord = true
+    }
+    items.append(recRow)
     items += rows as [NSView]
     // -- THE SETTING THAT DECIDES WHETHER YOU CAN BE CALLED AT ALL ------------
     //
@@ -5508,6 +5519,11 @@ final class CallControls: NSView {
   @objc private func renameRow(_ sender: SheetRow) {
     Metrics.tap("rename_open")
     showPage(.rename, opening: true)
+  }
+
+  @objc private func recordRow(_ sender: Any?) {
+    Menu.Target.shared.record()
+    rebuildSheet()
   }
 
   @objc private func saveNameRow(_ sender: SheetRow) { commitRename() }
