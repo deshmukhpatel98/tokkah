@@ -115,6 +115,10 @@ final class Crypto {
   /// True when the peer's identity matched a key this end already expected.
   private(set) var pinned = false
   private(set) var sealed = 0, opened = 0, openFails = 0
+  /// Packets opened UNDER THE CURRENT KEY. `opened` is a lifetime counter for the
+  /// beat, and it is the wrong ruler for "has the peer proved it holds THIS key":
+  /// see `handshakePackets`. Zeroed wherever a key is (re)derived.
+  private var openedSinceKey = 0
   private(set) var replayDrops = 0, preKeyDrops = 0, preKeyRx = 0, plaintextRx = 0
   private(set) var hsBadSig = 0, hsWrongId = 0, hsIdChanged = 0, hsOld = 0, hsFlood = 0, hsWeak = 0
   private(set) var hsKemHashBad = 0, hsCtRefused = 0, hsCtSeen = 0
@@ -194,10 +198,30 @@ final class Crypto {
   /// Everything this end should send on a handshake beat, in order: HS3, the two
   /// key halves, and -- when this end is B and has encapsulated -- the ciphertext.
   /// Once the peer has proved it holds the key, only HS3 (the liveness beat).
+  ///
+  /// ── PROVED THE KEY, NOT A KEY ─────────────────────────────────────────────
+  ///
+  /// "Proved" was `opened > 0`, and `opened` counts for the life of the object.
+  /// So the first key of a call satisfied it forever. When the far end RESTARTS
+  /// -- which every answered call does: answering a ring re-execs the callee --
+  /// its fresh offer re-keys this end (`adoptHandshake` drops the old key,
+  /// `derive` makes the new one), and this beat then read the OLD key's opened
+  /// count, decided the peer had already proved the new one, and sent HS3 alone.
+  /// B's ciphertext -- the one packet A cannot key without -- was never sent
+  /// again, not even once: the `.keyed` reply fires after `derive`, so it too
+  /// read "done". A sat unkeyed, probing in the clear, for the rest of the call;
+  /// this end held a key and refused everything A sent as plaintext. Each side
+  /// was correct about its own state and the call was dead. Live, 2026-09-03,
+  /// nxj-ltoi-nur: 20 minutes of "reconnecting" at a 3.5 s period, the far end
+  /// crypt=0 with two million pre-key drops, this end crypt=1 with 2707
+  /// plaintext refusals. It hit exactly the calls where the restarted end came
+  /// out as A -- half of them.
+  ///
+  /// The ruler is now packets opened SINCE THIS KEY, which `derive` zeroes.
   func handshakePackets(caps: UInt32) -> [[UInt8]] {
     var out = [handshakePacket(caps: caps)]
     lock.lock()
-    let done = established && opened > 0
+    let done = established && openedSinceKey > 0
     let ct = myCt
     lock.unlock()
     if done { return out }
@@ -287,6 +311,7 @@ final class Crypto {
     myCt = nil; hscCache = nil
     iAmA = myPublic.lexicographicallyPrecedes(eph)
     established = false; sendKey = nil; recvKey = nil
+    openedSinceKey = 0
     pinned = expected != nil
     lock.unlock()
     return .adopted
@@ -361,6 +386,7 @@ final class Crypto {
     recvKey = iAmA ? kb : ka
     sendCtr = 0; rxHigh = 0
     for i in rxBits.indices { rxBits[i] = 0 }
+    openedSinceKey = 0
     established = true
     lock.unlock()
   }
@@ -417,6 +443,7 @@ final class Crypto {
     rxBits[Int(ctr >> 6) % rxBits.count] |= (1 << UInt64(ctr & 63))
     pt.copyBytes(to: out, count: pt.count)
     opened += 1
+    openedSinceKey += 1
     return pt.count
   }
 
@@ -526,6 +553,34 @@ final class Crypto {
     check(Array(buf[0..<pB]).withUnsafeBufferPointer { a.open($0.baseAddress!, $0.count, into: &out) } == 5, "B->A opens")
     check(b.handshakePackets(caps: caps).count == 1, "once A has proved the key, B's beat is HS3 alone")
     let vecA = a, vecB = b, vecSealed = sealedA
+
+    // 1b. A RESTARTS with a fresh ephemeral key after B has opened its packets.
+    // This is every answered call (the callee re-execs) when the callee comes out
+    // as A. B must re-key AND send its ciphertext again -- the arm this project
+    // shipped without, and the live call that found it (see handshakePackets).
+    let bRe = mk(seedB, ephB, kemB, m: mB)
+    _ = feed(bRe, mk(seedA, ephA, kemA).handshakePackets(caps: caps))
+    for s in sealedA {   // B has opened packets under the FIRST key
+      _ = s.withUnsafeBufferPointer { bRe.open($0.baseAddress!, $0.count, into: &out) }
+    }
+    check(bRe.established && bRe.handshakePackets(caps: caps).count == 1, "before the restart B beats HS3 alone")
+    let aRe = mk(seedA, Data(repeating: 0x03, count: 32), kemA)   // same identity, new ephemeral
+    let rbRe = feed(bRe, aRe.handshakePackets(caps: caps))
+    check(isKeyed(rbRe) && bRe.established, "B re-keys on the restarted A's offer")
+    let beat = bRe.handshakePackets(caps: caps)
+    check(beat.count == 4, "and B's beat carries the ciphertext again (\(beat.count) packets, 4 wanted)")
+    let raRe = feed(aRe, beat)
+    check(isKeyed(raRe) && aRe.established && aRe.safetyCode == bRe.safetyCode,
+          "the restarted A keys from B's beat, codes agree: \(aRe.safetyCode ?? "-")")
+    check(bRe.handshakePackets(caps: caps).count == 4, "B keeps sending it until A proves the new key")
+    // `if let`, not `!`: on the old ruler A never keys here, and a trap would end
+    // the selftest before the arms below say what else broke.
+    if let pRe = "after".withCString({ aRe.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 5, into: &buf) }) {
+      check(Array(buf[0..<pRe]).withUnsafeBufferPointer { bRe.open($0.baseAddress!, $0.count, into: &out) } == 5, "A's first packet under the new key opens at B")
+    } else {
+      check(false, "the restarted A can seal under the new key")
+    }
+    check(bRe.handshakePackets(caps: caps).count == 1, "and only then does B's beat drop back to HS3 alone")
 
     // 2. B's packets land first (one and a half round trips): B cannot key yet.
     a = mk(seedA, ephA, kemA); b = mk(seedB, ephB, kemB, m: mB)

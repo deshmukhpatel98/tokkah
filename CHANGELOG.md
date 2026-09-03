@@ -5,6 +5,23 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.140.0 — 2026-09-03
+
+### Fixed — the "connecting… reconnecting…" loop after the other person answers
+
+- **Half of answered calls never keyed.** Answering a ring re-execs the callee, so the caller re-keys against a fresh offer. `Crypto.handshakePackets` decided "the peer has proved the key" from a **lifetime** `opened` counter, so after a re-key the side that came out as B sent HS3 alone and never re-sent its ML-KEM ciphertext — not even once, because the `.keyed` reply fires after `derive`. A stayed unkeyed and probed in the clear; B held a key and refused the plaintext. Live call `nxj-ltoi-nur` (2026-09-03 19:44): 20 minutes at a 3.5 s "reconnecting" period; far end `crypt=0`, 2,009,322 pre-key drops; near end `crypt=1`, 2,707 plaintext refusals. The ruler is now packets opened **since this key**. New selftest arm 1b (a restarted A after B has opened packets) fails on 0.139.0 and passes now.
+- **Liveness is any authenticated packet, not just packets from the address we chose.** Two ends of one call can settle on different paths (LAN vs the router's hairpin); a decrypted packet is the peer, whichever address it came from.
+- **The LAN is a one-way door.** 0.139.0 on two Macs on one Wi‑Fi: upgrade to LAN → 256 hairpin packets → back to public → LAN probe reply → upgrade, eleven times a second in the log. While the locked private path has answered a probe in the last 3 s, media arriving from the public address no longer moves us; the other end catches up on its own. Towards the LAN the move takes 4 packets.
+- **Same Wi‑Fi**: private candidates win the race outright and the race settles the moment one answers (ICE host priority); a same-subnet peer's LAN address is the provisional destination; LAN candidates survive rediscovery and get an ARP warm-up burst when learned; handshakes go to every candidate, not only the provisional peer.
+- **Bind**: after 5 s on a busy port the app takes any free port instead of dying — rendezvous publishes the port `getsockname` reports, so a second Kin on one Mac now works.
+- **A plaintext probe from a keyed peer** (a restarted process racing in the clear) triggers an immediate handshake beat, at most once a second.
+
+### Added — the far-away test (More sheet, Call menu ⌘⇧T, `--far-test`)
+
+Two Macs in one room in Delhi can now make a call that travels to South America and back. With the switch on at either end, every media datagram of the call — both directions — goes over a WebSocket to a Durable Object created with `locationHint: 'sam'` (room `xcont-<code>`, its own object so the hint is honoured) and is fanned out to the other Mac. That is what one participant on a VPN in Santiago would cost the call, using Cloudflare only. The relay's own round trip is measured every 2 s with a ping the object answers and shown in the sheet; if the object landed nearby the sheet says so rather than claiming a far-away test. The far end learns of the switch through a sealed once-a-second beat (`XMAGIC`, new) and forgets it 5 s after the beats stop. Relay packets arrive on a loopback socket the tunnel owns and are treated as the locked path: never adopted, never off-path. Media stays direct until the relay reports both ends on it (`xcont-peers`, pushed on every join and leave) and whenever it drops.
+
+Two things the new rig (`mac/tools/far-test-check.sh`, five arms against the live relay) found before anyone did: the beat's first magic number was the goodbye's (`0x544B_0008`), so the far end hung up on the first beat — `main.swift` now refuses to start if two packet kinds share a magic; and the relay object receives binary frames as a `Blob`, which `send()` forwards as the text "[object Blob]" — 28,000 packets a side sent, none received, until the fan-out read the bytes.
+
 ## Kin 0.139.0 — 2026-09-03
 
 ### Fixed — launch crash loop from stale resume video path, test isolation, and watcher Home window sibling detection

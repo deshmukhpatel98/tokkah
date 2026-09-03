@@ -54,6 +54,16 @@ let KMAGIC: UInt32 = 0x544B_0003
 // It rides the media socket, so it is sealed by the same key as everything else
 // and takes the same path the voice takes.
 let SMAGIC: UInt32 = 0x544B_0007
+/// The far-away test, level-triggered: byte 4 bit 0 = "this end wants the call
+/// routed the long way round". Sent once a second while on, three times on a
+/// change, sealed like everything else. A build that predates it drops the
+/// unknown magic on the floor, which is the right answer for a test feature.
+///
+/// 0x0D, not the next number after SMAGIC: 0x08 is BMAGIC, the goodbye, and the
+/// first draft of this constant reused it. The far end read the first far-test
+/// beat as a hang-up and left the call -- the rig found it in its first run.
+/// `main.swift` now refuses to start if two packet kinds share a magic.
+let XMAGIC: UInt32 = 0x544B_000D
 // ── "I HUNG UP", SAID ON THE CALL ITSELF ────────────────────────────────────
 //
 // A call now outlives the process that was carrying it (Resume.swift), which
@@ -383,8 +393,25 @@ final class Wire {
     guard let c = crypto else { return }
     // HS3 (signed once, cached), the two ML-KEM key halves while unkeyed, and B's
     // ciphertext until A has proved it holds the key. Each under 1200 bytes.
-    for out in c.handshakePackets(caps: Wire.myCaps) {
-      out.withUnsafeBufferPointer { wireSend($0.baseAddress!, $0.count) }
+    let packets = c.handshakePackets(caps: Wire.myCaps)
+    candLock.lock()
+    let cands = candidates
+    candLock.unlock()
+    for out in packets {
+      out.withUnsafeBufferPointer { b in
+        wireSend(b.baseAddress!, b.count)
+        // Also send handshakes directly to all discovered candidates (e.g. LAN) so direct LAN keys immediately
+        for target in cands {
+          if target.sin_addr.s_addr != peer.sin_addr.s_addr || target.sin_port != peer.sin_port {
+            var a = target
+            _ = withUnsafePointer(to: &a) { pp in
+              pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(fd, b.baseAddress!, b.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+              }
+            }
+          }
+        }
+      }
     }
   }
   /// Fired on the receive thread when a NEW, verified identity keyed the call.
@@ -430,6 +457,8 @@ final class Wire {
   /// a different external port per source port -- so the wrong socket yields an
   /// address that looks valid and drops every media packet.
   let fd: Int32
+  public private(set) var boundPort: UInt16 = 0
+  var cfTunnel: CloudflareTunnel?
   private var peer = sockaddr_in()
   private(set) var sent = 0
   private(set) var sendErrs = 0
@@ -458,7 +487,7 @@ final class Wire {
     me.sin_family = sa_family_t(AF_INET)
     me.sin_port = port.bigEndian
     me.sin_addr.s_addr = INADDR_ANY
-    let bound = withUnsafePointer(to: &me) { p in
+    var bound = withUnsafePointer(to: &me) { p in
       p.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
     }
     // RETRY, NEVER DIE. A bind that fails right now may succeed in a second --
@@ -466,20 +495,40 @@ final class Wire {
     // transient state, or a supervisor may be mid-restart. Exiting turns a
     // one-second race into a permanently unreachable peer, so the loop below
     // keeps trying and says so, and the process stays alive to be updated again.
+    //
+    // AND THEN ANY PORT. After five seconds the port is not in a transient
+    // state; something else owns it -- most often a second Kin on the same Mac
+    // (`open -n` makes one app per click). The port number is not part of the
+    // protocol: rendezvous publishes whatever `getsockname` says below, so an
+    // ephemeral port works exactly as well as 7001, and a process that binds is
+    // strictly better than one that waits thirty seconds and gives up.
     if bound < 0 {
       var tries = 0
       var ok = false
-      while tries < 60 {
+      while tries < 10 {
         usleep(500_000)
         tries += 1
         let r = withUnsafePointer(to: &me) { p in
           p.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
         if r == 0 { ok = true; break }
-        if tries % 10 == 0 { fputs("bind: port \(port) still busy after \(tries / 2)s, still trying\n", stderr) }
       }
-      if !ok { return nil }
+      if !ok {
+        me.sin_port = 0
+        let r = withUnsafePointer(to: &me) { p in
+          p.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        if r < 0 { return nil }
+        fputs("bind: port \(port) is taken -- taking any free port instead\n", stderr)
+      }
     }
+
+    var actual = sockaddr_in()
+    var slen = socklen_t(MemoryLayout<sockaddr_in>.size)
+    _ = withUnsafeMutablePointer(to: &actual) { p in
+      p.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &slen) }
+    }
+    boundPort = UInt16(bigEndian: actual.sin_port)
 
     peer.sin_family = sa_family_t(AF_INET)
     peer.sin_port = peerPort.bigEndian
@@ -587,7 +636,12 @@ final class Wire {
   /// `cls` has no default on purpose: a new send path that forgets to say what it
   /// is would otherwise be silently filed as audio, which is the exact failure
   /// this parameter exists to have prevented.
-  func rawSend(_ p: UnsafePointer<UInt8>, _ n: Int, _ cls: TxCls) {
+  ///
+  /// `direct` bypasses the far-away relay. For the one packet that is ABOUT the
+  /// path: the far-test beat tells the other end to join the relay, so sending
+  /// it through the relay -- where nobody is listening yet -- is a message that
+  /// can only arrive once it is no longer needed. The rig found exactly that.
+  func rawSend(_ p: UnsafePointer<UInt8>, _ n: Int, _ cls: TxCls, direct: Bool = false) {
     switch cls {
     case .audio: genAudio += n + 28
     case .video: genVideo += n + 28
@@ -625,7 +679,7 @@ final class Wire {
             let d = im.delayTicks()
             if d > 0, let q = delayQ { q.push(out, m, due: Clock.now() + d); return }
           }
-          wireSend(out, m)
+          wireSend(out, m, allowTunnel: !direct)
         }
       }
       if sentOK { return }
@@ -676,7 +730,14 @@ final class Wire {
   private(set) var handshakeReplies = 0
   private(set) var redundantSent = 0
 
-  private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int) {
+  private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true) {
+    if allowTunnel, let tunnel = cfTunnel, tunnel.isRouting {
+      if tunnel.send(p, n) {
+        sent += 1
+        sentBytes += n + 28
+        return
+      }
+    }
     if sendViaTurn, let t = turn {
       if t.sendChannel(fd: fd, p, n) { sent += 1; sentBytes += n + 28 + 4 }
       else { sendErrs += 1 }
@@ -736,10 +797,35 @@ final class Wire {
     a.sin_port = port.bigEndian
     a.sin_addr.s_addr = inet_addr(ip)
     candLock.lock()
-    if !candidates.contains(where: { $0.sin_addr.s_addr == a.sin_addr.s_addr && $0.sin_port == a.sin_port }) {
+    let exists = candidates.contains(where: { $0.sin_addr.s_addr == a.sin_addr.s_addr && $0.sin_port == a.sin_port })
+    if !exists {
       candidates.append(a)
     }
     candLock.unlock()
+    if !exists && isPrivateSubnet(a) {
+      // Warm up ARP immediately for private LAN candidates: send initial probe burst so macOS
+      // kernel populates ARP cache immediately without losing the first scheduled probe.
+      var out = [UInt8](repeating: 0, count: TPKTZ)
+      out.withUnsafeMutableBytes { p in
+        p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+        p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
+        p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
+      }
+      for _ in 0..<2 {
+        var target = a
+        out.withUnsafeBufferPointer { b in
+          if crypto?.established == true {
+            rawSendTo(b.baseAddress!, b.count, .probe, to: target)
+          } else {
+            _ = withUnsafePointer(to: &target) { pp in
+              pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(fd, b.baseAddress!, b.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   func clearCandidates() { candLock.lock(); candidates.removeAll(); candLock.unlock() }
@@ -759,14 +845,6 @@ final class Wire {
   /// that opens the NAT binding, so connectivity and offset are established by
   /// the same packet.
   func probeAllCandidates() {
-    // Two phases, both run from the 0.5 s rediscovery loop. In the RACE (unlocked
-    // and unkeyed) probe every candidate plus the relay, exactly as before. After
-    // it, keep probing JUST an unreplied LAN candidate -- its first probe is
-    // routinely dropped during ARP, so one shot loses the race to the public
-    // hairpin -- until it answers (pickBestPathLocked then upgrades onto it) or
-    // this end is already on a private path. A settled direct/relay call with no
-    // private candidate re-probes nothing, so it costs the same as before; the
-    // hunt is one 32-byte packet per unreplied LAN candidate per 0.5 s.
     let full = !locked && crypto?.established != true
     let onPrivate = locked && isPrivateSubnet(peer)
     if !full && (onPrivate || !Wire.lanUpgrade) { return }
@@ -776,7 +854,8 @@ final class Wire {
     if full {
       targets = candidates
     } else {
-      targets = candidates.filter { isPrivateSubnet($0) && pathRtt[pathKey($0)] == nil }
+      // While locked to a non-private candidate (e.g. WAN hairpin), keep probing all private candidates!
+      targets = candidates.filter { isPrivateSubnet($0) }
     }
     candLock.unlock()
     pathLock.unlock()
@@ -872,7 +951,16 @@ final class Wire {
     return "\(kind) \(String(cString: ipb)):\(UInt16(bigEndian: a.sin_port))"
   }
 
+  /// Host time of the last probe reply that came back on the LOCKED path. Read by
+  /// the off-path branch of the receive loop without allocating: it is the
+  /// evidence that the address we send to is alive, which is what decides whether
+  /// media arriving from somewhere else should move us or be left to catch up.
+  private(set) var lockedPathSeen: UInt64 = 0
+
   func notePath(_ from: sockaddr_in, rttMs: Double) {
+    if locked, from.sin_addr.s_addr == peer.sin_addr.s_addr, from.sin_port == peer.sin_port {
+      lockedPathSeen = Clock.now()
+    }
     // Outside the lock on purpose: `pathKey` allocates (a [CChar], a String, an
     // interpolation) and allocation is the one thing that must not happen while
     // the receive thread holds a lock the rediscovery thread also wants.
@@ -904,8 +992,20 @@ final class Wire {
   /// here would deadlock the receive thread against itself, and NSLock is not
   /// recursive.
   private func pickBestPathLocked() -> String? {
-    guard let best = pathRtt.min(by: { $0.value < $1.value }),
-          let addr = pathAddr[best.key] else { return nil }
+    // HOST/LAN candidate priority (RFC 8445 / ICE):
+    // If ANY private candidate answered, private candidate has absolute priority over
+    // public reflexive (hairpin) candidates and relay candidates!
+    let privAnswered = pathRtt.filter { k, _ in
+      guard let a = pathAddr[k] else { return false }
+      return isPrivateSubnet(a)
+    }
+    let best: (key: String, value: Double)?
+    if let bestPriv = privAnswered.min(by: { $0.value < $1.value }) {
+      best = (bestPriv.key, bestPriv.value)
+    } else {
+      best = pathRtt.min(by: { $0.value < $1.value })
+    }
+    guard let best, let addr = pathAddr[best.key] else { return nil }
     let elapsed = raceBegan == 0 ? 0 : Clock.ms(Clock.now() - raceBegan)
     candLock.lock()
     let hasPrivateUnreplied = candidates.contains { c in
@@ -913,37 +1013,33 @@ final class Wire {
     }
     candLock.unlock()
     let settleLimit: Double = (hasPrivateUnreplied && crypto?.established != true) ? 400.0 : 150.0
-    // Tentative: first working path so the call starts. Settled after 150 ms (or 400 ms if waiting for LAN candidate)
-    // of racing, or sooner if two paths have spoken and 60 ms have passed.
-    let settle = elapsed >= settleLimit || (pathRtt.count >= 2 && elapsed >= 60.0)
+    // Settle immediately once private LAN path has answered, or after race timeout
+    let hasPrivateAnswered = !privAnswered.isEmpty
+    let settle = hasPrivateAnswered || elapsed >= settleLimit || (pathRtt.count >= 2 && elapsed >= 60.0)
     if !locked {
       adopt(addr)
       sendViaTurn = turn?.isTurnServer(addr) == true
     }
-    // ── AFTER THE RACE: a one-way upgrade to the LAN ────────────────────────
-    // The race settles in 150-400 ms, but a same-router peer's LAN probe is
-    // routinely dropped during the first ARP (the documented hairpin, 0.133),
-    // so the LAN loses the initial race and the call stays on the public
-    // hairpin for its whole length -- a live call measured relocks=0 while it
-    // bled ~700 packets/s. Once a private path DOES answer, take it: one way
-    // only (public/relay -> private), so it cannot oscillate, and never off a
-    // path that is already private. `probeAllCandidates` keeps the LAN probed
-    // past the settle so this branch has something to fire on.
+
     if raceSettled {
-      guard Wire.lanUpgrade, isPrivateSubnet(addr), !isPrivateSubnet(peer),
-            pathKey(peer) != best.key else { return nil }
-      let was = lockedFrom
-      peer = addr
-      lockedFrom = best.key
-      sendViaTurn = false              // a private address is never the relay
-      relocks += 1
-      return "path: upgraded to LAN \(best.key) at \(String(format: "%.2f", best.value)) ms rtt (was \(was))\n"
+      // If currently on a non-private candidate and ANY private candidate has answered:
+      if !isPrivateSubnet(peer), Wire.lanUpgrade,
+         let bestPriv = privAnswered.min(by: { $0.value < $1.value }),
+         let privAddr = pathAddr[bestPriv.key],
+         pathKey(peer) != bestPriv.key {
+        let was = lockedFrom
+        peer = privAddr
+        locked = true
+        lockedFrom = bestPriv.key
+        sendViaTurn = false
+        relocks += 1
+        return "path: upgraded to LAN \(bestPriv.key) at \(String(format: "%.2f", bestPriv.value)) ms rtt (was \(was))\n"
+      }
+      return nil
     }
     guard settle else { return nil }
     raceSettled = true
     if pathKey(peer) != best.key {
-      // Read BEFORE the reassignment below: the line says which path we are
-      // leaving, and `lockedFrom` is about to stop being that.
       let was = lockedFrom
       peer = addr
       locked = true
@@ -1350,7 +1446,8 @@ final class Wire {
     // Not nested inside `pathLock` below: nothing takes both, and keeping them
     // sequential means no future caller can invent a lock-order deadlock here.
     candLock.lock()
-    candidates.removeAll()
+    // Retain private LAN candidates so rediscovery can probe them immediately without waiting for directory exchange
+    candidates = candidates.filter { isPrivateSubnet($0) }
     candLock.unlock()
     // Under the lock: this runs on the rediscovery thread while the receive thread
     // may be inserting the very probe reply that ends the gap which sent us here.
@@ -1360,6 +1457,7 @@ final class Wire {
     raceBegan = 0
     raceSettled = false
     pathLock.unlock()
+    lockedPathSeen = 0
     sendViaTurn = false
     relocks += 1
   }
@@ -1402,6 +1500,7 @@ final class Wire {
   /// Consecutive media packets that decrypted but came from somewhere other than
   /// the address this end is sending to. See the note at the assignment site.
   private var offPathRun = 0
+  private var lastPlainReoffer: UInt64 = 0
 
   var peerDescription: String {
     var b = [CChar](repeating: 0, count: 32)
@@ -1444,6 +1543,19 @@ final class Wire {
     }
     for (i, b) in bytes.enumerated() { out[7 + i] = b }
     out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .ctl) }
+  }
+
+  /// The far end asked for (or released) the far-away test. Receive thread.
+  var onPeerFarTest: ((Bool) -> Void)?
+
+  /// Tell the far end whether this end wants the call routed the long way round.
+  func sendFarTest(on: Bool) {
+    var out = [UInt8](repeating: 0, count: 8)
+    out.withUnsafeMutableBytes { p in
+      p.storeBytes(of: XMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
+      p.storeBytes(of: UInt8(on ? 1 : 0), toByteOffset: 4, as: UInt8.self)
+    }
+    out.withUnsafeBufferPointer { rawSend($0.baseAddress!, $0.count, .ctl, direct: true) }
   }
 
   /// The far end hung up. Fired from the receive thread, once per call: the
@@ -1664,6 +1776,15 @@ final class Wire {
         // A recognised magic in the clear while a key exists: an old build on
         // the far end, or someone probing. Counted, never used.
         c.notePlaintextRx()
+        // An unsealed PROBE from someone while this end holds a key is what a
+        // peer that lost its key looks like: a restarted process racing its
+        // candidates in the clear. Answer with a handshake beat now rather than
+        // at the 5 s tick -- at most once a second, so a stranger's probes cannot
+        // turn this end into a 3 KB-per-packet amplifier.
+        if magic == TMAGIC, Clock.msSigned(Clock.now(), lastPlainReoffer) > 1000 {
+          lastPlainReoffer = Clock.now()
+          sendHandshake()
+        }
         continue
       }
       guard let m = c.open(buf, Int(n), into: dbuf) else { continue }
@@ -1694,9 +1815,14 @@ final class Wire {
       // A recognised magic from a reachable address is enough to point media
       // there. Once encryption is up this is genuine authentication: the packet
       // decrypted, so it came from someone holding the key.
-      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC {
+      if magic == MAGIC || magic == VMAGIC || magic == TMAGIC || magic == KMAGIC || magic == SMAGIC || magic == XMAGIC {
         lastRecvHost = Clock.now()
-        if locked, src.sin_addr.s_addr == peer.sin_addr.s_addr, src.sin_port == peer.sin_port {
+        // A packet the far-away relay handed us arrives from our own loopback
+        // socket. It is the peer's -- it decrypted -- but its source address is
+        // not an address the peer can be reached at, so it is never adopted and
+        // never counts as "off path": it is treated as the locked path itself.
+        let viaTunnel = cfTunnel?.isLoopbackSource(src) == true
+        if locked, viaTunnel || (src.sin_addr.s_addr == peer.sin_addr.s_addr && src.sin_port == peer.sin_port) {
           // ── THE TWO STAMPS THAT BOUND A SILENCE ────────────────────────────
           //
           // Recorded HERE, on the receive thread, at the exact packet that ends
@@ -1749,20 +1875,49 @@ final class Wire {
           // port could steer the call by sending 256 packets; after it, doing so
           // requires holding the session key, which is the same bar `adopt` uses.
           if crypto?.established == true {
-            offPathRun += 1
-            if offPathRun >= 256 {
-              offPathRun = 0
-              relocks += 1
-              // READ BEFORE THE REASSIGNMENT. `peerDescription` is derived from
-              // `peer`, and `adoptFrom` is about to overwrite it -- so a line
-              // composed afterwards prints the SAME address twice and reads as a
-              // move to where we already were, which is exactly what the first
-              // run of this printed and exactly the wrong conclusion.
-              let was = peerDescription
-              adoptFrom(src)
-              lastFromPeer = lastRecvHost
-              fputs("path: their media has been arriving from \(pathKey(src)) and we were"
-                  + " sending to \(was) -- moving to theirs\n", stderr)
+            // ── ALIVE IS ALIVE, WHICHEVER ADDRESS IT CAME FROM ─────────────────
+            //
+            // This packet decrypted under the session key, so the person on the
+            // other end is there and reachable. That is the whole question the
+            // 3 s detector asks, and it used to be answered only by packets from
+            // the address WE chose -- so a healthy call whose two ends settled on
+            // different paths (the hairpin case above) read as silence and was
+            // torn down every 3.5 s. The gap stamps are kept for the same reason
+            // they are kept on-path: a rejoin is a rejoin from either address.
+            if lastFromPeer != 0, Clock.msSigned(lastRecvHost, lastFromPeer) > 1000 {
+              peerGoneAt = lastFromPeer
+              peerBackAt = lastRecvHost
+            }
+            lastFromPeer = lastRecvHost
+            // ── AND THE LAN IS A ONE-WAY DOOR ──────────────────────────────────
+            //
+            // Two Macs on one Wi-Fi, 0.139.0, live: this end upgraded to the LAN,
+            // 256 of their packets then arrived over the hairpin (they had not
+            // upgraded yet), this end moved BACK to the public address, the next
+            // LAN probe reply upgraded it again -- eleven round trips of that in
+            // one second, in the log. Their media arriving from the public address
+            // while OUR probes on the LAN are being answered is not evidence
+            // against the LAN; it is the other end still catching up, and it will,
+            // because its own LAN probes are answered back on the LAN. So while
+            // the locked private path has answered a probe in the last 3 s, hold
+            // it. If it has not -- the LAN really is dead -- the run below moves
+            // us exactly as before.
+            let toLan = isPrivateSubnet(src) && !isPrivateSubnet(peer)
+            let offLan = isPrivateSubnet(peer) && !isPrivateSubnet(src)
+            let lanAlive = offLan && lockedPathSeen != 0 && Clock.msSigned(lastRecvHost, lockedPathSeen) < 3000
+            if !lanAlive {
+              // Towards the LAN in 4 packets -- that is the upgrade this file wants
+              // anyway; anywhere else in 256, as before.
+              let threshold = toLan ? 4 : 256
+              offPathRun += 1
+              if offPathRun >= threshold {
+                offPathRun = 0
+                relocks += 1
+                let was = peerDescription
+                adoptFrom(src)
+                fputs("path: their media has been arriving from \(pathKey(src)) and we were"
+                    + " sending to \(was) -- moving to theirs\n", stderr)
+              }
             }
           }
         }
@@ -1796,7 +1951,12 @@ final class Wire {
         //     from beginning to end, and the first poll tick would restart the app
         //     out from under a working one-way call.
         Update.lastMediaHost = lastRecvHost
-        if !locked { adopt(src) }
+        if !locked, !viaTunnel { adopt(src) }
+      }
+      if magic == XMAGIC {
+        guard plainN >= 5 else { continue }
+        onPeerFarTest?(plain[4] & 1 != 0)
+        continue
       }
       if magic == VMAGIC {
         guard let v = video, plainN >= VHDR else { continue }
@@ -1936,7 +2096,7 @@ final class Wire {
           // request that arrived through the relay is still answered on the
           // channel, where a raw sendto to the relay's address would not land.
           out.withUnsafeBufferPointer { b in
-            if turn?.isTurnServer(src) == true {
+            if turn?.isTurnServer(src) == true || cfTunnel?.isLoopbackSource(src) == true {
               rawSend(b.baseAddress!, b.count, .probe)
             } else {
               rawSendTo(b.baseAddress!, b.count, .probe, to: src)

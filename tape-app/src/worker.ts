@@ -244,6 +244,7 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/xlate')) return this.xlate(request);
     if (url.pathname.endsWith('/lab') && request.method === 'POST') return this.lab(request);
     if (url.pathname.endsWith('/rv')) return this.rendezvous(url);
+    if (url.pathname.endsWith('/cf-relay') || url.pathname.endsWith('/xcont-tunnel')) return this.cfRelay(request, url);
     // ── The doorbell. THESE MUST RETURN BEFORE signal() BELOW. ───────────────
     // signal() answers 426 "expected websocket" to anything without an upgrade
     // header, so a handler added after the fallthrough is inert behind a
@@ -647,6 +648,88 @@ export class Room implements DurableObject {
       .filter(([k]) => k !== me)
       .map(([k, v]) => ({ id: k, addr: v.addr, local: v.local, relay: v.relay, ageMs: now - v.at }));
     return json({ me, peers: others });
+  }
+
+  // ── THE FAR-AWAY RELAY (the Mac app's "far-away test") ───────────────────
+  //
+  // Objects whose room code starts with `xcont-` are created with
+  // `locationHint: 'sam'` (South America -- the far side of the planet from
+  // Delhi, where this app is tested). Two Macs in one room each open a
+  // WebSocket here and every media datagram of the call goes out to this object
+  // and back to the other socket: the call travels to South America and back in
+  // both directions, which is exactly what one participant on a VPN there would
+  // cost it. Cloudflare only; no third party.
+  //
+  // Binary frames are media and are fanned out to every OTHER socket. Text
+  // frames are control: `xcont-ping` is answered with `xcont-pong` carrying the
+  // same stamp, so the client can measure the relay's own round trip and SAY
+  // where the object actually landed -- a hint is best-effort, and a "far-away"
+  // test whose relay sits in Mumbai must be able to notice.
+  private cfRelaySockets = new Set<WebSocket>();
+
+  private cfRelay(request: Request, url: URL): Response {
+    const ingress = (request.cf?.colo as string | undefined) ?? null;
+    if (request.headers.get('upgrade') !== 'websocket') {
+      return json({ ok: true, relay: 'far-test', hint: 'sam', ingress, peers: this.cfRelaySockets.size });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+    this.cfRelaySockets.add(server);
+
+    try {
+      server.send(JSON.stringify({ type: 'xcont-welcome', hint: 'sam', ingress, peers: this.cfRelaySockets.size }));
+    } catch { /* ignore */ }
+    // Everybody learns the head count on every join and leave: a Mac routes its
+    // media here only once BOTH are on, so the count is what starts the test.
+    const headcount = () => {
+      const msg = JSON.stringify({ type: 'xcont-peers', peers: this.cfRelaySockets.size });
+      for (const s of this.cfRelaySockets) { try { s.send(msg); } catch { /* closing */ } }
+    };
+    headcount();
+
+    // Fan a media frame out to every OTHER socket. The frame is whatever the
+    // runtime hands us: an ArrayBuffer in the docs, a Blob in this object as
+    // deployed (measured: `e.data.constructor.name === "Blob"`), and `send()`
+    // given a Blob does not send bytes -- it sends the thirteen characters
+    // "[object Blob]". Both Macs sat on the relay sending 1500 packets a
+    // second and receiving none, until the rig looked at what arrived.
+    const fanout = (buf: ArrayBuffer) => {
+      for (const peer of this.cfRelaySockets) {
+        if (peer !== server) {
+          try { peer.send(buf); } catch { /* peer closing */ }
+        }
+      }
+    };
+    server.addEventListener('message', (e: MessageEvent) => {
+      const d = e.data as unknown;
+      if (typeof d === 'string') {
+        try {
+          const m = JSON.parse(d) as { type?: string; t?: number };
+          if (m && m.type === 'xcont-ping') {
+            server.send(JSON.stringify({ type: 'xcont-pong', t: m.t, peers: this.cfRelaySockets.size }));
+          }
+        } catch { /* not ours */ }
+        return;
+      }
+      if (d instanceof ArrayBuffer) { fanout(d); return; }
+      if (ArrayBuffer.isView(d as ArrayBufferView)) {
+        const v = d as ArrayBufferView;
+        fanout(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer);
+        return;
+      }
+      if (d && typeof (d as Blob).arrayBuffer === 'function') {
+        (d as Blob).arrayBuffer().then(fanout, () => { /* dropped */ });
+      }
+    });
+
+    const teardown = () => {
+      if (this.cfRelaySockets.delete(server)) headcount();
+    };
+    server.addEventListener('close', teardown);
+    server.addEventListener('error', teardown);
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   /**
@@ -5140,7 +5223,7 @@ export default {
     }
 
     // /api/room/:code/ws | /api/room/:code/log | /api/room/:code/summary | …/warm
-    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab|warm|rv)$/);
+    const m = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|log|summary|xlate|lab|warm|rv|cf-relay|xcont-tunnel)$/);
     if (m) {
       const code = decodeURIComponent(m[1]);
       if (!ROOM_RE.test(code)) return json({ error: 'bad room code' }, 400);
@@ -5160,7 +5243,14 @@ export default {
       // rooms registry from inside the DO and needs to know which room it is.
       const doUrl = new URL(`https://do/${m[2]}${url.search}`);
       doUrl.searchParams.set('code', code);
-      return env.ROOM.get(env.ROOM.idFromName(code)).fetch(new Request(doUrl.toString(), request));
+      // The far-away relay lives in an object of its own, placed in South
+      // America. The hint is read only when the object is CREATED, which is why
+      // the relay never shares the call's own room object (that one was created
+      // by the first Mac to touch it, near Delhi).
+      const stub = code.startsWith('xcont-')
+        ? env.ROOM.get(env.ROOM.idFromName(code), { locationHint: 'sam' })
+        : env.ROOM.get(env.ROOM.idFromName(code));
+      return stub.fetch(new Request(doUrl.toString(), request));
     }
 
     if (url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404);

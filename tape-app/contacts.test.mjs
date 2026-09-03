@@ -1321,11 +1321,11 @@ const DEV2 = await device('dev2');
     sec('(l9) the toggle is rate limited, and a stranger cannot lock the owner out of it');
     const rmb = owned();
     let n = 0;
-    for (let i = 0; i < 6; i++) if ((await doQuiet(rmb, await quietOf(DEV), TO, NOW + i)).status === 200) n++;
-    const seventh = await doQuiet(rmb, await quietOf(DEV), TO, NOW + 6);
-    console.log(`  toggles in one minute: ${n} accepted, 7th -> ${seventh.status} ${JSON.stringify(seventh.body)}`);
-    eq(n, 6, '(l9) six toggles a minute per handle');
-    eq(seventh.status, 429, '(l9) the seventh is refused');
+    for (let i = 0; i < 30; i++) if ((await doQuiet(rmb, await quietOf(DEV), TO, NOW + i)).status === 200) n++;
+    const nextToggle = await doQuiet(rmb, await quietOf(DEV), TO, NOW + 30);
+    console.log(`  toggles in one minute: ${n} accepted, next -> ${nextToggle.status} ${JSON.stringify(nextToggle.body)}`);
+    eq(n, 30, '(l9) thirty toggles a minute per handle');
+    eq(nextToggle.status, 429, '(l9) the thirty-first is refused');
     eq((await doQuiet(rmb, await quietOf(DEV, { t: T + 61 }), TO, NOW + 61_000)).status, 200,
       '(l9) and the window reopens — a limit that never reopens is a ban');
 
@@ -2482,6 +2482,16 @@ const DEV2 = await device('dev2');
       eq(mine?.update_checks, 4, '(k5) and how many checks it has managed, from events');
       eq(mine?.watches, 1, '(k5) heartbeats counted');
       eq(mine?.calls, 1, '(k5) and calls counted separately');
+
+      // ── (k6) the far-away relay answers, and says where it is meant to be ──
+      const cfRes = await mf.dispatchFetch('http://x/api/room/xcont-testroom/cf-relay');
+      eq(cfRes.status, 200, '(k6) cf-relay HTTP probe answers 200');
+      const cfJson = await cfRes.json();
+      eq(cfJson.ok, true, '(k6) cf-relay ok');
+      eq(cfJson.hint, 'sam', '(k6) the relay object is hinted to South America');
+      eq(cfJson.peers, 0, '(k6) nobody on it yet');
+      const plainRes = await mf.dispatchFetch('http://x/api/room/plainroom/cf-relay');
+      eq(plainRes.status, 200, '(k6) the route exists on an ordinary room too (no hint there)');
     }
   } finally {
     await mf.dispose();

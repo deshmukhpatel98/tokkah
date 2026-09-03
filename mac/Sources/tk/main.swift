@@ -16,6 +16,17 @@ import Foundation
 
 let VERSION = "0.139.0"
 
+// ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
+//
+// Twelve packet kinds, twelve constants in four files, and nothing else stops a
+// new one from taking a number that is already spoken for -- the goodbye's, in
+// the case that prompted this. A duplicate is not a compile error and not a
+// visible failure: the far end simply does what the OTHER packet means. This
+// refuses to start instead, so every rig in tools/ trips on it at once.
+precondition(Set([MAGIC, VMAGIC, KMAGIC, TMAGIC, HMAGIC, SMAGIC, XMAGIC, BMAGIC,
+                  Crypto.HS_V2_MAGIC, Crypto.HS_MAGIC, Crypto.HSK_MAGIC, Crypto.HSC_MAGIC]).count == 12,
+             "two wire packet kinds share a magic number")
+
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
 // Declared here, as top-level code in main.swift, because top-level statements
@@ -529,6 +540,9 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
+  // The far-away test on from the first packet, for the rig and for a Mac
+  // driven from a terminal; the sheet and the menu switch it during a call.
+  "far-test",
   "no-vdenoise", "vdenoise-t", "vdenoise-floor", "vdenoise-deadband", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap", "vcodec",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
@@ -3396,7 +3410,16 @@ if let room = arg("room") {
     if stunDone.wait(timeout: .now()) == .success { stunReady = true }
   }
 
-  let myLocal = localIPv4().map { "\($0):\(listenPort)" }
+  let actualListenPort = wire.boundPort > 0 ? wire.boundPort : listenPort
+  let myLocal = localIPv4().map { "\($0):\(actualListenPort)" }
+
+  func isSameSubnet(_ ip1: String, _ ip2: String) -> Bool {
+    let p1 = ip1.split(separator: ".")
+    let p2 = ip2.split(separator: ".")
+    guard p1.count == 4, p2.count == 4 else { return false }
+    return p1[0] == p2[0] && p1[1] == p2[1] && p1[2] == p2[2]
+  }
+
   let mine = mapped.map { "\($0.ip):\($0.port)" }
   // These diagnostics deliberately stay on the MAIN thread: setStatus is AppKit,
   // and off-main AppKit mutation is the class of bug that has already SIGSEGV'd
@@ -3500,28 +3523,33 @@ if let room = arg("room") {
     }
     let peers = answer ?? []
     if let p = peers.first {
-      // Every address we have, raced by measured RTT — LAN, public, and the
-      // peer's TURN relayed address. First-packet-wins was the public internet
-      // as often as the short path.
-      wire.addCandidate(ip: p.ip, port: p.port)
-      var cands = ["\(p.ip):\(p.port)"]
+      let myPubIP = mine?.split(separator: ":").first.map(String.init)
+      let samePublicIP = (myPubIP != nil && myPubIP == p.ip)
+      let sameLocalSubnet: Bool = {
+        guard let myL = myLocal?.split(separator: ":").first,
+              let peerL = p.localIP else { return false }
+        return isSameSubnet(String(myL), peerL)
+      }()
+      let onSameLan = samePublicIP || sameLocalSubnet
+
+      var cands: [String] = []
       if let lip = p.localIP, let lport = p.localPort {
         wire.addCandidate(ip: lip, port: lport)
         cands.append("\(lip):\(lport)")
       }
+      wire.addCandidate(ip: p.ip, port: p.port)
+      cands.append("\(p.ip):\(p.port)")
       if let rip = p.relayIP, let rport = p.relayPort {
         wire.addCandidate(ip: rip, port: rport)
         cands.append("relay \(rip):\(rport)")
       }
-      // NOT HERE. bindPeer does two round-trips on wire.fd, and the TURN thread
-      // above may still be inside its own -- two readers on one descriptor, the
-      // exact race this file spends 40 lines warning about. Remembered, and done
-      // once that thread has signalled, a few lines below.
       bindTarget = (p.ip, p.port)
-      // A provisional destination so media has somewhere to go in the moments
-      // before a probe comes back; the first packet that arrives replaces it with
-      // an address known to work.
-      wire.setPeer(ip: p.ip, port: p.port)
+      if onSameLan, let lip = p.localIP, let lport = p.localPort {
+        fputs("room \(room): peers on same Wi-Fi (public \(p.ip)) -- locking direct LAN \(lip):\(lport)\n", stderr)
+        wire.setPeer(ip: lip, port: lport)
+      } else {
+        wire.setPeer(ip: p.ip, port: p.port)
+      }
       fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
       Metrics.mark("peer_found_ms", sinceLaunch())
       Metrics.count("join_polls", attempt)
@@ -3630,6 +3658,15 @@ if let room = arg("room") {
     fputs("turn: still working after 20 s -- carrying on without the relay"
         + " (that thread is now a second reader on the media socket)\n", stderr)
   }
+
+  // ── THE FAR-AWAY TEST, ARMED FOR EVERY CALL ─────────────────────────────
+  //
+  // Created here, off by default, so the sheet and the menu have something to
+  // switch and the far end's beat has something to land on. It opens no socket
+  // until somebody turns it on. See CloudflareTunnel.swift.
+  FarTest.shared = FarTest(room: room, wire: wire)
+  if flag("far-test") { FarTest.shared?.setMine(true) }
+
   // Keep the lease alive and keep re-reading: if the peer restarts, its NAT port
   // changes and the old address goes dead silently.
   //
@@ -4011,9 +4048,22 @@ if let room = arg("room") {
       // since that peer last said it was there, so the answer arrives in seconds
       // and needs no change to the protocol.
       func addAll(_ p: Rendezvous.Peer) {
-        wire.addCandidate(ip: p.ip, port: p.port)
+        let myPubIP = mine?.split(separator: ":").first.map(String.init)
+        let samePublicIP = (myPubIP != nil && myPubIP == p.ip)
+        let sameLocalSubnet: Bool = {
+          guard let myL = myLocal?.split(separator: ":").first,
+                let peerL = p.localIP else { return false }
+          return isSameSubnet(String(myL), peerL)
+        }()
+        let onSameLan = samePublicIP || sameLocalSubnet
+
         if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
+        wire.addCandidate(ip: p.ip, port: p.port)
         if let rip = p.relayIP, let rport = p.relayPort { wire.addCandidate(ip: rip, port: rport) }
+
+        if onSameLan, let lip = p.localIP, let lport = p.localPort, !wire.locked {
+          wire.setPeer(ip: lip, port: lport)
+        }
       }
       if let p = peers.first, p.ageMs < 4000 {
         gone = 0
@@ -7444,6 +7494,10 @@ func reportLoop() {
       + (impair.enabled ? "  [IMPAIRED \(impair.description), \(impair.dropped) dropped]" : "")
       + (audio.audioStalls > 0 ? "  [\(audio.audioStalls) capture stall(s) recovered]" : "")
       + (audio.rateEvents > 0 ? "  [\(audio.rateEvents) device rate change(s)]" : "") + "\n", stderr)
+  // The far-away test's own line, only while it is on: how much of the call
+  // went the long way round and how long the round trip to the relay is. A rig
+  // reads it, and so does the person deciding whether the relay is really far.
+  if let ft = FarTest.shared, ft.on { fputs("  \(ft.relayLine)\n", stderr) }
 
   // ── AND TELL THE PERSON ON THE CALL ─────────────────────────────────────────
   //
@@ -8254,6 +8308,7 @@ func reportLoop() {
   // Fourth instance today of one condition answering two questions. "Do I have a
   // video encoder" was deciding "does the other person find out I muted".
   wire.selfMuted = display?.controls?.micMuted ?? false
+  FarTest.shared?.tick()
   wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
                   | ((camOff || noCameraHere) ? Wire.ST_CAMOFF : 0)
                   // The bit that stops a ring answering itself. See the block

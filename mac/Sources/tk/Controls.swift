@@ -4602,7 +4602,16 @@ final class CallControls: NSView {
     }
   }
 
-@objc private func toggleSilentRow(_ sender: SheetRow) {
+  @objc private func toggleFarTestRow(_ sender: SheetRow) {
+    Metrics.tap("far_test")
+    guard let f = FarTest.shared else { setStatus("Start a call first"); nudgeBar(); return }
+    f.toggle()
+    setStatus(f.short)
+    refreshSheet()
+    nudgeBar()
+  }
+
+  @objc private func toggleSilentRow(_ sender: SheetRow) {
     Metrics.tap("silent")
     guard !silentBusy else { return }
     let want = !silent
@@ -5332,6 +5341,22 @@ final class CallControls: NSView {
     q.target = self; q.action = #selector(toggleSilentRow(_:))
     items.append(q)
     if !settingsNote.isEmpty { items.append(SheetHint(settingsNote)) }
+
+    // ── THE FAR-AWAY TEST ───────────────────────────────────────────────────
+    //
+    // A testing feature, on purpose in the consumer sheet: the person who
+    // asked for it tests on two Macs in one room and wants to feel a call to
+    // the other side of the world. A switch, one sentence, and the one number
+    // the feature exists to show. The sheet re-reads once a second, so the
+    // sentence tracks the relay coming up without anybody pressing anything.
+    if let f = FarTest.shared {
+      let far = SheetRow("Far-away test", glyph: Glyph.more)
+      far.switchState = f.on
+      far.target = self; far.action = #selector(toggleFarTestRow(_:))
+      items.append(far)
+      items.append(SheetHint(f.sentence))
+    }
+
     items.append(safety)
     items.append(SheetHint(silent
       ? "Silent: nobody can ring you. To them you simply look away."

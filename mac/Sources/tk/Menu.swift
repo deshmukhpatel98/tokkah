@@ -159,6 +159,11 @@ enum Menu {
                  keyEquivalent: "").target = Target.shared
     let code = call.addItem(withTitle: "Show Encryption Code", action: #selector(Target.more), keyEquivalent: "")
     code.target = Target.shared
+    // The far-away test: the call, routed to South America and back. A test
+    // feature with a menu item because the person testing it drives from the
+    // keyboard on two Macs at once.
+    let far = call.addItem(withTitle: "Far-Away Test", action: #selector(Target.farTest), keyEquivalent: "t")
+    far.keyEquivalentModifierMask = [.command, .shift]; far.target = Target.shared
     call.addItem(.separator())
     // Command-Delete, the same key a Mac uses everywhere else for "get rid of it",
     // and it still asks: the menu arms the confirm exactly as the button does.
@@ -295,6 +300,12 @@ enum Menu {
     @objc func more() { Menu.controls?.nudgeBar(); Menu.controls?.openMore() }
     @objc func people() { Menu.controls?.nudgeBar(); Menu.controls?.openPeople() }
     @objc func leave() { Menu.controls?.nudgeBar(); Menu.controls?.leave() }
+    @objc func farTest() {
+      guard let f = FarTest.shared else { Menu.controls?.setStatus("Start a call first"); Menu.controls?.nudgeBar(); return }
+      f.toggle()
+      Menu.controls?.setStatus(f.short)
+      Menu.controls?.nudgeBar()
+    }
     @objc func record() {
       if CallRecorder.shared.isRecording {
         let summary = CallRecorder.shared.stop()
