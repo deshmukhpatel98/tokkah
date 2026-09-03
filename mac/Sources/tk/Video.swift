@@ -709,14 +709,18 @@ final class VEncoder {
   // seconds anyway.
   private let cfgW: Int, cfgH: Int, cfgBitrate: Int
   private var cfgQuality: Double?
+  /// H.264 unless the far end has said it decodes HEVC (see the wire flag in
+  /// `serialize`). Apple silicon encodes and decodes both in hardware; HEVC is
+  /// the same picture for fewer bytes, and fewer bytes is fewer fragments.
+  private(set) var hevc: Bool
   /// Set by the controller on any thread; consumed on the capture thread inside
   /// `encode`. A pending flag rather than a lock, matching `wantKey`: rebuilding
   /// under the encoder's own thread means no other thread can be inside it.
   nonisolated(unsafe) var pendingQuality: Double?
   private(set) var rebuilds = 0
 
-  init(width: Int, height: Int, bitrate: Int, quality: Double? = nil) throws {
-    cfgW = width; cfgH = height; cfgBitrate = bitrate; cfgQuality = quality
+  init(width: Int, height: Int, bitrate: Int, quality: Double? = nil, hevc: Bool = false) throws {
+    cfgW = width; cfgH = height; cfgBitrate = bitrate; cfgQuality = quality; self.hevc = hevc
     try buildSession()
   }
 
@@ -725,7 +729,8 @@ final class VEncoder {
   private func buildSession() throws {
     var s: VTCompressionSession?
     let st = VTCompressionSessionCreate(allocator: nil, width: Int32(cfgW), height: Int32(cfgH),
-      codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
+      codecType: hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+      encoderSpecification: nil, imageBufferAttributes: nil,
       compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
     guard st == noErr, let sess = s else { throw Err.e("VTCompressionSessionCreate \(st)") }
     session = sess
@@ -740,7 +745,8 @@ final class VEncoder {
     }
     set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime")
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "AllowFrameReordering")   // no B-frames
-    set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel, "ProfileLevel")
+    set(kVTCompressionPropertyKey_ProfileLevel,
+        hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel, "ProfileLevel")
     set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: cfgBitrate), "AverageBitRate")
     set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 100_000), "MaxKeyFrameInterval")
     set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 100_000), "MaxKeyFrameIntervalDuration")
@@ -897,7 +903,7 @@ final class VEncoder {
       guard let self, status == noErr, let sb, CMSampleBufferDataIsReady(sb) else { return }
       self.encLatMs.add(Clock.ms(Clock.now() - t0))
       self.encodes += 1
-      guard let payload = Self.serialize(sb) else { return }
+      guard let payload = Self.serialize(sb, hevc: self.hevc) else { return }
       let key = Self.isKeyframe(sb)
       // SPLIT THE BYTES BY FRAME TYPE.
       //
@@ -926,25 +932,40 @@ final class VEncoder {
   /// a receiver that joins late, or loses the one packet that carried them, must
   /// be able to start from the next keyframe alone and never from a handshake
   /// that may never be repeated.
-  private static func serialize(_ sb: CMSampleBuffer) -> Data? {
+  /// The count byte's top bit says HEVC: an H.264 keyframe carries 2 sets, an
+  /// HEVC one 3 (VPS, SPS, PPS), and a receiver that does not know the bit reads
+  /// a count of 131 and fails the frame -- which is why the bit is only ever set
+  /// once the far end has said it understands it.
+  static let HEVC_FLAG: UInt8 = 0x80
+  private static func serialize(_ sb: CMSampleBuffer, hevc: Bool) -> Data? {
     var out = Data()
     if isKeyframe(sb), let fd = CMSampleBufferGetFormatDescription(sb) {
       var count = 0
-      CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
-        parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
-      out.append(UInt8(min(count, 255)))
+      if hevc {
+        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
+          parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+      } else {
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
+          parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+      }
+      out.append(UInt8(min(count, 127)) | (hevc ? HEVC_FLAG : 0))
       for i in 0..<count {
         var ptr: UnsafePointer<UInt8>?
         var len = 0
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: i,
-          parameterSetPointerOut: &ptr, parameterSetSizeOut: &len, parameterSetCountOut: nil,
-          nalUnitHeaderLengthOut: nil) == noErr, let p = ptr else { return nil }
+        let st = hevc
+          ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: i,
+              parameterSetPointerOut: &ptr, parameterSetSizeOut: &len, parameterSetCountOut: nil,
+              nalUnitHeaderLengthOut: nil)
+          : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: i,
+              parameterSetPointerOut: &ptr, parameterSetSizeOut: &len, parameterSetCountOut: nil,
+              nalUnitHeaderLengthOut: nil)
+        guard st == noErr, let p = ptr else { return nil }
         var l16 = UInt16(len).littleEndian
         withUnsafeBytes(of: &l16) { out.append(contentsOf: $0) }
         out.append(UnsafeBufferPointer(start: p, count: len))
       }
     } else {
-      out.append(UInt8(0))
+      out.append(hevc ? HEVC_FLAG : 0)
     }
     guard let bb = CMSampleBufferGetDataBuffer(sb) else { return nil }
     var total = 0
