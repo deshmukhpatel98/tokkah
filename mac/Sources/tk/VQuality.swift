@@ -164,10 +164,30 @@ final class VQuality {
   /// neither arm and measured nothing. A control arm has to be holdable.
   private let held: Bool
 
+  // ── A FRAME TOO BIG TO SEND IS HARM BEFORE ANY PACKET IS LOST ──────────────
+  //
+  // The ladder stepped down on one signal only: the far end losing video. On a
+  // clean link nothing ever stepped it down, so a dark room sat at q0.7 sending
+  // 28,600-byte frames -- 25 fragments each, 11 ms of serialisation on a 20 Mbps
+  // uplink, for a picture the ruler measures at 38.9 dB because the source is
+  // grain-limited. One rung down that same picture is 8,400 bytes and 36.2 dB:
+  // 2.7 dB nobody can see on a noisy picture, for 3.4x fewer bytes to serialise
+  // and 3.4x fewer fragments for one lost packet to take a frame with.
+  //
+  // So bytes per frame is a second reason to step down. A lit room at q0.7 is
+  // 7,400 bytes and never trips it; the calls this month that read 18-19 KB
+  // (dim rooms, luma ~74) would. Measured over a streak, not a second, so a
+  // pan or a laugh does not move the ladder. `--vbytes-cap 0` turns it off.
+  let heavyCap: Int
+  private static let heavyAfter = 5
+  private var heavyFor = 0
+  private(set) var heavyDowns = 0
+
   init(ceiling: Double? = nil, hold: Bool = false, pause: Bool = true,
-       pauseAfter: Int = 3, resumeQuiet: Int = 8) {
+       pauseAfter: Int = 3, resumeQuiet: Int = 8, heavyCap: Int = 12_000) {
     held = hold
     canPause = pause
+    self.heavyCap = max(0, heavyCap)
     self.pauseAfter = max(1, pauseAfter)
     self.resumeQuietBase = max(1, resumeQuiet)
     // A `--vquality` value pins the ceiling; without one the ceiling is the top
@@ -212,7 +232,7 @@ final class VQuality {
   /// harm is necessarily zero and every pause would grade itself a success. A
   /// metric that cannot see the failure returns the same value as a pass.
   func tick(now: Double, pictureHarmed: Bool, voiceHarmed: Bool,
-            voiceHarmRaw: Int) -> Double? {
+            voiceHarmRaw: Int, bytesPerFrame: Int = 0) -> Double? {
     if held { return nil }
     recentHarm.append(voiceHarmRaw)
     if recentHarm.count > pauseAfter { recentHarm.removeFirst() }
@@ -228,6 +248,23 @@ final class VQuality {
     // Either kind of unhappiness stops the picture climbing; only the picture's own
     // loss makes it step down, and only the voice's makes it stop.
     let harmed = pictureHarmed || voiceHarmed
+
+    // Heavy frames: see `heavyCap`. Only while there is a rung below to go to,
+    // and never while paused (there is no frame). Blocks the rung it leaves like a
+    // lossy one, so the up-path's backoff stops it climbing straight back into
+    // the same 28 KB frames fifteen seconds later.
+    if heavyCap > 0, !paused, level > 0, bytesPerFrame > heavyCap {
+      heavyFor += 1
+      if heavyFor >= VQuality.heavyAfter {
+        heavyFor = 0
+        blockedUntil[level] = now + penalty[level]
+        penalty[level] = min(penalty[level] * 2, 120)
+        level -= 1
+        heavyDowns += 1
+        quietFor = 0
+        return quality
+      }
+    } else { heavyFor = 0 }
 
     // ── WHILE PAUSED, THE ONLY QUESTION IS WHEN TO COME BACK ──────────────────
     //
@@ -403,6 +440,7 @@ final class VQuality {
     (paused ? "PAUSED (was q" : (held ? "HELD q" : "q")) + String(format: "%.1f", quality)
       + (paused ? ")" : "")
       + " (level \(level)/\(ceiling), \(stepDowns) down \(stepUps) up"
+      + (heavyDowns > 0 ? " \(heavyDowns) heavy-down" : "")
       + (refusedUps > 0 ? " \(refusedUps) up-refused" : "")
       + (pauses > 0 ? ", \(pauses) pause\(pauses == 1 ? "" : "s") \(pausedTicks)s" : "")
       + (pauseHelpless ? ", pausing ABANDONED" : "") + ")"

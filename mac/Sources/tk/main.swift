@@ -529,7 +529,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size",
+  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
@@ -5557,7 +5557,10 @@ audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
 let vq = VQuality(ceiling: arg("vquality").flatMap { Double($0) }, hold: flag("vq-hold"),
                   pause: !flag("no-vpause"),
                   pauseAfter: arg("vpause-after").flatMap { Int($0) } ?? 3,
-                  resumeQuiet: arg("vpause-quiet").flatMap { Int($0) } ?? 8)
+                  resumeQuiet: arg("vpause-quiet").flatMap { Int($0) } ?? 8,
+                  heavyCap: arg("vbytes-cap").flatMap { Int($0) } ?? 12_000)
+/// Bytes and frames the ladder last saw, so it is told this second's bytes per frame.
+var vqBytesPrev = 0, vqFramesPrev = 0
 // ── Prove a live encoder property, or do not believe it ─────────────────────
 //
 // `--vq-step 30:400000` drops the bitrate ceiling to 400 kbps at t=30 s on an
@@ -7745,6 +7748,7 @@ func reportLoop() {
     if let q = venc?.qualityNow { vb["v_quality"] = q }
     vb["v_dq_queued"] = dq.queued
     vb["v_dq_inline_full"] = dq.inlineFull
+    vb["v_q_heavy_downs"] = vq.heavyDowns
     vb["v_dq_inline_big"] = dq.inlineTooBig
     vb["v_dq_depth_max"] = dq.maxDepth
     if let d = display { vb["v_shown"] = d.shown; vb["v_enq_fail"] = d.enqueueFails }
@@ -8029,7 +8033,12 @@ func reportLoop() {
     let changed = vq.tick(now: Double(beatTick),
                           pictureHarmed: harmIsVideo ? harmed : false,
                           voiceHarmed: voiceHarmed,
-                          voiceHarmRaw: voiceDelta)
+                          voiceHarmRaw: voiceDelta,
+                          bytesPerFrame: sentFrames > 0 ? sentBytes / sentFrames : 0)
+    if vq.level < wasLevel, !harmed, sentFrames > 0 {
+      fputs("  picture: frames of \(sentBytes / sentFrames) B are over the \(vq.heavyCap) B cap"
+          + " -- stepping down without waiting for loss\n", stderr)
+    }
     // ── STOPPING THE PICTURE, AND SAYING SO IN THREE PLACES ───────────────────
     //
     // The decision is made here and has to reach three separate consumers, none
@@ -8049,6 +8058,9 @@ func reportLoop() {
     if vq.paused != wasPaused {
       Metrics.count(vq.paused ? "video_pause" : "video_resume")
       fputs("  picture: video \(vq.paused ? "PAUSED -- the link could not carry the floor" : "resumed")"
+    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
+    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
+    let wasLevel = vq.level
           + " (pause \(vq.pauses), \(vq.pausedTicks)s paused so far)"
           + (vq.pauseVerdict.isEmpty ? "" : " -- \(vq.pauseVerdict)") + "\n", stderr)
     }

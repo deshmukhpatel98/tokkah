@@ -43,6 +43,20 @@ threshold of 24 treated dark-room grain (~8 levels frame to frame) as motion.
 A fixed 40 took the grain out but turned a slow pan into a ghost (whole face in
 the difference image at 40 dB); the adaptive threshold lands at ~8 lit and ~28 dark.
 
+### Changed — a frame too big to send is harm before any packet is lost
+
+The quality ladder stepped down on one signal only: the far end losing video. On
+a clean link nothing ever stepped it down, so a dark room sat at q0.7 sending
+28,600-byte frames -- 25 fragments each, 11 ms of serialisation on a 20 Mbps
+uplink -- for a picture the ruler measures at 38.9 dB because the source is
+grain-limited. One rung down that picture is 8,400 bytes and 36.2 dB. Bytes per
+frame is now a second reason to step down: five consecutive seconds over 12,000 B
+(`--vbytes-cap`, 0 disables) drops a rung and blocks it the way a lossy rung is
+blocked. Loopback, dark capture as the camera: 37,200 B/frame at q0.7 → stepped to
+q0.6 at 13 s → 11,300 B/frame for the rest of the call, `v_q_heavy_downs 1`. The
+lit clip on the other end stayed at q0.7 (7–10 KB). The live calls this month that
+read 18–19 KB/frame (dim rooms) would take this step; the 4.7–5.6 KB ones would not.
+
 ### Fixed — the camera delivered 1080p to a 720p encoder
 
 `camera: mode 1280x720` was logged and the first frame measured 1920×1080: the
