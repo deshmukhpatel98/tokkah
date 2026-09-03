@@ -738,9 +738,9 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                         add(com.tokkah.kin.ui.SheetItem.Hint("Give this to someone and they can call you."))
                     }
                     // Only where it can work: mid-call there is no name field to hand over to.
-                    if (!peerPresent) add(com.tokkah.kin.ui.SheetItem.Row("Call someone new", onClick = {
+                    if (!peerPresent) add(com.tokkah.kin.ui.SheetItem.Row("Call someone new", indent = true, onClick = {
                         Metrics.tap("call_new"); page = null; dialFocus++ }))
-                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { Metrics.tap("people_back"); page = "settings" }))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", indent = true, onClick = { Metrics.tap("people_back"); page = "settings" }))
                 }
                 "rename" -> listOf(
                     com.tokkah.kin.ui.SheetItem.Hint("This is the name people type to call you."),
