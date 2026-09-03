@@ -173,7 +173,7 @@ fun CallScreen(
                 // show, the ground covers it (the Mac hides its picture layer;
                 // a SurfaceView cannot be hidden without losing the decoder's
                 // output surface).
-                if (ui.noPicture != null) Box(Modifier.fillMaxSize().background(Palette.bg))
+                if (ui.noPicture != null || !ui.peerPresent) Box(Modifier.fillMaxSize().background(Palette.bg))
             }
         },
     ) {
