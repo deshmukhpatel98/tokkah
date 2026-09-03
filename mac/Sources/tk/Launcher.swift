@@ -917,6 +917,11 @@ enum Launcher {
     reachRow.textInset = Metric.rowAvatarInset
     v.addSubview(reachRow)
     v.addSubview(reachHint)
+    let verRow = SheetRow("Version")
+    let verHint = SheetHint("")
+    verRow.textInset = Metric.rowAvatarInset
+    v.addSubview(verRow)
+    v.addSubview(verHint)
     // ── THE FURNITURE GOES BEHIND ONE BUTTON ─────────────────────────────────
     //
     // Your own handle, the login item, silent mode: all three are ABOUT you and
@@ -947,7 +952,7 @@ enum Launcher {
     // wrong here. Observed, before this line: an app launch put the list under a
     // resting pointer and the next click rang @arjun.
     for r in peopleRows { r.acceptsFirstClick = false }
-    for r in [linkRow, inviteRow, resumeRow, mineRow, reachRow] { r.acceptsFirstClick = false }
+    for r in [linkRow, inviteRow, resumeRow, mineRow, reachRow, verRow] { r.acceptsFirstClick = false }
 
     // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
@@ -1009,6 +1014,31 @@ enum Launcher {
       /// Turn on the login item. A closure rather than a method body because the
       /// row it reports into is built outside this class.
       var makeReachable: () -> Void = {}
+      var updateChecking = false
+      var updateNote = ""
+      @objc func checkUpdate(_ sender: SheetRow) {
+        Metrics.tap("check_update_row")
+        guard !updateChecking else { return }
+        if Update.pending != nil {
+          Update.restartNow = true
+          return
+        }
+        updateChecking = true
+        updateNote = ""
+        relayout()
+        Update.checkNowForPerson()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+          guard let self else { return }
+          self.updateChecking = false
+          self.updateNote = Update.pending != nil ? "" : "This is the newest version."
+          self.relayout()
+          DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self, !self.updateNote.isEmpty else { return }
+            self.updateNote = ""
+            self.relayout()
+          }
+        }
+      }
       init(field: NSTextField, status: NSTextField) {
         self.field = field; self.status = status
       }
@@ -1159,7 +1189,7 @@ enum Launcher {
         // name is in flight without a second surface saying it.
         r.alphaValue = (who == nil || r.handleName == who) ? 1 : 0.4
       }
-      for r in [linkRow, mineRow, reachRow] as [NSView] {
+      for r in [linkRow, mineRow, reachRow, verRow] as [NSView] {
         r.alphaValue = who == nil ? 1 : 0.4
       }
       fieldBack.alphaValue = who == nil ? 1 : 0.4
@@ -1311,6 +1341,27 @@ enum Launcher {
         // camera picture.
         column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
         column += [reachRow, reachHint]
+        if t?.updateChecking == true {
+          verRow.setLabel("Version")
+          verRow.value = "checking\u{2026}"
+          verRow.valueIsWord = true
+          verRow.valueIsAction = false
+          verRow.inert = true
+        } else if Update.pending != nil {
+          verRow.setLabel("Update ready")
+          verRow.value = "restart"
+          verRow.valueIsWord = true
+          verRow.valueIsAction = true
+          verRow.inert = false
+        } else {
+          verRow.setLabel("Version")
+          verRow.value = VERSION
+          verRow.valueIsWord = true
+          verRow.valueIsAction = true
+          verRow.inert = false
+        }
+        verHint.setText(t?.updateNote ?? "")
+        column += [verRow, verHint]
       } else {
         // A call you are still in comes first: it is the only row on this card
         // about something already happening. Then a link somebody just sent you,
@@ -1334,7 +1385,7 @@ enum Launcher {
       column = column.filter { ($0 as? SheetHint).map { !$0.text.isEmpty } ?? true }
       let shown = Set(column.map { ObjectIdentifier($0) })
       for x in [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
-                emptyHint, reachRow, reachHint] as [NSView] {
+                emptyHint, reachRow, reachHint, verRow, verHint] as [NSView] {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       moreBtn.on = t?.settingsOpen == true
@@ -1420,11 +1471,13 @@ enum Launcher {
         if x === status { return "status" }
         if x === mineRow { return "mine" }
         if x === reachRow { return "reach" }
+        if x === verRow { return "ver" }
         if x === emptyHint { return "empty" }
         // Named, not "hint": three of these can be on one card and a rig that
         // cannot tell them apart cannot say which sentence came back.
         if x === mineHint { return "mine-hint" }
         if x === reachHint { return "reach-hint" }
+        if x === verHint { return "ver-hint" }
         if x is SheetHint { return "hint" }
         if let c = x as? ContactRow { return "@" + c.handleName }
         return "?"
@@ -1442,6 +1495,8 @@ enum Launcher {
     mineRow.target = t; mineRow.action = #selector(Target.copyMine(_:))
     reachRow.target = t
     reachRow.action = #selector(Target.reachable)
+    verRow.target = t
+    verRow.action = #selector(Target.checkUpdate(_:))
     linkRow.target = t; linkRow.action = #selector(Target.joinClip)
     moreBtn.target = t; moreBtn.action = #selector(Target.settings)
     inviteRow.target = t; inviteRow.action = #selector(Target.copyInvite(_:))
@@ -1831,6 +1886,7 @@ enum Launcher {
     func rowNamed(_ n: String) -> SheetRow? {
       switch n {
       case "reach": return reachRow
+      case "ver": return verRow
       case "mine": return mineRow
       case "link": return linkRow
       case "invite": return inviteRow
@@ -1847,7 +1903,7 @@ enum Launcher {
     // publishes `firstMouseAt` for the same rule and the same reason.
     var audit: [String] = []
     for r in peopleRows { audit.append("@\(r.handleName)=\(r.acceptsFirstMouse(for: nil))") }
-    for (n, r) in [("link", linkRow), ("reach", reachRow), ("mine", mineRow as SheetRow)] {
+    for (n, r) in [("link", linkRow), ("reach", reachRow), ("mine", mineRow as SheetRow), ("ver", verRow)] {
       audit.append("\(n)=\(r.acceptsFirstMouse(for: nil))")
     }
     fputs("home firstmouse " + audit.joined(separator: " ") + "\n", stderr)
@@ -1895,7 +1951,7 @@ enum Launcher {
         case "?":
           for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
           fputs("\(Backdrop.shared.describe)\n", stderr)
-          fputs("home rows: " + ([linkRow, inviteRow, resumeRow, mineRow, reachRow]
+          fputs("home rows: " + ([linkRow, inviteRow, resumeRow, mineRow, reachRow, verRow]
             + peopleRows as [SheetRow])
             .filter { !$0.isHidden }.map(\.spoken).joined(separator: " | ") + "\n", stderr)
         // ── A REAL CLICK, NOT A HANDLER CALL ──────────────────────────────────
