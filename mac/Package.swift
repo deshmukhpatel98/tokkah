@@ -20,7 +20,7 @@ let package = Package(
       // anywhere because a lock on the audio thread is a dropout. The checker's
       // only available advice there is to add synchronisation that would break
       // the thing it is protecting.
-      swiftSettings: [.swiftLanguageMode(.v5), .unsafeFlags(["-Ounchecked"])],
+      swiftSettings: [.swiftLanguageMode(.v5), .unsafeFlags(["-O"])],
       linkerSettings: [
         .linkedFramework("CoreAudio"),
         .linkedFramework("AudioToolbox"),

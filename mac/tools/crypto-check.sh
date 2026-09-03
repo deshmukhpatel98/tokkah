@@ -43,7 +43,9 @@ COMMON=(--video off --mute --no-update --no-relocate --no-rings --no-subtitles
         --tel-endpoint "http://127.0.0.1:$PORT/api/mac/beat")
 
 echo "== 0. the class =="
-if "$TK" --selftest-crypto --no-telemetry >/dev/null 2>"$SP/self.log"; then say ok "selftest PASS ($(grep -c '  ok ' "$SP/self.log") arms)"
+# Its own port: the self-test runs after the socket is bound (top-level order),
+# and 7001 is whatever other rig or resident happens to hold it.
+if "$TK" --selftest-crypto --no-telemetry --listen $((21000 + RANDOM % 9000)) >/dev/null 2>"$SP/self.log"; then say ok "selftest PASS ($(grep -c '  ok ' "$SP/self.log") arms)"
 else say FAIL "selftest: $(grep FAIL "$SP/self.log" | head -3)"; fi
 
 # beats for one call id -> merged fields (last wins), as JSON on stdout

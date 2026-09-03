@@ -507,6 +507,39 @@ final class Crypto {
     let h = Crypto(roomSalt: room, identitySeed: seedB)
     check("x".withCString { h.seal(UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self), 1, into: &buf) } == nil, "no seal before a key")
 
+    // ── THE COST, on this build, at the real packet size ─────────────────────
+    //
+    // The header's "0.78 us to seal 276 bytes" was measured once. A build flag
+    // (-O vs -Ounchecked), a CryptoKit update, or an allocator change can move
+    // it, so every self-test prints it again. Informational, never a FAIL: the
+    // deadline it is judged against (1333 us per audio packet) is the caller's.
+    do {
+      var pkt = [UInt8](repeating: 0x5a, count: 276), o = [UInt8](repeating: 0, count: 400)
+      var samples = [Double](repeating: 0, count: 300_000)
+      for i in samples.indices {
+        let t0 = Clock.now()
+        _ = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }
+        samples[i] = Double(Clock.ns(Clock.now() - t0)) / 1000
+      }
+      samples.sort()
+      fputs(String(format: "  seal 276 B x 300k: p50 %.2f us  p99 %.2f us  max %.1f us\n",
+                   samples[150_000], samples[297_000], samples[299_999]), stderr)
+      var oo = [UInt8](repeating: 0, count: 400)
+      let m = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }!
+      var os = [Double](repeating: 0, count: 100_000)
+      for i in os.indices {
+        // Fresh counter each time so the replay window does not refuse it.
+        let mm = pkt.withUnsafeBufferPointer { a.seal($0.baseAddress!, 276, into: &o) }!
+        let t0 = Clock.now()
+        _ = o.withUnsafeBufferPointer { b.open($0.baseAddress!, mm, into: &oo) }
+        os[i] = Double(Clock.ns(Clock.now() - t0)) / 1000
+      }
+      _ = m
+      os.sort()
+      fputs(String(format: "  open 276 B x 100k: p50 %.2f us  p99 %.2f us  max %.1f us\n",
+                   os[50_000], os[99_000], os[99_999]), stderr)
+    }
+
     if let path {
       // Vectors for the Android port. Ed25519 in CryptoKit is randomised, so the
       // handshake packets are not byte-exact between runs -- the port VERIFIES

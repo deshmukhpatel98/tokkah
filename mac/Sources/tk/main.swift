@@ -7099,7 +7099,16 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // nobody needs is still something somebody has to read past.
     "floor_claims": audio.floorClaims,
     "dec_luma": gDecLuma,
-    "io": Audio.ioKind, "aec_on": Audio.ioKind == "vp" ? 1 : 0,
+    // `aec_on` used to be written here a SECOND time, as "is Apple's voice
+    // processing the io", from before the canceller existed. A duplicate key in a
+    // dictionary literal is a precondition failure in Swift; under -Ounchecked
+    // that check is compiled out and the later entry silently wins -- so for as
+    // long as the app was built that way, the canceller's own `aec_on` above was
+    // overwritten by this one on every beat. Built -O, the first live call
+    // trapped here (EXC_BREAKPOINT in Dictionary.init(dictionaryLiteral:)). Same
+    // class as duplicate-key-eats-shipped-fix; a scan for the shape is in
+    // tools/dupkey-check.sh.
+    "io": Audio.ioKind,
     // Zero on every build so far. A non-zero number here is a telemetry
     // call that landed on the real-time audio thread and was refused --
     // a latency bug reported as a number instead of as a mystery stall.
