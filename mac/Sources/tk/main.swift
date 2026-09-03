@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.137.0"
+let VERSION = "0.138.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -5882,7 +5882,7 @@ nonisolated(unsafe) var utteranceWasListening = true
 /// a transcript that falls further behind the longer the call runs.
 nonisolated(unsafe) var fedIn = 0
 nonisolated(unsafe) var fedOut = 0
-let subtitles = flag("subtitles")
+let subtitles = (!flag("no-subtitles") && flag("subtitles"))
   ? Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
   : nil
 
