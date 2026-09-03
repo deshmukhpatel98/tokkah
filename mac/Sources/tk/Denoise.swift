@@ -101,7 +101,7 @@ final class VDenoise {
   /// Share of luma pixels judged still (below threshold) on the last frame, %.
   private(set) var stillPct = 0
 
-  init(threshold: Int? = nil, floorWeight: Double = 0.25) {
+  init(threshold: Int? = nil, floorWeight: Double = 0.16) {
     pinned = threshold.map { max(1, min(255, $0)) }
     self.threshold = pinned ?? 24
     self.floorWeight = max(0, min(1, floorWeight))

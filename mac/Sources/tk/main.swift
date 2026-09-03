@@ -5322,7 +5322,7 @@ audio.stallOutAfterS = Double(arg("stall-out") ?? "0") ?? 0
 func makeDenoise() -> VDenoise? {
   if flag("no-vdenoise") { return nil }
   return VDenoise(threshold: arg("vdenoise-t").flatMap { Int($0) },
-                  floorWeight: Double(arg("vdenoise-floor") ?? "0.25") ?? 0.25)
+                  floorWeight: Double(arg("vdenoise-floor") ?? "0.16") ?? 0.16)
 }
 
 if let path = arg("vpsnr") {
