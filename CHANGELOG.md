@@ -5,6 +5,59 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.136.0 — 2026-09-03
+
+### Fixed — a path probe is answered on the path it arrived on
+
+0.135.0 shipped the LAN upgrade below and, with it, the instrument that proved
+the upgrade could never fire. The first live call on it read, on both ends and
+every beat: `lock_lan 0` (locked the public hairpin), `cand_priv 1` (a LAN
+candidate existed), `path_priv_ms -1` (the LAN **never answered a probe**),
+`relocks 0` -- while each end was probing that LAN address every 0.5 s for the
+whole call. The LAN was reachable: the other Mac was ARP-resolvable on
+`192.168.1.x` and the firewall was off.
+
+The probe *reply* was the bug. A clock-probe request was answered with
+`rawSend`, which goes through `wireSend` to the locked `peer` address. A probe
+that arrived on the LAN was therefore answered over the hairpin, to the public
+address; the reply came back from the public IP, and the receiver booked its
+round trip under the public path. The LAN could never be credited with the
+round trip it had just completed -- the race could not see the very path it was
+racing. A round trip only measures a path if it returns on it.
+
+A request is now answered at the address it came from (`rawSendTo`), sealed
+exactly as everything else is sealed and dropped under an impaired rig's loss.
+A request that arrived through the TURN relay is still answered on the channel,
+where a raw send to the relay's own address would not land.
+
+## Kin 0.135.0 — 2026-09-03
+
+### Fixed — a hairpinned call upgrades onto the LAN when it answers
+
+A live 0.134.0 call between two Macs on the same Wi-Fi locked the public
+hairpin path and stayed on it for 270 s: `route 1`, `relocks 0`, `rtt_jit`
+60–92 ms on a 6 ms link, ~700 packets/s lost each way, 47,650 samples
+concealed. The verdict was `audio_dropouts_in` (major).
+
+Root cause: `pickBestPathLocked` settled the path race **once** and never
+re-evaluated, and `probeAllCandidates` stopped the moment crypto keyed. The
+same-router peer's LAN probe is routinely dropped during the first ARP (the
+hairpin documented in 0.133), so the LAN lost the initial race; crypto then
+keyed fast over the public path, collapsing the 400 ms private-candidate grace
+to 150 ms, and the call hairpinned for its whole length with no way back.
+
+Now `probeAllCandidates` keeps probing an unreplied private candidate after the
+race settles (one 32-byte packet per 0.5 s, until it answers or this end is
+already on a private path), and `pickBestPathLocked` takes a private path when
+it answers: one way only (public/relay → private), so it cannot oscillate.
+`--no-lan-upgrade` is the legacy control arm.
+
+The beat now carries the diagnostic that `route` alone could not: `lock_lan`
+(the locked path is a private address), `cand_priv` (private candidates
+offered), `path_priv_ms` (best RTT a private path answered with, -1 = none). A
+public lock with `cand_priv > 0` is a hairpin. It was this instrument that
+found 0.136.0.
+
 ## Kin 0.134.0 — 2026-09-03
 
 ### Added — version row on the front-door settings card
