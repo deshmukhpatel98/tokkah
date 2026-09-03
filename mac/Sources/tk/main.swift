@@ -5441,6 +5441,9 @@ if let path = arg("vpsnr") {
           + "  noise \(String(format: "%.2f", Double(d.noiseX100) / 100)) lvl, still \(d.stillPct)%"
           + "  cost p50 \(d.cost.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
           + " p99 \(d.cost.p(0.99).map { String(format: "%.2f", $0) } ?? "-") ms"
+          + " (setup \(d.costSetup.p(0.5).map { String(format: "%.2f", $0) } ?? "-")"
+          + " luma \(d.costLuma.p(0.5).map { String(format: "%.2f", $0) } ?? "-")"
+          + " chroma \(d.costChroma.p(0.5).map { String(format: "%.2f", $0) } ?? "-"))"
           + (d.bypassed > 0 ? "  BYPASSED \(d.bypassed) frames" : "") } ?? "")
       + "\n  encode p50 \(String(format: "%.2f", encP50)) p99 \(String(format: "%.2f", encP99)) ms"
       + "\n  \(bytes / 1024) KiB in \(String(format: "%.1f", secs)) s"

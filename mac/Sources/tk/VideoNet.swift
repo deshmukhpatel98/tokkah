@@ -16,11 +16,14 @@ final class VDecoder {
   var decodes = 0, decFails = 0, noFormat = 0
   var decLatMs = Quantiles()
 
-  private func ensureSession(_ sets: [[UInt8]]) -> Bool {
+  /// Set by the frame that carried the parameter sets; the far end chose.
+  private(set) var hevc = false
+  private func ensureSession(_ sets: [[UInt8]], hevc: Bool) -> Bool {
     guard !sets.isEmpty else { return session != nil }
-    var h = 17
+    var h = hevc ? 19 : 17
     for s in sets { for b in s { h = h &* 31 &+ Int(b) } }
     if h == psHash, session != nil { return true }
+    self.hevc = hevc
 
     var ptrs: [UnsafePointer<UInt8>] = []
     var lens: [Int] = []
@@ -35,9 +38,13 @@ final class VDecoder {
     var f: CMVideoFormatDescription?
     let st = ptrs.withUnsafeBufferPointer { pb in
       lens.withUnsafeBufferPointer { lb in
-        CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
-          parameterSetCount: sets.count, parameterSetPointers: pb.baseAddress!,
-          parameterSetSizes: lb.baseAddress!, nalUnitHeaderLength: 4, formatDescriptionOut: &f)
+        hevc
+          ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: nil,
+              parameterSetCount: sets.count, parameterSetPointers: pb.baseAddress!,
+              parameterSetSizes: lb.baseAddress!, nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &f)
+          : CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
+              parameterSetCount: sets.count, parameterSetPointers: pb.baseAddress!,
+              parameterSetSizes: lb.baseAddress!, nalUnitHeaderLength: 4, formatDescriptionOut: &f)
       }
     }
     guard st == noErr, let fd = f else { return false }
@@ -70,14 +77,18 @@ final class VDecoder {
       let b = payload.startIndex + i; defer { i += 4 }
       return Int(payload[b]) | (Int(payload[b+1]) << 8) | (Int(payload[b+2]) << 16) | (Int(payload[b+3]) << 24)
     }
-    guard let n = u8() else { return }
+    guard let raw = u8() else { return }
+    // Top bit: HEVC parameter sets (see VEncoder.serialize). The ruler's
+    // --vcodec hevc arm needs this; a live call never sets it yet.
+    let isHevc = raw & Int(VEncoder.HEVC_FLAG) != 0
+    let n = raw & 0x7f
     var sets: [[UInt8]] = []
     for _ in 0..<n {
       guard let l = u16(), i + l <= payload.count else { return }
       sets.append([UInt8](payload[(payload.startIndex + i)..<(payload.startIndex + i + l)]))
       i += l
     }
-    guard ensureSession(sets), let sess = session, let fd = fmt else { noFormat += 1; return }
+    guard ensureSession(sets, hevc: isHevc), let sess = session, let fd = fmt else { noFormat += 1; return }
     guard let len = u32(), i + len <= payload.count else { return }
     let sample = [UInt8](payload[(payload.startIndex + i)..<(payload.startIndex + i + len)])
 
