@@ -1086,9 +1086,29 @@ enum Resident {
         // Dock click by bringing forward a process with no window -- which is a
         // click that does nothing, the report this all started with. What the
         // person wants is a window, so a window is what is looked for.
+        //
+        // A call window carries `--window`. The Home window (`Launcher.home`),
+        // opened by a normal Dock click or bundle launch, does not have
+        // `--window` in its argv -- so excluding everything without `--window`
+        // caused clicking the Dock icon while the Home window was open to spawn
+        // duplicate instances. A process with neither `--room` nor `--peer` and
+        // not running a background/test job is running the Home window.
         let a = argv(p)
+        guard !a.isEmpty else { continue }
         if a.contains("--watch") { continue }
-        if !a.contains("--window") { continue }
+        if a.contains("--window") {
+          out.append(p)
+          continue
+        }
+        if a.contains("--room") || a.contains("--peer") { continue }
+        let nonWindowFlags: Set<String> = [
+          "--claim", "--rings", "--quiet", "--ring-only", "--bye-only", "--version",
+          "--watch-policy", "--reopen-test", "--stun", "--acoustic", "--gate-test",
+          "--cam-picker-test", "--vpause-test", "--presence-run", "--backdrop-test",
+          "--vpsnr", "--camrec", "--shot",
+        ]
+        let isNonWindowJob = a.contains { nonWindowFlags.contains($0) || $0.hasPrefix("--selftest") || $0.hasPrefix("--test-") }
+        if isNonWindowJob { continue }
         out.append(p)
       }
       return out

@@ -61,6 +61,7 @@ final class VDenoise {
   /// Pinned by `--vdenoise-t`; nil means follow the measured noise.
   private let pinned: Int?
   let floorWeight: Double
+  let deadband: Int
   // ── THE THRESHOLD FOLLOWS THE NOISE ─────────────────────────────────────────
   //
   // A fixed 24 measured 12% grain removal on a dark room (std 5.8 -> 5.1). The
@@ -101,10 +102,11 @@ final class VDenoise {
   /// Share of luma pixels judged still (below threshold) on the last frame, %.
   private(set) var stillPct = 0
 
-  init(threshold: Int? = nil, floorWeight: Double = 0.16) {
+  init(threshold: Int? = nil, floorWeight: Double = 0.10, deadband: Int = 1) {
     pinned = threshold.map { max(1, min(255, $0)) }
     self.threshold = pinned ?? 24
     self.floorWeight = max(0, min(1, floorWeight))
+    self.deadband = max(0, min(255, deadband))
   }
 
   deinit { prevY?.deallocate(); prevC?.deallocate() }
@@ -193,8 +195,10 @@ final class VDenoise {
     // A table lookup does not vectorise, so the weight is the same ramp as an
     // expression: w = min(256, floor + |d| * slope), which does. The histogram
     // samples one lane in sixteen -- 57k samples a frame is plenty for a median.
+    let db = Int32(ProcessInfo.processInfo.environment["TK_DENOISE_DEADBAND"].flatMap(Int.init) ?? deadband)
+    let effRange = max(1, Int32(threshold) - db)
     let wf = Int32(floorWeight * 256)
-    let slope = Int32(((256 - Int(wf)) * 256) / threshold)     // Q8 per level
+    let slope = Int32(((256 - Int(wf)) * 256) / Int(effRange))     // Q8 per level
     // ── EIGHT 16-BIT LANES, NOT SIXTEEN 32-BIT ONES ────────────────────────────
     //
     // Measured standalone (swiftc -O, 1280x720): SIMD16<Int32> 1.00 ms, scalar
@@ -203,6 +207,7 @@ final class VDenoise {
     // 32-bit loop read 3.2 ms because the histogram branch sat inside it; the
     // statistics are now a separate pass over every fourth row.
     let vWf = SIMD8<Int32>(repeating: wf), vSlope = SIMD8<Int32>(repeating: slope)
+    let vDead = SIMD8<Int32>(repeating: db), vZero = SIMD8<Int32>(repeating: 0)
     let v256 = SIMD8<Int32>(repeating: 256), v255 = SIMD8<Int32>(repeating: 255)
     let v128 = SIMD8<Int32>(repeating: 128), v8 = SIMD8<Int16>(repeating: 8)
     @inline(__always)
@@ -213,7 +218,8 @@ final class VDenoise {
         let prev = UnsafeRawPointer(p + x).loadUnaligned(as: SIMD8<Int16>.self)
         let diff = SIMD8<Int32>(truncatingIfNeeded: cur &- prev)
         let ad = pointwiseMin(pointwiseMax(diff, 0 &- diff) &>> 4, v255)
-        let w = pointwiseMin(vWf &+ ((ad &* vSlope) &>> 8), v256)
+        let excess = pointwiseMax(ad &- vDead, vZero)
+        let w = pointwiseMin(vWf &+ ((excess &* vSlope) &>> 8), v256)
         let v = SIMD8<Int16>(truncatingIfNeeded: (diff &* w &+ v128) &>> 8) &+ prev
         UnsafeMutableRawPointer(p + x).storeBytes(of: v, as: SIMD8<Int16>.self)
         UnsafeMutableRawPointer(d + x).storeBytes(of: SIMD8<UInt8>(truncatingIfNeeded: (v &+ v8) &>> 4), as: SIMD8<UInt8>.self)
@@ -224,7 +230,8 @@ final class VDenoise {
         let cur = Int32(s[x]) << 4, prev = Int32(p[x])
         let diff = cur &- prev
         let ad = min((diff < 0 ? 0 &- diff : diff) >> 4, 255)
-        let w = min(wf &+ ((ad &* slope) >> 8), 256)
+        let excess = max(0, ad - db)
+        let w = min(wf &+ ((excess &* slope) >> 8), 256)
         let v = prev &+ ((diff &* w &+ 128) >> 8)
         p[x] = Int16(truncatingIfNeeded: v)
         d[x] = UInt8(truncatingIfNeeded: (v &+ 8) >> 4)

@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.138.0"
+let VERSION = "0.139.0"
 
 // ── LAUNCH ZERO ─────────────────────────────────────────────────────────────
 //
@@ -529,7 +529,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap", "vcodec",
+  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "vdenoise-deadband", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap", "vcodec",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
@@ -836,6 +836,12 @@ func resolveVideoArg() -> String {
   if v == "off" || v == "camera" { return v }
   if v == "on" || v == "cam" { return "camera" }
   if FileManager.default.fileExists(atPath: v) { return v }
+  if flag("resumed") {
+    fputs("--video \(v): file does not exist during resume -- falling back to camera\n", stderr)
+    Resume.end(why: "stale video file on resume")
+    return "camera"
+  }
+  Resume.end(why: "invalid video argument")
   fputs("--video \(v): not \"camera\", not \"off\", and not a file that exists.\n"
       + "  --video camera   the built-in camera\n"
       + "  --video off      audio only\n"
@@ -5327,7 +5333,8 @@ audio.stallOutAfterS = Double(arg("stall-out") ?? "0") ?? 0
 func makeDenoise() -> VDenoise? {
   if flag("no-vdenoise") { return nil }
   return VDenoise(threshold: arg("vdenoise-t").flatMap { Int($0) },
-                  floorWeight: Double(arg("vdenoise-floor") ?? "0.16") ?? 0.16)
+                  floorWeight: Double(arg("vdenoise-floor") ?? "0.10") ?? 0.10,
+                  deadband: arg("vdenoise-deadband").flatMap { Int($0) } ?? 1)
 }
 
 if let path = arg("vpsnr") {
@@ -5431,7 +5438,7 @@ if let path = arg("vpsnr") {
       enc.encode(fpb, hostTime: host)
     }
     fputs("vpsnr: \(path) -> \(enc.hevc ? "HEVC" : "H.264") 1280x720 @ \(br / 1000) kbps, \(want) frames"
-        + (dn.map { ", denoise t\($0.threshold) floor \($0.floorWeight)" } ?? ", denoise OFF") + "\n", stderr)
+        + (dn.map { ", denoise t\($0.threshold) floor \($0.floorWeight) deadband \($0.deadband)" } ?? ", denoise OFF") + "\n", stderr)
     try src.start()
     // The file plays in real time, so bound the wait by that plus slack rather
     // than spinning: 300 frames at 30 fps is ten seconds.

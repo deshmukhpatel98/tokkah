@@ -5,6 +5,17 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.139.0 — 2026-09-03
+
+### Fixed — launch crash loop from stale resume video path, test isolation, and watcher Home window sibling detection
+
+- **Stale video path in resume recovery**: When a call ran with a custom `--video <path>` (e.g. from an automated test or measurement run) and the video file was later deleted, `call.json` was left pointing at a non-existent file. On next launch, `Resume.pending()` re-execed with `--video <deleted>` and `resolveVideoArg()` called `exit(2)` before displaying any window, leaving `call.json` permanently on disk and creating an unrecoverable crash loop.
+  - `Resume.argv(_:bundled:)` now falls back to `"camera"` if a configured video file does not exist.
+  - `Resume.pending()` drops stale resume records if the video file is missing.
+  - `resolveVideoArg()` falls back to `"camera"` when resuming instead of crashing with `exit(2)`, and clears any pending resume record before exiting on invalid arguments.
+- **Test isolation in `record-check.sh`**: Exported `TK_KIN_DIR="$SP/kin"` and added `--no-rejoin` so test invocations never touch or pollute the user's real `~/Library/Application Support/Kin/call.json`.
+- **Watcher Home window sibling detection**: In `Target.siblings()`, processes running the Home window (`Launcher.home`) without `--window` in argv are properly recognized as running instances of Kin, preventing duplicate instances from being launched when clicking the Dock icon. Installed a `SIGWINCH` raise handler in `Launcher.home` to activate and bring the Home window forward when reopened.
+
 ## Kin 0.138.0 — 2026-09-03
 
 ### Added — call recording UI, menu integration, and wire status synchronization

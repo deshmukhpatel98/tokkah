@@ -2099,6 +2099,24 @@ enum Launcher {
     // two is the shape of the drift this whole audit exists to catch.
     for line in Glass.describeAll() { fputs("glass \(line)\n", stderr) }
 
+    // ── THE RAISE HANDLER FOR THE HOME WINDOW ─────────────────────────────────
+    //
+    // A click on the Dock icon or resident reopen brings an open Kin forward.
+    // When the Home window is showing, it was not wired to SIGWINCH -- so the
+    // watcher's raise signal went to the default action (ignore) and nothing came
+    // forward. Installed here on the main queue, raising this window and activating
+    // the application.
+    signal(SIGWINCH, SIG_IGN)
+    let homeRaise = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
+    homeRaise.setEventHandler {
+      fputs("raise: asked to come forward (home)\n", stderr)
+      app.activate(ignoringOtherApps: true)
+      w.orderFrontRegardless()
+    }
+    homeRaise.resume()
+    fputs("raise: ready -- a Dock click on an open Kin brings this window forward\n", stderr)
+    defer { homeRaise.cancel() }
+
     // Drive the event loop by hand. `app.run()` would not return, and this window
     // has to finish before the audio graph, the sockets or the camera exist.
     // Same pump as everywhere else now; the exit condition is the only difference.

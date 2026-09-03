@@ -758,6 +758,17 @@ final class VEncoder {
       // comes out. That controller does not exist yet, which is why the default
       // stays unset -- see DESIGN 17.104.
     }
+    // Candidate encoder levers investigated for lit-scene bytes reduction:
+    // - TK_WEIGHTED_PRED: measured with --vpsnr: inflates lit-scene bytes by +127% (8.3 -> 18.8 KB)
+    //   due to slice header weight tables on every P slice. Kept off.
+    // - TK_MIN_QP: min frame QP. Setting to 24 reduces bytes by 13% but lowers PSNR below 45 dB (44.6 dB).
+    //   At 20 the encoder already naturally operates at QP >= 20 for q0.7. Kept off.
+    if let mqp = ProcessInfo.processInfo.environment["TK_MIN_QP"].flatMap(Int.init) {
+      set(kVTCompressionPropertyKey_MinAllowedFrameQP, NSNumber(value: mqp), "MinAllowedFrameQP")
+    }
+    if ProcessInfo.processInfo.environment["TK_WEIGHTED_PRED"] == "1" {
+      set("EnableWeightedPrediction" as CFString, kCFBooleanTrue, "EnableWeightedPrediction")
+    }
     if !refused.isEmpty { fputs("encoder: REFUSED \(refused.joined(separator: " "))\n", stderr) }
     // Read the bitrate BACK. Setting is not applying.
     var got: CFTypeRef?

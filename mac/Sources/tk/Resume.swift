@@ -278,6 +278,11 @@ enum Resume {
       try? FileManager.default.removeItem(at: file)
       return nil
     }
+    if l.video != "camera" && l.video != "off" && !FileManager.default.fileExists(atPath: l.video) {
+      fputs("call: resume video file \(l.video) does not exist -- dropping stale record\n", stderr)
+      try? FileManager.default.removeItem(at: file)
+      return nil
+    }
     let age = now() - l.at
     if age > Double(askFirstMs) {
       fputs("call: last in \(l.room) \(Int(age / 3600_000)) h ago -- too long, not rejoining\n", stderr)
@@ -314,7 +319,14 @@ enum Resume {
     // that is thirty seconds old, and it is what marks the telemetry row as a
     // continuation. `--prev-call` is the existing chain field, so a dashboard
     // reading `prev_call` sees one call across every restart it survived.
-    var a = ["--video", l.video, "--listen", String(l.port), "--peer", l.peer,
+    let video: String
+    if l.video != "camera" && l.video != "off" && !FileManager.default.fileExists(atPath: l.video) {
+      fputs("call: resume video file \(l.video) does not exist -- falling back to camera\n", stderr)
+      video = "camera"
+    } else {
+      video = l.video
+    }
+    var a = ["--video", video, "--listen", String(l.port), "--peer", l.peer,
              "--prev-call", l.call, "--resumed"]
     if bundled { a.append("--window") }
     return a

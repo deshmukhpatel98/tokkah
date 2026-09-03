@@ -30,6 +30,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/record-check.$$"
 mkdir -p "$SP"
+export TK_KIN_DIR="$SP/kin"
+mkdir -p "$SP/kin"
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
 trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
@@ -51,7 +53,7 @@ AUDIO="$HERE/../../testbed/media/real/realA.wav"
 fail=0
 say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 
-BASE="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
+BASE="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles --no-rejoin"
 
 # ── ARM 1: Call recording under network loss (10% drop) ────────────────────────
 # Injected packet drop causes video frame stalls/repeats and audio concealment/breaks.
