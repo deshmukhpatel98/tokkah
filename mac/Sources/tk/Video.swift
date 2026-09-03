@@ -764,7 +764,8 @@ final class VEncoder {
     // - TK_MIN_QP: min frame QP. Setting to 24 reduces bytes by 13% but lowers PSNR below 45 dB (44.6 dB).
     //   At 20 the encoder already naturally operates at QP >= 20 for q0.7. Kept off.
     if let mqp = ProcessInfo.processInfo.environment["TK_MIN_QP"].flatMap(Int.init) {
-      set(kVTCompressionPropertyKey_MinAllowedFrameQP, NSNumber(value: mqp), "MinAllowedFrameQP")
+      let clamped = max(0, min(51, mqp))
+      set(kVTCompressionPropertyKey_MinAllowedFrameQP, NSNumber(value: clamped), "MinAllowedFrameQP")
     }
     if ProcessInfo.processInfo.environment["TK_WEIGHTED_PRED"] == "1" {
       set("EnableWeightedPrediction" as CFString, kCFBooleanTrue, "EnableWeightedPrediction")

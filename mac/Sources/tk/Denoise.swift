@@ -195,7 +195,8 @@ final class VDenoise {
     // A table lookup does not vectorise, so the weight is the same ramp as an
     // expression: w = min(256, floor + |d| * slope), which does. The histogram
     // samples one lane in sixteen -- 57k samples a frame is plenty for a median.
-    let db = Int32(ProcessInfo.processInfo.environment["TK_DENOISE_DEADBAND"].flatMap(Int.init) ?? deadband)
+    let rawDb = ProcessInfo.processInfo.environment["TK_DENOISE_DEADBAND"].flatMap(Int.init) ?? deadband
+    let db = Int32(max(0, min(255, rawDb)))
     let effRange = max(1, Int32(threshold) - db)
     let wf = Int32(floorWeight * 256)
     let slope = Int32(((256 - Int(wf)) * 256) / Int(effRange))     // Q8 per level

@@ -610,6 +610,8 @@ let isTestRun = CommandLine.arguments.dropFirst().contains { a in
     || name.hasPrefix("selftest-")
     || name.hasPrefix("fuzz-")
     || name == "crypto-vectors"
+    || name == "vpsnr"
+    || name == "camrec"
 }
 /// ── AND THE SAME FOR A RIG RUNNING A WHOLE CALL ────────────────────────────
 ///
@@ -5458,7 +5460,7 @@ if let path = arg("vpsnr") {
       + (dn.map { d in
           "\n  vs filtered p50 \(psnrF.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
           + "  filter-vs-raw p50 \(psnrDn.p(0.50).map { String(format: "%.1f", $0) } ?? "-") dB"
-          + "  noise \(String(format: "%.2f", Double(d.noiseX100) / 100)) lvl, still \(d.stillPct)%"
+          + "  noise \(String(format: "%.2f", Double(d.noiseX100) / 100)) lvl (adapted t\(d.threshold)), still \(d.stillPct)%"
           + "  cost p50 \(d.cost.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
           + " p99 \(d.cost.p(0.99).map { String(format: "%.2f", $0) } ?? "-") ms"
           + " (setup \(d.costSetup.p(0.5).map { String(format: "%.2f", $0) } ?? "-")"
@@ -5469,7 +5471,7 @@ if let path = arg("vpsnr") {
       + "\n  \(bytes / 1024) KiB in \(String(format: "%.1f", secs)) s"
       + " = \(String(format: "%.3f", Double(bytes) * 8 / 1e6 / max(secs, 0.001))) Mbps"
       + ", \(compared > 0 ? bytes / max(frames, 1) : 0) B/frame\n", stderr)
-  let p50 = psnr.p(0.50) ?? 0
+  let p50 = (dn != nil ? min(psnrF.p(0.50) ?? 0, psnrDn.p(0.50) ?? 0) : psnr.p(0.50)) ?? 0
   fputs("  verdict: " + (p50 >= 45 ? "visually lossless"
                        : p50 >= 40 ? "very good, not lossless"
                        : p50 >= 35 ? "good; detail is being lost"
