@@ -401,12 +401,24 @@ final class Wire {
     }
   }
 
+  @inline(__always) static func softLimit(_ x: Float) -> Float {
+    let knee: Float = 0.80
+    if x > knee {
+      let d = x - knee
+      return knee + (1.0 - knee) * tanh(d / (1.0 - knee))
+    } else if x < -knee {
+      let d = x + knee
+      return -knee + (1.0 - knee) * tanh(d / (1.0 - knee))
+    }
+    return x
+  }
+
   @inline(__always) private func pack16(_ src: UnsafePointer<Float>, _ n: Int,
                                         into dst: UnsafeMutablePointer<UInt8>) {
     dst.withMemoryRebound(to: Int16.self, capacity: n) { out in
       for i in 0..<n {
-        let v = max(-1.0, min(1.0, src[i])) * 32767.0
-        out[i] = Int16(v.rounded())
+        let v = Wire.softLimit(src[i]) * 32767.0
+        out[i] = Int16(max(-32767.0, min(32767.0, v)).rounded())
       }
     }
   }
@@ -702,11 +714,22 @@ final class Wire {
 
   func clearCandidates() { candLock.lock(); candidates.removeAll(); candLock.unlock() }
 
+  private func isPrivateSubnet(_ a: sockaddr_in) -> Bool {
+    let ip = UInt32(bigEndian: a.sin_addr.s_addr)
+    let b0 = UInt8((ip >> 24) & 0xff)
+    let b1 = UInt8((ip >> 16) & 0xff)
+    if b0 == 10 { return true }
+    if b0 == 172 && (b1 >= 16 && b1 <= 31) { return true }
+    if b0 == 192 && b1 == 168 { return true }
+    if b0 == 127 { return true }
+    return false
+  }
+
   /// Punch every candidate. Cheap: a 32-byte clock probe doubles as the probe
   /// that opens the NAT binding, so connectivity and offset are established by
   /// the same packet.
   func probeAllCandidates() {
-    guard !locked else { return }
+    guard !locked, crypto?.established != true else { return }
     var out = [UInt8](repeating: 0, count: TPKTZ)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -832,9 +855,15 @@ final class Wire {
     guard let best = pathRtt.min(by: { $0.value < $1.value }),
           let addr = pathAddr[best.key] else { return nil }
     let elapsed = raceBegan == 0 ? 0 : Clock.ms(Clock.now() - raceBegan)
-    // Tentative: first working path so the call starts. Settled after 150 ms
+    candLock.lock()
+    let hasPrivateUnreplied = candidates.contains { c in
+      isPrivateSubnet(c) && pathRtt[pathKey(c)] == nil
+    }
+    candLock.unlock()
+    let settleLimit: Double = (hasPrivateUnreplied && crypto?.established != true) ? 400.0 : 150.0
+    // Tentative: first working path so the call starts. Settled after 150 ms (or 400 ms if waiting for LAN candidate)
     // of racing, or sooner if two paths have spoken and 60 ms have passed.
-    let settle = elapsed >= 150 || (pathRtt.count >= 2 && elapsed >= 60)
+    let settle = elapsed >= settleLimit || (pathRtt.count >= 2 && elapsed >= 60.0)
     if !locked {
       adopt(addr)
       sendViaTurn = turn?.isTurnServer(addr) == true

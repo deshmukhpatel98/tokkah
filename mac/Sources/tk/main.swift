@@ -575,7 +575,7 @@ let KNOWN_FLAGS: Set<String> = [
   // environment for the usual reason: a security control whose flag is a silent
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
-  "watch-policy", "vq-legacy-denom",
+  "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -6432,7 +6432,8 @@ if audio.jitAuto {
     // halved -- the maximum buffer was cut in half by a change that had nothing
     // to do with it. Same family as every other duration hidden inside a count in
     // this codebase (queue tolerance in ms; a codec win is a change of units).
-    let JIT_MAX = max(JIT_MIN + 2, Int((30.0 / pktMs).rounded()))
+    let jitMaxMs = arg("jit-max-ms").flatMap { Double($0) } ?? 80.0
+    let JIT_MAX = max(JIT_MIN + 2, Int((jitMaxMs / pktMs).rounded()))
     let GROW_BELOW_MS = 1.0     // headroom this thin is one jitter spike from a click
     // A TRICKLE OF LATE PACKETS IS NOT A BUFFER THAT IS TOO SMALL.
     //
@@ -6722,7 +6723,8 @@ if audio.jitAuto {
       // and snapsPast are now separate counters and ride in every beat, so the
       // question "was the buffer too small, or did this machine stall" is
       // answerable from a call record instead of from a guess.
-      if snappedBehind > 0 {
+      let legacyVeto = flag("jit-legacy-veto")
+      if snappedBehind > 0 && (legacyVeto || (!starving && conc == 0)) {
         calm = 0
         fputs("jit: \(snappedBehind) backlog snap(s), \(conc) concealed -- stall, not jitter;"
             + " holding at \(audio.jitTarget)\n", stderr)
@@ -6746,7 +6748,7 @@ if audio.jitAuto {
               + " excursions at the pitch period rather than buying \(String(format: "%.2f", pktMs)) ms"
               + " more on every word\n", stderr)
         }
-      } else if late >= GROW_LATE_MIN, near < GROW_LATE_MIN, p01 >= GROW_BELOW_MS {
+      } else if !starving, late >= GROW_LATE_MIN, near < GROW_LATE_MIN, p01 >= GROW_BELOW_MS {
         // Late, but not by an amount a packet of buffer reaches, and the margin is
         // fine. Chasing this is the queue-tolerance mistake wearing a new hat.
         deepRefused += 1
@@ -6757,7 +6759,7 @@ if audio.jitAuto {
               + " -- one more packet would not have caught them; holding at \(audio.jitTarget)."
               + " Deep excursions are concealed at the pitch period instead.\n", stderr)
         }
-      } else if (late >= GROW_LATE_MIN && near >= GROW_LATE_MIN) || (p01 < GROW_BELOW_MS && converged) {
+      } else if (late >= GROW_LATE_MIN && (near >= GROW_LATE_MIN || starving)) || (p01 < GROW_BELOW_MS && converged) || (starving && audio.jitTarget < JIT_MAX) {
         if audio.jitTarget < JIT_MAX {
           audio.jitTarget += 1
           audio.jitGrows += 1

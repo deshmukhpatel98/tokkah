@@ -527,6 +527,8 @@ final class Audio {
   /// every machine that does not need it.
   private(set) var inputTrim: Float = 1
   private(set) var trimMoves = 0
+  private var overloadCooldown = 0
+  private var makeupCeiling: Float = Audio.MAKEUP_MAX
   /// True while the device knob is at its limit and the signal is STILL hot --
   /// the state the old loop sat in silently for a whole call.
   private(set) var gainAtRail = false
@@ -1475,6 +1477,8 @@ final class Audio {
     inputTrim = fix
     trimMoves += 1
     overloadCuts += 1
+    overloadCooldown = 15
+    makeupCeiling = max(1.0, fix * 1.30)
     Metrics.count("mic_overload_cut")
     Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
     fputs("mic gain: \(String(format: "%.2f", outPeak))x full scale is leaving this machine"
@@ -1491,6 +1495,8 @@ final class Audio {
     let raw = rawPeakWin
     rawPeakWin = 0
     guard raw > 0 else { return }
+    if overloadCooldown > 0 { overloadCooldown -= 1 }
+    let effectiveMax = overloadCooldown > 0 ? makeupCeiling : Audio.MAKEUP_MAX
     // ── THE DESCENT, WHICH DID NOT EXIST ────────────────────────────────────
     //
     // 0.102.0 added a climb and no way down. Measured on live call
@@ -1515,7 +1521,7 @@ final class Audio {
     // And the second: a makeup gain that is now too large for the level in the
     // room comes DOWN, on the same target the climb uses. Symmetric, so the
     // loop can converge from either side instead of latching at the ceiling.
-    let target = min(Audio.MAKEUP_MAX, max(0.02, Audio.TRIM_TARGET / raw))
+    let target = min(effectiveMax, max(0.02, Audio.TRIM_TARGET / raw))
     if inputTrim > 1, target < inputTrim - 0.02 {
       inputTrim = max(max(1, target), inputTrim / Audio.TRIM_UP_RATE)
       trimMoves += 1
@@ -1539,7 +1545,7 @@ final class Audio {
     // Now there is one target — speech peaking near `TRIM_TARGET` — and the
     // trim seeks it from either side, with a dead band between so an ordinary
     // conversation never moves it at all.
-    let want = min(Audio.MAKEUP_MAX, max(0.02, Audio.TRIM_TARGET / raw))
+    let want = min(effectiveMax, max(0.02, Audio.TRIM_TARGET / raw))
     if raw > 0.92 {
       // TOO HOT: go straight there. A clipping microphone is urgent, and this
       // is the path that fixed the 5.24 field case.
@@ -1572,7 +1578,8 @@ final class Audio {
         // Rate-limited, and deliberately slower than the way down: being 3 dB
         // quiet for a second costs nothing, and jumping the level inside a
         // syllable is audible pumping on every pause.
-        inputTrim = min(want, inputTrim * Audio.TRIM_UP_RATE)
+        let upRate: Float = overloadCooldown > 0 ? 1.15 : Audio.TRIM_UP_RATE
+        inputTrim = min(want, inputTrim * upRate)
         trimMoves += 1
         Metrics.count("mic_makeup_moved")
         Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
