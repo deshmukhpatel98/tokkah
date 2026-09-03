@@ -529,11 +529,12 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
+  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
   // to kill the app. Same family as silent-no-op-flags, one worse.
-  "no-ring-preview", "incoming-key", "with", "peer-key", "selftest-crypto", "crypto-vectors",
+  "no-ring-preview", "incoming-key", "with", "peer-key", "selftest-crypto", "crypto-vectors", "fuzz-parsers", "fuzz-send", "fuzz-seed",
   "watch", "watch-install", "watch-remove", "watch-status", "incoming", "calling",
   "in-process", "no-in-process", "launch-path",
   "callee-away",
@@ -1371,6 +1372,8 @@ if flag("resumed"), let p = Resume.rememberedPath() {
 // other side posted a beat anyway, to the production endpoint, because the line
 // that would have switched it off had not been reached yet. Same ordering fault
 // as the crash above it: the window can act before the setup below it exists.
+// Before the first request: the caches earlier builds wrote hold room codes.
+Http.wipeLegacyCache()
 if flag("no-telemetry") { Telemetry.enabled = false; fputs("telemetry: off\n", stderr) }
 // The id every beat of this process carries. Said once so a rig -- or a person
 // with two logs and a dashboard -- can find THIS process's beats by name.
@@ -5340,6 +5343,15 @@ if let path = arg("vpsnr") {
   exit(compared > 0 ? 0 : 1)
 }
 
+if let secs = arg("fuzz-parsers") {
+  // Every parser a stranger can reach before a key exists, on mutated input, in
+  // this binary with this build's checks. A trap is a finding; the rig reads it.
+  let seed = UInt64(arg("fuzz-seed") ?? "") ?? 1
+  let n = Fuzz.parsers(seconds: Double(secs) ?? 20, seed: seed)
+  fputs("fuzz-parsers: PASS (\(n) inputs, no trap)\n", stderr)
+  exit(0)
+}
+
 if flag("selftest-crypto") || arg("crypto-vectors") != nil {
   fputs("crypto selftest:\n", stderr)
   let ok = Crypto.selftest(vectorsTo: arg("crypto-vectors"))
@@ -6053,6 +6065,20 @@ if let c = crypto {
       Thread.sleep(forTimeInterval: c.established ? 5.0 : 0.25)
     }
   }.start()
+  // ── THE HOSTILE PEER (rig only) ──────────────────────────────────────────
+  // `--fuzz-send N`: once keyed, this end seals and sends N mutated packets of
+  // every post-authentication kind at the other end, beside its real audio.
+  // Announced, so a build that does not understand the flag cannot pass a rig
+  // that expects it to have attacked (silent-no-op-flags).
+  if let raw = arg("fuzz-send"), let count = Int(raw) {
+    let seed = UInt64(arg("fuzz-seed") ?? "") ?? 1
+    fputs("fuzz: this end will send \(count) hostile packets once keyed (seed \(seed))\n", stderr)
+    Thread {
+      while !c.established { Thread.sleep(forTimeInterval: 0.05) }
+      Thread.sleep(forTimeInterval: 1.0)
+      Fuzz.send(via: wire, count: count, seed: seed)
+    }.start()
+  }
 }
 
 // Clock sync, before the receive loop exists to answer probes.

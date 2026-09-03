@@ -1760,6 +1760,11 @@ final class Wire {
         } else {
           let t2 = (plain + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           let t3 = (plain + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+          // Three of these four came from the far end. A tick count no clock could
+          // produce (>= 2^62) overflows the conversions below; refused here, and
+          // counted by TimeSync, before any arithmetic touches it.
+          let sane: UInt64 = 1 << 56
+          guard t1 < sane, t2 < sane, t3 < sane else { tsync?.note(t1: t1, t2: t2, t3: t3, t4: t4); continue }
           tsync?.note(t1: t1, t2: t2, t3: t3, t4: t4)
           // One-way is not observable. Round trip of THIS packet on THIS address
           // is, and that is how we pick the path.

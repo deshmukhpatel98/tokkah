@@ -99,29 +99,37 @@ enum Stun {
     while Date() < deadline {
       let n = buf.withUnsafeMutableBufferPointer { b in recvfrom(fd, b.baseAddress!, 512, 0, nil, nil) }
       if n < 20 { continue }
-      guard buf[0] == 0x01, buf[1] == 0x01 else { continue }          // Binding Success
-      var ok = true
-      for i in 0..<12 where buf[8 + i] != txid[i] { ok = false; break }
-      guard ok else { continue }                                       // not our transaction
-      var i = 20
-      let end = 20 + (Int(buf[2]) << 8 | Int(buf[3]))
-      while i + 4 <= min(end, Int(n)) {
-        let type = Int(buf[i]) << 8 | Int(buf[i + 1])
-        let len = Int(buf[i + 2]) << 8 | Int(buf[i + 3])
-        let v = i + 4
-        // 0x0020 XOR-MAPPED-ADDRESS, 0x0001 MAPPED-ADDRESS (older servers).
-        if (type == 0x0020 || type == 0x0001), len >= 8, v + len <= Int(n), buf[v + 1] == 0x01 {
-          let xor = type == 0x0020
-          let p = UInt16(buf[v + 2]) << 8 | UInt16(buf[v + 3])
-          let port = xor ? p ^ UInt16(cookie >> 16) : p
-          var o = [UInt8](repeating: 0, count: 4)
-          for k in 0..<4 {
-            o[k] = xor ? buf[v + 4 + k] ^ UInt8((cookie >> (8 * (3 - UInt32(k)))) & 0xff) : buf[v + 4 + k]
-          }
-          return Mapped(ip: "\(o[0]).\(o[1]).\(o[2]).\(o[3])", port: port)
+      if let m = parseBindingReply(buf, Int(n), txid: txid) { return m }
+    }
+    return nil
+  }
+
+  /// One Binding reply, parsed on its own so it can be fuzzed: this is the first
+  /// packet a stranger on the path can put in front of this app, before any key
+  /// exists. Returns nil for anything that is not OUR successful reply carrying an
+  /// IPv4 mapped address. `buf` may be longer than `n`; nothing past `n` is read.
+  static func parseBindingReply(_ buf: [UInt8], _ n: Int, txid: [UInt8]) -> Mapped? {
+    guard n >= 20, buf.count >= n, txid.count == 12 else { return nil }
+    guard buf[0] == 0x01, buf[1] == 0x01 else { return nil }             // Binding Success
+    for i in 0..<12 where buf[8 + i] != txid[i] { return nil }           // not our transaction
+    var i = 20
+    let end = min(20 + (Int(buf[2]) << 8 | Int(buf[3])), n)
+    while i + 4 <= end {
+      let type = Int(buf[i]) << 8 | Int(buf[i + 1])
+      let len = Int(buf[i + 2]) << 8 | Int(buf[i + 3])
+      let v = i + 4
+      // 0x0020 XOR-MAPPED-ADDRESS, 0x0001 MAPPED-ADDRESS (older servers).
+      if (type == 0x0020 || type == 0x0001), len >= 8, v + len <= n, buf[v + 1] == 0x01 {
+        let xor = type == 0x0020
+        let p = UInt16(buf[v + 2]) << 8 | UInt16(buf[v + 3])
+        let port = xor ? p ^ UInt16(cookie >> 16) : p
+        var o = [UInt8](repeating: 0, count: 4)
+        for k in 0..<4 {
+          o[k] = xor ? buf[v + 4 + k] ^ UInt8((cookie >> (8 * (3 - UInt32(k)))) & 0xff) : buf[v + 4 + k]
         }
-        i = v + len + ((4 - len % 4) % 4)              // attributes are 4-byte aligned
+        return Mapped(ip: "\(o[0]).\(o[1]).\(o[2]).\(o[3])", port: port)
       }
+      i = v + len + ((4 - len % 4) % 4)              // attributes are 4-byte aligned
     }
     return nil
   }
@@ -195,7 +203,7 @@ enum Rendezvous {
     var req = URLRequest(url: url)
     req.timeoutInterval = 8
     req.cachePolicy = .reloadIgnoringLocalCacheData
-    URLSession.shared.dataTask(with: req) { d, _, _ in
+    Http.session.dataTask(with: req) { d, _, _ in
       defer { sem.signal() }
       guard let d,
             let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -273,7 +281,7 @@ enum Warm {
     req.timeoutInterval = 5
     req.cachePolicy = .reloadIgnoringLocalCacheData
     let began = Date()
-    URLSession.shared.dataTask(with: req) { d, resp, err in
+    Http.session.dataTask(with: req) { d, resp, err in
       let ms = Int(Date().timeIntervalSince(began) * 1000)
       let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
       // On stderr and not silent: a warm that has started failing is invisible

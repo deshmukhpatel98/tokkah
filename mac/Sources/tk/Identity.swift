@@ -378,7 +378,7 @@ enum Identity {
     // a 429 on a registration are backed off with the same rule.
     var hintMs: Int?
     let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    Http.session.dataTask(with: req) { data, resp, _ in
       status = (resp as? HTTPURLResponse)?.statusCode
       if let data, let s = String(data: data, encoding: .utf8) { payload = s }
       if let data,
@@ -715,7 +715,7 @@ enum Identity {
     var status = 0
     var payload = ""
     let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    Http.session.dataTask(with: req) { data, resp, _ in
       status = (resp as? HTTPURLResponse)?.statusCode ?? 0
       if let data, let str = String(data: data, encoding: .utf8) { payload = str }
       if status == 200, let data,
@@ -1118,7 +1118,7 @@ enum Identity {
     var status = 0
     var payload = ""
     let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    Http.session.dataTask(with: req) { data, resp, _ in
       status = (resp as? HTTPURLResponse)?.statusCode ?? 0
       if let data, let str = String(data: data, encoding: .utf8) { payload = str }
       sem.signal()
