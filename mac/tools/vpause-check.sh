@@ -236,13 +236,17 @@ fi
 # unchanged and still honest.
 CAPS="$(python3 -c "
 w=${WITHOUT:-1}
-print(' '.join('%.2f' % (w*f) for f in (0.85, 1.15, 1.5)))")"
+print(' '.join('%.2f' % (w*f) for f in (1.15, 1.5)))")"
 VERDICT2=""
 for RUNG in $CAPS; do
   echo "     trying a ceiling of ${RUNG} Mbps (voice alone needs ${WITHOUT})"
   run cap --imp-capacity "$RUNG" --imp-capacity-queue
   VERDICT2="$(grep -oE 'voice harm [^]]*with no video: [A-Za-z ]*' "$SP/cap-a.log" | head -1)"
-  [ -n "$VERDICT2" ] && { CAP="$RUNG"; break; }
+  # Only a rung where the pause HELPED ends the ladder. Breaking on any verdict
+  # let the first rung's "NOT HELPING" stop the sweep before a valid ceiling
+  # was ever tried -- and the first rung (0.85x voice alone) could not help by
+  # construction: below the voice's own rate there is nothing a pause gives back.
+  case "$VERDICT2" in *"the pause is helping"*) CAP="$RUNG"; break ;; esac
 done
 [ -n "$VERDICT2" ] && echo "     $VERDICT2"
 # ── WHAT THIS ARM ACTUALLY FOUND, WHICH IS NOT WHAT IT WAS LOOKING FOR ──────
