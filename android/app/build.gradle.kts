@@ -21,6 +21,13 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
+    // ONE curve implementation, constant-time, identical on every phone and in
+    // every JVM test: BouncyCastle's RFC 7748 / RFC 8032 code, called directly
+    // (no provider, no platform lookup, no fallback). Before this the app tried
+    // the platform first and dropped to BigInteger arithmetic when it refused --
+    // two paths, one of them not constant-time, and no way to know from a JVM
+    // test which one a given phone was on.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")

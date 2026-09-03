@@ -14,3 +14,5 @@ tasks.register<JavaExec>("call") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.tokkah.kin.harness.CallMain")
 }
+
+dependencies { implementation("org.bouncycastle:bcprov-jdk18on:1.79") }

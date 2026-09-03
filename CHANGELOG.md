@@ -5,7 +5,7 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
-## Kin 0.128.0–0.128.1 / 0.128.1-android.20 — 2026-09-03
+## Kin 0.128.0–0.128.1 / 0.128.1-android.21 — 2026-09-03
 
 ### Changed — the handshake is signed, and there is no plaintext window
 
@@ -52,9 +52,10 @@ vectors):
 
 **Cost: none on the media path.** The signature is computed once per call and
 cached; a same-key beat is compared before any arithmetic; verification happens
-once, at connection, off the audio thread. Android tries the platform's Ed25519
-first (API 33+) and counts every fall back to its own arithmetic
-(`ed25519_fallback`, `x25519_fallback`).
+once, at connection, off the audio thread. Android has ONE curve implementation
+(0.128.1-android.21): BouncyCastle's constant-time RFC 7748 / RFC 8032 code,
+called directly. The platform-first-then-BigInteger arrangement -- two paths,
+one not constant-time, chosen per phone invisibly -- is gone.
 
 **Incompatible on purpose.** A 0.128 end refuses a 0.127 end and says so
 (`hs_old`, "the other end is on an old build"); it does not fall back to an

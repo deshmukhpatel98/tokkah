@@ -8,12 +8,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The fallback path must give the same answer as the platform provider, or the
- * two ends of a call disagree by platform. Android's Conscrypt refuses
- * NamedParameterSpec (it crashed the app on its first join), so the fallback is
- * not hypothetical — on a phone it may be the path that actually runs.
+ * The one X25519 implementation the app ships must give CryptoKit's answers,
+ * or the two ends of a call disagree by platform.
  */
-class X25519FallbackTest {
+class X25519Test {
     private val text by lazy { javaClass.getResourceAsStream("/vectors/crypto.json")!!.reader().readText() }
     private fun top(k: String) = Regex("\"$k\"\\s*:\\s*\"([^\"]*)\"").find(text)!!.groupValues[1]
     private fun side(s: String, k: String): String {
