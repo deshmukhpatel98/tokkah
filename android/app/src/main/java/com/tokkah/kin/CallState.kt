@@ -78,6 +78,17 @@ class KinState(
             cardLine = null; cardBecause = null
             ctx?.let { Ringer.start(it) }
             onChanged?.invoke()
+            // A ring that lands in THIS poller a moment after the window went
+            // behind (the poll in flight when ON_STOP hit) would draw the card
+            // where nobody can see it and ring on. The Mac's window rises for a
+            // ring; so does this one, by the same grant the service uses.
+            if (!RingService.appInFront) ctx?.let { c ->
+                if (RingService.canOpenOverOthers(c)) c.startActivity(
+                    android.content.Intent(c, MainActivity::class.java).apply {
+                        flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    },
+                )
+            }
         }
     }
 
