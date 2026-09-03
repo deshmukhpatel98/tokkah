@@ -427,9 +427,12 @@ private fun WaitingRow(
     LaunchedEffect(copied) { if (copied) { delay(2000); copied = false } }
     LaunchedEffect(dialing) { if (dialing) focus.requestFocus() }
     val shape = RoundedCornerShape(Metric.cardFieldRadius)
+    // The Mac's box (Controls.swift 2819): as wide as the longer of the link and
+    // the placeholder plus s6, never under 180, never over 70% of the window.
+    val screenW = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
     Row(modifier.padding(horizontal = Metric.gutter), verticalAlignment = Alignment.CenterVertically) {
         GlassSurface(
-            Modifier.widthIn(min = 180.dp, max = 320.dp).height(Metric.fieldHeight),
+            Modifier.widthIn(min = 180.dp, max = screenW * 0.7f).height(Metric.fieldHeight),
             radius = Metric.cardFieldRadius, blurRadius = 18.dp,
         ) {
             if (dialing) {
@@ -456,7 +459,8 @@ private fun WaitingRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        if (copied) "copied ✓" else link.removePrefix("https://"),
+                        // The whole link, as the Mac shows it: a person reads it before a browser does.
+                        if (copied) "copied ✓" else link,
                         color = Palette.fg, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         fontFamily = FontFamily.Monospace,
                         fontSize = Type.mono.first, fontWeight = Type.mono.second,

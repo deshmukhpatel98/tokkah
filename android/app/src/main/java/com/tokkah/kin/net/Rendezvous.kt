@@ -7,6 +7,22 @@ import java.net.URL
 object Server {
     @Volatile var base = "https://room.tokkah.com"
     val invite get() = "https://kin.tokkah.com"
+
+    /**
+     * `roomURL` (main.swift 1668): two shapes, and only one works per room. A
+     * MINTED room (3-4-3 lowercase) is `origin/room`; anything else is
+     * `origin/?r=room`, because the short path 404s for a named room. The phone
+     * used the short path for everything, so `--room standup` on the far end
+     * produced a link nobody could follow.
+     */
+    fun roomURL(room: String): String {
+        val parts = room.split("-")
+        val minted = room.length == 12 && parts.map { it.length } == listOf(3, 4, 3) &&
+            room.all { it == '-' || it in 'a'..'z' }
+        if (minted) return "$invite/$room"
+        val esc = java.net.URLEncoder.encode(room, "UTF-8").replace("+", "%20").replace("%2D", "-").replace("%5F", "_")
+        return "$invite/?r=$esc"
+    }
     // A separate trust boundary on purpose; Android's feed lives beside macos/.
     val updates get() = "$base/android"
 }

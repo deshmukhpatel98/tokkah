@@ -599,7 +599,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                 }
             }
 
-            val inviteLink = "${Server.invite}/${s.room}"
+            val inviteLink = com.tokkah.kin.net.Server.roomURL(s.room)
 
             // ── ringing somebody INTO this call ─────────────────────────────
             fun dialInto(raw: String) {
