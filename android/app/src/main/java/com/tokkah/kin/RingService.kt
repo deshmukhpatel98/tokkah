@@ -182,6 +182,12 @@ class RingService : Service() {
             // A channel's importance cannot be lowered once it exists, so the
             // quiet one is a NEW id and the old LOW channel is removed.
             nm.deleteNotificationChannel("kin.listening")
+            nm.deleteNotificationChannel("kin.listening.none")   // a one-day experiment, see PARITY.md
+            // MEASURED 2026-09-03 on API 35: the system PROMOTES a foreground
+            // service's channel to LOW (mImportance=2) whether it was created at
+            // MIN or at NONE -- dumpsys shows mOriginalImp=1/0 and mImportance=2
+            // either way. No channel setting removes the listening notification;
+            // only push (FCM) would, and that needs a server route.
             nm.createNotificationChannel(
                 NotificationChannel(CH_ONGOING, "Listening for calls",
                     NotificationManager.IMPORTANCE_MIN).apply {
