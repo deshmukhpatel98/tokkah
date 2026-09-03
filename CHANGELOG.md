@@ -5,7 +5,17 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
-## Unreleased
+## Kin 0.134.0 — 2026-09-03
+
+### Added — version row on the front-door settings card
+
+The front-door settings card (opened by clicking `...` in the top right) now displays a
+dedicated `Version` row with a pill chip showing the running version (e.g. `0.134.0`).
+Matching the in-call controls sheet, tapping the version chip checks for updates
+(`Update.checkNowForPerson()`), displays temporary feedback (`This is the newest version.`),
+and turns into an `Update ready [restart]` action when a downloaded update is waiting.
+
+## Kin 0.133.0 — 2026-09-03
 
 ### Changed — temporal denoise floorWeight tuned to 0.16 (-7 to -9% bytes/frame at q0.7)
 
