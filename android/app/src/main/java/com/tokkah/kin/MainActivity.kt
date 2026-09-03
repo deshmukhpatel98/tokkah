@@ -657,9 +657,8 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     if (cameraCount > 1) add(com.tokkah.kin.ui.SheetItem.Row("Camera",
                         detail = if (video?.facingFront != false) "Front" else "Back", chevron = true,
                         glyph = com.tokkah.kin.ui.GlyphKind.CAMERA, onClick = { page = "camera" }))
-                    // Android picks the microphone with the route: a fact, not a door.
-                    add(com.tokkah.kin.ui.SheetItem.Row("Microphone", detail = micName.ifEmpty { "…" },
-                        glyph = com.tokkah.kin.ui.GlyphKind.MIC, inert = true))
+                    add(com.tokkah.kin.ui.SheetItem.Row("Microphone", detail = micName.ifEmpty { "…" }, chevron = true,
+                        glyph = com.tokkah.kin.ui.GlyphKind.MIC, onClick = { page = "mic" }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Speaker", detail = speakerName.ifEmpty { "…" }, chevron = true,
                         glyph = com.tokkah.kin.ui.GlyphKind.SPEAKER, onClick = { page = "speaker" }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Calls when Kin is closed", switchState = state.listening,
@@ -757,6 +756,13 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                             page = "settings"
                         }))
                     }
+                    add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
+                }
+                "mic" -> buildList {
+                    val mics = audio?.mics() ?: emptyList()
+                    for (m in mics) add(com.tokkah.kin.ui.SheetItem.Row(m.name, checked = m.name == micName, onClick = {
+                        audio?.setMic(m); page = "settings"
+                    }))
                     add(com.tokkah.kin.ui.SheetItem.Row("Back", onClick = { page = "settings" }))
                 }
                 "speaker" -> buildList {
