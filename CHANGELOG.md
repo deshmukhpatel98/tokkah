@@ -5,6 +5,24 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.131.0 — 2026-09-03
+
+### Fixed — the denoise stage cost 3.2 ms a frame under -O
+
+Measured on a quiet machine, the filter shipped in 0.129.0 spent 3.2 ms per 720p
+frame on the capture thread: 32-bit SIMD lanes plus a histogram scatter inside the
+hot loop. Standalone (`swiftc -O`): SIMD16<Int32> 1.00 ms, scalar 0.34 ms,
+SIMD8<Int16> 0.25 ms. The loop now runs eight 16-bit lanes (the Q4 values fit; only
+the weight multiply widens) and the noise statistics are a separate pass over every
+fourth row. Output is byte-identical (6,631 vs 6,632 B/frame on the lit clip);
+in-app cost reads 0.5–1.5 ms depending on the core's power state between frames.
+`--vpsnr` now prints the stage breakdown (setup / luma / chroma).
+
+### Added — `--vcodec hevc` decodes in the ruler
+
+The HEVC decode path that the measured negative in 0.129.0 relied on was dropped
+by a merge; it is back. Live calls still send H.264.
+
 ## Kin 0.130.0 / 0.130.0-android.32 — 2026-09-03
 
 ### Changed — the key exchange is post-quantum, and a release needs two signatures
