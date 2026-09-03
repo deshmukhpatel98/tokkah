@@ -97,6 +97,7 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | a ring that lands as Kin goes behind | the poll in flight when ON_STOP hit delivered a ring to the app's own poller, which drew the card in a backgrounded window and rang on (measured: 1 of 4 test rings). An in-app offer now raises the window under the same grant the service uses | ✅ android.27 |
 | the caption pill | placement matched (centred above the bar, `--press said` vs the phone's `--es said` rig arm); the text was centred where the Mac's reads from the left. Now Start-aligned | ✅ android.28 |
 | the People page | rows, the copy chip on your own row, the hint, Call someone new, Back — verified against the Mac's `--press more,people` shot | ✅ verified android.27 |
+| sheet row insets | the Mac indents ONLY the People page's glyph-less rows to the avatar column (Controls.swift 5446); every other row starts at s3. The phone indented every glyph-less row, so Save this name / Not now sat 14 pt right of their own hint. Now `Row(indent=)` mirrors the rule: rename rows at x=110 with the hint, People rows at x=225 with the names | ✅ android.29 |
 | own mouth-to-ear (m2e_p50/95/99) | same names; basis = device buffer, said in the facts | ✅ 0.126.13 |
 
 ## Found on the way (fixed 0.126.0-android.12)
