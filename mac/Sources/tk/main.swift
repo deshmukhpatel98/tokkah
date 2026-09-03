@@ -575,7 +575,7 @@ let KNOWN_FLAGS: Set<String> = [
   // environment for the usual reason: a security control whose flag is a silent
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
-  "watch-policy",
+  "watch-policy", "vq-legacy-denom",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -994,6 +994,7 @@ var resumable: Resume.Live?
 let namesAnotherJob = isTestRun || flag("stun") || flag("acoustic")
   || arg("call") != nil || arg("shot") != nil
   || flag("cam-picker-test") || flag("vpause-test") || flag("presence-run")
+  || arg("vpsnr") != nil || arg("camrec") != nil
 if arg("room") == nil, arg("peer") == nil, !flag("gui"), !flag("no-rejoin"),
    !namesAnotherJob,
    ProcessInfo.processInfo.environment["TK_NO_REJOIN"] != "1",
@@ -8030,15 +8031,24 @@ func reportLoop() {
     // fragments means the same amount of video damage reads as five times less
     // harm than it is. Counted without a denominator, or with the wrong one, is a
     // bug class this repo already has a name for.
+    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
+    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
     let vFragsNow = wire.peerVideoFrags
     var denom = Double(max(1, d.sent))
+    let legacyDenom = flag("vq-legacy-denom")
     if harmIsVideo {
-      let dFrags = max(0, vFragsNow - lastVqPeerFrags)
+      if legacyDenom {
+        let dFrags = max(0, vFragsNow - lastVqPeerFrags)
+        denom = Double(max(1, dFrags + outboundHarm))
+      } else {
+        // The peer's `missing` counter is in FRAMES, not fragments.
+        // Dividing missing frames by received fragments diluted real frame loss
+        // by ~7x, hiding 1-3 dropped frames/s below the 2% retreat threshold,
+        // while blowing up to 100% on startup when dFrags was 0. The true
+        // denominator for missing frames is the frames actually sent.
+        denom = Double(max(1, sentFrames))
+      }
       lastVqPeerFrags = vFragsNow
-      // Their fragments received plus the ones they gave up on: what we sent, as
-      // far as they can tell. A denominator of only what ARRIVED would make the
-      // rate approach 100% as the path got worse and 0% only when nothing was sent.
-      denom = Double(max(1, dFrags + outboundHarm))
     }
     let sentNow = max(1, d.sent)
     let harmRate = Double(outboundHarm) / denom
@@ -8047,7 +8057,7 @@ func reportLoop() {
     if harmed != lastVqHarmed {
       lastVqHarmed = harmed
       fputs("  picture: outbound \(harmIsVideo ? "VIDEO" : "audio") loss "
-          + "\(String(format: "%.2f", harmRate * 100))% of \(harmIsVideo ? "fragments" : "packets")"
+          + "\(String(format: "%.2f", harmRate * 100))% of \(harmIsVideo ? (legacyDenom ? "fragments" : "frames") : "packets")"
           + " -- \(harmed ? "above" : "below") the \(String(format: "%.1f", HARM_RETREAT))% line,"
           + " so quality \(harmed ? "retreats" : "holds")\n", stderr)
     }
@@ -8058,12 +8068,11 @@ func reportLoop() {
     // what arms the pause and what the pause is judged by -- see `VQuality.tick`.
     // Computed here whether or not it is the ladder's signal, because the day the
     // peer stops reporting video this is all there is.
+    //
     let voiceDelta = max(0, (pLost - lastVqVoiceLost) + (pRec - lastVqVoiceRec))
     lastVqVoiceLost = pLost; lastVqVoiceRec = pRec
     let voiceRate = Double(voiceDelta) / Double(sentNow)
     let voiceHarmed = voiceRate * 100.0 > HARM_RETREAT
-    let sentFrames = vSentFrames - vqFramesPrev, sentBytes = vBytesSent - vqBytesPrev
-    vqFramesPrev = vSentFrames; vqBytesPrev = vBytesSent
     let wasLevel = vq.level
     let changed = vq.tick(now: Double(beatTick),
                           pictureHarmed: harmIsVideo ? harmed : false,

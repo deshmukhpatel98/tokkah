@@ -5,6 +5,30 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.132.0 — 2026-09-03
+
+### Fixed — video loss divided missing frames by received fragments, hiding real loss
+
+The far end's receive-side loss counter (`peerVideoMissing`) counts missing whole
+frames (`VideoAssembler.missing`), while `peerVideoFrags` counts individual fragments
+(`fragsIn`). Dividing missing frames by received fragments divided a frame count by
+~7x more fragments: at 7 fragments/frame, 1 lost frame out of 30 produced an apparent
+loss of 1 / 204 = 0.49% — safely under the 2.0% retreat threshold. As a result,
+1–3 dropped frames every second (up to 10% frame loss, a visibly stuttering picture)
+were completely ignored by the quality controller, keeping the encoder at high bitrates
+under link congestion. Conversely, during startup when few fragments had arrived
+(`dFrags == 0`), a single dropped frame yielded 1 / 1 = 100% loss, instantly forcing a
+2-rung collapse.
+
+The denominator is now the number of frames actually sent in that tick (`sentFrames`).
+Measured on loopback under 3% uniform packet loss: 1 dropped frame out of 30 now
+correctly computes as 3.33% loss, prompting an immediate step down from q0.7 to q0.6
+and q0.5 to relieve network congestion, whereas the legacy calculation held high quality
+at 0.78%. `--vq-legacy-denom` is the control arm.
+
+`namesAnotherJob` now also recognizes `--vpsnr` and `--camrec`, preventing rig and
+measurement runs from accidentally resuming stale calls.
+
 ## Kin 0.131.0 — 2026-09-03
 
 ### Fixed — the denoise stage cost 3.2 ms a frame under -O
