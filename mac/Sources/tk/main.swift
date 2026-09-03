@@ -529,7 +529,7 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap",
+  "no-vdenoise", "vdenoise-t", "vdenoise-floor", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap", "vcodec",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
   // exited 2 instead of turning the feature off -- a flag whose only effect was
@@ -5335,6 +5335,7 @@ if let path = arg("vpsnr") {
   let lock = NSLock()
   let done = DispatchSemaphore(value: 0)
   let dn = makeDenoise()
+  var encP50 = 0.0, encP99 = 0.0
 
   func luma(_ pb: CVPixelBuffer) -> (buf: [UInt8], w: Int, h: Int)? {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
@@ -5351,7 +5352,8 @@ if let path = arg("vpsnr") {
   do {
     let dec = VDecoder()
     let enc = try VEncoder(width: 1280, height: 720, bitrate: br,
-                           quality: arg("vquality").flatMap { Double($0) })
+                           quality: arg("vquality").flatMap { Double($0) },
+                           hevc: arg("vcodec") == "hevc")
     enc.requestKeyframe()
     dec.onDecoded = { img, capHost in
       guard let pb = img as CVPixelBuffer?, let got = luma(pb) else { return }
@@ -5415,12 +5417,13 @@ if let path = arg("vpsnr") {
       }
       enc.encode(fpb, hostTime: host)
     }
-    fputs("vpsnr: \(path) -> H.264 1280x720 @ \(br / 1000) kbps, \(want) frames"
+    fputs("vpsnr: \(path) -> \(enc.hevc ? "HEVC" : "H.264") 1280x720 @ \(br / 1000) kbps, \(want) frames"
         + (dn.map { ", denoise t\($0.threshold) floor \($0.floorWeight)" } ?? ", denoise OFF") + "\n", stderr)
     try src.start()
     // The file plays in real time, so bound the wait by that plus slack rather
     // than spinning: 300 frames at 30 fps is ten seconds.
     _ = done.wait(timeout: .now() + Double(want) / 25.0 + 15.0)
+    encP50 = enc.encLatMs.p(0.50) ?? 0; encP99 = enc.encLatMs.p(0.99) ?? 0
   } catch {
     fputs("vpsnr: \(error)\n", stderr)
     exit(1)
@@ -5439,6 +5442,7 @@ if let path = arg("vpsnr") {
           + "  cost p50 \(d.cost.p(0.50).map { String(format: "%.2f", $0) } ?? "-")"
           + " p99 \(d.cost.p(0.99).map { String(format: "%.2f", $0) } ?? "-") ms"
           + (d.bypassed > 0 ? "  BYPASSED \(d.bypassed) frames" : "") } ?? "")
+      + "\n  encode p50 \(String(format: "%.2f", encP50)) p99 \(String(format: "%.2f", encP99)) ms"
       + "\n  \(bytes / 1024) KiB in \(String(format: "%.1f", secs)) s"
       + " = \(String(format: "%.3f", Double(bytes) * 8 / 1e6 / max(secs, 0.001))) Mbps"
       + ", \(compared > 0 ? bytes / max(frames, 1) : 0) B/frame\n", stderr)
@@ -7750,6 +7754,7 @@ func reportLoop() {
     if let v = dl.p(0.50) { vb["v_dec_ms_p50"] = v }
     vb["v_q_level"] = vq.level
     vb["v_q_downs"] = vq.stepDowns
+    vb["v_q_heavy_downs"] = vq.heavyDowns
     vb["v_q_ups"] = vq.stepUps
     // ── THE PAUSE, FROM BOTH ENDS ────────────────────────────────────────────
     //
@@ -7787,7 +7792,6 @@ func reportLoop() {
     } else { vb["v_dn_on"] = 0 }
     vb["v_dq_queued"] = dq.queued
     vb["v_dq_inline_full"] = dq.inlineFull
-    vb["v_q_heavy_downs"] = vq.heavyDowns
     vb["v_dq_inline_big"] = dq.inlineTooBig
     vb["v_dq_depth_max"] = dq.maxDepth
     if let d = display { vb["v_shown"] = d.shown; vb["v_enq_fail"] = d.enqueueFails }
