@@ -5,6 +5,17 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.138.0 — 2026-09-03
+
+### Added — call recording UI, menu integration, and wire status synchronization
+
+- Adds **Record Call** (`⌘⇧R`) and **Open Recordings in Finder** to the application menu and Call menu.
+- Adds `Record call` row to the in-call More sheet (`...`) with live recording feedback and toggle controls.
+- Introduces `Wire.ST_RECORDING` (bit 128) on the status byte so recording state synchronizes across ends, notifying the remote peer when a call is recorded locally.
+- Recordings are cleanly saved to `~/Movies/Kin/Kin-<timestamp>.mov` with sample-accurate audio/video synchronization and real-time packet loss concealment.
+- Automatically inhibits video pause on verified LAN paths (`inhibitPause`) to preserve full frame rate over local network.
+- Sets local speech subtitles to default off (opt-in with `--subtitles`) to reduce unnecessary background CPU usage.
+
 ## Kin 0.137.0 — 2026-09-03
 
 ### Added — in-call recorder (⌘⇧R and in-call More sheet)
