@@ -575,7 +575,7 @@ let KNOWN_FLAGS: Set<String> = [
   // environment for the usual reason: a security control whose flag is a silent
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
-  "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto",
+  "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto", "no-lan-upgrade",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -5278,6 +5278,7 @@ if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v
 if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
+if flag("no-lan-upgrade") { Wire.lanUpgrade = false; fputs("net: LAN path upgrade off (legacy lock-once)\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if let ed = arg("echo-sim") {
@@ -6930,6 +6931,11 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   // be two DIFFERENT windows sharing one name, and the second would report the
   // microseconds between them rather than the beat.
   let pwr = Power.sample()
+  // One sample of the path diagnostic, shared by the three fields below: whether
+  // the locked path is a LAN address, how many private candidates were offered,
+  // and the best RTT a private path answered with. Sampled once so the three
+  // cannot disagree across an upgrade that lands mid-beat.
+  let pd = wire.pathDiag()
   var f: [String: Any] = [
     "uptime_s": uptime,
     "up_mbps": up, "down_mbps": down,
@@ -7220,6 +7226,15 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // 1 direct, 2 relayed, 0 not locked yet. A relayed call is a different
     // product to a direct one and the dashboard could not tell them apart.
     "route": wire.lockedFrom.hasPrefix("relay") ? 2 : (wire.lockedFrom.isEmpty ? 0 : 1),
+    // Hairpin diagnosis. `route` alone cannot tell a LAN direct path from a
+    // public one -- both read 1. `lock_lan` = the locked path is a private
+    // (LAN) address; `cand_priv` = how many private candidates were offered;
+    // `path_priv_ms` = best RTT a private path answered with (-1 = none did).
+    // route 1 + lock_lan 0 + cand_priv>0 is a hairpin; path_priv_ms>0 there
+    // means the LAN answered and the upgrade should have taken it.
+    "lock_lan": pd.lockLan ? 1 : 0,
+    "cand_priv": pd.candPriv,
+    "path_priv_ms": pd.privRttMs,
     "turn_ok": wire.turn != nil ? 1 : 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
     // The INSTANT, kept for continuity, and the PEAK beside it -- the final beat

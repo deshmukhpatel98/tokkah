@@ -729,7 +729,28 @@ final class Wire {
   /// that opens the NAT binding, so connectivity and offset are established by
   /// the same packet.
   func probeAllCandidates() {
-    guard !locked, crypto?.established != true else { return }
+    // Two phases, both run from the 0.5 s rediscovery loop. In the RACE (unlocked
+    // and unkeyed) probe every candidate plus the relay, exactly as before. After
+    // it, keep probing JUST an unreplied LAN candidate -- its first probe is
+    // routinely dropped during ARP, so one shot loses the race to the public
+    // hairpin -- until it answers (pickBestPathLocked then upgrades onto it) or
+    // this end is already on a private path. A settled direct/relay call with no
+    // private candidate re-probes nothing, so it costs the same as before; the
+    // hunt is one 32-byte packet per unreplied LAN candidate per 0.5 s.
+    let full = !locked && crypto?.established != true
+    let onPrivate = locked && isPrivateSubnet(peer)
+    if !full && (onPrivate || !Wire.lanUpgrade) { return }
+    var targets: [sockaddr_in]
+    pathLock.lock()
+    candLock.lock()
+    if full {
+      targets = candidates
+    } else {
+      targets = candidates.filter { isPrivateSubnet($0) && pathRtt[pathKey($0)] == nil }
+    }
+    candLock.unlock()
+    pathLock.unlock()
+    if targets.isEmpty { return }
     var out = [UInt8](repeating: 0, count: TPKTZ)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
@@ -737,9 +758,6 @@ final class Wire {
       p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 8, as: UInt64.self)
       appendRxReport(p)
     }
-    candLock.lock()
-    let targets = candidates
-    candLock.unlock()
     for c in targets {
       var a = c
       out.withUnsafeBufferPointer { b in
@@ -750,8 +768,8 @@ final class Wire {
         }
       }
     }
-    // And through our TURN allocation, so the relayed path is in the same race.
-    if let t = turn {
+    // The relay only needs to be in the initial race; the LAN hunt never relays.
+    if full, let t = turn {
       out.withUnsafeBufferPointer { t.sendChannel(fd: fd, $0.baseAddress!, $0.count) }
     }
   }
@@ -868,7 +886,26 @@ final class Wire {
       adopt(addr)
       sendViaTurn = turn?.isTurnServer(addr) == true
     }
-    guard settle, !raceSettled else { return nil }
+    // ── AFTER THE RACE: a one-way upgrade to the LAN ────────────────────────
+    // The race settles in 150-400 ms, but a same-router peer's LAN probe is
+    // routinely dropped during the first ARP (the documented hairpin, 0.133),
+    // so the LAN loses the initial race and the call stays on the public
+    // hairpin for its whole length -- a live call measured relocks=0 while it
+    // bled ~700 packets/s. Once a private path DOES answer, take it: one way
+    // only (public/relay -> private), so it cannot oscillate, and never off a
+    // path that is already private. `probeAllCandidates` keeps the LAN probed
+    // past the settle so this branch has something to fire on.
+    if raceSettled {
+      guard Wire.lanUpgrade, isPrivateSubnet(addr), !isPrivateSubnet(peer),
+            pathKey(peer) != best.key else { return nil }
+      let was = lockedFrom
+      peer = addr
+      lockedFrom = best.key
+      sendViaTurn = false              // a private address is never the relay
+      relocks += 1
+      return "path: upgraded to LAN \(best.key) at \(String(format: "%.2f", best.value)) ms rtt (was \(was))\n"
+    }
+    guard settle else { return nil }
     raceSettled = true
     if pathKey(peer) != best.key {
       // Read BEFORE the reassignment below: the line says which path we are
@@ -884,6 +921,27 @@ final class Wire {
     return "path: kept \(best.key) at \(String(format: "%.2f", best.value)) ms rtt\n"
   }
 
+  /// Beat diagnostic: is the locked path a LAN (private-subnet) address, how many
+  /// private candidates were offered, and the RTT of the best private path that
+  /// actually answered (-1 if none did). This is what tells a hairpin (locked
+  /// public with a private candidate that never replied, or replied and was not
+  /// taken) apart from a genuinely lossy LAN. Read from the poll loop only; the
+  /// same racy read of `peer` the beat already makes for `route`.
+  func pathDiag() -> (lockLan: Bool, candPriv: Int, privRttMs: Double) {
+    let lockLan = locked && isPrivateSubnet(peer)
+    pathLock.lock()
+    candLock.lock()
+    var priv = 0
+    var best = -1.0
+    for c in candidates where isPrivateSubnet(c) {
+      priv += 1
+      if let r = pathRtt[pathKey(c)], best < 0 || r < best { best = r }
+    }
+    candLock.unlock()
+    pathLock.unlock()
+    return (lockLan, priv, best)
+  }
+
   /// What the PEER has lost and recovered on the path FROM HERE. Cumulative, so
   /// a reader that samples at any cadence gets a true delta -- a windowed average
   /// read on the wrong cadence has inverted an A/B in this project before.
@@ -895,6 +953,11 @@ final class Wire {
   /// `--pcm32` forces the old format so the change can be A/B'd from either side.
   nonisolated(unsafe) static var forceFloat = false
   nonisolated(unsafe) static var forceNoLp = false
+  /// After the path race settles, keep probing an unreplied LAN candidate and
+  /// take it if it answers -- two Macs on one router should never hairpin. On by
+  /// default; `--no-lan-upgrade` is the control arm (the legacy "lock once and
+  /// never re-evaluate" behaviour that left a live call on a 700-pkt/s hairpin).
+  nonisolated(unsafe) static var lanUpgrade = true
   private(set) var peerCaps: UInt32 = 0
   var sendPcm16: Bool { !Wire.forceFloat && (peerCaps & CAP_PCM16) != 0 }
   /// Compression rides ON TOP of 16-bit: the coder's input is int16 samples, so
