@@ -41,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
@@ -163,7 +164,18 @@ fun CallScreen(
 
     GlassBackdrop(
         Modifier.fillMaxSize().background(Palette.bg),
-        backdrop = { Box(Modifier.fillMaxSize()) { farVideo() } },
+        backdrop = {
+            Box(Modifier.fillMaxSize()) {
+                farVideo()
+                // A SurfaceView is a hole punched through the window, and with
+                // no picture in it the hole is pure black -- a band a shade
+                // darker than the ground around it. While there is nothing to
+                // show, the ground covers it (the Mac hides its picture layer;
+                // a SurfaceView cannot be hidden without losing the decoder's
+                // output surface).
+                if (ui.noPicture != null) Box(Modifier.fillMaxSize().background(Palette.bg))
+            }
+        },
     ) {
         Box(
             Modifier
@@ -236,9 +248,15 @@ fun CallScreen(
             // at the top ran INTO the who-pill. So the phone has one top line --
             // who on the left, `…` on the right, both centred on the same 48 pt
             // line -- and the sentence sits centred on the line below it.
+            //
+            // And not while the sheet is up: on the Mac the sheet is a panel at
+            // the right and the sentence stays in the open sky beside it; on the
+            // phone the sheet is the whole width and the pills would sit UNDER
+            // its glass as ghosts (effect-view-resamples-siblings).
             Column(
                 Modifier.align(Alignment.TopCenter).statusBarsPadding()
-                    .padding(top = Metric.gutter + Metric.controlSmall + Metric.s2),
+                    .padding(top = Metric.gutter + Metric.controlSmall + Metric.s2)
+                    .alpha(if (ui.sheet == null) 1f else 0f),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 if (ui.sentence.isNotEmpty()) HintPill(ui.sentence)
