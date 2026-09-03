@@ -642,6 +642,36 @@ final class Wire {
     return
   }
 
+  /// `rawSend` to an EXPLICIT address instead of the locked `peer`: for the reply
+  /// to a path probe, which has to go back the way the request came or the
+  /// requester measures the wrong path. Sealed like everything else -- nothing
+  /// leaves in the clear -- and dropped under an impaired rig's loss. It skips
+  /// the rig's delay queue, which is addressed to `peer`, so an impaired probe
+  /// reply is prompt rather than queued (a 1 Hz 32-byte packet; the queue exists
+  /// to model media). Never routed through TURN: a request that arrived on the
+  /// relay is answered on the channel by `rawSend`.
+  func rawSendTo(_ p: UnsafePointer<UInt8>, _ n: Int, _ cls: TxCls, to addr: sockaddr_in) {
+    guard let c = crypto, c.established else { crypto?.notePreKeyDrop(); return }
+    switch cls {
+    case .audio: genAudio += n + 28
+    case .video: genVideo += n + 28
+    case .probe: genProbe += n + 28
+    case .ctl:   genCtl += n + 28
+    }
+    withUnsafeTemporaryAllocation(byteCount: n + 32, alignment: 8) { tmp in
+      let out = tmp.baseAddress!.assumingMemoryBound(to: UInt8.self)
+      guard let m = c.seal(p, n, into: out) else { cryptSendFails += 1; return }
+      if let im = impair, im.enabled, im.shouldDrop(bytes: m) { return }
+      var a = addr
+      let r = withUnsafePointer(to: &a) { pp in
+        pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          sendto(fd, out, m, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+      if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += m + 28 }
+    }
+  }
+
   private(set) var cryptSendFails = 0
   private(set) var handshakeReplies = 0
   private(set) var redundantSent = 0
@@ -1861,7 +1891,25 @@ final class Wire {
             p.storeBytes(of: Clock.now().littleEndian, toByteOffset: 24, as: UInt64.self)  // t3
             appendRxReport(p)
           }
-          out.withUnsafeBufferPointer { _ = rawSend($0.baseAddress!, $0.count, .probe) }
+          // ── ANSWER ON THE PATH THE QUESTION CAME IN ON ───────────────────────
+          //
+          // This was `rawSend`, which goes to the locked `peer`. Two Macs on one
+          // Wi-Fi locked the public hairpin; every probe this end then sent to
+          // the LAN was ANSWERED -- over the hairpin, to the public address --
+          // so the reply arrived from the public IP and `notePath` booked its
+          // RTT under the public path. The LAN read path_priv_ms = -1 on both
+          // ends of a live call, the race could never credit the very path it
+          // was racing, and the upgrade in `pickBestPathLocked` had nothing to
+          // fire on. A round trip only measures a path if it returns on it. A
+          // request that arrived through the relay is still answered on the
+          // channel, where a raw sendto to the relay's address would not land.
+          out.withUnsafeBufferPointer { b in
+            if turn?.isTurnServer(src) == true {
+              rawSend(b.baseAddress!, b.count, .probe)
+            } else {
+              rawSendTo(b.baseAddress!, b.count, .probe, to: src)
+            }
+          }
         } else {
           let t2 = (plain + 16).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
           let t3 = (plain + 24).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
