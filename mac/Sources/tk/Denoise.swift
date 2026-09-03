@@ -87,6 +87,9 @@ final class VDenoise {
   private var hist = [Int32](repeating: 0, count: 256)
   /// Milliseconds per frame, so the cost is a number in the beat and not a guess.
   var cost = Quantiles()
+  /// Where inside the frame the time goes: getting and locking the buffers,
+  /// the luma pass, the chroma pass. Attribution, so "2 ms" can be attacked.
+  var costSetup = Quantiles(), costLuma = Quantiles(), costChroma = Quantiles()
   private(set) var frames = 0
   /// Frames handed back untouched because the format or size was not the one
   /// the encoder is configured for. Non-zero means the filter is not running.
@@ -143,7 +146,7 @@ final class VDenoise {
     guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outOpt) == kCVReturnSuccess, let out = outOpt else {
       bypassed += 1; return src
     }
-    let t0 = Clock.now()
+    let tPool = Clock.now()
     CVPixelBufferLockBaseAddress(src, .readOnly)
     CVPixelBufferLockBaseAddress(out, [])
     defer {
@@ -153,6 +156,8 @@ final class VDenoise {
     guard let sy = CVPixelBufferGetBaseAddressOfPlane(src, 0), let sc = CVPixelBufferGetBaseAddressOfPlane(src, 1),
           let dy = CVPixelBufferGetBaseAddressOfPlane(out, 0), let dc = CVPixelBufferGetBaseAddressOfPlane(out, 1),
           let py = prevY, let pc = prevC else { bypassed += 1; return src }
+    let t0 = Clock.now()
+    costSetup.add(Clock.ms(t0 - tPool))
     let ssY = CVPixelBufferGetBytesPerRowOfPlane(src, 0), ssC = CVPixelBufferGetBytesPerRowOfPlane(src, 1)
     let dsY = CVPixelBufferGetBytesPerRowOfPlane(out, 0), dsC = CVPixelBufferGetBytesPerRowOfPlane(out, 1)
     let hC = CVPixelBufferGetHeightOfPlane(src, 1)
@@ -228,10 +233,15 @@ final class VDenoise {
       return still
     }
     hist.withUnsafeMutableBufferPointer { H in
+      // The histogram and the still count are sampled on every fourth row: the
+      // scatter store made the luma pass 3x slower per pixel than the chroma
+      // pass without it (0.78 vs 0.15 ms for half the pixels), and a median
+      // over 14k samples is the same median.
       for y in 0..<h {
         stillN &+= run(sy.assumingMemoryBound(to: UInt8.self) + y * ssY, py + y * w,
-                       dy.assumingMemoryBound(to: UInt8.self) + y * dsY, w, H)
+                       dy.assumingMemoryBound(to: UInt8.self) + y * dsY, w, y & 3 == 0 ? H : nil)
       }
+      costLuma.add(Clock.ms(Clock.now() - t0))
       // Chroma, same rule. Chroma noise is where the colour speckle lives and it
       // is as expensive to the encoder as the luma kind.
       for y in 0..<hC {
@@ -240,10 +250,13 @@ final class VDenoise {
       }
     }
     frames += 1
-    stillPct = Int(stillN) * 100 / max(1, (w / 16) * 16 * h)
+    costChroma.add(Clock.ms(Clock.now() - t0) - (costLuma.p(1.0) ?? 0))
+    stillPct = Int(stillN) * 100 / max(1, (w / 16) * 16 * ((h + 3) / 4))
     // Median of |difference| from the histogram. The bins are whole levels, so
     // interpolate within the median bin for a number that moves smoothly.
-    let half = Int32(w * h / 32)   // one lane in sixteen was counted
+    var counted: Int32 = 0
+    for i in 0..<256 { counted &+= hist[i] }
+    let half = counted / 2
     var acc: Int32 = 0, med = 0
     for i in 0..<256 {
       let next = acc &+ hist[i]
