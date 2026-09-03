@@ -152,6 +152,15 @@ final class VQuality {
   /// Quiet seconds before it comes back -- doubling per pause, capped.
   private let resumeQuietBase: Int
   private let canPause: Bool
+  var inhibitPause = false {
+    didSet {
+      if inhibitPause && paused {
+        paused = false
+        quietPaused = 0
+        harmedAtFloor = 0
+      }
+    }
+  }
 
   /// Seconds of no harm before trying the next level up.
   private let quietNeeded = 15
@@ -275,6 +284,11 @@ final class VQuality {
     // The wait doubles per pause in the same call. One pause is bad luck; three
     // is a link that is going to do it again, and each recovery costs the far
     // end a black-to-blur-to-face flicker they did not ask for.
+    if inhibitPause && paused {
+      paused = false
+      quietPaused = 0
+      harmedAtFloor = 0
+    }
     if paused {
       pausedTicks += 1
       thisPauseTicks += 1
@@ -375,7 +389,7 @@ final class VQuality {
         // being damaged on a link whose audio is perfectly fine is a reason to send
         // a smaller picture, and there is no smaller one -- it is not a reason to
         // send none.
-        guard voiceHarmed, canPause, !pauseHelpless else { return nil }
+        guard voiceHarmed, canPause, !inhibitPause, !pauseHelpless else { return nil }
         harmedAtFloor += 1
         guard harmedAtFloor >= pauseAfter else { return nil }
         paused = true

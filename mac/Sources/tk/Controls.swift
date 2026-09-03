@@ -110,6 +110,11 @@ enum Glyph {
     p.appendOval(in: NSRect(x: 6 * k, y: 6 * k, width: 12 * k, height: 12 * k))
   } }, filled: true)
 
+  static let folder = Shape(build: { box in path(box) { p, k in
+    rr(p, k, 3, 5, 18, 14, 2)
+    m(p, k, 3, 14); l(p, k, 9, 14); l(p, k, 11, 16.5); l(p, k, 17, 16.5); l(p, k, 19, 14)
+  } }, filled: false)
+
   /// <circle cx=12 cy=9 r=3.2/><path d="M5.5 19c1.2-3 3.6-4.5 6.5-4.5s5.3 1.5 6.5 4.5"/>
   /// <rect x=2.8 y=3.2 width=18.4 height=17.6 rx=4.5/>  -- "hold to see yourself"
   static let peek = Shape(build: { box in path(box) { p, k in
@@ -5141,13 +5146,15 @@ final class CallControls: NSView {
   /// person leaves (`setPeerPresent`). Before that, `waiting.isHidden = true` was a
   /// one-way door, and removing this row would have left a departed call with no
   /// route to the link at all.
-  private func rebuildSheet() {
+  func rebuildSheet() {
     switch sheetPage {
     case .settings: buildSettingsPage()
     case .people: buildPeoplePage()
     case .rename: buildRenamePage()
     case .camera, .microphone, .speaker: buildDevicePage(sheetPage)
     }
+    needsLayout = true
+    layoutSubtreeIfNeeded()
   }
 
   // ── A REBUILD IS DESTRUCTIVE, AND ONE PAGE HOLDS TYPING ────────────────────
@@ -5293,6 +5300,9 @@ final class CallControls: NSView {
       recRow.valueIsWord = true
     }
     items.append(recRow)
+    let openRecRow = SheetRow("Open Recordings in Finder", glyph: Glyph.folder)
+    openRecRow.target = self; openRecRow.action = #selector(openRecordingsRow(_:))
+    items.append(openRecRow)
     items += rows as [NSView]
     // -- THE SETTING THAT DECIDES WHETHER YOU CAN BE CALLED AT ALL ------------
     //
@@ -5524,6 +5534,10 @@ final class CallControls: NSView {
   @objc private func recordRow(_ sender: Any?) {
     Menu.Target.shared.record()
     rebuildSheet()
+  }
+
+  @objc private func openRecordingsRow(_ sender: Any?) {
+    Menu.Target.shared.openRecordings()
   }
 
   @objc private func saveNameRow(_ sender: SheetRow) { commitRename() }
@@ -6187,6 +6201,7 @@ final class CallControls: NSView {
     switch ch {
     case "a": toggleMic(); nudgeBar(); return true
     case "v": toggleCam(); nudgeBar(); return true
+    case "r": Menu.Target.shared.record(); return true
     default: return false
     }
   }
@@ -6209,9 +6224,9 @@ final class CallControls: NSView {
     // So it goes through `window.sendEvent`, the path the window server uses, and
     // lands wherever it really lands. `handleKey` stays as the fallback for a
     // headless run, where there is no window to send anything to.
-    case "esc", "cmd-mic", "cmd-cam":
-      let ch = what == "esc" ? "\u{1b}" : (what == "cmd-mic" ? "a" : "v")
-      let code: UInt16 = what == "esc" ? 53 : (what == "cmd-mic" ? 0 : 9)
+    case "esc", "cmd-mic", "cmd-cam", "cmd-rec":
+      let ch = what == "esc" ? "\u{1b}" : (what == "cmd-mic" ? "a" : (what == "cmd-cam" ? "v" : "r"))
+      let code: UInt16 = what == "esc" ? 53 : (what == "cmd-mic" ? 0 : (what == "cmd-cam" ? 9 : 15))
       let mods: NSEvent.ModifierFlags = what == "esc" ? [] : [.command, .shift]
       guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods,
                                      timestamp: ProcessInfo.processInfo.systemUptime,

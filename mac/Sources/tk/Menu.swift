@@ -133,6 +133,8 @@ enum Menu {
     cam.keyEquivalentModifierMask = [.command, .shift]; cam.target = Target.shared
     let rec = call.addItem(withTitle: "Record Call", action: #selector(Target.record), keyEquivalent: "r")
     rec.keyEquivalentModifierMask = [.command, .shift]; rec.target = Target.shared
+    let openRec = call.addItem(withTitle: "Open Recordings in Finder", action: #selector(Target.openRecordings), keyEquivalent: "")
+    openRec.target = Target.shared
     call.addItem(.separator())
     // ── THE THIRD DOOR TO THE PEOPLE PANEL ────────────────────────────────────
     //
@@ -215,6 +217,9 @@ enum Menu {
     check.target = Target.shared
     app.addItem(.separator())
     settingsItem(app, home: true)
+    let openRec = app.addItem(withTitle: "Open Recordings in Finder", action: #selector(Target.openRecordings),
+                              keyEquivalent: "")
+    openRec.target = Target.shared
     app.addItem(.separator())
     app.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)),
                 keyEquivalent: "h")
@@ -303,6 +308,10 @@ enum Menu {
       }
       Menu.controls?.nudgeBar()
     }
+    @objc func openRecordings() {
+      let dir = CallRecorder.recordingsDirectory()
+      NSWorkspace.shared.open(dir)
+    }
     @objc func quit() { Menu.onQuit?(); NSApp.terminate(nil) }
     /// The front door's own `…` button, from the keyboard. Set by `Launcher` while
     /// its window is up and cleared when it goes, so `⌘,` is greyed rather than
@@ -341,7 +350,7 @@ enum Menu {
       if item.action == #selector(Target.more) { return Menu.controls != nil }
       if item.action == #selector(Target.record) {
         item.title = CallRecorder.shared.isRecording ? "Stop Recording" : "Record Call"
-        return true
+        return Menu.controls != nil
       }
       return true
     }

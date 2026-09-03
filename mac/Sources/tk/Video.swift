@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreVideo
 import Foundation
@@ -33,6 +34,9 @@ protocol FrameSource: AnyObject {
   var onFrame: ((CVPixelBuffer, UInt64) -> Void)? { get set }
   func start() throws
   var describe: String { get }
+  var width: Int { get }
+  var height: Int { get }
+  var maxFps: Double { get }
 }
 
 /// A real talking head from a file, paced by the host clock. Not a synthetic
@@ -42,6 +46,9 @@ final class FileSource: FrameSource {
   var onFrame: ((CVPixelBuffer, UInt64) -> Void)?
   private let url: URL
   private let fps: Double
+  var width: Int { 1280 }
+  var height: Int { 720 }
+  var maxFps: Double { fps }
   var describe: String { "file \(url.lastPathComponent) @\(Int(fps))fps" }
 
   /// Frames actually handed on. Distinguishes "the path was wrong" from "the file
@@ -138,6 +145,9 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   /// True once a bring-up has succeeded. `sessionQ` only.
   private var started = false
   private var name = "?"
+  private(set) var width: Int = 1280
+  private(set) var height: Int = 720
+  private(set) var maxFps: Double = 30.0
   /// `name` and `current` are written on `sessionQ` and read from wherever a log
   /// line or the picker asks. A `String` and an `AVCaptureDevice?` are both
   /// refcounted, so an unsynchronised read racing a write is a retain/release
@@ -145,7 +155,7 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
   /// because `describe` is legitimately read from INSIDE `sessionQ` (the
   /// bring-up's own log line), where a plain lock would deadlock on itself.
   private let meta = NSRecursiveLock()
-  var describe: String { meta.lock(); defer { meta.unlock() }; return "camera \(name)" }
+  var describe: String { meta.lock(); defer { meta.unlock() }; return "camera \(name) (\(width)x\(height)@\(Int(maxFps)))" }
 
   // ── EVERY CAMERA, NOT JUST THE DEFAULT ────────────────────────────────────
   //
@@ -339,19 +349,33 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     session.beginConfiguration()
     guard session.canAddInput(input) else { throw Err.e("cannot add camera input") }
     session.addInput(input)
-    // SIZE, NOT JUST FORMAT. The device was put in its 1280x720 mode and read
-    // back 1920x1080 -- and delivered 1920x1080, with the preset at 720p too. So
-    // the encoder configured for 720p was handed 2.25x the pixels on every frame
-    // and VideoToolbox scaled each one on the way in, silently. Asking the output
-    // for 1280x720 makes the capture pipeline deliver that size, so what reaches
-    // the denoiser, the mouth detector, the self-view and the encoder is the
-    // picture that is actually being sent.
-    // `--cam-native-size` is the control arm: the sensor's own size, scaled later
-    // by VideoToolbox, exactly as every release before this one.
+
+    // Check if 1080p is available on camera and screen
+    let cameraHas1080p = dev.formats.contains {
+      let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+      return d.width == 1920 && d.height == 1080
+    }
+    let screenHas1080p: Bool
+    if let screens = NSScreen.screens as [NSScreen]?, !screens.isEmpty {
+      screenHas1080p = screens.contains { s in
+        let w = s.frame.width * s.backingScaleFactor
+        let h = s.frame.height * s.backingScaleFactor
+        return w >= 1920 && h >= 1080
+      }
+    } else {
+      screenHas1080p = true
+    }
+
+    let want1080p = cameraHas1080p && screenHas1080p && !CommandLine.arguments.contains("--720p")
+    let targetW = want1080p ? 1920 : 1280
+    let targetH = want1080p ? 1080 : 720
+    self.width = targetW
+    self.height = targetH
+
     var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
     if !CommandLine.arguments.contains("--cam-native-size") {
-      settings[kCVPixelBufferWidthKey as String] = 1280
-      settings[kCVPixelBufferHeightKey as String] = 720
+      settings[kCVPixelBufferWidthKey as String] = targetW
+      settings[kCVPixelBufferHeightKey as String] = targetH
     }
     out.videoSettings = settings
     // Drop, never queue. A late frame is worthless on a call and a queue of them
@@ -381,28 +405,13 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       session.commitConfiguration()
       configure(dev)
     } else if CameraSource.armNoConfigure {
-      // ── ARM: DO NOT NEGOTIATE A FORMAT AT ALL ──────────────────────────────
-      //
-      // The question this answers is whether the ~640 ms between `startRunning`
-      // returning and the first buffer is the sensor powering up, or the sensor
-      // being told to change mode. If it is the mode change, this arm is fast and
-      // there is something to attack. If it is power-up, this arm is identical and
-      // the number is a platform floor -- which is a result, not a failure.
-      //
-      // MEASURED, n=5 alternated: identical. Sensor 644-650 ms with the format
-      // negotiated, 644-650 ms without it. The mode change is not the cost.
-      //
-      // NOT SHIPPABLE as-is: the encoder is hardcoded to 1280x720, so this arm can
-      // feed it the wrong size. It exists to attribute the cost, nothing else.
       session.commitConfiguration()
     } else {
-      // EXPLICIT. Assigning `activeFormat` is documented to flip the preset to
-      // `.inputPriority` by itself (an iOS-only preset); on this MacBook Air the
-      // delivered frames did not follow the format: the log
-      // said "mode 1280x720" and the first frame measured 1920x1080 -- the
-      // encoder was being fed 2.25x the pixels it was configured for and
-      // VideoToolbox quietly scaled every one. `readback-is-not-in-effect`.
-      if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
+      if want1080p, session.canSetSessionPreset(.hd1920x1080) {
+        session.sessionPreset = .hd1920x1080
+      } else if session.canSetSessionPreset(.hd1280x720) {
+        session.sessionPreset = .hd1280x720
+      }
       configure(dev)
       session.commitConfiguration()
     }
@@ -445,42 +454,22 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
 
   private func configure(_ dev: AVCaptureDevice?) {
     guard let dev else { return }
-    // Highest frame rate the format allows: fewer, older frames is the one thing
-    // that cannot be fixed downstream.
-    let cands = dev.formats.filter {
+    let targetW = self.width
+    let targetH = self.height
+    var cands = dev.formats.filter {
       let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-      return d.width == 1280 && d.height == 720
+      return d.width == targetW && d.height == targetH
     }
-    // The encoder is hardcoded to 1280x720 (main.swift), so a camera with no 720p
-    // mode is fed mismatched buffers. That used to be a silent no-op; say it.
-    // ── RANK THEM. `.last` IS NOT A CHOICE ────────────────────────────────────
-    //
-    // This was `cands.last` under a comment admitting it was list order and that
-    // a real preference was needed if more than one mode ever matched. More than
-    // one matched, on the Mac mini, and the telemetry says what it cost: that
-    // machine's C270 offers 720p as YUY2 at 10 fps and MJPEG at 30, and list
-    // order picked TEN.
-    //
-    // A third of the frame rate is three times the motion between frames, so
-    // every frame is three times bigger: measured at 30-38 kB against the
-    // laptop's 3-7 kB on the same call. At ~1.4 kB a fragment that is twenty-five
-    // fragments per frame, all of which must arrive, and losing any ONE destroys
-    // the whole frame -- the far end logged 47 frames lost and 24 partial drops
-    // and asked this end for a keyframe once a second for the length of the call.
-    // That is the "colourful pixelation when he moves" in the bug report: motion
-    // makes the frames bigger, bigger frames have more fragments, and more
-    // fragments is more whole frames destroyed.
-    //
-    // `last-match-wins-unpinned-selection`, exactly: a selection with no ranking
-    // is a bug waiting for the list to change under it.
-    //
-    // FRAME RATE FIRST, and only then the pixel format. The note below is right
-    // that MJPEG is already-thrown-away frames we then re-encode -- but 10 fps is
-    // worse on both counts at once, because it is fewer frames AND more loss. At
-    // EQUAL frame rate the uncompressed mode wins, which is what that note was
-    // actually asking for.
+    if cands.isEmpty && targetW != 1280 {
+      cands = dev.formats.filter {
+        let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+        return d.width == 1280 && d.height == 720
+      }
+      self.width = 1280
+      self.height = 720
+    }
     func rank(_ f: AVCaptureDevice.Format) -> (Double, Int) {
-      let fps = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+      let fps = f.videoSupportedFrameRateRanges.map { min(60.0, $0.maxFrameRate) }.max() ?? 0
       let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
       // 'dmb1' is Motion JPEG. Anything else here is raw.
       let raw = CameraSource.fourCC(sub) == "dmb1" ? 0 : 1
@@ -490,13 +479,10 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       rank($0).0 != rank($1).0 ? rank($0).0 < rank($1).0 : rank($0).1 < rank($1).1
     }
     guard let f = ranked.last else {
-      fputs("camera: no 1280x720 mode on \(dev.localizedName) -- staying in "
-          + "\(CameraSource.describe(dev.activeFormat)) while the encoder expects 1280x720\n", stderr)
+      fputs("camera: no \(self.width)x\(self.height) mode on \(dev.localizedName) -- staying in "
+          + "\(CameraSource.describe(dev.activeFormat)) while the encoder expects \(self.width)x\(self.height)\n", stderr)
       return
     }
-    // `try?` and then assign anyway made a failed lock look like a handled case:
-    // `activeFormat =` on an unlocked device is undefined and can raise. If the
-    // lock is refused, keep the format the system chose and say so.
     do {
       try dev.lockForConfiguration()
     } catch {
@@ -505,44 +491,36 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
       return
     }
     dev.activeFormat = f
-    // ── THIS LINE ABORTED THE APP EIGHT TIMES ON A REAL MAC ──────────────────
-    //
-    // It was `CMTime(value: 1, timescale: CMTimeScale(best))`, building a frame
-    // duration out of a Double frame RATE. `CMTimeScale` is an Int32, so that
-    // conversion TRUNCATES: a device advertising 29.97 asks for 1/29 s, which is
-    // outside the range it just advertised, and `setActiveVideoMinFrameDuration:`
-    // answers an out-of-range duration by raising an Objective-C exception.
-    // Nothing in a Swift process catches those, so it goes objc_terminate ->
-    // abort, on the camera queue, with the whole app.
-    //
-    // Reported as "picking up the call just unexpectedly quit the app", and that
-    // is exactly what it is: answering brings the camera up, and the camera
-    // killed the process before the call could start. Eight crashes in one day on
-    // 0.75.0, every one of them this frame.
-    //
-    // The fix is to stop CONSTRUCTING the duration at all. Each range already
-    // carries `minFrameDuration` -- the exact CMTime for its own maximum rate,
-    // in whatever timescale that device actually uses -- so the value handed
-    // back is one the device has already said it accepts. Nothing to round.
-    //
-    // And it is read off `dev.activeFormat` rather than off `f`: those are the
-    // same object when the assignment above took, and when it did not, the ranges
-    // that matter are the ones now in force. `readback-is-not-in-effect`.
     let ranges = dev.activeFormat.videoSupportedFrameRateRanges
-    if let fastest = ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
-      dev.activeVideoMinFrameDuration = fastest.minFrameDuration
+    var chosenDuration: CMTime?
+    var chosenFps: Double = 30.0
+    let cappedRanges = ranges.filter { $0.maxFrameRate <= 60.05 }
+    if let bestRange = cappedRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+      chosenDuration = bestRange.minFrameDuration
+      chosenFps = bestRange.maxFrameRate
+    } else if let range = ranges.first(where: { $0.minFrameRate <= 60.0 && $0.maxFrameRate >= 60.0 }) {
+      let ts = range.minFrameDuration.timescale
+      chosenDuration = CMTime(value: CMTimeValue(ts / 60), timescale: ts)
+      chosenFps = 60.0
+    } else if let fastest = ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+      chosenDuration = fastest.minFrameDuration
+      chosenFps = min(60.0, fastest.maxFrameRate)
+    }
+    if let d = chosenDuration {
+      dev.activeVideoMinFrameDuration = d
     } else {
       fputs("camera: \(dev.localizedName) advertises no frame-rate range for "
           + "\(CameraSource.describe(dev.activeFormat)) -- leaving its own pacing alone\n",
             stderr)
     }
-    let best = ranges.map { $0.maxFrameRate }.max() ?? 30
+    let best = chosenFps
+    self.maxFps = chosenFps
     dev.unlockForConfiguration()
-    // Which mode the sensor is actually in, and how many others matched. `.last`
-    // is list order, not a preference -- if this ever prints more than one
-    // candidate, the choice between them needs to be made deliberately.
+    let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+    self.width = Int(dims.width)
+    self.height = Int(dims.height)
     fputs("camera: mode \(CameraSource.describe(f))"
-        + (cands.count > 1 ? " (\(cands.count) 720p modes matched: "
+        + (cands.count > 1 ? " (\(cands.count) \(self.width)x\(self.height) modes matched: "
             + cands.map { CameraSource.describe($0) }.joined(separator: ", ") + ")" : "")
         + "\n", stderr)
     // ── AND ON THE WIRE, NOT ONLY IN A LOG NOBODY WILL EVER SEE ──────────────
@@ -554,7 +532,6 @@ final class CameraSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     // blockiness is baked in before our encoder ever sees it, and no amount of
     // bitrate on our side can put it back.
     let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
-    let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
     Metrics.fact("cam", dev.localizedName)
     Metrics.fact("cam_kind", CameraSource.kindOf(dev))
     Metrics.fact("cam_mode", "\(dims.width)x\(dims.height)@\(Int(best))")
@@ -675,6 +652,7 @@ final class VEncoder {
     let st = VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate,
                                   value: NSNumber(value: bps))
     bitrateAsked = bps
+    cfgBitrate = bps
     var back: CFTypeRef?
     VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate,
                           allocator: nil, valueOut: &back)
@@ -707,7 +685,8 @@ final class VEncoder {
   // did nothing at all. One keyframe to actually shed 20x the bandwidth is a good
   // trade, and a struggling link is currently being sent 180 keyframes in 90
   // seconds anyway.
-  private let cfgW: Int, cfgH: Int, cfgBitrate: Int
+  private let cfgW: Int, cfgH: Int
+  private var cfgBitrate: Int
   private var cfgQuality: Double?
   /// H.264 unless the far end has said it decodes HEVC (see the wire flag in
   /// `serialize`). Apple silicon encodes and decodes both in hardware; HEVC is

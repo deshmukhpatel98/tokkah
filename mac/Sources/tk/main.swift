@@ -553,7 +553,7 @@ let KNOWN_FLAGS: Set<String> = [
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
-  "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
+  "subtitles", "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
   // The linear echo canceller (0.107.0) and its arms. `--no-aec` is the control
   // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
@@ -5756,6 +5756,18 @@ vdec.onDecoded = { img, capHost in
   }
 }
 
+CallRecorder.shared.onRecordingStateChanged = { rec in
+  if rec {
+    wire.selfStatus |= Wire.ST_RECORDING
+  } else {
+    wire.selfStatus &= ~Wire.ST_RECORDING
+  }
+  wire.sendTimeProbe()
+  if let controls = display?.controls, controls.moreOpen {
+    controls.rebuildSheet()
+  }
+}
+
 if let recPath = arg("record") ?? arg("record-path") ?? (flag("record") ? CallRecorder.defaultRecordingURL().path : nil) {
   let url = URL(fileURLWithPath: recPath)
   _ = CallRecorder.shared.start(to: url)
@@ -5785,8 +5797,11 @@ if videoArg != "off", !ringPreview {
     let reusing = earlyCam != nil
     // The controller owns the quality from here; the flag only sets its ceiling.
     // `--vquality 0` pins it to the old unset behaviour.
-    let e = try VEncoder(width: 1280, height: 720,
-                         bitrate: Int(arg("vbitrate") ?? "3000000") ?? 3_000_000,
+    let srcW = src.width
+    let srcH = src.height
+    let baseBitrate = Int(arg("vbitrate") ?? "3000000") ?? 3_000_000
+    let e = try VEncoder(width: srcW, height: srcH,
+                         bitrate: baseBitrate,
                          quality: vq.quality)
     e.denoise = makeDenoise()
     e.requestKeyframe()
@@ -5828,7 +5843,7 @@ if videoArg != "off", !ringPreview {
     // throws.
     if !reusing { try src.start() }
     vsource = src; venc = e
-    fputs("video: \(src.describe) -> H.264 1280x720, no B-frames, realtime"
+    fputs("video: \(src.describe) -> H.264 \(srcW)x\(srcH), no B-frames, realtime"
         + (e.denoise.map { ", denoise t\($0.threshold)" } ?? ", denoise OFF") + "\n", stderr)
   } catch {
     fputs("video: disabled (\(error))\n", stderr)
@@ -5867,8 +5882,9 @@ nonisolated(unsafe) var utteranceWasListening = true
 /// a transcript that falls further behind the longer the call runs.
 nonisolated(unsafe) var fedIn = 0
 nonisolated(unsafe) var fedOut = 0
-let subtitles = flag("no-subtitles") ? nil
-  : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
+let subtitles = flag("subtitles")
+  ? Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
+  : nil
 
 // RECEIVING IS NOT SENDING, and this was inside the block that needs a
 // recogniser -- so a machine without one could not DISPLAY the far end's words
@@ -6257,7 +6273,7 @@ Thread {
     let until = Date().addingTimeInterval(Date() < fastUntil ? 0.15 : 0.3)
     while Date() < until {
       Thread.sleep(forTimeInterval: 0.02)
-      if wire.vocalChanged() || wire.predictCrossed() || wire.seenTalkingCrossed() {
+      if wire.vocalChanged() || wire.predictCrossed() || wire.seenTalkingCrossed() || wire.recordingChanged() {
         if ProcessInfo.processInfo.environment["KIN_CUE_DEBUG"] != nil {
           fputs(String(format: "cue out %.3f  me -> %d\n", Date().timeIntervalSince1970,
                        Audio.sharedGate.vocal.rawValue), stderr)
@@ -6298,6 +6314,30 @@ wire.onPeerBye = {
   DispatchQueue.global().async {
     postFinalBeat(why: "they hung up")
     exit(0)
+  }
+}
+
+// ── SYNCHRONIZED IN-CALL DUAL RECORDING ─────────────────────────────────────
+wire.onPeerRecording = { rec in
+  DispatchQueue.main.async {
+    if rec {
+      if !CallRecorder.shared.isRecording {
+        fputs("peer recording started -> recording locally\n", stderr)
+        let url = CallRecorder.defaultRecordingURL()
+        if CallRecorder.shared.start(to: url) {
+          display?.controls?.setStatus("recording call")
+          display?.controls?.nudgeBar()
+        }
+      }
+    } else {
+      if CallRecorder.shared.isRecording {
+        fputs("peer recording stopped -> finalizing local recording\n", stderr)
+        let summary = CallRecorder.shared.stop()
+        display?.controls?.setStatus("recording saved")
+        display?.controls?.nudgeBar()
+        fputs("\(summary)\n", stderr)
+      }
+    }
   }
 }
 
@@ -8128,8 +8168,11 @@ func reportLoop() {
     // `--vpause-test` forces the state without needing a bad link, which is the
     // only way to prove the far end's half on a clean LAN. It is deliberately
     // crude: the point is to exercise the wire bit, the blur and the sentence.
+    vq.inhibitPause = wire.isLAN
     if let at = arg("vpause-test").flatMap({ Int($0) }) {
       gVideoPaused = beatTick >= at && beatTick < at + 20
+    } else if wire.isLAN {
+      gVideoPaused = false
     } else {
       gVideoPaused = vq.paused
     }
@@ -8154,6 +8197,7 @@ func reportLoop() {
     // update, so a stale bit cannot survive a state change -- an OR-only status
     // byte is a latch, and a latch is how "their camera is off" outlives the
     // moment they turned it back on.
+
 
 
     // `r.concealLost`, matching the priming above and the read below it. This line
@@ -8207,6 +8251,7 @@ func reportLoop() {
                   // above `ringPreview`: packets arriving from here mean somebody
                   // is being ASKED, not that they said yes.
                   | (ringPreview ? Wire.ST_RINGING : 0)
+                  | (CallRecorder.shared.isRecording ? Wire.ST_RECORDING : 0)
   let pPaused = wire.peerVideoPaused, pCamOff = wire.peerCamOff
   if pPaused { vPeerPausedSecs += 1 }
   if pPaused != lastPeerPaused {

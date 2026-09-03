@@ -20,6 +20,7 @@ final class CallRecorder: @unchecked Sendable {
 
   private(set) var isRecording = false
   private(set) var recordingURL: URL?
+  var onRecordingStateChanged: ((Bool) -> Void)?
 
   private var writer: AVAssetWriter?
   private var videoInput: AVAssetWriterInput?
@@ -72,10 +73,15 @@ final class CallRecorder: @unchecked Sendable {
     audioBuf.deallocate()
   }
 
-  static func defaultRecordingURL() -> URL {
+  static func recordingsDirectory() -> URL {
     let dir = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Movies/Kin", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  static func defaultRecordingURL() -> URL {
+    let dir = recordingsDirectory()
     let df = DateFormatter()
     df.dateFormat = "yyyy-MM-dd-HHmmss"
     return dir.appendingPathComponent("Kin-\(df.string(from: Date())).mov")
@@ -212,11 +218,13 @@ final class CallRecorder: @unchecked Sendable {
         self?.onCadenceTick()
       }
       timer.resume()
-      ticker = timer
+      self.ticker = timer
 
       isRecording = true
       result = true
       fputs("callrec: recording started -> \(url.path)\n", stderr)
+      let cb = onRecordingStateChanged
+      DispatchQueue.main.async { cb?(true) }
       sem.signal()
     }
     sem.wait()
@@ -325,6 +333,8 @@ final class CallRecorder: @unchecked Sendable {
       self.lastPixelBuffer = nil
       self.blankPixelBuffer = nil
       fputs("\(summary)\n", stderr)
+      let cb = self.onRecordingStateChanged
+      DispatchQueue.main.async { cb?(false) }
       sem.signal()
     }
     sem.wait()

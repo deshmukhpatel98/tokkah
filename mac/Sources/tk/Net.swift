@@ -1084,6 +1084,7 @@ final class Wire {
   // does not set the bit reads as "cannot say" rather than "not talking" --
   // `blind-instruments-report-negatives`, and this is the wire's version of it.
   static let ST_SEEN_TALKING = 64  // a camera here sees this end's mouth moving
+  static let ST_RECORDING    = 128 // call recording is in progress on this machine
   // MUTE IS NOT IN THIS BYTE. It rides at TPKTX+4 as its own byte and has since
   // before this one existed -- see `selfMuted`/`peerMuted` above. Noted here
   // because "the status byte" reads like the complete list of what one end tells
@@ -1104,6 +1105,15 @@ final class Wire {
   var peerCamOff: Bool { peerStatus & Wire.ST_CAMOFF != 0 }
   var peerBackchannel: Bool { peerStatus & Wire.ST_BACKCHAN != 0 }
   var peerClaim: Bool { peerStatus & Wire.ST_CLAIM != 0 }
+  var peerRecording: Bool { peerStatus & Wire.ST_RECORDING != 0 }
+  var onPeerRecording: ((Bool) -> Void)?
+  var onPeerRecordingChanged: ((Bool) -> Void)? {
+    get { onPeerRecording }
+    set { onPeerRecording = newValue }
+  }
+  private var lastPeerRecording = false
+
+  var isLAN: Bool { locked && isPrivateSubnet(peer) }
   /// The far end is looking at a ring card, not at you. False against every build
   /// that predates the bit -- correct, because those never joined before
   /// answering, so their arrival really did mean answered.
@@ -1216,6 +1226,17 @@ final class Wire {
     lastStateFlush = now
     return true
   }
+
+  private var lastRecordingOut = false
+  func recordingChanged() -> Bool {
+    let rec = (selfStatus & Wire.ST_RECORDING) != 0
+    guard rec != lastRecordingOut else { return false }
+    let now = Clock.now()
+    guard lastStateFlush == 0 || Clock.ms(now - lastStateFlush) > 15 else { return false }
+    lastRecordingOut = rec
+    lastStateFlush = now
+    return true
+  }
   /// Whether the far end reports at all. False means an older build, and the
   /// controller must then fall back to the local numbers and SAY SO -- a silent
   /// fallback to the wrong signal is the bug this field exists to fix.
@@ -1320,6 +1341,8 @@ final class Wire {
     // where that process stops existing as far as this end is concerned.
     peerStatus = 0
     peerStatusSeen = false
+    lastPeerRecording = false
+    lastRecordingOut = false
     peerVocalSeen = false
     peerSeenTalkingSeen = false
     Audio.peerTurnEndProb = 0
@@ -1836,6 +1859,11 @@ final class Wire {
           peerMuted = plain[TPKTX + 4] == 1
           peerQLevel = Int(plain[TPKTX + 5])
           peerStatus = Int(plain[TPKTX + 6])
+          let pRec = (peerStatus & Wire.ST_RECORDING != 0)
+          if pRec != lastPeerRecording {
+            lastPeerRecording = pRec
+            onPeerRecording?(pRec)
+          }
           // ONE WORD FROM THEM, and it is the difference between "their status
           // byte says they are not ringing" and "we have never heard their
           // status byte". Those are the same zero, and the caller has to tell
