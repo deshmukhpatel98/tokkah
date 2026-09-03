@@ -186,7 +186,14 @@ def call_summary(bs, label=""):
 
 mode = sys.argv[1]
 if mode == "local":
-    bs = [json.loads(l) for l in open(sys.argv[2]) if l.strip()]
+    bs = []
+    for l in open(sys.argv[2], errors="replace"):
+        l = l.strip()
+        if not l: continue
+        try:
+            bs.append(json.loads(l))
+        except Exception:
+            pass
     calls = {}
     for b in bs: calls.setdefault(b.get("call", "?"), []).append(b)
     for c, rows in list(calls.items())[-10:]:

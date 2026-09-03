@@ -595,13 +595,20 @@ let KNOWN_FLAGS: Set<String> = [
 // Not moved -- this file is top-level code and I have been caught by its
 // ordering twice today. The side effects are skipped instead, which is the part
 // that can actually hurt somebody.
-let TEST_FLAGS = ["gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
-                  "subtitle-test", "decimator-test", "headphone-test",
-                  "predict-test", "floor-test", "turn-test",
-                  "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
-                  "predict-far-test", "aec-test"]
+let TEST_FLAGS: Set<String> = [
+  "gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
+  "subtitle-test", "decimator-test", "headphone-test",
+  "predict-test", "floor-test", "turn-test",
+  "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
+  "predict-far-test", "aec-test", "backdrop-test",
+]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
-  a.hasPrefix("--") && TEST_FLAGS.contains(String(a.dropFirst(2)))
+  guard a.hasPrefix("--") else { return false }
+  let name = String(a.dropFirst(2)).components(separatedBy: "=")[0]
+  return TEST_FLAGS.contains(name)
+    || name.hasPrefix("selftest-")
+    || name.hasPrefix("fuzz-")
+    || name == "crypto-vectors"
 }
 /// ── AND THE SAME FOR A RIG RUNNING A WHOLE CALL ────────────────────────────
 ///

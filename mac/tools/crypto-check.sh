@@ -20,7 +20,8 @@
 #
 # Distinct identity directories, distinct ports, a private beat sink: LOGIC lane.
 set -u
-cd "$(dirname "$0")/.." || exit 2
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE/.." || exit 2
 TK="${TK:-$PWD/.build/release/tk}"
 [ -x "$TK" ] || { echo "build first: swift build -c release"; exit 2; }
 NEWER=$(find Sources -name '*.swift' -newer "$TK" 2>/dev/null | head -3)
@@ -37,7 +38,7 @@ say() { printf '  %-5s %s\n' "$1" "$2"; [ "$1" = FAIL ] && fail=1; return 0; }
 
 PORT=9433
 BEATS="$SP/beats.ndjson"; : > "$BEATS"
-python3 "$(dirname "$0")/beat-sink.py" $PORT "$BEATS" & SINK=$!
+python3 "$HERE/beat-sink.py" $PORT "$BEATS" & SINK=$!
 perl -e 'select undef,undef,undef,1'
 COMMON=(--video off --mute --no-update --no-relocate --no-rings --no-subtitles
         --tel-endpoint "http://127.0.0.1:$PORT/api/mac/beat")
