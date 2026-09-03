@@ -5,6 +5,40 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Unreleased
+
+### Changed — temporal denoise floorWeight tuned to 0.16 (-7 to -9% bytes/frame at q0.7)
+
+Lowering the temporal denoise floor weight from 0.25 to 0.16 deepens temporal averaging
+over stationary regions from ~4 frames (~133 ms) to ~6 frames (~200 ms), cutting static
+background noise variance by ~35% without adding motion ghosting (moving pixels continue
+to bypass at full weight).
+
+Measured with the `--vpsnr` ruler across real sensor clips at the lossless rung (`q0.7`):
+- `talkingheadA.mov`: 8,418 -> 7,686 B/frame (-732 B/frame, -8.7%, -175 kbps), filter-vs-raw 50.7 dB.
+- `talkingheadB.mov`: 5,442 -> 5,085 B/frame (-357 B/frame, -6.6%, -85 kbps), filter-vs-raw 52.3 dB.
+- `realA.mp4`:        6,196 -> 5,700 B/frame (-496 B/frame, -8.0%, -119 kbps), filter-vs-raw 51.8 dB.
+
+Zero ghosting on difference dumps (`diff.png`); PSNR vs filtered reference 45.1–45.7 dB.
+`--vdenoise-floor 0.25` is the control arm.
+
+### Fixed — audio choppiness, AGC pumping distortion, and LAN hairpin stalls
+
+Real call analysis (`38un3grj16gfk`, 134s, `choppy 183`) showed three compounding failures:
+1. **Hairpin NAT lock**: Initial LAN UDP probe to `192.168.1.103` was dropped by macOS during
+   ARP resolution, locking the call onto a 150 ms public hairpin NAT. `Net.swift` now grants
+   a 400 ms settle window if an unreplied private candidate exists.
+2. **Buffer freeze on network bursts**: Network clump arrivals caused starvation (`conc > 0`)
+   followed by packet bursts (`snappedBehind > 0`). The jitter controller diagnosed this as an
+   engine stall and vetoed expansion, pinning the buffer at 6 packets (~4 ms). The veto is now
+   narrowed to true render stalls (`!starving && conc == 0`), allowing growth up to `JIT_MAX = 80ms`
+   during starvation. `--jit-legacy-veto` is the control arm.
+3. **AGC pumping & square-wave clipping**: Distance makeup gain climbed +4 dB/s to 4.0x (+12 dB),
+   driving signals to 3.6x full scale and triggering cyclic 9-dB overload cuts and 38 AEC resets.
+   `pack16` now applies `Wire.softLimit` ($C^1$ smooth $\tanh$ above 0.80 knee) instead of hard
+   quantization clipping, and `InputGain` holds an overload cooldown with dynamic `makeupCeiling`
+   and moderated climb rate (1.15x) post-cut.
+
 ## Kin 0.132.0 — 2026-09-03
 
 ### Fixed — video loss divided missing frames by received fragments, hiding real loss
