@@ -5,6 +5,65 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Unreleased (Kin, video) — 2026-09-03
+
+### Changed — the sensor's noise is taken out before the encoder sees it
+
+The "visually lossless" rung (q0.7) costs 1.2 Mbps on a clean file and read
+4.4–4.7 Mbps (~18.5 KB/frame, 17 fragments) on every live call this month. The
+difference is what a real camera adds to each frame: a fresh random pattern no
+reference frame predicts, so the encoder pays for it in full and then pays again
+when one of the extra fragments is lost. A motion-adaptive temporal filter now runs
+on the capture thread in front of VideoToolbox (`Denoise.swift`): a pixel that
+moved by a few levels is averaged with its own filtered past, a pixel that moved a
+lot is taken whole, and the threshold between them follows the measured noise
+(median |frame-to-frame difference|, ×12, clamped 6–40). Only the encoder sees the
+filtered frame; the mouth detector and the self-view still get the raw one.
+
+Measured with the `--vpsnr` ruler on real captures, q0.7, same encoder settings:
+
+| source | bytes/frame off | on | filter's own change vs raw |
+|---|---|---|---|
+| lit room (H.264 recording, 1620×1080→720p) | 8,545 | 7,433 (−13%) | 48.5 dB (invisible) |
+| dark room, raw sensor (`--camrec`, ProRes) | 57,662 | 28,611 (−50%) | 39.3 dB, difference image is pure grain, no trail |
+| live loopback, lit clip, one end on / one off | 7,661 | 5,752 (−25%) | — |
+
+Cost: ~2 ms per 720p frame in SIMD (measured on a machine at load 13; the scalar
+version read 3.5 ms and its p99 showed as +3.4 ms glass-to-glass on the filtered
+direction, which is why it was vectorised before shipping). Default ON;
+`--no-vdenoise` is the control, `--vdenoise-t` pins the threshold,
+`--vdenoise-floor` the still-pixel weight. New beat fields: `v_dn_on`, `v_dn_t`,
+`v_noise` (the camera's noise in levels), `v_still_pct`, `v_dn_ms_p50/p99`,
+`v_dn_bypassed`.
+
+Two versions of the filter were discarded on measurement: an 8-bit reference
+rounded the 1–2 level differences that ARE the noise to zero (raw and filtered
+crops were indistinguishable; the reference is Q4 fixed point now), and a fixed
+threshold of 24 treated dark-room grain (~8 levels frame to frame) as motion.
+A fixed 40 took the grain out but turned a slow pan into a ghost (whole face in
+the difference image at 40 dB); the adaptive threshold lands at ~8 lit and ~28 dark.
+
+### Fixed — the camera delivered 1080p to a 720p encoder
+
+`camera: mode 1280x720` was logged and the first frame measured 1920×1080: the
+device was put in its 720p format and read back 1080p, and delivered 1080p, with
+the session preset at 720p too. The encoder configured for 720p was handed 2.25×
+the pixels on every frame and VideoToolbox scaled each one on the way in. The video
+output now asks for 1280×720 explicitly and gets it (`camera: running in 1280x720`,
+`FIRST FRAME 1280x720`); the beat records the delivered size as `v_cap_w/h`.
+`--cam-native-size` is the control arm; A/B back to back, mean luma 5.1 vs 4.8.
+
+### Added — rig modes
+
+- `tk --camrec <out.mov> [--camrec-secs N]` records the raw sensor to ProRes 422 HQ
+  for the ruler. Must be launched through the signed bundle (`open -n Kin.app
+  --args ... --log <file>`): a shell-launched binary is the terminal for TCC and the
+  camera answers `access DENIED` with no prompt.
+- `--vpsnr` now reports PSNR against the filtered frame and the filter's own
+  distance from raw, and `--vpsnr-dump <dir>` writes the middle frame as
+  `raw/filtered/decoded/diff.png` — the difference image is what separates noise
+  removal (even haze) from ghosting (a trail behind every moving edge).
+
 ## Kin 0.128.0–0.128.1 / 0.128.1-android.21 — 2026-09-03
 
 ### Changed — the handshake is signed, and there is no plaintext window
