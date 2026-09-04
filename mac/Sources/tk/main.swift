@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.144.0"
+let VERSION = "0.145.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -7446,7 +7446,11 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   }
   if let ft = FarTest.shared {
     f["vpn_on"] = ft.on ? 1 : 0
+    f["vpn_mine"] = ft.mine ? 1 : 0
+    f["vpn_theirs"] = ft.theirs ? 1 : 0
     f["vpn_routed"] = ft.connected ? 1 : 0
+    f["vpn_my_origin_country"] = ft.myOriginCountry
+    f["vpn_peer_origin_country"] = ft.peerOriginCountry
     if ft.on {
       let actCountry = ft.activeCountry
       if !actCountry.isEmpty { f["vpn_relay_country"] = actCountry }

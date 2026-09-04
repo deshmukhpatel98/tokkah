@@ -5,6 +5,21 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.145.0 — 2026-09-04
+
+### Fixed — Separate VPN vs non-VPN participant identification in UI & telemetry
+
+- **Endpoint Disambiguation**: When only one participant activates the Integrated VPN, only that participant is displayed as routed via the VPN in Brazil. The non-VPN participant is clearly identified with their actual direct origin country (e.g. India) and labeled as non-VPN/direct.
+- **In-Call Screen & Banner Clarity**:
+  - The VPN-enabled caller's screen displays: `@peer (India) · 0:42 · Your VPN: Brazil`
+  - The non-VPN caller's screen displays: `@peer · 0:42 · Peer VPN: Brazil · You: India`
+  - Connection banners announce exact dual-endpoint topology (`connected (your VPN: Brazil · peer: India)` or `connected (peer VPN: Brazil · you: India)`).
+- **Controls More Sheet Rows**:
+  - Dedicated `Your VPN` / `Remote Location` rows for the VPN initiator.
+  - Dedicated `Remote VPN` / `Your Location` rows for the non-VPN receiver.
+  - Switch state tracks local toggle (`f.mine`) rather than global tunnel state.
+- **Worker Socket Metadata**: `tape-app/src/worker.ts` no longer hardcodes `isVpn: true` and `peerIsVpn: true` for all relay sockets; it respects the caller's actual ASN/Warp status.
+
 ## Kin 0.144.0 — 2026-09-04
 
 ### Fixed — South America VPN relay falsely resolving to local ingress country (India)

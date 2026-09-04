@@ -405,6 +405,24 @@ final class FarTest {
   var peerCountry: String { FarTest.countryName(codeOrName: tunnel.peerCountry) }
   var packetsSent: Int { tunnel.packetsSent }
   var packetsRecv: Int { tunnel.packetsRecv }
+  var myOriginCountry: String {
+    if !tunnel.myCountry.isEmpty { return FarTest.countryName(codeOrName: tunnel.myCountry) }
+    if !Rendezvous.myCountry.isEmpty { return FarTest.countryName(codeOrName: Rendezvous.myCountry) }
+    return "India"
+  }
+  var myOriginCity: String {
+    if !tunnel.myCity.isEmpty { return tunnel.myCity }
+    return Rendezvous.myCity
+  }
+  var peerOriginCountry: String {
+    if !tunnel.peerCountry.isEmpty { return FarTest.countryName(codeOrName: tunnel.peerCountry) }
+    if !Rendezvous.peerCountry.isEmpty { return FarTest.countryName(codeOrName: Rendezvous.peerCountry) }
+    return "India"
+  }
+  var peerOriginCity: String {
+    if !tunnel.peerCity.isEmpty { return tunnel.peerCity }
+    return Rendezvous.peerCity
+  }
 
   static func countryName(codeOrName: String) -> String {
     let trimmed = codeOrName.trimmingCharacters(in: .whitespacesAndNewlines)

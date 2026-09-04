@@ -364,10 +364,13 @@ enum Menu {
       }
       if item.action == #selector(Target.farTest) {
         let f = FarTest.shared
-        item.state = (f?.on == true) ? .on : .off
-        if let f, f.on {
+        item.state = (f?.mine == true) ? .on : .off
+        if let f, f.mine {
           let c = f.activeCountry
           item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (\(c))"
+        } else if let f, f.theirs {
+          let c = f.activeCountry
+          item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (Peer on \(c))"
         } else {
           item.title = "Integrated VPN"
         }
