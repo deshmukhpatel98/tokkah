@@ -550,50 +550,62 @@ final class Wire {
   ///
   /// `redundantOf` is the sequence the extra copy belongs to. Sent only when the
   /// path has actually been losing packets, so a clean call pays nothing.
-  func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>,
-            redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) {
-    scratch.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
-    (scratch + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
-    (scratch + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
-    // ── 16-bit on the wire, when the far end says it can read it ────────────
-    //
-    // The audio was costing 2.43 Mbps and the VIDEO of a person talking costs
-    // 0.15 -- sixteen times less -- because the samples went out as 32-bit float.
-    // A microphone's own noise floor is nowhere near 96 dB down, so the bottom
-    // sixteen bits of every sample are the preamp's noise sent at full price.
-    //
-    // The format rides in the high bits of the frame count, which is only safe
-    // because a packet is never sent in this format until the peer has advertised
-    // it in the handshake. Guessing here would mean an old build computing
-    // frames = 65568 and dropping the packet in silence.
-    let pcm16 = sendPcm16
-    let lp = sendLp
+  /// Pack an audio packet into `dst`. Returns the total serialized byte count.
+  /// If `redundant` is provided, serializes redundant block (capHost(8) + payload) directly behind primary block.
+  static func packAudio(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int,
+                        dst: UnsafeMutablePointer<UInt8>, pcm16: Bool = false, lp: Bool = false,
+                        redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) -> Int {
+    dst.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
+    (dst + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
+    (dst + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
     let bps = pcm16 ? 2 : 4
     let tag = UInt32(n) | (pcm16 ? (1 << 16) : 0) | (lp ? (1 << 17) : 0)
-    (scratch + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = tag.littleEndian }
-    // A compressed block is variable length, so it carries its own length byte.
-    // Deriving it from the datagram size would work for the primary block and be
-    // ambiguous the moment a redundant block follows.
+    (dst + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = tag.littleEndian }
     func put(_ from: UnsafePointer<Float>, _ at: Int) -> Int {
       guard lp else {
-        if pcm16 { pack16(from, n, into: scratch + at) } else { memcpy(scratch + at, from, n * 4) }
+        if pcm16 {
+          (dst + at).withMemoryRebound(to: Int16.self, capacity: n) { out in
+            for i in 0..<n {
+              let v = Wire.softLimit(from[i]) * 32767.0
+              out[i] = Int16(max(-32767.0, min(32767.0, v)).rounded())
+            }
+          }
+        } else {
+          memcpy(dst + at, from, n * 4)
+        }
         return n * bps
       }
-      pack16(from, n, into: lpTmp)
-      let m = lpTmp.withMemoryRebound(to: Int16.self, capacity: n) {
-        Lpc.encode($0, n, into: scratch + at + 1)
+      let lpTmp = UnsafeMutablePointer<UInt8>.allocate(capacity: Lpc.MAXN * 2)
+      defer { lpTmp.deallocate() }
+      lpTmp.withMemoryRebound(to: Int16.self, capacity: n) { out in
+        for i in 0..<n {
+          let v = Wire.softLimit(from[i]) * 32767.0
+          out[i] = Int16(max(-32767.0, min(32767.0, v)).rounded())
+        }
       }
-      scratch[at] = UInt8(m)
-      lpIn += n * 2; lpOut += m + 1
-      if scratch[at + 1] & 0x80 != 0 { lpRaws += 1 }
+      let m = lpTmp.withMemoryRebound(to: Int16.self, capacity: n) {
+        Lpc.encode($0, n, into: dst + at + 1)
+      }
+      dst[at] = UInt8(m)
       return 1 + m
     }
     var total = HDR + put(src, HDR)
     if let r = redundant {
-      (scratch + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
+      (dst + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
       let before = total
       total += 8 + put(r, total + 8)
-      genFec += total - before
+    }
+    return total
+  }
+
+  func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>,
+            redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) {
+    let beforeFec = genFec
+    let total = Wire.packAudio(seq: seq, cap: cap, src: src, n: n, dst: scratch,
+                               pcm16: sendPcm16, lp: sendLp,
+                               redundant: redundant, redundantCap: redundantCap)
+    if redundant != nil {
+      genFec += total - (HDR + (sendPcm16 ? n * 2 : (sendLp ? 1 + Int(scratch[HDR]) : n * 4)))
       redundantSent += 1
     }
     // Through rawSend, not sendto. This path used to call sendto directly, which
@@ -1649,6 +1661,93 @@ final class Wire {
       : "recv thread: NOT real-time (thread_policy_set = \(kr)) -- arrival jitter will include this thread's scheduling"
   }
 
+  /// Unpack an audio packet into `ring`.
+  /// Handles both primary payload and piggybacked forward redundant payload (if present).
+  @discardableResult
+  static func unpackAudio(plain: UnsafePointer<UInt8>, plainN: Int, into ring: RecvRing,
+                          fbuf: UnsafeMutablePointer<Float>? = nil,
+                          ibuf: UnsafeMutablePointer<Int16>? = nil,
+                          onMismatch: (() -> Void)? = nil,
+                          video: VideoAssembler? = nil) -> Bool {
+    guard plainN >= HDR else { return false }
+    let magic = plain.withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+    guard magic == MAGIC else { return false }
+    let seq = Int32(bitPattern: (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+    let cap = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+    let tag = (plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
+    let frames = Int(tag & 0xffff)
+    let bps = (tag >> 16) & 1 == 1 ? 2 : 4
+    let lp = (tag >> 17) & 1 == 1
+    let plen = lp ? (plainN > HDR ? 1 + Int(plain[HDR]) : 0) : frames * bps
+    if frames <= 0 || plen <= 0 || plainN < HDR + plen { return false }
+    if frames != FPP {
+      onMismatch?()
+      return false
+    }
+
+    let localFbuf: UnsafeMutablePointer<Float>
+    let localIbuf: UnsafeMutablePointer<Int16>
+    let allocated: Bool
+    if let fb = fbuf, let ib = ibuf {
+      localFbuf = fb
+      localIbuf = ib
+      allocated = false
+    } else {
+      localFbuf = .allocate(capacity: FPP + 8)
+      localIbuf = .allocate(capacity: Lpc.MAXN)
+      allocated = true
+    }
+    defer {
+      if allocated {
+        localFbuf.deallocate()
+        localIbuf.deallocate()
+      }
+    }
+
+    func expand(_ at: UnsafePointer<UInt8>, _ fr: Int) -> Bool {
+      let len = Int(at[0])
+      guard fr <= Lpc.MAXN, len > 0, Lpc.decode(at + 1, len, fr, into: localIbuf) else { return false }
+      for i in 0..<fr { localFbuf[i] = Float(localIbuf[i]) / 32767.0 }
+      return true
+    }
+
+    if lp {
+      if expand(plain + HDR, frames) { ring.write(seq: seq, cap: cap, src: localFbuf, n: frames) }
+    } else if bps == 2 {
+      (plain + HDR).withMemoryRebound(to: Int16.self, capacity: frames) { p in
+        for i in 0..<frames { localFbuf[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
+      }
+      ring.write(seq: seq, cap: cap, src: localFbuf, n: frames)
+    } else {
+      (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) {
+        ring.write(seq: seq, cap: cap, src: $0, n: frames)
+      }
+    }
+
+    let redOff = HDR + plen
+    let rLen = lp ? (plainN > redOff + 8 ? 1 + Int(plain[redOff + 8]) : 0) : frames * bps
+    if rLen > 0, plainN >= redOff + 8 + rLen, seq > 0 {
+      let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+      let rSeq = seq - 1
+      if !ring.present(rSeq) {
+        if lp {
+          if expand(plain + redOff + 8, frames) { ring.write(seq: rSeq, cap: rCap, src: localFbuf, n: frames) }
+        } else if bps == 2 {
+          (plain + redOff + 8).withMemoryRebound(to: Int16.self, capacity: frames) { p in
+            for i in 0..<frames { localFbuf[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
+          }
+          ring.write(seq: rSeq, cap: rCap, src: localFbuf, n: frames)
+        } else {
+          (plain + redOff + 8).withMemoryRebound(to: Float.self, capacity: frames) {
+            ring.write(seq: rSeq, cap: rCap, src: $0, n: frames)
+          }
+        }
+        if ring.present(rSeq) { ring.recovered += 1 }
+      }
+    }
+    return true
+  }
+
   func recvLoop(into ring: RecvRing, video: VideoAssembler? = nil) {
     reportRing = ring
     reportVideo = video
@@ -2125,91 +2224,22 @@ final class Wire {
         }
         continue
       }
-      if magic != MAGIC || plainN < HDR { continue }
-      let seq = Int32(bitPattern: (plain + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
-      let cap = (plain + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-      let tag = (plain + 16).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
-      let frames = Int(tag & 0xffff)
-      // MASK THE BIT, do not compare the whole field. This read `(tag >> 16) == 1`,
-      // which is the same thing only while pcm16 is the only flag up there -- the
-      // next flag added silently turns every 16-bit packet into a 32-bit one and
-      // the audio becomes noise. One bit per question.
-      let bps = (tag >> 16) & 1 == 1 ? 2 : 4
-      let lp = (tag >> 17) & 1 == 1
-      // EXACTLY our packet size, or nothing. The old test was `frames > FPP`,
-      // which is wrong in both directions during a rollout -- and the two machines
-      // in a call update up to 60 s apart, so a rollout is guaranteed.
-      //
-      // A larger packet was dropped SILENTLY, which is indistinguishable from a
-      // peer that is not sending at all. A smaller one PASSED, and wrote its
-      // samples into a slot sized for ours, leaving the remainder as whatever the
-      // previous packet left there: half the audio becomes stale garbage, which is
-      // far worse than silence and says nothing about why.
-      //
-      // Now it is neither. A mismatch is refused and named, so the failure tells
-      // you what it is and which side to fix.
-      // A compressed block's length is in the byte before it; an uncompressed one
-      // is frames * bps. Either way the payload must be entirely inside the packet.
-      let plen = lp ? (plainN > HDR ? 1 + Int(plain[HDR]) : 0) : frames * bps
-      if frames <= 0 || plen <= 0 || plainN < HDR + plen { continue }
-      if frames != FPP {
-        fmtMismatch += 1
-        // The far end is on another build and this call is going nowhere until one
-        // of us moves. Ask the updater to look now instead of at the end of its
-        // minute -- a wire-format change otherwise costs up to 60 s of silence in
-        // the middle of a real conversation.
-        // `wireMismatch` FIRST: it is the reason, `urgent` is only the trigger, and
-        // the poll thread reads the reason the moment it sees the trigger. Set the
-        // other way round and a tick landing between the two stores would see an
-        // urgent check with no reason attached, and hold the fix behind the silent
-        // call it exists to end.
-        if fmtMismatch == 1 { Update.wireMismatch = true; Update.urgent = true }
-        if fmtMismatch == 1 || fmtMismatch % 4000 == 0 {
-          fputs("audio: peer sends \(frames)-sample packets, this build expects \(FPP)"
-              + " -- the two ends are on different versions, one side needs the update"
-              + " (\(fmtMismatch) packets refused)\n", stderr)
+      if magic == MAGIC {
+        let ok = Wire.unpackAudio(plain: plain, plainN: plainN, into: ring, fbuf: fbuf, ibuf: ibuf, onMismatch: { [weak self] in
+          guard let self else { return }
+          self.fmtMismatch += 1
+          if self.fmtMismatch == 1 { Update.wireMismatch = true; Update.urgent = true }
+          if self.fmtMismatch == 1 || self.fmtMismatch % 4000 == 0 {
+            fputs("audio: peer sends mismatched packets, this build expects \(FPP)"
+                + " -- the two ends are on different versions, one side needs the update"
+                + " (\(self.fmtMismatch) packets refused)\n", stderr)
+          }
+        }, video: video)
+        if ok, ring.restarts != seenRingRestarts {
+          seenRingRestarts = ring.restarts
+          video?.peerRestarted()
         }
         continue
-      }
-      if lp {
-        if expand(plain + HDR, frames) { ring.write(seq: seq, cap: cap, src: fbuf, n: frames) }
-      } else if bps == 2 {
-        unpack16(plain + HDR, frames, into: fbuf)
-        ring.write(seq: seq, cap: cap, src: fbuf, n: frames)
-      } else {
-        (plain + HDR).withMemoryRebound(to: Float.self, capacity: frames) { ring.write(seq: seq, cap: cap, src: $0, n: frames) }
-      }
-      // The audio ring works out that the sender restarted forty times faster than
-      // the video assembler can, because audio arrives forty times more often. Tell
-      // it, rather than making it wait out its own thirty stale frames -- that is a
-      // second of frozen face after the voice is already back. See
-      // `VideoAssembler.peerRestarted`.
-      if ring.restarts != seenRingRestarts {
-        seenRingRestarts = ring.restarts
-        video?.peerRestarted()
-      }
-      // A trailing block means this packet is also carrying an earlier one. Fill
-      // the hole only if it IS a hole -- ring.write already refuses a duplicate,
-      // and refuses anything the cursor has passed, so nothing here can overwrite
-      // audio about to play.
-      let redOff = HDR + plen
-      let rLen = lp ? (plainN > redOff + 8 ? 1 + Int(plain[redOff + 8]) : 0) : frames * bps
-      if rLen > 0, plainN >= redOff + 8 + rLen, seq > 0 {
-        let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
-        let rSeq = seq - 1
-        if !ring.present(rSeq) {
-          if lp {
-            if expand(plain + redOff + 8, frames) { ring.write(seq: rSeq, cap: rCap, src: fbuf, n: frames) }
-          } else if bps == 2 {
-            unpack16(plain + redOff + 8, frames, into: fbuf)
-            ring.write(seq: rSeq, cap: rCap, src: fbuf, n: frames)
-          } else {
-            (plain + redOff + 8).withMemoryRebound(to: Float.self, capacity: frames) {
-              ring.write(seq: rSeq, cap: rCap, src: $0, n: frames)
-            }
-          }
-          if ring.present(rSeq) { ring.recovered += 1 }
-        }
       }
     }
   }

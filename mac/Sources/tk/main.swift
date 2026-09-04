@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.140.0"
+let VERSION = "0.141.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -177,6 +177,11 @@ if flag("backdrop-test") {
 if flag("selftest-identity") {
   let ok = Identity.selftest()
   fputs("selftest-identity: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+if flag("selftest-boost") || flag("boost-test") {
+  let ok = Audio.boostSelfTest()
+  fputs("selftest-boost: \(ok ? "PASS" : "FAIL")\n", stderr)
   exit(ok ? 0 : 1)
 }
 // Claim synchronously and say what happened, so the ladder can be exercised
@@ -590,7 +595,7 @@ let KNOWN_FLAGS: Set<String> = [
   // no-op is worse than no flag, because it reads as configured.
   "server", "update-key", "save-server", "forget-server", "server-print",
   "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto", "no-lan-upgrade",
-  "record", "record-path",
+  "record", "record-path", "selftest-boost", "boost-test",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -615,7 +620,7 @@ let TEST_FLAGS: Set<String> = [
   "subtitle-test", "decimator-test", "headphone-test",
   "predict-test", "floor-test", "turn-test",
   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
-  "predict-far-test", "aec-test", "backdrop-test",
+  "predict-far-test", "aec-test", "backdrop-test", "boost-test", "selftest-boost",
 ]
 let isTestRun = CommandLine.arguments.dropFirst().contains { a in
   guard a.hasPrefix("--") else { return false }

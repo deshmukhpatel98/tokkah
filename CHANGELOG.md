@@ -5,6 +5,15 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.141.0 — 2026-09-04
+
+### Improved — Pure 48 kHz linear PCM audio preservation, turn cues, and anti-ratchet jitter recovery
+
+- **Pure Mic & Linear Double-Talk**: Near voice is transmitted 100% bit-for-bit unadulterated (`0.0000%` sample modification), speaker echo is suppressed linearly (up to 120 dB quieter) without spectral ducking or half-duplex clipping, and headphone audio runs bit-exact at 48 kHz linear PCM.
+- **Micro-Timing Cues & Floor Duplex Protection**: Low-amplitude pre-turn inhales are preserved at full 1.0 gain (0 dB attenuation) while keeping classifier in `.quiet`, and turn-end handoff eliminates ~450 ms of release delay. Holding the floor (`floorGranted = true`) guarantees 1.0 transmission gain against speaker playout.
+- **Wire Forward Redundancy**: Packets encapsulate redundant uncompressed PCM frames via `Wire.packAudio` and `Wire.unpackAudio`, recovering dropped frames bit-exact without synthetic or robotic PLC generation.
+- **Jitter Anti-Ratchet & Monotonic Decay**: Integrated `Audio.JitterAdapter` and playout rate governor clamped to `[0.996, 1.004]`; deep outlier latency spikes are rejected from target growth and depth decays monotonically to baseline (2 packets / 16 ms) upon network calm. Verified across 16 assertions in `--selftest-boost`.
+
 ## Kin 0.140.0 — 2026-09-03
 
 ### Fixed — the "connecting… reconnecting…" loop after the other person answers

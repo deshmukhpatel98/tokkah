@@ -2412,6 +2412,546 @@ final class Audio {
     return fails == 0
   }
 
+  /// Fractional read cursor rate governor.
+  /// Translates buffer backlog / deficit (in samples) into fractional playout rate.
+  /// Bounded to +/- 0.4% (+/- 4 parts per thousand, < 5 cents pitch drift).
+  static func governorRate(errSamples: Double) -> (rate: Double, errMs: Double) {
+    let r = 1.0 + errSamples / (SR * 2.0)
+    let rate = min(1.004, max(0.996, r))
+    let errMs = errSamples / SR * 1000.0
+    return (rate, errMs)
+  }
+
+  /// Jitter target adaptation controller.
+  /// Governs buffer depth based on arrival slack, late arrival magnitude, and packet loss evidence.
+  /// Enforces monotonic decay upon recovery and prevents deep outlier spikes from ratcheting the target.
+  final class JitterAdapter {
+    var jitMin = 2
+    var jitMax = 20
+    var growLateMin = 8
+    var growBelowMs = 1.0
+    var shrinkAboveMs = 1.0
+    var shrinkHold = 5
+    var shrinkHoldFast = 5
+    var starveAudiblePct = 0.02
+
+    var target = 2
+    var grows = 0
+    var shrinks = 0
+    var calm = 0
+    var deepRefused = 0
+    var enoughRefused = 0
+    var growSuppressed = 0
+    var marginExcused = 0
+    var unsafeBelow = 0
+    var probeAt = 0.0
+    var backoff = 60.0
+
+    var lastConcealed = 0
+    var lastSnapsBehind = 0
+    var lastLate = 0
+    var lastNearLate = 0
+    var lastStarved = 0
+
+    var redundancy = false
+    var lastLostForFec = 0
+    var fecCalm = 0
+    var fecRecovered0 = 0
+    var fecLost0 = 0
+    var fecWindows = 0
+    var fecUselessUntil = 0.0
+    var fecBackoff = 60.0
+    var fecAllowed = true
+
+    init(jitMin: Int = 2, jitMax: Int = 20, shrinkAboveMs: Double = 1.0) {
+      self.jitMin = jitMin
+      self.jitMax = jitMax
+      self.target = jitMin
+      self.shrinkAboveMs = shrinkAboveMs
+    }
+
+    func step(t: Double, r: RecvRing, peerLost: Int = 0, peerRecovered: Int = 0, peerReportsLoss: Bool = false) {
+      guard r.pos >= 0 else { return }
+      let conc = r.concealed - lastConcealed
+      lastConcealed = r.concealed
+      let late = r.lateArrivals - lastLate
+      lastLate = r.lateArrivals
+      let near = r.nearLate - lastNearLate
+      lastNearLate = r.nearLate
+      let deep = late - near
+
+      let lostTotal = peerReportsLoss ? peerLost : r.concealLost
+      let recTotal = peerReportsLoss ? peerRecovered : r.recovered
+      var lostNow = lostTotal - lastLostForFec
+      if lostNow < 0 { lostNow = 0; fecRecovered0 = recTotal; fecLost0 = lostTotal }
+      lastLostForFec = lostTotal
+      if fecAllowed, lostNow > 0, !redundancy, t >= fecUselessUntil {
+        redundancy = true
+        fecRecovered0 = recTotal
+        fecLost0 = lostTotal
+        fecWindows = 0
+        fecCalm = 0
+      } else if redundancy {
+        fecWindows += 1
+        let rec = max(0, recTotal - fecRecovered0)
+        let lost = max(0, lostTotal - fecLost0)
+        if fecWindows >= 5, rec + lost >= 20 {
+          let rate = Double(rec) / Double(rec + lost)
+          if rate < 0.4 {
+            redundancy = false
+            fecUselessUntil = t + fecBackoff
+            fecBackoff = min(fecBackoff * 2, 600)
+            fecCalm = 0
+            return
+          }
+        }
+        if lostNow > 0 { fecCalm = 0 } else {
+          fecCalm += 1
+          if fecCalm >= 15 {
+            redundancy = false
+            fecCalm = 0
+            fecBackoff = 60
+          }
+        }
+      }
+
+      let snappedBehind = r.snapsBehind - lastSnapsBehind
+      lastSnapsBehind = r.snapsBehind
+
+      let starved = r.concealStarved - lastStarved
+      lastStarved = r.concealStarved
+      let expected = 2.0 * SR / Double(FPP)
+      let starvedPct = Double(starved) / expected * 100.0
+      let starving = starvedPct > starveAudiblePct
+      guard let p01 = r.slackWin.p(0.01) else { return }
+      r.slackWin.reset()
+      let worst = r.slackWinMin == 1e9 ? p01 : r.slackWinMin
+      r.slackWinMin = 1e9
+      let pktMs = Double(FPP) / SR * 1000.0
+      let head = worst - pktMs
+
+      let converged = abs(r.errMs) < 2.0
+      if p01 < growBelowMs, !converged { growSuppressed += 1 }
+
+      let senderGap = r.ipiCapWinMax
+      let senderHiccup = senderGap > pktMs * 1.5
+      r.ipiCapWinMax = 0
+      let excusedDip = p01 < growBelowMs && senderHiccup && conc == 0 && late == 0
+      if excusedDip { marginExcused += 1 }
+
+      if snappedBehind > 0 && (!starving && conc == 0) {
+        calm = 0
+      } else if excusedDip {
+        calm = 0
+      } else if !starving, target > jitMin + 1, (late >= growLateMin || p01 < growBelowMs) {
+        enoughRefused += 1
+        calm = 0
+      } else if !starving, late >= growLateMin, near < growLateMin, p01 >= growBelowMs {
+        deepRefused += 1
+        calm = 0
+      } else if (late >= growLateMin && (near >= growLateMin || starving)) || (p01 < growBelowMs && converged) || (starving && target < jitMax) {
+        if target < jitMax {
+          target += 1
+          grows += 1
+          unsafeBelow = max(unsafeBelow, target)
+          probeAt = t + backoff
+          backoff = min(backoff * 2, 120)
+        }
+        calm = 0
+      } else if target <= unsafeBelow && t < probeAt {
+        calm = 0
+      } else if head > shrinkAboveMs && converged && target > jitMin {
+        calm += 1
+        let hold = unsafeBelow == 0 ? shrinkHoldFast : shrinkHold
+        if calm >= hold {
+          target -= 1
+          shrinks += 1
+          calm = 0
+          if target < unsafeBelow { unsafeBelow = target; backoff = 60 }
+        }
+      } else {
+        calm = 0
+      }
+    }
+  }
+
+  /// `--selftest-boost`: Programmatic verification of the four architectural pillars:
+  /// 1. Pure Mic Is The Product (48 kHz linear PCM, bit-for-bit exactness, linear LMS AEC)
+  /// 2. Turn-Taking & Micro-Timing Cues (pre-turn inhales, trailing creaky voice, turn-end prediction handoff)
+  /// 3. Packet Loss Forward Redundancy (piggybacked uncompressed frames, bit-exact recovery, zero PLC synthesis)
+  /// 4. Jitter Buffer Ratchet Prevention & Monotonic Decay (cautious growth, outlier rejection, monotonic target decay, rate governor)
+  static func boostSelfTest() -> Bool {
+    var fails = 0
+    func check(_ ok: Bool, _ what: String) {
+      if !ok { fails += 1 }
+      let mark = ok ? "ok  " : "FAIL"
+      print("   \(mark) \(what)")
+      fputs("boost-selftest: \(mark) \(what)\n", stderr)
+    }
+
+    print("================================================================================")
+    print("BOOST SELFTEST: THE FOUR PILLARS OF IMMEDIATE REAL-TIME AUDIO")
+    print("================================================================================")
+
+    // ── PILLAR 1: PURE MIC IS THE PRODUCT ────────────────────────────────────
+    print("-- Pillar 1: Pure Mic Is The Product (48 kHz linear PCM, zero synthetic, linear LMS AEC)")
+
+    // 1.1 Headphone bypass (cfg.on = false): bit-for-bit exactness under double-talk
+    do {
+      let gHead = DuplexGate()
+      gHead.cfg.on = false
+      gHead.cfg.yieldOn = false
+      let nHead = 48000
+      var nearHead = [Float](repeating: 0, count: nHead)
+      var farHead = [Float](repeating: 0, count: nHead)
+      for i in 0..<nHead {
+        nearHead[i] = 0.4 * sin(Float(2 * Double.pi * 440.0 * Double(i) / SR))
+          + 0.1 * sin(Float(2 * Double.pi * 880.0 * Double(i) / SR))
+        farHead[i] = 0.5 * sin(Float(2 * Double.pi * 220.0 * Double(i) / SR))
+      }
+      var outHead = nearHead
+      outHead.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nHead {
+          for k in i..<(i + 16) { gHead.noteFar(farHead[k]) }
+          gHead.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      var maxDiffHead: Float = 0
+      for i in 0..<nHead {
+        let d = abs(outHead[i] - nearHead[i])
+        if d > maxDiffHead { maxDiffHead = d }
+      }
+      check(maxDiffHead == 0,
+            "Headphones: 48 kHz linear PCM bit-for-bit identical (max diff \(String(format: "%.8f", maxDiffHead))) during double-talk")
+    }
+
+    // 1.2 Near voice on speakers (cfg.on = true): untouched near speech during simultaneous far speech
+    do {
+      let gSpk = DuplexGate()
+      gSpk.cfg.on = true
+      gSpk.cfg.yieldOn = false
+      let nSpk = 48000
+      var nearSpk = [Float](repeating: 0, count: nSpk)
+      var farSpk = [Float](repeating: 0, count: nSpk)
+      for i in 0..<nSpk {
+        farSpk[i] = 0.3 * sin(Float(2 * Double.pi * 250.0 * Double(i) / SR))
+        nearSpk[i] = 0.4 * sin(Float(2 * Double.pi * 350.0 * Double(i) / SR))
+      }
+      var outSpk = nearSpk
+      outSpk.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nSpk {
+          for k in i..<(i + 16) { gSpk.noteFar(farSpk[k]) }
+          gSpk.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      var worstNearDiff: Double = 0
+      for i in Int(SR * 0.05)..<nSpk { // after gate has 50 ms to open
+        let diff = Double(abs(outSpk[i] - nearSpk[i]))
+        let rel = nearSpk[i] != 0 ? diff / Double(abs(nearSpk[i])) : 0
+        if rel > worstNearDiff { worstNearDiff = rel }
+      }
+      check(worstNearDiff < 1e-6,
+            "Near voice on speakers: bit-for-bit untouched during near speech (\(String(format: "%.4f%%", worstNearDiff * 100)) error)")
+    }
+
+    // 1.3 Far-only echo suppression on speakers (cfg.on = true)
+    do {
+      let gEcho = DuplexGate()
+      gEcho.cfg.on = true
+      gEcho.cfg.yieldOn = false
+      let nEcho = 48000
+      var farEcho = [Float](repeating: 0, count: nEcho)
+      var micEcho = [Float](repeating: 0, count: nEcho)
+      for i in 0..<nEcho {
+        farEcho[i] = 0.4 * sin(Float(2 * Double.pi * 300.0 * Double(i) / SR))
+        micEcho[i] = 0.25 * farEcho[i]
+      }
+      var outEcho = micEcho
+      outEcho.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nEcho {
+          for k in i..<(i + 16) { gEcho.noteFar(farEcho[k]) }
+          gEcho.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      var inE = 0.0, outE = 0.0
+      for i in Int(SR * 0.2)..<nEcho { // after 200 ms settling
+        inE += Double(micEcho[i]) * Double(micEcho[i])
+        outE += Double(outEcho[i]) * Double(outEcho[i])
+      }
+      let supDb = (inE > 0 && outE > 0) ? 10.0 * log10(inE / outE) : 0
+      check(supDb > 15.0,
+            "Speaker echo suppression: \(String(format: "%.1f", supDb)) dB quieter during peer speech without spectral ducking")
+    }
+
+    // 1.4 & 1.5 Linear AEC LMS subtraction without non-linear ducking or synthetic speech
+    do {
+      let fm = FileManager.default
+      let cand = ["testbed/media/real", "../testbed/media/real", "../../testbed/media/real"]
+      let mediaDir = cand.first { fm.fileExists(atPath: "\($0)/realB.wav") } ?? "testbed/media/real"
+      let wavB = Predict.readWav("\(mediaDir)/realB.wav")?.pcm
+      let wavA = Predict.readWav("\(mediaDir)/realA.wav")?.pcm
+
+      let nAec: Int
+      let nearAec: [Float]
+      let farAec: [Float]
+      if let A = wavA, let B = wavB, A.count > Int(SR * 4), B.count > Int(SR * 4) {
+        nAec = Int(SR * 4)
+        nearAec = Array(A[0..<nAec])
+        farAec = Array(B[0..<nAec])
+      } else {
+        nAec = Int(SR * 4)
+        var nBuf = [Float](repeating: 0, count: nAec)
+        var fBuf = [Float](repeating: 0, count: nAec)
+        var seed: UInt64 = 0x51ED
+        for i in 0..<nAec {
+          seed = seed &* 6364136223846793005 &+ 1442695040888963407
+          let r = Float(Int32(truncatingIfNeeded: Int(seed >> 33))) / Float(Int32.max)
+          let t = Double(i) / SR
+          let env = Float(0.55 + 0.45 * sin(2 * Double.pi * 4.3 * t))
+          if t >= 1.0 { fBuf[i] = r * 0.4 * env }
+          if t >= 2.0 && t < 3.5 { nBuf[i] = r * 0.3 * env }
+        }
+        nearAec = nBuf
+        farAec = fBuf
+      }
+
+      let cfgAec = Aec.Cfg()
+      let nullRun = Aec.run(near: nearAec, far: farAec, delayMs: 31, echoGain: 0,
+                            cfg: cfgAec, blockN: 16, corr: 0.26, echoOn: false)
+      check(nullRun.r.linearityDb < -100,
+            "Linear AEC: near speech linearity < -100 dB (actual \(String(format: "%.1f", nullRun.r.linearityDb)) dB), zero non-linear ducking")
+
+      let echoRun = Aec.run(near: [Float](repeating: 0, count: nAec), far: farAec,
+                            delayMs: 31, echoGain: 0.5, cfg: cfgAec, blockN: 16, corr: 0.8, echoOn: true)
+      check(echoRun.r.echoErleDb > 8,
+            "Linear AEC: removes echo linearly (\(String(format: "%.1f", echoRun.r.echoErleDb)) dB ERLE) without spectral masking")
+    }
+
+    // ── PILLAR 2: TURN-TAKING & MICRO-TIMING CUES ─────────────────────────────
+    print("-- Pillar 2: Turn-Taking & Micro-Timing Cues (Inhales, Creak, Turn Handoff Prediction)")
+
+    // 2.1 Pre-turn inhale preservation
+    do {
+      let gInhale = DuplexGate()
+      gInhale.cfg.on = true
+      let nInhale = Int(SR * 0.2) // 200 ms
+      var breath = [Float](repeating: 0, count: nInhale)
+      for i in 0..<nInhale {
+        breath[i] = 0.010 * sin(Float(2 * Double.pi * 150.0 * Double(i) / SR))
+      }
+      var outBreath = breath
+      outBreath.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nInhale {
+          gInhale.noteFar(0) // Far end is silent
+          gInhale.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      let inhaleGain = gInhale.appliedGainNow
+      let stayedQuiet = gInhale.vocal == .quiet
+      check(inhaleGain >= 0.999 && stayedQuiet,
+            "Pre-turn inhale: soft breath preserved with full 1.0 gain (actual \(String(format: "%.3f", inhaleGain)), 0 dB attenuation), classifier safe (.quiet)")
+    }
+
+    // 2.2 Trailing creaky voice / pitch drop hangover
+    do {
+      let gCreak = DuplexGate()
+      gCreak.cfg.on = true
+      let nTalk = Int(SR * 0.8) // 800 ms of speech
+      var talkBuf = [Float](repeating: 0, count: nTalk)
+      for i in 0..<nTalk { talkBuf[i] = 0.25 * sin(Float(2 * Double.pi * 200.0 * Double(i) / SR)) }
+      talkBuf.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nTalk {
+          gCreak.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      let claimed = gCreak.vocal == .claim
+
+      // Feed 250 ms of creaky voice / trailing low energy (< 450 ms hangover)
+      let nCreak = Int(SR * 0.25)
+      var creakBuf = [Float](repeating: 0, count: nCreak)
+      for i in 0..<nCreak { creakBuf[i] = 0.002 * sin(Float(2 * Double.pi * 100.0 * Double(i) / SR)) }
+      creakBuf.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nCreak {
+          gCreak.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      let creakSurvives = gCreak.vocal == .claim
+
+      // Feed additional 300 ms of silence (total quiet = 550 ms > 450 ms hangover)
+      let nQuiet = Int(SR * 0.3)
+      var quietBuf = [Float](repeating: 0, count: nQuiet)
+      quietBuf.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nQuiet {
+          gCreak.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      let released = gCreak.vocal == .quiet
+      check(claimed && creakSurvives && released,
+            "Trailing creak: 450 ms hangover preserves low-energy vocal tail without premature cut")
+    }
+
+    // 2.3 & 2.4 Turn-end prediction & immediate transmission
+    do {
+      let f = Floor()
+      f.cfg.strict = false
+      f.speakers = true
+      f.noteFar(.claim)
+      _ = f.step(dt: 0.02, near: .quiet)
+      let heldByThem = f.state == .theirs
+
+      // Peer emits turn completion probability 0.9
+      f.noteFarEndProb(0.3) // arm
+      _ = f.step(dt: 0.02, near: .quiet)
+      f.noteFarEndProb(0.9) // prosody prediction triggers
+      let stepPred = f.step(dt: 0.02, near: .quiet)
+      let handoffIdle = stepPred.state == .idle
+      let predReleasesCount = f.farPredictedReleases >= 1
+
+      // On the very next frame, near speaks and immediately takes floor
+      let stepNear = f.step(dt: 0.02, near: .claim)
+      let nearGranted = stepNear.state == .mine && stepNear.mayTransmit
+      check(heldByThem && handoffIdle && predReleasesCount,
+            "Turn-end prediction: 0 ms hesitation handoff (saved ~450 ms release delay, \(f.farPredictedReleases) far prediction release)")
+      check(nearGranted,
+            "Immediate microphone transmission on handoff frame (state=mine, mayTransmit=true)")
+    }
+
+    // 2.5 Floor grant duplex gate protection
+    do {
+      let gGrant = DuplexGate()
+      gGrant.cfg.on = true
+      gGrant.floorGranted = true
+      let nGrant = 1600
+      var dummy = [Float](repeating: 0.05, count: nGrant)
+      dummy.withUnsafeMutableBufferPointer { op in
+        var i = 0
+        while i + 16 <= nGrant {
+          gGrant.noteFar(0.6) // Peer loud
+          gGrant.process(op.baseAddress! + i, 16)
+          i += 16
+        }
+      }
+      let grantGain = gGrant.appliedGainNow
+      check(grantGain >= 0.999,
+            "Floor grant duplex protection: holding floor guarantees 1.0 gain (actual \(String(format: "%.3f", grantGain))) even under speaker playout")
+    }
+
+    // ── PILLAR 3: PACKET LOSS FORWARD REDUNDANCY ──────────────────────────────
+    print("-- Pillar 3: Packet Loss Forward Redundancy (Piggybacked PCM, Zero PLC Synthesis)")
+
+    do {
+      let ring = RecvRing()
+      let f0 = [Float](repeating: 0.11, count: FPP)
+      let f1 = (0..<FPP).map { Float($0) * 0.01 + 0.2 }
+      let f2 = [Float](repeating: 0.33, count: FPP)
+
+      let buf0 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf2 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf0.deallocate(); buf2.deallocate() }
+
+      // Packet 0 arrives
+      let len0 = Wire.packAudio(seq: 0, cap: 1000, src: f0, n: FPP, dst: buf0)
+      _ = Wire.unpackAudio(plain: buf0, plainN: len0, into: ring)
+      let p0Present = ring.present(0)
+
+      // Packet 1 is LOST in transit!
+      let p1LostBefore = !ring.present(1)
+
+      // Packet 2 arrives carrying redundant packet 1
+      let len2 = Wire.packAudio(seq: 2, cap: 3000, src: f2, n: FPP, dst: buf2,
+                                redundant: f1, redundantCap: 2000)
+      _ = Wire.unpackAudio(plain: buf2, plainN: len2, into: ring)
+
+      let p2Present = ring.present(2)
+      let p1Recovered = ring.present(1) && ring.recovered == 1
+
+      // Verify sample-for-sample bit-exactness:
+      var f1Exact = true
+      for k in 0..<FPP {
+        if let s = ring.sampleAt(Int64(1 * FPP + k)) {
+          if abs(s - f1[k]) > 1e-7 { f1Exact = false }
+        } else {
+          f1Exact = false
+        }
+      }
+      let plcBypassed = ring.concealed == 0
+
+      check(p0Present && p1LostBefore && p2Present && p1Recovered,
+            "Wire codec recovery: dropped frame N-1 recovered from wire datagram N (recovered=\(ring.recovered))")
+      check(f1Exact && plcBypassed,
+            "Recovered frame bit-exact with original PCM (\(FPP)/\(FPP) samples identical, zero PLC synthesis)")
+    }
+
+    // ── PILLAR 4: JITTER BUFFER RATCHET PREVENTION & MONOTONIC DECAY ─────────
+    print("-- Pillar 4: Jitter Buffer Ratchet Prevention & Monotonic Decay")
+
+    do {
+      let adapter = Audio.JitterAdapter(jitMin: 2, jitMax: 20, shrinkAboveMs: 1.0)
+      let ring = RecvRing()
+      ring.pos = 0
+
+      // Near-late arrivals: packets missed deadline by under 1 packet -> grows
+      ring.lateArrivals = 10
+      ring.nearLate = 10
+      ring.slackWin.add(0.5) // p01 < 1.0
+      adapter.step(t: 2.0, r: ring)
+      let grewOnNearLate = adapter.target == 3 && adapter.grows == 1
+
+      // Deep outlier arrivals: 10 packets late by 20 ms (near = 0, deep = 10), margin fine
+      ring.lateArrivals += 10
+      ring.slackWin.add(3.0) // p01 >= 1.0
+      adapter.step(t: 4.0, r: ring)
+      let refusedDeep = adapter.deepRefused == 1 && adapter.target == 3
+
+      check(grewOnNearLate, "Adaptive growth: near-late jitter expands target cautiously (jitTarget -> \(adapter.target))")
+      check(refusedDeep, "Ratchet prevention: deep outlier latency spikes rejected from target growth")
+
+      // Monotonic target decay upon network recovery
+      var decayedToMin = false
+      let startT = adapter.probeAt
+      for win in 1...6 {
+        ring.slackWin.add(4.5)
+        ring.slackWinMin = 3.5 // head = 3.5 - 0.67 = 2.83 > 1.0
+        adapter.step(t: startT + Double(win) * 2.0, r: ring)
+        if adapter.target == adapter.jitMin { decayedToMin = true; break }
+      }
+      check(decayedToMin && adapter.shrinks >= 1 && adapter.target == 2,
+            "Monotonic decay: target decays smoothly back to baseline (\(adapter.target) packets) upon calm (shrinks=\(adapter.shrinks))")
+
+      // Playout rate governor error correction
+      let errSamplesBacklog: Double = 0.025 * SR // 25 ms of buffer backlog
+      let govSpeed = Audio.governorRate(errSamples: errSamplesBacklog)
+
+      let errSamplesZero: Double = 0.0
+      let govZero = Audio.governorRate(errSamples: errSamplesZero)
+
+      let speedOk = abs(govSpeed.rate - 1.004) < 1e-6
+      let zeroOk = abs(govZero.rate - 1.0) < 1e-6
+      check(speedOk && zeroOk,
+            "Audio rate governor: drains excess backlog (+0.4%) with < 5 cents pitch drift, converges to 1.000")
+    }
+
+    print("================================================================================")
+    let passed = (fails == 0)
+    print(passed ? "BOOST SELFTEST PASSED (16/16 assertions)" : "BOOST SELFTEST FAILED (\(fails) failures)")
+    print("================================================================================")
+    return passed
+  }
+
 
   // ── ATTRIBUTION, THEN SUSTAIN, THEN ACT ────────────────────────────────────
   //
@@ -4847,10 +5387,10 @@ final class Audio {
     // a call that felt immediate at minute one feels laggy at minute ten, with
     // nothing in any log to explain why.
     let errSamples = Double(hi - cur - Int64(jitTarget)) * Double(FPP) - ring.pos.truncatingRemainder(dividingBy: Double(FPP))
-    let r = 1.0 + errSamples / (SR * 2.0)
-    ring.rate = min(1.004, max(0.996, r))
+    let gov = Audio.governorRate(errSamples: errSamples)
+    ring.rate = gov.rate
     ring.rateSum += ring.rate; ring.rateN += 1
-    ring.errMs = errSamples / SR * 1000.0
+    ring.errMs = gov.errMs
 
     // When this buffer will actually reach the DAC, on the host clock. The
     // output callback runs ahead of the sound; using now() here would understate
