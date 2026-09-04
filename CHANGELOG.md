@@ -5,6 +5,20 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.151.0 — 2026-09-05
+
+### Added — Burst-proof interleaved stride FEC, extended double-talk AEC on speakers, and dual-path packet racing
+
+- **Burst-Proof Interleaved Redundancy (Stride FEC & Parity)**:
+  - Extended 0.67 ms (FPP=32) audio wire packets with multi-stride interleaved redundancy (carrying N-1 and N-4 stride offsets) and block parity FEC (bitwise XOR across 4 frames).
+  - Reconstructs bursts of consecutive packet drops (5–25 ms) bit-for-bit with 0 ms retransmission delay, completely bypassing packet loss concealment (PLC) synthesis.
+- **Extended Double-Talk AEC on Speakers (PBFDAF & Spectral Coherence)**:
+  - Expanded tap coverage up to 4096–8192 taps (85–170 ms) using multi-partition filtering (PBFDAF) with 256-sample partition energy normalization, capturing long diffuse room reflection tails on speakers without starving direct-path convergence.
+  - Fast spectral coherence double-talk detector across 16 frequency bins over 32 samples freezes adaptation during simultaneous near speech without ducking or voice distortion, preserving full-duplex conversational presence.
+- **Dual-Path Packet Racing (Direct P2P + Anycast Relay Concurrent Racing)**:
+  - Concurrently transmits audio datagrams over both Direct STUN/P2P and Anycast Relay (Cloudflare Tunnel / TURN).
+  - Receiver ring buffer deduplicates by sequence number (`seq`) with zero overhead, collapsing network jitter across routes and delivering the fastest packet to the DAC.
+
 ## Kin 0.150.0 — 2026-09-05
 
 ### Added — Acoustic presence and ultra-low latency audio presence enhancements: headphone spatial room reflections, ambient room continuity duplex gating, and subsonic rumble filtration

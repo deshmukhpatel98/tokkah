@@ -137,6 +137,14 @@ final class Aec {
     /// 0.8 are both ordinary and no fixed ratio describes both.
     var dtRatio: Float = 2.5
     /// The estimate must move at least this far to be considered a new aim...
+    /// Multi-partition block frequency/time domain adaptation for long impulse responses (taps > 1024).
+    /// Normalizes each 256-tap partition by its local reference energy so direct path
+    /// convergence is not slowed by long room reflection tail coverage (up to 8192 taps).
+    var pbfdaf = true
+    /// Fast spectral coherence double-talk detector: freezes adaptation when
+    /// near speech corrupts cross-spectral coherence between reference and mic.
+    var spectralCoherence = true
+    var coherenceDtThresh: Float = 0.45
     var reaimMs: Double = 8
     /// ...and disagree this many computations in a row before the filter is
     /// zeroed. One window disagreeing is noise; three in a row is the path
@@ -445,6 +453,40 @@ final class Aec {
   private var bPeak = [Float](repeating: 0, count: Aec.nlBases)
   private let maxBlock: Int
 
+  // ── FAST SPECTRAL COHERENCE DOUBLE-TALK DETECTOR ───────────────────────────
+  // 16 bins across 32 samples (0.67 ms). Magnitude-squared cross-spectral
+  // coherence between aligned reference and microphone detects near-end speech
+  // to freeze adaptation without ducking near speech or corrupting duplex voice.
+  static let cohBins = 16
+  static let cohSamples = 32
+  static let cohCos: [Float] = {
+    var c = [Float](repeating: 0, count: cohBins * cohSamples)
+    for m in 0..<cohBins {
+      for k in 0..<cohSamples {
+        let angle = 2.0 * Float.pi * Float(m * k) / Float(cohSamples)
+        c[m * cohSamples + k] = cos(angle)
+      }
+    }
+    return c
+  }()
+  static let cohSin: [Float] = {
+    var s = [Float](repeating: 0, count: cohBins * cohSamples)
+    for m in 0..<cohBins {
+      for k in 0..<cohSamples {
+        let angle = 2.0 * Float.pi * Float(m * k) / Float(cohSamples)
+        s[m * cohSamples + k] = sin(angle)
+      }
+    }
+    return s
+  }()
+  private var sxx = [Float](repeating: 0, count: cohBins)
+  private var sdd = [Float](repeating: 0, count: cohBins)
+  private var sxd_r = [Float](repeating: 0, count: cohBins)
+  private var sxd_i = [Float](repeating: 0, count: cohBins)
+  private var micCohHist = [Float](repeating: 0, count: cohSamples)
+  private(set) var cohNow: Float = 1.0
+  private(set) var doubleTalkCoh = false
+
   /// Where the estimator says the echo is, in samples, and how sure it is.
   /// Written by the estimator thread as plain scalars; the DECISION to move the
   /// filter is taken on the audio thread, so the two never tear.
@@ -571,15 +613,15 @@ final class Aec {
 
   init(maxBlock: Int = 4096) {
     self.maxBlock = maxBlock
-    fFg = [Float](repeating: 0, count: 4096)
-    fBg = [Float](repeating: 0, count: 4096)
-    xwin = [Float](repeating: 0, count: 4096 + maxBlock)
+    fFg = [Float](repeating: 0, count: 8192)
+    fBg = [Float](repeating: 0, count: 8192)
+    xwin = [Float](repeating: 0, count: 8192 + maxBlock)
     yBuf = [Float](repeating: 0, count: maxBlock)
     yBgBuf = [Float](repeating: 0, count: maxBlock)
     eBuf = [Float](repeating: 0, count: maxBlock)
     eBgBuf = [Float](repeating: 0, count: maxBlock)
-    gBuf = [Float](repeating: 0, count: 4096)
-    rawWin = [Float](repeating: 0, count: 4096 + maxBlock + 3)
+    gBuf = [Float](repeating: 0, count: 8192)
+    rawWin = [Float](repeating: 0, count: 8192 + maxBlock + 3)
     fFgNl = Array(repeating: [Float](repeating: 0, count: 1024), count: Aec.nlBases)
     fBgNl = Array(repeating: [Float](repeating: 0, count: 1024), count: Aec.nlBases)
     bwins = Array(repeating: [Float](repeating: 0, count: 1024 + maxBlock), count: Aec.nlBases)
@@ -743,6 +785,10 @@ final class Aec {
     farMicE = 0; farEE = 0; farRefE = 0
     cmpFgE = 0; cmpBgE = 0; cmpMicE = 0; betterMs = 0; worseMs = 0
     refRun = 0
+    for m in 0..<Aec.cohBins { sxx[m] = 0; sdd[m] = 0; sxd_r[m] = 0; sxd_i[m] = 0 }
+    for k in 0..<Aec.cohSamples { micCohHist[k] = 0 }
+    cohNow = 1.0
+    doubleTalkCoh = false
   }
 
   /// Subtract the estimated echo from `x` in place.
@@ -759,7 +805,7 @@ final class Aec {
     guard cfg.on, n > 0, n <= maxBlock else { return }
     let t0 = Clock.now()
     let dt = Double(n) / SR
-    let T = min(cfg.taps, 4096)
+    let T = min(cfg.taps, 8192)
     coolMsLeft = max(0, coolMsLeft - dt * 1000)
 
     // ── AIM, AND ONLY WHEN THE MOVE IS EARNED ────────────────────────────────
@@ -1112,7 +1158,77 @@ final class Aec {
     let yRms = (ySq / Float(n)).squareRoot()
     let yBgRms = (yBgSq / Float(n)).squareRoot()
     yRmsNow = yRms
-    let doubleTalk = yBgRms > cfg.refRmsFloor && micRmsL > yBgRms * cfg.dtRatio
+
+    // ── FAST SPECTRAL COHERENCE DOUBLE-TALK DETECTOR ───────────────────────────
+    if cfg.spectralCoherence {
+      micCohHist.withUnsafeMutableBufferPointer { mb in
+        let mp = mb.baseAddress!
+        if n >= Aec.cohSamples {
+          memcpy(mp, x + (n - Aec.cohSamples), Aec.cohSamples * 4)
+        } else {
+          memmove(mp, mp + n, (Aec.cohSamples - n) * 4)
+          memcpy(mp + (Aec.cohSamples - n), x, n * 4)
+        }
+      }
+      var cohVal: Float = 1.0
+      var dtCoh = false
+      if refRun > Int(SR * 0.050), mix >= 0.2, micRmsL > yBgRms * 1.1, yBgRms > cfg.refRmsFloor, span >= Aec.cohSamples {
+        let alpha = Float(1.0 - exp(-dt / 0.030))
+        var validBins = 0
+        var cohSum: Float = 0
+        xwin.withUnsafeBufferPointer { w in
+          micCohHist.withUnsafeBufferPointer { mb in
+            let refBase = w.baseAddress! + (T - 1 + n - Aec.cohSamples)
+            let micBase = mb.baseAddress!
+            for m in 1..<Aec.cohBins {
+              let cosPtr = Aec.cohCos.withUnsafeBufferPointer { $0.baseAddress! + m * Aec.cohSamples }
+              let sinPtr = Aec.cohSin.withUnsafeBufferPointer { $0.baseAddress! + m * Aec.cohSamples }
+              var xr: Float = 0, xi: Float = 0, dr: Float = 0, di: Float = 0
+              for k in 0..<Aec.cohSamples {
+                let rk = refBase[k]
+                let dk = micBase[k]
+                let ck = cosPtr[k]
+                let sk = sinPtr[k]
+                xr += rk * ck
+                xi -= rk * sk
+                dr += dk * ck
+                di -= dk * sk
+              }
+              let pxx = xr * xr + xi * xi
+              let pdd = dr * dr + di * di
+              let pxd_r = xr * dr + xi * di
+              let pxd_i = xi * dr - xr * di
+
+              sxx[m] += alpha * (pxx - sxx[m])
+              sdd[m] += alpha * (pdd - sdd[m])
+              sxd_r[m] += alpha * (pxd_r - sxd_r[m])
+              sxd_i[m] += alpha * (pxd_i - sxd_i[m])
+
+              let denom = sxx[m] * sdd[m]
+              if denom > 1e-10 {
+                let num = sxd_r[m] * sxd_r[m] + sxd_i[m] * sxd_i[m]
+                let c = min(1.0, max(0.0, num / denom))
+                cohSum += c
+                validBins += 1
+              }
+            }
+          }
+        }
+        if validBins >= 4 {
+          cohVal = cohSum / Float(validBins)
+          if cohVal < cfg.coherenceDtThresh {
+            dtCoh = true
+          }
+        }
+      }
+      cohNow = cohVal
+      doubleTalkCoh = dtCoh
+    } else {
+      doubleTalkCoh = false
+    }
+
+    let doubleTalkLevel = yBgRms > cfg.refRmsFloor && micRmsL > yBgRms * cfg.dtRatio
+    let doubleTalk = doubleTalkLevel || (cfg.spectralCoherence && doubleTalkCoh)
     let mayAdapt = !doubleTalk && coolMsLeft <= 0
     // The far-only measurement, on the same blocks the filter fits. Half a
     // second, because those blocks are intermittent.
@@ -1148,33 +1264,67 @@ final class Aec {
     }
 
     if mayAdapt {
-      // ── ONE BLOCK NLMS STEP, ON THE BACKGROUND ─────────────────────────────
-      //
-      // g[p] = sum_k xwin[p+k] * eBg[k], which is the same `vDSP_conv` with the
-      // roles swapped -- the gradient of a correlation is a correlation. The
-      // normaliser is `n * refEnergy`, so this block step is exactly the AVERAGE
-      // of the `n` per-sample NLMS steps it stands in for: stable for `mu < 2` at
-      // any block size, which is the property a per-block coefficient would not
-      // have had.
-      //
-      // `max(refSq, floor)` and not `refSq + 1e-6`. The epsilon in the old code
-      // was not a level, so a near-silent reference still produced an enormous
-      // step -- and that is the whole arithmetic of the -21.7 dB failure.
-      var scale = cfg.mu / (Float(n) * max(refSq, Float(span) * cfg.refRmsFloor * cfg.refRmsFloor))
-      if cfg.leakTau > 0 {
-        var keep = Float(exp(-dt / cfg.leakTau))
-        fBg.withUnsafeMutableBufferPointer { fp in
-          vDSP_vsmul(fp.baseAddress!, 1, &keep, fp.baseAddress!, 1, vDSP_Length(T))
+      if cfg.pbfdaf && T > 1024 {
+        if cfg.leakTau > 0 {
+          var keep = Float(exp(-dt / cfg.leakTau))
+          fBg.withUnsafeMutableBufferPointer { fp in
+            vDSP_vsmul(fp.baseAddress!, 1, &keep, fp.baseAddress!, 1, vDSP_Length(T))
+          }
         }
-      }
-      xwin.withUnsafeBufferPointer { w in
-        eBgBuf.withUnsafeBufferPointer { e in
-          gBuf.withUnsafeMutableBufferPointer { g in
-            vDSP_conv(w.baseAddress!, 1, e.baseAddress!, 1, g.baseAddress!, 1,
-                      vDSP_Length(T), vDSP_Length(n))
-            fBg.withUnsafeMutableBufferPointer { fp in
-              vDSP_vsma(g.baseAddress!, 1, &scale, fp.baseAddress!, 1,
-                        fp.baseAddress!, 1, vDSP_Length(T))
+        let P = 256
+        let numPartitions = T / P
+        let floorSq = Float(span) * cfg.refRmsFloor * cfg.refRmsFloor
+        let globalDenom = Float(n) * max(refSq, floorSq)
+        let avgPartSq = refSq / Float(numPartitions)
+        xwin.withUnsafeBufferPointer { w in
+          eBgBuf.withUnsafeBufferPointer { e in
+            gBuf.withUnsafeMutableBufferPointer { g in
+              vDSP_conv(w.baseAddress!, 1, e.baseAddress!, 1, g.baseAddress!, 1,
+                        vDSP_Length(T), vDSP_Length(n))
+              fBg.withUnsafeMutableBufferPointer { fp in
+                for m in 0..<numPartitions {
+                  let partOffset = m * P
+                  var partSq: Float = 0
+                  vDSP_svesq(w.baseAddress! + partOffset, 1, &partSq, vDSP_Length(P))
+                  let localDenom = Float(n) * max(partSq * Float(numPartitions), avgPartSq * 0.25, floorSq / Float(numPartitions))
+                  var partScale = cfg.mu / (0.5 * globalDenom + 0.5 * localDenom)
+                  vDSP_vsma(g.baseAddress! + partOffset, 1, &partScale,
+                            fp.baseAddress! + partOffset, 1,
+                            fp.baseAddress! + partOffset, 1, vDSP_Length(P))
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // ── ONE BLOCK NLMS STEP, ON THE BACKGROUND ─────────────────────────────
+        //
+        // g[p] = sum_k xwin[p+k] * eBg[k], which is the same `vDSP_conv` with the
+        // roles swapped -- the gradient of a correlation is a correlation. The
+        // normaliser is `n * refEnergy`, so this block step is exactly the AVERAGE
+        // of the `n` per-sample NLMS steps it stands in for: stable for `mu < 2` at
+        // any block size, which is the property a per-block coefficient would not
+        // have had.
+        //
+        // `max(refSq, floor)` and not `refSq + 1e-6`. The epsilon in the old code
+        // was not a level, so a near-silent reference still produced an enormous
+        // step -- and that is the whole arithmetic of the -21.7 dB failure.
+        var scale = cfg.mu / (Float(n) * max(refSq, Float(span) * cfg.refRmsFloor * cfg.refRmsFloor))
+        if cfg.leakTau > 0 {
+          var keep = Float(exp(-dt / cfg.leakTau))
+          fBg.withUnsafeMutableBufferPointer { fp in
+            vDSP_vsmul(fp.baseAddress!, 1, &keep, fp.baseAddress!, 1, vDSP_Length(T))
+          }
+        }
+        xwin.withUnsafeBufferPointer { w in
+          eBgBuf.withUnsafeBufferPointer { e in
+            gBuf.withUnsafeMutableBufferPointer { g in
+              vDSP_conv(w.baseAddress!, 1, e.baseAddress!, 1, g.baseAddress!, 1,
+                        vDSP_Length(T), vDSP_Length(n))
+              fBg.withUnsafeMutableBufferPointer { fp in
+                vDSP_vsma(g.baseAddress!, 1, &scale, fp.baseAddress!, 1,
+                          fp.baseAddress!, 1, vDSP_Length(T))
+              }
             }
           }
         }

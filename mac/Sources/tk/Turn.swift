@@ -31,6 +31,8 @@ final class TurnClient {
     return "\(ip):\(p)"
   }
 
+  var hasChannel: Bool { boundPort != 0 }
+
   func isTurnServer(_ a: sockaddr_in) -> Bool {
     a.sin_addr.s_addr == turnAddr.sin_addr.s_addr && a.sin_port == turnAddr.sin_port
   }

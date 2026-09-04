@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.150.0"
+let VERSION = "0.151.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //

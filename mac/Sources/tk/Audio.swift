@@ -82,6 +82,11 @@ final class Audio {
   private var prevBuf: UnsafeMutablePointer<Float>
   private var prevCap: UInt64 = 0
   private var havePrev = false
+  static let CAP_HIST_COUNT = 32
+  private var capHistory: UnsafeMutablePointer<Float>
+  private var capHistoryCap: [UInt64] = Array(repeating: 0, count: 32)
+  private var capHistorySeq: [Int32] = Array(repeating: -1, count: 32)
+  private var fecParityScratch: UnsafeMutablePointer<Float>
   var redundancy = false
   private var inBufList: UnsafeMutablePointer<AudioBufferList>
   private var inScratch: UnsafeMutablePointer<Float>
@@ -3019,6 +3024,110 @@ final class Audio {
             "Recovered frame bit-exact with original PCM (\(FPP)/\(FPP) samples identical, zero PLC synthesis)")
     }
 
+    // 3.2 Multi-stride 4-packet burst loss recovery (Stride-4 FEC)
+    do {
+      let ring = RecvRing()
+      let f1 = (0..<FPP).map { Float($0) * 0.02 + 0.1 }
+      let f5 = [Float](repeating: 0.55, count: FPP)
+
+      let buf5 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf5.deallocate() }
+
+      // Packets 1, 2, 3, 4 dropped in network burst loss!
+      let p1LostBefore = !ring.present(1)
+
+      // Packet 5 arrives carrying stride-4 redundant copy of packet 1 (seq - 4)
+      let len5 = Wire.packAudio(seq: 5, cap: 5000, src: f5, n: FPP, dst: buf5,
+                                stride4: f1, stride4Cap: 1000)
+      _ = Wire.unpackAudio(plain: buf5, plainN: len5, into: ring)
+
+      let p5Present = ring.present(5)
+      let p1Recovered = ring.present(1) && ring.recovered == 1
+
+      var f1Exact = true
+      for k in 0..<FPP {
+        if let s = ring.sampleAt(Int64(1 * FPP + k)) {
+          if abs(s - f1[k]) > 1e-7 { f1Exact = false }
+        } else {
+          f1Exact = false
+        }
+      }
+      check(p1LostBefore && p5Present && p1Recovered && f1Exact,
+            "Multi-stride FEC: 4-packet burst loss recovered bit-exact from stride-4 chunk (recovered=\(ring.recovered))")
+    }
+
+    // 3.3 Block parity FEC recovery (XOR parity across 4 frames)
+    do {
+      let ring = RecvRing()
+      let f8 = (0..<FPP).map { Float($0) * 0.01 + 0.1 }
+      let f9 = (0..<FPP).map { Float($0) * 0.02 + 0.2 }
+      let f10 = (0..<FPP).map { Float($0) * 0.03 + 0.3 }
+      let f11 = (0..<FPP).map { Float($0) * 0.04 + 0.4 }
+
+      // Compute bitwise XOR parity across f8, f9, f10, f11
+      var par = [Float](repeating: 0, count: FPP)
+      for k in 0..<FPP {
+        let pBits = f8[k].bitPattern ^ f9[k].bitPattern ^ f10[k].bitPattern ^ f11[k].bitPattern
+        par[k] = Float(bitPattern: pBits)
+      }
+
+      let buf8 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf9 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf11 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf8.deallocate(); buf9.deallocate(); buf11.deallocate() }
+
+      // Packets 8 and 9 arrive
+      let len8 = Wire.packAudio(seq: 8, cap: 8000, src: f8, n: FPP, dst: buf8)
+      _ = Wire.unpackAudio(plain: buf8, plainN: len8, into: ring)
+      let len9 = Wire.packAudio(seq: 9, cap: 9000, src: f9, n: FPP, dst: buf9)
+      _ = Wire.unpackAudio(plain: buf9, plainN: len9, into: ring)
+
+      // Packet 10 is LOST!
+      let p10LostBefore = !ring.present(10)
+
+      // Packet 11 arrives carrying block parity FEC for baseSeq = 8, count = 4
+      let len11 = Wire.packAudio(seq: 11, cap: 11000, src: f11, n: FPP, dst: buf11,
+                                 fecParity: par, fecParityBaseSeq: 8,
+                                 fecParityCount: 4, fecParityCap: 8000)
+      _ = Wire.unpackAudio(plain: buf11, plainN: len11, into: ring)
+
+      let p10Recovered = ring.present(10) && ring.recovered >= 1
+      var f10Exact = true
+      for k in 0..<FPP {
+        if let s = ring.sampleAt(Int64(10 * FPP + k)) {
+          if s.bitPattern != f10[k].bitPattern { f10Exact = false }
+        } else {
+          f10Exact = false
+        }
+      }
+      check(p10LostBefore && p10Recovered && f10Exact,
+            "Block parity FEC: bit-exact reconstruction of dropped packet 10 from parity XOR chunk")
+    }
+
+    // 3.4 Dual-path packet racing deduplication (Direct P2P + Relay racing)
+    do {
+      let ring = RecvRing()
+      let f12 = [Float](repeating: 0.77, count: FPP)
+      let buf12a = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf12b = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf12a.deallocate(); buf12b.deallocate() }
+
+      let len12a = Wire.packAudio(seq: 12, cap: 12000, src: f12, n: FPP, dst: buf12a)
+      let len12b = Wire.packAudio(seq: 12, cap: 12000, src: f12, n: FPP, dst: buf12b)
+
+      // First path arrives (e.g. direct P2P)
+      _ = Wire.unpackAudio(plain: buf12a, plainN: len12a, into: ring)
+      let p12First = ring.present(12)
+      let dupsBefore = ring.dup
+
+      // Second path arrives later (e.g. relay)
+      _ = Wire.unpackAudio(plain: buf12b, plainN: len12b, into: ring)
+      let dupsAfter = ring.dup
+
+      check(p12First && dupsBefore == 0 && dupsAfter == 1,
+            "Dual-path packet racing: duplicate packet arriving on second path cleanly deduplicated (dup=\(ring.dup))")
+    }
+
     // ── PILLAR 4: JITTER BUFFER RATCHET PREVENTION & MONOTONIC DECAY ─────────
     print("-- Pillar 4: Jitter Buffer Ratchet Prevention & Monotonic Decay")
 
@@ -4399,11 +4508,15 @@ final class Audio {
     // Room for the primary payload AND a redundant copy with its own capture
     // stamp, so turning redundancy on never needs a reallocation on the audio
     // thread.
-    let scratchBytes = HDR + FPP * 4 + 8 + FPP * 4 + 64
+    let scratchBytes = 1500
     capScratch = .allocate(capacity: scratchBytes)
     capScratch.initialize(repeating: 0, count: scratchBytes)
     prevBuf = .allocate(capacity: FPP)
     prevBuf.initialize(repeating: 0, count: FPP)
+    capHistory = .allocate(capacity: Audio.CAP_HIST_COUNT * FPP)
+    capHistory.initialize(repeating: 0, count: Audio.CAP_HIST_COUNT * FPP)
+    fecParityScratch = .allocate(capacity: FPP)
+    fecParityScratch.initialize(repeating: 0, count: FPP)
     lastGood = .allocate(capacity: FPP)
     lastGood.initialize(repeating: 0, count: FPP)
     hist = .allocate(capacity: Audio.HIST)
@@ -4802,7 +4915,11 @@ final class Audio {
     // The rig's overrides for the canceller, applied before a sample moves.
     // Every production cadence gets a rig override (`compress-waits-in-test-rigs`);
     // these two are the ones `--aec-sweep` reads the defaults off.
-    if Audio.aecTaps > 0 { aec.cfg.taps = Audio.aecTaps }
+    if Audio.aecTaps > 0 {
+      aec.cfg.taps = Audio.aecTaps
+    } else if Audio.outputIsSpeakers {
+      aec.cfg.taps = 4096
+    }
     if Audio.aecMu > 0 { aec.cfg.mu = Audio.aecMu }
     aec.cfg.driftTrack = Audio.aecDrift
     aec.cfg.nlOn = Audio.aecNl
@@ -5344,6 +5461,7 @@ final class Audio {
     var rawBlockPeak: Float = 0
     for k in 0..<Int(n) { let a = abs(inScratch[k]); if a > rawBlockPeak { rawBlockPeak = a } }
     if Audio.aecOn, Audio.outputIsSpeakers, let mh = emitHist {
+      if Audio.aecTaps <= 0 && aec.cfg.taps < 4096 { aec.cfg.taps = 4096 }
       aec.process(inScratch, Int(n), ref: mh, refW: emitNow, refCap: Audio.ECHO_MAX)
       Audio.aecResidual = aec.residual
     }
@@ -5419,9 +5537,67 @@ final class Audio {
         // silence we chose. Reading an Int on the audio thread costs nothing and
         // allocates nothing, which is the only kind of check allowed here.
         if gMicMuted || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
+        let histSlot = Int(capSeq) % Audio.CAP_HIST_COUNT
+        memcpy(capHistory + histSlot * FPP, capBuf, FPP * 4)
+        capHistoryCap[histSlot] = cap
+        capHistorySeq[histSlot] = capSeq
+
+        var r1Ptr: UnsafePointer<Float>? = nil
+        var r1Cap: UInt64 = 0
+        var r4Ptr: UnsafePointer<Float>? = nil
+        var r4Cap: UInt64 = 0
+        var fecPtr: UnsafePointer<Float>? = nil
+        var fecBase: Int32 = 0
+        var fecCount: UInt8 = 0
+        var fecCap: UInt64 = 0
+
+        if redundancy {
+          if capSeq >= 1 {
+            let s1 = Int(capSeq - 1) % Audio.CAP_HIST_COUNT
+            if capHistorySeq[s1] == capSeq - 1 {
+              r1Ptr = UnsafePointer(capHistory + s1 * FPP)
+              r1Cap = capHistoryCap[s1]
+            }
+          }
+          if capSeq >= 4 {
+            let s4 = Int(capSeq - 4) % Audio.CAP_HIST_COUNT
+            if capHistorySeq[s4] == capSeq - 4 {
+              r4Ptr = UnsafePointer(capHistory + s4 * FPP)
+              r4Cap = capHistoryCap[s4]
+            }
+          }
+          let base = capSeq & ~3
+          if capSeq >= base + 3 {
+            var allHave = true
+            for offset in 0..<4 {
+              let s = Int(base + Int32(offset)) % Audio.CAP_HIST_COUNT
+              if capHistorySeq[s] != base + Int32(offset) {
+                allHave = false
+                break
+              }
+            }
+            if allHave {
+              for k in 0..<FPP {
+                var pBits: UInt32 = 0
+                for offset in 0..<4 {
+                  let s = Int(base + Int32(offset)) % Audio.CAP_HIST_COUNT
+                  pBits ^= (capHistory + s * FPP + k).pointee.bitPattern
+                }
+                fecParityScratch[k] = Float(bitPattern: pBits)
+              }
+              fecPtr = UnsafePointer(fecParityScratch)
+              fecBase = base
+              fecCount = 4
+              fecCap = capHistoryCap[Int(base) % Audio.CAP_HIST_COUNT]
+            }
+          }
+        }
+
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
-                   redundant: (redundancy && havePrev) ? prevBuf : nil,
-                   redundantCap: prevCap)
+                   redundant: r1Ptr, redundantCap: r1Cap,
+                   stride4: r4Ptr, stride4Cap: r4Cap,
+                   fecParity: fecPtr, fecParityBaseSeq: fecBase,
+                   fecParityCount: fecCount, fecParityCap: fecCap)
         memcpy(prevBuf, capBuf, FPP * 4)
         prevCap = cap
         havePrev = true

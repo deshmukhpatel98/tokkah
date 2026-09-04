@@ -283,6 +283,15 @@ final class RecvRing {
     seq >= 0 && tags[Int(seq) % RING] == seq
   }
 
+  /// Read samples for a given sequence number if present in the ring.
+  @discardableResult
+  func readSamples(seq: Int32, into dst: UnsafeMutablePointer<Float>) -> Bool {
+    guard present(seq) else { return false }
+    let slot = Int(seq) % RING
+    memcpy(dst, samples + slot * FPP, FPP * 4)
+    return true
+  }
+
   // Socket thread.
   func write(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int) {
     recv += 1
@@ -550,11 +559,20 @@ final class Wire {
   ///
   /// `redundantOf` is the sequence the extra copy belongs to. Sent only when the
   /// path has actually been losing packets, so a clean call pays nothing.
+  static let FEC_MAGIC: UInt16 = 0x5446 // 'TF'
+  static let FEC_TYPE_STRIDE: UInt16 = 0x0001
+  static let FEC_TYPE_PARITY: UInt16 = 0x0002
+
   /// Pack an audio packet into `dst`. Returns the total serialized byte count.
   /// If `redundant` is provided, serializes redundant block (capHost(8) + payload) directly behind primary block.
+  /// If `stride4` is provided, appends an interleaved stride-4 FEC extension chunk (recovering bursts up to 4+ frames).
+  /// If `fecParity` is provided, appends a block parity FEC extension chunk.
   static func packAudio(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int,
                         dst: UnsafeMutablePointer<UInt8>, pcm16: Bool = false, lp: Bool = false,
-                        redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) -> Int {
+                        redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0,
+                        stride4: UnsafePointer<Float>? = nil, stride4Cap: UInt64 = 0,
+                        fecParity: UnsafePointer<Float>? = nil, fecParityBaseSeq: Int32 = 0,
+                        fecParityCount: UInt8 = 0, fecParityCap: UInt64 = 0) -> Int {
     dst.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
     (dst + 4).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: seq).littleEndian }
     (dst + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = cap.littleEndian }
@@ -591,21 +609,56 @@ final class Wire {
     }
     var total = HDR + put(src, HDR)
     if let r = redundant {
-      (dst + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = redundantCap.littleEndian }
-      let before = total
+      var safeCap = redundantCap
+      if UInt16(truncatingIfNeeded: safeCap) == Wire.FEC_MAGIC { safeCap ^= 1 }
+      (dst + total).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = safeCap.littleEndian }
       total += 8 + put(r, total + 8)
+    }
+    if let s4 = stride4 {
+      let chunkStart = total
+      total += 6 // magic(2) + type(2) + len(2)
+      dst[total] = 4 // stride = 4
+      dst[total + 1] = 0 // pad
+      (dst + total + 2).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = stride4Cap.littleEndian }
+      let pLen = put(s4, total + 10)
+      let payloadBytes = 10 + pLen
+      total += payloadBytes
+      (dst + chunkStart).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_MAGIC.littleEndian }
+      (dst + chunkStart + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_TYPE_STRIDE.littleEndian }
+      (dst + chunkStart + 4).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(payloadBytes).littleEndian }
+    }
+    if let fp = fecParity, fecParityCount > 1 {
+      let chunkStart = total
+      total += 6 // magic(2) + type(2) + len(2)
+      (dst + total).withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = UInt32(bitPattern: fecParityBaseSeq).littleEndian }
+      dst[total + 4] = fecParityCount
+      dst[total + 5] = 0 // pad
+      (dst + total + 6).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
+      (dst + total + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = fecParityCap.littleEndian }
+      let pLen = put(fp, total + 16)
+      let payloadBytes = 16 + pLen
+      total += payloadBytes
+      (dst + chunkStart).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_MAGIC.littleEndian }
+      (dst + chunkStart + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_TYPE_PARITY.littleEndian }
+      (dst + chunkStart + 4).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(payloadBytes).littleEndian }
     }
     return total
   }
 
   func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>,
-            redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0) {
-    let beforeFec = genFec
+            redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0,
+            stride4: UnsafePointer<Float>? = nil, stride4Cap: UInt64 = 0,
+            fecParity: UnsafePointer<Float>? = nil, fecParityBaseSeq: Int32 = 0,
+            fecParityCount: UInt8 = 0, fecParityCap: UInt64 = 0) {
     let total = Wire.packAudio(seq: seq, cap: cap, src: src, n: n, dst: scratch,
                                pcm16: sendPcm16, lp: sendLp,
-                               redundant: redundant, redundantCap: redundantCap)
-    if redundant != nil {
-      genFec += total - (HDR + (sendPcm16 ? n * 2 : (sendLp ? 1 + Int(scratch[HDR]) : n * 4)))
+                               redundant: redundant, redundantCap: redundantCap,
+                               stride4: stride4, stride4Cap: stride4Cap,
+                               fecParity: fecParity, fecParityBaseSeq: fecParityBaseSeq,
+                               fecParityCount: fecParityCount, fecParityCap: fecParityCap)
+    let primaryLen = HDR + (sendPcm16 ? n * 2 : (sendLp ? 1 + Int(scratch[HDR]) : n * 4))
+    if total > primaryLen {
+      genFec += total - primaryLen
       redundantSent += 1
     }
     // Through rawSend, not sendto. This path used to call sendto directly, which
@@ -691,7 +744,7 @@ final class Wire {
             let d = im.delayTicks()
             if d > 0, let q = delayQ { q.push(out, m, due: Clock.now() + d); return }
           }
-          wireSend(out, m, allowTunnel: !direct)
+          wireSend(out, m, allowTunnel: !direct, cls: cls)
         }
       }
       if sentOK { return }
@@ -741,8 +794,34 @@ final class Wire {
   private(set) var cryptSendFails = 0
   private(set) var handshakeReplies = 0
   private(set) var redundantSent = 0
+  private(set) var dualPathAudioSent = 0
 
-  private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true) {
+  private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true, cls: TxCls = .ctl) {
+    let directValid = peer.sin_port != 0 && peer.sin_addr.s_addr != 0 && peer.sin_addr.s_addr != inet_addr("0.0.0.0")
+    let tunnelActive = allowTunnel && (cfTunnel?.isRouting == true)
+    let turnActive = (sendViaTurn || turn?.hasChannel == true) && turn != nil
+
+    if cls == .audio && directValid && (tunnelActive || turnActive) {
+      // ── DUAL-PATH PACKET RACING (Direct STUN/P2P + Anycast Relay / TURN) ──
+      // Concurrently transmit audio datagrams over both Direct P2P and Relay.
+      // The receiving ring buffer deduplicates by sequence number (`seq`).
+      // First packet to arrive wins. Collapses network jitter across routes.
+      if tunnelActive, let tunnel = cfTunnel {
+        _ = tunnel.send(p, n)
+      } else if turnActive, let t = turn {
+        _ = t.sendChannel(fd: fd, p, n)
+      }
+      let r = withUnsafePointer(to: &peer) { pp in
+        pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+      if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += n + 28 }
+      sent += 1; sentBytes += n + 28
+      dualPathAudioSent += 1
+      return
+    }
+
     if allowTunnel, let tunnel = cfTunnel, tunnel.isRouting {
       if tunnel.send(p, n) {
         sent += 1
@@ -1726,7 +1805,15 @@ final class Wire {
 
     let redOff = HDR + plen
     let rLen = lp ? (plainN > redOff + 8 ? 1 + Int(plain[redOff + 8]) : 0) : frames * bps
+    var extOff = redOff
+    var hasRedundant = false
     if rLen > 0, plainN >= redOff + 8 + rLen, seq > 0 {
+      let first2 = (plain + redOff).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) }
+      if first2 != Wire.FEC_MAGIC {
+        hasRedundant = true
+      }
+    }
+    if hasRedundant {
       let rCap = (plain + redOff).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
       let rSeq = seq - 1
       if !ring.present(rSeq) {
@@ -1744,6 +1831,88 @@ final class Wire {
         }
         if ring.present(rSeq) { ring.recovered += 1 }
       }
+      extOff = redOff + 8 + rLen
+    }
+
+    // ── MULTI-STRIDE INTERLEAVED REDUNDANCY & BLOCK PARITY FEC ──────────────
+    // Reconstruct consecutive packet burst drops (e.g. N-4 and block parity)
+    // with 0 ms retransmission delay.
+    while extOff + 6 <= plainN {
+      let cMagic = (plain + extOff).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) }
+      guard cMagic == Wire.FEC_MAGIC else { break }
+      let cType = (plain + extOff + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) }
+      let cLen = Int((plain + extOff + 4).withMemoryRebound(to: UInt16.self, capacity: 1) { UInt16(littleEndian: $0[0]) })
+      guard extOff + 6 + cLen <= plainN else { break }
+      let chunkBody = plain + extOff + 6
+
+      if cType == Wire.FEC_TYPE_STRIDE, cLen >= 10 {
+        let stride = Int(chunkBody[0])
+        let sSeq = seq - Int32(stride)
+        let sCap = (chunkBody + 2).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        let payloadPtr = chunkBody + 10
+        if sSeq >= 0, !ring.present(sSeq) {
+          if lp {
+            if expand(payloadPtr, frames) { ring.write(seq: sSeq, cap: sCap, src: localFbuf, n: frames) }
+          } else if bps == 2 {
+            payloadPtr.withMemoryRebound(to: Int16.self, capacity: frames) { p in
+              for i in 0..<frames { localFbuf[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
+            }
+            ring.write(seq: sSeq, cap: sCap, src: localFbuf, n: frames)
+          } else {
+            payloadPtr.withMemoryRebound(to: Float.self, capacity: frames) {
+              ring.write(seq: sSeq, cap: sCap, src: $0, n: frames)
+            }
+          }
+          if ring.present(sSeq) { ring.recovered += 1 }
+        }
+      } else if cType == Wire.FEC_TYPE_PARITY, cLen >= 16 {
+        let baseSeq = Int32(bitPattern: (chunkBody).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
+        let count = Int(chunkBody[4])
+        let pCap = (chunkBody + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
+        let payloadPtr = chunkBody + 16
+        if count > 1 {
+          var missingSeq: Int32 = -1
+          var missingCount = 0
+          for s in baseSeq..<(baseSeq + Int32(count)) {
+            if s >= 0 && !ring.present(s) {
+              missingSeq = s
+              missingCount += 1
+            }
+          }
+          if missingCount == 1, missingSeq >= 0 {
+            if lp {
+              _ = expand(payloadPtr, frames)
+            } else if bps == 2 {
+              payloadPtr.withMemoryRebound(to: Int16.self, capacity: frames) { p in
+                for i in 0..<frames { localFbuf[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
+              }
+            } else {
+              memcpy(localFbuf, payloadPtr, frames * 4)
+            }
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: frames) { tmp in
+              let tPtr = tmp.baseAddress!
+              var allFound = true
+              for s in baseSeq..<(baseSeq + Int32(count)) where s != missingSeq {
+                if ring.readSamples(seq: s, into: tPtr) {
+                  for k in 0..<frames {
+                    let pBits = localFbuf[k].bitPattern ^ tPtr[k].bitPattern
+                    localFbuf[k] = Float(bitPattern: pBits)
+                  }
+                } else {
+                  allFound = false
+                  break
+                }
+              }
+              if allFound {
+                let recCap = pCap + UInt64(max(0, missingSeq - baseSeq)) * Clock.ticks(ns: 666667)
+                ring.write(seq: missingSeq, cap: recCap, src: localFbuf, n: frames)
+                if ring.present(missingSeq) { ring.recovered += 1 }
+              }
+            }
+          }
+        }
+      }
+      extOff += 6 + cLen
     }
     return true
   }
