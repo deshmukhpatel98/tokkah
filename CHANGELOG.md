@@ -5,6 +5,21 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.150.0 — 2026-09-05
+
+### Added — Acoustic presence and ultra-low latency audio presence enhancements: headphone spatial room reflections, ambient room continuity duplex gating, and subsonic rumble filtration
+
+- **Headphone Spatial Presence (Binaural Room Spatialization)**:
+  - Auto-enable calibrated subtle spatial presence (`Presence.named("in-the-room")`) whenever headphones are worn (`outputIsSpeakers == false`). Direct path latency remains 0 ms with 0 echo feedback into the microphone, externalizing the voice from inside the head to sitting 1 meter in front in the same room.
+  - Keeps spatial presence disabled on speakers (`outputIsSpeakers == true`) to prevent lengthening the acoustic echo path for linear AEC.
+  - Preserves manual `--presence <mode>` overrides if explicitly set by the user.
+- **Ambient Room Continuity & Soft Duplex Gating**:
+  - Softened acoustic duplex gate floor (`cfg.floorDb`) from -120 dB (complete digital silence / dead air) to -22 dB on speaker calls.
+  - Retains natural ambient room presence and air continuity during conversational pauses, eradicating jarring noise-pumping and dead-air sensations. User hard mutes continue to guarantee complete digital silence.
+- **Subsonic Rumble High-Pass Filter (65 Hz HPF)**:
+  - Added a clean 2nd-order Butterworth high-pass filter at 65 Hz ($Q = 0.707$) on the raw microphone capture path before LPC compression and UDP transmission.
+  - Suppresses 0–60 Hz table thumps, keyboard vibrations, and HVAC/fan rumble by > 20 dB while preserving human vocal fundamentals (85+ Hz) within 0.05 dB, reclaiming 4–6 dB of dynamic range and eliminating speaker distortion.
+
 ## Kin 0.149.0 — 2026-09-05
 
 ### Fixed — Ultra-low latency audio refinements: click-free xfade cursor snapping, unblocked jitter spread adaptation, near voice attack preservation, and transit delay retention

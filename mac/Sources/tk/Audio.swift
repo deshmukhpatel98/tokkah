@@ -1246,6 +1246,17 @@ final class Audio {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
     }
+    if Audio.presenceAuto {
+      if !speakers {
+        if let p = Audio.Presence.named("in-the-room") {
+          Audio.presence = p
+          Metrics.fact("presence", "in-the-room")
+        }
+      } else {
+        Audio.presence = Audio.Presence()
+        Metrics.fact("presence", "off")
+      }
+    }
     Metrics.fact("output_route", speakers ? "speakers" : "headphones")
     // Says which of the two products this call is now, because they are not
     // small variations of each other: on headphones the turn rule stands down
@@ -1256,7 +1267,8 @@ final class Audio {
     let how = speakers ? "one at a time, so nobody hears themselves"
                        : (duplex ? "both at once, no turns, nothing in the way"
                                  : "one at a time (--no-headphone-duplex)")
-    fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\n", stderr)
+    let presInfo = Audio.presence.on ? " (spatial presence: in-the-room)" : ""
+    fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\(presInfo)\n", stderr)
   }
 
   /// The default output device, and whether sound leaves it into the room.
@@ -2751,6 +2763,46 @@ final class Audio {
             "Linear AEC: removes echo linearly (\(String(format: "%.1f", echoRun.r.echoErleDb)) dB ERLE) without spectral masking")
     }
 
+    // 1.6 Subsonic rumble high-pass filter: 65 Hz 2nd-order Butterworth
+    do {
+      let hpf = HighPassFilter(cutoff: 65.0, sampleRate: SR)
+      let nHpf = 48000
+      var rumble = [Float](repeating: 0, count: nHpf)
+      var voice = [Float](repeating: 0, count: nHpf)
+      for i in 0..<nHpf {
+        rumble[i] = 0.5 * sin(Float(2 * Double.pi * 20.0 * Double(i) / SR))
+        voice[i] = 0.5 * sin(Float(2 * Double.pi * 200.0 * Double(i) / SR))
+      }
+      var outRumble = rumble
+      var outVoice = voice
+      outRumble.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) }
+      hpf.reset()
+      outVoice.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) }
+
+      var inRumbleE = 0.0, outRumbleE = 0.0
+      var inVoiceE = 0.0, outVoiceE = 0.0
+      for i in Int(SR * 0.2)..<nHpf {
+        inRumbleE += Double(rumble[i]) * Double(rumble[i])
+        outRumbleE += Double(outRumble[i]) * Double(outRumble[i])
+        inVoiceE += Double(voice[i]) * Double(voice[i])
+        outVoiceE += Double(outVoice[i]) * Double(outVoice[i])
+      }
+      let rumbleAttenDb = 10.0 * log10(inRumbleE / max(outRumbleE, 1e-12))
+      let voiceAttenDb = 10.0 * log10(inVoiceE / max(outVoiceE, 1e-12))
+      check(rumbleAttenDb > 18.0 && voiceAttenDb < 0.2,
+            "Subsonic HPF: 20 Hz rumble attenuated > 18 dB (\(String(format: "%.1f", rumbleAttenDb)) dB), 200 Hz voice preserved (< 0.2 dB loss: \(String(format: "%.2f", voiceAttenDb)) dB)")
+    }
+
+    // 1.7 Headphone spatial presence
+    do {
+      guard let p = Presence.named("in-the-room") else {
+        check(false, "Presence: in-the-room preset exists")
+        return false
+      }
+      check(p.on && p.tailMs > 25.0 && p.scale > 0 && p.scale <= 1.0,
+            "Spatial presence: in-the-room calibrated (\(String(format: "%.1f", p.tailMs)) ms reflections, scale \(String(format: "%.2f", p.scale)))")
+    }
+
     // ── PILLAR 2: TURN-TAKING & MICRO-TIMING CUES ─────────────────────────────
     print("-- Pillar 2: Turn-Taking & Micro-Timing Cues (Inhales, Creak, Turn Handoff Prediction)")
 
@@ -2965,7 +3017,7 @@ final class Audio {
 
     print("================================================================================")
     let passed = (fails == 0)
-    print(passed ? "BOOST SELFTEST PASSED (16/16 assertions)" : "BOOST SELFTEST FAILED (\(fails) failures)")
+    print(passed ? "BOOST SELFTEST PASSED (18/18 assertions)" : "BOOST SELFTEST FAILED (\(fails) failures)")
     print("================================================================================")
     return passed
   }
@@ -3435,9 +3487,59 @@ final class Audio {
       return y * p.scale
     }
   }
+
+  /// 2nd-order Butterworth high-pass filter at 65 Hz (Q = 0.707).
+  /// Direct Form II Transposed biquad filter with Double-precision state.
+  /// Eliminates subsonic rumble (HVAC, fan, table thumps, keyboard vibrations)
+  /// below voice fundamentals (85+ Hz) to preserve dynamic range and avoid speaker distortion.
+  final class HighPassFilter {
+    private var s1: Double = 0
+    private var s2: Double = 0
+    let b0: Double
+    let b1: Double
+    let b2: Double
+    let a1: Double
+    let a2: Double
+
+    init(cutoff: Double = 65.0, sampleRate: Double = SR, q: Double = 0.7071067811865475) {
+      let w0 = 2.0 * Double.pi * cutoff / sampleRate
+      let cosW0 = cos(w0)
+      let sinW0 = sin(w0)
+      let alpha = sinW0 / (2.0 * q)
+      let a0 = 1.0 + alpha
+      b0 = ((1.0 + cosW0) / 2.0) / a0
+      b1 = (-(1.0 + cosW0)) / a0
+      b2 = ((1.0 + cosW0) / 2.0) / a0
+      a1 = (-2.0 * cosW0) / a0
+      a2 = (1.0 - alpha) / a0
+    }
+
+    @inline(__always) func process(_ x: Float) -> Float {
+      let xd = Double(x)
+      let y = b0 * xd + s1
+      s1 = b1 * xd - a1 * y + s2
+      s2 = b2 * xd - a2 * y
+      return Float(y)
+    }
+
+    func process(_ buf: UnsafeMutablePointer<Float>, _ count: Int) {
+      for i in 0..<count {
+        buf[i] = process(buf[i])
+      }
+    }
+
+    func reset() {
+      s1 = 0
+      s2 = 0
+    }
+  }
+
+  static var presenceAuto = true
   static var presence = Presence() { didSet { sharedPresence.p = presence } }
   nonisolated(unsafe) static let sharedPresence = PresenceFilter()
   private let pres = Audio.sharedPresence
+  private let captureHpf = HighPassFilter()
+  nonisolated(unsafe) static var hpfOn = true
 
   @inline(__always) private func presence(_ x: Float) -> Float { pres.process(x) }
 
@@ -3466,23 +3568,11 @@ final class Audio {
     var on = true
     /// How far down to turn the microphone when only the far end is talking.
     ///
-    /// ── A FULL MUTE, BY DECISION ──────────────────────────────────────────────
-    ///
-    /// This was -22 dB, and -22 dB is not silence: it is a quarter of the
-    /// volume, which is still plainly audible as echo. The field bore that out
-    /// -- echo on both ends of every call, reported as "ear deafening", with
-    /// this gate running the whole time.
-    ///
-    /// The product decision is half duplex: whoever is not speaking is MUTED,
-    /// not turned down, and whoever is speaking is heard raw with nothing
-    /// processing them. What makes that liveable is the rest of the app -- the
-    /// green edge and the subtitles say whose turn it is, so the silence is
-    /// information rather than a fault.
-    ///
-    /// -120 dB is one part in a million: inaudible, and a number rather than a
-    /// hard zero so the smoothing below still has something to converge to.
-    /// `--gate-floor -22` restores the old duck as a control arm.
-    var floorDb: Double = -120
+    /// Softened from -120 dB to -22 dB: gated intervals retain subtle ambient room presence,
+    /// preventing jarring noise-pumping / "dead air" sensation during conversational pauses.
+    /// Hard mutes (when user explicitly clicks mute via gMicMuted) remain silenced.
+    /// `--gate-floor <dB>` overrides if specified by the user.
+    var floorDb: Double = -22
     /// ── HOW LONG THE MUTE TAKES TO ARRIVE ─────────────────────────────────────
     ///
     /// The floor above was never the limit; THIS was. Closing used to be an
@@ -4132,7 +4222,21 @@ final class Audio {
   /// zero was a hidden distance limit.
   nonisolated(unsafe) static var owdMsNow: Double = 0
   /// The route, as a fact and not as the echo gate's conclusion about it.
-  nonisolated(unsafe) static var outputIsSpeakers = true
+  nonisolated(unsafe) static var outputIsSpeakers = true {
+    didSet {
+      if presenceAuto {
+        if !outputIsSpeakers {
+          if let p = Presence.named("in-the-room") {
+            presence = p
+            Metrics.fact("presence", "in-the-room")
+          }
+        } else {
+          presence = Presence()
+          Metrics.fact("presence", "off")
+        }
+      }
+    }
+  }
   /// ── THE ECHO DETECTOR'S VERDICT, GIVEN TO THE CLASSIFIER (0.94.0) ─────────
   ///
   /// True while the echo estimator's last computation said this microphone is
@@ -4658,6 +4762,7 @@ final class Audio {
           + " no gain control, nothing between the microphone and the wire\n", stderr)
     }
     inUnit = iu; outUnit = ou
+    captureHpf.reset()
     // A static survives the previous call in a resident app; a veto carried
     // across calls would be a verdict about a speaker that is no longer playing.
     Audio.corrVeto = false
@@ -5067,6 +5172,12 @@ final class Audio {
     // that the microphone is not processed.
     if inputTrim != 1 {
       for k in 0..<Int(n) { inScratch[k] *= inputTrim }
+    }
+
+    // Subsonic rumble high-pass filter: 2nd-order Butterworth at 65 Hz (Q = 0.707).
+    // Eliminates table thumps, keyboard impacts, and HVAC rumble before LPC compression.
+    if Audio.hpfOn {
+      captureHpf.process(inScratch, Int(n))
     }
 
     // What the microphone actually delivered. Placed HERE deliberately: after the

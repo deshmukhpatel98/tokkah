@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.149.0"
+let VERSION = "0.150.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -577,7 +577,7 @@ let KNOWN_FLAGS: Set<String> = [
   // The linear echo canceller (0.107.0) and its arms. `--no-aec` is the control
   // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
   // correlation alone.
-  "no-aec", "aec-test", "aec-sweep", "aec-taps", "aec-mu", "aec-media", "aec-block",
+  "no-aec", "no-hpf", "aec-test", "aec-sweep", "aec-taps", "aec-mu", "aec-media", "aec-block",
   "aec-trace", "no-aec-drift", "no-aec-nl", "aec-nl",
   "no-overload-guard",
   "turn-test", "turn-owd", "turn-coupling", "turn-wav", "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
@@ -4831,6 +4831,8 @@ func applyGateFlags() {
   // reaches the wire exactly as captured and the echo veto runs on the 500 ms
   // correlation alone, which is 0.106.0.
   if flag("no-aec") { Audio.aecOn = false }
+  // The control arm for the 65 Hz Butterworth subsonic rumble filter (0.150.0).
+  if flag("no-hpf") { Audio.hpfOn = false }
   // The control arm for the drift tracker (0.109.0): the filter is aimed at a
   // fixed integer delay again, which is 0.108.0.
   if flag("no-aec-drift") { Audio.aecDrift = false }
@@ -5275,6 +5277,7 @@ if flag("gate-test") {
 // and no test reads `Audio.sharedGate`.
 let audio = Audio()
 audio.wire = wire
+audio.checkOutputRoute()
 
 if let m = arg("presence") {
   guard let p = Audio.Presence.named(m) else {
@@ -5282,6 +5285,7 @@ if let m = arg("presence") {
         + " across-the-table or warmer, not \(m)\n", stderr)
     exit(2)
   }
+  Audio.presenceAuto = false
   Audio.presence = p
   Metrics.fact("presence", m)
   // A ROOM LENGTHENS THE ECHO PATH. The reflections this adds are played by the
