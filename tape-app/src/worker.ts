@@ -138,8 +138,52 @@ function sanitize(value: unknown, depth = 0): unknown {
     if (entries.length > MAX_KEYS_PER_OBJECT) out._truncKeys = entries.length - MAX_KEYS_PER_OBJECT;
     return out;
   }
-  return null; // functions, symbols, undefined
+  return null;
 }
+
+const VPN_ORGS = [
+  'vpn', 'proton', 'mullvad', 'nord', 'datacamp', 'm247', 'ovh', 'digitalocean',
+  'linode', 'hetzner', 'leaseweb', 'choopa', 'constant company', 'warp',
+  'expressvpn', 'surfshark', 'cyberghost', 'private internet access', 'ipvanish', 'windscribe',
+];
+
+function isVpnOrg(asOrg: string | null | undefined): boolean {
+  if (!asOrg) return false;
+  const s = asOrg.toLowerCase();
+  return VPN_ORGS.some((term) => s.includes(term));
+}
+
+const COLO_LOCATIONS: Record<string, { country: string; countryCode: string; city: string }> = {
+  // South America (sam)
+  GRU: { country: 'Brazil', countryCode: 'BR', city: 'São Paulo' },
+  GIG: { country: 'Brazil', countryCode: 'BR', city: 'Rio de Janeiro' },
+  SCL: { country: 'Chile', countryCode: 'CL', city: 'Santiago' },
+  EZE: { country: 'Argentina', countryCode: 'AR', city: 'Buenos Aires' },
+  BOG: { country: 'Colombia', countryCode: 'CO', city: 'Bogotá' },
+  LIM: { country: 'Peru', countryCode: 'PE', city: 'Lima' },
+  // Europe
+  AMS: { country: 'Netherlands', countryCode: 'NL', city: 'Amsterdam' },
+  FRA: { country: 'Germany', countryCode: 'DE', city: 'Frankfurt' },
+  LHR: { country: 'United Kingdom', countryCode: 'GB', city: 'London' },
+  OSL: { country: 'Norway', countryCode: 'NO', city: 'Oslo' },
+  // North America
+  IAD: { country: 'United States', countryCode: 'US', city: 'Washington D.C.' },
+  SFO: { country: 'United States', countryCode: 'US', city: 'San Francisco' },
+  ORD: { country: 'United States', countryCode: 'US', city: 'Chicago' },
+  // Asia
+  DEL: { country: 'India', countryCode: 'IN', city: 'New Delhi' },
+  BOM: { country: 'India', countryCode: 'IN', city: 'Mumbai' },
+  SIN: { country: 'Singapore', countryCode: 'SG', city: 'Singapore' },
+  NRT: { country: 'Japan', countryCode: 'JP', city: 'Tokyo' },
+};
+
+const COUNTRY_NAMES: Record<string, string> = {
+  BR: 'Brazil', CL: 'Chile', AR: 'Argentina', CO: 'Colombia', PE: 'Peru',
+  US: 'United States', CA: 'Canada', GB: 'United Kingdom', DE: 'Germany',
+  NL: 'Netherlands', NO: 'Norway', FR: 'France', ES: 'Spain', IT: 'Italy',
+  SE: 'Sweden', CH: 'Switzerland', IN: 'India', JP: 'Japan', SG: 'Singapore',
+  AU: 'Australia', NZ: 'New Zealand', ZA: 'South Africa', AE: 'United Arab Emirates',
+};
 
 export class Room implements DurableObject {
   private peers = new Map<WebSocket, string>();
@@ -243,7 +287,7 @@ export class Room implements DurableObject {
     if (url.pathname.endsWith('/warm')) return this.warm();
     if (url.pathname.endsWith('/xlate')) return this.xlate(request);
     if (url.pathname.endsWith('/lab') && request.method === 'POST') return this.lab(request);
-    if (url.pathname.endsWith('/rv')) return this.rendezvous(url);
+    if (url.pathname.endsWith('/rv')) return this.rendezvous(request, url);
     if (url.pathname.endsWith('/cf-relay') || url.pathname.endsWith('/xcont-tunnel')) return this.cfRelay(request, url);
     // ── The doorbell. THESE MUST RETURN BEFORE signal() BELOW. ───────────────
     // signal() answers 426 "expected websocket" to anything without an upgrade
@@ -619,9 +663,18 @@ export class Room implements DurableObject {
    * handing out mappings that expired hours ago — worse than handing out nothing,
    * because the caller would spend its whole punch budget on a dead address.
    */
-  private rvPeers = new Map<string, { addr: string; local?: string; relay?: string; at: number }>();
+  private rvPeers = new Map<string, {
+    addr: string;
+    local?: string;
+    relay?: string;
+    country?: string;
+    city?: string;
+    asOrg?: string;
+    isVpn?: boolean;
+    at: number;
+  }>();
 
-  private rendezvous(url: URL): Response {
+  private rendezvous(request: Request, url: URL): Response {
     const me = url.searchParams.get('me') ?? '';
     const addr = url.searchParams.get('addr') ?? '';
     const now = Date.now();
@@ -632,6 +685,12 @@ export class Room implements DurableObject {
     const local = url.searchParams.get('local') ?? '';
     const relay = url.searchParams.get('relay') ?? '';
     const addrOk = (a: string) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(a);
+
+    const country = (request.cf?.country as string | undefined) ?? null;
+    const city = (request.cf?.city as string | undefined) ?? null;
+    const asOrg = (request.cf?.asOrganization as string | undefined) ?? null;
+    const isVpn = isVpnOrg(asOrg) || !!(request.cf as Record<string, unknown> | undefined)?.isWarp;
+
     if (addr) {
       if (!addrOk(addr)) return json({ error: 'bad addr' }, 400);
       if (local && !addrOk(local)) return json({ error: 'bad local' }, 400);
@@ -642,15 +701,33 @@ export class Room implements DurableObject {
       // client compares public IPs and picks; this only carries both.
       // `relay` is this machine's TURN-allocated address — the short path on a
       // long call, raced against STUN and LAN by measured RTT.
-      this.rvPeers.set(me, { addr, local: local || undefined, relay: relay || undefined, at: now });
+      this.rvPeers.set(me, {
+        addr,
+        local: local || undefined,
+        relay: relay || undefined,
+        country: country || undefined,
+        city: city || undefined,
+        asOrg: asOrg || undefined,
+        isVpn: isVpn || undefined,
+        at: now,
+      });
     }
     const others = [...this.rvPeers.entries()]
       .filter(([k]) => k !== me)
-      .map(([k, v]) => ({ id: k, addr: v.addr, local: v.local, relay: v.relay, ageMs: now - v.at }));
-    return json({ me, peers: others });
+      .map(([k, v]) => ({
+        id: k,
+        addr: v.addr,
+        local: v.local,
+        relay: v.relay,
+        country: v.country || null,
+        city: v.city || null,
+        isVpn: !!v.isVpn,
+        ageMs: now - v.at,
+      }));
+    return json({ me, country, city, isVpn, peers: others });
   }
 
-  // ── THE FAR-AWAY RELAY (the Mac app's "far-away test") ───────────────────
+  // ── THE INTEGRATED VPN / FAR-AWAY RELAY ──────────────────────────────────
   //
   // Objects whose room code starts with `xcont-` are created with
   // `locationHint: 'sam'` (South America -- the far side of the planet from
@@ -663,28 +740,110 @@ export class Room implements DurableObject {
   // Binary frames are media and are fanned out to every OTHER socket. Text
   // frames are control: `xcont-ping` is answered with `xcont-pong` carrying the
   // same stamp, so the client can measure the relay's own round trip and SAY
-  // where the object actually landed -- a hint is best-effort, and a "far-away"
-  // test whose relay sits in Mumbai must be able to notice.
+  // where the object actually landed -- reporting the exact country (e.g. Brazil,
+  // Chile) rather than only a continent.
   private cfRelaySockets = new Set<WebSocket>();
+  private cfSocketMeta = new Map<WebSocket, {
+    country: string | null;
+    city: string | null;
+    colo: string | null;
+    asOrg: string | null;
+    isVpn: boolean;
+  }>();
+  private cfRelayLocation: { country: string; countryCode: string; city: string; colo: string } = {
+    country: 'Brazil',
+    countryCode: 'BR',
+    city: 'São Paulo',
+    colo: 'GRU',
+  };
+  private cfRelayLocationResolved = false;
+
+  private resolveRelayLocation() {
+    if (this.cfRelayLocationResolved) return;
+    this.cfRelayLocationResolved = true;
+    fetch('https://1.1.1.1/cdn-cgi/trace')
+      .then((r) => r.text())
+      .then((text) => {
+        const locMatch = text.match(/^loc=(.+)$/m);
+        const coloMatch = text.match(/^colo=(.+)$/m);
+        const loc = locMatch ? locMatch[1].trim() : null;
+        const colo = coloMatch ? coloMatch[1].trim() : null;
+        if (colo && COLO_LOCATIONS[colo]) {
+          this.cfRelayLocation = { ...COLO_LOCATIONS[colo], colo };
+        } else if (loc) {
+          const name = COUNTRY_NAMES[loc] || loc;
+          this.cfRelayLocation = { country: name, countryCode: loc, city: colo || '', colo: colo || '' };
+        }
+      })
+      .catch(() => { /* keep default */ });
+  }
 
   private cfRelay(request: Request, url: URL): Response {
+    this.resolveRelayLocation();
     const ingress = (request.cf?.colo as string | undefined) ?? null;
+    const country = (request.cf?.country as string | undefined) ?? null;
+    const city = (request.cf?.city as string | undefined) ?? null;
+    const asOrg = (request.cf?.asOrganization as string | undefined) ?? null;
+    const isVpn = isVpnOrg(asOrg) || !!(request.cf as Record<string, unknown> | undefined)?.isWarp;
+
     if (request.headers.get('upgrade') !== 'websocket') {
-      return json({ ok: true, relay: 'far-test', hint: 'sam', ingress, peers: this.cfRelaySockets.size });
+      return json({
+        ok: true,
+        relay: 'far-test',
+        vpn: true,
+        hint: 'sam',
+        ingress,
+        country,
+        city,
+        relayCountry: this.cfRelayLocation.country,
+        relayCountryCode: this.cfRelayLocation.countryCode,
+        relayCity: this.cfRelayLocation.city,
+        peers: this.cfRelaySockets.size,
+      });
     }
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     server.accept();
     this.cfRelaySockets.add(server);
+    this.cfSocketMeta.set(server, { country, city, colo: ingress, asOrg, isVpn: true });
 
     try {
-      server.send(JSON.stringify({ type: 'xcont-welcome', hint: 'sam', ingress, peers: this.cfRelaySockets.size }));
+      server.send(JSON.stringify({
+        type: 'xcont-welcome',
+        hint: 'sam',
+        ingress,
+        peers: this.cfRelaySockets.size,
+        country,
+        city,
+        relayCountry: this.cfRelayLocation.country,
+        relayCountryCode: this.cfRelayLocation.countryCode,
+        relayCity: this.cfRelayLocation.city,
+        relayColo: this.cfRelayLocation.colo,
+      }));
     } catch { /* ignore */ }
-    // Everybody learns the head count on every join and leave: a Mac routes its
+    // Everybody learns the head count and peers on every join and leave: a Mac routes its
     // media here only once BOTH are on, so the count is what starts the test.
     const headcount = () => {
-      const msg = JSON.stringify({ type: 'xcont-peers', peers: this.cfRelaySockets.size });
-      for (const s of this.cfRelaySockets) { try { s.send(msg); } catch { /* closing */ } }
+      for (const s of this.cfRelaySockets) {
+        const otherMetas = [...this.cfRelaySockets]
+          .filter((other) => other !== s)
+          .map((other) => this.cfSocketMeta.get(other))
+          .filter(Boolean);
+        const peerMeta = otherMetas[0] || null;
+        const msg = JSON.stringify({
+          type: 'xcont-peers',
+          peers: this.cfRelaySockets.size,
+          relayCountry: this.cfRelayLocation.country,
+          relayCountryCode: this.cfRelayLocation.countryCode,
+          relayCity: this.cfRelayLocation.city,
+          relayColo: this.cfRelayLocation.colo,
+          peerCountry: peerMeta?.country ?? null,
+          peerCity: peerMeta?.city ?? null,
+          peerColo: peerMeta?.colo ?? null,
+          peerIsVpn: true,
+        });
+        try { s.send(msg); } catch { /* closing */ }
+      }
     };
     headcount();
 
@@ -707,7 +866,15 @@ export class Room implements DurableObject {
         try {
           const m = JSON.parse(d) as { type?: string; t?: number };
           if (m && m.type === 'xcont-ping') {
-            server.send(JSON.stringify({ type: 'xcont-pong', t: m.t, peers: this.cfRelaySockets.size }));
+            server.send(JSON.stringify({
+              type: 'xcont-pong',
+              t: m.t,
+              peers: this.cfRelaySockets.size,
+              relayCountry: this.cfRelayLocation.country,
+              relayCountryCode: this.cfRelayLocation.countryCode,
+              relayCity: this.cfRelayLocation.city,
+              relayColo: this.cfRelayLocation.colo,
+            }));
           }
         } catch { /* not ours */ }
         return;
@@ -724,6 +891,7 @@ export class Room implements DurableObject {
     });
 
     const teardown = () => {
+      this.cfSocketMeta.delete(server);
       if (this.cfRelaySockets.delete(server)) headcount();
     };
     server.addEventListener('close', teardown);
