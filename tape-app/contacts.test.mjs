@@ -2484,7 +2484,9 @@ const DEV2 = await device('dev2');
       eq(mine?.calls, 1, '(k5) and calls counted separately');
 
       // ── (k6) the far-away relay answers, and says where it is meant to be ──
-      const cfRes = await mf.dispatchFetch('http://x/api/room/xcont-testroom/cf-relay');
+      const cfRes = await mf.dispatchFetch('http://x/api/room/xcont-testroom/cf-relay', {
+        headers: { 'cf-connecting-ip': '103.16.29.84' }
+      });
       eq(cfRes.status, 200, '(k6) cf-relay HTTP probe answers 200');
       const cfJson = await cfRes.json();
       eq(cfJson.ok, true, '(k6) cf-relay ok');

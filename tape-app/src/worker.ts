@@ -787,11 +787,25 @@ export class Room implements DurableObject {
       .then((text) => {
         const locMatch = text.match(/^loc=(.+)$/m);
         const coloMatch = text.match(/^colo=(.+)$/m);
-        const loc = locMatch ? locMatch[1].trim() : null;
-        const colo = coloMatch ? coloMatch[1].trim() : null;
-        if (colo && COLO_LOCATIONS[colo]) {
-          this.cfRelayLocation = { ...COLO_LOCATIONS[colo], colo };
-        } else if (loc) {
+        const loc = locMatch ? locMatch[1].trim().toUpperCase() : null;
+        const colo = coloMatch ? coloMatch[1].trim().toUpperCase() : null;
+        // The relay object is created with South America placement hint (locationHint: 'sam').
+        // Cloudflare's subrequest fetch('1.1.1.1/cdn-cgi/trace') routes via anycast and may
+        // reflect the client's nearest edge ingress (e.g. DEL in India), NOT the DO's location.
+        // Only accept a resolved location if it actually belongs to South America; never overwrite
+        // the South America relay with the caller's ingress country.
+        const SAM_COLOS: Record<string, { country: string; countryCode: string; city: string }> = {
+          GRU: { country: 'Brazil', countryCode: 'BR', city: 'São Paulo' },
+          GIG: { country: 'Brazil', countryCode: 'BR', city: 'Rio de Janeiro' },
+          SCL: { country: 'Chile', countryCode: 'CL', city: 'Santiago' },
+          EZE: { country: 'Argentina', countryCode: 'AR', city: 'Buenos Aires' },
+          BOG: { country: 'Colombia', countryCode: 'CO', city: 'Bogotá' },
+          LIM: { country: 'Peru', countryCode: 'PE', city: 'Lima' },
+        };
+        const SAM_COUNTRIES = new Set(['BR', 'CL', 'AR', 'CO', 'PE']);
+        if (colo && SAM_COLOS[colo]) {
+          this.cfRelayLocation = { ...SAM_COLOS[colo], colo };
+        } else if (loc && SAM_COUNTRIES.has(loc)) {
           const name = COUNTRY_NAMES[loc] || loc;
           this.cfRelayLocation = { country: name, countryCode: loc, city: colo || '', colo: colo || '' };
         }
