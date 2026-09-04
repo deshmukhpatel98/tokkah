@@ -5,6 +5,20 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.152.0 — 2026-09-05
+
+### Fixed & Enhanced — Burst-proof stride-8 interleaved redundancy, PCM16 parity FEC bit-exact recovery, and dual-path racing accounting
+
+- **Multi-Stride Stride-8 Interleaved Redundancy**:
+  - Added stride-8 (N-8) interleaved redundancy chunk framing alongside N-1 and N-4, expanding zero-delay burst dropout recovery to 8 consecutive dropped packets (5.3 ms) and interleaved bursts up to 16 packets.
+  - Reconstructed frames are bit-for-bit identical with original PCM, bypassing PLC synthesis.
+- **Bit-Exact Parity FEC under PCM16**:
+  - Fixed parity FEC framing bug where parity bits were erroneously passed through soft-limiting and LPC compression. Raw 32-bit parity bits are now transferred directly without lossy transform.
+  - Aligned sender capture history with receiver PCM16 decoded representation so parity XOR reconstruction operates on identical bit patterns under both linear Float32 and negotiated PCM16.
+  - Parity blocks are persisted across consecutive packets so loss of the block-end datagram does not forfeit parity recovery.
+- **Dual-Path Packet Racing Accounting**:
+  - Corrected transmission metric counters (`sent`, `sentBytes`, `sendErrs`) for concurrent direct P2P and relay routes, ensuring `allowTunnel` gates all relay transmission modes.
+
 ## Kin 0.151.0 — 2026-09-05
 
 ### Added — Burst-proof interleaved stride FEC, extended double-talk AEC on speakers, and dual-path packet racing

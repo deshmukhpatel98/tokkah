@@ -571,6 +571,7 @@ final class Wire {
                         dst: UnsafeMutablePointer<UInt8>, pcm16: Bool = false, lp: Bool = false,
                         redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0,
                         stride4: UnsafePointer<Float>? = nil, stride4Cap: UInt64 = 0,
+                        stride8: UnsafePointer<Float>? = nil, stride8Cap: UInt64 = 0,
                         fecParity: UnsafePointer<Float>? = nil, fecParityBaseSeq: Int32 = 0,
                         fecParityCount: UInt8 = 0, fecParityCap: UInt64 = 0) -> Int {
     dst.withMemoryRebound(to: UInt32.self, capacity: 1) { $0[0] = MAGIC.littleEndian }
@@ -627,6 +628,19 @@ final class Wire {
       (dst + chunkStart + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_TYPE_STRIDE.littleEndian }
       (dst + chunkStart + 4).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(payloadBytes).littleEndian }
     }
+    if let s8 = stride8 {
+      let chunkStart = total
+      total += 6 // magic(2) + type(2) + len(2)
+      dst[total] = 8 // stride = 8
+      dst[total + 1] = 0 // pad
+      (dst + total + 2).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = stride8Cap.littleEndian }
+      let pLen = put(s8, total + 10)
+      let payloadBytes = 10 + pLen
+      total += payloadBytes
+      (dst + chunkStart).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_MAGIC.littleEndian }
+      (dst + chunkStart + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_TYPE_STRIDE.littleEndian }
+      (dst + chunkStart + 4).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = UInt16(payloadBytes).littleEndian }
+    }
     if let fp = fecParity, fecParityCount > 1 {
       let chunkStart = total
       total += 6 // magic(2) + type(2) + len(2)
@@ -635,8 +649,8 @@ final class Wire {
       dst[total + 5] = 0 // pad
       (dst + total + 6).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = 0 }
       (dst + total + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { $0[0] = fecParityCap.littleEndian }
-      let pLen = put(fp, total + 16)
-      let payloadBytes = 16 + pLen
+      memcpy(dst + total + 16, fp, n * 4)
+      let payloadBytes = 16 + n * 4
       total += payloadBytes
       (dst + chunkStart).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_MAGIC.littleEndian }
       (dst + chunkStart + 2).withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] = FEC_TYPE_PARITY.littleEndian }
@@ -648,12 +662,14 @@ final class Wire {
   func send(seq: Int32, cap: UInt64, src: UnsafePointer<Float>, n: Int, scratch: UnsafeMutablePointer<UInt8>,
             redundant: UnsafePointer<Float>? = nil, redundantCap: UInt64 = 0,
             stride4: UnsafePointer<Float>? = nil, stride4Cap: UInt64 = 0,
+            stride8: UnsafePointer<Float>? = nil, stride8Cap: UInt64 = 0,
             fecParity: UnsafePointer<Float>? = nil, fecParityBaseSeq: Int32 = 0,
             fecParityCount: UInt8 = 0, fecParityCap: UInt64 = 0) {
     let total = Wire.packAudio(seq: seq, cap: cap, src: src, n: n, dst: scratch,
                                pcm16: sendPcm16, lp: sendLp,
                                redundant: redundant, redundantCap: redundantCap,
                                stride4: stride4, stride4Cap: stride4Cap,
+                               stride8: stride8, stride8Cap: stride8Cap,
                                fecParity: fecParity, fecParityBaseSeq: fecParityBaseSeq,
                                fecParityCount: fecParityCount, fecParityCap: fecParityCap)
     let primaryLen = HDR + (sendPcm16 ? n * 2 : (sendLp ? 1 + Int(scratch[HDR]) : n * 4))
@@ -799,7 +815,7 @@ final class Wire {
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true, cls: TxCls = .ctl) {
     let directValid = peer.sin_port != 0 && peer.sin_addr.s_addr != 0 && peer.sin_addr.s_addr != inet_addr("0.0.0.0")
     let tunnelActive = allowTunnel && (cfTunnel?.isRouting == true)
-    let turnActive = (sendViaTurn || turn?.hasChannel == true) && turn != nil
+    let turnActive = allowTunnel && (sendViaTurn || turn?.hasChannel == true) && turn != nil
 
     if cls == .audio && directValid && (tunnelActive || turnActive) {
       // ── DUAL-PATH PACKET RACING (Direct STUN/P2P + Anycast Relay / TURN) ──
@@ -807,9 +823,19 @@ final class Wire {
       // The receiving ring buffer deduplicates by sequence number (`seq`).
       // First packet to arrive wins. Collapses network jitter across routes.
       if tunnelActive, let tunnel = cfTunnel {
-        _ = tunnel.send(p, n)
+        if tunnel.send(p, n) {
+          sent += 1
+          sentBytes += n + 28
+        } else {
+          sendErrs += 1
+        }
       } else if turnActive, let t = turn {
-        _ = t.sendChannel(fd: fd, p, n)
+        if t.sendChannel(fd: fd, p, n) {
+          sent += 1
+          sentBytes += n + 28 + 4
+        } else {
+          sendErrs += 1
+        }
       }
       let r = withUnsafePointer(to: &peer) { pp in
         pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -817,7 +843,6 @@ final class Wire {
         }
       }
       if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += n + 28 }
-      sent += 1; sentBytes += n + 28
       dualPathAudioSent += 1
       return
     }
@@ -1865,7 +1890,7 @@ final class Wire {
           }
           if ring.present(sSeq) { ring.recovered += 1 }
         }
-      } else if cType == Wire.FEC_TYPE_PARITY, cLen >= 16 {
+      } else if cType == Wire.FEC_TYPE_PARITY, cLen >= 16 + frames * 4 {
         let baseSeq = Int32(bitPattern: (chunkBody).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) })
         let count = Int(chunkBody[4])
         let pCap = (chunkBody + 8).withMemoryRebound(to: UInt64.self, capacity: 1) { UInt64(littleEndian: $0[0]) }
@@ -1880,15 +1905,7 @@ final class Wire {
             }
           }
           if missingCount == 1, missingSeq >= 0 {
-            if lp {
-              _ = expand(payloadPtr, frames)
-            } else if bps == 2 {
-              payloadPtr.withMemoryRebound(to: Int16.self, capacity: frames) { p in
-                for i in 0..<frames { localFbuf[i] = Float(Int16(littleEndian: p[i])) / 32767.0 }
-              }
-            } else {
-              memcpy(localFbuf, payloadPtr, frames * 4)
-            }
+            memcpy(localFbuf, payloadPtr, frames * 4)
             withUnsafeTemporaryAllocation(of: Float.self, capacity: frames) { tmp in
               let tPtr = tmp.baseAddress!
               var allFound = true

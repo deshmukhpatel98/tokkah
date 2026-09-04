@@ -3056,7 +3056,39 @@ final class Audio {
             "Multi-stride FEC: 4-packet burst loss recovered bit-exact from stride-4 chunk (recovered=\(ring.recovered))")
     }
 
-    // 3.3 Block parity FEC recovery (XOR parity across 4 frames)
+    // 3.3 Multi-stride 8-packet burst loss recovery (Stride-8 FEC)
+    do {
+      let ring = RecvRing()
+      let f1 = (0..<FPP).map { Float($0) * 0.015 + 0.15 }
+      let f9 = [Float](repeating: 0.99, count: FPP)
+
+      let buf9 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf9.deallocate() }
+
+      // Packets 1 through 8 dropped in network burst loss!
+      let p1LostBefore = !ring.present(1)
+
+      // Packet 9 arrives carrying stride-8 redundant copy of packet 1 (seq - 8)
+      let len9 = Wire.packAudio(seq: 9, cap: 9000, src: f9, n: FPP, dst: buf9,
+                                stride8: f1, stride8Cap: 1000)
+      _ = Wire.unpackAudio(plain: buf9, plainN: len9, into: ring)
+
+      let p9Present = ring.present(9)
+      let p1Recovered = ring.present(1) && ring.recovered == 1
+
+      var f1Exact = true
+      for k in 0..<FPP {
+        if let s = ring.sampleAt(Int64(1 * FPP + k)) {
+          if abs(s - f1[k]) > 1e-7 { f1Exact = false }
+        } else {
+          f1Exact = false
+        }
+      }
+      check(p1LostBefore && p9Present && p1Recovered && f1Exact,
+            "Multi-stride FEC: 8-packet burst loss recovered bit-exact from stride-8 chunk (recovered=\(ring.recovered))")
+    }
+
+    // 3.4 Block parity FEC recovery (XOR parity across 4 frames)
     do {
       let ring = RecvRing()
       let f8 = (0..<FPP).map { Float($0) * 0.01 + 0.1 }
@@ -3104,7 +3136,69 @@ final class Audio {
             "Block parity FEC: bit-exact reconstruction of dropped packet 10 from parity XOR chunk")
     }
 
-    // 3.4 Dual-path packet racing deduplication (Direct P2P + Relay racing)
+    // 3.5 Block parity FEC recovery under PCM16
+    do {
+      let ring = RecvRing()
+      let rawF0 = (0..<FPP).map { Float($0) * 0.01 + 0.1 }
+      let rawF1 = (0..<FPP).map { Float($0) * 0.02 + 0.2 }
+      let rawF2 = (0..<FPP).map { Float($0) * 0.03 + 0.3 }
+      let rawF3 = (0..<FPP).map { Float($0) * 0.04 + 0.4 }
+
+      // In PCM16, sender's capHistory stores the quantized floats matching receiver ring
+      var f0 = [Float](repeating: 0, count: FPP)
+      var f1 = [Float](repeating: 0, count: FPP)
+      var f2 = [Float](repeating: 0, count: FPP)
+      var f3 = [Float](repeating: 0, count: FPP)
+      for k in 0..<FPP {
+        let q0 = Int16(max(-32767.0, min(32767.0, Wire.softLimit(rawF0[k]) * 32767.0)).rounded())
+        let q1 = Int16(max(-32767.0, min(32767.0, Wire.softLimit(rawF1[k]) * 32767.0)).rounded())
+        let q2 = Int16(max(-32767.0, min(32767.0, Wire.softLimit(rawF2[k]) * 32767.0)).rounded())
+        let q3 = Int16(max(-32767.0, min(32767.0, Wire.softLimit(rawF3[k]) * 32767.0)).rounded())
+        f0[k] = Float(q0) / 32767.0
+        f1[k] = Float(q1) / 32767.0
+        f2[k] = Float(q2) / 32767.0
+        f3[k] = Float(q3) / 32767.0
+      }
+
+      var par16 = [Float](repeating: 0, count: FPP)
+      for k in 0..<FPP {
+        let pBits = f0[k].bitPattern ^ f1[k].bitPattern ^ f2[k].bitPattern ^ f3[k].bitPattern
+        par16[k] = Float(bitPattern: pBits)
+      }
+
+      let buf0 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf1 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      let buf3 = UnsafeMutablePointer<UInt8>.allocate(capacity: 1500)
+      defer { buf0.deallocate(); buf1.deallocate(); buf3.deallocate() }
+
+      let len0 = Wire.packAudio(seq: 20, cap: 20000, src: rawF0, n: FPP, dst: buf0, pcm16: true)
+      _ = Wire.unpackAudio(plain: buf0, plainN: len0, into: ring)
+      let len1 = Wire.packAudio(seq: 21, cap: 21000, src: rawF1, n: FPP, dst: buf1, pcm16: true)
+      _ = Wire.unpackAudio(plain: buf1, plainN: len1, into: ring)
+
+      // Packet 22 is LOST!
+      let p22LostBefore = !ring.present(22)
+
+      // Packet 23 arrives carrying block parity FEC for baseSeq = 20, count = 4
+      let len3 = Wire.packAudio(seq: 23, cap: 23000, src: rawF3, n: FPP, dst: buf3, pcm16: true,
+                                fecParity: par16, fecParityBaseSeq: 20,
+                                fecParityCount: 4, fecParityCap: 20000)
+      _ = Wire.unpackAudio(plain: buf3, plainN: len3, into: ring)
+
+      let p22Recovered = ring.present(22)
+      var f2Exact = true
+      for k in 0..<FPP {
+        if let s = ring.sampleAt(Int64(22 * FPP + k)) {
+          if s.bitPattern != f2[k].bitPattern { f2Exact = false }
+        } else {
+          f2Exact = false
+        }
+      }
+      check(p22LostBefore && p22Recovered && f2Exact,
+            "Block parity FEC under PCM16: bit-exact reconstruction of dropped packet 22")
+    }
+
+    // 3.6 Dual-path packet racing deduplication (Direct P2P + Relay racing)
     do {
       let ring = RecvRing()
       let f12 = [Float](repeating: 0.77, count: FPP)
@@ -5538,7 +5632,16 @@ final class Audio {
         // allocates nothing, which is the only kind of check allowed here.
         if gMicMuted || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
         let histSlot = Int(capSeq) % Audio.CAP_HIST_COUNT
-        memcpy(capHistory + histSlot * FPP, capBuf, FPP * 4)
+        if let w = wire, w.sendPcm16 {
+          let histPtr = capHistory + histSlot * FPP
+          for i in 0..<FPP {
+            let v = Wire.softLimit(capBuf[i]) * 32767.0
+            let q = Int16(max(-32767.0, min(32767.0, v)).rounded())
+            histPtr[i] = Float(q) / 32767.0
+          }
+        } else {
+          memcpy(capHistory + histSlot * FPP, capBuf, FPP * 4)
+        }
         capHistoryCap[histSlot] = cap
         capHistorySeq[histSlot] = capSeq
 
@@ -5546,6 +5649,8 @@ final class Audio {
         var r1Cap: UInt64 = 0
         var r4Ptr: UnsafePointer<Float>? = nil
         var r4Cap: UInt64 = 0
+        var r8Ptr: UnsafePointer<Float>? = nil
+        var r8Cap: UInt64 = 0
         var fecPtr: UnsafePointer<Float>? = nil
         var fecBase: Int32 = 0
         var fecCount: UInt8 = 0
@@ -5566,12 +5671,26 @@ final class Audio {
               r4Cap = capHistoryCap[s4]
             }
           }
-          let base = capSeq & ~3
-          if capSeq >= base + 3 {
+          if capSeq >= 8 {
+            let s8 = Int(capSeq - 8) % Audio.CAP_HIST_COUNT
+            if capHistorySeq[s8] == capSeq - 8 {
+              r8Ptr = UnsafePointer(capHistory + s8 * FPP)
+              r8Cap = capHistoryCap[s8]
+            }
+          }
+          let pBase: Int32
+          if capSeq % 4 == 3 {
+            pBase = capSeq - 3
+          } else if capSeq >= 4 && (capSeq % 4 == 0 || capSeq % 4 == 1) {
+            pBase = (capSeq & ~3) - 4
+          } else {
+            pBase = -1
+          }
+          if pBase >= 0 {
             var allHave = true
             for offset in 0..<4 {
-              let s = Int(base + Int32(offset)) % Audio.CAP_HIST_COUNT
-              if capHistorySeq[s] != base + Int32(offset) {
+              let s = Int(pBase + Int32(offset)) % Audio.CAP_HIST_COUNT
+              if capHistorySeq[s] != pBase + Int32(offset) {
                 allHave = false
                 break
               }
@@ -5580,15 +5699,15 @@ final class Audio {
               for k in 0..<FPP {
                 var pBits: UInt32 = 0
                 for offset in 0..<4 {
-                  let s = Int(base + Int32(offset)) % Audio.CAP_HIST_COUNT
+                  let s = Int(pBase + Int32(offset)) % Audio.CAP_HIST_COUNT
                   pBits ^= (capHistory + s * FPP + k).pointee.bitPattern
                 }
                 fecParityScratch[k] = Float(bitPattern: pBits)
               }
               fecPtr = UnsafePointer(fecParityScratch)
-              fecBase = base
+              fecBase = pBase
               fecCount = 4
-              fecCap = capHistoryCap[Int(base) % Audio.CAP_HIST_COUNT]
+              fecCap = capHistoryCap[Int(pBase) % Audio.CAP_HIST_COUNT]
             }
           }
         }
@@ -5596,6 +5715,7 @@ final class Audio {
         wire?.send(seq: capSeq, cap: cap, src: capBuf, n: FPP, scratch: capScratch,
                    redundant: r1Ptr, redundantCap: r1Cap,
                    stride4: r4Ptr, stride4Cap: r4Cap,
+                   stride8: r8Ptr, stride8Cap: r8Cap,
                    fecParity: fecPtr, fecParityBaseSeq: fecBase,
                    fecParityCount: fecCount, fecParityCap: fecCap)
         memcpy(prevBuf, capBuf, FPP * 4)
