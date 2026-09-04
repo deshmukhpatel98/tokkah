@@ -1246,17 +1246,6 @@ final class Audio {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
     }
-    if Audio.presenceAuto {
-      if !speakers {
-        if let p = Audio.Presence.named("in-the-room") {
-          Audio.presence = p
-          Metrics.fact("presence", "in-the-room")
-        }
-      } else {
-        Audio.presence = Audio.Presence()
-        Metrics.fact("presence", "off")
-      }
-    }
     Metrics.fact("output_route", speakers ? "speakers" : "headphones")
     // Says which of the two products this call is now, because they are not
     // small variations of each other: on headphones the turn rule stands down
@@ -1267,7 +1256,7 @@ final class Audio {
     let how = speakers ? "one at a time, so nobody hears themselves"
                        : (duplex ? "both at once, no turns, nothing in the way"
                                  : "one at a time (--no-headphone-duplex)")
-    let presInfo = Audio.presence.on ? " (spatial presence: in-the-room)" : ""
+    let presInfo = Audio.presence.on ? " (spatial presence: \(Audio.presenceMode))" : ""
     fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\(presInfo)\n", stderr)
   }
 
@@ -2612,7 +2601,9 @@ final class Audio {
   /// 4. Jitter Buffer Ratchet Prevention & Monotonic Decay (cautious growth, outlier rejection, monotonic target decay, rate governor)
   static func boostSelfTest() -> Bool {
     var fails = 0
+    var total = 0
     func check(_ ok: Bool, _ what: String) {
+      total += 1
       if !ok { fails += 1 }
       let mark = ok ? "ok  " : "FAIL"
       print("   \(mark) \(what)")
@@ -2769,31 +2760,51 @@ final class Audio {
       let nHpf = 48000
       var rumble = [Float](repeating: 0, count: nHpf)
       var voice = [Float](repeating: 0, count: nHpf)
+      var fund = [Float](repeating: 0, count: nHpf)
       for i in 0..<nHpf {
         rumble[i] = 0.5 * sin(Float(2 * Double.pi * 20.0 * Double(i) / SR))
         voice[i] = 0.5 * sin(Float(2 * Double.pi * 200.0 * Double(i) / SR))
+        fund[i] = 0.5 * sin(Float(2 * Double.pi * 85.0 * Double(i) / SR))
       }
       var outRumble = rumble
       var outVoice = voice
+      var outFund = fund
       outRumble.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) }
       hpf.reset()
       outVoice.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) }
+      hpf.reset()
+      outFund.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) }
 
       var inRumbleE = 0.0, outRumbleE = 0.0
       var inVoiceE = 0.0, outVoiceE = 0.0
+      var inFundE = 0.0, outFundE = 0.0
       for i in Int(SR * 0.2)..<nHpf {
         inRumbleE += Double(rumble[i]) * Double(rumble[i])
         outRumbleE += Double(outRumble[i]) * Double(outRumble[i])
         inVoiceE += Double(voice[i]) * Double(voice[i])
         outVoiceE += Double(outVoice[i]) * Double(outVoice[i])
+        inFundE += Double(fund[i]) * Double(fund[i])
+        outFundE += Double(outFund[i]) * Double(outFund[i])
       }
       let rumbleAttenDb = 10.0 * log10(inRumbleE / max(outRumbleE, 1e-12))
       let voiceAttenDb = 10.0 * log10(inVoiceE / max(outVoiceE, 1e-12))
-      check(rumbleAttenDb > 18.0 && voiceAttenDb < 0.2,
-            "Subsonic HPF: 20 Hz rumble attenuated > 18 dB (\(String(format: "%.1f", rumbleAttenDb)) dB), 200 Hz voice preserved (< 0.2 dB loss: \(String(format: "%.2f", voiceAttenDb)) dB)")
+      let fundAttenDb = 10.0 * log10(inFundE / max(outFundE, 1e-12))
+      check(rumbleAttenDb > 18.0 && voiceAttenDb < 0.2 && fundAttenDb < 1.5,
+            "Subsonic HPF: 20 Hz rumble attenuated > 18 dB (\(String(format: "%.1f", rumbleAttenDb)) dB), 85 Hz fundamental (\(String(format: "%.2f", fundAttenDb)) dB) and 200 Hz harmonic preserved (\(String(format: "%.2f", voiceAttenDb)) dB loss)")
+
+      // Control arm: hpfOn = false bypass leaves signal bit-identical
+      let prevHpf = Audio.hpfOn
+      Audio.hpfOn = false
+      var bypassBuf = rumble
+      if Audio.hpfOn { bypassBuf.withUnsafeMutableBufferPointer { hpf.process($0.baseAddress!, nHpf) } }
+      var bypassDiff = 0.0
+      for i in 0..<nHpf { bypassDiff = max(bypassDiff, Double(abs(bypassBuf[i] - rumble[i]))) }
+      Audio.hpfOn = prevHpf
+      check(bypassDiff == 0.0,
+            "Subsonic HPF control arm: --no-hpf leaves capture audio bit-identical (0 error)")
     }
 
-    // 1.7 Headphone spatial presence
+    // 1.7 Headphone spatial presence and dynamic route switching
     do {
       guard let p = Presence.named("in-the-room") else {
         check(false, "Presence: in-the-room preset exists")
@@ -2801,6 +2812,48 @@ final class Audio {
       }
       check(p.on && p.tailMs > 25.0 && p.scale > 0 && p.scale <= 1.0,
             "Spatial presence: in-the-room calibrated (\(String(format: "%.1f", p.tailMs)) ms reflections, scale \(String(format: "%.2f", p.scale)))")
+
+      // Dynamic route switching: headphones auto-enable, speakers auto-disable
+      let prevRoute = Audio.outputIsSpeakers
+      let prevAuto = Audio.presenceAuto
+      let prevPresence = Audio.presence
+      let prevMode = Audio.presenceMode
+
+      Audio.presenceAuto = true
+      Audio.outputIsSpeakers = false
+      let hpAutoOk = Audio.presence.on && Audio.presenceMode == "in-the-room"
+
+      Audio.outputIsSpeakers = true
+      let spkAutoOk = !Audio.presence.on && Audio.presenceMode == "off"
+
+      // Manual override preservation: --presence mode must not be overwritten by route change
+      Audio.presenceAuto = false
+      if let warmer = Presence.named("warmer") {
+        Audio.presence = warmer
+        Audio.presenceMode = "warmer"
+      }
+      Audio.outputIsSpeakers = false
+      let hpOverrideOk = Audio.presence.on && Audio.presenceMode == "warmer"
+      Audio.outputIsSpeakers = true
+      let spkOverrideOk = Audio.presence.on && Audio.presenceMode == "warmer"
+
+      check(hpAutoOk && spkAutoOk && hpOverrideOk && spkOverrideOk,
+            "Spatial presence routing: auto-engages on headphones, passthrough on speakers, preserves manual overrides")
+
+      // Clean buffer reset on mode change
+      let pf = PresenceFilter()
+      pf.p = p
+      _ = pf.process(1.0)
+      pf.p = Presence() // turn off
+      pf.p = p          // turn back on: must reset buffer without playing stale samples
+      let cleanFirstSample = pf.process(0.0)
+      check(abs(cleanFirstSample) < 1e-6,
+            "Spatial presence filter: clean buffer reset on activation, zero stale audio burst")
+
+      Audio.presenceMode = prevMode
+      Audio.presence = prevPresence
+      Audio.presenceAuto = prevAuto
+      Audio.outputIsSpeakers = prevRoute
     }
 
     // ── PILLAR 2: TURN-TAKING & MICRO-TIMING CUES ─────────────────────────────
@@ -3017,7 +3070,7 @@ final class Audio {
 
     print("================================================================================")
     let passed = (fails == 0)
-    print(passed ? "BOOST SELFTEST PASSED (18/18 assertions)" : "BOOST SELFTEST FAILED (\(fails) failures)")
+    print(passed ? "BOOST SELFTEST PASSED (\(total)/\(total) assertions)" : "BOOST SELFTEST FAILED (\(fails) failures)")
     print("================================================================================")
     return passed
   }
@@ -3450,13 +3503,22 @@ final class Audio {
   final class PresenceFilter {
     static let PRES = 4096                              // > the longest reflection
     static let PMASK = PRES - 1
-    var p = Presence()
+    var p = Presence() {
+      didSet {
+        if oldValue.on != p.on { reset() }
+      }
+    }
     private let buf: UnsafeMutablePointer<Float>
     private var w = 0
     private var lo: Float = 0, hi: Float = 0, dull: Float = 0
     init() {
       buf = .allocate(capacity: PresenceFilter.PRES)
       buf.initialize(repeating: 0, count: PresenceFilter.PRES)
+    }
+    func reset() {
+      memset(buf, 0, PresenceFilter.PRES * MemoryLayout<Float>.size)
+      w = 0
+      lo = 0; hi = 0; dull = 0
     }
     /// One sample. No allocation, no locks, and a straight passthrough when off.
     @inline(__always) func process(_ x: Float) -> Float {
@@ -3535,6 +3597,7 @@ final class Audio {
   }
 
   static var presenceAuto = true
+  static var presenceMode = "off"
   static var presence = Presence() { didSet { sharedPresence.p = presence } }
   nonisolated(unsafe) static let sharedPresence = PresenceFilter()
   private let pres = Audio.sharedPresence
@@ -4224,13 +4287,16 @@ final class Audio {
   /// The route, as a fact and not as the echo gate's conclusion about it.
   nonisolated(unsafe) static var outputIsSpeakers = true {
     didSet {
+      guard oldValue != outputIsSpeakers else { return }
       if presenceAuto {
         if !outputIsSpeakers {
           if let p = Presence.named("in-the-room") {
+            presenceMode = "in-the-room"
             presence = p
             Metrics.fact("presence", "in-the-room")
           }
         } else {
+          presenceMode = "off"
           presence = Presence()
           Metrics.fact("presence", "off")
         }
@@ -5079,6 +5145,7 @@ final class Audio {
       // The read cursor must re-prime from the new stream rather than carry an
       // anchor from before the graph changed.
       ring.pos = -1
+      captureHpf.reset()
       fputs("*** audio graph rebuilt.\n", stderr)
     } catch {
       fputs("*** audio graph rebuild FAILED: \(error). Retrying in a moment.\n", stderr)

@@ -5277,7 +5277,6 @@ if flag("gate-test") {
 // and no test reads `Audio.sharedGate`.
 let audio = Audio()
 audio.wire = wire
-audio.checkOutputRoute()
 
 if let m = arg("presence") {
   guard let p = Audio.Presence.named(m) else {
@@ -5286,6 +5285,7 @@ if let m = arg("presence") {
     exit(2)
   }
   Audio.presenceAuto = false
+  Audio.presenceMode = m
   Audio.presence = p
   Metrics.fact("presence", m)
   // A ROOM LENGTHENS THE ECHO PATH. The reflections this adds are played by the
@@ -5300,6 +5300,8 @@ if let m = arg("presence") {
     Metrics.fact("presence_tail_ms", String(format: "%.0f", p.tailMs))
   }
 }
+
+audio.checkOutputRoute()
 
 // ── TWO IMPLEMENTATIONS OF THE SAME SOUND ────────────────────────────────
 //
