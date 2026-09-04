@@ -3543,7 +3543,11 @@ final class CallControls: NSView {
     onMain { [weak self] in
       guard let self else { return }
       self.statusPill.text = s
+      self.statusPill.isHidden = false
       self.needsLayout = true
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
+        self?.statusPill.isHidden = true
+      }
     }
   }
 
@@ -3666,6 +3670,10 @@ final class CallControls: NSView {
     if !Rendezvous.myCountry.isEmpty {
       return FarTest.countryName(codeOrName: Rendezvous.myCountry)
     }
+    if let region = (Locale.current as NSLocale).countryCode, !region.isEmpty {
+      let c = FarTest.countryName(codeOrName: region)
+      if !c.isEmpty { return c }
+    }
     return "India"
   }
 
@@ -3684,7 +3692,7 @@ final class CallControls: NSView {
     if !Rendezvous.peerCountry.isEmpty {
       return FarTest.countryName(codeOrName: Rendezvous.peerCountry)
     }
-    return "India"
+    return ""
   }
 
   /// `Meera · 4:12`. The name alone before the call starts, the clock alone when
@@ -3727,6 +3735,7 @@ final class CallControls: NSView {
       let loc = CallControls.currentLocation()
       let connStatus = loc.isEmpty ? "connected" : "connected (Location: \(loc))"
       self.statusPill.text = connStatus
+      self.statusPill.isHidden = false
       DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
         self?.statusPill.isHidden = true
       }

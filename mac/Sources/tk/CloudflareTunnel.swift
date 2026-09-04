@@ -273,7 +273,8 @@ final class CloudflareTunnel {
                 : "far test: the other end is not on the relay -- media is direct until it is\n", stderr)
       if now {
         DispatchQueue.main.async {
-          Menu.controls?.setStatus("VPN: routed via \(cName)")
+          let loc = CallControls.currentLocation()
+          Menu.controls?.setStatus(loc.isEmpty ? "connected" : "Location: \(loc)")
         }
       }
     }
@@ -408,6 +409,10 @@ final class FarTest {
   var myOriginCountry: String {
     if !tunnel.myCountry.isEmpty { return FarTest.countryName(codeOrName: tunnel.myCountry) }
     if !Rendezvous.myCountry.isEmpty { return FarTest.countryName(codeOrName: Rendezvous.myCountry) }
+    if let region = (Locale.current as NSLocale).countryCode, !region.isEmpty {
+      let c = FarTest.countryName(codeOrName: region)
+      if !c.isEmpty { return c }
+    }
     return "India"
   }
   var myOriginCity: String {
@@ -417,7 +422,7 @@ final class FarTest {
   var peerOriginCountry: String {
     if !tunnel.peerCountry.isEmpty { return FarTest.countryName(codeOrName: tunnel.peerCountry) }
     if !Rendezvous.peerCountry.isEmpty { return FarTest.countryName(codeOrName: Rendezvous.peerCountry) }
-    return "India"
+    return ""
   }
   var peerOriginCity: String {
     if !tunnel.peerCity.isEmpty { return tunnel.peerCity }
@@ -466,10 +471,17 @@ final class FarTest {
   }
 
   var short: String {
-    guard on else { return "Integrated VPN off" }
-    let cName = activeCountry
-    guard connected else { return "VPN: reaching \(cName)…" }
-    let rtt = relayRttMs
-    return rtt < 0 ? "VPN: routed via \(cName)" : "VPN: routed via \(cName) (\(Int(rtt)) ms)"
+    if mine {
+      let c = activeCountry
+      let loc = c.isEmpty ? "Brazil" : c
+      let rtt = relayRttMs
+      if connected && rtt >= 0 {
+        return "Location: \(loc) (\(Int(rtt)) ms)"
+      }
+      return "Location: \(loc)"
+    } else {
+      let loc = CallControls.currentLocation()
+      return loc.isEmpty ? "Location: India" : "Location: \(loc)"
+    }
   }
 }

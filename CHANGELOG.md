@@ -5,6 +5,15 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.147.0 — 2026-09-05
+
+### Fixed — Eradicate spurious VPN status banners on non-VPN devices and eliminate hardcoded location fallbacks
+
+- **Status Banner Truth**: Replaced `VPN: routed via <Country>` popup in `CloudflareTunnel.swift` (`notePeers`, `notePeer`, `tick`) with plain `Location: <Country>` reflecting the device's actual location, eliminating confusing Brazil VPN alerts on non-VPN participant devices.
+- **Dynamic Region Detection**: Added system locale region detection fallback (`Locale.current`) in place of hardcoded `"India"` when STUN/Rendezvous has not finished discovering the public IP.
+- **Accurate Peer Discovery**: Empty `remoteLocation()` when remote peer is not present or unresolved, preventing false location displays.
+- **Auto-Dismiss Status Pill**: Ensured all status announcements via `setStatus()` unhide and automatically dismiss after 2.8s.
+
 ## Kin 0.146.0 — 2026-09-05
 
 ### Fixed — Plain location presentation across active call UI and telemetry
