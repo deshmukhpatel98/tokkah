@@ -204,6 +204,15 @@ enum Rendezvous {
   nonisolated(unsafe) static var peerCity: String = ""
   nonisolated(unsafe) static var peerIsVpn: Bool = false
 
+  static func reset() {
+    myCountry = ""
+    myCity = ""
+    myIsVpn = false
+    peerCountry = ""
+    peerCity = ""
+    peerIsVpn = false
+  }
+
   /// Publish our address and return whoever else is in the room.
   ///
   /// ── nil IS NOT AN EMPTY ROOM ────────────────────────────────────────────────
@@ -235,7 +244,7 @@ enum Rendezvous {
       guard let d,
             let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
             let arr = o["peers"] as? [[String: Any]] else { return }
-      if let mc = o["country"] as? String, !mc.isEmpty { myCountry = mc }
+      if let mc = o["country"] as? String, !mc.isEmpty { myCountry = FarTest.countryName(codeOrName: mc) }
       if let mci = o["city"] as? String, !mci.isEmpty { myCity = mci }
       if let mv = o["isVpn"] as? Bool { myIsVpn = mv }
       // Assigned HERE and not before the guards: an answer that arrived and did
@@ -256,14 +265,15 @@ enum Rendezvous {
           let rb = r.split(separator: ":")
           if rb.count == 2, let rp = UInt16(rb[1]) { rip = String(rb[0]); rport = rp }
         }
-        let pCountry = p["country"] as? String
+        let pCountryRaw = p["country"] as? String
+        let pCountry = pCountryRaw.map { FarTest.countryName(codeOrName: $0) }
         let pCity = p["city"] as? String
         let pIsVpn = (p["isVpn"] as? Bool) ?? false
         if let pCountry, !pCountry.isEmpty {
           peerCountry = pCountry
           peerCity = pCity ?? ""
-          peerIsVpn = pIsVpn
         }
+        peerIsVpn = pIsVpn
         out?.append(Peer(id: id, ip: String(bits[0]), port: port,
                          ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport,
                          relayIP: rip, relayPort: rport, country: pCountry, city: pCity, isVpn: pIsVpn))

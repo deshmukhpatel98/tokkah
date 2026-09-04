@@ -271,6 +271,11 @@ final class CloudflareTunnel {
       let cName = FarTest.countryName(codeOrName: rCountry.isEmpty ? "South America" : rCountry)
       fputs(now ? "far test: both ends on the relay -- routing the call through \(cName)\n"
                 : "far test: the other end is not on the relay -- media is direct until it is\n", stderr)
+      if now {
+        DispatchQueue.main.async {
+          Menu.controls?.setStatus("VPN: routed via \(cName)")
+        }
+      }
     }
   }
 
@@ -363,6 +368,11 @@ final class FarTest {
     if changed {
       fputs("far test: the other end turned it \(on ? "on" : "off")\n", stderr)
       apply()
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        Menu.controls?.setStatus(self.short)
+        Menu.controls?.nudgeBar()
+      }
     }
   }
 
@@ -377,15 +387,20 @@ final class FarTest {
     if expired {
       fputs("far test: the other end's beat stopped -- treating it as off\n", stderr)
       apply()
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        Menu.controls?.setStatus(self.short)
+        Menu.controls?.nudgeBar()
+      }
     }
   }
 
   private func apply() { tunnel.setActive(on) }
 
-  var relayCountry: String { tunnel.relayCountry }
+  var relayCountry: String { FarTest.countryName(codeOrName: tunnel.relayCountry) }
   var relayCity: String { tunnel.relayCity }
-  var myCountry: String { tunnel.myCountry }
-  var peerCountry: String { tunnel.peerCountry }
+  var myCountry: String { FarTest.countryName(codeOrName: tunnel.myCountry) }
+  var peerCountry: String { FarTest.countryName(codeOrName: tunnel.peerCountry) }
 
   static func countryName(codeOrName: String) -> String {
     let trimmed = codeOrName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -399,8 +414,9 @@ final class FarTest {
   }
 
   var activeCountry: String {
-    if !tunnel.relayCountry.isEmpty {
-      return FarTest.countryName(codeOrName: tunnel.relayCountry)
+    let rc = relayCountry
+    if !rc.isEmpty {
+      return rc
     }
     return "Brazil"
   }

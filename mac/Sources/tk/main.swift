@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.142.0"
+let VERSION = "0.143.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -3669,6 +3669,7 @@ if let room = arg("room") {
   // Created here, off by default, so the sheet and the menu have something to
   // switch and the far end's beat has something to land on. It opens no socket
   // until somebody turns it on. See CloudflareTunnel.swift.
+  Rendezvous.reset()
   FarTest.shared = FarTest(room: room, wire: wire)
   if flag("far-test") || flag("vpn") { FarTest.shared?.setMine(true) }
 

@@ -362,6 +362,17 @@ enum Menu {
         item.title = CallRecorder.shared.isRecording ? "Stop Recording" : "Record Call"
         return Menu.controls != nil
       }
+      if item.action == #selector(Target.farTest) {
+        let f = FarTest.shared
+        item.state = (f?.on == true) ? .on : .off
+        if let f, f.on {
+          let c = f.activeCountry
+          item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (\(c))"
+        } else {
+          item.title = "Integrated VPN"
+        }
+        return f != nil
+      }
       return true
     }
     @objc func about() {

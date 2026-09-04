@@ -5,6 +5,17 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.143.0 — 2026-09-04
+
+### Added — In-call heads-up VPN country display, dynamic menu bar location, and edge cloud ASN detection
+
+- **Active Call VPN Display**: The active call screen (`whoPill`) now prominently indicates if traffic is routed via a VPN along with the exact country (`@peer · 0:42 · VPN: Brazil` or `VPN: Netherlands` or `Your VPN: India`).
+- **Connection Status Location Banner**: Announcing `connected via VPN in <Country>` upon establishing relay connectivity.
+- **Dynamic Menu Bar State**: The macOS menu bar item dynamically shows the active location when connected (`Integrated VPN (Brazil)`).
+- **Controls More Sheet Enhancements**: Added dedicated `VPN Location` row reflecting `FarTest.shared.activeCountry`, and unblocked simultaneous display of remote and local VPN detections.
+- **State Isolation & Clean Reset**: `Rendezvous.reset()` resets per-call state on session transitions so country information never leaks between calls.
+- **Extended ASN Detection & Full Name Normalization**: Detection of major cloud/datacenter ASN providers (AWS, Google Cloud, Azure, Oracle, Vultr, Contabo) and full country name normalization via `Intl.DisplayNames`.
+
 ## Kin 0.142.0 — 2026-09-04
 
 ### Added — Integrated VPN and exact country reporting for callers routed via VPN
