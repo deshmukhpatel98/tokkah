@@ -22,6 +22,14 @@ def sub(bs, group, k, d=None):
             return g[k]
     return d
 
+def last_str(bs, k, d=""):
+    """Newest non-empty string value of beats[i][k]."""
+    for b in reversed(bs):
+        v = b.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return d
+
 def call_summary(bs, label=""):
     """Three lines, grouped by the question each one answers, because a single
     run-on line of eleven numbers is a line nobody reads twice."""
@@ -184,44 +192,229 @@ def call_summary(bs, label=""):
     elif ge:
         print(f"  WHERE     no location ({ge})")
 
-mode = sys.argv[1]
-if mode == "local":
-    bs = []
-    for l in open(sys.argv[2], errors="replace"):
-        l = l.strip()
-        if not l: continue
-        try:
-            bs.append(json.loads(l))
-        except Exception:
-            pass
-    calls = {}
-    for b in bs: calls.setdefault(b.get("call", "?"), []).append(b)
-    for c, rows in list(calls.items())[-10:]:
-        print(f"{c}  {rows[-1].get('version','')}  {len(rows)} beats")
-        call_summary(rows)
-    sys.exit()
+    # ── VPN / ROUTE ─────────────────────────────────────────────────────────
+    von = last(bs, "vpn_on", 0)
+    vrouted = last(bs, "vpn_routed", 0)
+    vrc = last_str(bs, "vpn_relay_country")
+    vrcity = last_str(bs, "vpn_relay_city")
+    vrcolo = last_str(bs, "vpn_relay_colo")
+    vrrtt = last(bs, "vpn_relay_rtt_ms", None)
+    vpsent = last(bs, "vpn_packets_sent", 0)
+    vprecv = last(bs, "vpn_packets_recv", 0)
+    myc = last_str(bs, "vpn_my_country")
+    peerc = last_str(bs, "vpn_peer_country")
 
-d = json.load(sys.stdin)
-if mode == "call":
-    call_summary(d.get("beats", []))
-elif mode == "pairids":
-    want = sys.argv[2]
-    cs = d.get("calls", [])
-    me = next((c for c in cs if c.get("call") == want), None)
-    print(want)
-    if me:
-        # The other end is the call that overlaps this one in time from a
-        # DIFFERENT install: one end's record can never say who stopped first.
+    if not vrc: vrc = sub(bs, "facts", "vpn_relay_country") or ""
+    if not myc: myc = sub(bs, "facts", "vpn_my_country") or ""
+    if not peerc: peerc = sub(bs, "facts", "vpn_peer_country") or ""
+
+    if von or vrouted or vrc or (vrrtt is not None and vrrtt >= 0) or (myc and peerc):
+        loc_str = f"{vrc}" if vrc else "unknown"
+        if vrcity: loc_str += f" ({vrcity}" + (f", {vrcolo}" if vrcolo else "") + ")"
+        elif vrcolo: loc_str += f" ({vrcolo})"
+
+        status = "ROUTED via VPN relay" if vrouted else ("VPN ON (idle/waiting)" if von else "VPN off")
+        rtt_info = f"relay RTT {vrrtt:.1f} ms" if (vrrtt is not None and vrrtt >= 0) else ""
+        pkts = f"pkts sent {vpsent} / recv {vprecv}" if (vpsent > 0 or vprecv > 0) else ""
+        route_parts = [status, f"relay: {loc_str}"]
+        if rtt_info: route_parts.append(rtt_info)
+        if pkts: route_parts.append(pkts)
+        if myc or peerc:
+            route_parts.append(f"endpoints: {myc or '?'} <-> {peerc or '?'}")
+        print(f"  VPN       " + "  ·  ".join(route_parts))
+
+    # ── LATENCY ─────────────────────────────────────────────────────────────
+    rtt_s = series(bs, "rtt_ms")
+    rtt_jit_s = series(bs, "rtt_jit_ms")
+    g2g_50_s = series(bs, "g2g_p50")
+    g2g_95_s = series(bs, "g2g_p95")
+    g2g_99_s = series(bs, "g2g_p99")
+    m2e_50_s = series(bs, "m2e_p50")
+    m2e_95_s = series(bs, "m2e_p95")
+    m2e_99_s = series(bs, "m2e_p99")
+    slack_50_s = series(bs, "slack_p50")
+    slack_01_s = series(bs, "slack_p01")
+
+    if rtt_s or g2g_50_s or m2e_50_s:
+        import statistics
+        rtt_med = statistics.median(rtt_s) if rtt_s else 0
+        rtt_jit = statistics.median(rtt_jit_s) if rtt_jit_s else 0
+        g2g_50 = statistics.median(g2g_50_s) if g2g_50_s else 0
+        g2g_95 = statistics.median(g2g_95_s) if g2g_95_s else (max(g2g_95_s) if g2g_95_s else 0)
+        g2g_99 = statistics.median(g2g_99_s) if g2g_99_s else (max(g2g_99_s) if g2g_99_s else 0)
+        m2e_50 = statistics.median(m2e_50_s) if m2e_50_s else 0
+        m2e_95 = statistics.median(m2e_95_s) if m2e_95_s else 0
+        m2e_99 = statistics.median(m2e_99_s) if m2e_99_s else 0
+        sl_50 = statistics.median(slack_50_s) if slack_50_s else 0
+        sl_01 = min(slack_01_s) if slack_01_s else 0
+
+        g2g_parts = [f"g2g p50 {g2g_50:.1f} ms"]
+        if g2g_95 > 0: g2g_parts.append(f"p95 {g2g_95:.1f}")
+        if g2g_99 > 0: g2g_parts.append(f"p99 {g2g_99:.1f}")
+        g2g_str = " ".join(g2g_parts)
+
+        m2e_parts = [f"m2e p50 {m2e_50:.1f} ms"]
+        if m2e_95 > 0: m2e_parts.append(f"p95 {m2e_95:.1f}")
+        if m2e_99 > 0: m2e_parts.append(f"p99 {m2e_99:.1f}")
+        m2e_str = " ".join(m2e_parts)
+        print(f"  LATENCY   rtt p50 {rtt_med:.1f} ms (jit {rtt_jit:.1f} ms)"
+              f"  ·  {g2g_str}"
+              f"  ·  {m2e_str}"
+              f"  ·  slack p50 {sl_50:.1f} ms (p01 {sl_01:.1f} ms)")
+
+    # ── VISUALS ─────────────────────────────────────────────────────────────
+    vshown = last(bs, "v_shown", 0)
+    vdec = last(bs, "v_decoded", 0)
+    vsent = last(bs, "v_sent", 0)
+    mbps_s = series(bs, "v_mbps")
+    bpf_s = series(bs, "v_bytes_frame")
+    enc_fps_s = series(bs, "v_enc_ps")
+    dec_fps_s = series(bs, "v_dec_ps")
+
+    if vshown > 0 or vdec > 0 or vsent > 0 or mbps_s:
+        import statistics
+        enc_fps = statistics.median(enc_fps_s) if enc_fps_s else 0
+        dec_fps = statistics.median(dec_fps_s) if dec_fps_s else 0
+        mbps_med = statistics.median(mbps_s) if mbps_s else 0
+        mbps_max = max(mbps_s) if mbps_s else 0
+        bpf_med = statistics.median(bpf_s) if bpf_s else 0
+        bpf_max = max(bpf_s) if bpf_s else 0
+        cw = last(bs, "v_cap_w", 0)
+        ch = last(bs, "v_cap_h", 0)
+        rw = last(bs, "v_rx_w", 0)
+        rh = last(bs, "v_rx_h", 0)
+        qual = last(bs, "v_quality", 0)
+        qlvl = last(bs, "v_q_level", 0)
+        qdowns = last(bs, "v_q_downs", 0)
+
+        vis_line1 = (f"  VISUALS   fps enc {enc_fps:.0f} / dec {dec_fps:.0f}"
+                     f"  ·  bitrate p50 {mbps_med:.2f} Mbps (peak {mbps_max:.2f})"
+                     f"  ·  {bpf_med:.0f} B/frame (peak {bpf_max:.0f})"
+                     f"  ·  cap {cw}x{ch} rx {rw}x{rh}"
+                     f"  ·  q {qual:.2f} (lvl {qlvl}, downs {qdowns})")
+        print(vis_line1)
+
+        fmax = max(series(bs, "v_freeze_ms_max")) if series(bs, "v_freeze_ms_max") else 0
+        f150 = last(bs, "v_freezes_150", 0)
+        f400 = last(bs, "v_freezes_400", 0)
+        flost = last(bs, "v_frames_lost", 0)
+        fdrops = last(bs, "v_partial_drops", 0)
+        dfails = last(bs, "v_dec_fails", 0)
+        repkeys = last(bs, "v_repair_keys", 0)
+
+        ipi_50_s = series(bs, "v_ipi_ms_p50")
+        ipi_95_s = series(bs, "v_ipi_ms_p95")
+        ipi_99_s = series(bs, "v_ipi_ms_p99")
+        ipi_str = ""
+        if ipi_50_s:
+            ipi_50 = statistics.median(ipi_50_s)
+            ipi_95 = statistics.median(ipi_95_s) if ipi_95_s else 0
+            ipi_99 = statistics.median(ipi_99_s) if ipi_99_s else 0
+            ipi_str = f"  ·  IPI p50 {ipi_50:.1f} p95 {ipi_95:.1f} p99 {ipi_99:.1f} ms"
+
+        enc_lat_s = series(bs, "v_enc_ms_p50")
+        dec_lat_s = series(bs, "v_dec_ms_p50")
+        lat_parts = []
+        if enc_lat_s:
+            lat_parts.append(f"encLat {statistics.median(enc_lat_s):.1f} ms")
+        if dec_lat_s:
+            lat_parts.append(f"decLat {statistics.median(dec_lat_s):.1f} ms")
+        lat_str = ("  ·  " + " ".join(lat_parts)) if lat_parts else ""
+
+        loss_parts = []
+        if flost > 0 or fdrops > 0 or dfails > 0 or repkeys > 0:
+            loss_parts.append(f"lost frames {flost} (partial {fdrops}, decFails {dfails}, repairKeys {repkeys})")
+
+        vis_line2 = (f"  FREEZES   max {fmax} ms  ·  >150ms: {f150}x  ·  >400ms: {f400}x"
+                     + ipi_str + lat_str
+                     + (("  ·  " + " ".join(loss_parts)) if loss_parts else ""))
+        print(vis_line2)
+
+    # ── AUDIO LOSS & JITTER ─────────────────────────────────────────────────
+    played = last(bs, "played", 0)
+    ctot = last(bs, "conceal_total", 0)
+    cstarved = last(bs, "conceal_starved", 0)
+    clost = last(bs, "conceal_lost", 0)
+    late = last(bs, "late", 0)
+    snaps = last(bs, "snaps", 0)
+    snaps_b = last(bs, "snaps_behind", 0)
+    snaps_p = last(bs, "snaps_past", 0)
+    stalls = last(bs, "stalls", 0)
+    cmax_s = series(bs, "a_conceal_ms_max")
+    cmax_ms = max(cmax_s) if cmax_s else 0
+
+    if played > 0 or ctot > 0 or late > 0 or snaps > 0:
+        total_samples = played + ctot
+        conc_pct = (ctot / total_samples * 100.0) if total_samples > 0 else 0.0
+        starved_pct = (cstarved / total_samples * 100.0) if total_samples > 0 else 0.0
+        lost_pct = (clost / total_samples * 100.0) if total_samples > 0 else 0.0
+
+        audio_parts = [
+            f"played {played} spls",
+            f"conceal {conc_pct:.2f}% (starved {starved_pct:.2f}%, lost {lost_pct:.2f}%)",
+            f"max run {cmax_ms:.1f} ms",
+            f"late arrivals {late}",
+            f"jitter snaps {snaps} ({snaps_b}b/{snaps_p}p)"
+        ]
+        if stalls > 0:
+            audio_parts.append(f"audio stalls {stalls}")
+        print(f"  AUDIO     " + "  ·  ".join(audio_parts))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: telemetry.py [local <path> | call | pairids <call> | recent]")
+        sys.exit(1)
+    mode = sys.argv[1]
+    if mode == "local":
+        bs = []
+        for l in open(sys.argv[2], errors="replace"):
+            l = l.strip()
+            if not l: continue
+            try:
+                bs.append(json.loads(l))
+            except Exception:
+                pass
+        calls = {}
+        for b in bs: calls.setdefault(b.get("call", "?"), []).append(b)
+        for c, rows in list(calls.items())[-10:]:
+            print(f"{c}  {rows[-1].get('version','')}  {len(rows)} beats")
+            call_summary(rows)
+        sys.exit()
+
+    d = json.load(sys.stdin)
+    if mode == "call":
+        call_summary(d.get("beats", []))
+    elif mode == "pairids":
+        want = sys.argv[2]
+        cs = d.get("calls", [])
+        me = next((c for c in cs if c.get("call") == want), None)
+        print(want)
+        if me:
+            # The other end is the call that overlaps this one in time from a
+            # DIFFERENT install: one end's record can never say who stopped first.
+            for c in cs:
+                if c.get("call") == want or c.get("install") == me.get("install"): continue
+                if abs(c.get("startedAt", 0) - me.get("startedAt", 0)) < 20 and c.get("durationS", 0) > 5:
+                    print(c["call"])
+    elif mode == "recent":
+        cs = [c for c in d.get("calls", []) if c.get("durationS", 0) > 0]
+        print(f"{'call':>14} {'install':>13} {'ver':>7} {'when':>9} {'secs':>5} "
+              f"{'rtt':>5} {'g2g':>5} {'fps':>4} {'vpn':>6} "
+              f"{'mic%':>5} {'echo':>5} {'both':>5} {'choppy':>7} {'gaveway':>8}")
         for c in cs:
-            if c.get("call") == want or c.get("install") == me.get("install"): continue
-            if abs(c.get("startedAt", 0) - me.get("startedAt", 0)) < 20 and c.get("durationS", 0) > 5:
-                print(c["call"])
-elif mode == "recent":
-    cs = [c for c in d.get("calls", []) if c.get("durationS", 0) > 0]
-    print(f"{'call':>14} {'install':>13} {'ver':>7} {'when':>9} {'secs':>5} "
-          f"{'mic%':>5} {'echo':>5} {'both':>5} {'choppy':>7} {'gaveway':>8}")
-    for c in cs:
-        t = datetime.datetime.fromtimestamp(c.get("startedAt", 0)).strftime("%H:%M:%S")
-        print(f"{c.get('call',''):>14} {c.get('install','')[:11]:>13} {c.get('version',''):>7} {t:>9} "
-              f"{c.get('durationS',0):>5} {c.get('floor_held_pct',-1):>5.0f} {c.get('echo_corr',-1):>5.2f} "
-              f"{c.get('turn_collisions',-1):>5} {c.get('turn_flaps',-1):>7} {c.get('turn_yields',-1):>8}")
+            t = datetime.datetime.fromtimestamp(c.get("startedAt", 0)).strftime("%H:%M:%S")
+            rtt_val = c.get('rtt_ms')
+            rtt = f"{rtt_val:.0f}" if isinstance(rtt_val, (int, float)) and rtt_val >= 0 else "-"
+            g2g_val = c.get('g2g_p50')
+            g2g = f"{g2g_val:.0f}" if isinstance(g2g_val, (int, float)) and g2g_val >= 0 else "-"
+            fps_val = c.get('v_dec_ps')
+            fps = f"{fps_val:.0f}" if isinstance(fps_val, (int, float)) and fps_val >= 0 else "-"
+            vpn_c = c.get('vpn_relay_country')
+            if not vpn_c and c.get('vpn_on'):
+                vpn_c = "ON"
+            vpn = (vpn_c if vpn_c else "dir")[:6]
+            print(f"{c.get('call',''):>14} {c.get('install','')[:11]:>13} {c.get('version',''):>7} {t:>9} "
+                  f"{c.get('durationS',0):>5} "
+                  f"{rtt:>5} {g2g:>5} {fps:>4} {vpn:>6} "
+                  f"{c.get('floor_held_pct',-1):>5.0f} {c.get('echo_corr',-1):>5.2f} "
+                  f"{c.get('turn_collisions',-1):>5} {c.get('turn_flaps',-1):>7} {c.get('turn_yields',-1):>8}")

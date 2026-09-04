@@ -5,6 +5,19 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.144.0 — 2026-09-04
+
+### Fixed — South America VPN relay falsely resolving to local ingress country (India)
+
+- **Worker Subrequest Anycast Guard**: Cloudflare's internal subrequest to trace relay location routed via anycast to the nearest local edge (`DEL` / India) rather than the Durable Object's physical region (`sam`), overwriting the South America relay location with the caller's ingress country. The worker now strictly validates that resolved points of presence match verified South American colos (`GRU`, `GIG`, `SCL`, `EZE`, `BOG`, `LIM`).
+- **Client Relay Location Filtering**: `CloudflareTunnel.swift` and `FarTest` explicitly reject spurious local relay overrides, guaranteeing accurate display of the South America relay (`Brazil (São Paulo)`).
+
+### Added — Telemetry for Inter-Presentation Interval (IPI), motion lag, and VPN metrics
+
+- **Inter-Presentation Interval (IPI) Tracking**: Integrated frame presentation gap monitoring into `Display.swift` (`v_ipi_ms_p50`, `p95`, `p99`) to quantify visual smoothness and detect frame presentation stalls during camera motion.
+- **Deep Latency & Quality Telemetry**: Added 95th/99th percentiles for encoder and decoder latencies (`v_enc_ms`, `v_dec_ms`), 99th percentile glass-to-glass latency (`g2g_p99`), and comprehensive VPN telemetry into the live call heartbeat (`vpn_on`, `vpn_routed`, `vpn_relay_country`, `vpn_relay_rtt_ms`, `vpn_packets_sent`, `vpn_packets_recv`).
+- **Diagnostic Tooling (`tools/telemetry.py`)**: Enhanced CLI telemetry inspection with dedicated sections for VPN routing, visual freezes, jitter snaps, and audio sample starvation.
+
 ## Kin 0.143.0 — 2026-09-04
 
 ### Added — In-call heads-up VPN country display, dynamic menu bar location, and edge cloud ASN detection

@@ -211,10 +211,10 @@ final class CloudflareTunnel {
       lock.lock()
       let first = !isConnected
       isConnected = true
-      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
-      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
-      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
-      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty, rc != "India", rc != "IN" { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty, rcc != "IN" { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty, rci != "Delhi", rci != "New Delhi" { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty, rco != "DEL" { relayColo = rco }
       if let mc = j["country"] as? String, !mc.isEmpty { myCountry = mc }
       if let mci = j["city"] as? String, !mci.isEmpty { myCity = mci }
       let rCountry = relayCountry
@@ -230,20 +230,20 @@ final class CloudflareTunnel {
       if let peers { notePeers(peers) }
     case "xcont-peers":
       lock.lock()
-      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
-      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
-      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
-      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty, rc != "India", rc != "IN" { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty, rcc != "IN" { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty, rci != "Delhi", rci != "New Delhi" { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty, rco != "DEL" { relayColo = rco }
       if let pc = j["peerCountry"] as? String, !pc.isEmpty { peerCountry = pc }
       if let pci = j["peerCity"] as? String, !pci.isEmpty { peerCity = pci }
       lock.unlock()
       if let peers { notePeers(peers) }
     case "xcont-pong":
       lock.lock()
-      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
-      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
-      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
-      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty, rc != "India", rc != "IN" { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty, rcc != "IN" { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty, rci != "Delhi", rci != "New Delhi" { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty, rco != "DEL" { relayColo = rco }
       lock.unlock()
       if let peers { notePeers(peers) }
       // `t` went out as an integer host-clock stamp and comes back verbatim.
@@ -322,7 +322,7 @@ final class FarTest {
 
   let room: String
   private let wire: Wire
-  private let tunnel: CloudflareTunnel
+  let tunnel: CloudflareTunnel
   private let lock = NSLock()
   private(set) var mine = false
   private(set) var theirs = false
@@ -398,9 +398,13 @@ final class FarTest {
   private func apply() { tunnel.setActive(on) }
 
   var relayCountry: String { FarTest.countryName(codeOrName: tunnel.relayCountry) }
+  var relayCountryCode: String { tunnel.relayCountryCode }
   var relayCity: String { tunnel.relayCity }
+  var relayColo: String { tunnel.relayColo }
   var myCountry: String { FarTest.countryName(codeOrName: tunnel.myCountry) }
   var peerCountry: String { FarTest.countryName(codeOrName: tunnel.peerCountry) }
+  var packetsSent: Int { tunnel.packetsSent }
+  var packetsRecv: Int { tunnel.packetsRecv }
 
   static func countryName(codeOrName: String) -> String {
     let trimmed = codeOrName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -415,7 +419,7 @@ final class FarTest {
 
   var activeCountry: String {
     let rc = relayCountry
-    if !rc.isEmpty {
+    if !rc.isEmpty && rc != "India" && rc != "IN" {
       return rc
     }
     return "Brazil"

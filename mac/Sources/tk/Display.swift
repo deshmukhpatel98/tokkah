@@ -762,6 +762,7 @@ final class Display {
   private(set) var freezeMaxMs = 0
   private(set) var freezes150 = 0
   private(set) var freezes400 = 0
+  var ipi = Quantiles(cap: 2048)
   private var lastShownT: UInt64 = 0
   /// Drop the anchor the next gap would be measured from, so the next frame
   /// starts a fresh interval instead of closing one that spans a pause.
@@ -771,6 +772,7 @@ final class Display {
     defer { lastShownT = now }
     guard lastShownT != 0 else { return }
     let gap = Int(Clock.msSigned(now, lastShownT))
+    if gap > 0 { ipi.add(Double(gap)) }
     if gap > freezeMaxMs { freezeMaxMs = gap }
     if gap >= 150 { freezes150 += 1 }
     if gap >= 400 { freezes400 += 1 }

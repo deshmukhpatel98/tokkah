@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.143.0"
+let VERSION = "0.144.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -7436,12 +7436,31 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   if let c = crypto { c.beatFields(into: &f) }
   if let v = vg2g.p(0.50) { f["g2g_p50"] = v }
   if let v = vg2g.p(0.95) { f["g2g_p95"] = v }
+  if let v = vg2g.p(0.99) { f["g2g_p99"] = v }
   if vDecoded > 0 { f["v_decoded"] = vDecoded; f["v_sent"] = vSentFrames }
   if let e = venc {
     f["v_encodes"] = e.encodes
     if let v = e.encLatMs.p(0.50) { f["v_enc_ms_p50"] = v }
+    if let v = e.encLatMs.p(0.95) { f["v_enc_ms_p95"] = v }
     if let v = e.encLatMs.p(0.99) { f["v_enc_ms_p99"] = v }
   }
+  if let ft = FarTest.shared {
+    f["vpn_on"] = ft.on ? 1 : 0
+    f["vpn_routed"] = ft.connected ? 1 : 0
+    if ft.on {
+      let actCountry = ft.activeCountry
+      if !actCountry.isEmpty { f["vpn_relay_country"] = actCountry }
+      if !ft.relayCity.isEmpty { f["vpn_relay_city"] = ft.relayCity }
+      if !ft.relayColo.isEmpty { f["vpn_relay_colo"] = ft.relayColo }
+      if ft.relayRttMs >= 0 { f["vpn_relay_rtt_ms"] = ft.relayRttMs }
+      f["vpn_packets_sent"] = ft.packetsSent
+      f["vpn_packets_recv"] = ft.packetsRecv
+    }
+  }
+  if !Rendezvous.myCountry.isEmpty { f["vpn_my_country"] = Rendezvous.myCountry }
+  if Rendezvous.myIsVpn { f["vpn_my_is_vpn"] = 1 }
+  if !Rendezvous.peerCountry.isEmpty { f["vpn_peer_country"] = Rendezvous.peerCountry }
+  if Rendezvous.peerIsVpn { f["vpn_peer_is_vpn"] = 1 }
   for (k, v) in videoBeat { f[k] = v }
   return f
 }
@@ -7898,7 +7917,11 @@ func reportLoop() {
       "v_freezes_400": display?.freezes400 ?? 0,
     ]
     if let v = e.p(0.50) { vb["v_enc_ms_p50"] = v }
+    if let v = e.p(0.95) { vb["v_enc_ms_p95"] = v }
+    if let v = e.p(0.99) { vb["v_enc_ms_p99"] = v }
     if let v = dl.p(0.50) { vb["v_dec_ms_p50"] = v }
+    if let v = dl.p(0.95) { vb["v_dec_ms_p95"] = v }
+    if let v = dl.p(0.99) { vb["v_dec_ms_p99"] = v }
     vb["v_q_level"] = vq.level
     vb["v_q_downs"] = vq.stepDowns
     vb["v_q_heavy_downs"] = vq.heavyDowns
@@ -7941,7 +7964,13 @@ func reportLoop() {
     vb["v_dq_inline_full"] = dq.inlineFull
     vb["v_dq_inline_big"] = dq.inlineTooBig
     vb["v_dq_depth_max"] = dq.maxDepth
-    if let d = display { vb["v_shown"] = d.shown; vb["v_enq_fail"] = d.enqueueFails }
+    if let d = display {
+      vb["v_shown"] = d.shown
+      vb["v_enq_fail"] = d.enqueueFails
+      if let v = d.ipi.p(0.50) { vb["v_ipi_ms_p50"] = v }
+      if let v = d.ipi.p(0.95) { vb["v_ipi_ms_p95"] = v }
+      if let v = d.ipi.p(0.99) { vb["v_ipi_ms_p99"] = v }
+    }
     if let m = mdisplay {
       vb["v_shown"] = m.shown
       // Coverage travels WITH the number, because a percentile over a tenth of the
