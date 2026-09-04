@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.145.0"
+let VERSION = "0.146.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -7465,6 +7465,8 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   if Rendezvous.myIsVpn { f["vpn_my_is_vpn"] = 1 }
   if !Rendezvous.peerCountry.isEmpty { f["vpn_peer_country"] = Rendezvous.peerCountry }
   if Rendezvous.peerIsVpn { f["vpn_peer_is_vpn"] = 1 }
+  f["vpn_my_location"] = CallControls.currentLocation()
+  f["vpn_peer_location"] = CallControls.remoteLocation()
   for (k, v) in videoBeat { f[k] = v }
   return f
 }

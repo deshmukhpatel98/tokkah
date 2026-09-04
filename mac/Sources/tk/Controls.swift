@@ -3651,6 +3651,42 @@ final class CallControls: NSView {
     }
   }
 
+  static func currentLocation() -> String {
+    if let ft = FarTest.shared, ft.mine {
+      let c = ft.activeCountry
+      if !c.isEmpty { return c }
+    }
+    if Rendezvous.myIsVpn && !Rendezvous.myCountry.isEmpty {
+      return FarTest.countryName(codeOrName: Rendezvous.myCountry)
+    }
+    if let ft = FarTest.shared {
+      let orig = ft.myOriginCountry
+      if !orig.isEmpty { return orig }
+    }
+    if !Rendezvous.myCountry.isEmpty {
+      return FarTest.countryName(codeOrName: Rendezvous.myCountry)
+    }
+    return "India"
+  }
+
+  static func remoteLocation() -> String {
+    if let ft = FarTest.shared, ft.theirs {
+      let c = ft.activeCountry
+      if !c.isEmpty { return c }
+    }
+    if Rendezvous.peerIsVpn && !Rendezvous.peerCountry.isEmpty {
+      return FarTest.countryName(codeOrName: Rendezvous.peerCountry)
+    }
+    if let ft = FarTest.shared {
+      let orig = ft.peerOriginCountry
+      if !orig.isEmpty { return orig }
+    }
+    if !Rendezvous.peerCountry.isEmpty {
+      return FarTest.countryName(codeOrName: Rendezvous.peerCountry)
+    }
+    return "India"
+  }
+
   /// `Meera · 4:12`. The name alone before the call starts, the clock alone when
   /// there is no name.
   private func renderWho() {
@@ -3662,28 +3698,9 @@ final class CallControls: NSView {
         ? String(format: "%d:%02d:%02d", secs / 3600, (secs / 60) % 60, secs % 60)
         : String(format: "%d:%02d", secs / 60, secs % 60)
     }
-    var vpnBadge = ""
-    if let ft = FarTest.shared, ft.on {
-      let c = ft.activeCountry
-      if ft.mine && !ft.theirs {
-        let p = ft.peerOriginCountry
-        vpnBadge = "Your VPN: \(c)  ·  Peer: \(p)"
-      } else if !ft.mine && ft.theirs {
-        let m = ft.myOriginCountry
-        vpnBadge = "Peer VPN: \(c)  ·  You: \(m)"
-      } else {
-        vpnBadge = "VPN: \(c)"
-      }
-    } else if Rendezvous.peerIsVpn && !Rendezvous.peerCountry.isEmpty {
-      let c = FarTest.countryName(codeOrName: Rendezvous.peerCountry)
-      let m = Rendezvous.myCountry.isEmpty ? "" : FarTest.countryName(codeOrName: Rendezvous.myCountry)
-      vpnBadge = m.isEmpty ? "Peer VPN: \(c)" : "Peer VPN: \(c)  ·  You: \(m)"
-    } else if Rendezvous.myIsVpn && !Rendezvous.myCountry.isEmpty {
-      let c = FarTest.countryName(codeOrName: Rendezvous.myCountry)
-      let p = Rendezvous.peerCountry.isEmpty ? "" : FarTest.countryName(codeOrName: Rendezvous.peerCountry)
-      vpnBadge = p.isEmpty ? "Your VPN: \(c)" : "Your VPN: \(c)  ·  Peer: \(p)"
-    }
-    let line = [name, t, vpnBadge].filter { !$0.isEmpty }.joined(separator: "  ·  ")
+    let loc = CallControls.currentLocation()
+    let locBadge = loc.isEmpty ? "" : "Location: \(loc)"
+    let line = [name, t, locBadge].filter { !$0.isEmpty }.joined(separator: "  ·  ")
     whoPill.text = line
     whoPill.isHidden = line.isEmpty || !barShown
     if !line.isEmpty {
@@ -3707,23 +3724,8 @@ final class CallControls: NSView {
     onMain { [weak self] in
       guard let self else { return }
       self.waiting.isHidden = true
-      var connStatus = "connected"
-      if let ft = FarTest.shared, ft.on {
-        let c = ft.activeCountry
-        if ft.mine && !ft.theirs {
-          connStatus = "connected (your VPN: \(c) · peer: \(ft.peerOriginCountry))"
-        } else if !ft.mine && ft.theirs {
-          connStatus = "connected (peer VPN: \(c) · you: \(ft.myOriginCountry))"
-        } else {
-          connStatus = c.isEmpty ? "connected via VPN" : "connected via VPN in \(c)"
-        }
-      } else if Rendezvous.peerIsVpn && !Rendezvous.peerCountry.isEmpty {
-        let c = FarTest.countryName(codeOrName: Rendezvous.peerCountry)
-        connStatus = "connected (peer VPN: \(c))"
-      } else if Rendezvous.myIsVpn && !Rendezvous.myCountry.isEmpty {
-        let c = FarTest.countryName(codeOrName: Rendezvous.myCountry)
-        connStatus = "connected (your VPN: \(c))"
-      }
+      let loc = CallControls.currentLocation()
+      let connStatus = loc.isEmpty ? "connected" : "connected (Location: \(loc))"
       self.statusPill.text = connStatus
       DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
         self?.statusPill.isHidden = true
@@ -5394,72 +5396,40 @@ final class CallControls: NSView {
       far.target = self; far.action = #selector(toggleFarTestRow(_:))
       items.append(far)
       items.append(SheetHint(f.sentence))
-      if f.on {
-        if f.mine && !f.theirs {
-          let vpnLoc = SheetRow("Your VPN", glyph: Glyph.lock)
-          vpnLoc.inert = true
-          vpnLoc.value = f.activeCountry
-          vpnLoc.valueIsWord = true
-          items.append(vpnLoc)
-          let locCity = f.relayCity.isEmpty ? f.activeCountry : "\(f.activeCountry) (\(f.relayCity))"
-          items.append(SheetHint("Your traffic is routed through Cloudflare's relay in \(locCity)."))
-
-          let peerLoc = SheetRow("Remote Location", glyph: Glyph.person)
-          peerLoc.inert = true
-          let pCountry = f.peerOriginCountry
-          let pCity = f.peerOriginCity.isEmpty ? "" : " (\(f.peerOriginCity))"
-          peerLoc.value = pCountry
-          peerLoc.valueIsWord = true
-          items.append(peerLoc)
-          items.append(SheetHint("The other person is not on a VPN: connected directly in \(pCountry)\(pCity)."))
-        } else if !f.mine && f.theirs {
-          let remoteVpn = SheetRow("Remote VPN", glyph: Glyph.lock)
-          remoteVpn.inert = true
-          remoteVpn.value = f.activeCountry
-          remoteVpn.valueIsWord = true
-          items.append(remoteVpn)
-          let locCity = f.relayCity.isEmpty ? f.activeCountry : "\(f.activeCountry) (\(f.relayCity))"
-          items.append(SheetHint("The other person turned on Integrated VPN; traffic routes through \(locCity)."))
-
-          let myLoc = SheetRow("Your Location", glyph: Glyph.person)
-          myLoc.inert = true
-          let mCountry = f.myOriginCountry
-          let mCity = f.myOriginCity.isEmpty ? "" : " (\(f.myOriginCity))"
-          myLoc.value = mCountry
-          myLoc.valueIsWord = true
-          items.append(myLoc)
-          items.append(SheetHint("You are not on a VPN: connected directly in \(mCountry)\(mCity)."))
-        } else if f.mine && f.theirs {
-          let vpnLoc = SheetRow("VPN Location", glyph: Glyph.lock)
-          vpnLoc.inert = true
-          vpnLoc.value = f.activeCountry
-          vpnLoc.valueIsWord = true
-          items.append(vpnLoc)
-          let locCity = f.relayCity.isEmpty ? f.activeCountry : "\(f.activeCountry) (\(f.relayCity))"
-          items.append(SheetHint("Both participants are routed through Cloudflare's relay in \(locCity)."))
-        }
-      }
     }
-    if FarTest.shared?.on != true {
-      if Rendezvous.peerIsVpn && !Rendezvous.peerCountry.isEmpty {
-        let peerC = FarTest.countryName(codeOrName: Rendezvous.peerCountry)
-        let pCity = Rendezvous.peerCity.isEmpty ? "" : " (\(Rendezvous.peerCity))"
-        let vpn = SheetRow("Remote VPN", glyph: Glyph.lock)
-        vpn.inert = true
-        vpn.value = peerC
-        vpn.valueIsWord = true
-        items.append(vpn)
-        items.append(SheetHint("The other person is routed via a VPN in \(peerC)\(pCity)."))
-      }
-      if Rendezvous.myIsVpn && !Rendezvous.myCountry.isEmpty {
-        let myC = FarTest.countryName(codeOrName: Rendezvous.myCountry)
-        let mCity = Rendezvous.myCity.isEmpty ? "" : " (\(Rendezvous.myCity))"
-        let vpn = SheetRow("Your VPN", glyph: Glyph.lock)
-        vpn.inert = true
-        vpn.value = myC
-        vpn.valueIsWord = true
-        items.append(vpn)
-        items.append(SheetHint("You are routed via a VPN in \(myC)\(mCity)."))
+
+    // ── PLAIN LOCATION DISPLAY ──────────────────────────────────────────────
+    let myLoc = CallControls.currentLocation()
+    let isMyVpn = (FarTest.shared?.mine == true) || Rendezvous.myIsVpn
+    let locRow = SheetRow("Location", glyph: isMyVpn ? Glyph.lock : Glyph.person)
+    locRow.inert = true
+    locRow.value = myLoc
+    locRow.valueIsWord = true
+    items.append(locRow)
+    if isMyVpn {
+      let relayCity = FarTest.shared?.relayCity ?? ""
+      let locCity = relayCity.isEmpty ? myLoc : "\(myLoc) (\(relayCity))"
+      items.append(SheetHint("Traffic is routed through VPN in \(locCity)."))
+    } else {
+      let mCity = FarTest.shared?.myOriginCity ?? Rendezvous.myCity
+      let cStr = mCity.isEmpty ? myLoc : "\(myLoc) (\(mCity))"
+      items.append(SheetHint("Connected directly in \(cStr)."))
+    }
+
+    let remLoc = CallControls.remoteLocation()
+    if !remLoc.isEmpty {
+      let isRemVpn = (FarTest.shared?.theirs == true) || Rendezvous.peerIsVpn
+      let remRow = SheetRow("Remote Location", glyph: isRemVpn ? Glyph.lock : Glyph.person)
+      remRow.inert = true
+      remRow.value = remLoc
+      remRow.valueIsWord = true
+      items.append(remRow)
+      if isRemVpn {
+        items.append(SheetHint("The other person is routed through VPN in \(remLoc)."))
+      } else {
+        let pCity = FarTest.shared?.peerOriginCity ?? Rendezvous.peerCity
+        let pStr = pCity.isEmpty ? remLoc : "\(remLoc) (\(pCity))"
+        items.append(SheetHint("The other person is connected directly in \(pStr)."))
       }
     }
 

@@ -370,7 +370,7 @@ enum Menu {
           item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (\(c))"
         } else if let f, f.theirs {
           let c = f.activeCountry
-          item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (Peer on \(c))"
+          item.title = c.isEmpty ? "Integrated VPN" : "Integrated VPN (Remote: \(c))"
         } else {
           item.title = "Integrated VPN"
         }

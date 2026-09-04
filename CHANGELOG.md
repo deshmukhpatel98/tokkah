@@ -5,6 +5,21 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.146.0 — 2026-09-05
+
+### Fixed — Plain location presentation across active call UI and telemetry
+
+- **Plain Location Presentation**: Directly prints the location as requested without convoluted VPN jargon:
+  - If on VPN, location is simply presented as `Location: Brazil` (or the VPN relay country).
+  - If not on VPN, location is presented as `Location: India` (or the direct origin country calling from).
+- **Active Call Screen & Heads-up Pill**:
+  - The in-call `whoPill` displays `Meera · 4:12 · Location: Brazil` on the VPN-connected client, and `Meera · 4:12 · Location: India` on the non-VPN client.
+  - Connection banner cleanly announces `connected (Location: <Country>)`.
+- **Controls More Sheet Simplification**:
+  - Dedicated `Location` and `Remote Location` rows plainly stating each participant's active country.
+  - Clear explanatory hints indicating whether traffic is routed through VPN or connected directly.
+- **Beat Telemetry**: Added `vpn_my_location` and `vpn_peer_location` to heartbeat metrics to trace real-time location topology.
+
 ## Kin 0.145.0 — 2026-09-04
 
 ### Fixed — Separate VPN vs non-VPN participant identification in UI & telemetry
