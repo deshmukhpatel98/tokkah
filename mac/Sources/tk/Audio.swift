@@ -2415,8 +2415,8 @@ final class Audio {
   /// Fractional read cursor rate governor.
   /// Translates buffer backlog / deficit (in samples) into fractional playout rate.
   /// Bounded to +/- 0.4% (< 5 cents pitch drift) for normal steady-state drift (<= 25 ms),
-  /// with smooth dynamic scaling up to +3.5% for transient backlogs to drain post-stall
-  /// packet bursts smoothly without audible clicks or violent cursor snapping.
+  /// with smooth scaling up to +1.2% (< 20 cents pitch shift) for transient backlogs to drain
+  /// packet bursts smoothly without audible pitch distortion or clicks.
   static func governorRate(errSamples: Double) -> (rate: Double, errMs: Double) {
     let errMs = errSamples / SR * 1000.0
     let r = 1.0 + errSamples / (SR * 2.0)
@@ -2424,8 +2424,8 @@ final class Audio {
     if errMs <= 25.0 {
       rate = min(1.004, max(0.996, r))
     } else {
-      let extra = (errMs - 25.0) / 1000.0 * 0.15
-      rate = min(1.035, 1.004 + extra)
+      let extra = (errMs - 25.0) / 1000.0 * 0.08
+      rate = min(1.012, 1.004 + extra)
     }
     return (rate, errMs)
   }
@@ -2486,7 +2486,7 @@ final class Audio {
       lastLate = r.lateArrivals
       let near = r.nearLate - lastNearLate
       lastNearLate = r.nearLate
-      let deep = late - near
+      _ = late - near
 
       let lostTotal = peerReportsLoss ? peerLost : r.concealLost
       let recTotal = peerReportsLoss ? peerRecovered : r.recovered
@@ -3856,10 +3856,10 @@ final class Audio {
       let far = farEnv
       let farTalking = far > 0.004
       if farTalking {
-        farTalkingSamples += n
+        farTalkingSamples = min(Int(SR * 2), farTalkingSamples + n)
         farQuietSamples = 0
       } else {
-        farQuietSamples += n
+        farQuietSamples = min(Int(SR * 2), farQuietSamples + n)
         if farQuietSamples > Int(SR * 0.120) { farTalkingSamples = 0 }
       }
       farRun = farTalking ? farRun + n : 0
@@ -4050,7 +4050,7 @@ final class Audio {
       // Hangover dwell: hold suppression across brief inter-syllable pauses
       // (~120 ms) when near end is not vocalising, preventing rapid on/off flapping.
       let farDwell = farTalkingSamples > Int(SR * 0.08) && farQuietSamples < Int(SR * 0.120)
-      let farActive = farTalking || (farDwell && !confirmed)
+      let farActive = farTalking || (farDwell && !aboveEcho)
       let nearTalking = !farActive || aboveEcho
       // ONE OF THE TWO PLACES THAT TOUCHES SAMPLES, and the only one that is
       // about echo. On headphones this is always 1: nothing is held down,
@@ -4061,7 +4061,7 @@ final class Audio {
       // Smooth transitions: avoid violent square-wave gating and speech shredding.
       // Opening on near voice onset stays fast (~1 ms) to protect consonants;
       // opening on quiet release is smoothed (~12-16 ms) to prevent noise-floor pumping.
-      let openStep: Float = (confirmed && aboveEcho) ? 0.02 : 0.003
+      let openStep: Float = (aboveEcho && aboveRoom) ? 0.02 : 0.003
       let closeStep = Float(1.0 / (SR * max(0.5, cfg.closeMs) / 1000.0))
       // ── AND THE DUCK, WHICH IS A SEPARATE DECISION ─────────────────────────
       //
@@ -5341,10 +5341,10 @@ final class Audio {
     // are absorbed and drained smoothly by the audio rate governor instead of
     // violently snapping the cursor forward and discarding speech (which caused
     // 4.8 to 14.3 snaps/sec and audible clicks). Snap behind acts only on true
-    // runaway backlog (>= 350 ms).
+    // runaway backlog (>= 180 ms), and cross-fades the repositioned cursor to eliminate clicks.
     let pktMs = Double(FPP) / SR * 1000.0
-    let snapBehindMs = max(350.0, Double(jitTarget) * pktMs * 3.0)
-    let SNAP_PKTS = max(Int64(150), Int64((snapBehindMs / pktMs).rounded()))
+    let snapBehindMs = max(180.0, Double(jitTarget) * pktMs * 2.5)
+    let SNAP_PKTS = max(Int64(120), Int64((snapBehindMs / pktMs).rounded()))
     var cur = curSeq
     // SYMMETRIC, and it was not. This snapped only when the cursor fell BEHIND the
     // stream; a cursor that ran AHEAD had to be 341 ms out before the jump guard
@@ -5403,6 +5403,8 @@ final class Audio {
       // happened.
       if snapBehind { ring.snapsBehind += 1 } else { ring.snapsPast += 1 }
       cur = Int64(ring.pos) / Int64(FPP)
+      // Cross-fade the repositioned stream against synthesis to eliminate audible clicks/pops
+      xfade = Audio.XFADE
     }
 
     // THE GOVERNOR. Occupancy error, in samples, driven to zero by reading a

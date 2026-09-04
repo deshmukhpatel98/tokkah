@@ -976,7 +976,7 @@ final class Floor {
     if v != .quiet { farQuietMs = 0 }
     farVoice = v
     farAgeMs = 0
-    farTransitMs = transitMs
+    if transitMs > 0 { farTransitMs = transitMs }
     // ── AND THE FAST ANSWER, WHEN THEY CAN GIVE ONE ──────────────────────────
     //
     // `Wire.ST_VOICING`: sound leaving their microphone in the last 120 ms, as
@@ -2107,6 +2107,24 @@ extension Floor {
     }
     check(a6h.earShutMs == 0 && b6h.earShutMs == 0,
           "on headphones no ear ever closes")
+    // ── 7. TRANSIT-SCALED IN-FLIGHT SPEECH PROTECTION ─────────────────────────
+    // When one-way delay is 150 ms, the ear must stay open > 150 ms into my turn
+    // so in-flight speech from the far end is not clipped, and subsequent noteFar calls
+    // must not wipe out the measured transit delay.
+    let fTransit = Floor()
+    fTransit.speakers = true
+    fTransit.noteTransit(150.0)
+    fTransit.noteFar(.quiet) // transitMs not supplied, must NOT overwrite farTransitMs
+    _ = fTransit.step(dt: 0.010, near: .quiet)
+    let dec = fTransit.step(dt: 0.010, near: .claim)
+    check(fTransit.state == .mine && dec.playoutOpen,
+          "transit-scaled playout lag: ear stays open upon taking floor")
+    var stillOpen = true
+    for _ in 0..<10 {
+      let d = fTransit.step(dt: 0.010, near: .claim)
+      if !d.playoutOpen { stillOpen = false; break }
+    }
+    check(stillOpen, "transit-scaled playout lag: ear still open at 110 ms (exceeding baseline 60 ms)")
 
     print(failures == 0 ? "FLOOR TEST PASSED" : "FLOOR TEST FAILED (\(failures))")
     return failures == 0

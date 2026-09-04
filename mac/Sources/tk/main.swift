@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.148.0"
+let VERSION = "0.149.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -6842,6 +6842,7 @@ if audio.jitAuto {
       let dynJitMaxMs = arg("jit-max-ms") != nil ? baseJitMaxMs : max(baseJitMaxMs, min(600.0, measuredSpread * 1.5))
       let JIT_MAX = max(JIT_MIN + 2, Int((dynJitMaxMs / pktMs).rounded()))
       let legacyVeto = flag("jit-legacy-veto")
+      let needsSpreadGrowth = measuredSpread > 15.0 && Double(audio.jitTarget) * pktMs < min(dynJitMaxMs * 0.5, measuredSpread * 0.5)
       if snappedBehind > 0 && (legacyVeto || (!starving && conc == 0)) {
         calm = 0
         fputs("jit: \(snappedBehind) backlog snap(s), \(conc) concealed -- stall, not jitter;"
@@ -6853,7 +6854,7 @@ if audio.jitAuto {
         fputs("jit: slack p01 \(String(format: "%.2f", p01)) ms but the far end skipped an input"
             + " wakeup (cadence gap \(String(format: "%.2f", senderGap)) ms vs \(String(format: "%.2f", pktMs)) nominal),"
             + " 0 concealed, 0 late -- holding at \(audio.jitTarget)\n", stderr)
-      } else if !starving, audio.jitTarget > JIT_MIN + 1,
+      } else if !starving, !needsSpreadGrowth, audio.jitTarget > JIT_MIN + 1,
                 (late >= GROW_LATE_MIN || p01 < GROW_BELOW_MS) {
         // The thing a buffer prevents is not happening. Whatever the margin looks
         // like, there is nothing left for another packet of latency to buy.
@@ -6866,7 +6867,7 @@ if audio.jitAuto {
               + " excursions at the pitch period rather than buying \(String(format: "%.2f", pktMs)) ms"
               + " more on every word\n", stderr)
         }
-      } else if !starving, late >= GROW_LATE_MIN, near < GROW_LATE_MIN, p01 >= GROW_BELOW_MS {
+      } else if !starving, !needsSpreadGrowth, late >= GROW_LATE_MIN, near < GROW_LATE_MIN, p01 >= GROW_BELOW_MS {
         // Late, but not by an amount a packet of buffer reaches, and the margin is
         // fine. Chasing this is the queue-tolerance mistake wearing a new hat.
         deepRefused += 1
@@ -6877,7 +6878,10 @@ if audio.jitAuto {
               + " -- one more packet would not have caught them; holding at \(audio.jitTarget)."
               + " Deep excursions are concealed at the pitch period instead.\n", stderr)
         }
-      } else if (late >= GROW_LATE_MIN && (near >= GROW_LATE_MIN || starving)) || (p01 < GROW_BELOW_MS && converged) || (starving && audio.jitTarget < JIT_MAX) {
+      } else if (late >= GROW_LATE_MIN && (near >= GROW_LATE_MIN || starving))
+             || (p01 < GROW_BELOW_MS && converged)
+             || (starving && audio.jitTarget < JIT_MAX)
+             || (needsSpreadGrowth && audio.jitTarget < JIT_MAX) {
         if audio.jitTarget < JIT_MAX {
           let step: Int
           if starving && starvedPct > 10.0 {
@@ -6886,8 +6890,10 @@ if audio.jitAuto {
             step = min(16, max(2, Int((starvedPct * 0.5).rounded())))
           } else if starving {
             step = min(4, max(2, Int(starvedPct.rounded())))
-          } else if measuredSpread > 0 && Double(audio.jitTarget) * pktMs < min(dynJitMaxMs * 0.6, measuredSpread * 0.6) {
-            step = min(16, max(2, Int((((measuredSpread * 0.6) - Double(audio.jitTarget) * pktMs) / pktMs).rounded())))
+          } else if needsSpreadGrowth {
+            let targetMs = min(dynJitMaxMs * 0.5, measuredSpread * 0.5)
+            let diffPkts = Int(((targetMs - Double(audio.jitTarget) * pktMs) / pktMs).rounded())
+            step = min(16, max(2, diffPkts))
           } else {
             step = 1
           }
@@ -6903,7 +6909,8 @@ if audio.jitAuto {
           backoff = min(backoff * 2, 120)
           fputs("jit -> \(audio.jitTarget) (grew: \(late) late arrivals, \(near) of them by under one packet, slack p01 \(String(format: "%.2f", p01)) ms"
               + (growSuppressed > 0 ? ", \(growSuppressed) refused mid-slew" : "")
-              + (marginExcused > 0 ? ", \(marginExcused) refused as far-end hiccups" : "") + ")"
+              + (marginExcused > 0 ? ", \(marginExcused) refused as far-end hiccups" : "")
+              + (needsSpreadGrowth ? ", scaled from network spread \(String(format: "%.1f", measuredSpread)) ms" : "") + ")"
               + "  -- below \(unsafeBelow) marked unsafe, next probe in \(Int(backoff / 2)) s\n", stderr)
         }
         calm = 0

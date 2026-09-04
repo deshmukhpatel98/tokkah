@@ -5,6 +5,22 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.149.0 — 2026-09-05
+
+### Fixed — Ultra-low latency audio refinements: click-free xfade cursor snapping, unblocked jitter spread adaptation, near voice attack preservation, and transit delay retention
+
+- **Click-Free Playout Cursor Snapping & Waveform Cross-Fade**:
+  - Added seamless cross-fading (`xfade = Audio.XFADE`) on playout cursor jump repositioning (`snapBehind` / `snapPast`) using `plcNext()`, eliminating audible clicks and pops at discontinuity boundaries.
+  - Tuned `snapBehindMs = max(180.0, Double(jitTarget) * pktMs * 2.5)` to absorb post-stall packet bursts without letting stale backlogs (> 180 ms) linger in conversation.
+- **Natural Pitch-Bounded Governor Rate**:
+  - Bounded transient playout rate governor speedup to +1.2% (1.012, < 20 cents pitch shift) for backlogs > 25 ms, eliminating unnatural chipmunk vocal distortion while smoothly draining excess packets.
+- **Unblocked Dynamic Jitter Adaptation from Network Delay Spread**:
+  - Explicitly unblocked dynamic jitter buffer target scaling (`needsSpreadGrowth`) when measured round-trip spread (`tsync.rttSpreadMs > 15 ms`) is detected, preventing false refusals on high-jitter transatlantic paths while preserving 2-packet (1.33 ms) minimum latency on direct LAN connections.
+- **Preserved Near-Voice Consonant Attacks in Duplex Gate**:
+  - Restored immediate fast exponential opening (~1 ms, `openStep = 0.02`) on detected near voice onset (`aboveEcho && aboveRoom`), protecting initial plosives and consonants from being clipped or muffled during interruptions while retaining smooth 15 ms release on quiet transitions.
+- **Transit Delay Retention Across Turn Handoffs**:
+  - Prevented zero-transit parameter calls from clobbering measured `farTransitMs` in `Floor.noteFar`, ensuring trailing syllables of in-flight speech over intercontinental routes are never truncated.
+
 ## Kin 0.148.0 — 2026-09-05
 
 ### Fixed — Ultra-low latency audio pipeline improvements: dynamic jitter adaptation, anti-flapping duplex gate, and transit-scaled floor lag
