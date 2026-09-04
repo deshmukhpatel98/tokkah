@@ -843,7 +843,7 @@ export class Room implements DurableObject {
     const [client, server] = [pair[0], pair[1]];
     server.accept();
     this.cfRelaySockets.add(server);
-    this.cfSocketMeta.set(server, { country, countryCode, city, colo: ingress, asOrg, isVpn: true });
+    this.cfSocketMeta.set(server, { country, countryCode, city, colo: ingress, asOrg, isVpn: !!isVpn });
 
     try {
       server.send(JSON.stringify({
@@ -880,7 +880,7 @@ export class Room implements DurableObject {
           peerCountryCode: peerMeta?.countryCode ?? null,
           peerCity: peerMeta?.city ?? null,
           peerColo: peerMeta?.colo ?? null,
-          peerIsVpn: true,
+          peerIsVpn: !!peerMeta?.isVpn,
         });
         try { s.send(msg); } catch { /* closing */ }
       }
