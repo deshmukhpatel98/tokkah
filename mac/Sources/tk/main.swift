@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.141.0"
+let VERSION = "0.142.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -545,9 +545,9 @@ let KNOWN_FLAGS: Set<String> = [
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
-  // The far-away test on from the first packet, for the rig and for a Mac
-  // driven from a terminal; the sheet and the menu switch it during a call.
-  "far-test",
+  // The far-away test / integrated VPN on from the first packet, for the rig
+  // and for a Mac driven from a terminal; the sheet and the menu switch it during a call.
+  "far-test", "vpn",
   "no-vdenoise", "vdenoise-t", "vdenoise-floor", "vdenoise-deadband", "camrec", "camrec-secs", "vpsnr-dump", "cam-native-size", "vbytes-cap", "vcodec",
   "ring-only", "bye-only", "rings", "rings-for", "ring-gap", "stand-down", "call", "no-rings", "io", "no-agc", "audio-route", "gate-close-ms",
   // `no-ring-preview` was read by main.swift and missing from here, so passing it
@@ -3670,7 +3670,7 @@ if let room = arg("room") {
   // switch and the far end's beat has something to land on. It opens no socket
   // until somebody turns it on. See CloudflareTunnel.swift.
   FarTest.shared = FarTest(room: room, wire: wire)
-  if flag("far-test") { FarTest.shared?.setMine(true) }
+  if flag("far-test") || flag("vpn") { FarTest.shared?.setMine(true) }
 
   // Keep the lease alive and keep re-reading: if the peer restarts, its NAT port
   // changes and the old address goes dead silently.

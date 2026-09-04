@@ -5349,12 +5349,35 @@ final class CallControls: NSView {
     // the other side of the world. A switch, one sentence, and the one number
     // the feature exists to show. The sheet re-reads once a second, so the
     // sentence tracks the relay coming up without anybody pressing anything.
+    // ── THE INTEGRATED VPN ───────────────────────────────────────────────────
     if let f = FarTest.shared {
-      let far = SheetRow("Far-away test", glyph: Glyph.more)
+      let far = SheetRow("Integrated VPN", glyph: Glyph.more)
       far.switchState = f.on
       far.target = self; far.action = #selector(toggleFarTestRow(_:))
       items.append(far)
       items.append(SheetHint(f.sentence))
+    }
+    if FarTest.shared?.on != true {
+      if Rendezvous.peerIsVpn && !Rendezvous.peerCountry.isEmpty {
+        let peerC = FarTest.countryName(codeOrName: Rendezvous.peerCountry)
+        let pCity = Rendezvous.peerCity.isEmpty ? "" : " (\(Rendezvous.peerCity))"
+        let vpn = SheetRow("Remote VPN", glyph: Glyph.lock)
+        vpn.inert = true
+        vpn.value = peerC
+        vpn.valueIsWord = true
+        items.append(vpn)
+        items.append(SheetHint("The other person is routed via a VPN in \(peerC)\(pCity)."))
+      }
+      if Rendezvous.myIsVpn && !Rendezvous.myCountry.isEmpty {
+        let myC = FarTest.countryName(codeOrName: Rendezvous.myCountry)
+        let mCity = Rendezvous.myCity.isEmpty ? "" : " (\(Rendezvous.myCity))"
+        let vpn = SheetRow("Your VPN", glyph: Glyph.lock)
+        vpn.inert = true
+        vpn.value = myC
+        vpn.valueIsWord = true
+        items.append(vpn)
+        items.append(SheetHint("You are routed via a VPN in \(myC)\(mCity)."))
+      }
     }
 
     items.append(safety)

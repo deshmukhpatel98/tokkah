@@ -175,7 +175,34 @@ func localIPv4() -> String? {
 // inbound holes -- which is why BOTH sides must send even before either has
 // received anything.
 enum Rendezvous {
-  struct Peer { let id: String; let ip: String; let port: UInt16; let ageMs: Int; let localIP: String?; let localPort: UInt16?; let relayIP: String?; let relayPort: UInt16? }
+  struct Peer {
+    let id: String
+    let ip: String
+    let port: UInt16
+    let ageMs: Int
+    let localIP: String?
+    let localPort: UInt16?
+    let relayIP: String?
+    let relayPort: UInt16?
+    let country: String?
+    let city: String?
+    let isVpn: Bool
+
+    init(id: String, ip: String, port: UInt16, ageMs: Int, localIP: String?, localPort: UInt16?,
+         relayIP: String?, relayPort: UInt16?, country: String? = nil, city: String? = nil, isVpn: Bool = false) {
+      self.id = id; self.ip = ip; self.port = port; self.ageMs = ageMs
+      self.localIP = localIP; self.localPort = localPort
+      self.relayIP = relayIP; self.relayPort = relayPort
+      self.country = country; self.city = city; self.isVpn = isVpn
+    }
+  }
+
+  nonisolated(unsafe) static var myCountry: String = ""
+  nonisolated(unsafe) static var myCity: String = ""
+  nonisolated(unsafe) static var myIsVpn: Bool = false
+  nonisolated(unsafe) static var peerCountry: String = ""
+  nonisolated(unsafe) static var peerCity: String = ""
+  nonisolated(unsafe) static var peerIsVpn: Bool = false
 
   /// Publish our address and return whoever else is in the room.
   ///
@@ -208,6 +235,9 @@ enum Rendezvous {
       guard let d,
             let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
             let arr = o["peers"] as? [[String: Any]] else { return }
+      if let mc = o["country"] as? String, !mc.isEmpty { myCountry = mc }
+      if let mci = o["city"] as? String, !mci.isEmpty { myCity = mci }
+      if let mv = o["isVpn"] as? Bool { myIsVpn = mv }
       // Assigned HERE and not before the guards: an answer that arrived and did
       // not parse is not an answer about the room, and promoting it to "the room
       // is empty" is the same mistake in a different costume.
@@ -226,9 +256,17 @@ enum Rendezvous {
           let rb = r.split(separator: ":")
           if rb.count == 2, let rp = UInt16(rb[1]) { rip = String(rb[0]); rport = rp }
         }
+        let pCountry = p["country"] as? String
+        let pCity = p["city"] as? String
+        let pIsVpn = (p["isVpn"] as? Bool) ?? false
+        if let pCountry, !pCountry.isEmpty {
+          peerCountry = pCountry
+          peerCity = pCity ?? ""
+          peerIsVpn = pIsVpn
+        }
         out?.append(Peer(id: id, ip: String(bits[0]), port: port,
                          ageMs: (p["ageMs"] as? Int) ?? 0, localIP: lip, localPort: lport,
-                         relayIP: rip, relayPort: rport))
+                         relayIP: rip, relayPort: rport, country: pCountry, city: pCity, isVpn: pIsVpn))
       }
     }.resume()
     _ = sem.wait(timeout: .now() + 10)

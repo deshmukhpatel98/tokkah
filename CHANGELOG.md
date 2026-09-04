@@ -5,6 +5,14 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.142.0 — 2026-09-04
+
+### Added — Integrated VPN and exact country reporting for callers routed via VPN
+
+- **Integrated VPN Shipped**: Shipped the integrated VPN relay across the entire app — available directly in the More sheet (`...`), the Call menu (⌘⇧T), and via the `--vpn` CLI flag (with complete backwards compatibility for `--far-test`). Media packets route end-to-end through Cloudflare's dedicated South America relay with live round trip timing and packet telemetry.
+- **Exact Country Reporting**: For callers routed via a VPN (whether through the integrated VPN relay or via an external VPN detected over rendezvous), Kin now detects and shows the exact country and city they are routed through (e.g., Brazil (São Paulo), Chile (Santiago), Netherlands (Amsterdam), Norway (Oslo)) rather than generic continent names or silence.
+- **Peer and Dual-End Visibility**: In-call sheets and status lines clearly indicate whenever you or the remote peer are routed via a VPN, showing the exact country of egress for each participant.
+
 ## Kin 0.141.0 — 2026-09-04
 
 ### Improved — Pure 48 kHz linear PCM audio preservation, turn cues, and anti-ratchet jitter recovery

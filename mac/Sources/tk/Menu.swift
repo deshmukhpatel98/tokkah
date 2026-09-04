@@ -159,10 +159,9 @@ enum Menu {
                  keyEquivalent: "").target = Target.shared
     let code = call.addItem(withTitle: "Show Encryption Code", action: #selector(Target.more), keyEquivalent: "")
     code.target = Target.shared
-    // The far-away test: the call, routed to South America and back. A test
-    // feature with a menu item because the person testing it drives from the
-    // keyboard on two Macs at once.
-    let far = call.addItem(withTitle: "Far-Away Test", action: #selector(Target.farTest), keyEquivalent: "t")
+    // The integrated VPN: the call, routed via Cloudflare's relay in South America
+    // (Brazil / Chile) and back.
+    let far = call.addItem(withTitle: "Integrated VPN", action: #selector(Target.farTest), keyEquivalent: "t")
     far.keyEquivalentModifierMask = [.command, .shift]; far.target = Target.shared
     call.addItem(.separator())
     // Command-Delete, the same key a Mac uses everywhere else for "get rid of it",

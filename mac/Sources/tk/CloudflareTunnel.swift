@@ -39,6 +39,14 @@ final class CloudflareTunnel {
   private(set) var packetsSent = 0, packetsRecv = 0, bytesSent = 0, bytesRecv = 0
   private(set) var loopbackPort: UInt16 = 0
   private(set) var lastError = ""
+  private(set) var relayCountry = ""
+  private(set) var relayCountryCode = ""
+  private(set) var relayCity = ""
+  private(set) var relayColo = ""
+  private(set) var myCountry = ""
+  private(set) var myCity = ""
+  private(set) var peerCountry = ""
+  private(set) var peerCity = ""
 
   private var wsTask: URLSessionWebSocketTask?
   private var session: URLSession?
@@ -203,15 +211,40 @@ final class CloudflareTunnel {
       lock.lock()
       let first = !isConnected
       isConnected = true
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      if let mc = j["country"] as? String, !mc.isEmpty { myCountry = mc }
+      if let mci = j["city"] as? String, !mci.isEmpty { myCity = mci }
+      let rCountry = relayCountry
+      let rCity = relayCity
       lock.unlock()
       if first {
-        fputs("far test: relay reached (\(j["ingress"] as? String ?? "?") -> south america)\n", stderr)
+        let cName = FarTest.countryName(codeOrName: rCountry.isEmpty ? "Brazil" : rCountry)
+        let loc = cName.isEmpty ? "south america" : "\(cName)\(rCity.isEmpty ? "" : " (\(rCity))")"
+        fputs("far test: relay reached (\(j["ingress"] as? String ?? "?") -> \(loc))\n", stderr)
         Metrics.count("far_test_connects")
+        Metrics.count("vpn_connects")
       }
       if let peers { notePeers(peers) }
     case "xcont-peers":
+      lock.lock()
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      if let pc = j["peerCountry"] as? String, !pc.isEmpty { peerCountry = pc }
+      if let pci = j["peerCity"] as? String, !pci.isEmpty { peerCity = pci }
+      lock.unlock()
       if let peers { notePeers(peers) }
     case "xcont-pong":
+      lock.lock()
+      if let rc = j["relayCountry"] as? String, !rc.isEmpty { relayCountry = rc }
+      if let rcc = j["relayCountryCode"] as? String, !rcc.isEmpty { relayCountryCode = rcc }
+      if let rci = j["relayCity"] as? String, !rci.isEmpty { relayCity = rci }
+      if let rco = j["relayColo"] as? String, !rco.isEmpty { relayColo = rco }
+      lock.unlock()
       if let peers { notePeers(peers) }
       // `t` went out as an integer host-clock stamp and comes back verbatim.
       var t: UInt64 = 0
@@ -232,9 +265,11 @@ final class CloudflareTunnel {
     let was = relayPeers >= 2
     relayPeers = n
     let now = active && isConnected && n >= 2
+    let rCountry = relayCountry
     lock.unlock()
     if now != was {
-      fputs(now ? "far test: both ends on the relay -- routing the call through South America\n"
+      let cName = FarTest.countryName(codeOrName: rCountry.isEmpty ? "South America" : rCountry)
+      fputs(now ? "far test: both ends on the relay -- routing the call through \(cName)\n"
                 : "far test: the other end is not on the relay -- media is direct until it is\n", stderr)
     }
   }
@@ -347,24 +382,42 @@ final class FarTest {
 
   private func apply() { tunnel.setActive(on) }
 
+  var relayCountry: String { tunnel.relayCountry }
+  var relayCity: String { tunnel.relayCity }
+  var myCountry: String { tunnel.myCountry }
+  var peerCountry: String { tunnel.peerCountry }
+
+  static func countryName(codeOrName: String) -> String {
+    let trimmed = codeOrName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return "" }
+    if trimmed.count == 2 {
+      if let name = Locale(identifier: "en_US").localizedString(forRegionCode: trimmed.uppercased()) {
+        return name
+      }
+    }
+    return trimmed
+  }
+
+  var activeCountry: String {
+    if !tunnel.relayCountry.isEmpty {
+      return FarTest.countryName(codeOrName: tunnel.relayCountry)
+    }
+    return "Brazil"
+  }
+
   /// What the sheet and the status pill say. Plain words; the one number is the
   /// number this feature exists to show.
   var sentence: String {
     guard on else {
-      return "Off. Turn it on to send this call the long way round: through Cloudflare to South America and back, as if one of you were there."
+      return "Off. Turn it on to route this call via an integrated VPN."
     }
     let who = mine ? "" : " (turned on from the other end)"
-    guard connected else { return "Turning on\(who)… reaching Cloudflare's relay in South America." }
+    let cName = activeCountry
+    let loc = tunnel.relayCity.isEmpty ? cName : "\(cName) (\(tunnel.relayCity))"
+    guard connected else { return "Turning on\(who)… reaching integrated VPN in \(loc)." }
     let rtt = relayRttMs
-    if rtt < 0 { return "On\(who). Every packet crosses to South America and back. Measuring the relay…" }
-    // Delhi to South America and back cannot be under ~250 ms; an object that
-    // landed in Asia or Europe reads 100-150 from here, and a tester in Brazil
-    // reads 20 -- for whom this relay is not far away, which is exactly what
-    // the sentence should say.
-    if rtt < 220 {
-      return "On\(who), but the relay landed close by: \(Int(rtt)) ms round trip. This is not a far-away test right now."
-    }
-    return "On\(who). Every packet crosses to South America and back. Relay round trip \(Int(rtt)) ms."
+    if rtt < 0 { return "On\(who). Every packet is routed via VPN in \(loc). Measuring the relay…" }
+    return "On\(who). Every packet is routed via VPN in \(loc). Relay round trip \(Int(rtt)) ms."
   }
 
   /// The per-2-second log line: counts and the relay's round trip.
@@ -375,9 +428,10 @@ final class FarTest {
   }
 
   var short: String {
-    guard on else { return "Far-away test off" }
-    guard connected else { return "Far-away test: reaching South America…" }
+    guard on else { return "Integrated VPN off" }
+    let cName = activeCountry
+    guard connected else { return "VPN: reaching \(cName)…" }
     let rtt = relayRttMs
-    return rtt < 0 ? "Far-away test on" : "Far-away test on: \(Int(rtt)) ms to South America and back"
+    return rtt < 0 ? "VPN: routed via \(cName)" : "VPN: routed via \(cName) (\(Int(rtt)) ms)"
   }
 }
