@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.147.0"
+let VERSION = "0.148.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -6548,8 +6548,7 @@ if audio.jitAuto {
     // halved -- the maximum buffer was cut in half by a change that had nothing
     // to do with it. Same family as every other duration hidden inside a count in
     // this codebase (queue tolerance in ms; a codec win is a change of units).
-    let jitMaxMs = arg("jit-max-ms").flatMap { Double($0) } ?? 80.0
-    let JIT_MAX = max(JIT_MIN + 2, Int((jitMaxMs / pktMs).rounded()))
+    let baseJitMaxMs = arg("jit-max-ms").flatMap { Double($0) } ?? 80.0
     let GROW_BELOW_MS = 1.0     // headroom this thin is one jitter spike from a click
     // A TRICKLE OF LATE PACKETS IS NOT A BUFFER THAT IS TOO SMALL.
     //
@@ -6839,6 +6838,9 @@ if audio.jitAuto {
       // and snapsPast are now separate counters and ride in every beat, so the
       // question "was the buffer too small, or did this machine stall" is
       // answerable from a call record instead of from a guess.
+      let measuredSpread = tsync.rttSpreadMs ?? 0.0
+      let dynJitMaxMs = arg("jit-max-ms") != nil ? baseJitMaxMs : max(baseJitMaxMs, min(600.0, measuredSpread * 1.5))
+      let JIT_MAX = max(JIT_MIN + 2, Int((dynJitMaxMs / pktMs).rounded()))
       let legacyVeto = flag("jit-legacy-veto")
       if snappedBehind > 0 && (legacyVeto || (!starving && conc == 0)) {
         calm = 0
@@ -6877,7 +6879,19 @@ if audio.jitAuto {
         }
       } else if (late >= GROW_LATE_MIN && (near >= GROW_LATE_MIN || starving)) || (p01 < GROW_BELOW_MS && converged) || (starving && audio.jitTarget < JIT_MAX) {
         if audio.jitTarget < JIT_MAX {
-          audio.jitTarget += 1
+          let step: Int
+          if starving && starvedPct > 10.0 {
+            step = min(32, max(4, Int((starvedPct * 0.8).rounded())))
+          } else if starving && starvedPct > 2.0 {
+            step = min(16, max(2, Int((starvedPct * 0.5).rounded())))
+          } else if starving {
+            step = min(4, max(2, Int(starvedPct.rounded())))
+          } else if measuredSpread > 0 && Double(audio.jitTarget) * pktMs < min(dynJitMaxMs * 0.6, measuredSpread * 0.6) {
+            step = min(16, max(2, Int((((measuredSpread * 0.6) - Double(audio.jitTarget) * pktMs) / pktMs).rounded())))
+          } else {
+            step = 1
+          }
+          audio.jitTarget = min(JIT_MAX, audio.jitTarget + step)
           audio.jitGrows += 1
           // What just failed was the level we were AT, so nothing below the new
           // one is safe either.

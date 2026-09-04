@@ -145,7 +145,8 @@ final class Floor {
     var predictP: Double = 0.7
     /// How long the ear stays open after the floor leaves me. The far end's
     /// audio already in flight is their last half-word; closing my speaker the
-    /// instant the floor flips chops it off. One hop, from TimeSync.
+    /// instant the floor flips chops it off. Baseline one hop (60 ms), scaled
+    /// dynamically with measured one-way transit delay so sentence ends are never clipped.
     var playoutLagMs: Double = 60
     var on = true
     /// ── STRICT: ONE MICROPHONE, ONE LOUDSPEAKER, NEVER THE SAME END ─────────
@@ -857,7 +858,13 @@ final class Floor {
     // INTO my turn and then closes. The opening edge takes no lag at all --
     // that direction restores hearing, and the rule everywhere in this app is
     // that the direction which restores something is never the slow one.
-    if state == .mine, wasState != .mine { playoutHold = cfg.playoutLagMs }
+    if state == .mine, wasState != .mine {
+      // Scale playoutLagMs with measured one-way transit delay so in-flight speech
+      // sent before turn flip is never truncated when RTT / 2 > 60 ms.
+      // Include 25 ms playout buffer margin so the last packet clears the DAC.
+      let effectiveLag = farTransitMs > 0 ? max(cfg.playoutLagMs, min(600.0, farTransitMs + 25.0)) : cfg.playoutLagMs
+      playoutHold = effectiveLag
+    }
     wasState = state
     let earClosed = state == .mine && speakers && playoutHold <= 0
 
@@ -987,6 +994,11 @@ final class Floor {
       else if farVoicing { farSilentMs = transitMs }
       farVoicing = voicing
     }
+  }
+
+  /// Update the measured one-way transit delay directly (e.g. from TimeSync / Net).
+  func noteTransit(_ ms: Double) {
+    if ms > 0 { farTransitMs = ms }
   }
   /// `Predict.probability`, 0-1, that this end's current turn is ending.
   func noteEndProb(_ p: Double) { endProb = p }

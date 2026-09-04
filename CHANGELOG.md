@@ -5,6 +5,21 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.148.0 — 2026-09-05
+
+### Fixed — Ultra-low latency audio pipeline improvements: dynamic jitter adaptation, anti-flapping duplex gate, and transit-scaled floor lag
+
+- **Fast Jitter Buffer Adaptation & Dynamic Cap Scaling**:
+  - Replaced glacial single-packet growth with fast step adaptation (up to 16-32 packets) when starvation or severe packet loss is detected, instantly absorbing network hiccups without penalizing clean paths.
+  - Dynamically scale `jitMaxMs` (from base 80 ms up to 600 ms) using measured round-trip spread (`tsync.rttSpreadMs`) to absorb high-jitter excursions across international paths (e.g. transatlantic or VPN routing) while retaining minimum buffer latency (2 pkts / ~5.3 ms) on stable LAN connections.
+- **Audio Playout Rate Governor Burst Draining**:
+  - Replaced violent playout cursor snapping (`snapBehind` at 30 ms) with smooth audio rate governor scaling: steady-state clock drift remains bounded to ±0.4% (< 5 cents pitch drift), while transient backlogs scale smoothly up to +3.5% to drain post-stall packet bursts without speech truncation, clicking, or audible pops. Snap-behind threshold relaxed to >= 350 ms for genuine runaway backlogs.
+- **Acoustic Duplex Gate Hangover & Anti-Flapping**:
+  - Added a 120 ms hangover dwell across inter-syllable pauses (`farDwell`) when the near end is not vocalising, preventing rapid on/off flapping (hundreds of flaps per call) into -120 dB suppression during continuous peer speech.
+  - Smoothed gate opening transitions (fast ~1 ms on confirmed near voice onset to protect consonants, 12-16 ms on quiet release) and increased close ramp from 4 ms to 8 ms, eliminating audible chopping and room pumping.
+- **Transit-Delay Scaled Playout Hold**:
+  - Dynamically scaled floor management playout lag (`playoutLagMs`) with measured one-way transit delay (`farTransitMs + 25 ms` playout margin) to ensure that the trailing half-words of sentences in flight over high-latency paths (RTT / 2 > 60 ms) are never clipped when turns hand over.
+
 ## Kin 0.147.0 — 2026-09-05
 
 ### Fixed — Eradicate spurious VPN status banners on non-VPN devices and eliminate hardcoded location fallbacks

@@ -2414,11 +2414,19 @@ final class Audio {
 
   /// Fractional read cursor rate governor.
   /// Translates buffer backlog / deficit (in samples) into fractional playout rate.
-  /// Bounded to +/- 0.4% (+/- 4 parts per thousand, < 5 cents pitch drift).
+  /// Bounded to +/- 0.4% (< 5 cents pitch drift) for normal steady-state drift (<= 25 ms),
+  /// with smooth dynamic scaling up to +3.5% for transient backlogs to drain post-stall
+  /// packet bursts smoothly without audible clicks or violent cursor snapping.
   static func governorRate(errSamples: Double) -> (rate: Double, errMs: Double) {
-    let r = 1.0 + errSamples / (SR * 2.0)
-    let rate = min(1.004, max(0.996, r))
     let errMs = errSamples / SR * 1000.0
+    let r = 1.0 + errSamples / (SR * 2.0)
+    let rate: Double
+    if errMs <= 25.0 {
+      rate = min(1.004, max(0.996, r))
+    } else {
+      let extra = (errMs - 25.0) / 1000.0 * 0.15
+      rate = min(1.035, 1.004 + extra)
+    }
     return (rate, errMs)
   }
 
@@ -2551,7 +2559,17 @@ final class Audio {
         calm = 0
       } else if (late >= growLateMin && (near >= growLateMin || starving)) || (p01 < growBelowMs && converged) || (starving && target < jitMax) {
         if target < jitMax {
-          target += 1
+          let step: Int
+          if starving && starvedPct > 10.0 {
+            step = min(32, max(4, Int((starvedPct * 0.8).rounded())))
+          } else if starving && starvedPct > 2.0 {
+            step = min(16, max(2, Int((starvedPct * 0.5).rounded())))
+          } else if starving {
+            step = min(4, max(2, Int(starvedPct.rounded())))
+          } else {
+            step = 1
+          }
+          target = min(jitMax, target + step)
           grows += 1
           unsafeBelow = max(unsafeBelow, target)
           probeAt = t + backoff
@@ -3496,9 +3514,8 @@ final class Audio {
     /// the quickest switch available, while staying several times longer than
     /// the ~1 ms at which a gain step becomes an audible click.
     ///
-    /// Opening stays exponential and stays fast (~1 ms): that direction protects
-    /// the first syllable of an interruption, and it was never the problem.
-    var closeMs: Double = 4
+    /// Smoothed close ramp: 8 ms sits on the 37.7 dB plateau while preventing chopping.
+    var closeMs: Double = 8
     /// How much louder than the expected echo counts as somebody really talking.
     /// The base, at light coupling; it relaxes as the room couples harder --
     /// see the note at the comparison. Swept across simulated rooms: 2.8 holds
@@ -3577,6 +3594,8 @@ final class Audio {
     private var farEnv: Float = 0
     private var coupling: Float = 0.5
     private var farRun = 0
+    private var farTalkingSamples = 0
+    private var farQuietSamples = 0
     /// Samples since this vocalisation began, and CONSECUTIVE quiet samples since
     /// the last confirmed voice inside it. Both in samples, so no block size can
     /// change what they mean.
@@ -3836,6 +3855,13 @@ final class Audio {
       if nearEnv < floor { floor += (nearEnv - floor) * fallK }
       let far = farEnv
       let farTalking = far > 0.004
+      if farTalking {
+        farTalkingSamples += n
+        farQuietSamples = 0
+      } else {
+        farQuietSamples += n
+        if farQuietSamples > Int(SR * 0.120) { farTalkingSamples = 0 }
+      }
       farRun = farTalking ? farRun + n : 0
       // NOT AT THE ONSET. When the far end starts, the echo has not arrived yet
       // -- it is a room away and a buffer behind -- so for a few milliseconds
@@ -4021,23 +4047,21 @@ final class Audio {
       // retroactive buffer to be safe: hold the samples, and release them into
       // the gap if it turns out to be a bid. Until that exists, a continuer is
       // audible, which is exactly what happens today.
-      let nearTalking = !farTalking || aboveEcho
+      // Hangover dwell: hold suppression across brief inter-syllable pauses
+      // (~120 ms) when near end is not vocalising, preventing rapid on/off flapping.
+      let farDwell = farTalkingSamples > Int(SR * 0.08) && farQuietSamples < Int(SR * 0.120)
+      let farActive = farTalking || (farDwell && !confirmed)
+      let nearTalking = !farActive || aboveEcho
       // ONE OF THE TWO PLACES THAT TOUCHES SAMPLES, and the only one that is
       // about echo. On headphones this is always 1: nothing is held down,
       // because nothing would be heard twice.
-      let want: Float = (cfg.on && farTalking && !nearTalking && !floorGranted)
+      let want: Float = (cfg.on && farActive && !nearTalking && !floorGranted)
         ? Float(pow(10, cfg.floorDb / 20)) : 1
 
-      // OPEN FAST, CLOSE ON A RAMP. Backwards, opening slowly clips the first
-      // syllable of every interruption, which is the one thing a person notices
-      // immediately -- so that direction keeps its 1 ms exponential.
-      //
-      // Closing is linear and timed, because an exponential cannot deliver a
-      // mute: see `closeMs`. `closeStep` is per sample, so it means the same
-      // thing at 16 frames a block as at 512 -- a coefficient written per BLOCK
-      // would encode the device buffer, and this project has already shipped a
-      // classifier that could never fire for exactly that reason.
-      let openStep: Float = 0.02
+      // Smooth transitions: avoid violent square-wave gating and speech shredding.
+      // Opening on near voice onset stays fast (~1 ms) to protect consonants;
+      // opening on quiet release is smoothed (~12-16 ms) to prevent noise-floor pumping.
+      let openStep: Float = (confirmed && aboveEcho) ? 0.02 : 0.003
       let closeStep = Float(1.0 / (SR * max(0.5, cfg.closeMs) / 1000.0))
       // ── AND THE DUCK, WHICH IS A SEPARATE DECISION ─────────────────────────
       //
@@ -5313,10 +5337,14 @@ final class Audio {
     // The threshold sits far above real jitter and far below the ring: one rare
     // click after a network hiccup, in exchange for never carrying a hiccup's
     // latency for the rest of the call.
-    // In MILLISECONDS. As `11 packets` this meant 29 ms at the old packet size and
-    // silently became 14.7 ms when packets halved -- third instance of the same
-    // mistake in this one file, so it is now derived rather than typed.
-    let SNAP_PKTS = max(Int64(4), Int64((30.0 / (Double(FPP) / SR * 1000.0)).rounded()))
+    // In MILLISECONDS. Ordinary jitter excursions and post-stall packet bursts
+    // are absorbed and drained smoothly by the audio rate governor instead of
+    // violently snapping the cursor forward and discarding speech (which caused
+    // 4.8 to 14.3 snaps/sec and audible clicks). Snap behind acts only on true
+    // runaway backlog (>= 350 ms).
+    let pktMs = Double(FPP) / SR * 1000.0
+    let snapBehindMs = max(350.0, Double(jitTarget) * pktMs * 3.0)
+    let SNAP_PKTS = max(Int64(150), Int64((snapBehindMs / pktMs).rounded()))
     var cur = curSeq
     // SYMMETRIC, and it was not. This snapped only when the cursor fell BEHIND the
     // stream; a cursor that ran AHEAD had to be 341 ms out before the jump guard

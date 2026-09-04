@@ -2220,6 +2220,7 @@ final class Wire {
             // of noise and the turn layer wants the PATH, not this packet.
             Audio.owdMsNow = Audio.owdMsNow == 0 ? rtt / 2
                                                  : Audio.owdMsNow * 0.9 + rtt / 2 * 0.1
+            Audio.sharedFloor.noteTransit(Audio.owdMsNow)
           }
         }
         continue
