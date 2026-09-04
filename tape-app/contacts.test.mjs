@@ -2488,10 +2488,29 @@ const DEV2 = await device('dev2');
       eq(cfRes.status, 200, '(k6) cf-relay HTTP probe answers 200');
       const cfJson = await cfRes.json();
       eq(cfJson.ok, true, '(k6) cf-relay ok');
+      eq(cfJson.vpn, true, '(k6) cf-relay announces vpn: true');
       eq(cfJson.hint, 'sam', '(k6) the relay object is hinted to South America');
+      eq(cfJson.relayCountry, 'Brazil', '(k6) relay country is Brazil');
+      eq(cfJson.relayCountryCode, 'BR', '(k6) relay country code is BR');
+      eq(cfJson.relayCity, 'São Paulo', '(k6) relay city is São Paulo');
       eq(cfJson.peers, 0, '(k6) nobody on it yet');
       const plainRes = await mf.dispatchFetch('http://x/api/room/plainroom/cf-relay');
       eq(plainRes.status, 200, '(k6) the route exists on an ordinary room too (no hint there)');
+
+      // ── (k7) rv endpoint handles peer exchange and country reporting ────────
+      const rv1Res = await mf.dispatchFetch('http://x/api/room/testrv/rv?me=peer1&addr=1.2.3.4:5000');
+      eq(rv1Res.status, 200, '(k7) rv peer1 register answers 200');
+      const rv1Json = await rv1Res.json();
+      eq(rv1Json.me, 'peer1', '(k7) rv returns caller id');
+      eq(Array.isArray(rv1Json.peers), true, '(k7) peers is an array');
+      eq(rv1Json.peers.length, 0, '(k7) first peer has empty peer list');
+
+      const rv2Res = await mf.dispatchFetch('http://x/api/room/testrv/rv?me=peer2&addr=5.6.7.8:6000');
+      eq(rv2Res.status, 200, '(k7) rv peer2 register answers 200');
+      const rv2Json = await rv2Res.json();
+      eq(rv2Json.peers.length, 1, '(k7) peer2 sees peer1');
+      eq(rv2Json.peers[0].id, 'peer1', '(k7) peer1 is present in peer2 list');
+      eq(rv2Json.peers[0].addr, '1.2.3.4:5000', '(k7) peer1 address is present');
     }
   } finally {
     await mf.dispose();

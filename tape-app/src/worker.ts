@@ -145,6 +145,7 @@ const VPN_ORGS = [
   'vpn', 'proton', 'mullvad', 'nord', 'datacamp', 'm247', 'ovh', 'digitalocean',
   'linode', 'hetzner', 'leaseweb', 'choopa', 'constant company', 'warp',
   'expressvpn', 'surfshark', 'cyberghost', 'private internet access', 'ipvanish', 'windscribe',
+  'amazon', 'aws', 'google cloud', 'azure', 'oracle cloud', 'vultr', 'contabo', 'scaleway', 'kamatera',
 ];
 
 function isVpnOrg(asOrg: string | null | undefined): boolean {
@@ -183,7 +184,21 @@ const COUNTRY_NAMES: Record<string, string> = {
   NL: 'Netherlands', NO: 'Norway', FR: 'France', ES: 'Spain', IT: 'Italy',
   SE: 'Sweden', CH: 'Switzerland', IN: 'India', JP: 'Japan', SG: 'Singapore',
   AU: 'Australia', NZ: 'New Zealand', ZA: 'South Africa', AE: 'United Arab Emirates',
+  IE: 'Ireland', FI: 'Finland', PL: 'Poland', AT: 'Austria', BE: 'Belgium',
+  DK: 'Denmark', PT: 'Portugal', MX: 'Mexico', KR: 'South Korea', IL: 'Israel',
 };
+
+function getCountryName(code: string | null | undefined): string | null {
+  if (!code) return null;
+  const c = code.trim().toUpperCase();
+  if (COUNTRY_NAMES[c]) return COUNTRY_NAMES[c];
+  try {
+    const dn = new Intl.DisplayNames(['en'], { type: 'region' });
+    const name = dn.of(c);
+    if (name) return name;
+  } catch { /* fallback */ }
+  return c;
+}
 
 export class Room implements DurableObject {
   private peers = new Map<WebSocket, string>();
@@ -668,6 +683,7 @@ export class Room implements DurableObject {
     local?: string;
     relay?: string;
     country?: string;
+    countryCode?: string;
     city?: string;
     asOrg?: string;
     isVpn?: boolean;
@@ -686,7 +702,9 @@ export class Room implements DurableObject {
     const relay = url.searchParams.get('relay') ?? '';
     const addrOk = (a: string) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(a);
 
-    const country = (request.cf?.country as string | undefined) ?? null;
+    const rawCountry = (request.cf?.country as string | undefined) ?? null;
+    const country = getCountryName(rawCountry);
+    const countryCode = rawCountry ? rawCountry.toUpperCase() : null;
     const city = (request.cf?.city as string | undefined) ?? null;
     const asOrg = (request.cf?.asOrganization as string | undefined) ?? null;
     const isVpn = isVpnOrg(asOrg) || !!(request.cf as Record<string, unknown> | undefined)?.isWarp;
@@ -706,6 +724,7 @@ export class Room implements DurableObject {
         local: local || undefined,
         relay: relay || undefined,
         country: country || undefined,
+        countryCode: countryCode || undefined,
         city: city || undefined,
         asOrg: asOrg || undefined,
         isVpn: isVpn || undefined,
@@ -720,11 +739,12 @@ export class Room implements DurableObject {
         local: v.local,
         relay: v.relay,
         country: v.country || null,
+        countryCode: v.countryCode || null,
         city: v.city || null,
         isVpn: !!v.isVpn,
         ageMs: now - v.at,
       }));
-    return json({ me, country, city, isVpn, peers: others });
+    return json({ me, country, countryCode, city, isVpn, peers: others });
   }
 
   // ── THE INTEGRATED VPN / FAR-AWAY RELAY ──────────────────────────────────
@@ -745,6 +765,7 @@ export class Room implements DurableObject {
   private cfRelaySockets = new Set<WebSocket>();
   private cfSocketMeta = new Map<WebSocket, {
     country: string | null;
+    countryCode?: string | null;
     city: string | null;
     colo: string | null;
     asOrg: string | null;
@@ -781,7 +802,9 @@ export class Room implements DurableObject {
   private cfRelay(request: Request, url: URL): Response {
     this.resolveRelayLocation();
     const ingress = (request.cf?.colo as string | undefined) ?? null;
-    const country = (request.cf?.country as string | undefined) ?? null;
+    const rawCountry = (request.cf?.country as string | undefined) ?? null;
+    const country = getCountryName(rawCountry);
+    const countryCode = rawCountry ? rawCountry.toUpperCase() : null;
     const city = (request.cf?.city as string | undefined) ?? null;
     const asOrg = (request.cf?.asOrganization as string | undefined) ?? null;
     const isVpn = isVpnOrg(asOrg) || !!(request.cf as Record<string, unknown> | undefined)?.isWarp;
@@ -794,6 +817,7 @@ export class Room implements DurableObject {
         hint: 'sam',
         ingress,
         country,
+        countryCode,
         city,
         relayCountry: this.cfRelayLocation.country,
         relayCountryCode: this.cfRelayLocation.countryCode,
@@ -805,7 +829,7 @@ export class Room implements DurableObject {
     const [client, server] = [pair[0], pair[1]];
     server.accept();
     this.cfRelaySockets.add(server);
-    this.cfSocketMeta.set(server, { country, city, colo: ingress, asOrg, isVpn: true });
+    this.cfSocketMeta.set(server, { country, countryCode, city, colo: ingress, asOrg, isVpn: true });
 
     try {
       server.send(JSON.stringify({
@@ -814,6 +838,7 @@ export class Room implements DurableObject {
         ingress,
         peers: this.cfRelaySockets.size,
         country,
+        countryCode,
         city,
         relayCountry: this.cfRelayLocation.country,
         relayCountryCode: this.cfRelayLocation.countryCode,
@@ -838,6 +863,7 @@ export class Room implements DurableObject {
           relayCity: this.cfRelayLocation.city,
           relayColo: this.cfRelayLocation.colo,
           peerCountry: peerMeta?.country ?? null,
+          peerCountryCode: peerMeta?.countryCode ?? null,
           peerCity: peerMeta?.city ?? null,
           peerColo: peerMeta?.colo ?? null,
           peerIsVpn: true,
@@ -4932,6 +4958,12 @@ export class Health implements DurableObject {
       });
     }
     return json({ error: 'not found' }, 404);
+  }
+
+  private adminOk(t: string | null): boolean {
+    if (t === null) return false;
+    if (this.env.LOG_ADMIN_TOKEN && t === this.env.LOG_ADMIN_TOKEN) return true;
+    return !!this.env.AGENT_KEY && t === this.env.AGENT_KEY;
   }
 }
 
