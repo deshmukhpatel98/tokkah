@@ -20,13 +20,48 @@
     }
   }
 
+  // "Watch with sound" used to reload the frame with ?autoplay=1. A freshly
+  // loaded document has no user gesture of its own, so every browser kept its
+  // AudioContext suspended and the film played silent -- the reported bug. Now
+  // the click drives the film that is already running: the frame is same-origin,
+  // so the gesture on this page counts inside it too, and the film creates and
+  // resumes its audio in the same task. The reload stays only as the fallback
+  // for a frame that has not finished loading.
   if (filmCtrlBtn && filmIframe) {
     filmCtrlBtn.addEventListener('click', () => {
-      filmIframe.src = '/ad/kin-ad?autoplay=1';
-      if (filmCtrlText) {
-        filmCtrlText.textContent = 'Restart with sound';
+      const film = filmIframe.contentWindow && filmIframe.contentWindow.kinAd;
+      if (isNarrow) goBig();
+      if (film && typeof film.playWithSound === 'function') {
+        film.playWithSound();
+      } else {
+        filmIframe.src = '/ad/kin-ad?autoplay=1';
+      }
+      if (filmCtrlText) filmCtrlText.textContent = 'Restart with sound';
+    });
+
+    // Leaving full screen on a phone pauses the film rather than letting it
+    // play on unseen in a 200 px box.
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement) {
+        const film = filmIframe.contentWindow && filmIframe.contentWindow.kinAd;
+        if (film && typeof film.pause === 'function') film.pause();
+        if (filmCtrlText) filmCtrlText.textContent = 'Play film';
       }
     });
+  }
+
+  // On a phone the 16:9 film in a portrait page is a postage stamp, so playing
+  // it asks for the whole screen and a landscape lock. Both are best effort:
+  // iPhone Safari offers neither for a frame, and there the film plays in place.
+  function goBig() {
+    try {
+      const box = filmIframe.parentElement || filmIframe;
+      const req = box.requestFullscreen || box.webkitRequestFullscreen;
+      if (!req) return;
+      Promise.resolve(req.call(box)).then(() => {
+        if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
+      }).catch(() => {});
+    } catch (e) { /* stays in place */ }
   }
 
   // ── WAITLIST ENHANCEMENT ──────────────────────────────────────────────────

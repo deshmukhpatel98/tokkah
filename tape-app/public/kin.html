@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Kin — As close as light allows</title>
   <meta name="description" content="Video calls that feel like the same room. Lossless sound, the camera's own picture, and one goal: under 150 milliseconds, anywhere on Earth. Free on Mac.">
   <meta name="theme-color" content="#06080d">
@@ -85,6 +85,13 @@
       height: 100%;
       border: 0;
       display: block;
+    }
+
+    .film-box:fullscreen {
+      width: 100vw;
+      height: 100vh;
+      aspect-ratio: auto;
+      background: #05060a;
     }
 
     .film-control-bar {
@@ -541,12 +548,48 @@
 
     @media (max-width: 719px) {
       .section {
-        padding: 90px 20px;
+        padding: 72px max(20px, env(safe-area-inset-left)) 72px max(20px, env(safe-area-inset-right));
         min-height: auto;
       }
       .hero-story {
-        padding: 70px 20px 50px;
+        padding: 56px 20px 44px;
         min-height: auto;
+      }
+      .film-control-bar {
+        padding: 10px 16px;
+      }
+      .film-ctrl-btn {
+        min-height: 44px;
+        padding: 10px 22px;
+        font-size: 15px;
+      }
+      .wordmark {
+        font-size: 72px;
+      }
+      .tagline {
+        font-size: 24px;
+        margin: 16px 0 30px;
+      }
+      .meta {
+        font-size: 12px;
+        line-height: 1.8;
+        white-space: normal;
+      }
+      .meta span {
+        white-space: nowrap;
+      }
+      .body-text {
+        font-size: 17.5px;
+        line-height: 1.6;
+      }
+      .demo-window {
+        width: min(280px, 100%);
+      }
+      .footer-links {
+        font-size: 13px;
+      }
+      footer {
+        padding: 56px 20px calc(48px + env(safe-area-inset-bottom));
       }
       .headline {
         font-size: 34px;
@@ -605,7 +648,8 @@
       <iframe
         id="hero-film"
         src="/ad/kin-ad?autoplay=1&amp;muted=1&amp;loop=1"
-        allow="autoplay"
+        allow="autoplay; fullscreen"
+        allowfullscreen
         title="Kin — Animated film"></iframe>
     </div>
     <div class="film-control-bar">

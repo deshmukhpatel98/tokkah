@@ -506,6 +506,31 @@
       pointer-events: auto;
       color: #f3f1ec;
     }
+    /* One tap inside THIS frame is the only thing every browser accepts as
+       permission for sound. Shown while the film runs muted (the site's hero)
+       and whenever the browser kept the audio suspended. */
+    #sound-pill {
+      position: absolute;
+      bottom: 96px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 26px;
+      border-radius: 999px;
+      background: rgba(10, 14, 22, 0.62);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      color: #f3f1ec;
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      font-size: 22px;
+      cursor: pointer;
+      pointer-events: auto;
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+    #sound-pill:hover { background: rgba(10, 14, 22, 0.8); }
+
     #replay-button {
       position: absolute;
       top: 890px;
@@ -619,6 +644,10 @@
             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
             <path id="volume-waves" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
           </svg>
+        </div>
+        <div id="sound-pill" role="button" tabindex="0">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
+          <span id="sound-pill-text">Watch with sound</span>
         </div>
         <button id="replay-button">↺ Replay</button>
       </div>

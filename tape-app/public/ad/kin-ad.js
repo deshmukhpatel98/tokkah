@@ -231,15 +231,33 @@
 
   // --- Cached DOM Elements ---
   const el = {};
+  // On a phone the 1920x1080 stage is drawn at a third of its size or less, so
+  // the three canvases run at half resolution there: a quarter of the pixels
+  // per frame, indistinguishable after the CSS downscale. Never in render mode.
+  const CANVAS_SCALE = (() => {
+    const q = new URLSearchParams(window.location.search);
+    if (q.has("render")) return 1;
+    const cssShort = Math.min(window.screen.width || 1920, window.screen.height || 1080);
+    return (cssShort < 700 || /Mobi|Android/i.test(navigator.userAgent)) ? 0.5 : 1;
+  })();
+
+  function fitCanvas(canvas) {
+    canvas.width = Math.round(STAGE_WIDTH * CANVAS_SCALE);
+    canvas.height = Math.round(STAGE_HEIGHT * CANVAS_SCALE);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(CANVAS_SCALE, 0, 0, CANVAS_SCALE, 0, 0);
+    return ctx;
+  }
+
   function cacheElements() {
     el.stageContainer = document.getElementById("stage-container");
     el.stage = document.getElementById("stage");
     el.canvasRipples = document.getElementById("canvas-ripples");
-    el.ctxRipples = el.canvasRipples.getContext("2d");
+    el.ctxRipples = fitCanvas(el.canvasRipples);
     el.canvasGlobe = document.getElementById("canvas-globe");
-    el.ctxGlobe = el.canvasGlobe.getContext("2d");
+    el.ctxGlobe = fitCanvas(el.canvasGlobe);
     el.canvasGrain = document.getElementById("canvas-grain");
-    el.ctxGrain = el.canvasGrain.getContext("2d");
+    el.ctxGrain = fitCanvas(el.canvasGrain);
 
     el.act2Container = document.getElementById("act2-container");
     el.kinCornerWordmark = document.getElementById("kin-corner-wordmark");
@@ -275,6 +293,8 @@
     el.muteToggle = document.getElementById("mute-toggle");
     el.volumeWaves = document.getElementById("volume-waves");
     el.replayButton = document.getElementById("replay-button");
+    el.soundPill = document.getElementById("sound-pill");
+    el.soundPillText = document.getElementById("sound-pill-text");
   }
 
   // --- Pre-render Templates: Bokeh Discs & Soft Portraits ---
@@ -1866,14 +1886,75 @@
         }
       }
       if (_liveAudioCtx && _liveAudioCtx.state === "suspended") {
-        _liveAudioCtx.resume();
+        _liveAudioCtx.resume().catch(() => {});
       }
       if (_liveAudioCtx && !_liveScoreNodes) {
         _liveScoreNodes = buildScoreGraph(_liveAudioCtx, _liveAudioCtx.currentTime - _currentT, false);
       }
+      // A browser that had no user gesture for this document keeps the context
+      // suspended and says nothing. Watch its state: while it is not running,
+      // offer the one thing that always works -- a tap inside this frame.
+      if (_liveAudioCtx) {
+        _liveAudioCtx.onstatechange = () => updateSoundPill();
+        setTimeout(updateSoundPill, 400);
+      }
     } catch (err) {
       console.warn("Audio start error:", err);
     }
+  }
+
+  function updateSoundPill() {
+    if (!el.soundPill || isRender) return;
+    const suspended = !!_liveAudioCtx && _liveAudioCtx.state !== "running" && !_muted && _playing;
+    const mutedAutoplay = _muted && _playing && isAutoplay;
+    if (suspended) {
+      el.soundPillText.textContent = "Tap for sound";
+      el.soundPill.style.display = "flex";
+    } else if (mutedAutoplay) {
+      el.soundPillText.textContent = "Watch with sound";
+      el.soundPill.style.display = "flex";
+    } else {
+      el.soundPill.style.display = "none";
+    }
+  }
+
+  // Restart from the top with sound, synchronously inside whatever gesture
+  // called us: the AudioContext is created and resumed in the same task, which
+  // is the only ordering every browser honours. Same-origin parents may call
+  // this from their own click handlers (activation propagates to same-origin
+  // frames), which is how the site's "Watch with sound" button works without
+  // reloading the frame and losing the gesture.
+  function playWithSound() {
+    pause();
+    _muted = false;
+    if (el.volumeWaves) el.volumeWaves.style.display = "block";
+    if (_atRestBeforePlay) {
+      _atRestBeforePlay = false;
+      if (el.restDimOverlay) el.restDimOverlay.style.display = "none";
+    }
+    el.replayButton.style.display = "none";
+    _currentT = 0;
+    render(0);
+    play();
+    updateSoundPill();
+  }
+
+  // A film in a small frame on a phone is a postage stamp. When this document
+  // is framed and narrow, a tap to play also asks for the whole screen and a
+  // landscape lock; both are best-effort and silently declined where the
+  // browser does not offer them (iPhone Safari), in which case the film simply
+  // plays where it is.
+  function goBigIfSmall() {
+    try {
+      if (window.top === window.self || window.innerWidth >= 720) return;
+      const root = document.documentElement;
+      const req = root.requestFullscreen || root.webkitRequestFullscreen;
+      if (req) {
+        Promise.resolve(req.call(root)).then(() => {
+          if (screen.orientation && screen.orientation.lock) screen.orientation.lock("landscape").catch(() => {});
+        }).catch(() => {});
+      }
+    } catch (e) {}
   }
 
   function stopLiveAudio() {
@@ -1899,6 +1980,7 @@
     el.replayButton.style.display = "none";
     _lastRafTime = performance.now();
     startLiveAudio();
+    updateSoundPill();
 
     function loop(now) {
       if (!_playing) return;
@@ -1951,6 +2033,7 @@
       el.volumeWaves.style.display = "block";
       if (_playing) startLiveAudio();
     }
+    updateSoundPill();
   }
 
   // --- Query Flags Parsing (§7) ---
@@ -1971,6 +2054,11 @@
     pause,
     toggle,
     setMuted,
+    playWithSound,
+    get audioState() {
+      if (_muted) return "muted";
+      return _liveAudioCtx ? _liveAudioCtx.state : "none";
+    },
     transcript: TRANSCRIPT,
 
     // seek(t): renders frame and resolves AFTER double requestAnimationFrame
@@ -2017,7 +2105,16 @@
     } else {
       el.playButtonOverlay.addEventListener("click", e => {
         e.stopPropagation();
+        goBigIfSmall();
         play();
+      });
+
+      el.soundPill.addEventListener("click", e => {
+        e.stopPropagation();
+        goBigIfSmall();
+        if (_muted) playWithSound();
+        else startLiveAudio();
+        updateSoundPill();
       });
 
       el.stage.addEventListener("click", e => {
