@@ -107,7 +107,7 @@ await stage("assemble", async () => {
   let audio = scoreWav;
   if (voWav && fs.existsSync(voWav)) {
     // level each stem first: the voice to -18 LUFS (peaks under -4), the bed to -28 LUFS, then duck the bed under the voice
-    const gS = toward(measure(scoreWav), -28, -8), gV = toward(measure(voWav), -18, -4);
+    const gS = toward(measure(scoreWav), -26, -8), gV = toward(measure(voWav), -18, -4);
     console.error(`# stems: score ${gS >= 0 ? "+" : ""}${gS.toFixed(1)} dB, voice ${gV >= 0 ? "+" : ""}${gV.toFixed(1)} dB`);
     audio = path.join(work, "mixed.wav");
     const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", scoreWav, "-i", voWav, "-filter_complex",

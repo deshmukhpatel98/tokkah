@@ -502,6 +502,7 @@
   function buildAtlas() { atlas.them = buildPortrait("them"); atlas.you = buildPortrait("you"); }
 
   // ---------------------------------------------------------------- lib: drawing
+  const errors = [];
   let clipRadius = 0;
   function clipRect(ctx, x, y, w, h) { const r = clipRadius; if (r > 0 && ctx.roundRect) ctx.roundRect(x, y, w, h, [0, 0, r, r]); else ctx.rect(x, y, w, h); }
   function glow(ctx, x, y, r, color, alpha) { if (alpha <= 0.002 || r <= 0) return; ctx.save(); ctx.globalAlpha = clamp(alpha, 0, 1); ctx.drawImage(sprite(color), x - r, y - r, 2 * r, 2 * r); ctx.restore(); }
@@ -518,18 +519,44 @@
   }
   const pathCache = new Map();
   function path2d(d) { let P = pathCache.get(d); if (!P) { try { P = new Path2D(d); } catch (e) { P = new Path2D(); } pathCache.set(d, P); } return P; }
-  // shape: an SVG path in a 0..1000 box. o: {x,y (centre px), size (box height px), fill, stroke, strokeWidth, alpha, rotate (rad), scaleX, scaleY, glow (0..1), dash}
-  function shape(ctx, d, o = {}) {
-    const P = path2d(d), size = o.size || 500, sc = size / 1000, alpha = o.alpha ?? 1;
-    if (alpha <= 0.002) return;
-    ctx.save(); ctx.globalAlpha = clamp(alpha, 0, 1);
+  // Paint for a layer: a colour name/array/hex, or a gradient in 0..1000 box
+  // coordinates: {linear:[x0,y0,x1,y1], stops:[[pos,color],...]} or
+  // {radial:[cx,cy,r0,r1], stops:[...]} (stops may carry a 3rd alpha entry).
+  function paintFor(ctx, f) {
+    if (!f || f === "none") return null;
+    if (typeof f === "object" && !Array.isArray(f) && (f.linear || f.radial)) {
+      const g = f.linear ? ctx.createLinearGradient(...f.linear.slice(0, 4)) : ctx.createRadialGradient(f.radial[0], f.radial[1], f.radial[2] ?? 0, f.radial[0], f.radial[1], f.radial[3] ?? 500);
+      for (const st of (f.stops || [[0, "ink"], [1, "ground"]])) g.addColorStop(clamp(+st[0], 0, 1), rgba(st[1], st[2] ?? 1));
+      return g;
+    }
+    return hex(f);
+  }
+  // draw one layer {path, fill, stroke, strokeWidth, alpha, glow, dash} inside an already-applied 0..1000 box transform (sc = px per box unit)
+  function drawLayer(ctx, L, sc) {
+    const P = path2d(L.path), a = L.alpha ?? 1; if (a <= 0.002 || !L.path) return;
+    const prev = ctx.globalAlpha; ctx.globalAlpha = prev * clamp(a, 0, 1);
+    const fillP = paintFor(ctx, L.fill), strokeP = L.stroke && L.stroke !== "none" ? colorOf(L.stroke) : null;
+    const glowCol = typeof L.fill === "string" || Array.isArray(L.fill) ? (L.fill !== "none" ? colorOf(L.fill) : null) : (strokeP || INK);
+    if (L.glow > 0 && glowCol) { ctx.save(); ctx.shadowColor = rgba(glowCol, 0.9 * L.glow); ctx.shadowBlur = 90 * L.glow / sc; ctx.fillStyle = rgba(glowCol, 0.35 * L.glow); ctx.fill(P); ctx.restore(); }
+    if (fillP) { ctx.fillStyle = fillP; ctx.fill(P); }
+    if (strokeP) { ctx.strokeStyle = hex(strokeP); ctx.lineWidth = (L.strokeWidth || 6) / sc; ctx.lineJoin = "round"; ctx.lineCap = "round"; if (L.dash) ctx.setLineDash(L.dash.map(v => v / sc)); ctx.stroke(P); if (L.dash) ctx.setLineDash([]); }
+    ctx.globalAlpha = prev;
+  }
+  // shapes: several layers under ONE transform. o: {x,y (centre px), size (box height px), alpha, rotate, scaleX, scaleY, only:[tags], skip:[tags]}
+  function shapes(ctx, layers, o = {}) {
+    if (!layers || !layers.length || (o.alpha ?? 1) <= 0.002) return;
+    const size = o.size || 500, sc = size / 1000;
+    ctx.save(); ctx.globalAlpha = clamp(o.alpha ?? 1, 0, 1);
     ctx.translate(o.x ?? W / 2, o.y ?? H / 2); if (o.rotate) ctx.rotate(o.rotate); ctx.scale(sc * (o.scaleX ?? 1), sc * (o.scaleY ?? 1)); ctx.translate(-500, -500);
-    const fill = o.fill && o.fill !== "none" ? colorOf(o.fill) : null, stroke = o.stroke && o.stroke !== "none" ? colorOf(o.stroke) : null;
-    if (o.glow > 0 && (fill || stroke)) { ctx.save(); ctx.shadowColor = rgba(fill || stroke, 0.9 * o.glow); ctx.shadowBlur = 90 * o.glow / sc; ctx.fillStyle = rgba(fill || stroke, 0.35 * o.glow); ctx.fill(P); ctx.restore(); }
-    if (fill) { ctx.fillStyle = hex(fill); ctx.fill(P); }
-    if (stroke) { ctx.strokeStyle = hex(stroke); ctx.lineWidth = (o.strokeWidth || 6) / sc; ctx.lineJoin = "round"; ctx.lineCap = "round"; if (o.dash) ctx.setLineDash(o.dash.map(v => v / sc)); ctx.stroke(P); }
+    for (const L of layers) { if (o.only && !(o.only.includes(L.tag))) continue; if (o.skip && o.skip.includes(L.tag)) continue; drawLayer(ctx, L, sc); }
     ctx.restore();
   }
+  // shape: one SVG path in a 0..1000 box. o: {x,y,size,fill,stroke,strokeWidth,alpha,rotate,scaleX,scaleY,glow,dash}
+  function shape(ctx, d, o = {}) { shapes(ctx, [{ path: d, fill: o.fill, stroke: o.stroke, strokeWidth: o.strokeWidth, glow: o.glow, dash: o.dash }], o); }
+  // product: THE product, drawn once by the plan (spec.productDrawing.layers) and identical in every shot.
+  // o as in shapes(); use only/skip with layer tags (e.g. only:["outline"]) for partial reveals.
+  const PRODUCT = (SPEC.productDrawing && Array.isArray(SPEC.productDrawing.layers)) ? SPEC.productDrawing.layers : null;
+  function product(ctx, o = {}) { if (!PRODUCT) { if (!product.warned) { product.warned = true; errors.push({ shot: "product", error: "spec.productDrawing missing; lib.product drew nothing" }); } return; } shapes(ctx, PRODUCT, o); }
   // line: polyline of [x,y] points. o: {color, width, alpha, glow (0..1), cap, close}
   function line(ctx, pts, o = {}) {
     if (!pts || pts.length < 2 || (o.alpha ?? 1) <= 0.002) return;
@@ -681,12 +708,12 @@
   // ---------------------------------------------------------------- the lib object handed to modules
   const lib = Object.freeze({
     W, H, col: COL, rgba, mix, hex, clamp, lerp, ease, easeMark, sine, linear, span, kf, envelope, rng: mulberry32,
-    glow, field, shape, line, dot, text, portrait, edge, planet, project, route, city, mark, WIN
+    glow, field, shape, shapes, product, line, dot, text, portrait, edge, planet, project, route, city, mark, WIN, hasProduct: !!PRODUCT
   });
 
   // ---------------------------------------------------------------- shots
   const SHOTS = (SPEC.shots || []).slice().sort((a, b) => a.start - b.start);
-  const errors = []; const broken = {}; const frameMs = [];
+  const broken = {}; const frameMs = [];
   window.__adErrors = errors;
   function activeShot(t) { for (let i = 0; i < SHOTS.length; i++) { const s = SHOTS[i]; if (t >= s.start && (t < s.end || i === SHOTS.length - 1)) return i; } return 0; }
   // host-level fades only for fallbacks; modules own their transitions

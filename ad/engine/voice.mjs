@@ -68,13 +68,17 @@ async function tts(text, idx) {
 const t0 = Date.now();
 console.error(`# voice: ${lines.length} lines, model ${MODEL}, voice ${voice.voice_name || VOICE_ID}, stability ${STABILITY}`);
 const results = await Promise.all(lines.map((l, i) => tts(l.text, i)));
-const manifest = lines.map((l, i) => ({ t: l.t, text: l.text, ...results[i] }));
-for (let i = 0; i < manifest.length; i++) {
-  const m = manifest[i], next = manifest[i + 1];
-  const end = m.t + m.dur;
-  console.error(`  ${String(m.t).padStart(5)}s  ${m.dur.toFixed(2)}s  "${m.text}"` + (next && end > next.t ? `  OVERRUNS into next line by ${(end - next.t).toFixed(2)}s` : "") + (end > spec.duration ? "  RUNS PAST THE END" : ""));
-}
-fs.writeFileSync(path.join(outDir, "manifest.json"), JSON.stringify({ model: MODEL, voice_id: VOICE_ID, stability: STABILITY, lines: manifest }, null, 2));
+const manifest = lines.map((l, i) => ({ t: l.t, planned: l.t, text: l.text, ...results[i] }));
+// ripple: a line may not start until the previous one has ended plus a breath;
+// the last line may not run past the film. Shifts are reported, never silent.
+const GAP = 0.18;
+for (let i = 1; i < manifest.length; i++) { const prev = manifest[i - 1], m = manifest[i]; const earliest = prev.t + prev.dur + GAP; if (m.t < earliest) m.t = +earliest.toFixed(3); }
+const last = manifest[manifest.length - 1];
+if (last.t + last.dur > spec.duration - 0.2) { const over = last.t + last.dur - (spec.duration - 0.2); for (const m of manifest) m.t = +Math.max(0, m.t - over).toFixed(3); console.error(`  narration ran ${over.toFixed(2)}s past the end; every line pulled earlier by that much`); }
+for (const m of manifest) console.error(`  ${String(m.planned).padStart(5)}s${m.t !== m.planned ? ` -> ${m.t}s` : "      "}  ${m.dur.toFixed(2)}s  "${m.text}"`);
+const spoken = manifest.reduce((a, m) => a + m.dur, 0);
+console.error(`# narration: ${manifest.length} lines, ${spoken.toFixed(1)}s spoken of ${spec.duration}s (${Math.round(100 * spoken / spec.duration)}%)`);
+fs.writeFileSync(path.join(outDir, "manifest.json"), JSON.stringify({ model: MODEL, voice_id: VOICE_ID, stability: STABILITY, spokenSeconds: +spoken.toFixed(2), lines: manifest }, null, 2));
 
 // one timed voice track: each line delayed to its t, mixed, padded to the film's length
 const voTrack = path.join(outDir, "vo.wav");

@@ -19,6 +19,23 @@ engine v2 around it.
 | 7 | **A type system.** 88/72/64/56, fixed positions, 480 ms in, 280 ms out, authored line breaks. | Generic. | `dom.copy` enforces the system; the treatment chooses sizes from it. |
 | 8 | **A smoke test before the expensive render.** `render.mjs --stills`, `fps-probe.mjs`, ebur128. | None; the first full render found the bugs. | `smoke.mjs` seeks every shot at three times in a headless browser, collects thrown errors and ms/frame, and `direct.mjs` sends failures back to Astra for a repair pass before any stills. |
 
+## Three notes from the first v2 screening (Onefold), and what they changed
+
+The user's verdict on Onefold: the narration was barely there, the pace was
+slow, and the film sold an idea without showing the product. All three were
+the Kin film's taste leaking into the engine's prompts ("silence is welcome",
+"Apple-quiet", "0 to 4 lines", shots no shorter than 2.5 s). They became
+brief-level parameters and one new stage:
+
+| note | before | now |
+|---|---|---|
+| narration | 0-4 lines, silence welcome | narration-led by default: about 2.2 words per second, lines timed to cover the film, the picture serves the words; `--words N` |
+| pace | 6-9 shots, 600-1400 ms motion | `--tempo fast` (default): 12-18 shots for 45 s, something changes every 2-3 s, camera moves, a pulse in the score; `--tempo measured` keeps the old grammar |
+| the product | each shot drew its own approximation | a product illustration stage: Astra draws the product once as 8-16 tagged SVG layers with gradients, in parallel with the shot code; every shot renders it through `lib.product`, so it is identical everywhere; the treatment must put it on screen 40% of the time with a hero at 60% frame height |
+
+`voice.mjs` now ripples lines apart so narration never overlaps and reports
+spoken seconds; the critique judges product visibility and pace explicitly.
+
 ## What stays from engine v1
 
 The speed design: one-call JSON where JSON is enough (the plan extraction),
