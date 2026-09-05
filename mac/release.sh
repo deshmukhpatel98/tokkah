@@ -25,6 +25,27 @@ REPO="$(cd .. && pwd)"
 # worktree -- and a release cut from a worktree therefore uploaded the tarball,
 # wrote the manifest, bumped three pages, and then died at the deploy with an
 # ENOENT from wrangler. Said here, before any of that work, with the fix.
+# ── A RELEASE MUST NOT DEPLOY FROM A BRANCH THAT IS BEHIND ─────────────────────
+#
+# 0.153.0 and 0.154.0 were cut from a checkout whose main had forked before the
+# marketing line landed on origin. The push was refused as non-fast-forward, as
+# designed -- but the deploy had already happened, so production got the OLD
+# front door and lost the waitlist route, and the fix landed on GitHub only.
+# The deploy is the irreversible half, so the check has to come before it: if
+# origin/main has commits this HEAD does not, stop here and say what to run.
+if git -C "$REPO" fetch origin main --quiet 2>/dev/null; then
+  if ! git -C "$REPO" merge-base --is-ancestor origin/main HEAD; then
+    echo "FAILED: this checkout is BEHIND origin/main -- a deploy from here would"
+    echo "        put an older worker and older pages back on production."
+    echo "        Missing here:"
+    git -C "$REPO" log --oneline HEAD..origin/main | sed 's/^/          /'
+    echo "        Fix: git pull --rebase origin main   (then run the release again)"
+    exit 1
+  fi
+else
+  echo "NOTE: could not fetch origin/main to check this checkout is current; continuing."
+fi
+
 if [ ! -f "$REPO/tape-app/wrangler.prod.jsonc" ]; then
   echo "FAILED: no tape-app/wrangler.prod.jsonc -- it is gitignored, so this is"
   echo "  almost certainly a worktree. Copy it from the main checkout:"
@@ -349,7 +370,7 @@ for f in "$REPO/tape-app/public/kin.html" "$REPO/tape-app/public/join.html" \
          "$REPO/tape-app/public/macos/index.html"; do
   before=$(grep -coE "Kin-$VER\.dmg" "$f" || true)
   sed -i '' -E "s/Kin-[0-9]+\.[0-9]+\.[0-9]+\.dmg/Kin-$VER.dmg/g; \
-                s/(<span id=ver>)v[0-9]+\.[0-9]+\.[0-9]+/\1v$VER/g" "$f"
+                s/(<span id=\"?ver\"?>)v[0-9]+\.[0-9]+\.[0-9]+/\1v$VER/g" "$f"
   after=$(grep -coE "Kin-$VER\.dmg" "$f" || true)
   [ "$after" -gt 0 ] || { echo "FAILED: $f has no Kin-<version>.dmg link to bump"; exit 1; }
   echo "  $(basename "$f"): $after link(s) at $VER (was $before)"
