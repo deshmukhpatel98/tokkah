@@ -5,6 +5,71 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.153.0 — 2026-09-05
+
+### Added — the audio lab: a call's sound, judged from the data alone
+
+The owner's brief: *"I just do the calls, and you look at the data and keep
+improving the product. I don't even have to tell you how the audio felt."* Every
+counter the beat carried described what the machinery did. This release adds what a
+**listener** would report, per direction, and the audio itself. Contract and
+definitions: `mac/TELEMETRY-AUDIO.md`. Nothing here touches a sample the far end
+hears; the render callback's worst-case work stayed at 1 µs of its 333 with all of
+it on.
+
+- **What this end HEARD** (`a_rx_*`): clean share of the far voice (concealment
+  while they spoke vs while they were quiet), glitches at concealment seams, dead
+  air (their mute or floor, as digital silence), clipped peaks, level and its
+  second-to-second swing (the makeup-gain pumping detector), their room noise,
+  bandwidth, and how long the playout governor ran fast (pitch up).
+- **What LEFT this end** (`a_tx_*`): seconds of this person's voice and the seconds
+  of it that never left (transmit gain under half — the exact walkie-talkie cost),
+  samples that entered the soft limiter's knee, level, noise floor after makeup,
+  SNR, bandwidth.
+- **Did I hear MYSELF** (`a_echo_return_*`): my own voice inside the received
+  stream a round trip later — the echo symptom, not its local cause. Normalised
+  cross-correlation of what left against what arrived, aimed by the measured
+  mouth-to-ear. Live rig: the end whose voice returns through a 22 ms / 0.55
+  simulated room read a return in 16 of 19 talking seconds; the end with no echo
+  path read 1 of 23 (the reject). Offline on the same tape: 14 of 21 at −5.5 dB
+  against the planted −5.2 dB.
+- **The bandwidth ruler**, calibrated on real speech: untouched 9.05 kHz, through a
+  7 kHz windowed-sinc low-pass 7.18, through 3.4 kHz 3.59, white noise 20.3,
+  digital silence and under 300 ms of voice → no number. Two corrections it needed
+  before it passed: a "quietest band + 15 dB" criterion read a telephone band as
+  5.1 kHz (the quietest band was a −90 dB stopband; inaudible energy is not
+  bandwidth), and a ruler fed only the gate's "voice" blocks read real speech at
+  4.0 kHz because vowels alone are a telephone band — it runs under the voice's
+  envelope now.
+- **What it ran on**, as facts: both devices' names, transports, rates read back,
+  channels, the input's available rates, and `bt_hfp` — a Bluetooth headset in
+  phone mode, the trap that has invalidated more listening tests here than any
+  other. `in_rate`/`out_rate` read 0 on every live call since they were set in
+  only one of two start paths; fixed.
+- **Tapes (lab mode)**: on the owner's Macs every call is written to
+  `~/Library/Logs/Kin/tapes/<call>/` — `raw.wav` (the mic, float32), `sent.wav`
+  (what reached the wire), `played.wav` (what left the speaker), plus a record per
+  render callback (where every concealed sample fell, the governor's rate, the ear)
+  and per sent packet (the gate's gain on every word). Nothing is uploaded, ever.
+  Lock-free rings drained every 250 ms; a ring that overruns stops its stream and
+  says so (`tape_full`), never splices. Newest 3 calls kept, 3 GB cap, 60 min per
+  call. ~31 MB per minute of call. `--lab on|off`, or the owner's server answers
+  each beat with `lab: 0|1` for the allow-listed installs so no command is typed.
+  `--no-tapes` is the control arm. Verified on a live rig: 25.8 s recorded as 25.8 s
+  on every stream, headers agreeing with file sizes, 77,291 render records against
+  77,291 callbacks, concealed samples in the timeline equal to the beat's count.
+- **The reader**: `telemetry.sh pair` prints HEARD / SAID / RETURN / DEVICES and a
+  plain-words VERDICT per direction; every threshold lives in one table
+  (`telemetry-selftest.py` fires each rule just over its line and holds it just
+  under). A pre-lab build reads "not in this build", never zero. The server's
+  `fields_dropped` is shouted in capitals. `tape-report.py` reads a tape with the
+  same rulers as the app (`--selftest` plants an echo, a hole, two glitches, a
+  pitch-up and a gated stretch, and finds each; a clean tape yields none).
+- **Rigs**: `tk --selftest-audiolab` (every ruler on known inputs including the
+  rejects), `tools/audiolab-check.sh` (two live ends, tapes on, in the suite's TIME
+  lane). Worker: the beat store's field cap rises 8,000 → 12,000 bytes so a 263-key
+  beat plus these fields is never silently truncated.
+
 ## Kin 0.152.0 — 2026-09-05
 
 ### Fixed & Enhanced — Burst-proof stride-8 interleaved redundancy, PCM16 parity FEC bit-exact recovery, and dual-path racing accounting

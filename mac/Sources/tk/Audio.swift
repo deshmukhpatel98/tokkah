@@ -54,6 +54,23 @@ final class Audio {
   private var outUnit: AudioUnit?
 
   let ring = RecvRing()
+  /// The listener's numbers and the lab tapes -- see AudioLab.swift and
+  /// mac/TELEMETRY-AUDIO.md. Fed from both callbacks, read at beat time.
+  let lab = AudioLab()
+  /// Into the beat: everything the contract lists, plus the gate's own count of
+  /// this person's words that never left.
+  func labBeat(into f: inout [String: Any], m2eP50: Double?) {
+    lab.beatFields(into: &f, txVoiceS: dgate.txVoiceS, txVoiceMutedS: dgate.txVoiceMutedS, m2eP50: m2eP50)
+    if tapesStarted { Metrics.fact("tapes", lab.tape.state) }
+  }
+  private(set) var tapesStarted = false
+  /// Called once on the way out, before the final beat, so the tape's last
+  /// samples are on disk and its header tells the truth about its length.
+  func finishTapes() {
+    guard tapesStarted else { return }
+    lab.tape.finish(callId: Telemetry.call, facts: Metrics.snapshot().facts)
+    Metrics.fact("tapes", lab.tape.state)
+  }
   var wire: Wire?
   var mute = false                 // loopback on one machine: the mic hears the
                                    // speaker, so the receiver silences its output
@@ -2139,7 +2156,15 @@ final class Audio {
       let step = abs(val - prevOut)
       if step > edgeWinMax { edgeWinMax = step }
       edgeWinLeft -= 1
-      if edgeWinLeft == 0 { jumpAtEdge.add(Double(edgeWinMax)) }
+      if edgeWinLeft == 0 {
+        jumpAtEdge.add(Double(edgeWinMax))
+        // Against the level of the audio around the seam: `hist` is the last
+        // 42 ms that actually played, whatever its ring order. One vDSP call per
+        // seam, and seams are rare -- see `AudioLab.seam` for the threshold.
+        var rms: Float = 0
+        vDSP_rmsqv(hist, 1, &rms, vDSP_Length(Audio.HIST))
+        lab.seam(step: edgeWinMax, rms: rms)
+      }
     }
   }
 
@@ -3958,6 +3983,21 @@ final class Audio {
     private var vocalSamples = 0
     private var quietSamples = 0
     private(set) var gain: Float = 1
+    /// The gate's verdict on the block it just processed -- `aboveEcho &&
+    /// aboveRoom`, this person's voice by the same test the gate itself uses.
+    /// Read by the capture thread after `process`, for the lab's tx frames.
+    private(set) var blockVoiced = false
+    /// This person's voiced samples, and the ones that left at under half gain:
+    /// words the floor or the gate removed. Counted in SAMPLES on the capture
+    /// thread, turned into ms only in the beat (`a_tx_voice_ms`,
+    /// `a_tx_voice_muted_ms`). The exact walkie-talkie cost.
+    nonisolated(unsafe) var txVoiceS = 0
+    nonisolated(unsafe) var txVoiceMutedS = 0
+    /// Is the far voice active at this speaker right now -- the same envelope and
+    /// threshold the gate decides on, exposed for the lab's rx frames.
+    var farActive: Bool { farEnv > 0.004 }
+    /// The whole gain this microphone is under, for the tape's capture record.
+    var effectiveGain: Float { gain * yieldGain * floorGain }
     /// Set once per block by the turn accounting, which is the only place that
     /// sees this end's state and the far end's at the same instant. The gate does
     /// not decide this -- it applies it.
@@ -4294,6 +4334,7 @@ final class Audio {
       // the ROUTE, applied after the route changed.
       let aboveEcho = cfg.on ? nearEnv > expected * effMargin : true
       let aboveRoom = nearEnv > max(floor * 4.0, 0.006)
+      blockVoiced = aboveEcho && aboveRoom
       // TWO CONSECUTIVE BLOCKS was the rule, and two blocks is 5.3 ms on the rig
       // and 0.67 ms on the machine -- less than a single glottal period, so it
       // meant nothing there. It is 4 ms of continuous voice now, at any block
@@ -4445,7 +4486,14 @@ final class Audio {
         if fWant < floorGain { floorGain = max(fWant, floorGain - closeStep) }
         else { floorGain += (fWant - floorGain) * openStep }
         yieldGain += (yWant - yieldGain) * yStep
-        x[k] *= gain * yieldGain * floorGain
+        let eff = gain * yieldGain * floorGain
+        x[k] *= eff
+        // Words that did not leave, counted where the gain is applied and by the
+        // gate's own definition of a word -- no second opinion about voice here.
+        if blockVoiced {
+          txVoiceS += 1
+          if eff < 0.5 { txVoiceMutedS += 1 }
+        }
       }
       if yWant < 1 { yieldSamples += n }
       if want < 1 { closedFrames += n } else { openFrames += n }
@@ -4987,6 +5035,9 @@ final class Audio {
       throw Err.e("\(input ? "input" : "output") device at \(Int(rate)) Hz, need \(Int(SR)) Hz")
     }
     if input { inDev = dev } else { outDev = dev }
+    // The beat's `in_rate`/`out_rate` read 0 on every live call because they were
+    // set only in the other start path. The rate read back is the one in effect.
+    if input { hwInRate = rate } else { hwOutRate = rate }
     let got = setBufferFrames(dev, UInt32(Audio.devBuf), input: input)
     if input { inLatencyMs = deviceLatencyMs(dev, input: true) } else { outLatencyMs = deviceLatencyMs(dev, input: false) }
     let lat = input ? inLatencyMs : outLatencyMs
@@ -5074,6 +5125,21 @@ final class Audio {
       }
     }
     Thread { [weak self] in self?.echoEstimator() }.start()
+    // What this call is running on, as facts, and the lab: the 1 Hz analysis
+    // thread, and the tapes if this Mac is in lab mode. Off the audio thread, once.
+    _ = AudioLab.recordDeviceFacts(inDev: inDev, outDev: outDev)
+    lab.start()
+    if Lab.tapesOn() && !Lab.noTapesForRun {
+      Metrics.fact("lab", "on")
+      let msg = lab.tape.start(callId: Telemetry.call, facts: Metrics.snapshot().facts)
+      fputs(msg + "\n", stderr)
+      tapesStarted = lab.tape.dirPath != nil
+      Metrics.fact("tapes", lab.tape.state)
+      if let d = lab.tape.dirPath { Metrics.fact("tape_dir", d) }
+    } else {
+      Metrics.fact("lab", Lab.tapesOn() ? "on" : "off")
+      Metrics.fact("tapes", "off")
+    }
   }
 
   /// Tell me the moment the rate moves, and put it back.
@@ -5457,6 +5523,9 @@ final class Audio {
     if Audio.hpfOn {
       captureHpf.process(inScratch, Int(n))
     }
+    // The tape's `raw.wav`: the microphone as heard, after trim and filter,
+    // before anything decides what to do with it. A memcpy into a ring, or nothing.
+    lab.tape.raw(inScratch, Int(n))
 
     // What the microphone actually delivered. Placed HERE deliberately: after the
     // file substitution so a rig measures its own input, and before the simulated
@@ -5571,7 +5640,12 @@ final class Audio {
     // never spectrally masked, never guessed at. Whose turn it is and what this
     // speaker put into this room are the only two things between the room and
     // the far end.
+    // The lab's two views of this block: before the gate (the microphone that
+    // WOULD be sent -- its noise floor and bandwidth) and after it (what did
+    // leave -- its level, and the history the echo-return estimator reads).
+    let labPreSq = lab.txPre(inScratch, Int(n))
     duplexGate(inScratch, Int(n))
+    lab.txPost(inScratch, Int(n), preSq: labPreSq, voiced: dgate.blockVoiced)
     accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5, blockN: Int(n))
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any
@@ -5632,16 +5706,29 @@ final class Audio {
         // allocates nothing, which is the only kind of check allowed here.
         if gMicMuted || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
         let histSlot = Int(capSeq) % Audio.CAP_HIST_COUNT
+        // `knee` counts the samples that entered the soft limiter's bend (past
+        // 0.80): the far end hears those bent. Counted on both wire formats --
+        // a float sample past 0.80 is headed for the same bend at their DAC.
+        var knee = 0
         if let w = wire, w.sendPcm16 {
           let histPtr = capHistory + histSlot * FPP
           for i in 0..<FPP {
+            if abs(capBuf[i]) > 0.80 { knee += 1 }
             let v = Wire.softLimit(capBuf[i]) * 32767.0
             let q = Int16(max(-32767.0, min(32767.0, v)).rounded())
             histPtr[i] = Float(q) / 32767.0
+            lab.tape.sent(q)
           }
         } else {
           memcpy(capHistory + histSlot * FPP, capBuf, FPP * 4)
+          for i in 0..<FPP {
+            if abs(capBuf[i]) > 0.80 { knee += 1 }
+            lab.tape.sent(Int16(max(-32767.0, min(32767.0, capBuf[i] * 32767.0))))
+          }
         }
+        lab.txPacket(knee: knee)
+        lab.tape.capture(seq: capSeq, hostNs: Clock.ns(cap), gain: dgate.effectiveGain,
+                         muted: gMicMuted || (wire?.peerRinging ?? false), voiced: dgate.blockVoiced)
         capHistoryCap[histSlot] = cap
         capHistorySeq[histSlot] = capSeq
 
@@ -5911,6 +5998,12 @@ final class Audio {
     defer { renderCost.add(Clock.msSigned(Clock.now(), rEntry)) }
 
     var sawZero = false
+    // The lab's per-callback tallies: a few adds per sample here, one call after
+    // the loop. `posAtStart` is where this callback's samples begin in the
+    // stream, for the tape's render record.
+    let posAtStart = ring.pos
+    var labSumSq: Double = 0
+    var labPlayed = 0, labConcealed = 0, labSilent = 0
     for i in 0..<Int(n) {
       let absF = ring.pos + Double(i) * ring.rate
       let absI = Int64(absF)
@@ -6058,6 +6151,9 @@ final class Audio {
         sigSumSq += Double(val) * Double(val); sigN += 1
         // History is what was actually PLAYED, and only the good path writes it:
         // feeding synthesis back in would make the cursor chase its own tail.
+        labSumSq += Double(val) * Double(val)
+        labPlayed += 1
+        if lab.rxPlayed(val: val, emitted: emitted) { labSilent += 1 }
         hist[histW & Audio.HMASK] = val; histW += 1
         lastGood[off] = a
         // A complete packet of last-good samples needs the boundary; the run
@@ -6186,6 +6282,8 @@ final class Audio {
         // read once per block: two adds per sample, no allocation, no lock.
         playoutSumSq += Double(played) * Double(played)
         playoutN += 1
+        labConcealed += 1
+        lab.rxConcealed(emitted: emitted)
         if concealRun < 1_000_000_000 { concealRun += 1 }
         goodRun = 0
         ring.concealedS += 1
@@ -6195,6 +6293,10 @@ final class Audio {
         if off == 0 { sawZero = true }
       }
     }
+    lab.rxBlock(n: Int(n), playedN: labPlayed, concealedN: labConcealed, sumSq: labSumSq,
+                silentN: labSilent, farActive: dgate.farActive, rate: ring.rate)
+    lab.tape.render(hostNs: Clock.ns(dueHost), pos: posAtStart, n: Int(n), concealed: labConcealed,
+                    rate: ring.rate, ear: earGain)
     if sawZero { offZeroRun = 0 } else {
       offZeroMiss += 1; offZeroRun += 1
       if offZeroRun > offZeroRunMax { offZeroRunMax = offZeroRun }

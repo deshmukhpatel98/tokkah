@@ -3722,7 +3722,14 @@ const PROBE_REGIONS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'o
 /// Drop whole keys instead, largest serialised first, and leave the count behind
 /// so a reader can tell "trimmed here" from "never sent by the client". Always
 /// returns parseable JSON, including the degenerate case of one enormous field.
-export function packFields(rest: Record<string, unknown>, limit = 8000): string {
+// The installs whose calls are taped to their own disks (see the beat handler).
+// The owner's two Macs and the rig install on the first of them.
+const LAB_INSTALLS = new Set(['29jxj25dphu5j', '2960pyrqqritx', 'pftcpwr4k1s0']);
+
+// 12,000, not 8,000: the audio-lab fields (mac/TELEMETRY-AUDIO.md) took a
+// 263-key beat close to the old cap, and a record that silently drops its
+// largest fields reads as a blind end. The request cap at /api/mac/beat is 16,384.
+export function packFields(rest: Record<string, unknown>, limit = 12000): string {
   let out = JSON.stringify(rest);
   if (out.length <= limit) return out;
   const kept: Record<string, unknown> = { ...rest };
@@ -5230,10 +5237,22 @@ export default {
       macPosts.set(ip, hits);
       const body = await request.text();
       if (body.length > 16_384) return json({ error: 'too big' }, 413);
-      return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+      const stored = await env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request('https://do/mac/beat', { method: 'POST', body,
           headers: { 'content-type': 'application/json' } }),
       );
+      if (!stored.ok) return stored;
+      // ── LAB MODE, ANSWERED ON EVERY BEAT ──────────────────────────────────
+      //
+      // The owner's own Macs tape their calls to LOCAL disk (raw mic, what left,
+      // what played -- mac/TELEMETRY-AUDIO.md) so a bad call can be analysed
+      // without anybody describing it. The tapes never leave the machine; this
+      // reply only tells an install whether it is one of the lab machines, so
+      // nobody has to type a command on them. Every other install gets `lab: 0`,
+      // which a Mac that was never in lab mode ignores.
+      let install = '';
+      try { install = String((JSON.parse(body) as any)?.install ?? ''); } catch { /* not ours to fix */ }
+      return json({ ok: true, lab: LAB_INSTALLS.has(install) ? 1 : 0 });
     }
     // ── A crash on a Mac nobody is watching ──────────────────────────────────
     //
