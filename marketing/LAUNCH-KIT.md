@@ -7,7 +7,7 @@ This kit contains the public launch materials for Kin across Hacker News, X, Red
 ## 1. Positioning
 
 ### The One-Line
-Kin is a native Mac app for one-to-one video calls that feel like the same room — lossless voice, the camera's own picture, one voice at a time, straight between two Macs — with one goal: under 150 milliseconds anywhere on Earth. Free, open source (AGPL), no account.
+Kin is a native app for Mac and Android for one-to-one video calls that feel like the same room — lossless voice, the camera's own picture, one voice at a time, straight between two devices — with one goal: under 150 milliseconds anywhere on Earth. Free, open source (AGPL), no account.
 
 ### Tagline
 As close as light allows.
@@ -38,7 +38,7 @@ Kin is free and open source under the AGPL.
 
 ### Three Claims We Lead With and Why
 1. The feel. Lossless voice, the camera's own picture, one voice at a time, and the edge band. Why: People do not experience calls as network packets or software layers. They experience presence. When audio is transparent and only one voice speaks at a time, the artificial distance of a call disappears.
-2. The honesty. Publishing every measurement with its caveat. Distinguishing loopback on one Mac from live production. Stating what is missing: Mac only, two people, not notarized. Why: Video calling software is filled with unverified marketing claims. Stating measurements plainly and naming limitations builds lasting technical trust.
+2. The honesty. Publishing every measurement with its caveat. Distinguishing loopback on one Mac from live production. Stating what is missing: Mac and Android only, two people, not notarized. Why: Video calling software is filled with unverified marketing claims. Stating measurements plainly and naming limitations builds lasting technical trust.
 3. The goal. Under 150 milliseconds anywhere on Earth. Why: Between two people, the only real delay is the time light needs to cross the physical distance. Everything else is an engineering defect. Setting the 150 ms threshold as an explicit goal gives every architectural decision a clear benchmark.
 
 ---
@@ -69,9 +69,9 @@ Our rule is that every claim ships with a measurement. Almost every media figure
 What is not measured: we do not have a live cross-continental media latency receipt between two physical Macs yet. Distance numbers in our documentation (59.2 ms modelled Delhi to Netherlands, 116.7 ms modelled antipodes) are simulated with injected impairment on one Mac.
 
 What is deliberately missing:
-- Apple silicon Macs only, macOS 14+.
+- Mac (Apple silicon, macOS 14+) and Android (10+). No iPhone, Windows or Linux yet.
 - Two people per call. No group calls.
-- Not notarized by Apple. One Gatekeeper click ("Open Anyway" in System Settings) on the DMG route.
+- Not notarized by Apple. One Gatekeeper click ("Open Anyway" in System Settings) on the DMG route; on Android, one tap to allow installs from your browser.
 - No noise suppression or automatic gain; your voice is not processed. Headphones change the call: with no acoustic path, both microphones stay open.
 - Accessibility tooling cannot see the window yet.
 
@@ -91,8 +91,8 @@ We do not pay for an Apple Developer account, so macOS Gatekeeper requires a one
 2. Why write a custom transport instead of using WebRTC?
 WebRTC is built around one decision: when the network dips, quality gives (adaptive bitrate, a lossy codec, packet-loss concealment that invents audio). Kin inverts that. Quality is a constant and time is the only thing we spend, which needs a transport that carries 48 kHz 16-bit PCM in 0.667 ms datagrams and never lowers it.
 
-3. Why support only Apple silicon Macs?
-We optimized directly against CoreAudio render callbacks, VideoToolbox hardware encoding, and Apple silicon hardware without cross-platform shims. Building for one platform let us refine the real-time audio loop before taking on portable abstractions.
+3. Why Mac and Android, and nothing else yet?
+The Mac app came first, written straight against CoreAudio and VideoToolbox with no cross-platform layer, so the real-time audio path could be made right before anything was ported. Android is the first port, held to the same measurements; iPhone, Windows and Linux are not built.
 
 4. How do you handle echo without processing the voice?
 Turn-taking first: one microphone is open at a time, attenuating the other side by 19.3 dB while your own voice stays bit-for-bit untouched, so an echo has nothing to feed on. A linear echo canceller handles what still leaks when someone is on speakers; there is no noise suppression and no automatic gain anywhere.
@@ -135,16 +135,16 @@ Two Macs find each other through one Cloudflare Worker and then send packets dir
 Every claim ships with a receipt. In loopback on one Mac: mouth-to-ear is 9.23 ms (4.46 ms is hardware), glass-to-glass video is ~34.8 ms. On live production, cancel and decline takes 346 ms.
 
 #### Post 7
-What is missing, plainly: Apple silicon Macs only, macOS 14+. Two people per call. Not notarized by Apple, so the DMG requires a one-time Open Anyway click in System Settings.
+What is missing, plainly: Mac and Android only, no iPhone, Windows or Linux yet. Two people per call. Not notarized by Apple, so the Mac DMG requires a one-time Open Anyway click in System Settings.
 
 #### Post 8
 Our goal is under 150 milliseconds anywhere on Earth. Between two people, the only delay that is real is the time light takes to cross the distance. Everything else is a defect.
 
 #### Post 9
 Kin is free and open source under AGPL.
-Download for Mac: https://kin.tokkah.com
+Download for Mac or Android: https://kin.tokkah.com
 Star the code: https://github.com/deshmukhpatel98/tokkah
-Not on a Mac? Leave your name on the site.
+Not on either? Leave your name on the site.
 
 ### Standalone Posts for Later Days
 
@@ -178,7 +178,7 @@ Kin does not process your voice: no noise suppression, no automatic gain. Echo i
 There are no accounts, no meeting links, and no media servers. Two Macs connect directly over UDP.
 
 What is missing:
-- Apple silicon Macs only, macOS 14+.
+- Mac (Apple silicon, macOS 14+) and Android (10+). No iPhone, Windows or Linux yet.
 - Two people per call. No group calls.
 - Not notarized. The DMG requires a one-time Open Anyway click in System Settings.
 - No real cross-continental latency measurement yet; our published 9.23 ms mouth-to-ear is loopback on one Mac.
@@ -199,7 +199,7 @@ The server handles signaling, handle registration, and doorbell ringing using tw
 You can point the Mac client at your own backend with one flag (`tk --server https://…`) or the per-purpose environment variables SELF-HOSTING.md lists. The Worker deploys on Cloudflare's free tier with zero runtime dependencies and requires no paid database subscriptions.
 
 Key limitations to know:
-- The desktop app is currently Apple silicon macOS only.
+- Clients: Mac (Apple silicon) and Android. No iPhone, Windows or Linux yet.
 - Designed strictly for two people per call.
 - The default setup relies on public STUN servers to discover external IP addresses.
 - The Mac app is self-signed rather than Apple-notarized.
@@ -223,9 +223,9 @@ Every packet is encrypted end-to-end using a post-quantum hybrid handshake: X255
 Honest limitations:
 - On a first call between strangers, an out-of-band eight-character verification code read aloud prevents man-in-the-middle key substitution. Subsequent calls pin the key.
 - Signaling and discovery pass through a Cloudflare Worker before direct UDP transport begins.
-- Apple silicon Macs only, macOS 14+.
+- Mac (Apple silicon, macOS 14+) and Android (10+). No iPhone, Windows or Linux yet.
 - Two people per call.
-- The app is signed with a persistent self-signed certificate rather than an Apple Developer ID.
+- The Mac app is signed with a persistent self-signed certificate rather than an Apple Developer ID.
 
 Source code and protocol audit details:
 https://github.com/deshmukhpatel98/tokkah
@@ -241,7 +241,7 @@ Kin
 Native Mac video calls as close as light allows
 
 ### Description
-Native Mac app for 1:1 video calls that feel like the same room. Lossless voice, camera picture, one voice at a time, direct between Macs. Free, open source AGPL, no account. Goal: under 150 ms anywhere on Earth.
+Mac and Android app for 1:1 video calls that feel like the same room. Lossless voice, camera picture, one voice at a time, direct between devices. Free, open source AGPL, no account. Goal: under 150 ms anywhere on Earth.
 
 ### Maker Comment
 I built Kin because video calls tire people out. When the network dips, the common design spends quality: the voice goes through a lossy codec and the picture goes soft, and the delay becomes unpredictable, which is what breaks the rhythm of a conversation.
@@ -250,7 +250,7 @@ Kin takes a different path. It is a native Mac application for two people. Audio
 
 The app is free, open source under the AGPL, and requires no account. Media travels directly between two Macs over UDP.
 
-We are clear about what is not built: Kin runs only on Apple silicon Macs with macOS 14+, supports only two people, and is not notarized by Apple yet. Every number in our repository comes from verified measurements.
+We are clear about what is not built: Kin runs on Apple silicon Macs (macOS 14+) and Android (10+), not yet on iPhone, Windows or Linux; it supports only two people; and the Mac app is not notarized by Apple yet. Every number in our repository comes from verified measurements.
 
 Download: https://kin.tokkah.com
 Source: https://github.com/deshmukhpatel98/tokkah

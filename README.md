@@ -2,10 +2,11 @@
 <h1 align="center">Kin</h1>
 <p align="center"><em>As close as light allows.</em></p>
 
-<p align="center">Video calls for Mac that feel like the same room. Your voice arrives exactly as the microphone heard it. The picture is the one your camera saw. Between two people, the only delay we accept is the speed of light.</p>
+<p align="center">Video calls for Mac and Android that feel like the same room. Your voice arrives exactly as the microphone heard it. The picture is the one your camera saw. Between two people, the only delay we accept is the speed of light.</p>
 
 <p align="center">
   <a href="https://kin.tokkah.com">Download for Mac</a> &middot;
+  <a href="https://kin.tokkah.com">Download for Android</a> &middot;
   <a href="https://kin.tokkah.com/#waitlist">Not on a Mac? Leave your name</a> &middot;
   <a href="https://kin.tokkah.com/ad/kin-ad">Watch the film (75 s)</a>
 </p>
@@ -13,7 +14,7 @@
 <p align="center">
   <a href="https://github.com/deshmukhpatel98/tokkah/releases"><img src="https://img.shields.io/github/v/release/deshmukhpatel98/tokkah?style=flat-square&label=release" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-lightgrey?style=flat-square" alt="license"></a>
-  <a href="https://kin.tokkah.com"><img src="https://img.shields.io/badge/macOS_14%2B-Apple_silicon-black?style=flat-square" alt="platform"></a>
+  <a href="https://kin.tokkah.com"><img src="https://img.shields.io/badge/Mac-Apple_silicon%2C_macOS_14%2B-black?style=flat-square" alt="Mac"> <img src="https://img.shields.io/badge/Android-10%2B-black?style=flat-square" alt="Android"></a>
   <a href="https://github.com/deshmukhpatel98/tokkah/actions"><img src="https://img.shields.io/github/actions/workflow/status/deshmukhpatel98/tokkah/ci.yml?style=flat-square&label=CI" alt="CI"></a>
 </p>
 
@@ -39,6 +40,8 @@ A file fetched by `curl` is never quarantined, so Gatekeeper is never consulted 
 Or download the `.dmg` from [kin.tokkah.com](https://kin.tokkah.com). macOS will ask for a one-time "Open Anyway" click under System Settings → Privacy & Security because the app is self-signed rather than notarized ([docs/INSTALL.md](docs/INSTALL.md) explains why).
 
 macOS 14+, Apple silicon, about 2 MB, free, no account.
+
+**Android** is here too: download the `.apk` from [kin.tokkah.com](https://kin.tokkah.com) (Android 10+, about 70 MB). Android asks once to allow installs from your browser, because it comes from us rather than from Play; the app keeps itself up to date after that. The source is under [`android/`](android/).
 
 ## Make a call
 
@@ -117,7 +120,7 @@ better word.
 
 Named here rather than discovered later:
 
-- **Apple silicon Macs only**, macOS 14+. No Intel, Windows, Linux, iOS or Android build, and none planned.
+- **Mac (Apple silicon, macOS 14+) and Android (10+).** No Intel, Windows, Linux or iPhone build yet.
 - **Two people per call.** No group calls.
 - **Not notarized.** One Gatekeeper click on the `.dmg` route (see [docs/INSTALL.md](docs/INSTALL.md)).
 - **Your voice is not processed.** No noise suppression, no automatic gain, no voice effects; the only filter on the microphone is a 65 Hz high-pass for table thumps. Echo is handled by turn-taking first (one open microphone at a time) and a linear echo canceller second, for what leaks on speakers ([`mac/Sources/tk/Audio.swift`](mac/Sources/tk/Audio.swift), [`mac/Sources/tk/Aec.swift`](mac/Sources/tk/Aec.swift)). Headphones change the call: with no acoustic path there is nothing to gate, so both microphones stay open.

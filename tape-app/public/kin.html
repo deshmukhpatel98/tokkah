@@ -201,6 +201,19 @@
       border-color: var(--fg);
     }
 
+    .hero-secondary {
+      margin-top: 18px;
+    }
+
+    .hero-actions .btn-android { order: 1; }
+    .hero-actions .btn-download[data-dl] { order: 0; }
+    body.on-android .hero-actions .btn-android { order: 0; }
+    body.on-android .hero-actions .btn-download[data-dl] { order: 1; }
+
+    .meta-android {
+      margin-top: 8px;
+    }
+
     .meta {
       margin-top: 24px;
       color: var(--muted);
@@ -611,10 +624,12 @@
     <div class="hero-actions">
       <a class="btn-download" data-dl href="/macos/dl/Kin-0.152.0.dmg">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.5 12.6c0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7-1.3-.1-2.5.8-3.2.8-.7 0-1.7-.8-2.8-.7-1.4 0-2.8.8-3.5 2.1-1.5 2.6-.4 6.5 1.1 8.6.7 1 1.6 2.2 2.7 2.1 1.1 0 1.5-.7 2.8-.7 1.3 0 1.6.7 2.8.7 1.1 0 1.9-1.1 2.6-2.1.8-1.2 1.1-2.3 1.1-2.4-.1 0-2.3-.9-2.3-3.3zM14.4 5.7c.6-.7 1-1.7.9-2.7-.9 0-1.9.6-2.6 1.3-.5.6-1 1.6-.9 2.6 1 .1 2-.5 2.6-1.2z"/></svg> Download for Mac</a>
-      <a class="secondary-link" href="#waitlist">Not on a Mac? Leave your name</a>
+      <a class="btn-download btn-android" data-dl-android href="/android/dl/kin-0.128.1-android.32.apk"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M17.6 9.48l1.84-3.18c.16-.31.04-.69-.26-.85a.637.637 0 0 0-.83.22l-1.88 3.24a11.463 11.463 0 0 0-8.94 0L5.65 5.67a.643.643 0 0 0-.87-.2c-.28.18-.37.54-.22.83L6.4 9.48A10.78 10.78 0 0 0 1 18h22a10.78 10.78 0 0 0-5.4-8.52zM7 15.25a1.25 1.25 0 1 1 0-2.5 1.25 1.25 0 0 1 0 2.5zm10 0a1.25 1.25 0 1 1 0-2.5 1.25 1.25 0 0 1 0 2.5z"/></svg> Download for Android</a>
     </div>
+    <p class="hero-secondary"><a class="secondary-link" href="#waitlist">Not on a Mac or Android? Leave your name</a></p>
 
-    <p class="meta"><span id="ver">v0.152.0</span> · <span id="size">1.5 MB</span> · <span>macOS 14+</span> · <span>Apple silicon</span> · <span>free</span></p>
+    <p class="meta"><span>Mac</span> · <span id="ver">v0.152.0</span> · <span id="size">2.3 MB</span> · <span>macOS 14+</span> · <span>Apple silicon</span> · <span>free</span></p>
+    <p class="meta meta-android"><span>Android</span> · <span id="ver-android">v0.128.1-android.32</span> · <span id="size-android">71 MB</span> · <span>Android 10+</span> · <span>phone or tablet</span> · <span>free</span></p>
   </section>
 
   <!-- 2. Section: Call a person. Not a room. -->
@@ -680,9 +695,9 @@
   <!-- 7. Download block: existing steps condensed -->
   <section class="section">
     <div class="section-inner">
-      <h2 class="headline">Open on your Mac</h2>
+      <h2 class="headline">Open it</h2>
       <div class="steps-box">
-        <p class="steps">Open the <code>.dmg</code>, double-click <b>Kin</b>. macOS warns once,
+        <p class="steps"><b>On a Mac:</b> open the <code>.dmg</code>, double-click <b>Kin</b>. macOS warns once,
           because we sign it ourselves and Apple has not notarised it: open
           <code>System Settings → Privacy &amp; Security</code>, scroll down, click
           <b>Open&nbsp;Anyway</b> (or right-click the app → <b>Open</b>). That is the only step —
@@ -696,6 +711,9 @@
         <p class="steps">Prefer no security prompt at all, and comfortable with a terminal?<br>
           <code>curl -fsSL https://room.tokkah.com/macos/install.sh | sh</code> — a download by
           <code>curl</code> is never quarantined, so it never meets Gatekeeper.</p>
+        <p class="steps"><b>On Android:</b> open the downloaded <code>.apk</code>. Android asks once, because
+          this comes from us rather than from Play: tap <b>Settings</b> and allow your browser to install
+          apps. That is the only step. Kin keeps itself up to date after that, the same way it does on a Mac.</p>
       </div>
     </div>
   </section>
@@ -703,7 +721,7 @@
   <!-- 8. Waitlist block -->
   <section id="waitlist" class="section">
     <div class="section-inner">
-      <h2 class="headline">Not on a Mac yet?</h2>
+      <h2 class="headline">Not on a Mac or Android yet?</h2>
       <p class="body-text">Leave your name and you'll be first when Kin reaches your device.</p>
 
       <div id="waitlist-msg" class="waitlist-msg" role="status" aria-live="polite"></div>
@@ -722,7 +740,6 @@
             aria-label="Your email address">
           <select name="platform" id="waitlist-platform" class="waitlist-select" aria-label="Device platform">
             <option value="iphone">iPhone</option>
-            <option value="android">Android</option>
             <option value="windows">Windows</option>
             <option value="linux">Linux</option>
           </select>
