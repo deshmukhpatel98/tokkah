@@ -215,6 +215,7 @@
     el.progress = $("progress-hairline");
     el.progressFill = $("progress-fill");
     el.mute = $("mute-toggle");
+    el.download = $("download-film");
     el.volumeWaves = $("volume-waves");
     el.replay = $("replay-button");
     el.soundPill = $("sound-pill");
@@ -2189,6 +2190,12 @@
         window.kinAd.seek(frac * DURATION).then(() => { if (wasPlaying) play(); });
       });
       el.mute.addEventListener("click", e => { e.stopPropagation(); setMuted(!_muted); });
+      // The film also travels as one self-contained file (the artifact, a local
+      // open). Its download is a route on the site that serves the film, so the
+      // link is offered only when this page came from one.
+      const fromSite = /^https?:$/.test(location.protocol) && /\/ad\/kin-ad(\.html)?$/.test(location.pathname);
+      if (!fromSite) el.download.style.display = "none";
+      el.download.addEventListener("click", e => e.stopPropagation());
       el.replay.addEventListener("click", e => { e.stopPropagation(); _atRest = false; window.kinAd.seek(0).then(() => play()); });
     }
 

@@ -5793,7 +5793,14 @@ export default {
     // disk image, because a second bucket is a second thing to forget to
     // upload to. The path says which platform a person came for, so the
     // download page and the analytics can tell them apart.
-    const rel = url.pathname.match(/^\/(?:macos|android)\/dl\/([A-Za-z0-9._-]{1,64})$/);
+    // ── AND FOR THE FILM ─────────────────────────────────────────────────────
+    //
+    // /ad/dl/Kin.mp4 is the rendered film (ad/render.mjs -> ad/out/kin-ad.mp4),
+    // put into the bucket by hand: `wrangler r2 object put tokkah-mac/Kin.mp4
+    // --file=ad/out/kin-ad.mp4 --content-type video/mp4 --remote`. Same bucket,
+    // same reasons -- and it could not be a static asset anyway: the render is
+    // gitignored and larger than the assets layer allows for one file.
+    const rel = url.pathname.match(/^\/(?:macos|android|ad)\/dl\/([A-Za-z0-9._-]{1,64})$/);
     if (rel) {
       if (!env.MACREL) return json({ error: 'releases not configured' }, 503);
       const obj = await env.MACREL.get(rel[1]);
@@ -5815,7 +5822,13 @@ export default {
         ? 'application/x-apple-diskimage'
         : rel[1].endsWith('.apk')
         ? 'application/vnd.android.package-archive'
+        : rel[1].endsWith('.mp4')
+        ? 'video/mp4'
         : 'application/gzip');
+      // A browser handed video/mp4 opens a player; the person clicked a download
+      // icon and wants a file. The name is already limited to [A-Za-z0-9._-] by
+      // the route above, so it is safe inside the header.
+      if (rel[1].endsWith('.mp4')) h.set('content-disposition', `attachment; filename="${rel[1]}"`);
       // ── HOW BIG IS IT: THE ONE HEADER NOBODY WAS SENDING ─────────────────────
       //
       // `writeHttpMetadata` copies what R2 stored ABOUT the object -- type,

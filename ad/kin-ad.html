@@ -115,6 +115,16 @@
       background: rgba(10,14,22,0.55); border: 1px solid rgba(255,255,255,0.14);
       display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: auto; color: #f3f1ec;
     }
+    /* Beside the mute control: the film as a file. The route serves the rendered
+       MP4 from the release bucket as an attachment. The script hides it when the
+       page is not served from its own site (the artifact, a local open). */
+    #download-film {
+      position: absolute; bottom: 32px; right: 104px; width: 44px; height: 44px; border-radius: 50%;
+      background: rgba(10,14,22,0.55); border: 1px solid rgba(255,255,255,0.14);
+      display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: auto; color: #f3f1ec;
+      text-decoration: none;
+    }
+    #download-film:hover { background: rgba(10,14,22,0.8); }
     #sound-pill {
       position: absolute; bottom: 96px; left: 50%; transform: translateX(-50%); display: none; align-items: center; gap: 10px;
       padding: 14px 26px; border-radius: 999px; background: rgba(10,14,22,0.62); border: 1px solid rgba(255,255,255,0.22); color: #f3f1ec;
@@ -184,6 +194,9 @@
             <path id="volume-waves" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
           </svg>
         </div>
+        <a id="download-film" href="/ad/dl/Kin.mp4" download="Kin.mp4" title="Download the film" aria-label="Download the film">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+        </a>
         <div id="sound-pill" role="button" tabindex="0">
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
           <span id="sound-pill-text">Watch with sound</span>

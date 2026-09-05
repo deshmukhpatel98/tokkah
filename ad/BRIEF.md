@@ -245,7 +245,9 @@ graph on either a live AudioContext or an OfflineAudioContext)
 - Player: a centered play control (a cream circle with a triangle, glass
   behind it) that starts the film with sound — required by autoplay policy. A
   thin progress hairline along the bottom (cream, 2px) that fills with time.
-  Click anywhere to pause/resume; a mute toggle bottom-right (icon only);
+  Click anywhere to pause/resume; a mute toggle bottom-right (icon only), and
+  beside it a download icon that saves the rendered film (`/ad/dl/Kin.mp4`,
+  served from the release bucket; hidden when the page is not on its own site);
   at the end, a replay control. Query flags: `?autoplay=1&muted=1` starts on
   load without a click (the website hero uses this); `?loop=1` loops;
   `?render=1` hides every control, seeds the grain from the frame index, and
