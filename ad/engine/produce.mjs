@@ -112,15 +112,15 @@ await stage("assemble", async () => {
     audio = path.join(work, "mixed.wav");
     const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", scoreWav, "-i", voWav, "-filter_complex",
       // the leveled voice feeds both the ducker's sidechain and the mix, so it must be split
-      `[0:a]volume=${gS.toFixed(2)}dB[s];[1:a]volume=${gV.toFixed(2)}dB,asplit[v1][v2];[s][v1]sidechaincompress=threshold=0.02:ratio=4:attack=30:release=600:makeup=1[duck];[duck][v2]amix=inputs=2:normalize=0:duration=first[out]`,
-      "-map", "[out]", "-ar", "48000", "-ac", "2", audio], { encoding: "utf8" });
+      `[0:a]volume=${gS.toFixed(2)}dB[s];[1:a]volume=${gV.toFixed(2)}dB,asplit[v1][v2];[s][v1]sidechaincompress=threshold=0.02:ratio=4:attack=30:release=600:makeup=1[duck];[duck][v2]amix=inputs=2:normalize=0:duration=first,apad=whole_dur=${D}[out]`,
+      "-map", "[out]", "-t", String(D), "-ar", "48000", "-ac", "2", audio], { encoding: "utf8" });
     if (r.status !== 0) throw new Error("voice mix failed: " + r.stderr);
   }
   // the mix to -21 LUFS integrated; a true-peak limiter holds -3 dBTP instead of a bare gain cap
   const mix = measure(audio);
   const gainDb = isFinite(mix.I) ? -21 - mix.I : 0;
   console.error(`# mix: ${isFinite(mix.I) ? mix.I.toFixed(1) : "?"} LUFS, peak ${isFinite(mix.P) ? mix.P.toFixed(1) : "?"} dBFS -> ${gainDb >= 0 ? "+" : ""}${gainDb.toFixed(1)} dB, limiter at -3 dBTP`);
-  const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", video, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-af", `volume=${gainDb.toFixed(2)}dB,alimiter=limit=0.7079:attack=5:release=60:level=false`, "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", finalPath], { encoding: "utf8" });
+  const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", video, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-af", `volume=${gainDb.toFixed(2)}dB,alimiter=limit=0.7079:attack=5:release=60:level=false`, "-c:a", "aac", "-b:a", "192k", "-t", String(D), "-movflags", "+faststart", finalPath], { encoding: "utf8" });
   if (r.status !== 0) throw new Error(r.stderr);
   const fin = measure(finalPath);
   console.error(`# final: ${isFinite(fin.I) ? fin.I.toFixed(1) : "?"} LUFS, true peak ${isFinite(fin.P) ? fin.P.toFixed(1) : "?"} dBTP`);
