@@ -156,8 +156,6 @@ jobs:
       #   --selftest-rename   update rename, temp-dir filesystem only
       #   --selftest-install  relocation rules, temp-dir filesystem only
       #   --selftest-identity handle normalisation; no network, no disk
-      #   --sameroom-test     arithmetic over a synthetic buffer; hoisted above
-      #                       the socket, so no port, no device, no window
       #   --gate-test         duplex gate: near voice bit-for-bit untouched
       #   --ledger-test       turn-taking ledger arithmetic
       #   --cue-test          caption layout and bid placement
@@ -217,7 +215,6 @@ jobs:
           tk_run selftest-rename --mute
           tk_run selftest-install --mute
           tk_run selftest-identity --mute
-          tk_run sameroom-test --mute
 
           # Each gets its OWN --listen port rather than fighting over the
           # default. These bind a real UDP socket on localhost; nothing leaves

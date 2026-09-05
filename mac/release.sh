@@ -482,6 +482,14 @@ Or download [Kin-$VER.dmg](https://room.tokkah.com/macos/dl/Kin-$VER.dmg).
 Kin keeps itself up to date after that. The shipped binary can be checked
 against its signature with \`tools/verify-release.py\`." >/dev/null 2>&1; then
           echo "  published the GitHub release for v$VER"
+          # The .dmg rides on the GitHub release too. The Releases tab is where a
+          # stranger who found the repo looks for a download, and a release with
+          # no asset reads as a project that has not shipped.
+          if gh release upload "v$VER" "/tmp/$DMG" --clobber --repo "$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')" >/dev/null 2>&1; then
+            echo "  attached $DMG to the GitHub release"
+          else
+            echo "  NOTE: could not attach $DMG to the release (by hand: gh release upload v$VER /tmp/$DMG)"
+          fi
         else
           echo "  NOTE: no GitHub release published (gh auth? already exists?)."
           echo "        By hand: gh release create v$VER"

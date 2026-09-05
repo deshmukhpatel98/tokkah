@@ -1,178 +1,82 @@
-# Kin
+<p align="center"><img src="docs/media/kin-call.gif" width="880" alt="A Kin call: the other person fills the window; a soft green light at the frame edge while you speak, blue while you listen; then both Macs side by side, taking turns."></p>
+<h1 align="center">Kin</h1>
+<p align="center"><em>As close as light allows.</em></p>
 
-**A video call between two Macs. The audio is 48 kHz 16-bit PCM, compressed
-losslessly — no lossy codec ever touches it — and it travels over a UDP
-transport written for this one job, directly between the two machines. A call
-that is lossless in both directions costs about 2.4 Mbps.**
+<p align="center">Video calls for Mac that feel like the same room. Your voice arrives exactly as the microphone heard it. The picture is the one your camera saw. Between two people, the only delay we accept is the speed of light.</p>
 
-Download: **[room.tokkah.com](https://room.tokkah.com)** · or one line in a
-terminal:
+<p align="center">
+  <a href="https://kin.tokkah.com">Download for Mac</a> &middot;
+  <a href="https://kin.tokkah.com/#waitlist">Not on a Mac? Leave your name</a> &middot;
+  <a href="https://kin.tokkah.com/ad/kin-ad">Watch the film (75 s)</a>
+</p>
 
-```bash
-curl -fsSL https://room.tokkah.com/macos/install.sh | sh
-```
+<p align="center">
+  <a href="https://github.com/deshmukhpatel98/tokkah/releases"><img src="https://img.shields.io/github/v/release/deshmukhpatel98/tokkah?style=flat-square&label=release" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-lightgrey?style=flat-square" alt="license"></a>
+  <a href="https://kin.tokkah.com"><img src="https://img.shields.io/badge/macOS_14%2B-Apple_silicon-black?style=flat-square" alt="platform"></a>
+  <a href="https://github.com/deshmukhpatel98/tokkah/actions"><img src="https://img.shields.io/github/actions/workflow/status/deshmukhpatel98/tokkah/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+</p>
 
-macOS 14+, Apple silicon, 1.7 MB, free, no account. The repository is called
-`tokkah`; the app it now builds is called **Kin**, and its binary is `tk`.
+## Why Kin
 
----
+Every video call you have ever made runs on a design from 2011 that spends your face when the network dips: the picture goes soft, the voice gets invented, and you end up talking over each other. Kin does the opposite. Quality is a constant. Time is the only thing we ever spend.
 
-## What this is, and what it is not
-
-Kin is a **native macOS app** for one-to-one calls. There is no browser
-involved, no meeting room to schedule, and no media server: the two Macs find
-each other through a Cloudflare Worker and then send audio and video **directly
-to each other** over UDP.
-
-It is not a Zoom replacement. There are no group calls, no recording, no chat,
-no calendar, no Windows or Linux or iOS build, and no Intel Mac build. It does
-one thing: two people, talking, with as little between them as the hardware
-allows.
-
-**If you were here for the browser version, read
-[The browser era](#the-browser-era-and-what-happened-to-it) before anything
-else. Short version: an invite link now opens the Mac app instead of a browser
-call, the embed still works but had to be repaired during this audit, and none
-of the browser-era numbers carry over.**
+- **Call a person, not a room.** Type a name and their Mac rings. No link to paste, no account to make, no waiting room to sit in.
+- **Green means they can hear you.** A soft light at the edge of the window: green while you speak, blue while you listen, rising and falling with your voice.
+- **One voice at a time.** Kin gives the floor to whoever is speaking, the way a room does. Nobody talks over anybody, and nobody hears themselves come back.
+- **The voice is the recording.** 48 kHz PCM, losslessly compressed, encrypted per packet. No codec ever touches it.
+- **Straight between two Macs.** A Cloudflare Worker introduces you and steps aside; audio and video travel directly over UDP. Where two routers refuse a direct path, a relay forwards packets it has no key for.
+- **Measured, every release.** Every claim in this repository ships with the number that proves it and the command that reproduces it.
 
 ## Install
 
-Two routes. They install the same signed app; they differ only in whether you
-meet Gatekeeper.
-
-**The `.dmg`** — from [room.tokkah.com](https://room.tokkah.com). Open it,
-double-click Kin, and **macOS will warn you once**, because of the next section.
-Go to System Settings → Privacy & Security, scroll down, click **Open Anyway**.
-After that the app moves itself to `/Applications` and keeps itself updated.
-
-**Or `curl`**, which never meets Gatekeeper at all:
-
 ```bash
 curl -fsSL https://room.tokkah.com/macos/install.sh | sh
 ```
 
-Not because it is sneaking past anything — quarantine is set by *quarantine-aware*
-applications like browsers, and a file fetched by `curl` never gets the
-attribute, so Gatekeeper is never consulted. The script refuses anything that is
-not `Darwin-arm64`, fetches the manifest, and checks the download's SHA-256
-against it before unpacking.
+A file fetched by `curl` is never quarantined, so Gatekeeper is never consulted (details in [docs/INSTALL.md](docs/INSTALL.md)).
 
-### There is no Apple Developer ID, and there is not going to be one
+Or download the `.dmg` from [kin.tokkah.com](https://kin.tokkah.com). macOS will ask for a one-time "Open Anyway" click under System Settings → Privacy & Security because the app is self-signed rather than notarized ([docs/INSTALL.md](docs/INSTALL.md) explains why).
 
-Say it plainly, because it is the first thing that will happen to you: **this app
-is not notarized.** There is no paid Apple Developer account behind it. `spctl`
-rejects the bundle, and the one-time "Open Anyway" click is a permanent part of
-the `.dmg` route.
-
-What the app *does* have is a **persistent self-signed certificate**, and that is
-a different problem being solved. macOS pins a camera or microphone grant to an
-app's *designated requirement*; under ad-hoc signing that requirement is a hash
-of the bundle's contents, so every release looked like a brand-new application
-and re-asked every user for permission. Signing every build with one certificate
-makes the requirement name the certificate instead:
-
-```bash
-codesign -dr - /Applications/Kin.app
-# designated => identifier "com.tokkah.tk" and certificate root = H"ef8e905f…"
-```
-
-That string is asserted at build time and must never change. The full story,
-including the measurements that ruled out the obvious wrong explanation, is
-[mac/SIGNING.md](mac/SIGNING.md). To be exact about what it buys: **permission
-persistence, not notarisation.** Gatekeeper is unchanged.
-
-### Updates are signed, and the key is not in this repo
-
-The app updates itself. Because an updater that installs whatever a URL serves
-is a remote-code-execution channel into every machine running it, the release
-manifest carries an **Ed25519 signature**, verified against a public key
-compiled into the binary
-([`mac/Sources/tk/Update.swift`](mac/Sources/tk/Update.swift)). There is no
-override flag, deliberately — a security control with a bypass is decoration.
-
-You can check the live channel yourself; this is the manifest every installed
-copy is verifying right now:
-
-```bash
-curl -s https://room.tokkah.com/macos/manifest.json
-# {"version":"0.69.0","url":"…/tk-0.69.0.tar.gz","sha256":"25c9d852…", …}
-```
-
-**The private half of that key, and the signing certificate, live outside this
-repository** — on the maintainer's machine, under `~/.config/kin-signing/`.
-Anyone can build this app. Only the maintainer can publish a release that
-existing installations will accept. That is a deliberate boundary, and
-[GOVERNANCE.md](GOVERNANCE.md#releases-and-the-keys-that-gate-them) spells out
-exactly what it costs a fork.
-
-## Build it yourself
-
-No credentials, no signing identity, nothing outside the toolchain:
-
-```bash
-git clone https://github.com/deshmukhpatel98/tokkah.git
-cd tokkah/mac
-swift build              # → "Build complete!"
-.build/debug/tk --version    # → 0.69.0
-.build/debug/tk --help
-```
-
-Requires Swift 6 and macOS 14+. Verified from clean at commit `13b85b3`:
-`swift build` finished in **25.7 s** with no configuration of any kind.
-
-There is a self-contained check that needs no network, no second machine and no
-microphone — it runs the duplex gate against synthesised audio and asserts the
-property the gate exists to protect:
-
-```bash
-.build/debug/tk --gate-test
-#   while only they are talking, the microphone is 19.3 dB quieter
-#   while you are talking, the worst sample differs by 0.0001% -- untouched
-#   GATE TEST PASSED -- your voice is bit-for-bit what the microphone heard
-```
-
-To build the `.app` bundle rather than the bare binary, `mac/bundle/mkapp.sh`
-does it; without the signing identity it falls back to ad-hoc signing, which
-works fine for a local build and will re-prompt for permissions on each rebuild.
+macOS 14+, Apple silicon, about 2 MB, free, no account.
 
 ## Make a call
 
-Both people run Kin and type the same room name. That is the whole protocol.
+Both people run Kin. Type a name to ring someone directly, or type a room word to meet.
 
 ```bash
 tk --room our-room --video camera    # camera on
 tk --room our-room                   # audio only
-tk                                   # the window asks for a room name
+tk                                   # the window asks for a name or room
 ```
 
-Room names are the capability — anyone who knows one can join, so treat it like
-a meeting link. The name also travels as `tokkah://join/<room>`, so an invite is
-a link someone clicks rather than a string they have to retype.
+Room names are the capability: anyone who knows one can join, and an invite travels as `tokkah://join/<room>`.
 
-`tk --help` is the reference and is kept honest by construction: **an unknown
-option is refused, not ignored.** That is not fastidiousness — it has happened
-twice in this project that an A/B experiment silently compared an arm against
-itself, because a misspelled flag did nothing quietly and the damaged arm ran
-with its impairment switched off.
+`tk --help` is the reference and is kept honest by construction: **an unknown option is refused, not ignored.** That is not fastidiousness — it has happened twice in this project that an A/B experiment silently compared an arm against itself, because a misspelled flag did nothing quietly and the damaged arm ran with its impairment switched off.
 
-## What is actually measured
+## How it works
 
-This project's one real rule is that a claim ships with the number that proves
-it. **Read the next section before you read this table** — it says what these
-numbers are and are not, and it matters more than any single figure in them.
+- **Rendezvous** via one Cloudflare Worker and two Durable Object classes ([`tape-app/src/worker.ts`](tape-app/src/worker.ts)). The server introduces the two Macs and steps aside; media never touches it unless two routers refuse a direct path and require a TURN relay.
+- **Direct UDP**, one socket carrying both audio and video ([`mac/Sources/tk/Net.swift`](mac/Sources/tk/Net.swift)), so there is one port and one hole to punch.
+- **48 kHz 16-bit PCM**, losslessly compressed 2.6× by fixed-order prediction and Rice coding ([`mac/Sources/tk/Lpc.swift`](mac/Sources/tk/Lpc.swift)), packed at 32 samples (0.667 ms) of audio per datagram. No lossy codec ever touches it.
+- **Loss repair** via a second copy of each packet offset in time ([DESIGN.md](DESIGN.md) §17.86), recovering 94.8% at 1% uniform loss for 1.2 ms of added buffer, switching off during bursts.
+- **Video** via H.264 High through VideoToolbox ([`mac/Sources/tk/Video.swift`](mac/Sources/tk/Video.swift)), visually lossless (45.5 dB PSNR at ~1.19 Mbps, 30 fps sustained), never bit-exact.
+- **Encryption** via X25519 + ML-KEM-768 post-quantum hybrid handshake and AES-256-GCM per packet ([`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift)), using two keys (one per direction) to eliminate nonce reuse.
+- **The floor and edge light**: one open microphone at a time ([`mac/Sources/tk/Audio.swift`](mac/Sources/tk/Audio.swift)), giving the floor to whoever is speaking so echo has nothing to feed on, with a linear echo canceller ([`mac/Sources/tk/Aec.swift`](mac/Sources/tk/Aec.swift)) for what leaks on speakers; the edge light glows green while you speak and blue while you listen ([`mac/Sources/tk/Controls.swift`](mac/Sources/tk/Controls.swift)).
+- **Signed self-updater** verifying Ed25519 signatures ([`mac/Sources/tk/Update.swift`](mac/Sources/tk/Update.swift)) and swapping the bundle atomically via `renamex_np`; the private signing key is not in this repo ([GOVERNANCE.md](GOVERNANCE.md#releases-and-the-keys-that-gate-them)).
+
+## What is measured
+
+This project's one real rule is that a claim ships with the number that proves it. The full table of measurements is in [docs/MEASURED-KIN.md](docs/MEASURED-KIN.md).
 
 | Claim | Measured | Where |
 |---|---|---|
 | Mouth to ear | **9.23 ms**, fully attributed with 0.08 ms unaccounted: `cap→send 1.67 · recv→play 3.01 · mic 1.88 · spk 2.58`. **4.46 ms of that 9.23 is the microphone and the speaker** — hardware nobody can optimise | [DESIGN.md](DESIGN.md) §17.108 |
 | Audio format | 48 kHz **16-bit PCM, losslessly compressed 2.6×** by fixed-order prediction + Rice coding (the FLAC/Shorten subset, no lookahead, so it costs no latency by construction): **1.16 Mbps** each way, was 1.64 uncompressed. 137,005 packets round-tripped with **0 mismatches** | [`mac/Sources/tk/Lpc.swift`](mac/Sources/tk/Lpc.swift), `tk --selftest-lpc` |
-| Packet cadence | 32 samples per packet = **0.667 ms** of audio per datagram, 1511 packets/s. One UDP socket carries audio and video, so there is one port and one hole to punch | [`mac/Sources/tk/Net.swift`](mac/Sources/tk/Net.swift) |
 | Encryption costs nothing | X25519 + ML-KEM-768 (post-quantum hybrid) + AES-256-GCM per packet, handshake signed by the device key, replay window: **0.78 µs** to seal 276 bytes, worst of 300,000 at 15 µs, against a 1333 µs deadline — 0.06% typical | [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift) |
 | Your voice is untouched | duplex gate: **19.3 dB** of attenuation while only the far end is talking, **0.0001%** worst-sample difference while you talk — bit-for-bit | `tk --gate-test` |
 | Video | H.264 High through VideoToolbox: **45.5 dB PSNR at ~1.19 Mbps, 30 fps sustained**. Glass-to-glass **~34.8 ms** in the shipping default (5.6 ms capture→decoded, 29.2 ms decoded→glass) | [DESIGN.md](DESIGN.md), [`mac/Sources/tk/Video.swift`](mac/Sources/tk/Video.swift) |
-| Loss repair | a second copy of each packet, offset in time: **94.8% recovered at 1% uniform loss for 1.2 ms** of added buffer — and it switches itself off under bursts, where it does not work | [DESIGN.md](DESIGN.md) §17.86 |
-| Window on screen | **192 ms**, first camera frame **464 ms**, by starting the sensor before the window rather than after. 640 of the ~780 ms to first frame is the sensor itself and is not ours | [`mac/Sources/tk/main.swift`](mac/Sources/tk/main.swift) |
 | Answering a ring | **429 ms** to first picture on a real answered ring | [`mac/Sources/tk/main.swift`](mac/Sources/tk/main.swift) |
-| **Cancel and decline** | **346 ms on production**, from the press to the other Mac having it | [CHANGELOG.md](CHANGELOG.md) (0.62.0) |
 
 ### What these numbers are not
 
@@ -209,157 +113,32 @@ microphone captured**, and lossy with respect to the float the OS hands over.
 The project's own word for that is **"transparent, not lossless"**, and it is the
 better word.
 
-## Where the interesting engineering is
-
-Roughly in order of how much of the project's difficulty lives there:
-
-- **[`mac/Sources/tk/Audio.swift`](mac/Sources/tk/Audio.swift)** (3,944 lines) —
-  the real-time path. A CoreAudio render callback reading a lock-free ring
-  written by a socket thread, with no locks anywhere, because a lock on the audio
-  thread is a dropout. This is also why the package builds in Swift 5 language
-  mode on purpose: Swift 6's actor isolation cannot model that, and its only
-  available advice would break the thing it is protecting
-  ([`mac/Package.swift`](mac/Package.swift)).
-- **[`mac/Sources/tk/Net.swift`](mac/Sources/tk/Net.swift)** — the wire. A
-  20-byte header, one datagram per 0.667 ms of audio, capability bits so that a
-  format change is never assumed of the far end — the two ends of a call can be
-  up to 60 s apart in version.
-- **[`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift)** — X25519 and
-  AES-256-GCM, **two keys, one per direction**, because a single key with a
-  counter from zero would make every packet number a nonce reuse, and nonce reuse
-  under GCM does not weaken the cipher, it forfeits it.
-- **[`mac/Sources/tk/Update.swift`](mac/Sources/tk/Update.swift)** — the signed
-  self-updater, which swaps the whole bundle in one `renamex_np(RENAME_SWAP)`
-  because editing files inside a bundle invalidates the signature over it and a
-  machine with no private key cannot repair what it breaks.
-- **[`mac/Sources/tk/Controls.swift`](mac/Sources/tk/Controls.swift)** (5,282
-  lines) — the interface, which has been a richer source of bugs than the codec.
-- **[`mac/tools/`](mac/tools)** — 23 check scripts, one per behaviour that has
-  broken before (`gate-check.sh`, `crash-check.sh`, `sameroom-check.sh`,
-  `update-check.sh`, …). These are the regression suite for everything CI cannot
-  reach, which is all of `mac/`.
-- **[`tape-app/src/worker.ts`](tape-app/src/worker.ts)** — the entire server: one
-  Cloudflare Worker, two Durable Object classes (`Room`, `Health`) and one R2
-  bucket for the Mac releases. It does rendezvous, the doorbell, optional TURN
-  credentials, telemetry, and it serves the download page. **Media never touches
-  it** — except on a call where the two routers will not allow a direct path, in
-  which case it falls back to Cloudflare's TURN relay, which forwards packets it
-  has no key for.
-
-Design notes are per-topic rather than in one file:
-[RINGING.md](RINGING.md), [TURNS.md](TURNS.md), [HELD.md](HELD.md),
-[VIDEOLOSS.md](VIDEOLOSS.md), [GESTURES.md](GESTURES.md),
-[DIAGNOSE.md](DIAGNOSE.md), [LAUNCH.md](LAUNCH.md), [PARITY.md](PARITY.md),
-[mac/SIGNING.md](mac/SIGNING.md), [mac/GLASS.md](mac/GLASS.md).
-
 ## Known limitations
 
 Named here rather than discovered later:
 
-- **Apple silicon Macs only**, macOS 14+. No Intel, Windows, Linux, iOS or
-  Android build, and none planned.
+- **Apple silicon Macs only**, macOS 14+. No Intel, Windows, Linux, iOS or Android build, and none planned.
 - **Two people per call.** No group calls.
-- **Not notarized** (above). One Gatekeeper click on the `.dmg` route.
-- **No echo canceller — on purpose, and it has a cost.** It was built, measured
-  at 11–13 dB on a simulated path, judged not good enough, and then **deleted**
-  in 0.56.0, because turn-taking makes the echo not exist: only one microphone
-  is open at a time, so there is nothing to subtract and nothing to damage.
-  Nothing filters your microphone now. The cost is that **headphones change the
-  call**, and two Macs in one room needed a separate detector to stop them
-  playing each other out of two speakers at once.
-- **No real two-machine latency measurement.** Every media figure above is
-  loopback or injected impairment (see
-  [What these numbers are not](#what-these-numbers-are-not)).
-- **A first call between two strangers, through a server that also lies about
-  their keys, is the one man-in-the-middle case left.** The media handshake is
-  signed by each install's device key and checked against the key that rang, the
-  key the server bound the name to, or the key pinned from the last call — so a
-  substituted key is refused, not merely detectable, everywhere an expectation
-  exists. Where none does (an invite link, a first call), the eight-character
-  code the two of you can read aloud is the check, and the pin written after
-  that call closes the window. Written out in full at the top of
-  [`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift).
-- **The window is invisible to accessibility tooling.** Kin reports zero
-  accessibility elements, so screen readers and window automation cannot see it
-  ([LAUNCH.md](LAUNCH.md)). That is a real defect, not a design choice.
-- **CI cannot make a call.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-  builds the Mac app on a macOS runner and runs its offline self-tests, and it
-  builds and tests the Worker on Linux — but no runner has a camera, a
-  microphone, or a second machine. Anything about how a real call *sounds or
-  looks* is verified by a person, by hand.
-- **There are no git tags and no GitHub Releases.** A release is a commit whose
-  message is the version, plus a signed manifest. Pin a commit if you need to pin.
-- **The documentation is split by era, and you have to know where the line is.**
-  [MEASURED.md](MEASURED.md) is 4,600 lines of genuine lab notebook — every
-  claim's receipt, every experiment that failed — and it is **entirely the
-  browser product**, last touched 2026-08-13. [DESIGN.md](DESIGN.md) straddles
-  both: §1–§17.76 are the browser, and **§17.77 onward is the native Mac app**,
-  which is where most numbers in the table above come from. It stops around
-  0.40.0, so releases 0.41.0–0.61.0 are documented only in
-  [CHANGELOG.md](CHANGELOG.md) and in git commit messages. Several
-  per-topic docs ([LAUNCH.md](LAUNCH.md), [RINGING.md](RINGING.md)) contain
-  "nothing here is fixed yet" statements that the code has since overtaken.
+- **Not notarized.** One Gatekeeper click on the `.dmg` route (see [docs/INSTALL.md](docs/INSTALL.md)).
+- **Your voice is not processed.** No noise suppression, no automatic gain, no voice effects; the only filter on the microphone is a 65 Hz high-pass for table thumps. Echo is handled by turn-taking first (one open microphone at a time) and a linear echo canceller second, for what leaks on speakers ([`mac/Sources/tk/Audio.swift`](mac/Sources/tk/Audio.swift), [`mac/Sources/tk/Aec.swift`](mac/Sources/tk/Aec.swift)). Headphones change the call: with no acoustic path there is nothing to gate, so both microphones stay open.
+- **No real two-machine latency measurement.** Every media figure above is loopback or injected impairment (see [What these numbers are not](#what-these-numbers-are-not)).
+- **A first call between strangers through a server that lies about keys is the one remaining MITM case.** Subsequent calls pin keys, and an eight-character voice code verifies first calls ([`mac/Sources/tk/Crypto.swift`](mac/Sources/tk/Crypto.swift)).
+- **The window is invisible to accessibility tooling.** Kin reports zero accessibility elements ([LAUNCH.md](LAUNCH.md)); a real defect, not a design choice.
+- **CI cannot make a call.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) verifies builds and offline tests, but audio and video are checked by hand on hardware ([`mac/tools/`](mac/tools)).
+- **Releases are tagged and listed under [GitHub Releases](https://github.com/deshmukhpatel98/tokkah/releases)**; the `.dmg` and the signed manifest are served from [kin.tokkah.com](https://kin.tokkah.com).
+- **Documentation is split by era.** [docs/BROWSER-ERA.md](docs/BROWSER-ERA.md) and [MEASURED.md](MEASURED.md) cover the browser product; [DESIGN.md](DESIGN.md) covers both; native Mac details are in [docs/ENGINEERING.md](docs/ENGINEERING.md).
 
-## The browser era, and what happened to it
+## The goal
 
-This repository began on 2026-08-04 as a browser product: a WebRTC call with a
-lossless-PCM audio lane over datachannels, embeddable in any page with one
-`<script>` tag. It worked, and it produced real results — sliding-window FEC
-repairing a lost packet at a p50 of 8 ms where a block code needed 80 ms+,
-VMAF 99.7 video, and a **127 ms mouth-to-ear on a genuine cross-planet call**
-between Delhi and the Netherlands, which is the one long-distance media
-measurement this project has ever taken on real machines in real places
-([LATENCY-150.md](LATENCY-150.md)). Those measurements are all still in
-[MEASURED.md](MEASURED.md), failures included.
+Under 150 milliseconds, anywhere on Earth. Between two people there is exactly one delay that is real: the time light needs to cross the distance. Everything else is a defect, and we are removing it — measured on live calls, every release.
 
-The native macOS work starts on 2026-08-23; the app was renamed **Kin** at
-0.56.0 on 2026-08-25. None of the browser-era numbers carry over — different
-transport, different codec, different measurements — which is why the table
-above shares none of them.
-
-**An invite link is no longer a browser call.** Following a link that somebody
-sent you now opens Kin, or offers the download. That was deliberate, and it is
-what "open it in two tabs, that's a call" no longer describes.
-
-**The embed still works — but it was broken, silently, and this audit is what
-found it.** Worth writing down because of the shape of the failure rather than
-the size of the fix:
-
-- `embed.js` builds an iframe pointing at the room. The invite funnel above
-  could not tell that iframe apart from a person following a link, so it sent
-  the frame to the download page. The page did not error. It rendered a
-  plausible "Join on Kin" panel where a call should have been, and returned
-  HTTP 200 doing it. Nothing anywhere said anything was wrong.
-- The fix is one parameter: `web=1`, the escape hatch `tape-app/src/worker.ts`
-  already documented and already served. It belongs on the frame and not on the
-  shareable link — a person sent a link may genuinely want the app; a page that
-  embedded a call has already decided.
-- Verified, in this order: the real `build()` run under Node emits
-  `…/?r=standup&web=1`; that URL returns `<title>Kin</title>` on production
-  where the one without it returns `<title>Join on Kin</title>`; and a real
-  browser loading it renders the call surface — "Join call", camera state and
-  all — rather than a download page.
-
-So the one-line integration is true again — **once the Worker is redeployed.**
-The fix is a static asset, so `https://room.tokkah.com/embed.js` still serves the
-broken build until then (`curl -s …/embed.js | grep -c web=1` → `0`):
-
-```html
-<script src="https://room.tokkah.com/embed.js" data-room="standup"></script>
-```
-
-with the honest caveat that it embeds the **browser** client, which is not where
-the work goes.
-
-The browser client source is still in `tape-app/public/` and is still AGPL, so
-nothing is lost if you want it — but **it is not where the work goes**, and it
-is not maintained. Every commit since the pivot has been in `mac/`.
+For the record so far, see [LATENCY-150.md](LATENCY-150.md): the one real cross-planet measurement (Delhi ↔ Netherlands, 127 ms mouth-to-ear) was taken in the browser era and does not carry over to the Mac app; the Mac app's own long-distance number is the next thing worth measuring.
 
 ## Self-hosting
 
 The Worker is in this repo and deploys on a **free** Cloudflare account.
-[SELF-HOSTING.md](SELF-HOSTING.md) has the full walkthrough, including the
-optional TURN credentials and pointing your own build at your own deployment.
+[SELF-HOSTING.md](SELF-HOSTING.md) has the full walkthrough, including optional
+TURN credentials and pointing your own build at your deployment.
 
 ## License
 
@@ -368,16 +147,14 @@ Dual-licensed, and for almost everyone the answer is "free, go ahead".
 **Free, under the [GNU AGPL v3](LICENSE)** — OSI-approved. Use it, deploy it,
 fork it, sell a service built on it. Two light obligations: if you modify it and
 serve those modifications to other people, publish your modified source too; and
-**credit it** with one line in an About screen, credits page or footer, linked.
-That second one applies only to products other people use — running it for
-yourself or your team requires nothing. Details:
-[ATTRIBUTION.md](ATTRIBUTION.md).
+**credit it** with one line in an About screen, credits page or footer, linked
+([ATTRIBUTION.md](ATTRIBUTION.md)). That second one applies only to products
+other people use — running it for yourself or your team requires nothing.
 
-**Commercially, under a paid license** — for the one case the AGPL does not
-cover: shipping this inside a **closed-source** product, or running a modified
-version as a service without publishing your changes. See
-[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md), which opens with a table telling
-you whether you owe anything at all, or write to licensing@tokkah.com.
+**Commercially, under a paid license** — for shipping inside a
+**closed-source** product, or running a modified version as a service without
+publishing your changes. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or
+write to licensing@tokkah.com.
 
 Contributions carry a DCO sign-off plus a licensing grant, both explained in
 [CONTRIBUTING.md](CONTRIBUTING.md). Third-party components: [NOTICE](NOTICE) —
@@ -393,11 +170,13 @@ versions.
 - **Want to contribute?** [CONTRIBUTING.md](CONTRIBUTING.md). Be warned that the
   bar is a measurement, including for the maintainer.
 
-This is a **one-person project** — 483 commits, one author, started three weeks
-before this sentence was written. [GOVERNANCE.md](GOVERNANCE.md) says who decides
-what, how a pull request gets accepted, what a fork can and cannot do with the
-signing keys, and what happens to all of this if the maintainer disappears.
+This is **a one-person project, in the open since August 2026**.
+[GOVERNANCE.md](GOVERNANCE.md) says who decides what, how a pull request gets
+accepted, what a fork can and cannot do with the signing keys, and what
+happens to all of this if the maintainer disappears.
 
 [OPENNESS.md](OPENNESS.md) is the scorecard the project grades itself against —
 can a stranger license it, deploy it, understand it, contribute to it, trust it —
 with the command that proves each row.
+
+If a call on Kin felt closer than it should have, a star here helps the next person find it.

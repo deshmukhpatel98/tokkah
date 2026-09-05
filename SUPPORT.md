@@ -5,7 +5,7 @@ install it from [room.tokkah.com](https://room.tokkah.com) — or
 `curl -fsSL https://room.tokkah.com/macos/install.sh | sh` — and have the other
 person do the same. Both of you type the same room name. There is no browser
 version any more; see
-[the README](README.md#the-browser-era-and-what-happened-to-it) if you are
+[docs/BROWSER-ERA.md](docs/BROWSER-ERA.md) if you are
 looking for it.
 
 Before reporting anything, check which version you are on. The panel shows it,
