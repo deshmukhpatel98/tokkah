@@ -70,10 +70,10 @@ const THREE_ENABLED = false;
 
 const ROLES = ['a', 'b', 'c'] as const;
 
-const json = (body: unknown, status = 200): Response =>
+const json = (body: unknown, status = 200, extraHeaders?: Record<string, string>): Response =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...extraHeaders },
   });
 
 // Numeric or short-string metrics only. An event whose payload isn't one of these
@@ -4290,6 +4290,14 @@ export function diagnoseAgreement(ends: DiagEnd[]): { agree: boolean | null; not
 
 export class Health implements DurableObject {
   private sql: SqlStorage;
+  // ── Waitlist abuse control: sliding per-IP window in DO memory ─────────────
+  //
+  // Generous on purpose: 30 signups / rolling hour per IP address. This project
+  // once locked its own owner out with an over-eager 429, so the first 30 must
+  // NEVER fail under legitimate use.
+  // Kept here in DO memory alongside the authoritative SQLite store.
+  private waitlistPosts = new Map<string, number[]>();
+
   constructor(private state: DurableObjectState, private env: Env) {
     this.sql = state.storage.sql;
     this.sql.exec(`
@@ -4409,6 +4417,26 @@ export class Health implements DurableObject {
         joins INTEGER NOT NULL
       );
     `);
+    // ── Waitlist registry ───────────────────────────────────────────────────
+    //
+    // Holds email signups, optional platform and source attribution, request
+    // metadata (country, truncated user-agent), and first/last seen timestamps.
+    // Lives in Health DO because Health already acts as the global single-point
+    // registry for this worker. Repeat signups update last_seen and hits via
+    // UPSERT, preserving the original first_seen.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS waitlist (
+        email TEXT PRIMARY KEY,
+        platform TEXT,
+        source TEXT,
+        ua TEXT,
+        country TEXT,
+        first_seen REAL,
+        last_seen REAL,
+        hits INTEGER
+      );
+    `);
+    try { this.sql.exec(`CREATE INDEX IF NOT EXISTS waitlist_first_seen ON waitlist(first_seen)`); } catch {}
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -4971,6 +4999,213 @@ export class Health implements DurableObject {
           }, {}),
       });
     }
+    // ── /waitlist: zero-leakage waitlist collection & operator dashboard ─────
+    if (url.pathname === '/waitlist' || url.pathname === '/api/waitlist') {
+      if (request.method === 'POST') {
+        const ct = (request.headers.get('content-type') ?? '').toLowerCase();
+        const isForm = ct.includes('application/x-www-form-urlencoded');
+
+        // ── RATE LIMIT: generous 30 signups / rolling hour per IP ───────────
+        //
+        // Ingest is public and unauthenticated, so an abuse ceiling is necessary.
+        // 30 per rolling hour is intentionally generous: this project once
+        // locked its own owner out with an over-eager 429, so the first 30 must NEVER
+        // fail under normal use.
+        // When tripped: JSON callers get 429 { ok: false, retry: true }, while
+        // HTML form submissions 303 bounce to /?joined=0 so a non-JS browser sees
+        // an appropriate status without a raw JSON error page.
+        const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+        const now = Date.now();
+        const hits = (this.waitlistPosts.get(ip) ?? []).filter((t) => now - t < 3600_000);
+        if (hits.length >= 30) {
+          this.waitlistPosts.set(ip, hits);
+          if (isForm) {
+            return new Response(null, {
+              status: 303,
+              headers: { location: '/?joined=0', 'cache-control': 'no-store' },
+            });
+          }
+          return json({ ok: false, retry: true }, 429, { 'cache-control': 'no-store' });
+        }
+
+        // ── BODY PARSING: JSON or urlencoded form ────────────────────────────
+        //
+        // Accepts both modern fetch-based callers (JSON) and zero-JS HTML <form>
+        // posts. A user on a locked-down browser, Tor, or with JS disabled must
+        // still be able to join the waitlist.
+        let rawEmail: unknown;
+        let rawPlatform: unknown;
+        let rawSource: unknown;
+
+        const bodyText = await request.text();
+        if (isForm) {
+          const params = new URLSearchParams(bodyText);
+          rawEmail = params.get('email');
+          rawPlatform = params.get('platform');
+          rawSource = params.get('source');
+        } else {
+          try {
+            const parsed = JSON.parse(bodyText);
+            if (parsed && typeof parsed === 'object') {
+              rawEmail = (parsed as Record<string, unknown>).email;
+              rawPlatform = (parsed as Record<string, unknown>).platform;
+              rawSource = (parsed as Record<string, unknown>).source;
+            }
+          } catch {
+            rawEmail = null;
+          }
+        }
+
+        // ── VALIDATION: strict email format & length, constrained platforms ──
+        //
+        // RFC 5321 caps email addresses at 254 octets. We trim whitespace, fold to
+        // lowercase, and check a sane regex: user@domain.tld with at least one dot
+        // in the domain part. Anything else is rejected before hitting SQLite.
+        const email = typeof rawEmail === 'string' ? rawEmail.trim().toLowerCase() : '';
+        const emailValid = email.length > 0 && email.length <= 254 && /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(email);
+
+        if (!emailValid) {
+          if (isForm) {
+            return new Response(null, {
+              status: 303,
+              headers: { location: '/?joined=0', 'cache-control': 'no-store' },
+            });
+          }
+          return json({ ok: false, error: 'email' }, 400, { 'cache-control': 'no-store' });
+        }
+
+        // Platform is optional, but restricted to known client environments so
+        // junk values do not fragment the aggregation dashboard.
+        const VALID_PLATFORMS = new Set(['iphone', 'android', 'windows', 'linux', 'mac', 'other']);
+        const platStr = typeof rawPlatform === 'string' ? rawPlatform.trim().toLowerCase() : '';
+        const platform = VALID_PLATFORMS.has(platStr) ? platStr : null;
+
+        // Source is optional, max 64 chars, restricted to safe identifier characters.
+        const srcStr = typeof rawSource === 'string' ? rawSource.trim() : '';
+        const source = (srcStr.length > 0 && srcStr.length <= 64 && /^[A-Za-z0-9_.-]+$/.test(srcStr)) ? srcStr : null;
+
+        // User-agent truncated to 200 chars to prevent storage bloat.
+        const rawUa = request.headers.get('user-agent');
+        const ua = rawUa ? rawUa.slice(0, 200) : null;
+
+        // Country from Cloudflare edge header or x-country forward.
+        const countryRaw = request.headers.get('x-country') ?? request.headers.get('cf-ipcountry');
+        const country = countryRaw && countryRaw.trim() ? countryRaw.trim().slice(0, 10) : null;
+
+        // Rate limit hit is recorded only for valid submissions.
+        hits.push(now);
+        this.waitlistPosts.set(ip, hits);
+
+        // ── SQLITE UPSERT ────────────────────────────────────────────────────
+        //
+        // Repeat signups bump last_seen and increment hits so we can measure how
+        // many times someone checked back, but DO NOT overwrite first_seen.
+        // Existing platform/source/ua/country are preserved if repeat signup omitted them.
+        const nowSec = Date.now() / 1000;
+        this.sql.exec(
+          `INSERT INTO waitlist (email, platform, source, ua, country, first_seen, last_seen, hits)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+           ON CONFLICT(email) DO UPDATE SET
+             last_seen = excluded.last_seen,
+             hits = waitlist.hits + 1,
+             platform = coalesce(excluded.platform, waitlist.platform),
+             source = coalesce(excluded.source, waitlist.source),
+             ua = coalesce(excluded.ua, waitlist.ua),
+             country = coalesce(excluded.country, waitlist.country)`,
+          email, platform, source, ua, country, nowSec, nowSec,
+        );
+
+        // Successful response: 200 { ok: true } with no-store for JSON, 303 /?joined=1 for HTML forms.
+        if (isForm) {
+          return new Response(null, {
+            status: 303,
+            headers: { location: '/?joined=1', 'cache-control': 'no-store' },
+          });
+        }
+        return json({ ok: true }, 200, { 'cache-control': 'no-store' });
+      }
+
+      if (request.method === 'GET') {
+        const authHeader = request.headers.get('authorization');
+        const bearerToken = authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : null;
+        const t = url.searchParams.get('token')
+          ?? url.searchParams.get('key')
+          ?? request.headers.get('x-agent-key')
+          ?? bearerToken;
+
+        if (!this.adminOk(t)) {
+          return new Response(null, {
+            status: 401,
+            headers: { 'cache-control': 'no-store' },
+          });
+        }
+
+        if (url.searchParams.get('format') === 'csv') {
+          const rows = this.sql.exec<{
+            email: string;
+            platform: string | null;
+            source: string | null;
+            ua: string | null;
+            country: string | null;
+            first_seen: number;
+            last_seen: number;
+            hits: number;
+          }>('SELECT email, platform, source, ua, country, first_seen, last_seen, hits FROM waitlist ORDER BY first_seen DESC').toArray();
+
+          const escapeCsv = (v: unknown): string => {
+            if (v === null || v === undefined) return '';
+            const s = String(v);
+            if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+            return s;
+          };
+
+          const lines = ['email,platform,source,ua,country,first_seen,last_seen,hits'];
+          for (const r of rows) {
+            lines.push([
+              escapeCsv(r.email),
+              escapeCsv(r.platform),
+              escapeCsv(r.source),
+              escapeCsv(r.ua),
+              escapeCsv(r.country),
+              escapeCsv(r.first_seen),
+              escapeCsv(r.last_seen),
+              escapeCsv(r.hits),
+            ].join(','));
+          }
+          return new Response(lines.join('\n') + '\n', {
+            status: 200,
+            headers: {
+              'content-type': 'text/csv; charset=utf-8',
+              'content-disposition': 'attachment; filename="waitlist.csv"',
+              'cache-control': 'no-store',
+            },
+          });
+        }
+
+        const [{ n: count }] = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM waitlist').toArray();
+
+        const platRows = this.sql.exec<{ platform: string | null; n: number }>(
+          'SELECT platform, COUNT(*) AS n FROM waitlist GROUP BY platform'
+        ).toArray();
+        const byPlatform: Record<string, number> = {};
+        for (const r of platRows) {
+          const k = r.platform || 'other';
+          byPlatform[k] = (byPlatform[k] ?? 0) + r.n;
+        }
+
+        const recent = this.sql.exec<{
+          email: string;
+          platform: string | null;
+          source: string | null;
+          country: string | null;
+          first_seen: number;
+        }>('SELECT email, platform, source, country, first_seen FROM waitlist ORDER BY first_seen DESC LIMIT 50').toArray();
+
+        return json({ count, byPlatform, recent }, 200, { 'cache-control': 'no-store' });
+      }
+
+      return json({ error: 'method' }, 405, { 'cache-control': 'no-store' });
+    }
     return json({ error: 'not found' }, 404);
   }
 
@@ -5376,6 +5611,61 @@ export default {
       return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
         new Request(`https://do/recent${url.search}`),
       );
+    }
+
+    // ── /api/waitlist: waitlist signups and operator reads ───────────────────
+    //
+    // Served across all domains (kin.tokkah.com and room.tokkah.com alike).
+    // Reachable here BEFORE any catch-all asset or room routing swallows the request.
+    // The DO holds the authoritative SQLite database and per-IP rate limits.
+    //
+    // Operator read (GET) requires AGENT_KEY (or LOG_ADMIN_TOKEN). Unauthenticated
+    // requests get a 401 with no body detail.
+    //
+    // All waitlist requests and responses are strictly forbidden from being cached.
+    if (url.pathname === '/api/waitlist') {
+      if (request.method === 'POST') {
+        const ip = request.headers.get('cf-connecting-ip') ?? 'local';
+        const country = (request.cf?.country as string | undefined) ?? request.headers.get('cf-ipcountry') ?? '';
+        const body = await request.text();
+        return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+          new Request('https://do/waitlist', {
+            method: 'POST',
+            redirect: 'manual',
+            headers: {
+              'content-type': request.headers.get('content-type') ?? 'application/json',
+              'cf-connecting-ip': ip,
+              'user-agent': request.headers.get('user-agent') ?? '',
+              'x-country': country,
+            },
+            body,
+          }),
+        );
+      }
+      if (request.method === 'GET') {
+        const authHeader = request.headers.get('authorization');
+        const bearerToken = authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : null;
+        const t = url.searchParams.get('token')
+          ?? url.searchParams.get('key')
+          ?? request.headers.get('x-agent-key')
+          ?? bearerToken;
+        const authed = (env.LOG_ADMIN_TOKEN && t === env.LOG_ADMIN_TOKEN) || (env.AGENT_KEY && t === env.AGENT_KEY);
+        if (!authed) {
+          return new Response(null, {
+            status: 401,
+            headers: { 'cache-control': 'no-store' },
+          });
+        }
+        return env.HEALTH.get(env.HEALTH.idFromName('global')).fetch(
+          new Request(`https://do/waitlist${url.search}`, {
+            method: 'GET',
+            headers: {
+              ...(t ? { 'x-agent-key': t } : {}),
+            },
+          }),
+        );
+      }
+      return json({ error: 'method' }, 405, { 'cache-control': 'no-store' });
     }
 
     // ── The doorbell: /api/kin/<handle>/(register|ring|poll) ─────────────────

@@ -1,21 +1,104 @@
 // ── kin.tokkah.com, the front door ───────────────────────────────────────────
 //
-// One job: the version and size on the page come from the same signed manifest
-// the app's updater reads, so a release can never leave a stale number here.
-// The HTML ships with the last-known values baked in; if this fetch fails the
-// page is merely a release behind, never blank.
-//
-// (External file because the worker's CSP is script-src 'self' -- no inline JS.)
+// Hero film controls, waitlist form enhancement, and live release manifest sync.
+// Worker CSP: script-src 'self' 'wasm-unsafe-eval' -- no inline JS.
 (async () => {
+  // ── HERO FILM CONTROLS & POSTER DETECTION ──────────────────────────────────
+  const filmIframe = document.getElementById('hero-film');
+  const filmCtrlBtn = document.getElementById('film-ctrl-btn');
+  const filmCtrlText = document.getElementById('film-ctrl-text');
+
+  const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const isNarrow = window.innerWidth < 720;
+
+  if (isNarrow || prefersReducedMotion) {
+    if (filmIframe) {
+      filmIframe.src = '/ad/kin-ad?t=64.5';
+    }
+    if (filmCtrlText) {
+      filmCtrlText.textContent = 'Play film';
+    }
+  }
+
+  if (filmCtrlBtn && filmIframe) {
+    filmCtrlBtn.addEventListener('click', () => {
+      filmIframe.src = '/ad/kin-ad?autoplay=1';
+      if (filmCtrlText) {
+        filmCtrlText.textContent = 'Restart with sound';
+      }
+    });
+  }
+
+  // ── WAITLIST ENHANCEMENT ──────────────────────────────────────────────────
+  const waitlistForm = document.getElementById('waitlist-form');
+  const waitlistMsg = document.getElementById('waitlist-msg');
+
+  function showWaitlistSuccess() {
+    if (waitlistForm) waitlistForm.style.display = 'none';
+    if (waitlistMsg) {
+      waitlistMsg.className = 'waitlist-msg success';
+      waitlistMsg.textContent = "You're on the list.";
+    }
+  }
+
+  function showWaitlistError(text) {
+    if (waitlistMsg) {
+      waitlistMsg.className = 'waitlist-msg error';
+      waitlistMsg.textContent = text || "That address didn't look right.";
+    }
+  }
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('joined') === '1') {
+      showWaitlistSuccess();
+    } else if (params.get('joined') === '0') {
+      showWaitlistError("That address didn't look right.");
+    }
+  } catch { /* URLSearchParams unavailable or invalid */ }
+
+  if (waitlistForm) {
+    waitlistForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (waitlistMsg) {
+        waitlistMsg.textContent = '';
+        waitlistMsg.className = 'waitlist-msg';
+      }
+      const emailInput = waitlistForm.querySelector('input[name="email"]');
+      const platformSelect = waitlistForm.querySelector('select[name="platform"]');
+      const sourceInput = waitlistForm.querySelector('input[name="source"]');
+
+      const email = emailInput ? emailInput.value.trim() : '';
+      const platform = platformSelect ? platformSelect.value : undefined;
+      const source = sourceInput ? sourceInput.value : 'kin-home';
+
+      try {
+        const res = await fetch('/api/waitlist', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email, platform, source }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.ok) {
+            showWaitlistSuccess();
+            return;
+          }
+        }
+        showWaitlistError("That address didn't look right.");
+      } catch {
+        showWaitlistError("That address didn't look right.");
+      }
+    });
+  }
+
   // ── WHICH APP THIS VISITOR CAN ACTUALLY RUN ────────────────────────────────
   //
   // One front door, two apps. A person on a phone offered a disk image has been
   // handed a file their device cannot open, and the commonest thing they will do
   // about it is leave. So the button asks what they are holding first, and the
   // Mac path below is left exactly as it was for everybody else.
-  //
-  // On the user agent, not on screen width: a narrow window on a Mac is still a
-  // Mac, and a tablet in landscape is still Android.
   if (/Android/i.test(navigator.userAgent)) {
     try {
       const r = await fetch('/android/manifest.json', { cache: 'no-cache' });
@@ -60,8 +143,6 @@
     // content-disposition on /macos/dl/* -- the browser names the saved file after
     // the last path segment, so `Kin.dmg` lands as an anonymous `Kin.dmg` and a
     // second download collides with the first. `Kin-0.46.0.dmg` names itself.
-    // Relative on purpose: the manifest gives an absolute room.tokkah.com URL and
-    // this page is also served from kin.tokkah.com.
     let dl = '/macos/dl/Kin.dmg';
     if (m.dmg) {
       const path = new URL(m.dmg, location.origin).pathname;
