@@ -92,7 +92,7 @@ const ANGLES = ["lead with the feeling the audience already has, then one quiet 
 // ---------------------------------------------------------------- prompts
 function treatmentPrompt(angle) {
   const pace = FAST
-    ? `PACE: fast and immersive. ${Math.round(o.duration / 3.2)}-${Math.round(o.duration / 2.4)} shots for ${o.duration} s: most 2-3.5 s, a few 1.2-2 s beats; something new must enter or change every 2-3 s; motion durations 240-700 ms; whole-scene camera moves (push-ins, pans, a snap zoom) are welcome; cut on the beats of the score; the film never sits still and never fades to black except at the very end.`
+    ? `PACE: fast and immersive. ${Math.round(o.duration / 4.5)}-${Math.round(o.duration / 3.2)} shots for ${o.duration} s: most 2.5-4 s, one or two 1.5-2 s beats; something new must enter or change every 2-3 s; motion durations 240-700 ms; whole-scene camera moves (push-ins, pans, a snap zoom) are welcome; cut on the beats of the score; the film never sits still and never fades to black except at the very end.`
     : `PACE: measured. 6-9 shots; slow, confident motion (600-1400 ms); silence used as a beat.`;
   const narration = `NARRATION LEADS. Write the narrator's script FIRST: about ${o.words} words in ${Math.round(o.words / 11)}-${Math.round(o.words / 7)} lines, timed in seconds, covering the whole film with gaps under 1.5 s (the first line starts by 0.6 s; the last line lands the tagline or the offer). The script sells the product concretely: what it is, what it does, why it matters, the offer, the name. Spoken, direct, present tense, no jargon. The picture serves the words: every line has a visual event on or just before its onset. On-screen copy is separate and sparer (short lines that punctuate, never the same words as the narration). Cast the voice for this energy from the roster.`;
   const productRule = `THE PRODUCT IS THE STAR. First describe how it looks in 4-6 concrete visual traits (form, material, colour, distinguishing details${o.productNotes ? `; the maker says: ${o.productNotes}` : ""}). The product itself must be on screen for at least 40% of the film, including one HERO shot where it fills at least 60% of the frame height, lit, with material and detail, and one shot of it in use or in its world. Every shot draws it through lib.product (one shared illustration), so it is identical everywhere; the motif should live IN the product (a detail of it, its silhouette, its light), not beside it.`;
@@ -108,8 +108,9 @@ ${narration}
 ${productRule}
 The renderer draws: the product (lib.product), light fields and glows, layered SVG objects with gradient fills, strokes and dots, camera moves, small labels, out-of-focus people in call windows (only for products about people talking), a lit planet (only for distance), the brand mark and an end card.
 
-Write, in this order:
-TREATMENT (prose, 400-700 words): 1) the tension in one sentence; 2) the idea in one line; 3) the product's appearance (the 4-6 traits); 4) ONE recurring visual motif and exactly where it returns; 5) the narration script, line by line with times; 6) shot-by-shot direction, contiguous shots: for each, id, times, what we see (say when the product is on screen and how large), how it MOVES (easing, durations in ms, positions in px on a 1920x1080 stage, camera moves), the light, which narration line it carries, and how it hands off to the next shot; 7) the score: tempo, pulse, harmonic plan, timbres, and a beat list synced to cuts; 8) type: which on-screen lines, sizes from 88/72/64/56; 9) the voice: cast ONE from the roster: ${ROSTER}
+Write, in this order, and keep the whole reply under 1400 words:
+TREATMENT (prose, 250-400 words, no shot list here): 1) the tension in one sentence; 2) the idea in one line; 3) the product's appearance (the 4-6 traits); 4) ONE recurring visual motif and exactly where it returns; 5) the narration script, line by line with times; 6) the score in three sentences: tempo/pulse, harmony, timbres; 7) the voice: cast ONE from the roster: ${ROSTER}
+The shot-by-shot direction goes ONLY in the PLAN JSON below: each "direction" is 25-45 words with the numbers that matter (what we see, when the product is on screen and how large in px, one motion with its duration in ms, the light, which narration line it carries); "handoffIn"/"handoffOut" are one short clause each.
 
 Then, on its own line, the word PLAN, then STRICT JSON only:
 {"product":"...","tension":"...","idea":"...","tagline":"<=6 words","wordmark":"the brand name as shown","tempo":"${o.tempo}",
@@ -118,7 +119,7 @@ Then, on its own line, the word PLAN, then STRICT JSON only:
  "motif":{"name":"...","description":"how it is drawn and moves","returns":["S1","S5","S9"]},
  "voice":{"voice_id":"...","voice_name":"...","stability":0.5,"direction":"one line of read direction"},
  "voiceover":[{"t":0.6,"text":"..."}],
- "score":{"bpm":<number or null>,"harmony":"...","timbres":"...","beats":[{"t":2.0,"what":"..."}]},
+ "score":{"bpm":<number or null>,"harmony":"...","timbres":"...","beats":[{"t":2.0,"what":"3 words"}]},
  "duration":${o.duration},
  "shots":[{"id":"S1","start":0,"end":2.6,"title":"3 words","direction":"the full direction for this shot from the treatment, with numbers","handoffIn":"what is on screen as this shot begins","handoffOut":"what this shot leaves on screen for the next","copy":"optional verbatim on-screen line or null","primitive":"title|glow|shape|portrait|duo|planet|mark|cta","params":{}}]}
 Rules for shots: contiguous (each start = previous end), first start 0, last end ${o.duration}, each >= ${FAST ? 1.2 : 2.5} s, the last two are "mark" then "cta". Voiceover lines must not overlap: allow at least 0.35 s per word plus 0.3 s between lines. "primitive"/"params" are only a fallback; keep them simple and valid.`;

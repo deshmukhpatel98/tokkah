@@ -89,8 +89,11 @@ export async function callAstra(prompt, opts = {}) {
     } catch (err) {
       clearTimeout(timer);
       const timedOut = err.name === "AbortError";
-      if ((timedOut || /HTTP 5/.test(err.message)) && tier < EFFORTS.length - 1) {
-        console.error(`[${label}] ${effort} ${timedOut ? "timed out" : "failed"} after ${((Date.now() - t0) / 1000).toFixed(0)}s; retrying at ${EFFORTS[tier + 1]}`);
+      // a stream the gateway cut (its ~600 s deadline, or a dropped connection) surfaces as
+      // "terminated" / a network TypeError, not as an HTTP status: retry one tier lower, which is faster
+      const cut = /terminated|ECONNRESET|network|socket|fetch failed|aborted/i.test(err.message || "");
+      if ((timedOut || cut || /HTTP 5/.test(err.message)) && tier < EFFORTS.length - 1) {
+        console.error(`[${label}] ${effort} ${timedOut ? "timed out" : cut ? "stream cut (" + err.message.slice(0, 40) + ")" : "failed"} after ${((Date.now() - t0) / 1000).toFixed(0)}s; retrying at ${EFFORTS[tier + 1]}`);
         continue;
       }
       throw err;
