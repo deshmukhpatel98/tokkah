@@ -781,6 +781,20 @@
           const fill = new T.DirectionalLight("#dfe7ff", white ? 1.1 : 0.5); fill.position.set(5, 3, 2); cache.set("__studio.fill", fill); scene.add(fill);
           const hemi = new T.HemisphereLight("#ffffff", white ? "#8a8c92" : "#111318", white ? 0.7 : 0.35); cache.set("__studio.hemi", hemi); scene.add(hemi);
           studioBuilt = kind;
+          const target = +(SPEC.stage && SPEC.stage.groundLum) || (white ? 170 : 12);
+          if (white) {
+            for (let pass = 0; pass < 3; pass++) {
+              for (const k of cache.keys()) cache.get(k).visible = k.startsWith("__studio");
+              const savedPos = camera.position.clone(); camera.position.set(0, 1.3, 5); camera.lookAt(0, 0.3, 0);
+              renderer.render(scene, camera); camera.position.copy(savedPos);
+              const probe = offscreen(96, 54), pg = probe.getContext("2d"); pg.drawImage(el.gl, 0, 0, 96, 54);
+              const d = pg.getImageData(0, 0, 96, 54).data; let sum = 0; for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+              const lum = sum / (d.length / 4);
+              if (Math.abs(lum - target) < 3) break;
+              renderer.toneMappingExposure = clamp(renderer.toneMappingExposure * Math.pow(target / Math.max(1, lum), 1.35), 0.15, 3);
+            }
+            api.calibratedExposure = renderer.toneMappingExposure;
+          }
         }
         for (const k of cache.keys()) if (k.startsWith("__studio")) { cache.get(k).visible = true; touched.add(k); }
         return api;
