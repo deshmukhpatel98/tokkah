@@ -36,6 +36,8 @@ function parseArgs(args) {
     out: null,
     noScore: false,
     scoreOnly: false,
+    capture: 'png',
+    gpu: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -86,6 +88,11 @@ function parseArgs(args) {
       options.noScore = true;
     } else if (arg === '--score-only') {
       options.scoreOnly = true;
+    } else if (arg === '--gpu') {
+      options.gpu = true;
+    } else if (arg === '--capture') {
+      options.capture = args[++i];
+      if (!['png', 'jpeg'].includes(options.capture)) throw new Error(`--capture must be png or jpeg, got ${options.capture}`);
     } else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: node ad/render.mjs [options]
 Options:
@@ -98,6 +105,8 @@ Options:
   --out <dir>         Output directory (default: ad/out); lets renders run in parallel
   --no-score          Video only: skip the score and mux no audio (parallel slices)
   --score-only        Render only the full-length score.wav and exit
+  --capture png|jpeg  Frame capture format (default png; jpeg is ~3x faster, quality 95)
+  --gpu               Do not pass --disable-gpu to the browser (faster canvas work on Apple silicon)
 `);
       process.exit(0);
     } else {
@@ -290,7 +299,7 @@ async function main() {
     `--user-data-dir=${tempDir}`,
     '--no-first-run',
     '--no-default-browser-check',
-    '--disable-gpu',
+    ...(options.gpu ? [] : ['--disable-gpu']),
     '--hide-scrollbars',
     '--disable-component-update',
     '--disable-background-networking',
@@ -438,7 +447,7 @@ async function main() {
   // Clean existing frames
   const existing = fs.readdirSync(framesDir);
   for (const f of existing) {
-    if (f.endsWith('.png')) fs.unlinkSync(path.join(framesDir, f));
+    if (f.endsWith('.png') || f.endsWith('.jpg')) fs.unlinkSync(path.join(framesDir, f));
   }
 
   if (!options.scoreOnly) {
@@ -456,8 +465,8 @@ async function main() {
       throw new Error(`Seek error at frame ${i} (t=${t}): ${seekRes.exceptionDetails.text || JSON.stringify(seekRes.exceptionDetails)}`);
     }
 
-    const snap = await cdp.send('Page.captureScreenshot', { format: 'png' });
-    const frameFile = `${String(i + 1).padStart(5, '0')}.png`;
+    const snap = await cdp.send('Page.captureScreenshot', options.capture === 'jpeg' ? { format: 'jpeg', quality: 95 } : { format: 'png' });
+    const frameFile = `${String(i + 1).padStart(5, '0')}.${options.capture === 'jpeg' ? 'jpg' : 'png'}`;
     fs.writeFileSync(path.join(framesDir, frameFile), Buffer.from(snap.data, 'base64'));
 
     const done = i + 1;
@@ -607,7 +616,7 @@ async function main() {
     '-y',
     '-framerate', String(fps),
     '-start_number', '1',
-    '-i', path.join(framesDir, '%05d.png'),
+    '-i', path.join(framesDir, options.capture === 'jpeg' ? '%05d.jpg' : '%05d.png'),
     ...(options.noScore ? [] : ['-i', wavPath]),
     '-c:v', 'libx264',
     '-crf', '17',

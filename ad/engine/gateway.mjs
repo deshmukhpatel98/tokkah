@@ -53,8 +53,10 @@ export async function callAstra(prompt, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 560000;
   const label = opts.label || "astra";
   let effort = opts.effort || "high";
-  const content = opts.image
-    ? [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: opts.image } }]
+  // one image (`image`) or several (`images`, in order): the critic can see our stills beside a reference's
+  const imgs = opts.images || (opts.image ? [opts.image] : []);
+  const content = imgs.length
+    ? [{ type: "text", text: prompt }, ...imgs.map(url => ({ type: "image_url", image_url: { url } }))]
     : prompt;
 
   for (let tier = EFFORTS.indexOf(effort); tier < EFFORTS.length; tier++) {
