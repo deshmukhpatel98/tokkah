@@ -1,131 +1,151 @@
 window.__AD_MODULES__ = {};
 __AD_MODULES__["S1"] = (function(){ function shot(c) {
   const { scene: s, light: l, lib, tl } = c;
-  const W = 1920, H = 1080, size = 560;
-  const progress = (a, b) => lib.span(tl, a, b, lib.ease);
-  const rebuild = progress(0, 0.6);
-  const separate = progress(2, 2.6);
-  const rake = progress(0.3, 0.9);
-  const beat = lib.envelope(tl, [[0.3, 1], [2, 0.6]], 0.035, 0.25);
-  const pan = lib.lerp(-12, 0, progress(0, 3.5));
-  const hero = {
-    x: lib.lerp(960, 1050, separate),
-    y: lib.lerp(548, 582, separate),
-    size, rotate: 0, alpha: 1
-  };
-  const partner = {
-    x: lib.lerp(960, 835, separate),
-    y: lib.lerp(548, 478, separate),
-    size, rotate: -0.055 * separate, alpha: 1
-  };
-  const fold = u => ({
-    x: size * (-0.445 + 0.89 * u),
-    y: size * (0.145 + 0.035 * Math.sin(Math.PI * u) - 0.025 * u)
-  });
+  const W = 1920, H = 1080;
+  const ease = (a, b) => lib.span(tl, a, b, lib.ease);
+  const rebuild = ease(0, 0.6), separate = ease(2, 2.6);
+  const rake = ease(0.3, 0.9);
+  const beat = lib.envelope(tl, [[0.3, 1], [2, 0.65]], 0.045, 0.28);
+
+  // Calibrate visible artwork, rather than mistaking its box for its silhouette.
+  const left = -0.445, right = 0.445;
+  const top = -0.20, bottom = top + 0.22 * H / 560;
+  const forefoot = 0.06, collar = -0.07, sole = 0.155;
+  const mx = x => x <= forefoot ? x : forefoot + (x - forefoot) * 1.15;
+  const my = y => y < collar ? collar + (y - collar) * 0.8 :
+    y > sole ? sole + (y - sole) * 0.8 : y;
+  const midX = (mx(left) + mx(right)) / 2;
+  const midY = (my(top) + my(bottom)) / 2;
+  const size = 648 / (my(bottom) - my(top));
+  const widthFit = Math.min(1, 1728 / ((mx(right) - mx(left)) * size));
+  const hero = { x: 960 + 54 * separate, y: 540 + 62 * separate };
+  const partner = { x: 960 - 54 * separate, y: 540 - 62 * separate };
+
+  // One shared, non-mutating revision: retain the actual supplied illustration.
+  function product(ctx, p, only, alpha = 1) {
+    const xs = [-2, forefoot, 2], ys = [-2, collar, sole, 2];
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    for (let ix = 0; ix < 2; ix++) {
+      for (let iy = 0; iy < 3; iy++) {
+        const ax = ix ? 1.15 : 1, bx = ix ? -0.15 * forefoot : 0;
+        const ay = iy === 1 ? 1 : 0.8;
+        const by = iy === 0 ? 0.2 * collar : iy === 2 ? 0.2 * sole : 0;
+        const x0 = (mx(xs[ix]) - midX) * size * widthFit;
+        const y0 = (my(ys[iy]) - midY) * size;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x0, y0, (mx(xs[ix + 1]) - mx(xs[ix])) * size * widthFit,
+          (my(ys[iy + 1]) - my(ys[iy])) * size);
+        ctx.clip();
+        ctx.translate((bx - midX) * size * widthFit, (by - midY) * size);
+        ctx.scale(ax * widthFit, ay);
+        lib.product(ctx, { x: 0, y: 0, size, alpha, only, skip: ["shadow"] });
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+  function point(x, y) {
+    return [hero.x + (mx(x) - midX) * size * widthFit,
+      hero.y + (my(y) - midY) * size];
+  }
 
   s.save();
   s.fillStyle = lib.rgba("ground", 1);
   s.fillRect(0, 0, W, H);
-  const atmosphere = s.createLinearGradient(180, 120, 1650, 1040);
-  atmosphere.addColorStop(0, lib.rgba("B", 0.055 * (1 - rebuild)));
-  atmosphere.addColorStop(0.52, lib.rgba("A", 0.025 + 0.025 * rake));
-  atmosphere.addColorStop(1, lib.rgba("ground", 0));
-  s.fillStyle = atmosphere;
+  const background = s.createRadialGradient(960, 620, 60, 960, 620, 1050);
+  background.addColorStop(0, lib.rgba(lib.mix("B", "A", rebuild), 0.065));
+  background.addColorStop(1, lib.rgba("ground", 0));
+  s.fillStyle = background;
   s.fillRect(0, 0, W, H);
-  s.translate(pan, 0);
-
-  function shadow(x, y, alpha) {
+  function contact(p, alpha) {
     s.save();
-    s.translate(x, y);
-    s.scale(1, 0.14);
-    const g = s.createRadialGradient(0, 0, 12, 0, 0, 290);
+    s.translate(p.x, p.y + 330);
+    s.scale(1, 0.075);
+    const g = s.createRadialGradient(0, 0, 20, 0, 0, 760);
     g.addColorStop(0, `rgba(0,0,0,${alpha})`);
     g.addColorStop(1, "rgba(0,0,0,0)");
     s.fillStyle = g;
-    s.fillRect(-290, -290, 580, 580);
+    s.fillRect(-760, -760, 1520, 1520);
     s.restore();
   }
-  shadow(partner.x, 747 - 56 * separate, 0.38 * separate);
-  shadow(hero.x, 751 + 16 * separate, 0.58);
-  if (separate > 0) lib.product(s, partner);
-  lib.product(s, hero);
+  if (separate > 0) {
+    contact(partner, 0.32 * separate);
+    product(s, partner);
+  }
+  contact(hero, 0.58);
+  product(s, hero);
   s.restore();
 
   l.save();
-  l.translate(pan, 0);
-  lib.product(l, { ...hero, only: ["outline"], alpha: 0.42 });
+  product(l, hero, ["outline"], 0.7);
   l.globalCompositeOperation = "source-in";
-  const rim = l.createLinearGradient(hero.x - 290, 320, hero.x + 290, 780);
-  rim.addColorStop(0, lib.rgba(lib.mix("B", "A", rebuild), 0.85));
-  rim.addColorStop(0.55, lib.rgba("A", 0.06 + 0.23 * rebuild));
-  rim.addColorStop(1, lib.rgba("A", 0));
-  l.fillStyle = rim;
-  l.fillRect(-20, 0, W + 40, H);
+  l.fillStyle = lib.rgba(lib.mix("B", "A", rebuild), 0.75 - 0.48 * rebuild);
+  l.fillRect(0, 0, W, H);
   l.globalCompositeOperation = "source-over";
-  l.translate(hero.x, hero.y);
 
-  const cold = l.createLinearGradient(-280, -200, 250, 180);
-  cold.addColorStop(0, lib.rgba("B", 0.23 * (1 - rebuild)));
-  cold.addColorStop(0.6, lib.rgba("B", 0.065 * (1 - rebuild)));
-  cold.addColorStop(1, lib.rgba("B", 0));
-  l.fillStyle = cold;
-  l.fillRect(-330, -330, 660, 660);
+  const sweep = hero.x + lib.lerp(-760, 470, rake) + 35 * Math.sin(tl * 2);
+  const grazing = l.createLinearGradient(sweep - 230, hero.y - 320, sweep + 190, hero.y + 300);
+  grazing.addColorStop(0, lib.rgba("A", 0));
+  grazing.addColorStop(0.38, lib.rgba("A", 0.035 * rake));
+  grazing.addColorStop(0.52, lib.rgba("ink", (0.11 + beat * 0.1) * rake));
+  grazing.addColorStop(0.67, lib.rgba("A", 0.12 * rake));
+  grazing.addColorStop(1, lib.rgba("A", 0));
+  l.fillStyle = grazing;
+  l.fillRect(0, 0, W, H);
 
-  const sweepX = lib.lerp(-280, 215, rake) + 12 * Math.sin(tl * 1.7);
-  const warm = l.createLinearGradient(sweepX - 170, -230, sweepX + 145, 240);
-  warm.addColorStop(0, lib.rgba("A", 0));
-  warm.addColorStop(0.43, lib.rgba("A", 0.035 * rebuild));
-  warm.addColorStop(0.56, lib.rgba("A", (0.16 + 0.11 * beat) * rebuild));
-  warm.addColorStop(0.66, lib.rgba("ink", 0.045 * rebuild));
-  warm.addColorStop(1, lib.rgba("A", 0));
-  l.fillStyle = warm;
-  l.fillRect(-330, -330, 660, 660);
+  l.lineCap = "round";
+  l.strokeStyle = lib.rgba("ink", 0.095 * rebuild);
+  l.lineWidth = 0.85;
+  l.beginPath();
+  for (let i = 0; i < 1008; i++) {
+    const col = i % 126, row = Math.floor(i / 126);
+    const x = hero.x - 630 + col * 10 + (row % 2) * 5;
+    const y = hero.y - 122 + row * 10 + 28 * Math.sin(col / 125 * Math.PI);
+    l.moveTo(x - 3, y - 2);
+    l.quadraticCurveTo(x, y + 4, x + 3, y - 2);
+  }
+  l.stroke();
 
   if (tl < 0.6) {
-    const rng = lib.rng(109);
-    l.lineCap = "round";
+    const random = lib.rng(109);
     for (let i = 0; i < 92; i++) {
-      const u = 0.025 + rng() * 0.95;
-      const target = fold(u);
-      const originalY = -size * 0.25 + rng() * size * 0.57;
-      const drift = (rng() - 0.5) * 75;
-      const length = 8 + rng() * 23;
-      const x = target.x + drift * (1 - rebuild);
-      const y = lib.lerp(originalY, target.y, rebuild);
-      const curl = (3 + rng() * 12) * (1 - rebuild);
-      l.strokeStyle = lib.rgba(
-        lib.mix(i % 4 === 0 ? "ink" : "B", "A", rebuild),
-        (0.18 + rng() * 0.38) * (1 - rebuild)
-      );
-      l.lineWidth = 0.8 + rng() * 1.3;
+      const u = 0.025 + random() * 0.95;
+      const fy = 0.145 + 0.035 * Math.sin(Math.PI * u) - 0.025 * u;
+      const startY = -0.19 + random() * 0.37;
+      const drift = (random() - 0.5) * 0.1;
+      const p = point(-0.445 + 0.89 * u + drift * (1 - rebuild), lib.lerp(startY, fy, rebuild));
+      const length = 10 + random() * 24, curl = (4 + random() * 12) * (1 - rebuild);
+      l.strokeStyle = lib.rgba(lib.mix("B", "A", rebuild), (0.24 + random() * 0.36) * (1 - rebuild));
+      l.lineWidth = 1.1;
       l.beginPath();
-      l.moveTo(x - length * 0.5, y + curl);
-      l.bezierCurveTo(x - length * 0.2, y - curl, x, y + curl, x + length * 0.5, y);
+      l.moveTo(p[0] - length / 2, p[1] + curl);
+      l.bezierCurveTo(p[0] - 5, p[1] - curl, p[0] + 4, p[1] + curl, p[0] + length / 2, p[1]);
       l.stroke();
     }
-
-    const head = rebuild * 1.24;
-    for (let i = 0; i < 28; i++) {
-      const a = head - 0.24 + i * 0.24 / 28;
-      const b = a + 0.24 / 28;
-      if (a < 0 || b > 1) continue;
-      const p = fold(a), q = fold(b);
-      const intensity = (i + 1) / 28;
-      lib.line(l, [[p.x, p.y], [q.x, q.y]], {
-        color: "A", width: 7, alpha: 0.13 * intensity
-      });
-      lib.line(l, [[p.x, p.y], [q.x, q.y]], {
-        color: i > 23 ? "ink" : "A", width: 2.2, alpha: 0.95 * intensity
-      });
-    }
   }
-  if (beat > 0.001) {
-    const p = fold(lib.clamp(rebuild, 0.05, 0.95));
-    lib.glow(l, p.x, p.y, 88, "A", 0.18 * beat);
-  }
-  l.translate(-hero.x, -hero.y);
+  lib.glow(l, hero.x - 160, hero.y - 90, 180, "A", 0.26 * beat);
   l.globalCompositeOperation = "destination-in";
-  lib.product(l, hero);
+  product(l, hero, ["body"]);
+  l.globalCompositeOperation = "source-over";
+  if (tl < 0.6) {
+    const start = point(left, 0)[0], end = point(right, 0)[0];
+    const head = lib.lerp(start, end + 150, rebuild);
+    l.save();
+    l.beginPath();
+    l.rect(head - 150, hero.y - 350, 150, 700);
+    l.clip();
+    product(l, hero, ["fold-highlight"]);
+    l.globalCompositeOperation = "source-in";
+    const trail = l.createLinearGradient(head - 150, 0, head, 0);
+    trail.addColorStop(0, lib.rgba("A", 0));
+    trail.addColorStop(0.8, lib.rgba("A", 1));
+    trail.addColorStop(1, lib.rgba("A", 0));
+    l.fillStyle = trail;
+    l.fillRect(head - 150, hero.y - 350, 150, 700);
+    l.restore();
+  }
   l.restore();
 }
  return shot; })();
@@ -445,130 +465,161 @@ __AD_MODULES__["S4"] = (function(){ function shot(c) {
 
 __AD_MODULES__["S5"] = (function(){ function shot(c) {
   const { scene: s, light: l, lib, tl } = c;
+  const W = 1920, H = 1080, size = 648;
+  const angle = -12 * Math.PI / 180;
   const p = (a, b) => lib.span(tl, a, b, lib.ease);
+  const wear = p(0.42, 0.74);
   const turn = p(2, 2.65);
-  const sweep = p(0, 0.6);
-  const impact = lib.envelope(tl, [[0.1, 1]], 0.07, 0.3);
-  const px = 948 + 24 * p(0, 0.65) + 124 * turn + 5 * p(2.7, 3.5);
-  const py = lib.kf(tl, [[0, 493], [0.18, 530], [0.39, 519], [0.67, 526], [3.5, 526]], lib.ease);
-  const roll = lib.kf(tl, [[0, 0.065], [0.22, 0], [0.65, -0.015], [2, -0.015], [2.65, -0.125]], lib.ease);
-  const flat = lib.lerp(1, 0.64, turn);
+  const cameraX = 128 * turn + 8 * p(0.8, 1.45);
+  const impact = lib.envelope(tl, [[0.1, 1]], 0.055, 0.25);
+  const px = 950;
+  const py = lib.kf(tl, [
+    [0, 534], [0.1, 569], [0.28, 565], [0.54, 569], [3.5, 569]
+  ], lib.ease);
+  const q = size / 580;
   const pose = ctx => {
     ctx.translate(px, py);
-    ctx.rotate(roll);
-    ctx.transform(flat, -0.075 * turn, 0, 1, 0, 0);
+    ctx.rotate(angle);
+  };
+  const clearLight = () => {
+    l.save();
+    l.setTransform(1, 0, 0, 1, 0, 0);
+    l.clearRect(0, 0, W, H);
+    l.restore();
   };
 
-  // The untouched illustration supplies every edge of the shoe.
+  s.save();
+  l.save();
+  s.translate(cameraX, 0);
+  l.translate(cameraX, 0);
+
+  // Rigid placement: the illustration retains its original silhouette.
   s.save();
   pose(s);
-  lib.product(s, { x: 0, y: 0, size: 580, alpha: 1 });
-  s.globalCompositeOperation = "source-atop";
-
-  // Dry, shallow rubbing: no cuts, missing material, or altered silhouette.
-  const patches = [
-    [-204, 37, 47, 67, 0.1],
-    [-48, 144, 142, 16, 0.21],
-    [193, 81, 48, 31, 0.39]
-  ];
-  for (const [x, y, rx, ry, onset] of patches) {
-    const a = lib.span(tl, onset, onset + 0.18, lib.ease);
-    s.save();
-    s.translate(x, y);
-    s.scale(rx, ry);
-    const g = s.createRadialGradient(0, 0, 0.05, 0, 0, 1);
-    g.addColorStop(0, lib.rgba(lib.mix("A", "ground", 0.38), 0.22 * a));
-    g.addColorStop(1, lib.rgba("A", 0));
-    s.fillStyle = g;
-    s.beginPath();
-    s.arc(0, 0, 1, 0, Math.PI * 2);
-    s.fill();
-    s.restore();
-  }
-
-  const random = lib.rng(515);
-  s.lineCap = "round";
-  for (let i = 0; i < 112; i++) {
-    const zone = i % 4;
-    const x = zone < 2 ? -237 + random() * 92 :
-      zone === 2 ? -218 + random() * 449 : 142 + random() * 105;
-    const y = zone < 2 ? -52 + random() * 170 :
-      zone === 2 ? 122 + random() * 43 : 40 + random() * 76;
-    const length = 2 + random() * 8;
-    const slope = (random() - 0.5) * 2.5;
-    const revealAt = 0.1 + lib.clamp((x + 250) / 500, 0, 1) * 0.34;
-    const reveal = 0.12 * p(0, 0.09) +
-      0.88 * lib.span(tl, revealAt, revealAt + 0.16, lib.ease);
-    s.strokeStyle = lib.rgba(
-      i % 3 ? lib.mix("A", "ink", 0.48) : lib.mix("A", "ground", 0.65),
-      reveal * (0.12 + random() * 0.22)
-    );
-    s.lineWidth = 0.55 + random() * 0.85;
-    s.beginPath();
-    s.moveTo(x, y);
-    s.lineTo(x + length, y + slope);
-    s.stroke();
-  }
+  lib.product(s, { x: 0, y: 0, size, skip: ["shadow"] });
   s.restore();
 
-  // Recolour the illustration's own detail paths, including its fold line.
-  // A moving strip makes the original line travel rather than inventing one.
-  const travelling = tl < 0.6;
-  const foldAlpha = p(0, 0.055) * (1 - p(0.51, 0.6));
-  const heelAlpha = p(2.04, 2.56) * (0.66 + 0.08 * p(2.85, 3.5));
-  if ((travelling && foldAlpha > 0) || heelAlpha > 0) {
+  // Material abrasion, masked by the illustration's actual upper and sole.
+  if (wear > 0) {
+    const left = -0.47 * size, width = 0.94 * size;
+    for (let zone = 0; zone < 2; zone++) {
+      l.save();
+      pose(l);
+      lib.product(l, {
+        x: 0, y: 0, size,
+        only: zone ? ["sole"] : ["body", "instep", "knit-upper", "knit-forefoot"]
+      });
+      if (!zone) {
+        l.globalCompositeOperation = "destination-out";
+        lib.product(l, { x: 0, y: 0, size, only: ["sole", "opening"] });
+      }
+      l.globalCompositeOperation = "source-in";
+      const tint = lib.mix("A", "ground", zone ? 0.64 : 0.48);
+      const opacity = zone ? 0.57 : 0.43;
+      const g = l.createLinearGradient(left, 0, left + width, 0);
+      // Upper: 23% heel + 12% forefoot. Outsole: 25% heel contact zone.
+      const stops = zone
+        ? [[0, 0], [0.02, 1], [0.23, 1], [0.25, 0], [1, 0]]
+        : [[0, 0], [0.02, 1], [0.21, 1], [0.23, 0],
+           [0.78, 0], [0.8, 1], [0.88, 1], [0.9, 0], [1, 0]];
+      for (const [at, strength] of stops)
+        g.addColorStop(at, lib.rgba(tint, opacity * strength));
+      l.fillStyle = g;
+      l.fillRect(-size, -size, size * 2, size * 2);
+      l.globalCompositeOperation = "source-atop";
+      l.lineCap = "round";
+      const random = lib.rng(515 + zone * 93);
+      for (let i = 0; i < 96; i++) {
+        const band = !zone && i % 3 === 0 ? 1 : 0;
+        const fraction = zone ? random() * 0.25 :
+          band ? 0.78 + random() * 0.12 : random() * 0.23;
+        const x = left + width * fraction;
+        const y = zone ? (121 + random() * 53) * q :
+          (-103 + random() * 256) * q;
+        const length = 3 + random() * 15;
+        l.strokeStyle = lib.rgba(
+          i % 4 ? lib.mix("A", "ink", 0.64) : "ground",
+          0.38 + random() * 0.38
+        );
+        l.lineWidth = 0.7 + random() * 1.3;
+        l.beginPath();
+        l.moveTo(x, y);
+        l.lineTo(x + length, y - 1.5 + random() * 3);
+        l.stroke();
+      }
+      l.restore();
+      s.save();
+      s.setTransform(1, 0, 0, 1, 0, 0);
+      s.globalAlpha = wear;
+      s.drawImage(l.canvas, 0, 0);
+      s.restore();
+      clearLight();
+    }
+  }
+
+  // The heel comes forward through a rigid camera pan and raking light.
+  s.save();
+  pose(s);
+  s.globalCompositeOperation = "source-atop";
+  const rake = s.createLinearGradient(-315, 0, 15, 0);
+  rake.addColorStop(0, lib.rgba("ink", 0.17 * turn));
+  rake.addColorStop(0.43, lib.rgba("A", 0.12 * turn));
+  rake.addColorStop(1, lib.rgba("A", 0));
+  s.fillStyle = rake;
+  s.fillRect(-size, -size, size * 2, size * 2);
+  s.restore();
+
+  // Sweep only the existing fold-highlight: a six-pixel amber leading edge.
+  const lateSweep = tl >= 2.2 && tl <= 2.52;
+  if (tl <= 0.6 || lateSweep) {
+    const a = lateSweep ? 2.2 : 0, b = lateSweep ? 2.52 : 0.6;
+    const head = lib.lerp(-size * 0.5, size * 0.5, p(a, b));
+    const alpha = p(a, a + 0.025) * (1 - p(b - 0.035, b));
     l.save();
     pose(l);
-    lib.product(l, { x: 0, y: 0, size: 580, only: ["detail"], alpha: 1 });
+    lib.product(l, { x: 0, y: 0, size, only: ["fold-highlight"] });
     l.globalCompositeOperation = "source-in";
-    const head = travelling ? lib.lerp(-278, 278, sweep) : -196;
-    const width = travelling ? 91 : 112;
-    const alpha = travelling ? foldAlpha : heelAlpha;
-    const g = l.createLinearGradient(head - width, 0, head + width * 0.38, 0);
+    const g = l.createLinearGradient(head - 48, 0, head + 3, 0);
     g.addColorStop(0, lib.rgba("A", 0));
-    g.addColorStop(0.42, lib.rgba("A", alpha * 0.6));
-    g.addColorStop(0.73, lib.rgba("A", alpha));
-    g.addColorStop(0.81, lib.rgba("ink", alpha * 0.9));
+    g.addColorStop(42 / 51, lib.rgba("A", alpha * 0.28));
+    g.addColorStop(45 / 51, lib.rgba("A", alpha));
+    g.addColorStop(48 / 51, lib.rgba("ink", alpha * 0.92));
     g.addColorStop(1, lib.rgba("A", 0));
     l.fillStyle = g;
-    l.fillRect(-430, -430, 860, 860);
-    l.restore();
-    l.save();
-    l.globalCompositeOperation = "destination-in";
-    l.drawImage(s.canvas, 0, 0);
+    l.fillRect(-size, -size, size * 2, size * 2);
     l.restore();
   }
 
-  // Build the environment behind the still-transparent product canvas.
   s.save();
   s.globalCompositeOperation = "destination-over";
-  s.fillStyle = lib.rgba("ground", 0.75);
+  s.fillStyle = lib.rgba("ground", 0.88);
   s.beginPath();
-  s.ellipse(px - 12, 795, 282 - 66 * turn, 19, 0, 0, Math.PI * 2);
+  s.ellipse(738, 805, 78, 8, 0, 0, Math.PI * 2);
   s.fill();
-  for (let i = 0; i < 5; i++) {
-    const y = 797 + i * 37;
-    const slide = 105 * p(0, 0.66) + tl * 9;
-    lib.line(s, [[225 - slide - i * 30, y], [1600 - slide + i * 25, y - 20]], {
-      color: i === 0 ? "A" : "muted",
-      width: i === 0 ? 1.3 : 0.8,
-      alpha: (i === 0 ? 0.15 : 0.065) * (1 - 0.55 * turn)
+  s.fillStyle = lib.rgba("ground", 0.4);
+  s.beginPath();
+  s.ellipse(924, 813, 274, 17, 0, 0, Math.PI * 2);
+  s.fill();
+  for (let i = 0; i < 5; i++)
+    lib.line(s, [[140 - tl * 12, 807 + i * 38], [1750, 805 + i * 34]], {
+      color: i ? "muted" : "A", width: i ? 0.8 : 1.2,
+      alpha: (i ? 0.065 : 0.16) * (1 - 0.45 * turn)
     });
-  }
-  const bg = s.createRadialGradient(910 + turn * 60, 475, 60, 960, 565, 1040);
-  bg.addColorStop(0, "#272018");
-  bg.addColorStop(0.53, "#141514");
+  const bg = s.createRadialGradient(920, 510, 80, 960, 570, 1080);
+  bg.addColorStop(0, "#292119");
+  bg.addColorStop(0.55, "#141514");
   bg.addColorStop(1, lib.hex("ground"));
   s.fillStyle = bg;
-  s.fillRect(0, 0, 1920, 1080);
+  s.fillRect(-cameraX, 0, W, H);
   s.restore();
-
-  lib.field(l, 650 + 75 * sweep, 360, 560, "A", 0.055);
-  lib.field(l, 1470, 660, 520, "B", 0.025 + 0.05 * turn);
-  lib.glow(l, 1120, 790, 112, "A", 0.12 * impact);
-  lib.line(l, [[785, 797], [1130 + 70 * impact, 792]], {
-    color: "A", width: 1.1, alpha: 0.19 * impact
+  lib.field(l, 690 + tl * 12, 405, 490, "A", 0.045 + 0.035 * turn);
+  lib.field(l, 1470, 650, 490, "B", 0.025 + 0.04 * turn);
+  lib.glow(l, 738, 798, 92, "A", 0.24 * impact);
+  lib.line(l, [[676, 805], [840, 805]], {
+    color: "A", width: 1.5, alpha: 0.34 * impact
   });
+  l.restore();
+  s.restore();
 }
  return shot; })();
 
@@ -952,35 +1003,39 @@ __AD_MODULES__["S8"] = (function(){ function shot(c) {
  return shot; })();
 
 __AD_MODULES__["S9"] = (function(){ function shot(c) {
-  const { scene: s, light: l, lib, dom, tl, shot } = c;
+  const { scene: s, light: l, lib, tl, t } = c;
   const W = 1920, H = 1080;
   const p = (a, b) => lib.span(tl, a, b, lib.ease);
   const resolve = p(0.1, 0.7);
-  const step = p(2, 2.6);
-  const appear = p(2, 2.24);
+  const reveal = lib.span(t, 29.10, 29.42, lib.ease);
+  const sweep = lib.span(t, 29.42, 29.74, lib.ease);
+  const stride = p(2, 2.6);
   const poised = p(3.35, 3.95);
   const contact = lib.envelope(tl, [[2.56, 1]], 0.07, 0.3);
-  const pan = -14 * p(0.1, 0.7) - 16 * poised;
+  const voice = lib.envelope(tl, [[0.1, 1]], 0.08, 0.4);
+  const pan = -8 * tl - 12 * stride;
   const hero = {
-    x: 1055 + 78 * step + 35 * poised,
-    y: 552 + 35 * step - 10 * poised,
+    x: 1100 + 48 * stride + 28 * poised,
+    y: 568 - 17 * Math.sin(Math.PI * stride) - 8 * poised,
+    size: 648,
     rotate: -0.018 - 0.025 * poised,
     alpha: 1
   };
-  const mate = {
-    x: 835 - 115 * (1 - step) + 17 * poised,
-    y: 465 - 115 * (1 - step) - 24 * Math.sin(Math.PI * step),
-    rotate: -0.09 * (1 - step) - 0.025,
-    alpha: appear
+  const rear = {
+    x: hero.x - 230 - 38 * (1 - reveal),
+    y: hero.y - 110 - 44 * (1 - reveal),
+    size: 518,
+    rotate: hero.rotate - 0.045 * (1 - reveal),
+    alpha: reveal
   };
   function product(ctx, q, only) {
     lib.product(ctx, {
-      x: q.x, y: q.y, size: 600,
-      alpha: q.alpha, rotate: q.rotate, only
+      x: q.x, y: q.y, size: q.size,
+      rotate: q.rotate, alpha: q.alpha, only
     });
   }
   function pair(ctx, only) {
-    if (appear > 0) product(ctx, mate, only);
+    if (reveal > 0) product(ctx, rear, only);
     product(ctx, hero, only);
   }
   function ellipse(ctx, x, y, rx, ry, color, alpha) {
@@ -994,33 +1049,24 @@ __AD_MODULES__["S9"] = (function(){ function shot(c) {
   s.fillStyle = lib.rgba("ground", 1);
   s.fillRect(0, 0, W, H);
   s.translate(pan, 0);
-  lib.field(s, 590, 430, 720, "B", 0.105 * (1 - resolve));
-  lib.field(s, 1190, 470, 690, "A", 0.13 + 0.12 * resolve);
-  lib.field(s, 1510, 710, 570, "A", 0.045 + 0.015 * Math.sin(tl * 2.1));
-
-  const road = s.createLinearGradient(0, 680, 0, 1080);
-  road.addColorStop(0, lib.rgba("ground", 0));
-  road.addColorStop(1, lib.rgba("#211b14", 0.64));
+  const road = s.createLinearGradient(0, 650, 0, H);
+  road.addColorStop(0, lib.rgba("#211b14", 0));
+  road.addColorStop(1, lib.rgba("#211b14", 0.72));
   s.fillStyle = road;
-  s.fillRect(-40, 620, 2000, 460);
-  const roadAlpha = 0.025 + 0.075 * step + 0.025 * poised;
+  s.fillRect(-60, 620, 2040, 460);
+  const roadAlpha = 0.025 + 0.065 * stride + 0.025 * poised;
   lib.line(s, [[430, 1080], [1630, 645]], {
     color: "A", width: 2, alpha: roadAlpha
   });
   lib.line(s, [[1150, 1080], [1790, 645]], {
     color: "ink", width: 1, alpha: roadAlpha * 0.4
   });
-
-  ellipse(s, hero.x + 16, 748, 256, 29, "#000000", 0.66);
-  ellipse(s, mate.x + 20, 635, 220, 23, "#000000", 0.5 * appear);
-  lib.glow(s, hero.x + 65, 724, 235, "A", 0.11 + 0.08 * resolve);
-  if (appear > 0) {
-    lib.glow(s, mate.x + 50, 623, 210, "A", appear * (0.12 + 0.16 * contact));
-  }
+  ellipse(s, rear.x + 16, rear.y + 165, 209, 22, "#000000", 0.55 * reveal);
+  ellipse(s, hero.x + 20, hero.y + 207, 265, 29, "#000000", 0.68);
   pair(s);
   s.restore();
 
-  // Continue the gathered material, using the actual upper and sole as a mask.
+  // Carry the gathered material forward inside the original silhouette.
   if (resolve < 1) {
     l.save();
     l.translate(pan, 0);
@@ -1030,57 +1076,57 @@ __AD_MODULES__["S9"] = (function(){ function shot(c) {
     l.rotate(hero.rotate);
     l.beginPath();
     for (let i = 0; i < 26; i++) {
-      const y = -126 + i * 10;
+      const y = -140 + i * 11;
       const knot = (1 - resolve) * (24 + 12 * Math.sin(i * 1.7));
-      l.moveTo(-310, y + 24 * Math.sin(i * 0.8));
+      l.moveTo(-340, y + 24 * Math.sin(i * 0.8));
       l.bezierCurveTo(
-        -165 + knot, y - knot * 2,
-        42 - knot, y + knot * 2.1,
-        310, y + 31
+        -175 + knot, y - knot * 2,
+        45 - knot, y + knot * 2.1,
+        340, y + 31
       );
     }
     l.strokeStyle = lib.rgba("A", 0.48 * (1 - resolve));
     l.lineWidth = 1.4;
     l.stroke();
     l.restore();
-    s.save();
     s.drawImage(l.canvas, 0, 0);
-    s.restore();
     l.clearRect(0, 0, W, H);
   }
 
-  // Illuminate the illustration's own detail strokes: no replacement fold.
+  // A six-pixel amber light head sweeps only the existing fold artwork.
   l.save();
   l.translate(pan, 0);
-  pair(l, ["detail"]);
-  l.globalCompositeOperation = "source-in";
-  const travel = lib.span(tl, 0.1, 0.7, lib.ease);
-  const head = hero.x - 320 + 640 * travel;
-  const sweep = Math.sin(Math.PI * travel);
-  const base = 0.035 + 0.045 * resolve;
-  const fold = l.createLinearGradient(0, 0, W, 0);
-  fold.addColorStop(0, lib.rgba("A", base));
-  fold.addColorStop((head - 105) / W, lib.rgba("A", base));
-  fold.addColorStop((head - 34) / W, lib.rgba("A", base + 0.72 * sweep));
-  fold.addColorStop(head / W, lib.rgba("ink", base + 0.88 * sweep));
-  fold.addColorStop((head + 38) / W, lib.rgba("A", base + 0.55 * sweep));
-  fold.addColorStop((head + 100) / W, lib.rgba("A", base));
-  fold.addColorStop(1, lib.rgba("A", base));
-  l.fillStyle = fold;
-  l.fillRect(-80, 0, W + 160, H);
-  l.globalCompositeOperation = "source-over";
-  lib.glow(l, hero.x + 65, 725, 175, "A", 0.055 + 0.055 * resolve);
-  if (contact > 0) {
-    ellipse(l, mate.x + 52, 625, 165 + 52 * contact, 9, "A", 0.12 * contact);
+  if (t >= 29.42 && t <= 29.74) {
+    pair(l, ["fold-highlight"]);
+    l.globalCompositeOperation = "source-in";
+    const start = rear.x - rear.size * 0.5;
+    const end = hero.x + hero.size * 0.5;
+    const head = lib.lerp(start, end, sweep);
+    const strength = Math.sin(Math.PI * sweep);
+    const fold = l.createLinearGradient(0, 0, W, 0);
+    fold.addColorStop(0, lib.rgba("A", 0));
+    fold.addColorStop((head - 100) / W, lib.rgba("A", 0));
+    fold.addColorStop((head - 35) / W, lib.rgba("A", 0.38 * strength));
+    fold.addColorStop((head - 3) / W, lib.rgba("A", strength));
+    fold.addColorStop((head + 3) / W, lib.rgba("A", strength));
+    fold.addColorStop((head + 24) / W, lib.rgba("A", 0));
+    fold.addColorStop(1, lib.rgba("A", 0));
+    l.fillStyle = fold;
+    l.fillRect(-80, 0, W + 160, H);
+    l.globalCompositeOperation = "source-over";
   }
-  lib.field(l, 1510 + 45 * poised, 620, 370, "A", 0.025 + 0.04 * poised);
+  lib.field(l, 620, 420, 670, "B", 0.055 * (1 - resolve));
+  lib.field(l, 1200 + 12 * tl, 440, 660, "A", 0.10 + 0.085 * resolve);
+  lib.glow(l, hero.x - 80, hero.y - 115, 240, "A", 0.045 + 0.055 * voice);
+  lib.glow(l, hero.x + 65, hero.y + 190, 190, "A", 0.075 + 0.06 * resolve);
+  if (reveal > 0) {
+    lib.glow(l, rear.x + 45, rear.y + 150, 165, "A",
+      reveal * (0.095 + 0.12 * contact));
+    ellipse(l, rear.x + 45, rear.y + 163, 155 + 40 * contact, 8,
+      "A", reveal * (0.035 + 0.11 * contact));
+  }
+  lib.field(l, 1510 + 45 * poised, 630, 360, "A", 0.025 + 0.04 * poised);
   l.restore();
-
-  dom.copy("left", "Again.", {
-    size: 88, y: 254, color: "ink",
-    tIn: shot.start + 0.1,
-    tOut: shot.start + 3.62
-  });
 }
  return shot; })();
 
@@ -1335,20 +1381,23 @@ __AD_MODULES__["S11"] = (function(){ function shot(c) {
  return shot; })();
 
 __AD_MODULES__["S12"] = (function(){ function shot(c) {
-  const { scene, light, dom, lib } = c;
+  const { scene, light, lib } = c;
   const tl = Math.max(0, c.tl);
   const reframe = lib.span(tl, 0, 0.32, lib.ease);
-  const growth = lib.span(tl, 0, 0.85, lib.easeMark);
-  const nameIn = lib.span(tl, 0.4, 0.88, lib.ease);
-  const invitationIn = lib.span(tl, 1.2, 1.68, lib.ease);
-  const dx = lib.lerp(-116, 0, reframe);
-  const dy = lib.lerp(44, 0, reframe);
-  const x = 1480;
-  const y = 826;
-  const size = 360;
+  const settle = lib.span(tl, 0, 0.6, lib.ease);
+  const growth = lib.span(tl, 0, 0.7, lib.easeMark);
+  const nameIn = lib.span(c.t, c.shot.start + 0.5, c.shot.start + 0.98, lib.ease);
+  const nameRise = lib.span(c.t, c.shot.start + 0.5, c.shot.start + 1.1, lib.ease);
+  const breathPhase = lib.span(tl, 0.6, 2, lib.linear);
+  const breath = 1 + 0.003 * Math.sin(breathPhase * Math.PI * 2);
+  const x = lib.lerp(680, 620, settle);
+  const y = lib.lerp(630, 600, settle);
+  const size = lib.lerp(650, 600, settle) * breath;
   const heelX = x - size * 0.31;
   const heelY = y + size * 0.055;
-  const warmth = lib.lerp(0.86, 0.65, reframe);
+  const floorY = y + size * 0.34;
+  const dx = lib.lerp(44, 0, reframe);
+  const dy = lib.lerp(20, 0, reframe);
 
   scene.save();
   scene.fillStyle = lib.rgba("ground", 1);
@@ -1357,40 +1406,36 @@ __AD_MODULES__["S12"] = (function(){ function shot(c) {
 
   for (const ctx of [scene, light]) {
     ctx.save();
-    ctx.translate(960, 540);
-    ctx.scale(1, 1);
-    ctx.translate(-960 + dx, -540 + dy);
+    ctx.translate(dx, dy);
   }
 
-  const floor = scene.createLinearGradient(0, 740, 0, 1124);
-  floor.addColorStop(0, "rgba(25,23,20,0)");
-  floor.addColorStop(0.56, "rgba(31,28,24,0.42)");
-  floor.addColorStop(1, "rgba(17,16,15,0.88)");
+  const floor = scene.createLinearGradient(0, 680, 0, 1080);
+  floor.addColorStop(0, "rgba(30,26,21,0)");
+  floor.addColorStop(0.55, "rgba(30,26,21,0.36)");
+  floor.addColorStop(1, "rgba(21,19,17,0.62)");
   scene.fillStyle = floor;
-  scene.fillRect(-160, 740, 2240, 440);
+  scene.fillRect(-80, 680, 2080, 480);
 
-  const pool = scene.createRadialGradient(x, 951, 5, x, 951, 325);
-  pool.addColorStop(0, lib.rgba("A", 0.075));
-  pool.addColorStop(0.5, lib.rgba("A", 0.025));
-  pool.addColorStop(1, lib.rgba("A", 0));
-  scene.save();
-  scene.translate(x, 951);
-  scene.scale(1, 0.23);
-  scene.translate(-x, -951);
-  scene.fillStyle = pool;
-  scene.fillRect(x - 330, 621, 660, 660);
-  scene.restore();
+  lib.field(scene, 560, 760, 520, "A", 0.32);
 
-  scene.save();
-  scene.fillStyle = "rgba(0,0,0,0.48)";
-  scene.beginPath();
-  scene.ellipse(x + 8, 948, 151, 13, -0.018, 0, Math.PI * 2);
-  scene.fill();
-  scene.restore();
+  const ellipse =
+    "M100 500 C100 458 279 424 500 424 C721 424 900 458 900 500 " +
+    "C900 542 721 576 500 576 C279 576 100 542 100 500 Z";
 
-  lib.product(scene, {
-    x, y, size, alpha: 1, rotate: 0
+  lib.shape(scene, ellipse, {
+    x: x + 8, y: floorY + 4, size: size * 1.12,
+    scaleY: 0.58, fill: "ground", alpha: 0.07
   });
+  lib.shape(scene, ellipse, {
+    x: x + 8, y: floorY + 3, size: size * 1.04,
+    scaleY: 0.46, fill: "ground", alpha: 0.12
+  });
+  lib.shape(scene, ellipse, {
+    x: x + 8, y: floorY, size,
+    scaleY: 0.32, fill: "ground", alpha: 0.45
+  });
+
+  lib.product(scene, { x, y, size, alpha: 1, rotate: 0 });
 
   light.save();
   lib.product(light, {
@@ -1398,12 +1443,13 @@ __AD_MODULES__["S12"] = (function(){ function shot(c) {
     only: ["body", "sole"]
   });
   light.globalCompositeOperation = "source-in";
+
   const heel = light.createRadialGradient(
-    heelX, heelY, 3, heelX, heelY, 166
+    heelX, heelY, 4, heelX, heelY, size * 0.38
   );
-  heel.addColorStop(0, lib.rgba("A", warmth));
-  heel.addColorStop(0.32, lib.rgba("A", warmth * 0.57));
-  heel.addColorStop(0.72, lib.rgba("A", 0.11));
+  heel.addColorStop(0, lib.rgba("A", 0.72));
+  heel.addColorStop(0.3, lib.rgba("A", 0.38));
+  heel.addColorStop(0.7, lib.rgba("A", 0.09));
   heel.addColorStop(1, lib.rgba("A", 0));
   light.fillStyle = heel;
   light.fillRect(-2048, -2048, 6000, 5000);
@@ -1411,153 +1457,137 @@ __AD_MODULES__["S12"] = (function(){ function shot(c) {
 
   light.save();
   light.globalCompositeOperation = "destination-over";
-  lib.glow(light, heelX, heelY, 106, "A", 0.11);
-  lib.field(light, x - 35, 897, 420, "A", 0.035);
+  lib.glow(light, heelX, heelY, 140, "A", 0.12);
   light.restore();
 
   lib.mark(
-    light, 960, 470,
-    lib.lerp(20, 110, growth),
-    70, 1, 1, 0.32, 1
+    light, 1300, 360,
+    lib.lerp(20, 100, growth),
+    64, 0.88, 0.74, 0.14, 1
   );
+
+  lib.text(light, "Onefold", {
+    x: 1300,
+    y: lib.lerp(568, 560, nameRise),
+    size: 152,
+    font: "serif",
+    color: "ink",
+    align: "center",
+    alpha: nameIn
+  });
 
   scene.restore();
   light.restore();
-
-  dom.wordmark("Onefold", {
-    size: 152,
-    top: 618,
-    alpha: nameIn
-  });
-  dom.tagline("Your next pair starts here.", {
-    size: 46,
-    top: 800,
-    alpha: invitationIn
-  });
 }
  return shot; })();
 
 __AD_MODULES__["S13"] = (function(){ function shot(c) {
   const { scene, light, dom, lib, tl } = c;
-  const q = lib.clamp(tl, 0, 2.5);
-  const fade = 1 - lib.span(q, 2.26, 2.5, lib.ease);
-  const invitation = lib.span(q, 0.10, 0.58, lib.ease);
-  const reframe = lib.span(q, 0, 0.32, lib.ease);
-  const sweep = lib.span(q, 0.04, 0.64, lib.ease);
-  const arrival = lib.span(q, 2.00, 2.24, lib.ease);
-  const size = 480;
-  const x = 1530;
-  const y = 650;
-  const dx = (960 - x) * (1 - reframe);
-  const dy = (825 - y) * (1 - reframe);
-  const secondX = lib.lerp(1770, 1580, arrival);
-  const secondY = lib.lerp(795, 758, arrival);
-  const breath = 0.5 + 0.5 * Math.sin(q * 3.8);
+  const start = c.shot.start;
+  const reveal = lib.span(tl, 0.10, 0.52, lib.ease);
+  const invitation = lib.span(tl, 0.04, 0.52, lib.ease);
+  const sweep = lib.span(tl, 0.08, 0.40, lib.ease);
+  const warmth = lib.span(tl, 0.08, 0.40, lib.ease);
+  const second = lib.span(tl, 2.00, 2.32, lib.ease);
+  const heroScale = lib.lerp(360 / 648, 1, reveal);
+  const heroY = lib.lerp(825, 540, reveal);
+
+  function heroCamera(ctx) {
+    ctx.translate(960, heroY);
+    ctx.scale(heroScale, heroScale);
+    ctx.translate(-960, -540);
+  }
 
   scene.save();
-  scene.fillStyle = lib.rgba("ground", 1);
+  scene.fillStyle = lib.hex("ground");
   scene.fillRect(0, 0, 1920, 1080);
 
-  scene.save();
-  scene.translate(dx, dy);
+  lib.field(
+    scene, 960, 600, 490, "A",
+    lib.lerp(0.035, 0.085, warmth)
+  );
 
-  const groundGlow = scene.createRadialGradient(x, 856, 8, x, 856, 285);
-  groundGlow.addColorStop(0, lib.rgba("A", 0.055 * fade));
-  groundGlow.addColorStop(1, lib.rgba("A", 0));
-  scene.save();
-  scene.translate(0, 856);
-  scene.scale(1, 0.22);
-  scene.translate(0, -856);
-  scene.fillStyle = groundGlow;
-  scene.fillRect(x - 290, 566, 580, 580);
-  scene.restore();
-
-  if (arrival > 0) {
+  if (tl >= 2.00) {
     lib.product(scene, {
-      x: secondX,
-      y: secondY,
-      size,
-      rotate: -0.11 * arrival,
-      alpha: arrival * fade
+      x: lib.lerp(2110, 1580, second),
+      y: lib.lerp(675, 620, second),
+      size: 320,
+      rotate: lib.lerp(-0.12, -0.035, second),
+      alpha: 1
     });
   }
 
-  lib.product(scene, { x, y, size, alpha: fade });
-  scene.restore();
-  scene.restore();
-
-  light.save();
-  light.translate(dx, dy);
-
-  const heelX = x - size * 0.34;
-  const heelY = y + size * 0.06;
-  const toeX = x + size * 0.37;
-  const toeY = y + size * 0.17;
-
-  lib.glow(light, heelX, heelY, 38, "A",
-    (0.22 + 0.035 * breath) * fade);
-  lib.field(light, x, y + 28, 195, "A",
-    (0.018 + 0.065 * sweep) * fade);
-
-  if (sweep > 0 && sweep < 1) {
-    const headX = lib.lerp(heelX, toeX, sweep);
-    const pulse = Math.pow(Math.sin(Math.PI * sweep), 0.55);
-    const ribbon = light.createLinearGradient(headX - 82, 0, headX + 18, 0);
-    ribbon.addColorStop(0, lib.rgba("A", 0));
-    ribbon.addColorStop(0.62, lib.rgba("A", 0.65 * pulse * fade));
-    ribbon.addColorStop(0.83, lib.rgba("ink", 0.95 * pulse * fade));
-    ribbon.addColorStop(1, lib.rgba("A", 0));
-
-    light.beginPath();
-    light.moveTo(heelX, heelY);
-    light.bezierCurveTo(
-      x - size * 0.10, y + size * 0.075,
-      x + size * 0.11, y + size * 0.20,
-      toeX, toeY
-    );
-    light.strokeStyle = ribbon;
-    light.lineWidth = 3.5;
-    light.lineCap = "round";
-    light.stroke();
-
-    lib.glow(light, headX, lib.lerp(heelY, toeY, sweep),
-      31, "A", 0.42 * pulse * fade);
-  }
-
-  light.globalCompositeOperation = "destination-in";
-  lib.product(light, {
-    x, y, size, alpha: 1, only: ["body"]
+  scene.save();
+  heroCamera(scene);
+  lib.product(scene, {
+    x: 960,
+    y: 540,
+    size: 648,
+    alpha: 1
   });
-  light.restore();
+  scene.restore();
+  scene.restore();
 
   light.save();
-  lib.field(light, 1000, 470, 390, "A",
-    0.034 * invitation * fade);
-  lib.field(light, x + dx, 865 + dy, 240, "A",
-    (0.022 + 0.008 * breath) * fade);
+  heroCamera(light);
 
-  if (arrival > 0) {
-    lib.glow(light, secondX - 135, secondY + 35, 42,
-      "A", 0.07 * arrival * fade);
+  if (tl >= 0.08 && tl < 0.40) {
+    lib.product(light, {
+      x: 960,
+      y: 540,
+      size: 648,
+      alpha: 0.16,
+      only: ["knit-upper", "knit-forefoot", "instep-knit", "sole-knit"]
+    });
+    lib.product(light, {
+      x: 960,
+      y: 540,
+      size: 648,
+      alpha: 1,
+      only: ["fold-highlight", "seam"]
+    });
+
+    const head = 960 + lib.lerp(-0.46, 0.48, sweep) * 648;
+    const width = 88;
+    const band = light.createLinearGradient(
+      head - width, 0, head + width, 0
+    );
+    band.addColorStop(0, lib.rgba("A", 0));
+    band.addColorStop(0.38, lib.rgba("A", 0.35));
+    band.addColorStop(0.55, lib.rgba("A", 1));
+    band.addColorStop(1, lib.rgba("A", 0));
+
+    light.globalCompositeOperation = "source-in";
+    light.fillStyle = band;
+    light.fillRect(580, 160, 780, 780);
+    light.globalCompositeOperation = "source-over";
   }
 
-  lib.mark(
-    light, 960, 470, 110, 70,
-    1, 1, 0.6, invitation * fade
+  lib.glow(
+    light, 960 - 648 * 0.34, 540 + 648 * 0.06,
+    38, "A", lib.lerp(0.22, 0.30, warmth)
   );
   light.restore();
 
   dom.wordmark("Onefold", {
-    size: 152,
-    top: 618,
-    alpha: fade
+    size: lib.lerp(152, 144, reveal),
+    top: lib.lerp(618, 60, reveal),
+    alpha: 1
   });
+
   dom.tagline("Your next pair starts here.", {
-    size: 56,
-    top: 800,
-    alpha: invitation * fade
+    size: 72,
+    top: 936,
+    alpha: invitation
   });
-  dom.cta(["Explore the shoe."], invitation * fade);
+
+  dom.copy("center", "Explore the shoe.", {
+    size: 56,
+    y: 864,
+    color: "ink",
+    tIn: start + 0.04,
+    tOut: c.shot.end + 1
+  });
 }
  return shot; })();
 

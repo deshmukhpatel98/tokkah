@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>lab: in-page encoding</title>
+<style>html,body{margin:0;background:#111}canvas{display:block}</style>
+<script src="../vendor/three-bundle.js"></script>
+</head><body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Measures: how fast can this browser turn 1080p canvas frames into an H.264
+// (or VP9) MP4 entirely in-page, with no screenshots? Draws a moving test
+// scene, encodes N frames, muxes with mp4-muxer, returns the file as base64.
+window.encodeTest = async function(n = 300, fps = 30, prefer = "avc1.640028") {
+  const c = document.getElementById("c"), g = c.getContext("2d");
+  const { Muxer, ArrayBufferTarget } = window.Mp4Muxer;
+  const want = [prefer, "avc1.4d0028", "avc1.42001f", "vp09.00.40.08", "vp8"];
+  let codec = null, cfg = null;
+  for (const cd of want) {
+    const trial = { codec: cd, width: 1920, height: 1080, bitrate: 12_000_000, framerate: fps, ...(cd.startsWith("avc1") ? { avc: { format: "avc" }, hardwareAcceleration: "prefer-hardware" } : {}) };
+    try { const s = await VideoEncoder.isConfigSupported(trial); if (s.supported) { codec = cd; cfg = trial; break; } } catch (e) {}
+    if (cd.startsWith("avc1")) { const sw = { ...trial, hardwareAcceleration: "prefer-software" }; try { const s2 = await VideoEncoder.isConfigSupported(sw); if (s2.supported) { codec = cd; cfg = sw; break; } } catch (e) {} }
+  }
+  if (!codec) return { error: "no supported encoder", checked: want };
+  const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: codec.startsWith("avc1") ? "avc" : codec.startsWith("vp09") ? "vp9" : "vp8", width: 1920, height: 1080 }, fastStart: "in-memory" });
+  let encErr = null;
+  const enc = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: e => { encErr = String(e); } });
+  enc.configure(cfg);
+  const t0 = performance.now(); let drawMs = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / fps, d0 = performance.now();
+    // a test scene with gradients, text and motion, so the encoder does real work
+    const bg = g.createLinearGradient(0, 0, 0, 1080); bg.addColorStop(0, "#c9cbd0"); bg.addColorStop(1, "#9a9ca1"); g.fillStyle = bg; g.fillRect(0, 0, 1920, 1080);
+    g.fillStyle = "rgba(0,0,0,0.25)"; g.beginPath(); g.ellipse(960 + Math.sin(t) * 300, 700, 260, 40, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = "#d8d9dc"; g.beginPath(); g.roundRect(960 + Math.sin(t) * 300 - 180, 420, 360, 240, 40); g.fill();
+    g.fillStyle = "#111"; g.font = "600 112px -apple-system, Helvetica, sans-serif"; g.fillText("The Little", 90, 571); g.textAlign = "right"; g.fillText("Pebble", 1773, 573); g.textAlign = "left";
+    drawMs += performance.now() - d0;
+    const frame = new VideoFrame(c, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+    enc.encode(frame, { keyFrame: i % 60 === 0 }); frame.close();
+    if (enc.encodeQueueSize > 8) await new Promise(r => setTimeout(r, 2)); // back-pressure
+  }
+  await enc.flush(); enc.close(); muxer.finalize();
+  const total = (performance.now() - t0) / 1000;
+  const buf = muxer.target.buffer;
+  let b64 = ""; { const u8 = new Uint8Array(buf); const CH = 0x8000; for (let i = 0; i < u8.length; i += CH) b64 += String.fromCharCode.apply(null, u8.subarray(i, i + CH)); b64 = btoa(b64); }
+  return { result: { codec, hardware: cfg.hardwareAcceleration || "n/a", frames: n, seconds: +total.toFixed(2), fps: +(n / total).toFixed(1), drawMsPerFrame: +(drawMs / n).toFixed(2), bytes: buf.byteLength, error: encErr }, fileB64: b64 };
+};
+</script>
+</body></html>
