@@ -54,7 +54,8 @@ for (const s of shots) {
   msByShot[s.id] = +worst.toFixed(1);
   // blank check at the mid frame: sample the composited canvases for any lit pixel
   await evaluate(`kinAd.seek(${s.start + d / 2})`);
-  const lit = await evaluate(`(() => { let lit = 0; for (const id of ["c-scene", "c-light"]) { const c = document.getElementById(id), g = c.getContext("2d"); const w = c.width, h = c.height; const img = g.getImageData(0, 0, w, h).data; for (let i = 3; i < img.length; i += 4 * 97) if (img[i] > 12) lit++; } const copy = [...document.querySelectorAll(".copy, #mark-wrap, #cta")].some(n => n.style.display !== "none" && parseFloat(n.style.opacity || "0") > 0.05 && n.textContent.trim()); return { lit, copy }; })()`);
+  // sample every layer: the 2D canvases directly, the WebGL layer through a 2D copy (no getImageData on a GL context), the type twin too
+  const lit = await evaluate(`(() => { let lit = 0; const sample = (src) => { const w = src.width, h = src.height; const tmp = document.createElement("canvas"); tmp.width = w; tmp.height = h; const g = tmp.getContext("2d"); g.drawImage(src, 0, 0); const img = g.getImageData(0, 0, w, h).data; for (let i = 3; i < img.length; i += 4 * 97) if (img[i] > 12) lit++; }; for (const id of ["c-scene", "c-light", "c-3d", "c-type"]) { const c = document.getElementById(id); if (c) sample(c); } const copy = [...document.querySelectorAll(".copy, #mark-wrap, #cta")].some(n => n.style.display !== "none" && parseFloat(n.style.opacity || "0") > 0.05 && n.textContent.trim()); return { lit, copy }; })()`);
   if (lit.lit < 8 && !lit.copy) blank.push(s.id);
 }
 const errors = await evaluate("kinAd.errors");
