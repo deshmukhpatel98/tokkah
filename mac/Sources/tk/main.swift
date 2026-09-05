@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.153.0"
+let VERSION = "0.154.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -1770,7 +1770,7 @@ func postFinalBeat(why: String) -> Bool {
   // an app that died without saying goodbye.
   Crash.endRun()
   // The tape before the beat: the beat carries the tape's final size and state.
-  audio.finishTapes()
+  if beatReady { audio.finishTapes() }
   guard Telemetry.enabled else { return false }
   // Last second's percentiles, not a live sort of the audio-thread buffer.
   var beat = audioBeat(uptime: Double(beatTick),

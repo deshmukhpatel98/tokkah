@@ -5,6 +5,12 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.154.0 — 2026-09-05
+
+### Fixed — crash on answering or leaving an incoming ring before connection
+
+An incoming call waits for an answer at `NSApplication.shared.run()` before the media pipeline and its top-level `audio` instance are initialized. In 0.153.0, `audio.finishTapes()` was added to `postFinalBeat` without checking `beatReady`. When answering a ring (triggering a re-exec) or declining/cancelling, `postFinalBeat` dereferenced the uninitialized `audio` pointer when reading `tapesStarted` at offset `0x50`, crashing with `EXC_BAD_ACCESS (SIGSEGV)`. Guarded `audio.finishTapes()` with `beatReady`.
+
 ## Kin 0.153.0 — 2026-09-05
 
 ### Added — the audio lab: a call's sound, judged from the data alone
