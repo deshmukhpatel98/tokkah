@@ -2,19 +2,40 @@
 
 A product brief goes in; a finished, voiced, 1920×1080 brand film comes out.
 Astra (`gpt-6-astra`, through the Experiential Labs gateway) does the
-thinking: the tension, the idea, the tagline, the palette, the shot plan, the
-narration, the voice casting. This code does the rendering: a deterministic
-DOM + Canvas 2D film drawn from Astra's JSON, captured frame-exact in headless
-Brave, muxed by ffmpeg, voiced by ElevenLabs (Eleven v3, lossless PCM).
+thinking AND writes the shot code: the treatment, the motif, the shot plan,
+one `function shot(c)` per shot, the score, the narration, the voice casting.
+This code hosts and renders it: a deterministic DOM + Canvas 2D film, captured
+frame-exact in headless Brave, muxed by ffmpeg, voiced by ElevenLabs
+(Eleven v3, lossless PCM). Why it is built this way: `PROCESS.md`.
 
 ```bash
-EXPLABS_API_KEY=… ELEVENLABS_API_KEY=… \
-node ad/engine/produce.mjs --product "Halcyon, a bedside sunrise lamp" \
-  --audience "people who hate their phone alarm" --duration 40 --variants 3
-# -> ad/engine/out/halcyon-a-bedside-sunrise-lamp/{spec.json, ad.html, final.mp4, contact.png}
+# v2 (the process): treatment -> per-shot code in parallel -> smoke test -> stills ->
+# image critique -> rewrites; then the parallel render with voice
+EXPLABS_API_KEY=… node ad/engine/direct.mjs --product "Onefold, a running shoe made from one material" \
+  --audience "runners with a drawer of dead shoes" --duration 45 --treatments 2 --rounds 1
+EXPLABS_API_KEY=… ELEVENLABS_API_KEY=… node ad/engine/produce.mjs --spec ad/engine/out/onefold/spec.json
+# -> ad/engine/out/onefold/{treatment.md, spec.json, modules.js, critique-1.md, contact-*.png, final.mp4}
+
+# v1 (fast, data only): one JSON call against fixed primitives
+node ad/engine/produce.mjs --product "…" --audience "…" --duration 40 --variants 3
 ```
 
 Keys live in the environment only. Nothing here writes a secret to disk.
+
+## v2: the process, as stages
+
+| stage | what happens | parallel |
+|---|---|---|
+| treatments | N director's treatments in prose + the plan as JSON; a low-effort judge picks one | N calls at once |
+| code | Astra writes `function shot(c)` for every shot against `host.js`'s `lib`/`dom` API (entrance from the previous shot, exit into the next), plus `function score(h, D, SHOTS, SPEC)`; syntax-checked, compile failures repaired once | shots + score at once |
+| smoke | `smoke.mjs` seeks every shot at three times headless: thrown errors, ms per frame (from the host's own timer), blank mid-frames; failures go back to Astra as repairs | — |
+| review | 10 stills → contact sheet → Astra critiques with the image against its own treatment → JSON notes → flagged shots rewritten with the notes → smoke → stills; `--rounds N` | rewrites at once |
+| produce | K render slices + score + voice at once → concat by copy → duck → loudness to -21 LUFS / -3 dBTP → `final.mp4` | K+2 processes |
+
+`host.js` runs model-written code as a pure function of time; a module that
+throws is disabled and its shot falls back to the v1 primitive, and the error
+is reported through `kinAd.errors`. Modules cannot reach the DOM, the network
+or wall-clock time through the API they are given.
 
 ## Built for speed
 

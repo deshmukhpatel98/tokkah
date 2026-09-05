@@ -100,15 +100,30 @@ await stage("assemble", async () => {
   const video = path.join(work, "video.mp4");
   const c = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", video], { encoding: "utf8" });
   if (c.status !== 0) throw new Error("concat failed: " + c.stderr);
+  // Mastering. ebur128 prints a per-frame "I:" as it goes; only the block
+  // after "Summary:" is the whole-file figure.
+  const measure = f => { const raw = spawnSync(FFMPEG, ["-nostats", "-i", f, "-af", "ebur128=peak=true", "-f", "null", "-"], { encoding: "utf8" }).stderr; const m = raw.slice(raw.lastIndexOf("Summary:")); return { I: parseFloat((m.match(/I:\s+(-?[\d.]+) LUFS/) || [])[1]), P: parseFloat((m.match(/Peak:\s+(-?[\d.]+) dBFS/) || [])[1]) }; };
+  const toward = (meas, targetI, peakCap) => { if (!isFinite(meas.I) || !isFinite(meas.P)) return 0; let g = targetI - meas.I; if (meas.P + g > peakCap) g = peakCap - meas.P; return g; };
   let audio = scoreWav;
   if (voWav && fs.existsSync(voWav)) {
+    // level each stem first: the voice to -18 LUFS (peaks under -4), the bed to -28 LUFS, then duck the bed under the voice
+    const gS = toward(measure(scoreWav), -28, -8), gV = toward(measure(voWav), -18, -4);
+    console.error(`# stems: score ${gS >= 0 ? "+" : ""}${gS.toFixed(1)} dB, voice ${gV >= 0 ? "+" : ""}${gV.toFixed(1)} dB`);
     audio = path.join(work, "mixed.wav");
     const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", scoreWav, "-i", voWav, "-filter_complex",
-      "[0:a][1:a]sidechaincompress=threshold=0.015:ratio=5:attack=30:release=500:makeup=1[duck];[duck][1:a]amix=inputs=2:normalize=0:duration=first[out]", "-map", "[out]", "-ar", "48000", "-ac", "2", audio], { encoding: "utf8" });
-    if (r.status !== 0) { console.error(r.stderr); audio = scoreWav; }
+      // the leveled voice feeds both the ducker's sidechain and the mix, so it must be split
+      `[0:a]volume=${gS.toFixed(2)}dB[s];[1:a]volume=${gV.toFixed(2)}dB,asplit[v1][v2];[s][v1]sidechaincompress=threshold=0.02:ratio=4:attack=30:release=600:makeup=1[duck];[duck][v2]amix=inputs=2:normalize=0:duration=first[out]`,
+      "-map", "[out]", "-ar", "48000", "-ac", "2", audio], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error("voice mix failed: " + r.stderr);
   }
-  const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", video, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", finalPath], { encoding: "utf8" });
+  // the mix to -21 LUFS integrated; a true-peak limiter holds -3 dBTP instead of a bare gain cap
+  const mix = measure(audio);
+  const gainDb = isFinite(mix.I) ? -21 - mix.I : 0;
+  console.error(`# mix: ${isFinite(mix.I) ? mix.I.toFixed(1) : "?"} LUFS, peak ${isFinite(mix.P) ? mix.P.toFixed(1) : "?"} dBFS -> ${gainDb >= 0 ? "+" : ""}${gainDb.toFixed(1)} dB, limiter at -3 dBTP`);
+  const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", video, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-af", `volume=${gainDb.toFixed(2)}dB,alimiter=limit=0.7079:attack=5:release=60:level=false`, "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", finalPath], { encoding: "utf8" });
   if (r.status !== 0) throw new Error(r.stderr);
+  const fin = measure(finalPath);
+  console.error(`# final: ${isFinite(fin.I) ? fin.I.toFixed(1) : "?"} LUFS, true peak ${isFinite(fin.P) ? fin.P.toFixed(1) : "?"} dBTP`);
 });
 
 // ---- 5. stills

@@ -16,8 +16,12 @@ if (!specPath) { console.error("usage: build-ad.mjs <spec.json>"); process.exit(
 
 const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
 const shell = fs.readFileSync(path.join(HERE, "engine.html"), "utf8");
-const lib = fs.readFileSync(path.join(HERE, "render-lib.js"), "utf8");
-if (lib.includes("/*@@")) { console.error("render-lib.js still has unstitched markers"); process.exit(1); }
+// v2 ads carry Astra-written shot modules next to the spec; they run on host.js.
+const modulesPath = path.join(path.dirname(specPath), "modules.js");
+const hasModules = fs.existsSync(modulesPath);
+const lib = fs.readFileSync(path.join(HERE, hasModules ? "host.js" : "render-lib.js"), "utf8");
+if (lib.includes("/*@@")) { console.error("render library still has unstitched markers"); process.exit(1); }
+const modules = hasModules ? fs.readFileSync(modulesPath, "utf8") : "";
 
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 const lines = [];
@@ -29,7 +33,7 @@ const transcript = lines.map(l => `<li>${esc(l)}</li>`).join("");
 const title = `${(spec.product || "Ad").split(/[,:]/)[0].trim()} — ${spec.tagline || ""}`.trim();
 // The spec is inlined inside a <script> element: "</script>" inside it must be broken.
 const specJson = JSON.stringify(spec).replace(/<\/script/gi, "<\\/script");
-const libSafe = lib.replace(/<\/script/gi, "<\\/script");
+const libSafe = (modules ? modules.replace(/<\/script/gi, "<\\/script") + "\n" : "") + lib.replace(/<\/script/gi, "<\\/script");
 const html = shell
   .replace(/@@TITLE@@/g, esc(title))
   .replace(/@@GROUND@@/g, spec.palette?.ground || "#05060a")
@@ -40,4 +44,4 @@ const html = shell
 
 const outPath = path.join(path.dirname(specPath), "ad.html");
 fs.writeFileSync(outPath, html);
-console.log(`${outPath} (${(html.length / 1024).toFixed(1)} KB, ${spec.shots.length} shots, ${spec.duration}s)`);
+console.log(`${outPath} (${(html.length / 1024).toFixed(1)} KB, ${spec.shots.length} shots, ${spec.duration}s${hasModules ? ", " + (modules.match(/__AD_MODULES__\[/g) || []).length + " modules" : ""})`);
