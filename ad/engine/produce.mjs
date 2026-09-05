@@ -37,7 +37,9 @@ const o = {
   product: opt("--product", null), audience: opt("--audience", "people"), duration: +opt("--duration", 40),
   variants: +opt("--variants", 1), slug: opt("--slug", null), spec: opt("--spec", null),
   fps: +opt("--fps", 30), chunks: +opt("--chunks", Math.max(2, Math.min(6, Math.floor(os.cpus().length / 2)))), voice: !has("--no-voice"), effort: opt("--effort", "high"),
-  capture: opt("--capture", "jpeg")                    // frame capture: jpeg (4.6x faster) | png
+  capture: opt("--capture", "jpeg"),                   // frame capture when screenshotting: jpeg (4.6x faster) | png
+  encode: !has("--screenshots"),                       // default: the page encodes itself (~200 fps); --screenshots for the old path
+  gpu: !has("--no-gpu")                                // 3D on the real GPU
 };
 if (!o.product && !o.spec) { console.error("need --product or --spec"); process.exit(2); }
 
@@ -77,17 +79,17 @@ fs.mkdirSync(work, { recursive: true });
 const done = p => reuse && fs.existsSync(p) && fs.statSync(p).size > 0;
 // slice boundaries land on the frame grid, so the concatenation has neither a
 // duplicated nor a missing frame at any seam
-const K = Math.max(1, Math.min(o.chunks, Math.floor(D / 4)));
+const K = Math.max(1, Math.min(o.encode && !has("--chunks") ? 3 : o.chunks, Math.floor(D / 4)));
 const totalFrames = Math.round(D * o.fps);
 const bounds = Array.from({ length: K + 1 }, (_, i) => Math.round(totalFrames * i / K) / o.fps);
 const sliceJobs = Array.from({ length: K }, (_, i) => {
   const dir = path.join(work, `slice${i}`), mp4 = path.join(dir, "kin-ad.mp4");
   if (done(mp4)) return Promise.resolve(mp4);
   // JPEG capture at quality 95: 4.6x faster per frame than PNG (88 ms vs 403 ms measured), invisible after H.264
-  return run(process.execPath, [RENDER, "--page", page, "--fps", String(o.fps), "--from", String(bounds[i]), "--to", String(bounds[i + 1]), "--out", dir, "--no-score", "--capture", o.capture]).then(() => mp4);
+  return run(process.execPath, [RENDER, "--page", page, "--fps", String(o.fps), "--from", String(bounds[i]), "--to", String(bounds[i + 1]), "--out", dir, "--no-score", "--capture", o.capture, ...(o.encode ? ["--encode"] : []), ...(o.gpu ? ["--gpu"] : [])]).then(() => mp4);
 });
 const scoreWavPath = path.join(work, "score", "score.wav");
-const scoreJob = done(scoreWavPath) ? Promise.resolve(scoreWavPath) : run(process.execPath, [RENDER, "--page", page, "--score-only", "--out", path.join(work, "score")]).then(() => scoreWavPath);
+const scoreJob = done(scoreWavPath) ? Promise.resolve(scoreWavPath) : run(process.execPath, [RENDER, "--page", page, "--score-only", "--out", path.join(work, "score"), ...(o.gpu ? ["--gpu"] : [])]).then(() => scoreWavPath);
 const voWavPath = path.join(outDir, "voice", "vo.wav");
 const voiceJob = (o.voice && (spec.voiceover || []).length && (done(voWavPath) || process.env.ELEVENLABS_API_KEY))
   ? (done(voWavPath) ? Promise.resolve(voWavPath) : run(process.execPath, [path.join(HERE, "voice.mjs"), specPath, "--score", "/nonexistent", "--video", "/nonexistent"], { echo: true }).then(() => voWavPath).catch(e => { console.error("# voice failed: " + e.message.split("\n")[0]); return null; }))
@@ -131,7 +133,7 @@ await stage("assemble", async () => {
 // ---- 5. stills
 await stage("stills", async () => {
   const dir = path.join(work, "stills");
-  await run(process.execPath, [RENDER, "--page", page, "--stills", "8", "--fps", "30", "--out", dir]);
+  await run(process.execPath, [RENDER, "--page", page, "--stills", "8", "--fps", "30", "--out", dir, ...(o.gpu ? ["--gpu"] : [])]);
   spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", path.join(dir, "stills", "still_%02d.png"), "-vf", "scale=640:-1,tile=4x2", path.join(outDir, "contact.png")]);
 });
 

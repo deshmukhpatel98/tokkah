@@ -14,7 +14,8 @@
     .sans { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: @@INK@@; }
     .mono { font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.08em; color: @@INK@@; }
     canvas { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; pointer-events: none; }
-    #c-scene { z-index: 10; } #c-light { z-index: 30; } #c-grain { z-index: 45; opacity: 0.02; mix-blend-mode: screen; }
+    #c-scene { z-index: 10; } #c-3d { z-index: 15; } #c-light { z-index: 30; } #c-grain { z-index: 45; opacity: 0.02; mix-blend-mode: screen; } #c-type { z-index: 50; display: none; }
+    body.canvas-type #c-type { display: block; } body.canvas-type .copy, body.canvas-type #copy-number, body.canvas-type #mark-wrap, body.canvas-type #cta, body.canvas-type .mac-window { visibility: hidden !important; }
     .mac-window { position: absolute; left: 0; top: 0; width: 1008px; height: 744px; z-index: 20; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); overflow: hidden; transform-origin: 0 0; pointer-events: none; display: none; box-shadow: 0 24px 60px rgba(0,0,0,0.45); }
     .mac-titlebar { position: absolute; top: 0; left: 0; width: 100%; height: 44px; display: flex; align-items: center; padding-left: 18px; gap: 8px; background: rgba(10,14,22,0.92); border-bottom: 1px solid rgba(255,255,255,0.08); }
     .dot { width: 12px; height: 12px; border-radius: 50%; background: rgba(154,163,178,0.32); }
@@ -46,10 +47,12 @@
   <div id="stage-container">
     <div id="stage">
       <canvas id="c-scene" width="1920" height="1080"></canvas>
+      <canvas id="c-3d" width="1920" height="1080"></canvas>
       <div id="win-a" class="mac-window"><div class="mac-titlebar"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>
       <div id="win-b" class="mac-window"><div class="mac-titlebar"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>
       <canvas id="c-light" width="1920" height="1080"></canvas>
       <canvas id="c-grain" width="480" height="270"></canvas>
+      <canvas id="c-type" width="1920" height="1080"></canvas>
       <div id="copy-center" class="copy serif"></div>
       <div id="copy-side" class="copy serif"></div>
       <div id="copy-left" class="copy serif"></div>
@@ -67,6 +70,7 @@
     </div>
   </div>
   <script type="application/json" id="ad-spec">@@SPEC@@</script>
+  @@BUNDLE@@
   <script>@@LIB@@</script>
 </body>
 </html>

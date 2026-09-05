@@ -77,6 +77,13 @@ lib (all pure and deterministic):
   portrait(ctx,"them"|"you",{x,y,w,h},{alpha,zoom,dx,dy}) a person out of focus; edge(ctx,rect,color,opacity,depth) the edge light inside a rect
   planet(ctx,{cx,cy,R,lat,lon,alpha}) -> cam; route(ctx,cam,fromV,toV,u0,u1,{cx,cy,R,color,alpha,width}) -> head {x,y,vis}; city("LONDON") -> {v,lat,lon}; project(cam,v,cx,cy,R)
   mark(ctx,cx,cy,r,sep,alphaInk,alphaAccent,overlapAlpha,fade) the brand mark: ink disc left, accent-A disc right; WIN={x:120,y:156,w:1008,h:744}
+c.three (3D, lazy; using it composites a WebGL layer between scene and light). Objects persist: create ONCE with three.get(key, T => object) and set transforms EVERY frame; anything not fetched in a frame is hidden. Units: metres; the studio floor is y=0; camera default at (0,1.3,5) looking at (0,0.3,0); a 1920x1080 frame at that distance shows about 4.3 m across.
+  three.THREE (the library), three.scene, three.camera (PerspectiveCamera; set .position and call .lookAt each frame), three.renderer
+  three.studio("white"|"dark") seamless sweep + soft shadowed key from upper-left + fill + room reflections; call it each frame you want it visible
+  three.get(key, factory) -> the object (Mesh/Group); factory(T) builds it once
+  three.roundedBox(w,h,d,r,mat?) three.capsule(r,len,mat?) three.cylinder(rTop,rBot,h,mat?) three.sphere(r,mat?) three.group() meshes cast shadows
+  three.aluminium(color?) brushed metal; three.plastic(color?,roughness?) matte; three.rubber(color?); three.glow(color?,intensity?) emissive. Colours accept "A"|"B"|"ink"|"#hex".
+  Animate by setting object.position/rotation/scale from c.tl each frame (lib.span/lib.kf). Do not create objects outside three.get; never Math.random.
 dom (the type layer; call each frame the element should be visible):
   copy(pos,text,{size,y,tIn,tOut,sub,color}) pos "center"|"side"|"left"|"below"; sizes from the system 88/72/64/56; fades in over 480 ms from film time tIn and out over 280 ms from tOut
   window(rect,alpha,"a"|"b") window chrome; content(rect) -> the rect below its title strip
@@ -143,7 +150,7 @@ PALETTE: A=${plan.palette.accentA} (the product's own colour), B=${plan.palette.
 THE PRODUCT: ${pd || o.product}. Draw it ONLY with lib.product(ctx, {x, y, size, alpha, rotate, only, skip}) — never your own approximation; size is the box height in px (the hero shot: 650-800). Layer tags available in the illustration: ${(plan.productDrawing?.layers || []).map(l => l.tag).filter(Boolean).join(", ") || "outline, body, sole, detail, highlight, shadow (typical)"}.
 MOTIF: ${plan.motif?.name}: ${plan.motif?.description} (returns in ${(plan.motif?.returns || []).join(", ")})
 TYPE: sizes 88/72/64/56; copy fades in 480 ms, out 280 ms; safe area 120 px.
-${plan.tempo === "reference" ? `REFERENCE STUDY: the stage is a light studio (ground ${plan.palette.accentA ? plan.palette.ground : "#b6b8bd"}): paint the whole frame with a soft vertical gradient of the ground first (lighter above, a touch darker below a horizon near y 620), draw a long diffuse shadow under the object with a radial gradient of the ground darkened 25%, and use ink (dark) for type. Match the measured timing exactly; the shot's direction carries the numbers. Comedy parts (limbs, wheels, boosters) are lib.shapes layers you draw, attached to lib.product's position and animated with rotate/translate; keep them bold and readable at 480 px wide.` : FAST ? "PACE: fast. Something must change every 2-3 s inside this shot; motion 240-700 ms with lib.ease; camera push-ins/pans via ctx.save/translate/scale; no dead frames; no fade to black." : "PACE: measured; slow confident motion."}
+${plan.tempo === "reference" ? `REFERENCE STUDY, IN 3D: build the shot with c.three. Every frame: three.studio("white"); the hero is three.get("box", T => a rounded aluminium box 1.97 x 0.5 x 1.97 m with corner radius 0.16 sitting on the floor (position.y 0.25), plus a thin dark rubber ring underneath and a tiny white power light on the front); frame it with three.camera to match the direction. Comedy parts (a hand, a chip, arms, legs, wheels, tentacle arms, boosters, clouds) are 3D: capsules, cylinders, spheres and groups from three.* with three.plastic in the accent colours or three.rubber, created once with three.get and posed every frame from c.tl; they attach to the box's position and appear with 300-500 ms eased pops. Clouds are clusters of white matte spheres. Match the measured timing exactly; the direction carries the numbers. Type (lockup, logo, legal) is drawn with lib.text on c.light at the measured pixel positions. Leave the 2D scene canvas empty unless the direction asks for it.` : FAST ? "PACE: fast. Something must change every 2-3 s inside this shot; motion 240-700 ms with lib.ease; camera push-ins/pans via ctx.save/translate/scale; no dead frames; no fade to black." : "PACE: measured; slow confident motion."}
 
 THIS SHOT ${s.id} "${s.title}" — film time ${s.start}s to ${s.end}s (dur ${(s.end - s.start).toFixed(2)}s)
 DIRECTION: ${s.direction}
@@ -301,7 +308,7 @@ async function build() { await run(process.execPath, [path.join(HERE, "build-ad.
 async function smoke(page) { const out = await run(process.execPath, [path.join(HERE, "smoke.mjs"), page]); const r = JSON.parse(out.trim().split("\n").pop()); fs.writeFileSync(path.join(OUT, "smoke.json"), JSON.stringify(r, null, 2)); return r; }
 async function stills(page, round) {
   const dir = path.join(OUT, "work", `stills-${round}`);
-  await run(process.execPath, [RENDER, "--page", page, "--stills", "10", "--fps", "30", "--out", dir]);
+  await run(process.execPath, [RENDER, "--page", page, "--stills", "10", "--fps", "30", "--out", dir, "--gpu"]);
   const sheet = path.join(OUT, `contact-${round}.png`);
   const r = spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", path.join(dir, "stills", "still_%02d.png"), "-vf", "scale=512:-1,tile=5x2", sheet], { encoding: "utf8" });
   if (r.status !== 0) throw new Error(r.stderr);

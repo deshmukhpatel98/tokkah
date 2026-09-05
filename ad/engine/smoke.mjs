@@ -21,7 +21,7 @@ const freePort = () => new Promise((res, rej) => { const s = net.createServer();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const port = await freePort();
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), "kin-smoke-"));
-const brave = spawn(BRAVE, ["--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--hide-scrollbars", "--disable-component-update", "--disable-background-networking", "--window-size=1920,1080", "about:blank"], { stdio: "ignore" });
+const brave = spawn(BRAVE, ["--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--use-angle=metal", "--ignore-gpu-blocklist", "--hide-scrollbars", "--disable-component-update", "--disable-background-networking", "--window-size=1920,1080", "about:blank"], { stdio: "ignore" });
 const kill = () => { try { brave.kill("SIGKILL"); } catch (e) {} try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) {} };
 process.on("exit", kill);
 

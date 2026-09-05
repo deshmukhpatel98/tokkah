@@ -38,6 +38,7 @@ function parseArgs(args) {
     scoreOnly: false,
     capture: 'png',
     gpu: false,
+    encode: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -88,6 +89,8 @@ function parseArgs(args) {
       options.noScore = true;
     } else if (arg === '--score-only') {
       options.scoreOnly = true;
+    } else if (arg === '--encode') {
+      options.encode = true;
     } else if (arg === '--gpu') {
       options.gpu = true;
     } else if (arg === '--capture') {
@@ -107,6 +110,7 @@ Options:
   --score-only        Render only the full-length score.wav and exit
   --capture png|jpeg  Frame capture format (default png; jpeg is ~3x faster, quality 95)
   --gpu               Do not pass --disable-gpu to the browser (faster canvas work on Apple silicon)
+  --encode            Let the page encode the video itself (WebCodecs H.264, ~200 fps) instead of screenshots
 `);
       process.exit(0);
     } else {
@@ -450,7 +454,26 @@ async function main() {
     if (f.endsWith('.png') || f.endsWith('.jpg')) fs.unlinkSync(path.join(framesDir, f));
   }
 
-  if (!options.scoreOnly) {
+  let encodedVideo = null;
+  if (options.encode && !options.scoreOnly) {
+    console.log(`[render] Encoding ${totalFrames} frames at ${fps} fps in-page (span: ${from}s - ${to}s)...`);
+    const t0 = performance.now();
+    const encRes = await cdp.send('Runtime.evaluate', { expression: `window.kinAd.encodeStart({ fps: ${fps}, from: ${from}, to: ${to} })`, awaitPromise: true, returnByValue: true });
+    if (encRes.exceptionDetails) throw new Error(`Encode error: ${encRes.exceptionDetails.text} ${encRes.exceptionDetails.exception?.description || ''}`);
+    const info = encRes.result.value;
+    encodedVideo = path.join(outDir, 'video.mp4');
+    const fd = fs.openSync(encodedVideo, 'w');
+    const CH = 3 * 1024 * 1024;
+    for (let off = 0; off < info.bytes; off += CH) {
+      const r = await cdp.send('Runtime.evaluate', { expression: `window.kinAd.encodeChunk(${off}, ${Math.min(CH, info.bytes - off)})`, returnByValue: true });
+      if (r.exceptionDetails) { fs.closeSync(fd); throw new Error('encode chunk failed'); }
+      fs.writeSync(fd, Buffer.from(r.result.value, 'base64'));
+    }
+    fs.closeSync(fd);
+    const secs = (performance.now() - t0) / 1000;
+    console.log(`[render] Encoded ${info.frames} frames (${info.codec}, ${info.hardware}) in ${secs.toFixed(2)}s (${(info.frames / secs).toFixed(0)} fps) -> ${(info.bytes / 1024 / 1024).toFixed(1)} MB`);
+  }
+  if (!options.scoreOnly && !options.encode) {
   console.log(`[render] Capturing ${totalFrames} frames at ${fps} fps (span: ${from}s - ${to}s)...`);
 
   const captureStart = performance.now();
@@ -612,7 +635,11 @@ async function main() {
   console.log(`[render] Muxing video with ffmpeg...`);
 
   const mp4Path = path.join(outDir, 'kin-ad.mp4');
-  const muxArgs = [
+  const muxArgs = encodedVideo ? [
+    '-y', '-i', encodedVideo, ...(options.noScore ? [] : ['-i', wavPath]),
+    '-map', '0:v', ...(options.noScore ? [] : ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']),
+    '-c:v', 'copy', '-movflags', '+faststart', mp4Path
+  ] : [
     '-y',
     '-framerate', String(fps),
     '-start_number', '1',
@@ -664,6 +691,7 @@ async function main() {
 
   // Frame cleanup
   if (!options.keepFrames) {
+    if (encodedVideo && !options.keepFrames) { try { fs.unlinkSync(encodedVideo); } catch (e) {} }
     fs.rmSync(framesDir, { recursive: true, force: true });
     console.log(`[render] Temporary frame PNGs cleaned up`);
   } else {

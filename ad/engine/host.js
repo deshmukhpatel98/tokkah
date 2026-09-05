@@ -59,6 +59,10 @@
   function cacheElements() {
     el.stage = $("stage"); el.scene = fitCanvas($("c-scene")); el.light = fitCanvas($("c-light"));
     el.grainCanvas = $("c-grain"); el.grain = el.grainCanvas.getContext("2d");
+    el.typeCanvas = $("c-type"); el.type = fitCanvas(el.typeCanvas);
+    el.gl = $("c-3d");
+    // in render mode the type layer is drawn on canvas (so the page can composite and encode itself); live, the DOM shows
+    if (isRender) document.body.classList.add("canvas-type");
     el.winA = $("win-a"); el.winB = $("win-b");
     el.copy = { center: $("copy-center"), side: $("copy-side"), left: $("copy-left"), below: $("copy-below") };
     el.number = $("copy-number");
@@ -690,6 +694,46 @@
     node.style.fontSize = `${c.size}px`; node.style.top = `${c.y}px`; node.style.color = c.color ? hex(c.color) : "";
     node.style.opacity = (ein * eout).toFixed(3); node.style.transform = `translateY(${(8 * (1 - ein)).toFixed(2)}px)`;
   }
+  const FONT = { serif: 'Baskerville, "Iowan Old Style", Georgia, serif', sans: '-apple-system, BlinkMacSystemFont, system-ui, sans-serif', mono: 'ui-monospace, Menlo, monospace' };
+  function drawTypeLayer(t) {
+    const g = el.type; g.clearRect(0, 0, W, H);
+    const txt = (str, x, y, size, family, o = {}) => {
+      if (!str || (o.alpha ?? 1) <= 0.002) return;
+      g.save(); g.globalAlpha = clamp(o.alpha ?? 1, 0, 1);
+      g.font = `${o.italic ? "italic " : ""}${o.weight || 400} ${size}px ${FONT[family] || family}`; g.textAlign = o.align || "center"; g.textBaseline = "top";
+      if ("letterSpacing" in g) g.letterSpacing = `${(o.tracking ?? 0) * size}px`;
+      g.fillStyle = o.color || hex(INK);
+      const lines = String(str).split("\n"); lines.forEach((ln, i) => g.fillText(ln, x, y + i * size * 1.04));
+      g.restore();
+    };
+    // window chrome
+    for (const wnd of [D.winA, D.winB]) {
+      if (!wnd || !wnd.r || wnd.alpha <= 0.002) continue;
+      const r = wnd.r, sc = r.w / WIN.w; g.save(); g.globalAlpha = clamp(wnd.alpha, 0, 1);
+      g.shadowColor = "rgba(0,0,0,0.45)"; g.shadowBlur = 60 * sc; g.shadowOffsetY = 24 * sc; g.fillStyle = "rgba(0,0,0,0.001)"; g.beginPath(); g.roundRect(r.x, r.y, r.w, r.h, 12 * sc); g.fill(); g.shadowColor = "transparent";
+      g.fillStyle = "rgba(10,14,22,0.92)"; g.beginPath(); g.roundRect(r.x, r.y, r.w, TITLE * sc, [12 * sc, 12 * sc, 0, 0]); g.fill();
+      g.fillStyle = "rgba(255,255,255,0.08)"; g.fillRect(r.x, r.y + TITLE * sc - 1, r.w, 1);
+      g.fillStyle = "rgba(154,163,178,0.32)"; for (let i = 0; i < 3; i++) { g.beginPath(); g.arc(r.x + (18 + 6 + i * 20) * sc, r.y + TITLE * sc / 2, 6 * sc, 0, Math.PI * 2); g.fill(); }
+      g.strokeStyle = "rgba(255,255,255,0.14)"; g.lineWidth = 1; g.beginPath(); g.roundRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1, 12 * sc); g.stroke();
+      g.restore();
+    }
+    // story copy (matches #copy-* CSS: serif, tracking -0.015em, line-height 1.04, 480/280 ms fades, 8 px rise)
+    const cols = { center: [960, "center"], below: [960, "center"], side: [1264, "left"], left: [120, "left"] };
+    for (const k of ["center", "side", "left", "below"]) {
+      const c = D.copy[k]; if (!c || !c.text) continue;
+      const ein = span(t, c.tIn, c.tIn + 0.48), eout = 1 - span(t, c.tOut, c.tOut + 0.28, linear), a = ein * eout; if (a <= 0.002) continue;
+      const [x, align] = cols[k];
+      txt(c.text, x, c.y + 8 * (1 - ein), c.size, "serif", { align, alpha: a, tracking: -0.015, color: c.color ? hex(c.color) : hex(INK) });
+      if (c.sub) txt(c.sub, x, c.y + 8 * (1 - ein) + c.size * 1.04 * String(c.text).split("\n").length + c.size * 0.5, c.size * 0.45, "serif", { align, alpha: a, color: rgba(MUTED, 0.9) });
+    }
+    if (D.number) txt(D.number.text, 120, 560, 84, "mono", { align: "left", alpha: D.number.alpha, tracking: 0.02 });
+    if (D.mark) {
+      const m = D.mark;
+      if (m.wm) txt(m.wm, 960, (m.wmTop ?? 640) + 8 * (1 - (m.wmAlpha ?? 1)), m.wmSize || 204, "serif", { alpha: m.wmAlpha ?? 0, tracking: -0.025 });
+      if (m.tagline) txt(m.tagline, 960, m.tlTop ?? 860, m.tlSize || 46, "serif", { alpha: m.tlAlpha ?? 0, italic: true });
+    }
+    if (D.cta) { const L = D.cta.lines, a = D.cta.alpha; if (L[0]) txt(L[0], 960, 776, 36, "serif", { alpha: a }); if (L[1]) txt(L[1], 960, 839, 24, "mono", { alpha: a, tracking: 0.06 }); if (L[2]) txt(L[2], 960, 895, 26, "sans", { alpha: a, color: rgba(MUTED, 0.9) }); }
+  }
   function commitDom(t) {
     placeWin(el.winA, D.winA && D.winA.r, D.winA ? D.winA.alpha : 0);
     placeWin(el.winB, D.winB && D.winB.r, D.winB ? D.winB.alpha : 0);
@@ -703,6 +747,59 @@
     if (D.cta) { el.cta.style.display = "block"; el.cta.style.opacity = clamp(D.cta.alpha, 0, 1).toFixed(3); D.cta.lines.forEach((l, i) => { el.ctaLines[i].textContent = l; el.ctaLines[i].style.display = "block"; }); for (let i = D.cta.lines.length; i < 3; i++) el.ctaLines[i].style.display = "none"; }
     else el.cta.style.display = "none";
     el.progressFill.style.width = `${(clamp(t / DURATION, 0, 1) * 100).toFixed(2)}%`;
+  }
+
+  // ---------------------------------------------------------------- lib: 3D (three.js, when the page bundles it)
+  // Shot code stays a pure function of time: objects are created once through
+  // three.get(key, factory) and positioned every frame; anything not touched in a
+  // frame is hidden. The host renders the scene after the module ran.
+  let three = null;
+  function initThree() {
+    if (three || !window.THREE || !el.gl) return three;
+    const T = window.THREE;
+    const renderer = new T.WebGLRenderer({ canvas: el.gl, antialias: true, alpha: true, preserveDrawingBuffer: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(1); renderer.setSize(W, H, false); renderer.setClearColor(0x000000, 0);
+    renderer.shadowMap.enabled = true; renderer.shadowMap.type = T.PCFSoftShadowMap;
+    renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.1; renderer.outputColorSpace = T.SRGBColorSpace;
+    const scene = new T.Scene();
+    const camera = new T.PerspectiveCamera(28, W / H, 0.05, 200); camera.position.set(0, 1.3, 5); camera.lookAt(0, 0.3, 0);
+    const pmrem = new T.PMREMGenerator(renderer);
+    const cache = new Map(); const touched = new Set(); let studioBuilt = null;
+    const api = {
+      THREE: T, renderer, scene, camera,
+      // objects persist across frames; call each frame you want them visible
+      get(key, factory) { let o = cache.get(key); if (!o) { o = factory(T); if (o) { scene.add(o); cache.set(key, o); } } if (o) { o.visible = true; touched.add(key); } return o; },
+      // a studio: seamless sweep + soft shadowed key + fill + hemisphere + room reflections. kind: "white" | "dark"
+      studio(kind = "white") {
+        if (studioBuilt !== kind) {
+          for (const k of [...cache.keys()]) if (k.startsWith("__studio")) { scene.remove(cache.get(k)); cache.delete(k); }
+          const white = kind === "white";
+          scene.environment = pmrem.fromScene(new T.RoomEnvironment(), 0.04).texture;
+          const floor = new T.Mesh(new T.PlaneGeometry(60, 60), new T.MeshStandardMaterial({ color: white ? "#d3d5da" : "#0b0c10", roughness: 0.95 })); floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; cache.set("__studio.floor", floor); scene.add(floor);
+          const back = new T.Mesh(new T.PlaneGeometry(60, 30), new T.MeshStandardMaterial({ color: white ? "#c9cbd0" : "#07080c", roughness: 1 })); back.position.set(0, 15, -10); back.receiveShadow = true; cache.set("__studio.back", back); scene.add(back);
+          const key = new T.DirectionalLight("#fff6ea", white ? 3.2 : 2.2); key.position.set(-4, 7, 4); key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.radius = 8; key.shadow.camera.near = 1; key.shadow.camera.far = 40; key.shadow.camera.left = key.shadow.camera.bottom = -8; key.shadow.camera.right = key.shadow.camera.top = 8; cache.set("__studio.key", key); scene.add(key);
+          const fill = new T.DirectionalLight("#dfe7ff", white ? 1.1 : 0.5); fill.position.set(5, 3, 2); cache.set("__studio.fill", fill); scene.add(fill);
+          const hemi = new T.HemisphereLight("#ffffff", white ? "#8a8c92" : "#111318", white ? 0.9 : 0.35); cache.set("__studio.hemi", hemi); scene.add(hemi);
+          studioBuilt = kind;
+        }
+        for (const k of cache.keys()) if (k.startsWith("__studio")) { cache.get(k).visible = true; touched.add(k); }
+        return api;
+      },
+      // materials and geometry helpers (colours accept the palette names)
+      aluminium(color = "#cfd1d5") { return new T.MeshPhysicalMaterial({ color: hex(colorOf(color)), metalness: 0.85, roughness: 0.38, clearcoat: 0.15, clearcoatRoughness: 0.5, envMapIntensity: 1.1 }); },
+      plastic(color = "A", roughness = 0.45) { return new T.MeshStandardMaterial({ color: hex(colorOf(color)), roughness, metalness: 0.05 }); },
+      rubber(color = "#1a1a1c") { return new T.MeshStandardMaterial({ color: hex(colorOf(color)), roughness: 0.95, metalness: 0 }); },
+      glow(color = "A", intensity = 2) { return new T.MeshStandardMaterial({ color: hex(colorOf(color)), emissive: hex(colorOf(color)), emissiveIntensity: intensity }); },
+      roundedBox(w, h, d, r = 0.1, mat) { const m = new T.Mesh(new T.RoundedBoxGeometry(w, h, d, 6, r), mat || api.aluminium()); m.castShadow = m.receiveShadow = true; return m; },
+      capsule(r, len, mat) { const m = new T.Mesh(new T.CapsuleGeometry(r, len, 8, 16), mat || api.plastic("A")); m.castShadow = true; return m; },
+      cylinder(rTop, rBot, h, mat) { const m = new T.Mesh(new T.CylinderGeometry(rTop, rBot, h, 32), mat || api.rubber()); m.castShadow = true; return m; },
+      sphere(r, mat) { const m = new T.Mesh(new T.SphereGeometry(r, 32, 24), mat || api.plastic("ink", 0.9)); m.castShadow = true; return m; },
+      group() { return new T.Group(); },
+      // called by the host after the module; hides untouched objects, renders
+      _frame() { for (const [k, o] of cache) if (!touched.has(k)) o.visible = false; touched.clear(); renderer.render(scene, camera); },
+      _clear() { renderer.setClearColor(0x000000, 0); renderer.clear(); }
+    };
+    three = api; return three;
   }
 
   // ---------------------------------------------------------------- the lib object handed to modules
@@ -740,16 +837,21 @@
     resetDom();
     const i = activeShot(_t), s = SHOTS[i], tl = _t - s.start, dur = s.end - s.start;
     const mod = MODULES[s.id];
+    let usedThree = false;
     if (mod && !broken[s.id]) {
       try {
-        mod({ scene: el.scene, light: el.light, dom, lib, t: _t, tl, u: clamp(tl / dur, 0, 1), dur, a: 1, shot: s, prev: SHOTS[i - 1] || null, next: SHOTS[i + 1] || null, spec: SPEC, D: DURATION });
+        const ctx = { scene: el.scene, light: el.light, dom, lib, t: _t, tl, u: clamp(tl / dur, 0, 1), dur, a: 1, shot: s, prev: SHOTS[i - 1] || null, next: SHOTS[i + 1] || null, spec: SPEC, D: DURATION };
+        Object.defineProperty(ctx, "three", { get() { usedThree = true; return initThree(); } });
+        mod(ctx);
       } catch (e) {
         broken[s.id] = true; errors.push({ shot: s.id, error: String(e && e.stack || e).slice(0, 600), t: _t });
         el.scene.clearRect(0, 0, W, H); el.light.clearRect(0, 0, W, H); resetDom();
         fallback(s, tl, _t, fallbackAlpha(i, _t));
       }
     } else fallback(s, tl, _t, fallbackAlpha(i, _t));
+    if (three) { if (usedThree) three._frame(); else three._clear(); }
     commitDom(_t);
+    if (isRender) drawTypeLayer(_t);
     renderGrain(_t);
     const ms = performance.now() - t0; if (frameMs.length < 4000) frameMs.push([+_t.toFixed(2), +ms.toFixed(2)]);
   }
@@ -848,8 +950,47 @@
   function toggle() { if (_playing) pause(); else play(); }
   function setMuted(m) { _muted = !!m; el.volumeWaves.style.display = _muted ? "none" : "block"; if (_muted) stopSource(); else if (_playing) startLiveAudio(); }
 
+  // Encode [from,to) at fps entirely in-page: render(t), composite the layers in
+  // DOM order (scene, 3D, light, type, grain), VideoFrame -> VideoEncoder -> MP4.
+  // Returns the byte length; encodeChunk(off,len) hands the file out in base64.
+  let _encoded = null;
+  async function encodeStart(o = {}) {
+    const fps = o.fps || 30, from = o.from ?? 0, to = o.to ?? DURATION, n = Math.round((to - from) * fps);
+    const { Muxer, ArrayBufferTarget } = window.Mp4Muxer;
+    const off = new OffscreenCanvas(W, H), g = off.getContext("2d");
+    let cfg = null;
+    for (const cd of [o.codec || "avc1.640028", "avc1.4d0028", "vp09.00.40.08"]) {
+      for (const hw of ["prefer-hardware", "prefer-software"]) {
+        const c = { codec: cd, width: W, height: H, bitrate: o.bitrate || 14_000_000, framerate: fps, hardwareAcceleration: hw, ...(cd.startsWith("avc1") ? { avc: { format: "avc" } } : {}) };
+        try { if ((await VideoEncoder.isConfigSupported(c)).supported) { cfg = c; break; } } catch (e) {}
+      }
+      if (cfg) break;
+    }
+    if (!cfg) throw new Error("no VideoEncoder configuration supported");
+    const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: cfg.codec.startsWith("avc1") ? "avc" : "vp9", width: W, height: H }, fastStart: "in-memory" });
+    let err = null; const enc = new VideoEncoder({ output: (ch, meta) => muxer.addVideoChunk(ch, meta), error: e => { err = String(e); } }); enc.configure(cfg);
+    const gs = el.grainCanvas;
+    for (let i = 0; i < n; i++) {
+      const t = from + i / fps; render(t);
+      g.fillStyle = hex(GROUND); g.fillRect(0, 0, W, H);
+      g.drawImage(el.scene.canvas, 0, 0, W, H);
+      if (three && el.gl) g.drawImage(el.gl, 0, 0, W, H);
+      g.drawImage(el.light.canvas, 0, 0, W, H);
+      g.drawImage(el.typeCanvas, 0, 0, W, H);
+      if (!reducedMotion) { g.save(); g.globalAlpha = 0.02; g.globalCompositeOperation = "screen"; g.drawImage(gs, 0, 0, W, H); g.restore(); }
+      const frame = new VideoFrame(off, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      enc.encode(frame, { keyFrame: i % (fps * 2) === 0 }); frame.close();
+      if (enc.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 1));
+      if (err) throw new Error(err);
+    }
+    await enc.flush(); enc.close(); muxer.finalize();
+    _encoded = new Uint8Array(muxer.target.buffer);
+    return { bytes: _encoded.byteLength, frames: n, codec: cfg.codec, hardware: cfg.hardwareAcceleration };
+  }
+  function encodeChunk(off, len) { const s = _encoded.subarray(off, off + len); let b = ""; const CH = 0x8000; for (let i = 0; i < s.length; i += CH) b += String.fromCharCode.apply(null, s.subarray(i, i + CH)); return btoa(b); }
+
   window.kinAd = {
-    duration: DURATION, get time() { return _t; }, play, pause, toggle, setMuted,
+    duration: DURATION, get time() { return _t; }, play, pause, toggle, setMuted, encodeStart, encodeChunk,
     get errors() { return errors.slice(); }, get frameMs() { return frameMs.slice(); }, get broken() { return Object.keys(broken); },
     transcript: SHOTS.filter(s => s.copy).map(s => ({ t: s.start, text: s.copy })).concat((SPEC.voiceover || []).map(v => ({ t: v.t, text: "[voice] " + v.text }))),
     seek(t) { pause(); _atRest = false; el.replay.style.display = "none"; render(t); return new Promise(res => requestAnimationFrame(() => requestAnimationFrame(res))); },

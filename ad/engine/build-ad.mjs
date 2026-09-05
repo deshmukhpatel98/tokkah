@@ -22,6 +22,9 @@ const hasModules = fs.existsSync(modulesPath);
 const lib = fs.readFileSync(path.join(HERE, hasModules ? "host.js" : "render-lib.js"), "utf8");
 if (lib.includes("/*@@")) { console.error("render library still has unstitched markers"); process.exit(1); }
 const modules = hasModules ? fs.readFileSync(modulesPath, "utf8") : "";
+// the vendored bundle (three.js + mp4 muxer) gives the page 3D and in-page encoding; one local script, no external resources
+const bundlePath = path.join(HERE, "vendor", "three-bundle.js");
+const bundle = fs.existsSync(bundlePath) ? `<script>${fs.readFileSync(bundlePath, "utf8").replace(/<\/script/gi, "<\\/script")}</script>` : "";
 
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 const lines = [];
@@ -39,6 +42,7 @@ const html = shell
   .replace(/@@GROUND@@/g, spec.palette?.ground || "#05060a")
   .replace(/@@INK@@/g, spec.palette?.ink || "#f3f1ec")
   .replace("@@TRANSCRIPT@@", transcript)
+  .replace("@@BUNDLE@@", () => bundle)
   .replace("@@SPEC@@", () => specJson)
   .replace("@@LIB@@", () => libSafe);
 
