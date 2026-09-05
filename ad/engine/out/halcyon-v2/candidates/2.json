@@ -1,0 +1,137 @@
+{
+  "product": "Halcyon, a bedside sunrise lamp that wakes you without an alarm",
+  "tension": "A phone alarm drops you into the day before you are ready.",
+  "idea": "Morning is a cliff edge; Halcyon's rising light turns the drop into a gentle slope.",
+  "tone": "hushed, precise, humane",
+  "tagline": "Wake without the alarm.",
+  "palette": {
+    "ground": "#05060a",
+    "ink": "#f3f1ec",
+    "accentA": "#FFB66B",
+    "accentB": "#7D9DBF"
+  },
+  "voice": {
+    "voice_id": "pFZP5JQG7iQjIQuC4Bku",
+    "voice_name": "Lily",
+    "stability": 0.5,
+    "direction": "Close, unhurried and understated; let the pauses breathe, with no advertising lift."
+  },
+  "duration": 40,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 5,
+      "primitive": "shape",
+      "params": {
+        "path": "M80 305 L500 305 L500 790 L920 790 M500 260 C500 285 480 305 455 305 C430 305 410 285 410 260 C410 235 430 215 455 215 C480 215 500 235 500 260 Z",
+        "fill": "none",
+        "stroke": "B",
+        "strokeWidth": 5,
+        "size": 780,
+        "x": 0.5,
+        "y": 0.46,
+        "motion": "still",
+        "glow": 0
+      }
+    },
+    {
+      "id": "S2",
+      "start": 5,
+      "end": 8,
+      "primitive": "shape",
+      "params": {
+        "path": "M80 305 L500 305 L500 790 L920 790 M590 745 C590 770 570 790 545 790 C520 790 500 770 500 745 C500 720 520 700 545 700 C570 700 590 720 590 745 Z",
+        "fill": "none",
+        "stroke": "B",
+        "strokeWidth": 5,
+        "size": 780,
+        "x": 0.5,
+        "y": 0.46,
+        "motion": "shudder",
+        "glow": 0
+      }
+    },
+    {
+      "id": "S3",
+      "start": 8,
+      "end": 15,
+      "primitive": "shape",
+      "params": {
+        "path": "M240 730 L240 500 C240 350 355 230 500 230 C645 230 760 350 760 500 L760 730 Z M355 760 L645 760 L645 792 L355 792 Z",
+        "fill": "A",
+        "stroke": "none",
+        "strokeWidth": 0,
+        "size": 620,
+        "x": 0.5,
+        "y": 0.52,
+        "motion": "fadein",
+        "glow": 0.18
+      }
+    },
+    {
+      "id": "S4",
+      "start": 15,
+      "end": 24,
+      "primitive": "glow",
+      "params": {
+        "color": "A",
+        "from": 0.08,
+        "to": 0.72,
+        "x": 0.5,
+        "y": 0.57,
+        "radius": 1000,
+        "curve": "ease"
+      }
+    },
+    {
+      "id": "S5",
+      "start": 24,
+      "end": 31,
+      "primitive": "shape",
+      "params": {
+        "path": "M80 305 C420 305 480 790 820 790 L920 790 M910 745 C910 770 890 790 865 790 C840 790 820 770 820 745 C820 720 840 700 865 700 C890 700 910 720 910 745 Z",
+        "fill": "none",
+        "stroke": "A",
+        "strokeWidth": 5,
+        "size": 780,
+        "x": 0.5,
+        "y": 0.46,
+        "motion": "still",
+        "glow": 0.12
+      }
+    },
+    {
+      "id": "S6",
+      "start": 31,
+      "end": 36,
+      "primitive": "mark",
+      "params": {
+        "wordmark": "Halcyon"
+      }
+    },
+    {
+      "id": "S7",
+      "start": 36,
+      "end": 40,
+      "primitive": "cta",
+      "params": {
+        "lines": [
+          "Wake without the alarm."
+        ]
+      }
+    }
+  ],
+  "voiceover": [
+    {
+      "t": 2.5,
+      "text": "Every morning. A hard landing."
+    },
+    {
+      "t": 18,
+      "text": "Let light bring you gently into the day."
+    }
+  ],
+  "_angle": "an unexpected metaphor for the problem; the product resolves the metaphor",
+  "_effort": "high"
+}

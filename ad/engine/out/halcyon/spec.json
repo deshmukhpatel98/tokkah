@@ -1,0 +1,93 @@
+{
+  "product": "Halcyon, a bedside sunrise lamp that wakes you without an alarm",
+  "tagline": "Wake without the jolt.",
+  "palette": {
+    "ground": "#05060a",
+    "ink": "#f3f1ec",
+    "accentA": "#EDB580",
+    "accentB": "#7F91A3"
+  },
+  "duration": 40,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 3,
+      "primitive": "title",
+      "params": {
+        "copy": "braced against it.",
+        "size": 56
+      }
+    },
+    {
+      "id": "S2",
+      "start": 3,
+      "end": 6,
+      "primitive": "portrait",
+      "params": {
+        "who": "them",
+        "edge": "blue"
+      }
+    },
+    {
+      "id": "S3",
+      "start": 6,
+      "end": 12,
+      "primitive": "portrait",
+      "params": {
+        "who": "you",
+        "edge": "none"
+      }
+    },
+    {
+      "id": "S4",
+      "start": 12,
+      "end": 20,
+      "primitive": "portrait",
+      "params": {
+        "who": "you",
+        "edge": "none"
+      }
+    },
+    {
+      "id": "S5",
+      "start": 20,
+      "end": 28,
+      "primitive": "portrait",
+      "params": {
+        "who": "you",
+        "edge": "none"
+      }
+    },
+    {
+      "id": "S6",
+      "start": 28,
+      "end": 35,
+      "primitive": "mark",
+      "params": {
+        "wordmark": "Halcyon"
+      }
+    },
+    {
+      "id": "S7",
+      "start": 35,
+      "end": 40,
+      "primitive": "cta",
+      "params": {
+        "lines": [
+          "Wake without the jolt."
+        ]
+      }
+    }
+  ],
+  "voiceover": [
+    {
+      "t": 9,
+      "text": "You don't have to be ready yet."
+    },
+    {
+      "t": 24,
+      "text": "Let the world wait a little."
+    }
+  ]
+}

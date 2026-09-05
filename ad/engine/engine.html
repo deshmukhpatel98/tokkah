@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>@@TITLE@@</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: @@GROUND@@; overflow: hidden; user-select: none; -webkit-user-select: none; }
+    #stage-container { width: 100vw; height: 100vh; position: relative; background: @@GROUND@@; overflow: hidden; }
+    #stage { position: absolute; left: 50%; top: 50%; width: 1920px; height: 1080px; background: @@GROUND@@; overflow: hidden; transform-origin: center center; transform: translate(-50%, -50%); }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .serif { font-family: Baskerville, "Iowan Old Style", Georgia, serif; font-weight: 400; letter-spacing: -0.015em; line-height: 1.04; color: @@INK@@; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: @@INK@@; }
+    .mono { font-family: ui-monospace, Menlo, monospace; letter-spacing: 0.08em; color: @@INK@@; }
+    canvas { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; pointer-events: none; }
+    #c-scene { z-index: 10; } #c-light { z-index: 30; } #c-grain { z-index: 45; opacity: 0.02; mix-blend-mode: screen; }
+    .mac-window { position: absolute; left: 0; top: 0; width: 1008px; height: 744px; z-index: 20; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); overflow: hidden; transform-origin: 0 0; pointer-events: none; display: none; box-shadow: 0 24px 60px rgba(0,0,0,0.45); }
+    .mac-titlebar { position: absolute; top: 0; left: 0; width: 100%; height: 44px; display: flex; align-items: center; padding-left: 18px; gap: 8px; background: rgba(10,14,22,0.92); border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .dot { width: 12px; height: 12px; border-radius: 50%; background: rgba(154,163,178,0.32); }
+    .copy { position: absolute; z-index: 50; pointer-events: none; opacity: 0; will-change: transform, opacity; }
+    .copy .sub { font-size: 0.45em; margin-top: 0.5em; color: rgba(154,163,178,0.9); }
+    #copy-center { left: 240px; right: 240px; text-align: center; }
+    #copy-side { left: 1264px; width: 536px; text-align: left; }
+    #copy-left { left: 120px; width: 660px; text-align: left; }
+    #copy-below { left: 240px; right: 240px; text-align: center; }
+    #copy-number { position: absolute; left: 120px; top: 560px; font-size: 84px; z-index: 50; opacity: 0; letter-spacing: 0.02em; }
+    #mark-wrap { position: absolute; inset: 0; z-index: 50; pointer-events: none; display: none; }
+    #mark-wordmark { position: absolute; left: 0; width: 1920px; text-align: center; letter-spacing: -0.025em; line-height: 1; }
+    #mark-tagline { position: absolute; left: 0; width: 1920px; text-align: center; font-style: italic; line-height: 1; }
+    #cta { position: absolute; inset: 0; z-index: 50; pointer-events: none; display: none; }
+    #cta-1 { position: absolute; left: 0; width: 1920px; top: 776px; text-align: center; font-size: 36px; line-height: 1; }
+    #cta-2 { position: absolute; left: 0; width: 1920px; top: 839px; text-align: center; font-size: 24px; letter-spacing: 0.06em; line-height: 1; }
+    #cta-3 { position: absolute; left: 0; width: 1920px; top: 895px; text-align: center; font-size: 26px; line-height: 1; color: rgba(154,163,178,0.9); }
+    #player-controls { position: absolute; inset: 0; z-index: 100; pointer-events: none; }
+    #play-button { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 104px; height: 104px; border-radius: 50%; display: none; align-items: center; justify-content: center; background: rgba(5,6,10,0.30); border: 1px solid rgba(243,241,236,0.14); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); cursor: pointer; pointer-events: auto; }
+    #play-button .disc { width: 76px; height: 76px; border-radius: 50%; background: @@INK@@; display: flex; align-items: center; justify-content: center; }
+    #play-button .tri { width: 0; height: 0; border-style: solid; border-width: 12px 0 12px 20px; border-color: transparent transparent transparent @@GROUND@@; margin-left: 5px; }
+    #progress-hairline { position: absolute; bottom: 0; left: 0; width: 100%; height: 2px; background: rgba(255,255,255,0.08); pointer-events: auto; cursor: pointer; }
+    #progress-fill { height: 100%; width: 0%; background: @@INK@@; }
+    #mute-toggle { position: absolute; bottom: 32px; right: 48px; width: 44px; height: 44px; border-radius: 50%; background: rgba(10,14,22,0.55); border: 1px solid rgba(255,255,255,0.14); display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: auto; color: @@INK@@; }
+    #replay-button { position: absolute; left: 50%; top: 960px; transform: translateX(-50%); padding: 12px 24px; border-radius: 999px; background: rgba(243,241,236,0.10); border: 1px solid rgba(243,241,236,0.28); color: @@INK@@; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 18px; cursor: pointer; pointer-events: auto; display: none; backdrop-filter: blur(8px); }
+  </style>
+</head>
+<body>
+  <div id="stage-container">
+    <div id="stage">
+      <canvas id="c-scene" width="1920" height="1080"></canvas>
+      <div id="win-a" class="mac-window"><div class="mac-titlebar"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>
+      <div id="win-b" class="mac-window"><div class="mac-titlebar"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>
+      <canvas id="c-light" width="1920" height="1080"></canvas>
+      <canvas id="c-grain" width="480" height="270"></canvas>
+      <div id="copy-center" class="copy serif"></div>
+      <div id="copy-side" class="copy serif"></div>
+      <div id="copy-left" class="copy serif"></div>
+      <div id="copy-below" class="copy serif"></div>
+      <div id="copy-number" class="mono"></div>
+      <div id="mark-wrap"><div id="mark-wordmark" class="serif"></div><div id="mark-tagline" class="serif"></div></div>
+      <div id="cta"><div id="cta-1" class="serif"></div><div id="cta-2" class="mono"></div><div id="cta-3" class="sans"></div></div>
+      <div id="player-controls">
+        <div id="play-button" role="button" tabindex="0" aria-label="Play film"><div class="disc"><div class="tri"></div></div></div>
+        <div id="progress-hairline"><div id="progress-fill"></div></div>
+        <div id="mute-toggle" title="Mute/Unmute"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path id="volume-waves" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg></div>
+        <button id="replay-button">↺ Watch again</button>
+      </div>
+      <ol id="transcript" class="sr-only">@@TRANSCRIPT@@</ol>
+    </div>
+  </div>
+  <script type="application/json" id="ad-spec">@@SPEC@@</script>
+  <script>@@LIB@@</script>
+</body>
+</html>

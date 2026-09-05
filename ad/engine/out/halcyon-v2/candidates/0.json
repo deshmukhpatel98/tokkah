@@ -1,0 +1,141 @@
+{
+  "product": "Halcyon, a bedside sunrise lamp that wakes you without an alarm",
+  "tension": "Your phone pulls you out of sleep before you're ready to meet the day.",
+  "idea": "Replace the cold jolt with one slow rise of warmth.",
+  "tone": "restrained, intimate, unhurried",
+  "tagline": "Wake without the jolt.",
+  "palette": {
+    "ground": "#05060a",
+    "ink": "#f3f1ec",
+    "accentA": "#F3AF68",
+    "accentB": "#789AC5"
+  },
+  "voice": {
+    "voice_id": "pFZP5JQG7iQjIQuC4Bku",
+    "voice_name": "Lily",
+    "stability": 0.5,
+    "direction": "Speak softly and naturally, with room between words; an invitation, never a pitch."
+  },
+  "duration": 40,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 5,
+      "primitive": "shape",
+      "params": {
+        "path": "M 365 95 L 635 95 Q 675 95 675 135 L 675 865 Q 675 905 635 905 L 365 905 Q 325 905 325 865 L 325 135 Q 325 95 365 95 Z M 440 145 L 560 145 M 435 850 L 565 850",
+        "fill": "none",
+        "stroke": "B",
+        "strokeWidth": 3,
+        "size": 600,
+        "x": 0.5,
+        "y": 0.54,
+        "motion": "shudder",
+        "glow": 0.08
+      }
+    },
+    {
+      "id": "S2",
+      "start": 5,
+      "end": 8,
+      "primitive": "glow",
+      "params": {
+        "color": "B",
+        "from": 0.08,
+        "to": 0.4,
+        "x": 0.5,
+        "y": 0.54,
+        "radius": 500,
+        "curve": "ease"
+      }
+    },
+    {
+      "id": "S3",
+      "start": 8,
+      "end": 13,
+      "primitive": "shape",
+      "params": {
+        "path": "M 180 710 L 180 545 C 180 368 323 225 500 225 C 677 225 820 368 820 545 L 820 710 Q 820 735 795 735 L 205 735 Q 180 735 180 710 Z M 180 690 L 820 690",
+        "fill": "none",
+        "stroke": "A",
+        "strokeWidth": 2,
+        "size": 650,
+        "x": 0.5,
+        "y": 0.54,
+        "motion": "fadein",
+        "glow": 0.1
+      }
+    },
+    {
+      "id": "S4",
+      "start": 13,
+      "end": 22,
+      "primitive": "glow",
+      "params": {
+        "color": "A",
+        "from": 0.04,
+        "to": 0.7,
+        "x": 0.5,
+        "y": 0.54,
+        "radius": 1100,
+        "curve": "ease"
+      }
+    },
+    {
+      "id": "S5",
+      "start": 22,
+      "end": 28,
+      "primitive": "shape",
+      "params": {
+        "path": "M 180 710 L 180 545 C 180 368 323 225 500 225 C 677 225 820 368 820 545 L 820 710 Q 820 735 795 735 L 205 735 Q 180 735 180 710 Z",
+        "fill": "A",
+        "stroke": "none",
+        "strokeWidth": 0,
+        "size": 650,
+        "x": 0.5,
+        "y": 0.54,
+        "motion": "still",
+        "glow": 0.35
+      }
+    },
+    {
+      "id": "S6",
+      "start": 28,
+      "end": 33,
+      "primitive": "title",
+      "params": {
+        "copy": "Wake without the jolt.",
+        "size": 76
+      }
+    },
+    {
+      "id": "S7",
+      "start": 33,
+      "end": 36.5,
+      "primitive": "mark",
+      "params": {
+        "wordmark": "Halcyon"
+      }
+    },
+    {
+      "id": "S8",
+      "start": 36.5,
+      "end": 40,
+      "primitive": "cta",
+      "params": {
+        "lines": [
+          "Choose a gentler morning."
+        ]
+      }
+    }
+  ],
+  "voiceover": [
+    {
+      "t": 15,
+      "text": "Let the light wake you."
+    }
+  ],
+  "_angle": "lead with the tension the audience already feels, then one quiet move",
+  "_effort": "high"
+}
