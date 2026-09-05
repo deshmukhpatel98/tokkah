@@ -43,7 +43,9 @@ const o = {
   words: +opt("--words", 0),                           // narration budget; 0 = duration x 2.2
   productNotes: opt("--product-notes", ""),            // optional: how the product looks
   reference: opt("--reference", null),                 // ref/<slug>/shots.json: the plan comes from measurement, not a treatment
-  referenceVideo: opt("--reference-video", null)       // the reference film, for side-by-side critique stills
+  referenceVideo: opt("--reference-video", null),      // the reference film, for side-by-side critique stills
+  // stand-in copy for a reference study: the reference's words are never reused; defaults match its character counts
+  refHeadline: opt("--headline", "The Little"), refName: opt("--name", null), refSub: opt("--sub", "with P2")
 };
 o.words = o.words || Math.round(o.duration * 2.2);
 const FAST = o.tempo !== "measured";
@@ -252,7 +254,9 @@ function referencePlan(refPath) {
   const R = JSON.parse(fs.readFileSync(refPath, "utf8"));
   const seg = R.structure;
   o.duration = +seg[seg.length - 1].end;
-  const lock = R.type?.lockup || {};
+  const lock0 = R.type?.lockup || {};
+  const wordmark = o.refName || (o.product.split(/[,:]/)[0] || "").trim();
+  const lock = { ...lock0, headline: lock0.headline && { ...lock0.headline, text: o.refHeadline }, name: lock0.name && { ...lock0.name, text: wordmark }, sub: lock0.sub && { ...lock0.sub, text: o.refSub } };
   const shots = seg.map((g, i) => ({
     id: g.id, start: g.start, end: g.end, title: g.title,
     direction: `${g.subject}. Camera: ${g.camera}. Transition into the next: ${g.transition}.` +
@@ -265,7 +269,7 @@ function referencePlan(refPath) {
   }));
   const plan = {
     product: o.product, tension: "", idea: `A frame-accurate study of the reference's structure, timing, light and type, with ${o.product} in the hero's place.`,
-    tagline: lock.headline ? `${lock.headline.text} ${lock.name?.text || ""}`.trim() : "", wordmark: (o.product.split(/[,:]/)[0] || "").trim(), tempo: "reference",
+    tagline: lock.headline ? `${lock.headline.text} ${lock.name?.text || ""}`.trim() : "", wordmark, tempo: "reference",
     palette: { ground: R.stage?.ground || "#b6b8bd", ink: R.stage?.type || "#111111", accentA: "#F0B64A", accentB: "#4B7BD6" },
     productDescription: { form: o.productNotes || o.product, material: "as described", colour: "as described", details: [] },
     motif: { name: "the hero object", description: "one object throughout; every vignette adds parts to it (limbs, wheels, arms, boosters) drawn with lib.shapes around lib.product, never replacing it", returns: seg.map(g => g.id) },
