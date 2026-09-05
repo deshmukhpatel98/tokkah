@@ -1,9 +1,3 @@
-> **Version 2 (2026-09-05).** The film was rebuilt from two director's treatments;
-> the shot list below is the original (v1) spec and still defines the technical
-> contract (§4 visual system, §6-§9). For what v2 actually does shot by shot, the
-> final copy, and why, read `ad/v2-notes/DECISIONS.md` and the two critiques
-> beside it. Version 1 is frozen in `ad/versions/v1-2026-09-05/` (git tag `ad-v1`).
-
 # Kin — the animated film. Creative brief and technical spec.
 
 Owner of taste: the orchestrator. Owner of the build: the worker. Read all of it
