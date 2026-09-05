@@ -360,6 +360,172 @@ def call_summary(bs, label=""):
             audio_parts.append(f"audio stalls {stalls}")
         print(f"  AUDIO     " + "  ·  ".join(audio_parts))
 
+    lab_summary(bs)
+
+
+# ── THE LISTENER'S NUMBERS (mac/TELEMETRY-AUDIO.md) ─────────────────────────
+#
+# What this end HEARD, what LEFT it, whether it heard ITSELF, and what it was
+# running on -- then one line of plain words per direction. Every threshold
+# lives in VERDICTS, in one place, so moving one is one edit. A build that
+# predates a field says "not in this build": absent and zero are different
+# answers, and a reader that confuses them would grade an old call as perfect.
+
+def med(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else None
+
+def heard_clean_pct(bs):
+    """100 - the share of the far voice that was concealed. None when the build
+    has no such fields."""
+    voice = last(bs, "a_rx_voice_ms", None)
+    cv = last(bs, "a_rx_conceal_voiced_ms", None)
+    if voice is None or cv is None:
+        return None
+    if voice <= 0:
+        return None
+    return max(0.0, 100.0 - 100.0 * cv / voice)
+
+# (direction, word, predicate over a dict of the derived numbers)
+VERDICTS = [
+    ("heard", "a few patches",          lambda d: d["patched_pct"] is not None and 1.0 <= d["patched_pct"] < 3.0),
+    ("heard", "patchy",                 lambda d: d["patched_pct"] is not None and d["patched_pct"] >= 3.0),
+    ("heard", "clicks",                 lambda d: d["glitch_per_min"] is not None and d["glitch_per_min"] >= 3.0),
+    ("heard", "pumping",                lambda d: d["swing_db"] is not None and d["swing_db"] > 6.0),
+    # 4.5 kHz, not 5, and no "dull" word: the ruler moves one 1/6-octave band with
+    # the content it lands on, and a real voice recording read 5.7-6.4 on one file
+    # and 7.2-9 on another. Under 4.5 is a telephone band (CVSD, an 8 kHz device)
+    # on any content; the wideband-headset case (~7 kHz) is caught by `bt_hfp`.
+    ("heard", "telephone-grade",        lambda d: d["rx_bw"] is not None and d["rx_bw"] < 4.5),
+    ("heard", "distorted",              lambda d: d["rx_clip_pct"] is not None and d["rx_clip_pct"] >= 0.1),
+    ("heard", "dead air",               lambda d: d["dead_s"] is not None and d["dead_s"] >= 1.0),
+    ("heard", "sped up",                lambda d: d["fast_s"] is not None and d["fast_s"] > 2.0),
+    ("said",  "words lost to the floor",lambda d: d["muted_s"] is not None and d["muted_s"] >= 0.5),
+    ("said",  "went out distorted",     lambda d: d["knee_pct"] is not None and d["knee_pct"] >= 0.5),
+    ("said",  "noisy mic",              lambda d: d["snr_db"] is not None and d["snr_db"] < 20.0),
+    ("said",  "telephone-grade mic",    lambda d: d["tx_bw"] is not None and d["tx_bw"] < 4.5),
+    ("return","heard yourself",         lambda d: d["return_pct"] is not None and d["return_pct"] >= 5.0),
+]
+
+def lab_numbers(bs):
+    """Every derived number the verdict table reads, or None when the build lacks
+    the field. One place, so the summary lines and the verdicts cannot disagree."""
+    have_rx = any(k.startswith("a_rx_") for b in bs for k in b)
+    have_tx = any(k.startswith("a_tx_") for b in bs for k in b)
+    have_ret = any(k.startswith("a_echo_return") for b in bs for k in b)
+    voice_s = last(bs, "a_rx_voice_ms", None)
+    d = {"have_rx": have_rx, "have_tx": have_tx, "have_ret": have_ret}
+    d["voice_s"] = voice_s / 1000.0 if voice_s is not None else None
+    d["clean_pct"] = heard_clean_pct(bs)
+    d["patched_pct"] = (100.0 - d["clean_pct"]) if d["clean_pct"] is not None else None
+    up = last(bs, "uptime_s", None)
+    gl = last(bs, "a_rx_glitches", None)
+    d["glitch_per_min"] = (gl / (up / 60.0)) if (gl is not None and up and up > 30) else (0.0 if gl is not None else None)
+    d["glitches"] = gl
+    d["dead_s"] = last(bs, "a_rx_silence_ms", None)
+    if d["dead_s"] is not None: d["dead_s"] /= 1000.0
+    d["fast_s"] = last(bs, "a_rate_fast_ms", None)
+    if d["fast_s"] is not None: d["fast_s"] /= 1000.0
+    d["rx_clip_pct"] = last(bs, "a_rx_clip_pct", None)
+    d["rx_level"] = med(series(bs, "a_rx_level_db_p50"))
+    sw = series(bs, "a_rx_level_swing_db")
+    d["swing_db"] = max(sw) if sw else None
+    d["rx_noise"] = med(series(bs, "a_rx_noise_db"))
+    d["rx_bw"] = med(series(bs, "a_rx_bw_khz"))
+    d["talk_s"] = last(bs, "a_tx_voice_ms", None)
+    if d["talk_s"] is not None: d["talk_s"] /= 1000.0
+    d["muted_s"] = last(bs, "a_tx_voice_muted_ms", None)
+    if d["muted_s"] is not None: d["muted_s"] /= 1000.0
+    d["knee_pct"] = last(bs, "a_tx_softlimit_pct", None)
+    d["tx_level"] = med(series(bs, "a_tx_level_db_p50"))
+    d["tx_noise"] = med(series(bs, "a_tx_noise_db"))
+    d["snr_db"] = med(series(bs, "a_tx_snr_db"))
+    d["tx_bw"] = med(series(bs, "a_tx_bw_khz"))
+    talk = last(bs, "a_echo_talk_s", None)
+    ret = last(bs, "a_echo_return_s", None)
+    d["return_pct"] = (100.0 * ret / talk) if (talk and ret is not None and talk > 0) else (0.0 if ret is not None else None)
+    d["return_db"] = med(series(bs, "a_echo_return_db"))
+    d["return_lag"] = med(series(bs, "a_echo_return_lag_ms"))
+    return d
+
+def verdict_words(d, direction):
+    return [w for (dr, w, pred) in VERDICTS if dr == direction and pred(d)]
+
+def lab_summary(bs):
+    dropped = max([num(b, "fields_dropped", 0) or 0 for b in bs] or [0])
+    if dropped:
+        print(f"  SERVER TRUNCATED THIS RECORD: {dropped} field(s) dropped -- do not read a missing field as zero")
+    d = lab_numbers(bs)
+    def f1(v, unit=""):
+        return "?" if v is None else f"{v:.1f}{unit}"
+    def f0(v, unit=""):
+        return "?" if v is None else f"{v:.0f}{unit}"
+    if d["have_rx"]:
+        print(f"  HEARD     clean {f1(d['clean_pct'], '%')} of their voice ({f0(d['voice_s'], ' s')})"
+              f"  ·  {f1(d['glitch_per_min'])} glitches/min"
+              f"  ·  dead air {f1(d['dead_s'], ' s')}"
+              f"  ·  level {f0(d['rx_level'], ' dBFS')} (swing {f0(d['swing_db'], ' dB')})"
+              f"  ·  their room noise {f0(d['rx_noise'], ' dBFS')}"
+              f"  ·  band {f1(d['rx_bw'], ' kHz')}"
+              f"  ·  clip {f1(d['rx_clip_pct'], '%')}"
+              f"  ·  sped up {f1(d['fast_s'], ' s')}")
+    else:
+        print("  HEARD     not in this build")
+    if d["have_tx"]:
+        trim = last(bs, "mic_trim", 1)
+        print(f"  SAID      talked {f0(d['talk_s'], ' s')}"
+              f"  ·  {f1(d['muted_s'], ' s')} of your words never left"
+              f"  ·  soft-limited {f1(d['knee_pct'], '%')}"
+              f"  ·  level {f0(d['tx_level'], ' dBFS')}"
+              f"  ·  noise {f0(d['tx_noise'], ' dBFS')} (SNR {f0(d['snr_db'], ' dB')})"
+              f"  ·  band {f1(d['tx_bw'], ' kHz')}"
+              f"  ·  trim {trim:.2f}")
+    else:
+        print("  SAID      not in this build")
+    if d["have_ret"] or last(bs, "a_echo_talk_s", None) is not None:
+        rp = d["return_pct"]
+        if rp is not None and rp > 0:
+            print(f"  RETURN    heard yourself {rp:.0f}% of your talking"
+                  f"  ·  at {f1(d['return_db'], ' dB')}  ·  {f0(d['return_lag'], ' ms')} later")
+        else:
+            print(f"  RETURN    heard yourself 0% of your talking")
+    else:
+        print("  RETURN    not in this build")
+    facts = {}
+    for b in bs:
+        g = b.get("facts")
+        if isinstance(g, dict): facts.update(g)
+    if any(k in facts for k in ("in_dev", "out_dev", "bt_hfp")):
+        def dev(side):
+            return (f"\"{facts.get(side + '_dev', '?')}\" {facts.get(side + '_transport', '?')}"
+                    f" {facts.get(side + '_rate_hw', '?')}/{facts.get(side + '_ch', '?')}ch")
+        print(f"  DEVICES   in {dev('in')}  ·  out {dev('out')}"
+              f"  ·  phone-mode {facts.get('bt_hfp', '?')}"
+              f"  ·  mic mode {facts.get('mic_mode', '?')}"
+              f"  ·  route {facts.get('output_route', '?')}"
+              + (f"  ·  lab {facts.get('lab')}" if facts.get("lab") else "")
+              + (f"  ·  tapes {facts.get('tapes')}" if facts.get("tapes") else ""))
+    else:
+        print("  DEVICES   not in this build")
+    def side(direction, have):
+        if not have:
+            return "not in this build"
+        w = verdict_words(d, direction)
+        if not w:
+            return "clear"
+        out = []
+        for x in w:
+            if x == "words lost to the floor": out.append(f"{d['muted_s']:.1f} s of words lost to the floor")
+            elif x == "dead air": out.append(f"dead air {d['dead_s']:.0f} s")
+            elif x == "sped up": out.append(f"sped up for {d['fast_s']:.0f} s")
+            elif x == "heard yourself": out.append(f"heard yourself {d['return_pct']:.0f}% at {f1(d['return_db'], ' dB')}")
+            elif x == "a few patches" or x == "patchy": out.append(f"{x} ({d['patched_pct']:.1f}% of their words patched)")
+            else: out.append(x)
+        return ", ".join(out)
+    print(f"  VERDICT   you heard them: {side('heard', d['have_rx'])}"
+          f"  ·  they heard you: {side('said', d['have_tx'])}"
+          + (f"  ·  {side('return', d['have_ret'])}" if d["have_ret"] and verdict_words(d, 'return') else ""))
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: telemetry.py [local <path> | call | pairids <call> | recent]")
@@ -400,8 +566,13 @@ if __name__ == "__main__":
         cs = [c for c in d.get("calls", []) if c.get("durationS", 0) > 0]
         print(f"{'call':>14} {'install':>13} {'ver':>7} {'when':>9} {'secs':>5} "
               f"{'rtt':>5} {'g2g':>5} {'fps':>4} {'vpn':>6} "
-              f"{'mic%':>5} {'echo':>5} {'both':>5} {'choppy':>7} {'gaveway':>8}")
+              f"{'mic%':>5} {'echo':>5} {'both':>5} {'choppy':>7} {'gaveway':>8} {'heard':>6}")
         for c in cs:
+            # `heard` = clean share of the far voice (mac/TELEMETRY-AUDIO.md).
+            # Blank when the build predates the fields: not zero.
+            hv, hc = c.get("a_rx_voice_ms"), c.get("a_rx_conceal_voiced_ms")
+            heard = (f"{max(0.0, 100.0 - 100.0 * hc / hv):.0f}%"
+                     if isinstance(hv, (int, float)) and isinstance(hc, (int, float)) and hv > 0 else "")
             t = datetime.datetime.fromtimestamp(c.get("startedAt", 0)).strftime("%H:%M:%S")
             rtt_val = c.get('rtt_ms')
             rtt = f"{rtt_val:.0f}" if isinstance(rtt_val, (int, float)) and rtt_val >= 0 else "-"
@@ -417,4 +588,4 @@ if __name__ == "__main__":
                   f"{c.get('durationS',0):>5} "
                   f"{rtt:>5} {g2g:>5} {fps:>4} {vpn:>6} "
                   f"{c.get('floor_held_pct',-1):>5.0f} {c.get('echo_corr',-1):>5.2f} "
-                  f"{c.get('turn_collisions',-1):>5} {c.get('turn_flaps',-1):>7} {c.get('turn_yields',-1):>8}")
+                  f"{c.get('turn_collisions',-1):>5} {c.get('turn_flaps',-1):>7} {c.get('turn_yields',-1):>8} {heard:>6}")

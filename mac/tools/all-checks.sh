@@ -105,7 +105,9 @@ export TK_NO_RAISE=1
 # `predict-live-check` is two 40-second calls of real speech through the real
 # audio path, and its verdict is a count and a number of milliseconds saved, so it
 # belongs alone with the rest of the timing work.
-LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check liveupdate-check watch-check floor-check"
+# `audiolab-check` is two real ends of real speech with tapes on and a verdict on
+# the render callback's p99 cost, so it belongs with the rigs that measure time.
+LANE_TIME="aec-check mute-check subtitle-check immersive-check vpause-check stress-check bye-check recover-check predict-live-check liveupdate-check watch-check floor-check audiolab-check"
 LANE_LIGHT="glass-check home-check ringpicture-check preanswer-check reopen-check"
 # ── AND ONE LANE THAT LOAD CANNOT FLATTER ───────────────────────────────────
 #

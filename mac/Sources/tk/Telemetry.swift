@@ -155,7 +155,7 @@ enum Telemetry {
     // Short timeout: this is a report about a live call, and one that takes ten
     // seconds to deliver is describing the past.
     req.timeoutInterval = final ? 6 : 4
-    Http.session.dataTask(with: req) { _, resp, err in
+    Http.session.dataTask(with: req) { data, resp, err in
       var ok = false
       if let err {
         failed += 1
@@ -166,6 +166,13 @@ enum Telemetry {
       } else {
         sent += 1
         ok = true
+        // The owner's server answers every beat with whether this install is a
+        // lab machine (`lab: 0|1`). Acted on only when it differs from the file,
+        // so the owner's Macs tape their calls with no command typed on them.
+        if let d = data, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let lab = j["lab"] as? Int {
+          Lab.applyServer(lab == 1)
+        }
       }
       done?(ok)
     }.resume()

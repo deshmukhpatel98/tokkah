@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.152.0"
+let VERSION = "0.154.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -179,6 +179,24 @@ if flag("selftest-identity") {
   fputs("selftest-identity: \(ok ? "PASS" : "FAIL")\n", stderr)
   exit(ok ? 0 : 1)
 }
+if flag("selftest-audiolab") {
+  let ok = AudioLab.selftest()
+  fputs("selftest-audiolab: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// `--lab on|off` writes lab.json and leaves; `--lab` alone (as the last
+// argument) prints the state. Nothing on the consumer surface ever shows this.
+if flag("lab") {
+  if let v = arg("lab") {
+    guard v == "on" || v == "off" else { fputs("--lab takes on or off\n", stderr); exit(2) }
+    let changed = Lab.set(tapes: v == "on", source: "cli")
+    fputs("lab: tapes \(v)\(changed ? "" : " (already)") -- \(Lab.file.path)\n", stderr)
+  } else {
+    fputs("lab: \(Lab.state())\n", stderr)
+  }
+  exit(0)
+}
+if flag("no-tapes") { Lab.noTapesForRun = true }
 if flag("selftest-boost") || flag("boost-test") {
   let ok = Audio.boostSelfTest()
   fputs("selftest-boost: \(ok ? "PASS" : "FAIL")\n", stderr)
@@ -596,6 +614,9 @@ let KNOWN_FLAGS: Set<String> = [
   "server", "update-key", "save-server", "forget-server", "server-print",
   "watch-policy", "vq-legacy-denom", "jit-max-ms", "jit-legacy-veto", "no-lan-upgrade",
   "record", "record-path", "selftest-boost", "boost-test",
+  // The audio lab (mac/TELEMETRY-AUDIO.md): its rulers' selftest, the lab-mode
+  // switch (`--lab on|off`, or bare to print it), and the tape control arm.
+  "selftest-audiolab", "lab", "no-tapes",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -1748,6 +1769,8 @@ func postFinalBeat(why: String) -> Bool {
   // anything. Without this line every answered ring would have been reported as
   // an app that died without saying goodbye.
   Crash.endRun()
+  // The tape before the beat: the beat carries the tape's final size and state.
+  if beatReady { audio.finishTapes() }
   guard Telemetry.enabled else { return false }
   // Last second's percentiles, not a live sort of the audio-thread buffer.
   var beat = audioBeat(uptime: Double(beatTick),
@@ -7453,6 +7476,9 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "lp_bad": wire.lpBadDecode,
     "probes": tsync.samples,
   ]
+  // The listener's numbers -- mac/TELEMETRY-AUDIO.md. Cumulative fields always,
+  // window fields only when the window had something to measure.
+  audio.labBeat(into: &f, m2eP50: p50)
   if let v = p50 { f["m2e_p50"] = v }
   if let v = p95 { f["m2e_p95"] = v }
   if let v = p99 { f["m2e_p99"] = v }
