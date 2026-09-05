@@ -41,7 +41,9 @@ const o = {
   duration: +opt("--duration", 45), treatments: +opt("--treatments", 2), rounds: +opt("--rounds", 1), effort: opt("--effort", "high"), slug: opt("--slug", null),
   tempo: opt("--tempo", "fast"),                       // fast (default) | measured
   words: +opt("--words", 0),                           // narration budget; 0 = duration x 2.2
-  productNotes: opt("--product-notes", "")             // optional: how the product looks
+  productNotes: opt("--product-notes", ""),            // optional: how the product looks
+  reference: opt("--reference", null),                 // ref/<slug>/shots.json: the plan comes from measurement, not a treatment
+  referenceVideo: opt("--reference-video", null)       // the reference film, for side-by-side critique stills
 };
 o.words = o.words || Math.round(o.duration * 2.2);
 const FAST = o.tempo !== "measured";
@@ -139,7 +141,7 @@ PALETTE: A=${plan.palette.accentA} (the product's own colour), B=${plan.palette.
 THE PRODUCT: ${pd || o.product}. Draw it ONLY with lib.product(ctx, {x, y, size, alpha, rotate, only, skip}) — never your own approximation; size is the box height in px (the hero shot: 650-800). Layer tags available in the illustration: ${(plan.productDrawing?.layers || []).map(l => l.tag).filter(Boolean).join(", ") || "outline, body, sole, detail, highlight, shadow (typical)"}.
 MOTIF: ${plan.motif?.name}: ${plan.motif?.description} (returns in ${(plan.motif?.returns || []).join(", ")})
 TYPE: sizes 88/72/64/56; copy fades in 480 ms, out 280 ms; safe area 120 px.
-${FAST ? "PACE: fast. Something must change every 2-3 s inside this shot; motion 240-700 ms with lib.ease; camera push-ins/pans via ctx.save/translate/scale; no dead frames; no fade to black." : "PACE: measured; slow confident motion."}
+${plan.tempo === "reference" ? `REFERENCE STUDY: the stage is a light studio (ground ${plan.palette.accentA ? plan.palette.ground : "#b6b8bd"}): paint the whole frame with a soft vertical gradient of the ground first (lighter above, a touch darker below a horizon near y 620), draw a long diffuse shadow under the object with a radial gradient of the ground darkened 25%, and use ink (dark) for type. Match the measured timing exactly; the shot's direction carries the numbers. Comedy parts (limbs, wheels, boosters) are lib.shapes layers you draw, attached to lib.product's position and animated with rotate/translate; keep them bold and readable at 480 px wide.` : FAST ? "PACE: fast. Something must change every 2-3 s inside this shot; motion 240-700 ms with lib.ease; camera push-ins/pans via ctx.save/translate/scale; no dead frames; no fade to black." : "PACE: measured; slow confident motion."}
 
 THIS SHOT ${s.id} "${s.title}" — film time ${s.start}s to ${s.end}s (dur ${(s.end - s.start).toFixed(2)}s)
 DIRECTION: ${s.direction}
@@ -244,6 +246,36 @@ function repairSpec(plan) {
   plan.wordmark = plan.wordmark || o.product.split(/[,:]/)[0].trim();
   return plan;
 }
+// A plan built from a measured reference (REPLICATE.md): the reference's structure,
+// timing and type become the specification; the product is the user's stand-in.
+function referencePlan(refPath) {
+  const R = JSON.parse(fs.readFileSync(refPath, "utf8"));
+  const seg = R.structure;
+  o.duration = +seg[seg.length - 1].end;
+  const lock = R.type?.lockup || {};
+  const shots = seg.map((g, i) => ({
+    id: g.id, start: g.start, end: g.end, title: g.title,
+    direction: `${g.subject}. Camera: ${g.camera}. Transition into the next: ${g.transition}.` +
+      (g.id === "S12" && lock.headline ? ` TYPE LOCKUP, measured on the reference and to be matched within 4 px: headline "${lock.headline.text}" as a left block x ${lock.headline.x0}-${lock.headline.x1}, cap top ${lock.headline.capTop}, baseline ${lock.headline.baseline}, cap height ${lock.headline.capHeight} px, ${lock.headline.weight}; the product centred at (${lock.product.centre.join(",")}) ${lock.product.width} px wide; name "${lock.name.text}" x ${lock.name.x0}-${lock.name.x1} baseline ${lock.name.baseline}; sub "${lock.sub.text}" ${lock.sub.height} px tall centred under the name at y ${lock.sub.top}-${lock.sub.bottom}. Timing: ${lock.timing.textIn}; hold ${lock.timing.hold}; out ${lock.timing.out}. Use lib.text with font "sans" for these (canvas text, positions exact).` : "") +
+      (g.id === "S13" && R.type?.logo ? ` LOGO: our mark alone, centred at (${R.type.logo.centre.join(",")}), ${R.type.logo.height} px tall, in at ${R.type.logo.timing}.` : "") +
+      (g.id === "S14" && R.type?.legal ? ` LEGAL: black frame; one line of small text (${R.type.legal.glyphHeight} px glyphs, mid grey) across x ${R.type.legal.band[0]}-${R.type.legal.band[2]} at y ${R.type.legal.band[1]}-${R.type.legal.band[3]}, in at ${R.type.legal.timing}.` : ""),
+    handoffIn: i ? `${seg[i - 1].title}: ${seg[i - 1].subject}` : "black / empty studio",
+    handoffOut: i < seg.length - 1 ? `${seg[i + 1].title} begins: ${seg[i + 1].subject}` : "end",
+    copy: null, primitive: g.id === "S14" ? "cta" : "shape", params: {}
+  }));
+  const plan = {
+    product: o.product, tension: "", idea: `A frame-accurate study of the reference's structure, timing, light and type, with ${o.product} in the hero's place.`,
+    tagline: lock.headline ? `${lock.headline.text} ${lock.name?.text || ""}`.trim() : "", wordmark: (o.product.split(/[,:]/)[0] || "").trim(), tempo: "reference",
+    palette: { ground: R.stage?.ground || "#b6b8bd", ink: R.stage?.type || "#111111", accentA: "#F0B64A", accentB: "#4B7BD6" },
+    productDescription: { form: o.productNotes || o.product, material: "as described", colour: "as described", details: [] },
+    motif: { name: "the hero object", description: "one object throughout; every vignette adds parts to it (limbs, wheels, arms, boosters) drawn with lib.shapes around lib.product, never replacing it", returns: seg.map(g => g.id) },
+    voice: null, voiceover: [],
+    score: { bpm: null, harmony: R.audio?.note || "", timbres: "music and sound effects only; hits on every transformation and on each of the launch cuts", beats: seg.map(g => ({ t: g.start, what: g.title })) },
+    stage: R.stage, referenceTargets: R.replicationTargets, duration: o.duration, shots
+  };
+  const treatment = `REFERENCE STUDY. ${plan.idea}\nStage: ${JSON.stringify(R.stage)}\nGenre: ${R.genre}\nTargets: ${JSON.stringify(R.replicationTargets)}\nType: ${JSON.stringify(R.type)}\nAudio: ${JSON.stringify(R.audio)}`;
+  return { treatment, plan };
+}
 function validateDrawing(pd) {
   if (!pd || !Array.isArray(pd.layers) || pd.layers.length < 3) throw new Error("product drawing has too few layers");
   pd.layers = pd.layers.slice(0, 20).map((L, i) => ({
@@ -292,6 +324,12 @@ if (resume) {
   for (const m of src.matchAll(/__AD_MODULES__\["([^"]+)"\] = \(function\(\)\{ ([\s\S]*?)\n return \w+; \}\)\(\);/g)) mods[m[1]] = m[2];
   log(`# resumed: ${plan.shots.length} shots, ${Object.keys(mods).length} modules`);
 } else {
+if (o.reference) {
+  ({ treatment, plan } = referencePlan(o.reference));
+  fs.writeFileSync(path.join(OUT, "treatment.md"), treatment);
+  fs.writeFileSync(path.join(OUT, "spec.json"), JSON.stringify(plan, null, 2));
+  log(`# reference plan: ${plan.shots.length} segments, ${o.duration}s, ground ${plan.palette.ground}`);
+} else {
 // 1. treatments in parallel, judge
 ({ treatment, plan } = await stage("treatments", async () => {
   const rs = await Promise.allSettled(Array.from({ length: o.treatments }, (_, i) => callAstra(treatmentPrompt(ANGLES[i % ANGLES.length]), { effort: o.effort, label: `treat${i}` })));
@@ -310,6 +348,7 @@ if (resume) {
   fs.writeFileSync(path.join(OUT, "spec.json"), JSON.stringify(cands[pick].plan, null, 2));
   return cands[pick];
 }));
+}
 log(`# idea: ${plan.idea}\n# motif: ${plan.motif?.name}\n# shots: ${plan.shots.map(s => `${s.id} ${s.title}`).join(" > ")}`);
 
 // 2. code: every shot + the score, in parallel; syntax-check; repair once
@@ -369,8 +408,19 @@ for (let round = 1; round <= o.rounds; round++) {
       crit = { notes: humanNotes, rewrite: [...new Set(humanNotes.map(n => n.shot))], verdict: "director's notes" };
     } else {
       const sheet = await stills(page, round);
-      const img = "data:image/png;base64," + fs.readFileSync(sheet).toString("base64");
-      try { crit = extractJson((await callAstra(critiquePrompt(plan, treatment, round), { effort: o.effort, label: `critique${round}`, image: img })).text); }
+      const imgs = ["data:image/png;base64," + fs.readFileSync(sheet).toString("base64")];
+      let prompt = critiquePrompt(plan, treatment, round);
+      if (o.referenceVideo && fs.existsSync(o.referenceVideo)) {
+        // the same 10 moments from the reference, so the critic judges the match, not just the film
+        const rs = path.join(OUT, "work", `ref-stills-${round}`); fs.mkdirSync(rs, { recursive: true });
+        const times = Array.from({ length: 10 }, (_, i) => +(o.duration * i / 9).toFixed(3));
+        times.forEach((t, i) => spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-ss", String(Math.min(t, o.duration - 0.05)), "-i", o.referenceVideo, "-frames:v", "1", "-vf", "scale=512:-1", path.join(rs, `r_${String(i + 1).padStart(2, "0")}.png`)]));
+        const refSheet = path.join(OUT, `reference-contact-${round}.png`);
+        spawnSync(FFMPEG, ["-loglevel", "error", "-y", "-i", path.join(rs, "r_%02d.png"), "-vf", "tile=5x2", refSheet]);
+        imgs.push("data:image/png;base64," + fs.readFileSync(refSheet).toString("base64"));
+        prompt += `\n\nTWO IMAGES ARE ATTACHED. The FIRST is OUR film; the SECOND is the REFERENCE at the same ten moments. This is a replication study: judge, moment by moment, whether our framing, object scale and position, lighting logic, type position/size/timing and cut rhythm match the reference. Our object is a stand-in and our drawing is stylised; do not ask for photorealism. List the largest mismatches first, with the numbers to change.`;
+      }
+      try { crit = extractJson((await callAstra(prompt, { effort: o.effort, label: `critique${round}`, images: imgs })).text); }
       catch (e) { log(`# critique failed: ${e.message}`); return; }
     }
     fs.writeFileSync(path.join(OUT, `critique-${round}${humanNotes && round === 1 ? "-notes" : ""}.md`), JSON.stringify(crit, null, 2));
