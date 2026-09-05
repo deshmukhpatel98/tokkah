@@ -74,6 +74,15 @@ export async function callAstra(prompt, opts = {}) {
       if (!resp.ok) {
         clearTimeout(timer);
         const body = await resp.text().catch(() => "");
+        // the free tier caps output tokens per hour and says so; a long pipeline should
+        // stall until the top of the hour rather than degrade shot by shot (once only)
+        if (resp.status === 429 && /free.*tier|resets at the top of the hour/i.test(body) && !opts._waitedForReset) {
+          const now = new Date(), next = new Date(now); next.setMinutes(60, 20, 0);
+          const ms = next - now;
+          console.error(`[${label}] hourly free-tier cap; waiting ${Math.ceil(ms / 60000)} min for the reset at ${next.toTimeString().slice(0, 5)}`);
+          await new Promise(r => setTimeout(r, ms));
+          return callAstra(prompt, { ...opts, effort, _waitedForReset: true });
+        }
         if (resp.status >= 500 && tier < EFFORTS.length - 1) {
           console.error(`[${label}] ${effort} -> HTTP ${resp.status}; retrying at ${EFFORTS[tier + 1]}`);
           continue;

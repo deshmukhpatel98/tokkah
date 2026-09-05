@@ -22,6 +22,38 @@ the whole loop to about a minute per iteration.
   a later stage that needs a 3D renderer (WebGL, physically based materials,
   an environment light) and a different render path.
 
+## The first reference, measured (ref/macmini)
+
+Watching it changed the plan: this is not a quiet product film. It is a bright
+white-studio comedy in high-end 3D character animation: a chip lands on the
+box; the box grows cartoon arms and does push-ups, becomes a monster truck,
+an octopus robot juggling a camera and charts, a rocket through clouds; then
+the type lockup, the logo, black with legal text. Fourteen segments in 43.0 s,
+mostly continuous with soft transitions (scene score 0.10-0.18); the only
+hard cuts are five launch cuts 0.42 s apart around 31 s and the cut to black
+at 37.95. Ground luminance 165-180 of 255 in the studio, 137-150 in the
+clouds, 16 on black. Music from 0.1 s at about -20 dB RMS, no voice.
+
+The type lockup at 34.8 s, measured to the pixel: headline as a left block
+x 90-643 with an 81 px cap height and baseline 571; the product centred at
+(1018, 618) and 373 px wide; the name x 1344-1773 at the same cap height; the
+sub-line 43 px tall centred under the name; the logo at (957, 516) and 141 px
+tall; the legal line's glyphs 21-25 px in the band y 1004-1031. The
+composition is balanced optically, not geometrically. All of it is in
+`shots.json`; the per-frame curves in `analysis.json`.
+
+What this means for the engine: structure, timing, light logic and type are
+reachable now as an illustrated 2D reinterpretation with a stand-in box whose
+comedy parts (limbs, wheels, boosters) are drawn layers attached to the
+product. Surface-level indistinguishability from 3D character animation is a
+platform stage, not a prompt: a WebGL scene with rigged parts and physically
+based materials, rendered through the same deterministic seek contract.
+
+`score.mjs` calibrated on 2026-09-05: the reference against itself matches
+8 of 8 cuts, luminance and motion correlation 1.0, type deltas 0 px; an
+unrelated film against it matches 0 of 8 cuts, luminance delta 109, motion
+correlation 0, type deltas in the hundreds of pixels. The ruler discriminates.
+
 ## The decomposition: the parts
 
 Every part is a measurement with a tolerance, so the engine can be scored.
