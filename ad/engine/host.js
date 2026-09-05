@@ -760,7 +760,7 @@
     const renderer = new T.WebGLRenderer({ canvas: el.gl, antialias: true, alpha: true, preserveDrawingBuffer: true, powerPreference: "high-performance" });
     renderer.setPixelRatio(1); renderer.setSize(W, H, false); renderer.setClearColor(0x000000, 0);
     renderer.shadowMap.enabled = true; renderer.shadowMap.type = T.PCFSoftShadowMap;
-    renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.1; renderer.outputColorSpace = T.SRGBColorSpace;
+    renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.92; renderer.outputColorSpace = T.SRGBColorSpace;
     const scene = new T.Scene();
     const camera = new T.PerspectiveCamera(28, W / H, 0.05, 200); camera.position.set(0, 1.3, 5); camera.lookAt(0, 0.3, 0);
     const pmrem = new T.PMREMGenerator(renderer);
@@ -775,11 +775,11 @@
           for (const k of [...cache.keys()]) if (k.startsWith("__studio")) { scene.remove(cache.get(k)); cache.delete(k); }
           const white = kind === "white";
           scene.environment = pmrem.fromScene(new T.RoomEnvironment(), 0.04).texture;
-          const floor = new T.Mesh(new T.PlaneGeometry(60, 60), new T.MeshStandardMaterial({ color: white ? "#d3d5da" : "#0b0c10", roughness: 0.95 })); floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; cache.set("__studio.floor", floor); scene.add(floor);
-          const back = new T.Mesh(new T.PlaneGeometry(60, 30), new T.MeshStandardMaterial({ color: white ? "#c9cbd0" : "#07080c", roughness: 1 })); back.position.set(0, 15, -10); back.receiveShadow = true; cache.set("__studio.back", back); scene.add(back);
-          const key = new T.DirectionalLight("#fff6ea", white ? 3.2 : 2.2); key.position.set(-4, 7, 4); key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.radius = 8; key.shadow.camera.near = 1; key.shadow.camera.far = 40; key.shadow.camera.left = key.shadow.camera.bottom = -8; key.shadow.camera.right = key.shadow.camera.top = 8; cache.set("__studio.key", key); scene.add(key);
+          const floor = new T.Mesh(new T.PlaneGeometry(60, 60), new T.MeshStandardMaterial({ color: white ? "#bfc1c6" : "#0b0c10", roughness: 0.95 })); floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; cache.set("__studio.floor", floor); scene.add(floor);
+          const back = new T.Mesh(new T.PlaneGeometry(60, 30), new T.MeshStandardMaterial({ color: white ? "#b8babf" : "#07080c", roughness: 1 })); back.position.set(0, 15, -10); back.receiveShadow = true; cache.set("__studio.back", back); scene.add(back);
+          const key = new T.DirectionalLight("#fff6ea", white ? 2.9 : 2.2); key.position.set(-4, 7, 4); key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.radius = 8; key.shadow.camera.near = 1; key.shadow.camera.far = 40; key.shadow.camera.left = key.shadow.camera.bottom = -8; key.shadow.camera.right = key.shadow.camera.top = 8; cache.set("__studio.key", key); scene.add(key);
           const fill = new T.DirectionalLight("#dfe7ff", white ? 1.1 : 0.5); fill.position.set(5, 3, 2); cache.set("__studio.fill", fill); scene.add(fill);
-          const hemi = new T.HemisphereLight("#ffffff", white ? "#8a8c92" : "#111318", white ? 0.9 : 0.35); cache.set("__studio.hemi", hemi); scene.add(hemi);
+          const hemi = new T.HemisphereLight("#ffffff", white ? "#8a8c92" : "#111318", white ? 0.7 : 0.35); cache.set("__studio.hemi", hemi); scene.add(hemi);
           studioBuilt = kind;
         }
         for (const k of cache.keys()) if (k.startsWith("__studio")) { cache.get(k).visible = true; touched.add(k); }

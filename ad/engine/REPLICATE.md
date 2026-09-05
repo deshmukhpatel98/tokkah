@@ -54,6 +54,31 @@ based materials, rendered through the same deterministic seek contract.
 unrelated film against it matches 0 of 8 cuts, luminance delta 109, motion
 correlation 0, type deltas in the hundreds of pixels. The ruler discriminates.
 
+## Replica pass 1 (2026-09-05 evening, in 3D)
+
+Built with `direct.mjs --reference` on the GPU: fourteen 3D shots, the score
+and the box in 157 s, one side-by-side critique round (249 s), render 9 s,
+score 40 s. All fourteen beats present as posed geometry: push-up arms,
+wheels, monster truck with roll bar and flames, brain-headed robot with
+tentacle arms holding a camera, keyboard, chart and molecule, the booster
+rig, the lockup, black with legal.
+
+| metric | pass 1 | target |
+|---|---|---|
+| hard cuts matched within 2 frames | 1 of 8 | 8 of 8 |
+| luminance correlation / mean delta | 0.93 / 40 | > 0.9 / < 12 |
+| motion correlation | 0.34 | > 0.7 |
+| lockup: product box | 0 px | < 4 px |
+| lockup: sub-line | 2 px | < 4 px |
+| lockup: headline | unmatched at 34.8 s | < 4 px |
+| logo | 67 px, height 0.90 | < 4 px, 0.97-1.03 |
+
+Diagnosis from the numbers: the studio ran 43-66 levels too bright at every
+studio second while black matched within 2 (a global stage calibration, not a
+per-shot note); the launch was one continuous shot where the original cuts
+five times in two seconds; the chip close-up was skipped. Notes for pass 2 are
+in `out/macmini-study/notes-director.json`.
+
 ## The decomposition: the parts
 
 Every part is a measurement with a tolerance, so the engine can be scored.
