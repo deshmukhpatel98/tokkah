@@ -14,7 +14,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.154.0"
+let VERSION = "0.155.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -732,9 +732,10 @@ if let io = arg("io") {
 // A/B-able on a real call rather than argued about.
 if !Audio.ioPinned {
   let (name, speakers) = Audio.outputDevice()
-  Audio.ioKind = "hal"
-  fputs("audio: out is \(name) -- \(speakers ? "speakers" : "headphones")"
-      + ", raw mic, one at a time\n", stderr)
+  Audio.ioKind = speakers ? "vp" : "hal"
+  let why = speakers ? "speakers, so the echo canceller is on"
+                     : "headphones, so nothing is between the mic and the wire"
+  fputs("audio: out is \(name) -- \(why)\n", stderr)
 }
 Metrics.fact("io_reason", Audio.ioPinned ? "pinned" : "route")
 

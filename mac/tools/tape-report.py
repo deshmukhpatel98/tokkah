@@ -236,17 +236,25 @@ def report(d, lag_ms=(20, 1500), out=print):
         s8, r8 = decimate8(streams["sent.wav"]), decimate8(streams["played.wav"])
         W = 6000
         shift = int(round(shift_s * 6000))
-        lag_min = max(0, int(lag_ms[0] / 1000 * 6000) - shift)
-        lag_max = max(lag_min + 1, int(lag_ms[1] / 1000 * 6000) - shift)
+        # Time-align s8 and r8 so that at index `start` in the common timeline,
+        # s8 and r8 correspond to the same physical moment.
+        s_off = shift if shift > 0 else 0
+        r_off = -shift if shift < 0 else 0
+        lag_min = max(0, int(round(lag_ms[0] / 1000.0 * 6000)))
+        lag_max = max(lag_min + 1, int(round(lag_ms[1] / 1000.0 * 6000)))
         talk = found = 0
         hits = []
-        for start in range(0, len(s8) - W - lag_max, W):
-            seg = s8[start:start + W]
-            if np.sqrt(np.mean(seg * seg)) <= 0.0056: continue
-            talk += 1
-            r = echo_return(seg, r8[start:start + W + lag_max], lag_min, lag_max)
-            if r and r[0] >= 0.20:
-                found += 1; hits.append((start / 6000.0, r[0], r[1], (r[2] + shift) / 6.0))
+        max_start = min(len(s8) - s_off - W, len(r8) - r_off - W - lag_max)
+        if max_start >= 0:
+            for start in range(0, max_start + 1, W):
+                s_idx = s_off + start
+                r_idx = r_off + start
+                seg = s8[s_idx:s_idx + W]
+                if np.sqrt(np.mean(seg * seg)) <= 0.0056: continue
+                talk += 1
+                r = echo_return(seg, r8[r_idx:r_idx + W + lag_max], lag_min, lag_max)
+                if r and r[0] >= 0.20:
+                    found += 1; hits.append((s_idx / 6000.0, r[0], r[1], r[2] / 6.0))
         if talk:
             line = f"  echo return: heard myself in {found} of {talk} talking seconds"
             if abs(shift_s) > 0.0005: line += f" (streams offset {shift_s * 1000:+.1f} ms, corrected)"
@@ -309,18 +317,19 @@ def selftest():
         if not ok: fail += 1
     print("tape-report selftest")
     lines = []
-    def build(d, faulty):
+    def build(d, faulty, shift_s=0.0):
         secs = 20
         sent = voice_like(secs, 140.0, 1)
         far = voice_like(secs, 190.0, 2)                                    # equal level, unrelated voice
         played = far.copy()
-        lag = int(0.350 * SR)
-        if faulty:
+        lag = int((0.350 - shift_s) * SR)
+        if faulty and lag >= 0:
             played[lag:] += 0.30 * sent[:-lag]
         n_cb = secs * 3000
+        t0 = 10_000_000_000
         rr = np.zeros(n_cb, dtype=RENDER)
         rr["n"] = 16; rr["rate"] = 1.0; rr["ear"] = 1.0
-        rr["host_ns"] = np.arange(n_cb) * 333_333
+        rr["host_ns"] = t0 + np.arange(n_cb) * 333_333 + int(shift_s * 1e9)
         rr["pos"] = np.arange(n_cb) * 16.0
         if faulty:
             # 400 ms concealed starting at 5.0 s: 1200 callbacks of 16 samples.
@@ -339,7 +348,7 @@ def selftest():
                 rr["concealed"][cb:cb + 2] = 16
             rr["rate"][10 * 3000:12 * 3000] = 1.010
         cr = np.zeros(secs * 1500, dtype=CAPTURE)
-        cr["seq"] = np.arange(len(cr)); cr["cap_ns"] = np.arange(len(cr)) * 666_666
+        cr["seq"] = np.arange(len(cr)); cr["cap_ns"] = t0 + np.arange(len(cr)) * 666_666
         cr["gain"] = 1.0; cr["voiced"] = 1
         if faulty:
             cr["gain"][3 * 1500:int(4.5 * 1500)] = 0.2
@@ -393,6 +402,20 @@ def selftest():
         say("under half gain 0.0 s" in cl, "clean tape: no words under half gain -- REJECT row")
         gl = [l for l in text if l.startswith("  glitches")][0]
         say("glitches in played.wav: 0" in gl, "clean tape: no glitches -- REJECT row")
+        od = os.path.join(tmp, "offset"); os.makedirs(od); build(od, True, shift_s=0.2)
+        text = []
+        report(od, out=text.append)
+        er = [l for l in text if l.startswith("  echo return")]
+        say(er and "heard myself in" in er[0] and " 0 of" not in er[0], f"offset tape: echo return found ({er[0].strip() if er else 'no line'})")
+        m = re.search(r"level (-?[\d.]+) dB · lag (\d+) ms", er[0]) if er else None
+        say(m and abs(float(m.group(1)) - (-10.46)) <= 2 and abs(int(m.group(2)) - 350) <= 5, f"offset tape: return level/lag within tolerance ({m.groups() if m else None})")
+        nd = os.path.join(tmp, "neg_offset"); os.makedirs(nd); build(nd, True, shift_s=-0.1)
+        text = []
+        report(nd, out=text.append)
+        er = [l for l in text if l.startswith("  echo return")]
+        say(er and "heard myself in" in er[0] and " 0 of" not in er[0], f"neg-offset tape: echo return found ({er[0].strip() if er else 'no line'})")
+        m = re.search(r"level (-?[\d.]+) dB · lag (\d+) ms", er[0]) if er else None
+        say(m and abs(float(m.group(1)) - (-10.46)) <= 2 and abs(int(m.group(2)) - 350) <= 5, f"neg-offset tape: return level/lag within tolerance ({m.groups() if m else None})")
     print(f"tape-report selftest: {'PASS' if fail == 0 else f'FAIL ({fail})'}")
     return fail == 0
 

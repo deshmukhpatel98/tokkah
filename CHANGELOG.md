@@ -5,6 +5,26 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.155.0 — 2026-09-07
+
+### Changed — on speakers, the echo canceller is back on
+
+Last night's speakerphone calls on 0.154.0 read an echo return of 0.19–0.34 with
+tens of choppy seconds per direction: the half-duplex gate alone was not holding
+the room. Calls whose sound leaves into a room now run Apple's VoiceProcessingIO
+(echo cancellation, full duplex); headphones keep the raw hardware path with
+nothing between the mic and the wire. The owner's call. `--io hal` / `--io vp`
+still pin either path for an A/B on a live call.
+
+### Fixed — telemetry
+
+- `tape-report.py`: the echo-return scan aligned the sent and received tapes by
+  index without applying the measured clock shift, so a hit was reported at the
+  wrong moment and near-boundary segments were skipped. Both tapes are now
+  time-aligned before the scan.
+- Server diagnostics judge echo spikes and dropouts over the whole call rather
+  than the last few beats, so a fault that has already passed is still named.
+
 ## Kin 0.154.0 — 2026-09-05
 
 ### Fixed — crash on answering or leaving an incoming ring before connection
