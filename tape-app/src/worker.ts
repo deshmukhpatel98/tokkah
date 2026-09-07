@@ -3729,7 +3729,7 @@ const LAB_INSTALLS = new Set(['29jxj25dphu5j', '2960pyrqqritx', 'pftcpwr4k1s0'])
 // 12,000, not 8,000: the audio-lab fields (mac/TELEMETRY-AUDIO.md) took a
 // 263-key beat close to the old cap, and a record that silently drops its
 // largest fields reads as a blind end. The request cap at /api/mac/beat is 16,384.
-export function packFields(rest: Record<string, unknown>, limit = 12000): string {
+export function packFields(rest: Record<string, unknown>, limit = 8000): string {
   let out = JSON.stringify(rest);
   if (out.length <= limit) return out;
   const kept: Record<string, unknown> = { ...rest };
@@ -3847,10 +3847,10 @@ function diagRound(v: number | null, d = 2): number | null {
 /// The window's view of one field. Nothing here ever invents a value: a field
 /// the beats do not carry comes back `null`, and the caller must then name the
 /// blindness instead of grading it.
-function diagWindow(beats: Record<string, unknown>[]) {
+function diagWindow(beats: Record<string, unknown>[], callBeats: Record<string, unknown>[] = beats) {
   const first = beats[0];
   const last = beats[beats.length - 1];
-  const spanS = Math.max(0, (dnum(last.wall) ?? 0) - (dnum(first.wall) ?? 0));
+  const spanS = Math.max(0, (dnum(last?.wall) ?? 0) - (dnum(first?.wall) ?? 0));
   const vals = (k: string): number[] =>
     beats.map((b) => dnum(b[k])).filter((v): v is number => v !== null);
   const avg = (k: string): number | null => {
@@ -3866,29 +3866,81 @@ function diagWindow(beats: Record<string, unknown>[]) {
     const v = vals(k);
     return v.length > 1 && v.some((x) => x !== v[0]);
   };
+  const callFirst = callBeats[0];
+  const callLast = callBeats[callBeats.length - 1];
+  const callSpanS = Math.max(0, (dnum(callLast?.wall) ?? 0) - (dnum(callFirst?.wall) ?? 0));
+  const callVals = (k: string): number[] =>
+    callBeats.map((b) => dnum(b[k])).filter((v): v is number => v !== null);
+  const callAvg = (k: string): number | null => {
+    const v = callVals(k);
+    return v.length ? v.reduce((a, x) => a + x, 0) / v.length : null;
+  };
+  const callMaxOf = (k: string): number | null => {
+    const v = callVals(k);
+    return v.length ? v.reduce((a, x) => (x > a ? x : a), v[0]) : null;
+  };
+  const isThroughput = (k: string): boolean =>
+    k === 'recv' || k === 'peer_played' || k === 'cap' || k === 'cap_callbacks'
+    || k === 'v_shown' || k === 'v_dec' || k === 'v_enc' || k === 'v_encodes' || k === 'v_frags';
+
+  const counterRate = (samples: { wall: number; v: number }[]): number | null => {
+    if (samples.length < 2) return null;
+    const tSpan = samples[samples.length - 1].wall - samples[0].wall;
+    if (tSpan <= 0) return null;
+    let totalDelta = 0;
+    for (let i = 0; i < samples.length - 1; i++) {
+      const d = samples[i + 1].v - samples[i].v;
+      if (d >= 0) {
+        totalDelta += d;
+      } else {
+        // Counter reset (e.g. process restart / reconnection).
+        // At least samples[i + 1].v events occurred in the new epoch.
+        totalDelta += Math.max(0, samples[i + 1].v);
+      }
+    }
+    return totalDelta / tSpan;
+  };
+
   // A counter's RATE per second, or null when these beats cannot yield one.
   //
   // `foo_ps` is a rate already and is believed directly. Everything else in
   // this schema is a CUMULATIVE total -- that is how calls.js reads every one
   // of them -- so its rate is the delta over the seconds between the beats,
-  // and a flat counter means a rate of zero. That is the whole point: a
-  // `peer_played` that does not move is one-way audio.
+  // and a flat counter means a rate of zero.
   //
-  // Two cases yield null instead of a number, because they are genuinely
-  // unreadable rather than zero: no beat carried the field at all, and a
-  // counter that went DOWN (a restarted peer resets to zero, and this codebase
-  // has already been bitten by treating that as data).
+  // Evaluated across the entire call (callBeats) rather than only the trailing
+  // window so bursts of loss, concealment, or restarts earlier in the call are
+  // not masked by a quiet finish, while still catching window-level freezes
+  // for throughput metrics.
   const rateOf = (k: string): number | null => {
-    const ps = avg(k + '_ps');
-    if (ps !== null) return ps;
-    const v = vals(k);
-    if (!v.length) return null;
-    const d = v[v.length - 1] - v[0];
-    if (d < 0) return null;
-    if (spanS <= 0) return null;
-    return d / spanS;
+    const ps = callAvg(k + '_ps');
+    if (ps !== null) {
+      const winPs = avg(k + '_ps');
+      if (winPs !== null) {
+        return isThroughput(k) ? Math.min(ps, winPs) : Math.max(ps, winPs);
+      }
+      return ps;
+    }
+    const extractSamples = (beatList: Record<string, unknown>[], key: string): { wall: number; v: number }[] => {
+      let entries = beatList
+        .map((b) => ({ wall: dnum(b.wall), v: dnum(b[key]) }))
+        .filter((e): e is { wall: number; v: number } => e.wall !== null && e.v !== null);
+      if (!entries.length && key === 'conceal') {
+        entries = beatList
+          .map((b) => ({ wall: dnum(b.wall), v: dnum(b.conceal_total) }))
+          .filter((e): e is { wall: number; v: number } => e.wall !== null && e.v !== null);
+      }
+      return entries;
+    };
+    const callSamples = extractSamples(callBeats, k);
+    const winSamples = extractSamples(beats, k);
+    const callRate = counterRate(callSamples);
+    const winRate = counterRate(winSamples);
+    if (callRate === null) return winRate;
+    if (winRate === null) return callRate;
+    return isThroughput(k) ? Math.min(callRate, winRate) : Math.max(callRate, winRate);
   };
-  return { beats, first, last, spanS, vals, avg, maxOf, has, flips, rateOf };
+  return { beats, first, last, spanS, vals, avg, maxOf, has, flips, rateOf, callAvg, callMaxOf };
 }
 
 /// One end's account of one call. `beats` should be that end's most recent
@@ -3945,7 +3997,7 @@ export function diagnoseEnd(input: DiagEndInput): DiagEnd {
   }
 
   const win = connected.slice(-DIAG_WINDOW);
-  const w = diagWindow(win);
+  const w = diagWindow(win, connected);
 
   // ── Blindness gate: latency ───────────────────────────────────────────────
   // prop is NEVER 0 when the round trip is unknown. Defaulting it turns a
@@ -4166,13 +4218,29 @@ export function diagnoseEnd(input: DiagEndInput): DiagEnd {
   else if ((inRate !== null && inRate !== 48000) || (outRate !== null && outRate !== 48000)) {
     mk(endFaults, 'device_wrong', `device is running at ${inRate ?? '?'} in / ${outRate ?? '?'} out, not 48000`);
   }
-  const echoCorr = w.avg('echo_corr');
-  const erle = w.avg('erle_db');
+  const echoCorr = w.callMaxOf('echo_corr_peak') ?? w.maxOf('echo_corr_peak')
+    ?? w.callMaxOf('echo_corr') ?? w.maxOf('echo_corr') ?? w.avg('echo_corr');
+  const erle = w.avg('aec_erle_db') ?? w.avg('erle_db')
+    ?? w.callAvg('aec_erle_db') ?? w.callAvg('erle_db');
   const mute = w.maxOf('mute');
+  let echoHit: { corr: number; erle: number } | null = null;
+  for (const b of connected) {
+    const c = dnum(b.echo_corr_peak) ?? dnum(b.echo_corr);
+    const e = dnum(b.aec_erle_db) ?? dnum(b.erle_db);
+    const m = dnum(b.mute);
+    if (c !== null && e !== null && (m ?? mute ?? 0) === 0 && c > 0.45 && e < 6) {
+      if (!echoHit || c > echoHit.corr) {
+        echoHit = { corr: c, erle: e };
+      }
+    }
+  }
+  if (!echoHit && echoCorr !== null && erle !== null && (mute ?? 0) === 0 && echoCorr > 0.45 && erle < 6) {
+    echoHit = { corr: echoCorr, erle };
+  }
   if (echoCorr === null || erle === null || mute === null) {
     endSkipped.push({ rule: 'echo', why: 'no_echo_corr_erle_db_or_mute' });
-  } else if (echoCorr > 0.45 && mute === 0 && erle < 6) {
-    mk(endFaults, 'echo', `correlation ${diagRound(echoCorr, 2)} with only ${diagRound(erle, 1)} dB ERLE, speaker live`);
+  } else if (echoHit) {
+    mk(endFaults, 'echo', `correlation ${diagRound(echoHit.corr, 2)} with only ${diagRound(echoHit.erle, 1)} dB ERLE, speaker live`);
   }
   const freezePs = w.rateOf('aec_freezes');
   if (freezePs === null) endSkipped.push({ rule: 'aec_thrashing', why: 'no_aec_freezes' });
@@ -4488,7 +4556,7 @@ export class Health implements DurableObject {
         // zero-length call for every heartbeat. Anything unrecognised still
         // becomes 'live', so an older client cannot invent a phase.
         phase === 'final' ? 'final' : phase === 'watch' ? 'watch' : 'live',
-        pair, packFields(rest));
+        pair, packFields(rest, 12000));
       // Keep a week. Long enough for "the call on Tuesday was bad", short enough
       // that the DO stays small without a scheduled job to remember.
       this.sql.exec(`DELETE FROM mac_beats WHERE wall < ?`, Date.now() / 1000 - 7 * 86400);
@@ -5314,6 +5382,25 @@ export default {
     const atEdge = request.headers.get('cf-ray') !== null;
     if (atEdge && url.protocol === 'http:' && /(^|\.)(tokkah\.com|workers\.dev)$/.test(url.hostname)) {
       return Response.redirect(`https://${url.host}${url.pathname}${url.search}`, 301);
+    }
+
+    if (url.pathname === '/.well-known/assetlinks.json') {
+      return new Response(JSON.stringify([{
+        relation: ["delegate_permission/common.handle_all_urls"],
+        target: {
+          namespace: "android_app",
+          package_name: "com.tokkah.kin",
+          sha256_cert_fingerprints: [
+            "62:33:2C:1F:ED:CF:A0:DB:22:E2:63:5E:BD:EF:A6:43:85:4E:C3:94:EB:8D:CD:E4:15:EF:A1:03:CE:B8:A0:B8"
+          ]
+        }
+      }]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'access-control-allow-origin': '*',
+        },
+      });
     }
 
     if (url.pathname === '/api/ice') {

@@ -268,6 +268,107 @@ const rep = (n, over) => [full(1, over), full(2, over), full(3, over)];
   eq(noProbe.latency.why, 'no_probe_count', '(k3) the rule is not disabled, only unconfused');
 }
 
+// ── (l) echo diagnosis with aec_erle_db and echo_corr_peak ─────────────────
+{
+  // l1: Mac beat shape sends aec_erle_db (no erle_db) and peak correlation spiked
+  // earlier in the call while trailing echo_corr is low. Must catch echo!
+  const echoBeats = [1, 2, 3].map((i) => {
+    const b = drop(full(i, {
+      aec_erle_db: 3.5,
+      echo_corr_peak: 0.68,
+      echo_corr: 0.04,
+      mute: 0,
+    }), 'erle_db');
+    return b;
+  });
+  const e = run('(l1) aec_erle_db + echo_corr_peak spike -> echo fault', echoBeats);
+  ok(hasFault(e, 'echo'), '(l1) flags echo from aec_erle_db and echo_corr_peak');
+  eq(e.verdict, 'echo', '(l1) verdict is echo');
+
+  // l2: aec_erle_db is high (good cancellation), echo must not fire
+  const goodAec = [1, 2, 3].map((i) => {
+    return drop(full(i, {
+      aec_erle_db: 18.0,
+      echo_corr_peak: 0.68,
+      echo_corr: 0.04,
+      mute: 0,
+    }), 'erle_db');
+  });
+  const e2 = run('(l2) aec_erle_db high -> healthy, echo does not fire', goodAec);
+  ok(!hasFault(e2, 'echo'), '(l2) no echo fault when aec_erle_db is healthy');
+}
+
+// ── (m) counter metrics evaluated across call, not only trailing window ─────
+{
+  // Dropouts in beats 1..3, but trailing beats 4..6 have 0 dropouts
+  const dropoutBeats = [
+    full(1, { conceal_ps: 25 }),
+    full(2, { conceal_ps: 25 }),
+    full(3, { conceal_ps: 25 }),
+    full(4, { conceal_ps: 0 }),
+    full(5, { conceal_ps: 0 }),
+    full(6, { conceal_ps: 0 }),
+  ];
+  const e = run('(m) dropouts earlier in call -> audio_dropouts_in caught across call', dropoutBeats);
+  ok(hasFault(e.directions.audio_in, 'audio_dropouts_in'), '(m) audio_in flags audio_dropouts_in even if trailing window is quiet');
+}
+
+// ── (n) echo earlier in call caught even when trailing window has recovered ─
+{
+  const echoEarlier = [
+    full(1, { echo_corr_peak: 0.75, aec_erle_db: 2.0, mute: 0 }),
+    full(2, { echo_corr_peak: 0.75, aec_erle_db: 2.0, mute: 0 }),
+    full(3, { echo_corr_peak: 0.75, aec_erle_db: 2.0, mute: 0 }),
+    full(4, { echo_corr_peak: 0.05, aec_erle_db: 18.0, mute: 0 }),
+    full(5, { echo_corr_peak: 0.05, aec_erle_db: 18.0, mute: 0 }),
+    full(6, { echo_corr_peak: 0.05, aec_erle_db: 18.0, mute: 0 }),
+  ];
+  const e = run('(n) echo earlier in call -> echo fault caught across call', echoEarlier);
+  ok(hasFault(e, 'echo'), '(n) flags echo when peak correlation was high and ERLE low earlier');
+  eq(e.verdict, 'echo', '(n) verdict is echo');
+}
+
+// ── (o) counter reset midway through call still computes rate and detects dropouts
+{
+  const resetBeats = [
+    drop(full(1, { conceal_total: 200 }), 'conceal_ps'),
+    drop(full(2, { conceal_total: 400 }), 'conceal_ps'),
+    drop(full(3, { conceal_total: 0 }), 'conceal_ps'),
+    drop(full(4, { conceal_total: 50 }), 'conceal_ps'),
+    drop(full(5, { conceal_total: 100 }), 'conceal_ps'),
+  ];
+  const e = run('(o) counter reset midway through call -> rate computed across resets', resetBeats);
+  ok(hasFault(e.directions.audio_in, 'audio_dropouts_in'), '(o) flags audio_dropouts_in despite counter reset');
+}
+
+// ── (p) video freeze in trailing window flags video_frozen_in ───────────────
+{
+  const vidFreeze = [
+    full(1, { v_shown: 30 * 1 * 5, v_dec_ps: 0 }),
+    full(2, { v_shown: 30 * 2 * 5, v_dec_ps: 0 }),
+    full(3, { v_shown: 30 * 3 * 5, v_dec_ps: 0 }),
+    full(4, { v_shown: 30 * 3 * 5, v_dec_ps: 0 }),
+    full(5, { v_shown: 30 * 3 * 5, v_dec_ps: 0 }),
+    full(6, { v_shown: 30 * 3 * 5, v_dec_ps: 0 }),
+  ];
+  const e = run('(p) video freeze in trailing window -> video_frozen_in', vidFreeze);
+  ok(hasFault(e.directions.video_in, 'video_frozen_in'), '(p) flags video_frozen_in when shown fps drops to zero in window');
+}
+
+// ── (q) capture callback stall in trailing window flags capture_broken ──────
+{
+  const capStall = [
+    full(1, { cap_callbacks: 200 * 1 * 5 }),
+    full(2, { cap_callbacks: 200 * 2 * 5 }),
+    full(3, { cap_callbacks: 200 * 3 * 5 }),
+    full(4, { cap_callbacks: 200 * 3 * 5 }),
+    full(5, { cap_callbacks: 200 * 3 * 5 }),
+    full(6, { cap_callbacks: 200 * 3 * 5 }),
+  ];
+  const e = run('(q) capture callback stall in trailing window -> capture_broken', capStall);
+  ok(hasFault(e.directions.audio_out, 'capture_broken'), '(q) flags capture_broken when capture callbacks stop firing');
+}
+
 console.log(failures === 0
   ? '\nAll diagnose cases passed.'
   : `\n${failures} assertion(s) FAILED.`);
