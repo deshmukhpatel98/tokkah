@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import KinAudio
 
 let SR = 48_000.0
 // samples per packet -> 0.667 ms, and ALSO the CoreAudio device buffer size, so
@@ -104,6 +105,9 @@ let BMAGIC: UInt32 = 0x544B_0008
 // hold, the cursor JUMPS to the stream. There is no plausibility test, because
 // there is no prior worth defending against arriving data.
 final class RecvRing {
+  /// Where the buffer target comes from now: the distribution of arrival delay,
+  /// read on every packet (audio/Sources/KinAudio/DelayTracker.swift).
+  let tracker = DelayTracker()
   let samples: UnsafeMutablePointer<Float>
   let tags: UnsafeMutablePointer<Int32>       // seq present in this slot, or -1
   let capHost: UnsafeMutablePointer<UInt64>   // capture host time of that packet
@@ -363,6 +367,7 @@ final class RecvRing {
     }
     memcpy(samples + slot * FPP, src, min(n, FPP) * 4)
     let now = Clock.now()
+    tracker.note(seq: seq, capMs: Clock.ms(cap), recvMs: Clock.ms(now))
     if seq == lastIpiSeq + 1, lastIpiCap != 0 {
       let dc = Clock.msSigned(cap, lastIpiCap)
       let dr = Clock.msSigned(now, lastIpiRecv)

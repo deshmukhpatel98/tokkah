@@ -559,7 +559,7 @@ let KNOWN_FLAGS: Set<String> = [
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
   "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
-  "mute", "no-fec", "no-rt", "no-update", "pcm32", "peer", "room",
+  "mute", "no-fec", "no-rt", "no-update", "pcm32", "peer", "playout", "room",
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
@@ -5666,6 +5666,14 @@ audio.jitAuto = (jitArg == "auto")
 // and nothing else. So the descent is the default and the growth path is only
 // there for a path that degrades mid-call.
 audio.jitTarget = audio.jitAuto ? 6 : (Int(jitArg) ?? 2)
+// `--playout classic` is the control arm: the 2 s grow/shrink controller and the
+// +1.2 % fast resampler. Anything else is the new playout (audio/PLAN.md, Phase 1).
+Audio.playoutClassic = arg("playout") == "classic"
+if let p = arg("playout"), p != "classic", p != "new" {
+  fputs("*** --playout takes 'classic' or 'new', not '\(p)'\n", stderr); exit(2)
+}
+if !Audio.playoutClassic, audio.jitAuto { audio.jitTarget = 15 }   // the tracker's 10 ms start
+fputs("playout: \(Audio.playoutClassic ? "classic (2 s controller, fractional rate)" : "new (10 ms decisions, silence and pitch-period ops)")\n", stderr)
 
 // ── Video ───────────────────────────────────────────────────────────────────
 //
@@ -6739,6 +6747,9 @@ if audio.jitAuto {
       }
       // Attribution, not just a count. Only a BACKLOG snap is evidence that a
       // bigger buffer would not have helped; a starvation snap is the opposite.
+      // The new playout sets the target from the render thread; only the
+      // redundancy controller above is shared. The rest of this loop is classic.
+      if !Audio.playoutClassic { continue }
       let snappedBehind = r.snapsBehind - lastSnapsBehind
       lastSnapsBehind = r.snapsBehind
       // ── What growing is FOR, and when it has finished ──────────────────────
@@ -7107,6 +7118,30 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "up_mbps": up, "down_mbps": down,
     "played_ps": played, "conceal_ps": concealed, "cap_ps": cap,
     "jit": audio.jitTarget,
+    // ── THE NEW PLAYOUT'S RECORD (audio/PLAN.md Phase 1) ───────────────────
+    // Where the target came from, what moved the level, and how. `a_drain_*`
+    // and `a_grow_*` are ms of audio removed / added: silence is free, a period
+    // is a gated seam. `a_hold_conceal_ms` is refill-after-underrun time,
+    // booked as neither lost nor starved. `a_sender_gap_ms` is the far Mac's
+    // own capture clock skipping -- not jitter, and the buffer never grows for it.
+    "playout_new": Audio.playoutClassic ? 0 : 1,
+    "jit_target_ms": r.tracker.targetMs, "jit_q_ms": r.tracker.quantileMs,
+    "jit_peak_ms": r.tracker.peakMs, "jit_peak_s": r.tracker.peakModeS, "jit_peaks": r.tracker.peaks,
+    "jit_big_jumps": r.tracker.bigJumps, "jit_last_jump_ms": r.tracker.lastPeakJumpMs, "jit_thr_ms": r.tracker.lastThresholdMs,
+    "a_sender_gap_ms": r.tracker.senderGapMs, "a_sender_gaps": r.tracker.senderGaps,
+    "a_drain_silence_ms": Double(audio.drainSilenceS) / SR * 1000.0,
+    "a_drain_period_ms": Double(audio.drainPeriodS) / SR * 1000.0,
+    "a_grow_silence_ms": Double(audio.growSilenceS) / SR * 1000.0,
+    "a_grow_period_ms": Double(audio.growPeriodS) / SR * 1000.0,
+    "a_hold_conceal_ms": Double(audio.holdConcealS) / SR * 1000.0,
+    "a_cn_ms": Double(audio.cnS) / SR * 1000.0,
+    "a_rewind_ms": Double(audio.rewindS) / SR * 1000.0, "a_rewinds": audio.rewinds, "a_starve_episodes": audio.starveEpisodes,
+    "a_ts_shallow": TimeStretch.refusedShallow, "a_ts_missing": TimeStretch.refusedMissing, "a_ts_quietref": TimeStretch.refusedQuietRef,
+    "a_ts_corrlow": TimeStretch.refusedCorrLow, "a_ts_corrmid": TimeStretch.refusedCorrMid, "a_ts_passive": TimeStretch.passivePlans,
+    "a_noise_floor_db": 20 * log10(Double(max(1e-6, audio.noiseFloor.rms))),
+    "a_stretch_ops": audio.stretchOps, "a_stretch_refused": audio.stretchRefused, "a_stretch_aborted": audio.stretchAborted,
+    "a_policy_skips": audio.policy.silenceSkips, "a_policy_stalls": audio.policy.silenceStalls,
+    "a_policy_acc": audio.policy.accelerates + audio.policy.fastAccelerates, "a_policy_exp": audio.policy.expands,
     // ── THE AUDIO FACTS THE DIAGNOSIS WAS ASKING FOR ────────────────────────
     //
     // Every audio verdict on the server reads fields the client had never sent:

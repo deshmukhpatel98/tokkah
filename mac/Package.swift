@@ -10,9 +10,18 @@ import PackageDescription
 let package = Package(
   name: "tk",
   platforms: [.macOS(.v14)],
+  // THE SOUND LIVES IN ITS OWN REPOSITORY. `../audio` is the nested Kin audio
+  // repo (see audio/README.md): pure signal and control logic, tested on its
+  // own. This checkout depends on it by path; a worktree needs the symlink
+  // `ln -s "$MAIN/audio" audio` at its root, and a fresh clone needs the audio
+  // repo beside `mac/` until it is published as a submodule.
+  dependencies: [
+    .package(path: "../audio"),
+  ],
   targets: [
     .executableTarget(
       name: "tk",
+      dependencies: [.product(name: "KinAudio", package: "audio")],
       path: "Sources/tk",
       // Swift 5 language mode, deliberately. Swift 6 actor isolation cannot model
       // what this program does on purpose: a real-time CoreAudio render callback

@@ -85,3 +85,7 @@ mac/tools/__pycache__/
 # deliberate goes in with `git add -f`.
 cmp-*.png
 /*.png
+
+# The audio work is its own repository, nested at audio/ (see audio/README.md).
+# Its history is not this history: ignored here so the two never tangle.
+/audio

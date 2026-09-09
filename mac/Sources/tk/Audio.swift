@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Accelerate
+import KinAudio
 
 // ── The mute flag outlives the audio engine, and has to ─────────────────────
 //
@@ -54,6 +55,31 @@ final class Audio {
   private var outUnit: AudioUnit?
 
   let ring = RecvRing()
+  // ── THE NEW PLAYOUT (the audio/ repo) ─────────────────────────────────────
+  //
+  // Decided every 10 ms from the buffer level against a target read off the
+  // arrival-delay distribution; backlog and shortfall moved by skipping or
+  // holding SILENCE first and by removing or inserting one PITCH PERIOD second;
+  // the fractional rate kept only for clock drift (±0.1 %, 1.7 cents). Measured
+  // reason (audio/BASELINE.md): the fast resampler ran +1.2 % -- 20 cents sharp
+  // -- for two thirds of every far call. `--playout classic` is the old
+  // behaviour, kept as the control arm.
+  nonisolated(unsafe) static var playoutClassic = false
+  let policy = PlayoutPolicy()
+  let sched = ConcealSchedule()
+  var noiseFloor = NoiseFloor()
+  var cn = ComfortNoise()
+  private let stretchScratch = UnsafeMutablePointer<Float>.allocate(capacity: TimeStretch.scratchCount)
+  private var decisionAcc = 0
+  private var olaRemain = 0, olaLen = 0
+  private var olaShift: Int64 = 0
+  private var stallLeft = 0
+  private var stalledNow = false
+  private var holdConcealLeft = 0
+  private var xfadeLen = 64
+  private(set) var drainSilenceS = 0, drainPeriodS = 0, growSilenceS = 0, growPeriodS = 0
+  private(set) var holdConcealS = 0, cnS = 0, stretchRefused = 0, stretchOps = 0, stretchAborted = 0
+  private(set) var rewindS = 0, rewinds = 0, starveEpisodes = 0
   /// The listener's numbers and the lab tapes -- see AudioLab.swift and
   /// mac/TELEMETRY-AUDIO.md. Fed from both callbacks, read at beat time.
   let lab = AudioLab()
@@ -245,7 +271,8 @@ final class Audio {
   private static let HMASK = HIST - 1
   private static let PMIN = 96             // 500 Hz
   private static let PMAX = 600            // 80 Hz
-  private static let XFADE = 64            // 1.3 ms, both seams
+  private static let XFADE = 64            // 1.3 ms, both seams (classic)
+  private static let XFADE_NEW = 240       // 5 ms: the overlap every mature concealer uses
   private var hist: UnsafeMutablePointer<Float>
   private var histW = 0                    // next write position
   private var plcPeriod = 0
@@ -2146,8 +2173,113 @@ final class Audio {
     // Hold the level for 10 ms, then fade over 40 ms. A voice that stops dead is
     // a click; a voice that hangs on forever is a robot.
     let ms = Double(plcSamples) / SR * 1000.0
-    let g: Float = ms <= 10 ? 1 : Float(max(0.0, 1.0 - (ms - 10) / 40.0))
-    return v * g
+    if Audio.playoutClassic {
+      let g: Float = ms <= 10 ? 1 : Float(max(0.0, 1.0 - (ms - 10) / 40.0))
+      return v * g
+    }
+    // New schedule (G.711 App. I timings, NetEQ's background rule): hold 20 ms,
+    // then -20 % per 10 ms, and what fades in underneath is the far ROOM at the
+    // level it actually has -- never digital zero, unless the far end sent zero.
+    let g = sched.voiceGain(ms: ms)
+    if ms <= sched.holdMs { return v * g }
+    cnS += 1
+    return v * g + cn.next(rms: noiseFloor.rms) * sched.noiseGain(ms: ms)
+  }
+
+  /// The resampler's value at a fractional absolute position, or nil if the
+  /// packet under it (or its right neighbour) is not here. Catmull-Rom, as the
+  /// main read is, so a time-stretch overlap-add mixes two identically shaped
+  /// readings.
+  @inline(__always) private func interpAt(_ absF: Double) -> Float? {
+    let absI = Int64(absF)
+    guard let a = ring.sampleAt(absI), let b = ring.sampleAt(absI + 1) else { return nil }
+    let sm = ring.sampleAt(absI - 1) ?? a
+    let s2 = ring.sampleAt(absI + 2) ?? b
+    let t = Float(absF - Double(absI)), t2 = t * t, t3 = t2 * t
+    return 0.5 * ((2 * a) + (-sm + b) * t + (2 * sm - 5 * a + 4 * b - s2) * t2 + (-sm + 3 * a - 3 * b + s2) * t3)
+  }
+
+  /// The new playout's decision: once per 10 ms of render, on the render thread,
+  /// nothing allocated. Sets the buffer target from the tracker and starts at
+  /// most one operation, which the sample loop then carries out.
+  private func playoutDecide(hi: Int64, nowMs: Double) {
+    let pktMs = Double(FPP) / SR * 1000.0
+    let t = ring.tracker
+    if jitAuto { jitTarget = max(2, Int((t.targetMs / pktMs).rounded())) }
+    let targetMs = Double(jitTarget) * pktMs
+    let absI = Int64(ring.pos)
+    let curSeq = absI / Int64(FPP)
+    let ahead = (hi + 1) * Int64(FPP) - absI
+    let bufferedMs = Double(ahead) / SR * 1000.0
+    // NOTHING ARRIVES TOO LATE TO BE PLAYED. The time-based cursor kept walking
+    // through a hold, concealing, and when the held packets landed behind it
+    // they were "late" and thrown away: on the rig, 7 % of every clumping call
+    // was concealed and the clump's audio was never heard. NetEQ's cursor is
+    // the next unplayed packet, whatever the wall clock says: it conceals the
+    // hold once, then plays the clump, and the buffer is left deep enough that
+    // the NEXT hold costs nothing. So: if there is unplayed audio behind the
+    // cursor, go back and play it. The latency this adds is then the policy's
+    // to keep (peak mode) or to drain (silence first, then periods).
+    if curSeq > ring.maxPlayedSeq + 1, ring.maxPlayedSeq >= 0 {
+      let first = ring.maxPlayedSeq + 1
+      if ring.present(Int32(truncatingIfNeeded: first)), curSeq - first < Int64(RING) - 64 {
+        let back = Double(curSeq * Int64(FPP)) - Double(first * Int64(FPP))
+        ring.pos = Double(first * Int64(FPP))
+        rewindS += Int(back); rewinds += 1
+        return   // decide again next tick, from the new position
+      }
+    }
+    let concealing = !ring.present(Int32(truncatingIfNeeded: curSeq))
+    let starved = concealing && curSeq > hi
+    // Is the next 20 ms quiet -- all present, all under twice the room floor?
+    let thr = max(1e-4, noiseFloor.rms * 2)
+    var quiet = ahead >= 960
+    if quiet {
+      var i: Int64 = 0
+      while i < 960 {
+        guard let v = ring.sampleAt(absI + i), abs(v) < thr else { quiet = false; break }
+        i += 1
+      }
+    }
+    if olaRemain > 0 || stallLeft > 0 || holdConcealLeft > 0 { return }   // an op is in flight
+    let read: (Int) -> Float? = { [ring] i in ring.sampleAt(absI + Int64(i)) }
+    switch policy.decide(nowMs: nowMs, bufferedMs: bufferedMs, targetMs: targetMs,
+                         concealing: concealing, starved: starved, farQuiet: quiet) {
+    case .normal:
+      break
+    case .skipSilence(let maxMs):
+      // Walk forward while it stays quiet, at most 100 ms per decision, and
+      // leave the last 10 ms of quiet in place so the seam lands inside silence.
+      let limit = Int64(min(maxMs, 100.0) / 1000.0 * SR)
+      var k: Int64 = 960
+      while k < limit {
+        guard let v = ring.sampleAt(absI + k), abs(v) < thr else { break }
+        k += 1
+      }
+      let skip = max(0, k - 480)
+      if skip > 0 {
+        ring.pos += Double(skip); drainSilenceS += Int(skip)
+        // Skipped on purpose is not unplayed: the rewind below must not fetch it back.
+        ring.maxPlayedSeq = max(ring.maxPlayedSeq, Int64(ring.pos) / Int64(FPP) - 1)
+      }
+    case .stallSilence(let maxMs):
+      stallLeft = Int(min(maxMs, 20.0) / 1000.0 * SR)
+      growSilenceS += stallLeft
+    case .holdConceal:
+      holdConcealLeft = 480
+    case .accelerate(let fast):
+      let plan = TimeStretch.plan(lookahead: Int(ahead), fast: fast, scratch: stretchScratch, noiseRms: noiseFloor.rms, read: read)
+      if plan.period > 0 {
+        olaLen = plan.period; olaRemain = plan.period; olaShift = Int64(plan.period)
+        drainPeriodS += plan.period; stretchOps += 1
+      } else { policy.refused(nowMs: nowMs); stretchRefused += 1 }
+    case .expand:
+      let plan = TimeStretch.plan(lookahead: Int(ahead), fast: false, scratch: stretchScratch, noiseRms: noiseFloor.rms, read: read)
+      if plan.period > 0 {
+        olaLen = plan.period; olaRemain = plan.period; olaShift = -Int64(plan.period)
+        growPeriodS += plan.period; stretchOps += 1
+      } else { policy.refused(nowMs: nowMs); stretchRefused += 1 }
+    }
   }
 
   /// The worst sample-to-sample step in the window around a seam.
@@ -5904,7 +6036,10 @@ final class Audio {
     // 4.8 to 14.3 snaps/sec and audible clicks). Snap behind acts only on true
     // runaway backlog (>= 180 ms), and cross-fades the repositioned cursor to eliminate clicks.
     let pktMs = Double(FPP) / SR * 1000.0
-    let snapBehindMs = max(180.0, Double(jitTarget) * pktMs * 2.5)
+    // The new playout drains a backlog itself (silence first, then one pitch
+    // period per 20-50 ms), so its snap is for a genuinely runaway cursor only.
+    let snapBehindMs = Audio.playoutClassic ? max(180.0, Double(jitTarget) * pktMs * 2.5)
+                                            : max(1000.0, Double(jitTarget) * pktMs * 2.5)
     let SNAP_PKTS = max(Int64(120), Int64((snapBehindMs / pktMs).rounded()))
     var cur = curSeq
     // SYMMETRIC, and it was not. This snapped only when the cursor fell BEHIND the
@@ -5965,7 +6100,8 @@ final class Audio {
       if snapBehind { ring.snapsBehind += 1 } else { ring.snapsPast += 1 }
       cur = Int64(ring.pos) / Int64(FPP)
       // Cross-fade the repositioned stream against synthesis to eliminate audible clicks/pops
-      xfade = Audio.XFADE
+      xfadeLen = Audio.playoutClassic ? Audio.XFADE : Audio.XFADE_NEW
+      xfade = xfadeLen
     }
 
     // THE GOVERNOR. Occupancy error, in samples, driven to zero by reading a
@@ -5980,6 +6116,11 @@ final class Audio {
     let errSamples = Double(hi - cur - Int64(jitTarget)) * Double(FPP) - ring.pos.truncatingRemainder(dividingBy: Double(FPP))
     let gov = Audio.governorRate(errSamples: errSamples)
     ring.rate = gov.rate
+    if !Audio.playoutClassic {
+      // Drift only. Anything larger is the policy's, by silence or by period.
+      ring.rate = min(1.001, max(0.999, 1.0 + errSamples / (SR * 2.0)))
+      if stallLeft > 0 { ring.rate = 0; stallLeft -= Int(n); stalledNow = true } else { stalledNow = false }
+    }
     ring.rateSum += ring.rate; ring.rateN += 1
     ring.errMs = gov.errMs
 
@@ -5996,6 +6137,10 @@ final class Audio {
     renderTicks += 1
     renderFrames += Int(n)
     defer { renderCost.add(Clock.msSigned(Clock.now(), rEntry)) }
+    if !Audio.playoutClassic {
+      decisionAcc += Int(n)
+      if decisionAcc >= 480 { decisionAcc = 0; playoutDecide(hi: hi, nowMs: Clock.ms(dueHost)) }
+    }
 
     var sawZero = false
     // The lab's per-callback tallies: a few adds per sample here, one call after
@@ -6009,7 +6154,7 @@ final class Audio {
       let absI = Int64(absF)
       let seq = Int32(absI / Int64(FPP))
       let off = Int(absI % Int64(FPP))
-      if ring.present(seq) {
+      if ring.present(seq), holdConcealLeft == 0 {
         let slot = Int(seq) % RING
         // Linear interpolation between neighbouring samples, so a rate that is
         // not exactly 1.0 resamples rather than dropping or duplicating. A
@@ -6054,18 +6199,34 @@ final class Audio {
                      + (2 * sm - 5 * a + 4 * b - s2) * t2
                      + (-sm + 3 * a - 3 * b + s2) * t3)
         }
+        if olaRemain > 0 {
+          // One pitch period being removed (shift > 0) or inserted (shift < 0):
+          // overlap-add this reading into the one a period away, then jump.
+          if let b = interpAt(absF + Double(olaShift)) {
+            let w = TimeStretch.weight(olaLen - olaRemain, olaLen)
+            val = val * (1 - w) + b * w
+            olaRemain -= 1
+            if olaRemain == 0 {
+              ring.pos += Double(olaShift)
+              // A removed period was skipped on purpose; mark it played so the
+              // rewind never fetches it back (it did: drained 1622 ms, rewound 1619).
+              if olaShift > 0 { ring.maxPlayedSeq = max(ring.maxPlayedSeq, Int64(ring.pos) / Int64(FPP) - 1) }
+            }
+          } else { olaRemain = 0; stretchAborted += 1 }
+        }
         if wasConcealing {
           // Do not step into the returning signal either. Cross-fade its first
           // 1.3 ms against the synthesis that is already running -- the real
           // samples still play at their real time, they are only mixed, so this
           // costs no latency at all.
           wasConcealing = false
-          xfade = Audio.XFADE
+          xfadeLen = Audio.playoutClassic ? Audio.XFADE : Audio.XFADE_NEW
+          xfade = xfadeLen
           edgeWinLeft = Audio.XFADE * 2
           edgeWinMax = 0
         }
         if xfade > 0 {
-          let w = Float(Audio.XFADE - xfade) / Float(Audio.XFADE)
+          let w = Float(xfadeLen - xfade) / Float(xfadeLen)
           let synth = plcNext()
           val = val * w + synth * (1 - w)
           xfade -= 1
@@ -6155,6 +6316,7 @@ final class Audio {
         labPlayed += 1
         if lab.rxPlayed(val: val, emitted: emitted) { labSilent += 1 }
         hist[histW & Audio.HMASK] = val; histW += 1
+        noiseFloor.note(val)
         lastGood[off] = a
         // A complete packet of last-good samples needs the boundary; the run
         // length does not, and resetting it per sample is what makes it true.
@@ -6204,7 +6366,11 @@ final class Audio {
       } else {
         // Repeat the last good packet, fading out over about 20 ms so a real
         // outage becomes quiet rather than a held note.
+        let held = holdConcealLeft > 0
+        if held { holdConcealLeft -= 1; holdConcealS += 1 }
         if !wasConcealing {
+          // One starvation episode = one hold on the path (or one sender stall).
+          if hi < Int64(seq) { starveEpisodes += 1 }
           // First concealed sample of this outage. The period is decided ONCE,
           // here, from the sound that was actually playing -- not per sample, and
           // not from a cached estimate belonging to a different phoneme.
@@ -6289,12 +6455,15 @@ final class Audio {
         ring.concealedS += 1
         // Already past this sequence and it never came: lost. Not yet reached
         // by the stream: starved, which a bigger buffer does address.
-        if hi > Int64(seq) { ring.concealLostS += 1 } else { ring.concealStarvedS += 1 }
+        if held { /* refilling after an underrun: neither lost nor starved */ }
+        else if hi > Int64(seq) { ring.concealLostS += 1 } else { ring.concealStarvedS += 1 }
         if off == 0 { sawZero = true }
       }
     }
+    // A stall over silence is not a playback rate: the lab's "sped up / slowed
+    // down" ruler must not read it as -100 %.
     lab.rxBlock(n: Int(n), playedN: labPlayed, concealedN: labConcealed, sumSq: labSumSq,
-                silentN: labSilent, farActive: dgate.farActive, rate: ring.rate)
+                silentN: labSilent, farActive: dgate.farActive, rate: stalledNow ? 1.0 : ring.rate)
     lab.tape.render(hostNs: Clock.ns(dueHost), pos: posAtStart, n: Int(n), concealed: labConcealed,
                     rate: ring.rate, ear: earGain)
     if sawZero { offZeroRun = 0 } else {
