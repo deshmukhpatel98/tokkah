@@ -331,6 +331,8 @@ final class RecvRing {
           tags.update(repeating: -1, count: RING)
           hiSeq = -1
           pos = -1          // the render callback re-primes from the new stream
+          maxPlayedSeq = -1 // or the rewind-to-unplayed would never fire again
+          tracker.reset()   // and the old stream's delay distribution is not this one's
           oldRun = 0
           // fall through and write this packet as the first of the new stream
         } else {

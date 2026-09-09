@@ -184,6 +184,46 @@ Rules:
 
 Consumer surface: nothing. No row, no icon, no word.
 
+## The new playout (0.156.0; `audio/` repo, PLAN.md Phase 1)
+
+The buffer target is read off the arrival-delay distribution (`DelayTracker`),
+decisions are made every 10 ms (`PlayoutPolicy`), and the level is moved by
+skipping or holding silence first and by removing or inserting one pitch period
+second (`TimeStretch`). The fractional playout rate is bounded to ±0.1 % (clock
+drift only), so `a_rate_fast_ms` reads ~0 by construction; the drain is booked
+in the fields below instead. `--playout classic` is the control arm and sets
+`playout_new` 0.
+
+| field | kind | meaning |
+|---|---|---|
+| `playout_new` | flag | 1 = the new playout; 0 = `--playout classic`. |
+| `jit_target_ms` | now | the tracker's target, ms. `jit` (packets) follows it. |
+| `jit_q_ms` | now | the 97th percentile of relative arrival delay (0.5 ms buckets, 2 s memory). |
+| `jit_peak_ms` | now | the tallest recent peak episode while in peak mode, else 0. The target is 1.2× this plus a packet. |
+| `jit_peak_s` | cumul | seconds in peak mode (two peak episodes within 10 s; held ≤ 2× their period, ≤ 20 s). |
+| `jit_peaks` | cumul | peak episodes: runs of ≥ 16 packets with relative delay over max(2×median+20 ms, 2×(median+margin)). A lone reordered packet is never one. |
+| `jit_big_jumps`, `jit_last_jump_ms`, `jit_thr_ms` | diag | transit jumps over 50 ms; the last episode height; the threshold in force. |
+| `a_sender_gap_ms`, `a_sender_gaps` | cumul | the far Mac's own capture clock skipping between consecutive packets. Not jitter; the buffer never grows for it. |
+| `a_drain_silence_ms`, `a_drain_period_ms` | cumul | backlog removed by skipping quiet audio / by removing pitch periods. Silence is free; a period is a gated seam. |
+| `a_grow_silence_ms`, `a_grow_period_ms` | cumul | shortfall filled by stalling over quiet audio / by inserting pitch periods. |
+| `a_rewind_ms`, `a_rewinds` | cumul | after a starvation, the cursor went back to play audio that had arrived behind it. Nothing arrives too late to be played; the latency this adds is the policy's to keep or drain. |
+| `a_starve_episodes` | cumul | starvation runs (one per hold on the path, or per sender stall). Compare with `jit_peaks`. |
+| `a_hold_conceal_ms` | cumul | concealment continued after an underrun until the buffer refilled to half the target (≤ 20 ms per underrun). Booked as neither lost nor starved. |
+| `a_cn_ms` | cumul | comfort noise rendered: past 20 ms into a gap the repeated voice fades −20 %/10 ms toward the far room's floor (`a_noise_floor_db`), never to digital zero unless the far end sent zero. |
+| `a_noise_floor_db` | now | the far room's floor as tracked on the render thread (quietest 10 ms frame in 1.5 s). |
+| `a_stretch_ops`, `a_stretch_refused`, `a_stretch_aborted` | cumul | period operations done; refused by a gate; abandoned mid-way because a sample went missing. |
+| `a_ts_shallow`, `a_ts_missing`, `a_ts_quietref`, `a_ts_corrlow`, `a_ts_corrmid`, `a_ts_passive` | cumul | why plans were refused (not enough buffered; a hole in the window; no energy; correlation < 0.5; correlation in [0.5, 0.85)); and plans admitted as passive (quiet) segments. |
+| `a_policy_skips`, `a_policy_stalls`, `a_policy_acc`, `a_policy_exp` | cumul | decisions by kind. |
+
+Known inputs (`audio/Tests`, 26 tests, and `audio/tools/playout-ab.sh`): a clean
+loopback must read 0 % concealed and within 1 ms of classic mouth-to-ear; a path
+that holds 300 ms every ~4 s must read peak episodes = starvations of the classic
+arm, concealment under a third of classic's, and no `a_rate_fast_ms`. Measured
+2026-09-09 on the rig: clean 20.7 vs 20.0 ms, 0.00–0.02 % vs 0 %; clumping path
+1.9 % vs 6.2 % concealed, 3 vs 5–9 glitches/min, 4 vs 16 starvations/min, mouth-
+to-ear 396 vs 145 ms (the honest price of covering a 300 ms hold; classic threw
+the held audio away).
+
 ## The reader
 
 `mac/tools/telemetry.sh pair <id>` prints, per end, after the existing groups:

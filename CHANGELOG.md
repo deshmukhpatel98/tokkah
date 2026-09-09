@@ -5,6 +5,38 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.156.0 — 2026-09-09
+
+### Changed — the far voice is played at pitch, from a buffer sized by the path
+
+The receiver used to drain a backlog by playing 1.2 % fast — 20 cents sharp — and
+on the far-away calls it did that for two thirds of the call (`a_rate_fast_ms`
+59 s of 84). Its buffer grew after each click and shrank after each calm spell,
+and audio that arrived late was thrown away. Now (the `audio/` repo, Phase 1):
+
+- The buffer target is read off the distribution of arrival delay (97th
+  percentile, 2 s memory) with a peak detector for recurring spikes, as NetEQ
+  does; a sender's own capture stalls are booked separately and never grow it.
+- Backlog is removed by skipping silence first and by removing one pitch period
+  at a time second (correlation-gated, ≤ one per 50 ms on speech); shortfall the
+  same way in reverse. The playout rate is bounded to ±0.1 % for clock drift.
+- After a starvation the cursor goes back and plays what arrived behind it.
+- A gap holds its level 20 ms, then fades toward the far room's noise floor over
+  ~60 ms — never to digital zero — and the return cross-fade is 5 ms, not 1.3.
+- On the rig (`audio/tools/playout-ab.sh`, a path that holds 300 ms every ~4 s):
+  concealed 6.2 % → 1.9 %, glitches 5–9 → 3 per minute, starvation runs 16 → 4
+  per minute, held audio played instead of discarded; mouth-to-ear rises to
+  cover the hold (145 → 396 ms on that path). Clean loopback: 20.0 → 20.7 ms,
+  0 % concealed either way.
+- `--playout classic` is the old behaviour. New beat fields are listed in
+  `mac/TELEMETRY-AUDIO.md`; `playout_new` says which arm a call ran.
+
+### Fixed — rigs
+
+- `audiolab-check.sh` expected 16-sample render callbacks and has failed on the
+  speakers route since 0.155.0 put it on VoiceProcessingIO (128). It reads the
+  device buffer from the beat now.
+
 ## Kin 0.155.0 — 2026-09-07
 
 ### Changed — on speakers, the echo canceller is back on

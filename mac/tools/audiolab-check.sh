@@ -191,7 +191,18 @@ say(raw > 0 and abs(dur(raw) - dur(sent)) < 2.5 and dur(sent) > lo, f"raw {dur(r
 say(played > 0 and dur(played) > lo, f"played {dur(played):.1f} s")
 rb = os.path.getsize(os.path.join(d, "render.bin")) // 32
 cb = os.path.getsize(os.path.join(d, "capture.bin")) // 32
-say(abs(rb - dur(played) * 3000) < dur(played) * 3000 * 0.05 + 100, f"render.bin {rb} records (~{dur(played)*3000:.0f} for 16-sample callbacks)")
+# One render record per callback, and the callback size is the DEVICE buffer the
+# beat reports: 16 on the raw HAL path, 128 under VoiceProcessingIO (the speakers
+# route since 0.155.0). The old constant 3000/s assumed 16 and failed every
+# speakers-route run after that release.
+devbuf = 16
+for ln in open(beats, errors="replace"):
+    try:
+        b = json.loads(ln)
+        if isinstance(b.get("devbuf"), (int, float)) and b["devbuf"] > 0: devbuf = b["devbuf"]
+    except Exception: pass
+cps = 48000.0 / devbuf
+say(abs(rb - dur(played) * cps) < dur(played) * cps * 0.05 + 100, f"render.bin {rb} records (~{dur(played)*cps:.0f} for {devbuf}-sample callbacks)")
 say(abs(cb - dur(sent) * 1500) < dur(sent) * 1500 * 0.05 + 100, f"capture.bin {cb} records (~{dur(sent)*1500:.0f} packets)")
 # Concealed samples in the timeline against the beat's own count.
 conc = 0
