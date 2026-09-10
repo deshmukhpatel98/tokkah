@@ -5,6 +5,25 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.160.0 — 2026-09-11
+
+Two follow-ups to 0.158.0, both found on the first loopback call of the installed build.
+
+### Fixed — the far-voice levelling takes the first pause
+
+0.158.0 decided a level move once a second and applied it only when that same
+once-a-second look happened to land in a 200 ms pause of the far voice. On thirty
+seconds of read speech it wanted a move on 28 ticks and landed none. The apply
+half now runs ten times a second, as the microphone trim's already did
+(`KinAudio/LevelHold.applyPending`); the decision is unchanged.
+
+### Fixed — `net_svc_mark` never appeared
+
+The socket's marking level was read on the send path, which runs on the audio
+thread, and a fact written from a hot thread is dropped by design (the guard that
+keeps dictionaries off the real-time threads). The send path now leaves a
+number; the once-a-second reporter writes the fact.
+
 ## Kin 0.159.0 — 2026-09-11
 
 ### Fixed — answering a call from someone new crashed Kin (0.157.0)
