@@ -5,6 +5,19 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.161.0 — 2026-09-11
+
+### Fixed — the far-voice levelling now sees a pause
+
+0.158.0 called the far voice "paused" when its envelope fell under a fixed
+0.004, the number the duplex gate uses. A far room at −47 dBFS keeps that
+envelope above 0.004 through every pause, so on the lab recording the levelling
+waited 26 ticks and never moved, while the microphone trim — which tests against
+the room floor — moved twice. The pause test is now relative to the far room's
+floor — the higher of the render-side tracker and the far end's own measurement
+that arrives on the probe (0.158.0) — three times it, about +10 dB; speech sits
+15–35 dB above.
+
 ## Kin 0.160.0 — 2026-09-11
 
 Two follow-ups to 0.158.0, both found on the first loopback call of the installed build.

@@ -7021,7 +7021,17 @@ final class Audio {
           xfade -= 1
           if xfade == 0 { plcPeriod = 0; plcSamples = 0 }
         }
-        if dgate.farEnvNow > 0.004 {
+        // "Far voice" for the levelling is RELATIVE to the far room's floor, not
+        // the fixed 0.004 the gate uses: a far room at -47 dBFS keeps the envelope
+        // above 0.004 through every pause, so the levelling never saw a pause on
+        // the lab recording (26 waits, 0 moves) while the trim, which tests
+        // against the room floor, moved twice. Three times the tracked floor is
+        // ~+10 dB; speech sits 15-35 dB above it. Two floors, the higher wins:
+        // the render tracker finds the quietest 10 ms in 1.5 s (a between-words
+        // dip, -76 dBFS on the lab recording) while the far end's own measurement
+        // (the probe byte, 0.158.0) is the RMS of its unvoiced frames (-47 dBFS on
+        // the same recording) -- the one that describes a pause.
+        if dgate.farEnvNow > max(0.004, max(noiseFloor.rms, Wire.peerNoiseRms) * 3) {
           farVoicedSumSq += Double(val) * Double(val)
           farVoicedN += 1
           farQuietRun = 0
@@ -7205,7 +7215,17 @@ final class Audio {
         } else if !concealZeros {
           val = plcNext()
         }
-        if dgate.farEnvNow > 0.004 {
+        // "Far voice" for the levelling is RELATIVE to the far room's floor, not
+        // the fixed 0.004 the gate uses: a far room at -47 dBFS keeps the envelope
+        // above 0.004 through every pause, so the levelling never saw a pause on
+        // the lab recording (26 waits, 0 moves) while the trim, which tests
+        // against the room floor, moved twice. Three times the tracked floor is
+        // ~+10 dB; speech sits 15-35 dB above it. Two floors, the higher wins:
+        // the render tracker finds the quietest 10 ms in 1.5 s (a between-words
+        // dip, -76 dBFS on the lab recording) while the far end's own measurement
+        // (the probe byte, 0.158.0) is the RMS of its unvoiced frames (-47 dBFS on
+        // the same recording) -- the one that describes a pause.
+        if dgate.farEnvNow > max(0.004, max(noiseFloor.rms, Wire.peerNoiseRms) * 3) {
           farVoicedSumSq += Double(val) * Double(val)
           farVoicedN += 1
           farQuietRun = 0
