@@ -574,8 +574,114 @@ final class Audio {
   /// Software attenuation applied at capture when the device's own volume has
   /// reached its floor and the signal is still too hot. 1 = untouched, which is
   /// every machine that does not need it.
-  private(set) var inputTrim: Float = 1
+  var inputTrim: Float {
+    get { trimTarget }
+    set {
+      trimTarget = newValue
+      trimApplied = newValue
+      trimStep = 0
+      hasPendingTrim = false
+      pendingSince = 0
+    }
+  }
+  private(set) var trimTarget: Float = 1
+  private(set) var trimApplied: Float = 1
+  private var trimStep: Float = 0
   private(set) var trimMoves = 0
+  private(set) var trimDeferred = 0
+  private(set) var trimWaitMs = 0
+  private var hasPendingTrim = false
+  private var pendingTrimWish: Float = 1
+  private var pendingSince: UInt64 = 0
+  private var pendingKnob: Float32? = nil
+  /// Quiet sample counter on capture thread: reset to 0 on voiced block, += n otherwise.
+  /// A pause is quietRun >= 0.200 * SR. Initialized to 200 ms so newly created instances
+  /// start in a quiet state before voice is detected.
+  var quietRun: Int = Int(0.200 * 48000.0)
+  /// Test-only hook to override voice verdict in tests (TEST INPUT ONLY).
+  var testVoiceOverride: Bool? = nil
+  static let PAUSE_SAMPLES: Int = Int(0.200 * 48000.0)
+  static let RAMP_SAMPLES: Float = Float(0.020 * 48000.0)
+  static let MAX_MOVE_RATIO: Float = 1.4125375
+
+  func checkPendingTrim() {
+    guard hasPendingTrim, quietRun >= Audio.PAUSE_SAMPLES else { return }
+    applyPendingTrim()
+  }
+
+  func applyPendingTrim() {
+    guard hasPendingTrim else { return }
+    let wish = pendingTrimWish
+    hasPendingTrim = false
+    let newTarget: Float
+    if wish > trimTarget {
+      newTarget = min(wish, trimTarget * Audio.MAX_MOVE_RATIO)
+    } else {
+      newTarget = max(wish, trimTarget / Audio.MAX_MOVE_RATIO)
+    }
+    setTrimTarget(newTarget)
+    trimMoves += 1
+    if pendingSince > 0 {
+      let waitMs = Int(Clock.msSigned(Clock.now(), pendingSince))
+      if waitMs > 0 {
+        trimWaitMs += waitMs
+        Metrics.count("mic_trim_wait_ms", waitMs)
+      }
+      pendingSince = 0
+    }
+    saveTrim()
+  }
+
+  func setTrimTarget(_ target: Float) {
+    trimTarget = target
+    if Audio.RAMP_SAMPLES > 0 {
+      trimStep = (trimTarget - trimApplied) / Audio.RAMP_SAMPLES
+    } else {
+      trimApplied = trimTarget
+      trimStep = 0
+    }
+  }
+
+  /// Capture thread: the ramp and nothing else. Deciding to APPLY a pending
+  /// move (`checkPendingTrim`) writes a file and a metric, so it runs on the 1 Hz
+  /// gain tick -- never here (`a-dictionary-on-the-realtime-thread-killed-a-call`).
+  func applyCaptureTrim(_ x: UnsafeMutablePointer<Float>, _ n: Int) {
+    if trimStep != 0 {
+      for k in 0..<n {
+        trimApplied += trimStep
+        if (trimStep > 0 && trimApplied >= trimTarget) || (trimStep < 0 && trimApplied <= trimTarget) {
+          trimApplied = trimTarget
+          trimStep = 0
+        }
+        x[k] *= trimApplied
+      }
+    } else if trimApplied != 1.0 {
+      for k in 0..<n {
+        x[k] *= trimApplied
+      }
+    }
+  }
+
+  /// Rig only: override voice detection for testing gain changes between words.
+  func setTestVoiceActive(_ active: Bool?) {
+    testVoiceOverride = active
+    if active == true {
+      quietRun = 0
+    }
+  }
+
+  /// Rig only: what the capture callback does per block -- the ramp and the quiet
+  /// counter. The tick's part (`checkPendingTrim`) is the rig's to call.
+  func processCaptureBlockForTest(_ samples: UnsafeMutablePointer<Float>, _ count: Int, voiced: Bool) {
+    applyCaptureTrim(samples, count)
+    let isVoiced = testVoiceOverride ?? voiced
+    if isVoiced {
+      quietRun = 0
+    } else {
+      quietRun += count
+    }
+  }
+
   private var overloadCooldown = 0
   private var makeupCeiling: Float = Audio.MAKEUP_MAX
   /// True while the device knob is at its limit and the signal is STILL hot --
@@ -1340,6 +1446,9 @@ final class Audio {
 
   func tuneInputGain() {
     guard Audio.autoGain else { return }
+    // A move decided on an earlier tick, held because somebody was talking:
+    // apply it now if this tick lands in a pause (>= 200 ms of no voice).
+    checkPendingTrim()
     // ── AN OVERLOADED MICROPHONE IS FIXED BEFORE ANYTHING ELSE IS DECIDED ────
     //
     // This was below the echo veto's early return, and that ordering was a
@@ -1419,6 +1528,28 @@ final class Audio {
       fputs("  gain: peak \(String(format: "%.4f", peak)) floor \(String(format: "%.4f", micFloor))"
           + " speaking \(speaking) run \(speechRun) ticks \(gainTicks)\n", stderr)
     }
+    // If a knob change was held as pending and we have entered a pause, apply it now.
+    if let want = pendingKnob, quietRun >= Audio.PAUSE_SAMPLES,
+       let dev = inDev as AudioDeviceID?, dev != 0 {
+      var cur: Float32 = 0
+      var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+      var sz = UInt32(MemoryLayout<Float32>.size)
+      if AudioObjectGetPropertyData(dev, &addr, 0, nil, &sz, &cur) == noErr,
+         abs(want - cur) > 0.001 {
+        var v = want
+        if AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &v) == noErr {
+          var got: Float32 = -1
+          sz = UInt32(MemoryLayout<Float32>.size)
+          _ = AudioObjectGetPropertyData(dev, &addr, 0, nil, &sz, &got)
+          gainMoves += 1
+          micGainNow = got
+          Metrics.count("mic_gain_moved")
+          Metrics.fact("mic_gain_end", String(format: "%.2f", got))
+        }
+      }
+      pendingKnob = nil
+    }
     guard gainTicks > 3, speechRun >= 3 else { return }
     // ── THE SOFTWARE TRIM IS DECIDED FIRST, AND WITHOUT A DEVICE ───────────
     //
@@ -1460,6 +1591,14 @@ final class Audio {
     }
     trimStep(deviceAtFloor: want <= Audio.MIN_INPUT + 1e-4, knob: cur, outPeak: peak)
     guard abs(want - cur) > 0.001 else { return }
+    let isPause = quietRun >= Audio.PAUSE_SAMPLES
+    if peak <= 0.92 && !isPause {
+      pendingKnob = want
+      trimDeferred += 1
+      Metrics.count("mic_trim_deferred")
+      return
+    }
+    pendingKnob = nil
     var v = want
     guard AudioObjectSetPropertyData(dev, &addr, 0, nil,
             UInt32(MemoryLayout<Float32>.size), &v) == noErr else { return }
@@ -1522,20 +1661,67 @@ final class Audio {
   @discardableResult
   func trimOverload(outPeak: Float) -> Bool {
     guard Audio.overloadGuard, outPeak > 0.95 else { return false }
-    let fix = max(Audio.TRIM_MIN, inputTrim * max(0.5, 0.8 / outPeak))
-    guard fix < inputTrim - 0.02 else { return false }
-    inputTrim = fix
+    let fix = max(Audio.TRIM_MIN, trimTarget * max(0.5, 0.8 / outPeak))
+    guard fix < trimTarget - 0.02 else { return false }
+    hasPendingTrim = false
+    pendingSince = 0
+    setTrimTarget(fix)
     trimMoves += 1
     overloadCuts += 1
     overloadCooldown = 15
     makeupCeiling = max(1.0, fix * 1.30)
     Metrics.count("mic_overload_cut")
-    Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+    Metrics.fact("mic_trim", String(format: "%.3f", trimTarget))
     fputs("mic gain: \(String(format: "%.2f", outPeak))x full scale is leaving this machine"
-        + " -- trimming to \(String(format: "%.2f", inputTrim))"
-        + " (\(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB)\n", stderr)
+        + " -- trimming to \(String(format: "%.2f", trimTarget))"
+        + " (\(String(format: "%.0f", 20 * log10(Double(trimTarget)))) dB)\n", stderr)
     saveTrim()
     return true
+  }
+
+  private func requestTrimMove(wish: Float, immediate: Bool, metric: String) {
+    if immediate {
+      hasPendingTrim = false
+      pendingSince = 0
+      setTrimTarget(wish)
+      trimMoves += 1
+      Metrics.count(metric)
+      Metrics.fact("mic_trim", String(format: "%.3f", trimTarget))
+      saveTrim()
+      return
+    }
+
+    let isPause = quietRun >= Audio.PAUSE_SAMPLES
+    if isPause {
+      hasPendingTrim = false
+      let newTarget: Float
+      if wish > trimTarget {
+        newTarget = min(wish, trimTarget * Audio.MAX_MOVE_RATIO)
+      } else {
+        newTarget = max(wish, trimTarget / Audio.MAX_MOVE_RATIO)
+      }
+      setTrimTarget(newTarget)
+      trimMoves += 1
+      if pendingSince > 0 {
+        let waitMs = Int(Clock.msSigned(Clock.now(), pendingSince))
+        if waitMs > 0 {
+          trimWaitMs += waitMs
+          Metrics.count("mic_trim_wait_ms", waitMs)
+        }
+        pendingSince = 0
+      }
+      Metrics.count(metric)
+      Metrics.fact("mic_trim", String(format: "%.3f", trimTarget))
+      saveTrim()
+    } else {
+      hasPendingTrim = true
+      pendingTrimWish = wish
+      if pendingSince == 0 {
+        pendingSince = Clock.now()
+      }
+      trimDeferred += 1
+      Metrics.count("mic_trim_deferred")
+    }
   }
 
   /// `outPeak` is the peak AFTER the trim -- the level that actually leaves this
@@ -1572,12 +1758,9 @@ final class Audio {
     // room comes DOWN, on the same target the climb uses. Symmetric, so the
     // loop can converge from either side instead of latching at the ceiling.
     let target = min(effectiveMax, max(0.02, Audio.TRIM_TARGET / raw))
-    if inputTrim > 1, target < inputTrim - 0.02 {
-      inputTrim = max(max(1, target), inputTrim / Audio.TRIM_UP_RATE)
-      trimMoves += 1
-      Metrics.count("mic_makeup_down")
-      Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
-      saveTrim()
+    if trimTarget > 1, target < trimTarget - 0.02 {
+      let wish = max(max(1, target), trimTarget / Audio.TRIM_UP_RATE)
+      requestTrimMove(wish: wish, immediate: false, metric: "mic_makeup_down")
       return
     }
     // ── ONE TARGET, BOTH DIRECTIONS ─────────────────────────────────────────
@@ -1599,19 +1782,15 @@ final class Audio {
     if raw > 0.92 {
       // TOO HOT: go straight there. A clipping microphone is urgent, and this
       // is the path that fixed the 5.24 field case.
-      if want < inputTrim - 0.02 {
-        inputTrim = want
-        trimMoves += 1
-        Metrics.count("mic_trim_moved")
-        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
+      if want < trimTarget - 0.02 {
+        requestTrimMove(wish: want, immediate: true, metric: "mic_trim_moved")
         fputs("mic gain: the microphone peaks at \(String(format: "%.2f", raw))"
             + (deviceAtFloor ? " and the input knob is at its floor (\(Int(knob * 100))%)" : "")
-            + " -- trimming \(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB"
+            + " -- trimming \(String(format: "%.0f", 20 * log10(Double(trimTarget)))) dB"
             + " in software\n", stderr)
-        saveTrim()
       }
       if !gainAtRail { gainAtRail = true; Metrics.fact("mic_gain_rail", "yes") }
-    } else if raw < Audio.TRIM_QUIET, want > inputTrim + 0.02 {
+    } else if raw < Audio.TRIM_QUIET, want > trimTarget + 0.02 {
       // TOO QUIET: climb, but only under three conditions, because a gain
       // amplifies whatever is there and not only the person.
       //
@@ -1629,20 +1808,17 @@ final class Audio {
         // quiet for a second costs nothing, and jumping the level inside a
         // syllable is audible pumping on every pause.
         let upRate: Float = overloadCooldown > 0 ? 1.15 : Audio.TRIM_UP_RATE
-        inputTrim = min(want, inputTrim * upRate)
-        trimMoves += 1
-        Metrics.count("mic_makeup_moved")
-        Metrics.fact("mic_trim", String(format: "%.3f", inputTrim))
-        if inputTrim > 1.02 {
+        let wish = min(want, trimTarget * upRate)
+        requestTrimMove(wish: wish, immediate: false, metric: "mic_makeup_moved")
+        if trimTarget > 1.02 {
           fputs("mic gain: this microphone is far away (peaks at"
               + " \(String(format: "%.2f", raw))) -- adding"
-              + " \(String(format: "%.0f", 20 * log10(Double(inputTrim)))) dB\n", stderr)
+              + " \(String(format: "%.0f", 20 * log10(Double(trimTarget)))) dB\n", stderr)
         }
-        saveTrim()
       } else {
         Metrics.count("mic_makeup_refused_noise")
       }
-      if inputTrim >= 1, gainAtRail { gainAtRail = false }
+      if trimTarget >= 1, gainAtRail { gainAtRail = false }
     }
     // Between TRIM_QUIET and 0.92 is the dead band: a healthy microphone is
     // left completely alone, which is the property the third rig row protects.
@@ -1681,15 +1857,88 @@ final class Audio {
   /// Called from the gain tick, never the render thread. Debounced: the relax
   /// path moves 5% a tick and a file write per tick is a diary, not a record.
   private func saveTrim() {
-    guard abs(inputTrim - trimSaved) > 0.02, let uid = Audio.deviceUID(inDev) else { return }
+    guard abs(trimTarget - trimSaved) > 0.02, let uid = Audio.deviceUID(inDev) else { return }
     var map = (try? Data(contentsOf: Audio.trimFile()))
       .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Double] } ?? [:]
     // Unity is "nothing learned about this device" and is not worth a row.
-    if abs(inputTrim - 1) < 0.02 { map.removeValue(forKey: uid) }
-    else { map[uid] = Double(inputTrim) }
+    if abs(trimTarget - 1) < 0.02 { map.removeValue(forKey: uid) }
+    else { map[uid] = Double(trimTarget) }
     if let out = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]) {
       try? out.write(to: Audio.trimFile(), options: .atomic)
-      trimSaved = inputTrim
+      trimSaved = trimTarget
+    }
+  }
+
+  // ── THE DEVICE BUFFER PERSISTED PER MAC ──────────────────────────────────
+  private struct StoredDevBuf: Codable {
+    let devbuf: Int
+    let reason: String
+    let history: [DeviceBufferPolicy.CallRecord]
+    /// Which IO path learned it. The HAL path's floor is 16 frames and Apple's
+    /// voice-processing unit's is 128, so a buffer learned on speakers (vp) says
+    /// nothing about headphones (hal) and must not be carried across.
+    let io: String?
+  }
+
+  static func devBufFile() -> URL { Identity.dir.appendingPathComponent("devbuf.json") }
+
+  /// The stored buffer for THIS IO path, or nil when nothing was learned on it.
+  static func loadDevBuf(io: String) -> (buffer: Int, reason: String)? {
+    guard let data = try? Data(contentsOf: devBufFile()),
+          let obj = try? JSONDecoder().decode(StoredDevBuf.self, from: data),
+          (obj.io ?? "hal") == io else { return nil }
+    return (obj.devbuf, obj.reason)
+  }
+
+  static func loadDevBufHistory(io: String) -> (buffer: Int, reason: String, history: [DeviceBufferPolicy.CallRecord]) {
+    guard let data = try? Data(contentsOf: devBufFile()),
+          let obj = try? JSONDecoder().decode(StoredDevBuf.self, from: data),
+          (obj.io ?? "hal") == io else {
+      return (Audio.devBuf, "default", [])
+    }
+    return (obj.devbuf, obj.reason, obj.history)
+  }
+
+  private static var recordedCallOutcome = false
+
+  static func recordFinishedCall(durationS: Double, capSkips: Int, renderSkips: Int, capCallbacks: Int,
+                                 explicitOverride: Bool = false) {
+    guard !recordedCallOutcome else { return }
+    recordedCallOutcome = true
+
+    // An explicit --devbuf on the command line wins, is used as-is, and is NOT persisted.
+    guard !explicitOverride else { return }
+    // Only a session whose microphone actually ran teaches anything. The home
+    // screen posts beats for hours with the audio engine never started; counted
+    // as a "clean call" it would step the buffer back down on no evidence at all
+    // (`counted-without-a-denominator`).
+    guard capCallbacks > 0 else { return }
+
+    let floor = Audio.ioKind == "vp" ? 128 : 16
+    let skips = capSkips + renderSkips
+    let skipsPerMin = durationS > 0 ? Double(skips) / (durationS / 60.0) : 0.0
+
+    let (_, _, prevHistory) = loadDevBufHistory(io: Audio.ioKind)
+    let decision = DeviceBufferPolicy.decide(
+      current: Audio.devBuf,
+      floor: floor,
+      durationS: durationS,
+      skipsPerMin: skipsPerMin,
+      history: prevHistory
+    )
+
+    var newHistory = prevHistory
+    if durationS >= 30.0 {
+      newHistory.append(DeviceBufferPolicy.CallRecord(buffer: Audio.devBuf, skipsPerMin: skipsPerMin, durationS: durationS))
+      if newHistory.count > 10 {
+        newHistory.removeFirst(newHistory.count - 10)
+      }
+    }
+
+    let stored = StoredDevBuf(devbuf: decision.nextBuffer, reason: decision.reason, history: newHistory, io: Audio.ioKind)
+    try? FileManager.default.createDirectory(at: Identity.dir, withIntermediateDirectories: true)
+    if let data = try? JSONEncoder().encode(stored) {
+      try? data.write(to: devBufFile(), options: .atomic)
     }
   }
   /// The device's stable name. `inDev` alone is a transient integer.
@@ -2059,6 +2308,93 @@ final class Audio {
         + " (\(String(format: "%.1f", l.inputTrim))x)")
     say(l.inputTrim <= Audio.MAKEUP_MAX + 0.01,
         "and the ceiling is \(Int(Audio.MAKEUP_MAX))x, not the 8x that overdrove a live call")
+
+    // ── 13. GAIN MOVES ONLY BETWEEN WORDS (Phase 2 item 6) ───────────────────
+    //
+    // (a) a quiet talker (raw peak 0.08) with continuous speech and the gate reporting voice on every
+    //     block for 5 s of ticks -> inputTrim's APPLIED value does not change during those ticks and
+    //     mic_trim_deferred counts them
+    let m = Audio()
+    m.setFloorForTest(0.002)
+    m.setTestVoiceActive(true)
+    for _ in 0..<5 {
+      m.rawPeakWin = 0.08
+      m.trimStep(deviceAtFloor: true, knob: 0.95)
+    }
+    say(m.trimApplied == 1.0,
+        "(a) quiet talker (0.08) during continuous speech: applied trim does not change (stayed \(String(format: "%.2f", m.trimApplied)))")
+    say(m.trimDeferred == 5,
+        "(a) and mic_trim_deferred counted all 5 ticks (counted \(m.trimDeferred))")
+
+    // (b) then a 300 ms pause (gate quiet) -> the move applies, and the applied value reaches the
+    //     target only after the 20 ms ramp (check an intermediate sample is between old and new)
+    m.setTestVoiceActive(false)
+    var testBlock = [Float](repeating: 1.0, count: 9600)
+    testBlock.withUnsafeMutableBufferPointer { ptr in
+      m.processCaptureBlockForTest(ptr.baseAddress!, 9600, voiced: false)
+    }
+    m.checkPendingTrim()          // the next 1 Hz tick, landing in the pause
+    say(m.trimTarget > 1.0,
+        "(b) after 200 ms pause: move applies, target is \(String(format: "%.3f", m.trimTarget))")
+    say(m.trimApplied == 1.0,
+        "(b) at exact instant of pause, applied trim has not moved yet (\(String(format: "%.3f", m.trimApplied)))")
+
+    var rampBlock1 = [Float](repeating: 1.0, count: 480)
+    rampBlock1.withUnsafeMutableBufferPointer { ptr in
+      m.processCaptureBlockForTest(ptr.baseAddress!, 480, voiced: false)
+    }
+    let midApplied = m.trimApplied
+    say(midApplied > 1.0 && midApplied < m.trimTarget,
+        "(b) intermediate sample at 10 ms into ramp is between old and new (\(String(format: "%.3f", midApplied)))")
+
+    var rampBlock2 = [Float](repeating: 1.0, count: 4320)
+    rampBlock2.withUnsafeMutableBufferPointer { ptr in
+      m.processCaptureBlockForTest(ptr.baseAddress!, 4320, voiced: false)
+    }
+    say(abs(m.trimApplied - m.trimTarget) < 1e-4,
+        "(b) applied value reaches target after 20 ms ramp (\(String(format: "%.3f", m.trimApplied)))")
+
+    // (c) an overload (post-trim peak 2.0) during continuous speech -> the cut applies at once, no wait
+    m.setTestVoiceActive(true)
+    let preOverloadTarget = m.trimTarget
+    let cutFired = m.trimOverload(outPeak: 2.0)
+    say(cutFired && m.trimTarget < preOverloadTarget,
+        "(c) overload post-trim peak 2.0 cuts at once during continuous speech (\(String(format: "%.2f", preOverloadTarget)) -> \(String(format: "%.2f", m.trimTarget))), no wait")
+
+    // (d) a wish of +9 dB is applied as three moves of <= 3 dB over three pauses, not one jump
+    let n = Audio()
+    n.setFloorForTest(0.002)
+    n.forceTrimForTest(1.0)
+    let wishRaw: Float = 0.55 / Float(pow(10.0, 9.0 / 20.0))
+    var rampBuf = [Float](repeating: 1.0, count: 960)
+
+    // Pause 1
+    n.setTestVoiceActive(false)
+    n.rawPeakWin = wishRaw
+    n.trimStep(deviceAtFloor: true, knob: 0.95)
+    let t1 = n.trimTarget
+    let db1 = 20 * log10(Double(t1 / 1.0))
+    rampBuf.withUnsafeMutableBufferPointer { n.processCaptureBlockForTest($0.baseAddress!, 960, voiced: false) }
+
+    // Pause 2
+    n.rawPeakWin = wishRaw
+    n.trimStep(deviceAtFloor: true, knob: 0.95)
+    let t2 = n.trimTarget
+    let db2 = 20 * log10(Double(t2 / t1))
+    rampBuf.withUnsafeMutableBufferPointer { n.processCaptureBlockForTest($0.baseAddress!, 960, voiced: false) }
+
+    // Pause 3
+    n.rawPeakWin = wishRaw
+    n.trimStep(deviceAtFloor: true, knob: 0.95)
+    let t3 = n.trimTarget
+    let db3 = 20 * log10(Double(t3 / t2))
+    rampBuf.withUnsafeMutableBufferPointer { n.processCaptureBlockForTest($0.baseAddress!, 960, voiced: false) }
+
+    say(db1 <= 3.05 && db2 <= 3.05 && db3 <= 3.05 && t3 > 2.7,
+        "(d) wish of +9 dB applied in 3 moves of <= 3 dB over 3 pauses (+\(String(format: "%.1f", db1)) dB, +\(String(format: "%.1f", db2)) dB, +\(String(format: "%.1f", db3)) dB -> \(String(format: "%.2f", t3))x)")
+
+    m.setTestVoiceActive(nil)
+    n.setTestVoiceActive(nil)
 
     fputs("GAIN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok
@@ -5646,9 +5982,7 @@ final class Audio {
     // dividing recovers the signal exactly, with no compression, no limiter and
     // no colour. That matters here more than usual -- the whole audio design is
     // that the microphone is not processed.
-    if inputTrim != 1 {
-      for k in 0..<Int(n) { inScratch[k] *= inputTrim }
-    }
+    applyCaptureTrim(inScratch, Int(n))
 
     // Subsonic rumble high-pass filter: 2nd-order Butterworth at 65 Hz (Q = 0.707).
     // Eliminates table thumps, keyboard impacts, and HVAC rumble before LPC compression.
@@ -5666,7 +6000,7 @@ final class Audio {
     // pipeline actually gets; `rawPeakWin` keeps the untrimmed truth for the
     // loop that sets the trim.
     for k in 0..<Int(n) {
-      let r = abs(inScratch[k]) / inputTrim
+      let r = trimApplied > 0 ? abs(inScratch[k]) / trimApplied : abs(inScratch[k])
       if r > rawPeakWin { rawPeakWin = r }
     }
     for k in 0..<Int(n) {
@@ -5779,6 +6113,15 @@ final class Audio {
     duplexGate(inScratch, Int(n))
     lab.txPost(inScratch, Int(n), preSq: labPreSq, voiced: dgate.blockVoiced)
     accountTurn(peerVocal: Audio.peerVocalNow, audible: dgate.gain > 0.5, blockN: Int(n))
+
+    // How long since this person last said anything, in samples. The gain tick
+    // reads it to land a trim or knob move in a pause instead of a syllable.
+    let isVoiced = testVoiceOverride ?? dgate.blockVoiced
+    if isVoiced {
+      quietRun = 0
+    } else {
+      quietRun += Int(n)
+    }
 
     // Listen for the click we emitted. Scanning the raw input buffer, before any
     // packetising, so nothing in this file's own plumbing is inside the answer.

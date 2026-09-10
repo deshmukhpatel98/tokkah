@@ -157,6 +157,16 @@ echo "== building $NEW =="
 mkdir -p "$SP/src"
 cp "$HERE/../Package.swift" "$SP/src/"
 cp -R "$HERE/../Sources" "$SP/src/"
+# Since 0.156.0 the audio code is its own package beside `mac/` (`audio/` at the
+# checkout root -- a symlink inside a worktree) and Package.swift depends on it
+# by path (`../audio`). A scratch copy of `mac/` alone could not resolve it and
+# this rig reported "the build failed" for a build that never had its inputs.
+# Copied to the same relative place, following the symlink, without its own
+# .build and .git.
+AUDIO_SRC="$(cd "$HERE/../../audio" 2>/dev/null && pwd -P)"
+[ -n "$AUDIO_SRC" ] || cant "no audio package beside mac/ (Package.swift expects ../audio)"
+mkdir -p "$SP/audio"
+rsync -a --exclude .build --exclude .git "$AUDIO_SRC/" "$SP/audio/"
 sed -i '' "s/let VERSION = \"$OLD\"/let VERSION = \"$NEW\"/" "$SP/src/Sources/tk/main.swift"
 grep -q "let VERSION = \"$NEW\"" "$SP/src/Sources/tk/main.swift" \
   || cant "the VERSION bump in the scratch copy matched nothing"

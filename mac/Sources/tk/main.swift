@@ -15,7 +15,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.156.0"
+let VERSION = "0.157.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -54,7 +54,9 @@ let launchT0 = Clock.now()
 func teeStderrToLogIfNowhere() {
   if isatty(2) == 1 { return }
   var st = stat()
-  if fstat(2, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG { return }
+  // A regular file or a pipe is somewhere: somebody redirected it or is reading
+  // it (`tk --gain-test 2>&1 | tail` saw nothing while a pipe counted as nowhere).
+  if fstat(2, &st) == 0 && ((st.st_mode & S_IFMT) == S_IFREG || (st.st_mode & S_IFMT) == S_IFIFO) { return }
   let dir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Logs/Kin", isDirectory: true)
   try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1771,6 +1773,8 @@ func postFinalBeat(why: String) -> Bool {
   // anything. Without this line every answered ring would have been reported as
   // an app that died without saying goodbye.
   Crash.endRun()
+  Audio.recordFinishedCall(durationS: Double(beatTick), capSkips: audio.capSkips, renderSkips: audio.renderSkips,
+                           capCallbacks: audio.capCallbacks, explicitOverride: arg("devbuf") != nil)
   // The tape before the beat: the beat carries the tape's final size and state.
   if beatReady { audio.finishTapes() }
   guard Telemetry.enabled else { return false }
@@ -5372,8 +5376,18 @@ if let io = arg("presence-run") {
 // control (11.2 ms) is +9.6 ms, paid for an echo canceller that actually exists.
 //
 // So the default is per-path, and an explicit --devbuf still wins over both.
+var devBufReason = "default"
 if Audio.ioKind == "vp" { Audio.devBuf = 128 }
-if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 { Audio.devBuf = v }
+let dbFloor = Audio.ioKind == "vp" ? 128 : 16
+if let loaded = Audio.loadDevBuf(io: Audio.ioKind) {
+  Audio.devBuf = max(loaded.buffer, dbFloor)
+  devBufReason = loaded.reason
+}
+if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 {
+  Audio.devBuf = v
+  devBufReason = "flag"
+}
+Metrics.fact("devbuf_reason", devBufReason)
 if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
@@ -7398,6 +7412,7 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // `mic_gain_end` was a fact and said 0.15 -- the floor of a loop that had
     // given up. Whether it was STUCK there is the thing worth knowing.
     "mic_trim": Double(audio.inputTrim), "mic_trim_moves": audio.trimMoves,
+    "mic_trim_deferred": audio.trimDeferred, "mic_trim_wait_ms": audio.trimWaitMs,
     "mic_gain_rail": audio.gainAtRail ? 1 : 0,
     // Turn-taking is the product now, so it reports like the product.
     "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
@@ -7503,6 +7518,8 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     // person on the call cannot see".
     "stalls": audio.audioStalls, "rate_events": audio.rateEvents,
     "render_errs": audio.xruns, "cap_skips": audio.capSkips,
+    "cap_skips_pm": uptime > 0 ? Double(audio.capSkips) / (uptime / 60.0) : 0.0,
+    "render_skips": audio.renderSkips,
     "fmt_mismatch": wire.fmtMismatch, "relocks": wire.relocks,
     "peer_restarts": r.restarts,
     // The sample audit is an identity, so a non-zero difference is a real defect

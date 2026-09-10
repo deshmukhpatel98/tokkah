@@ -1,6 +1,7 @@
 import Foundation
 import Accelerate
 import CoreAudio
+import KinAudio
 
 // ── THE LAB THE CALLS RUN IN ─────────────────────────────────────────────────
 //
@@ -111,6 +112,7 @@ final class AudioLab {
   private(set) var echoReturnS = 0
   private var rxRead = 0, txRead = 0             // frame ring read cursors (beat)
   private var running = false
+  private var turnGaps = TurnGaps()
 
   let tape = Tape()
 
@@ -131,6 +133,12 @@ final class AudioLab {
   @inline(__always) @discardableResult
   func rxPlayed(val: Float, emitted: Float) -> Bool {
     rxAn[rxAnW & AudioLab.AMASK] = val
+    // 2 = "played, verdict pending": `rxBlock` turns it into the block's far-voice
+    // flag. Concealed samples write 0 for themselves (`rxConcealed`), so the two
+    // kinds can arrive in ANY order inside one callback -- the render loop decides
+    // sample by sample, and a block that starts starved and then finds packets is
+    // concealed first and played second.
+    rxAnV[rxAnW & AudioLab.AMASK] = 2
     rxAnW += 1
     let a = abs(val)
     if a >= 0.997 { rxClipS += 1 }
@@ -144,9 +152,15 @@ final class AudioLab {
     tape.played(emitted)
     return silent
   }
-  /// One concealed sample. Nothing was received, so it is not in the analysis
-  /// ring, but the tape still carries what the speaker emitted.
-  @inline(__always) func rxConcealed(emitted: Float) { tape.played(emitted) }
+  /// One concealed sample. The tape carries what the speaker emitted, and the
+  /// analysis ring records it so the timeline aligns, but rxBlock flags it
+  /// not-voice so concealment seams cannot inflate the bandwidth ruler.
+  @inline(__always) func rxConcealed(emitted: Float) {
+    rxAn[rxAnW & AudioLab.AMASK] = emitted
+    rxAnV[rxAnW & AudioLab.AMASK] = 0            // never voice for the rulers
+    rxAnW += 1
+    tape.played(emitted)
+  }
   /// Once per render callback: the block's far-voice state and its split.
   @inline(__always) func rxBlock(n: Int, playedN: Int, concealedN: Int, sumSq: Double,
                                  silentN: Int, farActive: Bool, rate: Double) {
@@ -156,12 +170,18 @@ final class AudioLab {
     } else {
       rxConcealQuietS += concealedN
     }
-    // The voiced flag for the samples just written, so the ruler can trust it.
-    if playedN > 0 {
-      let v: UInt8 = farActive ? 1 : 0
-      var i = rxAnW - playedN
-      let end = rxAnW
-      while i < end { rxAnV[i & AudioLab.AMASK] = v; i += 1 }
+    // The block's far-voice verdict goes onto the PLAYED samples only. They were
+    // marked 2 as they were written; concealed samples already carry 0, so a
+    // broadband concealment seam can never count as voice for the bandwidth
+    // ruler (on a live call it read 20.3 kHz for a 7.2 kHz microphone). The two
+    // kinds may interleave inside a block, so this walks the block's span rather
+    // than assuming the concealed run sits at its end.
+    let v: UInt8 = farActive ? 1 : 0
+    var i = rxAnW - playedN - concealedN
+    while i < rxAnW {
+      let k = i & AudioLab.AMASK
+      if rxAnV[k] == 2 { rxAnV[k] = v }
+      i += 1
     }
     rx.addBlock(postSq: sumSq, preSq: sumSq, n: n, voicedN: farActive ? n : 0, silentN: silentN)
     let dev = abs(rate - 1.0)
@@ -470,11 +490,15 @@ final class AudioLab {
   }
 
   /// Level statistics of a run of frames: (p50, p90, swing, noise).
+  /// Excludes frames with postDb <= -150 (digital zeros from floor mute or empty stream)
+  /// from voiced and noise so muted frames do not poison level, snr, or noise estimates.
   private static func levels(_ fr: [Frame], noiseFrom pre: Bool) -> (p50: Double?, p90: Double?, swing: Double?, noise: Double?) {
-    let voiced = fr.filter { $0.voiced >= 0.5 }.map { Double($0.postDb) }
+    let voiced = fr.filter { $0.voiced >= 0.5 && $0.postDb > -150 }.map { Double($0.postDb) }
     var p50: Double?, p90: Double?
     if voiced.count >= 6 { p50 = pct(voiced, 0.5); p90 = pct(voiced, 0.9) }
-    let quiet = fr.filter { $0.voiced < 0.5 && $0.silent < 0.5 }.map { Double(pre ? $0.preDb : $0.postDb) }
+    let quiet = fr.filter {
+      $0.voiced < 0.5 && $0.silent < 0.5 && $0.postDb > -150 && (pre ? $0.preDb > -150 : true)
+    }.map { Double(pre ? $0.preDb : $0.postDb) }
     let noise: Double? = quiet.count >= 6 ? pct(quiet, 0.1) : nil
     // Adjacent one-second means of the voiced frames, needing at least half a
     // second of voice in each second to count.
@@ -482,7 +506,7 @@ final class AudioLab {
     var secMeans: [Double] = []
     var i = 0
     while i + 20 <= fr.count {
-      let v = fr[i..<i + 20].filter { $0.voiced >= 0.5 }.map { Double($0.postDb) }
+      let v = fr[i..<i + 20].filter { $0.voiced >= 0.5 && $0.postDb > -150 }.map { Double($0.postDb) }
       if v.count >= 10 { secMeans.append(v.reduce(0, +) / Double(v.count)) } else { secMeans.append(.nan) }
       i += 20
     }
@@ -521,6 +545,21 @@ final class AudioLab {
     if let v = t.p50 { f["a_tx_level_db_p50"] = v }
     if let v = t.noise { f["a_tx_noise_db"] = v }
     if let p = t.p50, let n = t.noise { f["a_tx_snr_db"] = p - n }
+
+    // Both rings advance one frame per 50 ms wall time, written by render and capture
+    // audio threads respectively; at 50 ms resolution, phase alignment across threads
+    // is sub-frame, so pairing by index within the drained window is correct.
+    let count = min(rxF.count, txF.count)
+    for i in 0..<count {
+      turnGaps.addFrame(far: rxF[i].voiced >= 0.5, near: txF[i].voiced >= 0.5)
+    }
+    f["a_turn_changes"] = turnGaps.changes
+    f["a_turn_short_bursts"] = turnGaps.shortBursts
+    if let v = turnGaps.overlapPct { f["a_turn_overlap_pct"] = v }
+    if let v = turnGaps.gapMineP50Ms { f["a_turn_gap_mine_p50_ms"] = v }
+    if let v = turnGaps.gapMineP90Ms { f["a_turn_gap_mine_p90_ms"] = v }
+    if let v = turnGaps.gapTheirsP50Ms { f["a_turn_gap_theirs_p50_ms"] = v }
+    if let v = turnGaps.gapTheirsP90Ms { f["a_turn_gap_theirs_p90_ms"] = v }
 
     lock.lock()
     if !rxBwWin.isEmpty { f["a_rx_bw_khz"] = AudioLab.pct(rxBwWin, 0.5); rxBwWin.removeAll(keepingCapacity: true) }
@@ -985,6 +1024,20 @@ final class AudioLab {
     for i in 0..<48000 { let a = abs(aSec[i]); env = a > env ? a : env * dec; envFlags[i] = env > 0.004 ? 1 : 0 }
     let bwE = bandwidthKHz(aSec, voiced: envFlags)
     say((bwE ?? 0) >= 8, "bandwidth: the same speech under the live envelope flag reads \(fmt(bwE)) kHz (>= 8; whole-second read \(fmt(bwRaw)))")
+    var aClicks = aSec
+    var clickFlags = all
+    let clickStart = 19200
+    let clickEnd = clickStart + 9600
+    for i in clickStart..<clickEnd {
+      aClicks[i] = (i % 40 < 20) ? 0 : 0.25
+      clickFlags[i] = 0
+    }
+    let bwClean = bandwidthKHz(aClicks, voiced: clickFlags)
+    let bwDirty = bandwidthKHz(aClicks, voiced: all)
+    let bandRatio = (bwClean ?? 0) / (bwRaw ?? 1)
+    say(bwClean != nil && bwRaw != nil && bandRatio >= 0.84 && bandRatio <= 1.19,
+        "bandwidth: 20% zero-fill clicks flagged not-voice reads \(fmt(bwClean)) kHz (within one band of \(fmt(bwRaw)))")
+    fputs("  note  bandwidth: negative control - leaving concealment clicks flagged as voice reads higher (\(fmt(bwDirty)) vs \(fmt(bwClean)) kHz)\n", stderr)
 
     // ── echo return ──
     func dec8(_ x: [Float]) -> [Float] {
@@ -1046,6 +1099,36 @@ final class AudioLab {
     empty.beatFields(into: &g, txVoiceS: 0, txVoiceMutedS: 0, m2eP50: nil)
     say(g["a_rx_level_db_p50"] == nil && g["a_rx_bw_khz"] == nil && g["a_echo_return_db"] == nil,
         "levels: an empty window sends NO level, bandwidth or echo field -- REJECT row")
+    let labTxZero = AudioLab()
+    for _ in 0..<20 {
+      labTxZero.tx.addBlock(postSq: 0, preSq: 0, n: FRAME, voicedN: FRAME, silentN: 0)
+    }
+    var fTxZero: [String: Any] = [:]
+    labTxZero.beatFields(into: &fTxZero, txVoiceS: 0, txVoiceMutedS: 0, m2eP50: nil)
+    say(fTxZero["a_tx_level_db_p50"] == nil && fTxZero["a_tx_snr_db"] == nil,
+        "levels: tx window whose voiced frames are all zeros reports no level or snr -- REJECT row")
+    let labTxMix = AudioLab()
+    let realAmp = Double(pow(10, Float(-20) / 20))
+    let realSq = realAmp * realAmp
+    for _ in 0..<10 {
+      labTxMix.tx.addBlock(postSq: realSq * Double(FRAME), preSq: realSq * Double(FRAME), n: FRAME, voicedN: FRAME, silentN: 0)
+    }
+    for _ in 0..<10 {
+      labTxMix.tx.addBlock(postSq: 0, preSq: 0, n: FRAME, voicedN: FRAME, silentN: 0)
+    }
+    var fTxMix: [String: Any] = [:]
+    labTxMix.beatFields(into: &fTxMix, txVoiceS: 0, txVoiceMutedS: 0, m2eP50: nil)
+    let txMixP50 = fTxMix["a_tx_level_db_p50"] as? Double
+    say(txMixP50 != nil && abs(txMixP50! - (-20)) <= 0.5,
+        "levels: 10 real voiced + 10 zero frames -> p50 matches real median (\(fmt(txMixP50)) dBFS)")
+    let labRxSilent = AudioLab()
+    for _ in 0..<20 {
+      labRxSilent.rx.addBlock(postSq: 0, preSq: 0, n: FRAME, voicedN: 0, silentN: Int(0.4 * Double(FRAME)))
+    }
+    var fRxSilent: [String: Any] = [:]
+    labRxSilent.beatFields(into: &fRxSilent, txVoiceS: 0, txVoiceMutedS: 0, m2eP50: nil)
+    say(fRxSilent["a_rx_noise_db"] == nil,
+        "levels: rx window of zero frames flagged silent=0.4 reports no noise -- REJECT row")
 
     // ── glitches ──
     let quiet = AudioLab()

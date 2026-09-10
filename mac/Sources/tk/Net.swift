@@ -498,6 +498,36 @@ final class Wire {
     // discarded packet is indistinguishable from a network loss in the numbers.
     var rcv: Int32 = 1 << 21
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, socklen_t(MemoryLayout<Int32>.size))
+    // ── THE PACKETS SAY WHAT THEY ARE ────────────────────────────────────────
+    //
+    // Everything this app sends -- 1500 audio datagrams a second, the video
+    // fragments, clock probes, control -- leaves through this one socket, and
+    // until now it all went out as unclassified bulk data. On Wi-Fi that is the
+    // same queue as a backup upload; a router that honours DSCP treats it the
+    // same way. Apple's network service types reach both layers: on Wi-Fi the
+    // frame goes out in the matching WMM access category (shorter contention
+    // window, first at the medium), and on a network that announces a DiffServ
+    // domain the IP header carries the DSCP as well.
+    //
+    // The socket's default class is INTERACTIVE VIDEO (video telephony), which
+    // is what the flow as a whole is. The voice class is put on the AUDIO
+    // datagrams alone, per send, in `sendVoice` -- <sys/socket.h> is explicit
+    // that a bursty multi-megabit flow in the voice class is "disastrous" under
+    // congestion because the voice queue is small and overflows, and 3-6 Mb/s of
+    // video would do exactly that to its own audio.
+    //
+    // Measured 2026-09-11 on the dev Mac's home Wi-Fi with the interface's own
+    // per-class output counters (`netstat -qq -I en0`): a default socket's
+    // datagrams land in BE, a VI socket's in VI, and datagrams from a VI socket
+    // sent with the voice class as ancillary data land in VO. The IP header on
+    // that network still read tos 0x0 (tcpdump): DSCP is only written where the
+    // network asks for it, so the layer-2 queue is the part that is in effect
+    // here. `net_svc_mark` (below) records what the stack claims for the route.
+    // A setsockopt that returned 0 is not a bit on the wire
+    // (`readback-is-not-in-effect`); the counters were.
+    var vi: Int32 = NET_SERVICE_TYPE_VI
+    let svc = setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &vi, socklen_t(MemoryLayout<Int32>.size))
+    Metrics.fact("net_svc", svc == 0 ? "vi+vo" : "refused:\(errno)")
 
     var me = sockaddr_in()
     me.sin_family = sa_family_t(AF_INET)
@@ -819,6 +849,33 @@ final class Wire {
   private(set) var redundantSent = 0
   private(set) var dualPathAudioSent = 0
 
+  /// What the system actually does with the "Interactive Voice" service type on
+  /// this route. Measured on the dev Mac's home Wi-Fi (2026-09-10) with a probe
+  /// socket and tcpdump: the readback said 2 (layer 3 and layer 2 for all types)
+  /// and the IP header on the wire still carried tos 0x0. Apple marks the DSCP
+  /// byte only when the network announces a DiffServ domain (the header comment
+  /// above `NET_SERVICE_TYPE_BE` in <sys/socket.h>); the WMM access category at
+  /// layer 2 cannot be seen without a monitor-mode capture. So this fact is what
+  /// the stack CLAIMS, and the comment is what was seen. `net_svc_mark`:
+  /// `unknown` / `l2` / `l3l2` / `l3l2-bk` / `unreadable:<errno>`.
+  private func noteMarkingLevel() {
+    var lvl: Int32 = -1
+    var len = socklen_t(MemoryLayout<Int32>.size)
+    let r = getsockopt(fd, SOL_SOCKET, SO_NETSVC_MARKING_LEVEL, &lvl, &len)
+    let word: String
+    if r != 0 { word = "unreadable:\(errno)" }
+    else {
+      switch lvl {
+      case NETSVC_MRKNG_UNKNOWN: word = "unknown"
+      case NETSVC_MRKNG_LVL_L2: word = "l2"
+      case NETSVC_MRKNG_LVL_L3L2_ALL: word = "l3l2"
+      case NETSVC_MRKNG_LVL_L3L2_BK: word = "l3l2-bk"
+      default: word = "other:\(lvl)"
+      }
+    }
+    Metrics.fact("net_svc_mark", word)
+  }
+
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true, cls: TxCls = .ctl) {
     let directValid = peer.sin_port != 0 && peer.sin_addr.s_addr != 0 && peer.sin_addr.s_addr != inet_addr("0.0.0.0")
     let tunnelActive = allowTunnel && (cfTunnel?.isRouting == true)
@@ -844,11 +901,7 @@ final class Wire {
           sendErrs += 1
         }
       }
-      let r = withUnsafePointer(to: &peer) { pp in
-        pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-          sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
+      let r = sendVoice(p, n)
       if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += n + 28 }
       dualPathAudioSent += 1
       return
@@ -866,13 +919,57 @@ final class Wire {
       else { sendErrs += 1 }
       return
     }
-    let r = withUnsafePointer(to: &peer) { pp in
-      pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    let r: Int
+    if cls == .audio {
+      r = sendVoice(p, n)
+    } else {
+      r = withUnsafePointer(to: &peer) { pp in
+        pp.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          sendto(fd, p, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
       }
     }
     if r < 0 { sendErrs += 1 } else { sent += 1; sentBytes += n + 28 }
+    // The marking level is only knowable once the stack has routed packets out
+    // of an interface, so it is read back here, once, a few hundred sends in --
+    // and written as a fact, because it is about this Mac on this network.
+    if sent == 300 { noteMarkingLevel() }
   }
+
+  /// One datagram in the Wi-Fi VOICE queue, from a socket whose default class is
+  /// interactive video: the class rides as ancillary data on this send alone
+  /// (`SOL_SOCKET` / `SO_NET_SERVICE_TYPE`, the same option the socket takes).
+  /// The control block is built once at init and never touched again, so this
+  /// costs the audio thread nothing beyond the syscall it was already making.
+  /// Measured 2026-09-11 with `netstat -qq -I en0`: 200 datagrams sent this way
+  /// from a VI socket were dequeued from the VO class, 200 plain ones from VI.
+  private func sendVoice(_ p: UnsafePointer<UInt8>, _ n: Int) -> Int {
+    var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: UnsafeRawPointer(p)), iov_len: n)
+    return withUnsafeMutablePointer(to: &iov) { iovp in
+      withUnsafeMutablePointer(to: &peer) { ap in
+        var msg = msghdr()
+        msg.msg_name = UnsafeMutableRawPointer(ap)
+        msg.msg_namelen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        msg.msg_iov = iovp
+        msg.msg_iovlen = 1
+        msg.msg_control = voiceCtl
+        msg.msg_controllen = socklen_t(Wire.VOICE_CTL_LEN)
+        return Int(sendmsg(fd, &msg, 0))
+      }
+    }
+  }
+  /// `CMSG_LEN(sizeof(int))` on Darwin: a 12-byte cmsghdr (len, level, type) and
+  /// one 4-byte value at offset 12.
+  static let VOICE_CTL_LEN = 16
+  private let voiceCtl: UnsafeMutableRawPointer = {
+    let b = UnsafeMutableRawPointer.allocate(byteCount: Wire.VOICE_CTL_LEN, alignment: 8)
+    b.initializeMemory(as: UInt8.self, repeating: 0, count: Wire.VOICE_CTL_LEN)
+    b.storeBytes(of: UInt32(Wire.VOICE_CTL_LEN), as: UInt32.self)
+    b.storeBytes(of: Int32(SOL_SOCKET), toByteOffset: 4, as: Int32.self)
+    b.storeBytes(of: Int32(SO_NET_SERVICE_TYPE), toByteOffset: 8, as: Int32.self)
+    b.storeBytes(of: Int32(NET_SERVICE_TYPE_VO), toByteOffset: 12, as: Int32.self)
+    return b
+  }()
 
   /// Bytes actually put on the wire, plus 28 for the UDP and IP headers each
   /// datagram carries. Reported because this is uncompressed float32 audio and

@@ -413,8 +413,9 @@ def lab_numbers(bs):
     have_rx = any(k.startswith("a_rx_") for b in bs for k in b)
     have_tx = any(k.startswith("a_tx_") for b in bs for k in b)
     have_ret = any(k.startswith("a_echo_return") for b in bs for k in b)
+    have_turns = any(k.startswith("a_turn_") for b in bs for k in b)
     voice_s = last(bs, "a_rx_voice_ms", None)
-    d = {"have_rx": have_rx, "have_tx": have_tx, "have_ret": have_ret}
+    d = {"have_rx": have_rx, "have_tx": have_tx, "have_ret": have_ret, "have_turns": have_turns}
     d["voice_s"] = voice_s / 1000.0 if voice_s is not None else None
     d["clean_pct"] = heard_clean_pct(bs)
     d["patched_pct"] = (100.0 - d["clean_pct"]) if d["clean_pct"] is not None else None
@@ -446,6 +447,17 @@ def lab_numbers(bs):
     d["return_pct"] = (100.0 * ret / talk) if (talk and ret is not None and talk > 0) else (0.0 if ret is not None else None)
     d["return_db"] = med(series(bs, "a_echo_return_db"))
     d["return_lag"] = med(series(bs, "a_echo_return_lag_ms"))
+    d["turn_changes"] = last(bs, "a_turn_changes", None)
+    d["turn_overlap_pct"] = last(bs, "a_turn_overlap_pct", None)
+    d["turn_mine_p50_s"] = last(bs, "a_turn_gap_mine_p50_ms", None)
+    if d["turn_mine_p50_s"] is not None: d["turn_mine_p50_s"] /= 1000.0
+    d["turn_mine_p90_s"] = last(bs, "a_turn_gap_mine_p90_ms", None)
+    if d["turn_mine_p90_s"] is not None: d["turn_mine_p90_s"] /= 1000.0
+    d["turn_theirs_p50_s"] = last(bs, "a_turn_gap_theirs_p50_ms", None)
+    if d["turn_theirs_p50_s"] is not None: d["turn_theirs_p50_s"] /= 1000.0
+    d["turn_theirs_p90_s"] = last(bs, "a_turn_gap_theirs_p90_ms", None)
+    if d["turn_theirs_p90_s"] is not None: d["turn_theirs_p90_s"] /= 1000.0
+    d["turn_short_bursts"] = last(bs, "a_turn_short_bursts", None)
     return d
 
 def verdict_words(d, direction):
@@ -482,6 +494,28 @@ def lab_summary(bs):
               f"  ·  trim {trim:.2f}")
     else:
         print("  SAID      not in this build")
+    if d["have_turns"]:
+        parts = []
+        if d["turn_mine_p50_s"] is not None:
+            m = f"you answered {f1(d['turn_mine_p50_s'], ' s')} after them"
+            if d["turn_mine_p90_s"] is not None:
+                m += f" (p90 {f1(d['turn_mine_p90_s'], ' s')})"
+            parts.append(m)
+        if d["turn_theirs_p50_s"] is not None:
+            t = f"they answered {f1(d['turn_theirs_p50_s'], ' s')} after you"
+            if d["turn_theirs_p90_s"] is not None:
+                t += f" (p90 {f1(d['turn_theirs_p90_s'], ' s')})"
+            parts.append(t)
+        if d["turn_overlap_pct"] is not None:
+            parts.append(f"{d['turn_overlap_pct']:.0f} % of changes overlapped")
+        if not parts:
+            if d["turn_changes"] is not None:
+                parts.append(f"{d['turn_changes']} changes")
+            else:
+                parts.append("0 changes")
+        print(f"  TURNS     " + "  ·  ".join(parts))
+    else:
+        print("  TURNS     not in this build")
     if d["have_ret"] or last(bs, "a_echo_talk_s", None) is not None:
         rp = d["return_pct"]
         if rp is not None and rp > 0:

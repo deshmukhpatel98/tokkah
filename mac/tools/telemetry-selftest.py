@@ -21,7 +21,10 @@ def beat(**kw):
          "a_rx_level_db_p50": -24.0, "a_rx_level_swing_db": 2.0, "a_rx_bw_khz": 14.0,
          "a_tx_voice_ms": 50000, "a_tx_voice_muted_ms": 0, "a_tx_softlimit_pct": 0.0,
          "a_tx_level_db_p50": -20.0, "a_tx_noise_db": -60.0, "a_tx_snr_db": 40.0, "a_tx_bw_khz": 12.0,
-         "a_echo_talk_s": 50, "a_echo_return_s": 0}
+         "a_echo_talk_s": 50, "a_echo_return_s": 0,
+         "a_turn_changes": 12, "a_turn_overlap_pct": 31.0,
+         "a_turn_gap_mine_p50_ms": 400.0, "a_turn_gap_mine_p90_ms": 1100.0,
+         "a_turn_gap_theirs_p50_ms": 900.0, "a_turn_short_bursts": 2}
     b.update(kw)
     return [b]
 
@@ -68,11 +71,14 @@ say("dead air 3 s" in out, "VERDICT names the dead air")
 out = render(beat(a_echo_return_s=10, a_echo_return_db=-18.0, a_echo_return_lag_ms=640.0))
 say("heard yourself 20% of your talking" in out and "-18.0 dB" in out and "640 ms later" in out,
     "RETURN names share, level and lag")
+out = render(beat())
+say("you answered 0.4 s after them (p90 1.1 s)" in out and "they answered 0.9 s after you" in out and "31 % of changes overlapped" in out,
+    "TURNS names response gaps and overlap")
 
 # Absent is not zero: a build before the fields.
 old = [{"uptime_s": 120, "conceal_total": 0, "played": 100}]
 out = render(old)
-say("HEARD     not in this build" in out and "SAID      not in this build" in out and "RETURN    not in this build" in out,
+say("HEARD     not in this build" in out and "SAID      not in this build" in out and "RETURN    not in this build" in out and "TURNS     not in this build" in out,
     "a pre-lab build reads 'not in this build', never a verdict")
 say(T.heard_clean_pct(old) is None, "heard_clean_pct is None (not 100) for a pre-lab build -- REJECT row")
 say(abs(T.heard_clean_pct(beat(a_rx_conceal_voiced_ms=3000)) - 95.0) < 1e-9, "heard_clean_pct: 3 s patched of 60 s voice = 95%")

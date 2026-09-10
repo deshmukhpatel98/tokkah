@@ -5,6 +5,82 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.157.0 — 2026-09-11
+
+### Changed — the packets say what they are
+
+Everything Kin sends left through one UDP socket as unclassified bulk data. The
+socket now declares itself interactive video, and every audio datagram carries
+the interactive-voice class on its own send (`Wire.sendVoice`), so on Wi-Fi the
+voice goes out in the voice queue, the video in the video queue, and neither
+waits behind a download. A socket-wide voice class was measured and rejected:
+3–6 Mb/s of bursty video in the small voice queue is the case Apple's own header
+calls "disastrous" under congestion. Proof is the interface's per-class output
+counters (`netstat -qq -I en0`): 200 datagrams from a default socket → best
+effort; from a video-class socket → VI; from that socket with the per-send voice
+class → VO. On a home Wi-Fi the IP header's DSCP byte stays 0 (tcpdump), so the
+layer-2 queue is what is in effect there; facts `net_svc` and `net_svc_mark`.
+
+### Changed — the microphone's gain moves between words
+
+The trim and the input knob used to move on a 1 Hz tick while the person was
+speaking (14 moves in 79 s on one lab call; the far end measured 15–22 dB level
+swings between adjacent seconds). A move now waits for 200 ms of no voice,
+ramps over 20 ms, and is bounded to 3 dB; the overload cut and the too-hot path
+stay instant. `mic_trim_deferred`, `mic_trim_wait_ms`. Rig: `tk --gain-test`
+rows 13(a)–(d).
+
+### Changed — the device buffer is a fact about a Mac
+
+A Mac that misses capture wakeups leaves holes the far end hears as clicks (the
+slow Mac on the same-room lab call missed 1021 in 75 s at 16 frames; the other
+Mac heard 120 seams a minute). After a call of 30 s or more with more than 20
+missed wakeups a minute, that Mac's next call runs a doubled IO buffer (16 → 32
+… ≤ 256; +0.33 ms per step); three clean calls step it back. `devbuf.json`
+beside `trim.json`, per IO path; `--devbuf` still wins and is never persisted.
+`KinAudio/DeviceBufferPolicy` (pure, tested). Facts `devbuf_reason`; numbers
+`cap_skips_pm`, `render_skips`.
+
+### Added — the turn gap, per call, per direction
+
+The most defensible single number for "does this feel like the same room"
+(Boland 2021: 135 ms in person, 487 ms on Zoom) is now in the beat:
+`a_turn_gap_mine_p50_ms` / `_p90_ms` (my answer after hearing them stop),
+`a_turn_gap_theirs_p50_ms` / `_p90_ms` (theirs as heard here, round trip
+included), `a_turn_changes`, `a_turn_overlap_pct` (natural ≈ 40 %),
+`a_turn_short_bursts`. `KinAudio/TurnGaps`, six known inputs including the
+rejects; `telemetry.sh` prints them in words.
+
+### Fixed — three rulers that lied on the lab calls
+
+- `a_tx_level_db_p50` read −180 and `a_tx_snr_db` −133 where the gate called
+  frames voiced but the wire got zeros (muted words counted as a level).
+- `a_rx_noise_db` read −180 from digital-zero frames that slipped past the
+  silence flag.
+- `a_rx_bw_khz` read 20.3 kHz on a 7.2 kHz microphone in windows full of
+  concealment seams: clicks are broadband and were flagged as voice. Concealed
+  samples are flagged not-voice; the echo estimator's history now keeps its
+  timeline through them.
+- The stderr redirect treated a pipe as nowhere, so `tk --gain-test | tail`
+  showed nothing; a pipe is somewhere.
+- `update-check.sh` copied `mac/` alone into its scratch build and has reported
+  "the build failed" since 0.156.0 moved the audio code into the `audio/`
+  package beside it; the rig copies the package too.
+
+### Research — the `audio/` repo
+
+`NOISE.md` (new): a loud room in both directions — suppression at the talker
+vs. the listener, listening effort at +10 / −3 dB SNR, near-end listening
+enhancement, voice detection in noise, and Kin's design (N1–N7: the wire stays
+pure; the work is at the listener's end). Second passes in `RESEARCH.md` (the
+socket, measured; AWDL 2025; L4S), `PERCEPTION.md` (post-pandemic fatigue
+literature; effort in noise), `INDUSTRY.md` (Meta Beryl's P.831 numbers; the
+2025 TestDevLab tests; Zoom's reports test no noise), `BASELINE.md` (second
+read of the four lab calls), `PLAN.md` (status, Phase 2b).
+
+Still unverified on a two-Mac call: 0.155.0, 0.156.0 and this release — no
+such call has been made since 2026-09-08.
+
 ## Kin 0.156.0 — 2026-09-09
 
 ### Changed — the far voice is played at pitch, from a buffer sized by the path
