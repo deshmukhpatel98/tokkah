@@ -410,7 +410,7 @@ VERDICTS = [
 def lab_numbers(bs):
     """Every derived number the verdict table reads, or None when the build lacks
     the field. One place, so the summary lines and the verdicts cannot disagree."""
-    have_rx = any(k.startswith("a_rx_") for b in bs for k in b)
+    have_rx = any(k.startswith("a_rx_") or k == "a_peer_noise_db" for b in bs for k in b)
     have_tx = any(k.startswith("a_tx_") for b in bs for k in b)
     have_ret = any(k.startswith("a_echo_return") for b in bs for k in b)
     have_turns = any(k.startswith("a_turn_") for b in bs for k in b)
@@ -432,6 +432,7 @@ def lab_numbers(bs):
     sw = series(bs, "a_rx_level_swing_db")
     d["swing_db"] = max(sw) if sw else None
     d["rx_noise"] = med(series(bs, "a_rx_noise_db"))
+    d["peer_noise"] = med(series(bs, "a_peer_noise_db"))
     d["rx_bw"] = med(series(bs, "a_rx_bw_khz"))
     d["talk_s"] = last(bs, "a_tx_voice_ms", None)
     if d["talk_s"] is not None: d["talk_s"] /= 1000.0
@@ -473,11 +474,13 @@ def lab_summary(bs):
     def f0(v, unit=""):
         return "?" if v is None else f"{v:.0f}{unit}"
     if d["have_rx"]:
+        peer_rm = f"  ·  their room {f0(d['peer_noise'], ' dBFS')}" if d.get("peer_noise") is not None else ""
         print(f"  HEARD     clean {f1(d['clean_pct'], '%')} of their voice ({f0(d['voice_s'], ' s')})"
               f"  ·  {f1(d['glitch_per_min'])} glitches/min"
               f"  ·  dead air {f1(d['dead_s'], ' s')}"
               f"  ·  level {f0(d['rx_level'], ' dBFS')} (swing {f0(d['swing_db'], ' dB')})"
               f"  ·  their room noise {f0(d['rx_noise'], ' dBFS')}"
+              f"{peer_rm}"
               f"  ·  band {f1(d['rx_bw'], ' kHz')}"
               f"  ·  clip {f1(d['rx_clip_pct'], '%')}"
               f"  ·  sped up {f1(d['fast_s'], ' s')}")

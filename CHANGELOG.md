@@ -5,6 +5,70 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.158.0 — 2026-09-11
+
+### Fixed — a crash on answering a ring, shipped in 0.157.0
+
+0.157.0's device-buffer bookkeeping ran in the final beat unguarded and read the
+audio engine before top-level code had created it. Three exits reach that beat
+before a call exists — a ring answered from the card, a cancel while waiting, and
+the caller hanging up while this Mac rang — and each died with SIGSEGV. The
+goodbye had already left the socket, so every rig that presses those buttons
+stayed green; the crash reports were the only witnesses (found by the rig-repair
+session, `final-beat-read-audio-before-it-existed`). The bookkeeping now sits
+under the same guard as the tape. Update at once if you are on 0.157.0.
+
+The owner's ask: the well-researched "same room" pieces that were never built.
+
+### Added — the far voice is levelled between their words
+
+If the other person is too quiet or too loud as they reach you, this end now
+levels what it plays — toward −20 dBFS, at most 1 dB per move, one move every
+two seconds, only while they have paused for 200 ms, never raising a peak past
+−1 dBFS, and drifting back to neutral when nobody talks. The sender's own trim
+(0.157.0) covers capture headroom; this covers what is heard past the sender's
+4× ceiling (a distant talker on a webcam microphone sat at that ceiling for a
+whole lab call). `KinAudio/LevelHold` (pure, six known inputs);
+`a_rx_level_gain_db`, `a_rx_level_moves`, `a_rx_level_waited`; `--far-level off`
+is the control arm.
+
+### Added — a little of your own voice, on headphones
+
+People shout into closed headphones because they cannot hear themselves, and
+the shouting trips the overload cut and the floor. Telephones have always fed a
+little of the talker's voice back; Kin now does on headphones: −16 dB, about
+5 ms after the mouth (device latency plus one buffer), off on speakers, off on
+a Bluetooth headset in phone mode, off under `--mute`. It touches the headphone
+output only — never the wire, the canceller's reference, the tape or the lab's
+analysis. `--sidetone off` / `--sidetone <dB>`; fact `sidetone`; `sidetone_ms`,
+`sidetone_starved`.
+
+### Added — the far room's floor, as one byte
+
+The comfort noise that fills a concealment gap fades toward the far room's noise
+floor, and on a speakers call that floor could not be measured because the far
+microphone is muted to digital zero most of the time. The far end now sends its
+own measurement (0.5 dB steps, one byte on the once-a-second probe; unknown is
+255), and the gap's fade lands on the real room instead of dead silence.
+Concealment gaps only: a silence the far end sent is still played as silence —
+room tone while muted remains the owner's decision. `a_peer_noise_db`,
+`a_peer_noise_reports`; `telemetry.sh` prints "their room −58 dBFS".
+
+### Changed — 55 Hz, not 65
+
+The microphone's high-pass corner moves from 65 to 55 Hz, the line below which
+naturalness holds (Moore & Tan 2003). Not 50: the mains here are 50 Hz, and a
+corner at the hum would pass it at −3 dB where 55 still takes about 4 dB off.
+An 85 Hz fundamental now loses 0.7 dB instead of 1.5.
+
+### Changed — a waiting gain move takes the first real pause
+
+0.157.0 held a microphone trim move until a pause, but only the once-a-second
+tick looked, and on a rig with fifteen pauses per ninety seconds five moves
+waited and none landed in thirty seconds. A 10 Hz check catches the first pause.
+The socket-marking readback (`net_svc_mark`) also fires once past the 300th
+send instead of exactly on it, where a probe reply could take the slot.
+
 ## Kin 0.157.0 — 2026-09-11
 
 ### Changed — the packets say what they are

@@ -98,10 +98,13 @@ final class Audio {
     Metrics.fact("tapes", lab.tape.state)
   }
   var wire: Wire?
-  var mute = false                 // loopback on one machine: the mic hears the
-                                   // speaker, so the receiver silences its output
-                                   // AFTER timestamping. The measurement is
-                                   // untouched; the howl is gone.
+  var mute = false {               // loopback on one machine: the mic hears the
+    didSet {                       // speaker, so the receiver silences its output
+      if oldValue != mute {        // AFTER timestamping. The measurement is
+        updateSidetoneTarget()     // untouched; the howl is gone.
+      }
+    }
+  }
   var jitTarget = 2                // packets of deliberate buffer. 2 == 5.3 ms.
   var jitAuto = true               // size the buffer from measurement, not from a guess
   // peer clock - my clock, in ms, from TimeSync. Zero and INVALID are different
@@ -594,6 +597,208 @@ final class Audio {
   private var pendingTrimWish: Float = 1
   private var pendingSince: UInt64 = 0
   private var pendingKnob: Float32? = nil
+
+  // ── THE FAR VOICE IS LEVELLED BETWEEN THEIR WORDS (Task D1) ───────────────
+  static var farLevelOn: Bool = true
+  let levelHold = LevelHold()
+  nonisolated(unsafe) var farVoicedSumSq: Double = 0
+  nonisolated(unsafe) var farVoicedN: Int = 0
+  nonisolated(unsafe) var farPeakWin: Float = 0
+  nonisolated(unsafe) var farQuietRun: Int = Int(0.200 * 48000.0)
+  var testFarVoiceOverride: Bool? = nil
+  private(set) var farGainTarget: Float = 1.0
+  private(set) var farGainApplied: Float = 1.0
+  private var farGainStep: Float = 0.0
+
+  var rxLevelGainDb: Double {
+    farGainApplied > 0 ? 20.0 * log10(Double(farGainApplied)) : 0.0
+  }
+  var rxLevelMoves: Int { levelHold.moves }
+  var rxLevelWaited: Int { levelHold.waited }
+
+  func setFarGainTarget(_ target: Float) {
+    farGainTarget = target
+    if Audio.RAMP_SAMPLES > 0 {
+      farGainStep = (farGainTarget - farGainApplied) / Audio.RAMP_SAMPLES
+    } else {
+      farGainApplied = farGainTarget
+      farGainStep = 0
+    }
+  }
+
+  func tuneFarLevel() {
+    guard Audio.farLevelOn else {
+      if farGainTarget != 1.0 || farGainApplied != 1.0 {
+        farGainTarget = 1.0
+        farGainApplied = 1.0
+        farGainStep = 0.0
+      }
+      return
+    }
+    let sumSq = farVoicedSumSq
+    let count = farVoicedN
+    let peak = farPeakWin
+    farVoicedSumSq = 0
+    farVoicedN = 0
+    farPeakWin = 0
+
+    let voicedRmsDb: Double?
+    if count > 0 && sumSq > 0 {
+      let rms = (sumSq / Double(count)).squareRoot()
+      voicedRmsDb = 20.0 * log10(rms)
+    } else {
+      voicedRmsDb = nil
+    }
+
+    let quietNow = (testFarVoiceOverride != nil) ? (testFarVoiceOverride == false) : (farQuietRun >= Audio.PAUSE_SAMPLES)
+    let targetDb = levelHold.tick(voicedRmsDb: voicedRmsDb, quietNow: quietNow, peak: Double(peak))
+    let targetLinear = Float(pow(10.0, targetDb / 20.0))
+    setFarGainTarget(targetLinear)
+  }
+
+  func setTestFarVoiceActive(_ active: Bool?) {
+    testFarVoiceOverride = active
+    if active == true {
+      farQuietRun = 0
+    } else if active == false {
+      farQuietRun = Audio.PAUSE_SAMPLES
+    }
+  }
+
+  func feedFarLevelForTest(rmsDb: Double?, peak: Float) {
+    if let rms = rmsDb {
+      let linearRms = pow(10.0, rms / 20.0)
+      farVoicedN = 48000
+      farVoicedSumSq = Double(linearRms * linearRms) * 48000.0
+    } else {
+      farVoicedN = 0
+      farVoicedSumSq = 0
+    }
+    farPeakWin = peak
+  }
+
+  func processFarBlockForTest(_ samples: UnsafeMutablePointer<Float>, _ count: Int) {
+    for k in 0..<count {
+      if farGainStep != 0 {
+        farGainApplied += farGainStep
+        if (farGainStep > 0 && farGainApplied >= farGainTarget) || (farGainStep < 0 && farGainApplied <= farGainTarget) {
+          farGainApplied = farGainTarget
+          farGainStep = 0
+        }
+      }
+      samples[k] *= farGainApplied
+    }
+  }
+
+  // ── HEAR A LITTLE OF YOURSELF, ON HEADPHONES ONLY (Task D2) ───────────────
+  static var sidetoneEnabled: Bool = true
+  static var sidetoneDb: Float = -16.0
+
+  /// A raw ring, not a Swift Array: the capture thread writes it while the render
+  /// thread reads it, and a `[Float]` stored property under two threads is an
+  /// exclusivity violation the runtime is entitled to abort on. Same shape as
+  /// `echoHist` and the lab's rings; allocated once, never resized.
+  let sideRing: UnsafeMutablePointer<Float> = {
+    let p = UnsafeMutablePointer<Float>.allocate(capacity: 8192)
+    p.initialize(repeating: 0, count: 8192)
+    return p
+  }()
+  nonisolated(unsafe) var sideW: Int = 0
+  nonisolated(unsafe) var sideR: Int = 0
+  nonisolated(unsafe) var sidetoneStarved: Int = 0
+  nonisolated(unsafe) var sidetoneRenderedSamples: Int = 0
+
+  private(set) var sidetoneGainTarget: Float = 0.0
+  private(set) var sidetoneGainApplied: Float = 0.0
+  private var sidetoneGainStep: Float = 0.0
+  var outDevIsBtHfp: Bool = false
+
+  var sidetoneMs: Double {
+    Double(sidetoneRenderedSamples) / 48.0
+  }
+
+  var sidetoneFact: String {
+    if Audio.outputIsSpeakers {
+      return "speakers"
+    }
+    if !Audio.sidetoneEnabled || outDevIsBtHfp {
+      return "off"
+    }
+    return "\(Int(round(Audio.sidetoneDb))) dB"
+  }
+
+  func updateSidetoneTarget() {
+    let active = Audio.sidetoneEnabled && !Audio.outputIsSpeakers && !outDevIsBtHfp && !mute
+    let target: Float = active ? Float(pow(10.0, Double(Audio.sidetoneDb) / 20.0)) : 0.0
+    if target != sidetoneGainTarget {
+      sidetoneGainTarget = target
+      if Audio.RAMP_SAMPLES > 0 {
+        sidetoneGainStep = (sidetoneGainTarget - sidetoneGainApplied) / Audio.RAMP_SAMPLES
+      } else {
+        sidetoneGainApplied = sidetoneGainTarget
+        sidetoneGainStep = 0
+      }
+    }
+    updateSidetoneFact()
+  }
+
+  func updateSidetoneFact() {
+    Metrics.fact("sidetone", sidetoneFact)
+  }
+
+  func feedCaptureForSidetoneTest(_ samples: UnsafePointer<Float>, _ count: Int) {
+    for k in 0..<count {
+      sideRing[sideW & 8191] = samples[k]
+      sideW += 1
+    }
+  }
+
+  func forceSidetoneGainForTest(_ gain: Float) {
+    sidetoneGainTarget = gain
+    sidetoneGainApplied = gain
+    sidetoneGainStep = 0
+  }
+
+  // Do NOT feed the sidetone into anything that reaches the wire, the echo canceller's
+  // reference, the tape's played.wav, or the lab's rx analysis: add it at the very last step,
+  // into out[i] only, after emitted is computed and recorded.
+  func applySidetone(_ out: UnsafeMutablePointer<Float>, _ count: Int) {
+    if sidetoneGainStep == 0 && sidetoneGainApplied == 0 && sidetoneGainTarget == 0 {
+      sideR = sideW
+      return
+    }
+    if sideW - sideR > 8192 {
+      sideR = sideW - 8192
+    }
+    for i in 0..<count {
+      if sidetoneGainStep != 0 {
+        sidetoneGainApplied += sidetoneGainStep
+        if (sidetoneGainStep > 0 && sidetoneGainApplied >= sidetoneGainTarget) ||
+           (sidetoneGainStep < 0 && sidetoneGainApplied <= sidetoneGainTarget) {
+          sidetoneGainApplied = sidetoneGainTarget
+          sidetoneGainStep = 0
+        }
+      }
+      if sidetoneGainApplied > 0 {
+        if sideR < sideW {
+          let s = sideRing[sideR & 8191]
+          sideR += 1
+          out[i] += sidetoneGainApplied * s
+          sidetoneRenderedSamples += 1
+        } else {
+          sidetoneStarved += 1
+        }
+      } else {
+        sideR = sideW
+      }
+    }
+  }
+
+  static func isBtHfp(dev: AudioDeviceID, input: Bool) -> Bool {
+    guard dev != 0 else { return false }
+    let f = AudioLab.deviceFacts(dev, input: input)
+    return f.transport.hasPrefix("bluetooth") && (f.channels == 1 || (f.rate > 0 && f.rate <= 16000))
+  }
   /// Quiet sample counter on capture thread: reset to 0 on voiced block, += n otherwise.
   /// A pause is quietRun >= 0.200 * SR. Initialized to 200 ms so newly created instances
   /// start in a quiet state before voice is detected.
@@ -604,9 +809,27 @@ final class Audio {
   static let RAMP_SAMPLES: Float = Float(0.020 * 48000.0)
   static let MAX_MOVE_RATIO: Float = 1.4125375
 
+  /// Two off-audio threads reach the pending move -- the 1 Hz gain tick and the
+  /// 10 Hz pause check below -- so the decision state is behind one lock. The
+  /// capture thread never takes it: it only reads `trimApplied`/`trimStep`.
+  private let trimLock = NSLock()
   func checkPendingTrim() {
+    trimLock.lock(); defer { trimLock.unlock() }
     guard hasPendingTrim, quietRun >= Audio.PAUSE_SAMPLES else { return }
     applyPendingTrim()
+  }
+  /// The pause check, ten times a second. The 1 Hz tick alone SAMPLED the pause:
+  /// on 30 s of read speech with fifteen pauses over 200 ms per 90 s, five moves
+  /// waited and none landed, because a 300 ms pause is caught by a 1 Hz sample
+  /// about one time in ten. At 10 Hz the first real pause takes the move.
+  private var pauseTimer: DispatchSourceTimer?
+  func startPauseCheck() {
+    guard pauseTimer == nil else { return }
+    let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "kin.gain.pause", qos: .utility))
+    t.schedule(deadline: .now() + 0.1, repeating: 0.1, leeway: .milliseconds(20))
+    t.setEventHandler { [weak self] in self?.checkPendingTrim() }
+    t.resume()
+    pauseTimer = t
   }
 
   func applyPendingTrim() {
@@ -1401,6 +1624,8 @@ final class Audio {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
     }
+    outDevIsBtHfp = (outDev != 0) ? Audio.isBtHfp(dev: outDev, input: false) : false
+    updateSidetoneTarget()
     Metrics.fact("output_route", speakers ? "speakers" : "headphones")
     // Says which of the two products this call is now, because they are not
     // small variations of each other: on headphones the turn rule stands down
@@ -1445,6 +1670,8 @@ final class Audio {
   }
 
   func tuneInputGain() {
+    tuneFarLevel()
+    updateSidetoneFact()
     guard Audio.autoGain else { return }
     // A move decided on an earlier tick, held because somebody was talking:
     // apply it now if this tick lands in a pause (>= 200 ms of no voice).
@@ -1663,6 +1890,7 @@ final class Audio {
     guard Audio.overloadGuard, outPeak > 0.95 else { return false }
     let fix = max(Audio.TRIM_MIN, trimTarget * max(0.5, 0.8 / outPeak))
     guard fix < trimTarget - 0.02 else { return false }
+    trimLock.lock(); defer { trimLock.unlock() }
     hasPendingTrim = false
     pendingSince = 0
     setTrimTarget(fix)
@@ -1680,6 +1908,7 @@ final class Audio {
   }
 
   private func requestTrimMove(wish: Float, immediate: Bool, metric: String) {
+    trimLock.lock(); defer { trimLock.unlock() }
     if immediate {
       hasPendingTrim = false
       pendingSince = 0
@@ -2396,6 +2625,176 @@ final class Audio {
     m.setTestVoiceActive(nil)
     n.setTestVoiceActive(nil)
 
+    // ── 14. FAR VOICE LEVELLING BETWEEN WORDS (Task D1) ──────────────────────
+    //
+    // (a) quiet far voice (-30 dBFS) during continuous speech (no pause) ->
+    //     no applied change, a_rx_level_waited counts
+    let p = Audio()
+    p.setTestFarVoiceActive(true)
+    p.feedFarLevelForTest(rmsDb: -30.0, peak: 0.1)
+    p.tuneFarLevel()
+    say(p.farGainApplied == 1.0,
+        "(14a) quiet far voice (-30 dBFS) during continuous speech: applied gain does not change (stayed \(String(format: "%.3f", p.farGainApplied)))")
+    say(p.rxLevelWaited == 1,
+        "(14a) and a_rx_level_waited counted the tick (counted \(p.rxLevelWaited))")
+
+    // (b) then a pause (quietNow = true) -> one move of <= 1 dB with the 20 ms ramp
+    p.setTestFarVoiceActive(false)
+    p.feedFarLevelForTest(rmsDb: -30.0, peak: 0.1)
+    p.tuneFarLevel()
+    let pMoveTarget = p.farGainTarget
+    let pMoveDb = 20.0 * log10(Double(pMoveTarget / 1.0))
+    say(pMoveDb > 0 && pMoveDb <= 1.01,
+        "(14b) in pause: move target is <= 1 dB (+\(String(format: "%.2f", pMoveDb)) dB, target \(String(format: "%.3f", pMoveTarget)))")
+    say(p.farGainApplied == 1.0,
+        "(14b) at exact moment of decision, applied gain has not moved yet (\(String(format: "%.3f", p.farGainApplied)))")
+    say(p.rxLevelMoves == 1,
+        "(14b) and a_rx_level_moves counted 1 move (\(p.rxLevelMoves))")
+
+    var pRamp1 = [Float](repeating: 1.0, count: 480)
+    pRamp1.withUnsafeMutableBufferPointer { ptr in
+      p.processFarBlockForTest(ptr.baseAddress!, 480)
+    }
+    let pMidApplied = p.farGainApplied
+    say(pMidApplied > 1.0 && pMidApplied < pMoveTarget,
+        "(14b) intermediate sample at 10 ms into ramp is between old and new (\(String(format: "%.3f", pMidApplied)))")
+
+    var pRamp2 = [Float](repeating: 1.0, count: 480)
+    pRamp2.withUnsafeMutableBufferPointer { ptr in
+      p.processFarBlockForTest(ptr.baseAddress!, 480)
+    }
+    say(abs(p.farGainApplied - pMoveTarget) < 1e-4,
+        "(14b) applied value reaches target after 20 ms ramp (\(String(format: "%.3f", p.farGainApplied)))")
+    p.setTestFarVoiceActive(nil)
+
+    // (c) a far voice already at -20 dBFS -> nothing moves
+    let q = Audio()
+    q.setTestFarVoiceActive(false)
+    q.feedFarLevelForTest(rmsDb: -20.0, peak: 0.5)
+    q.tuneFarLevel()
+    say(q.rxLevelMoves == 0 && q.rxLevelWaited == 0 && q.farGainApplied == 1.0 && q.farGainTarget == 1.0,
+        "(14c) far voice already at -20 dBFS: nothing moves (gain \(String(format: "%.2f", q.farGainApplied))x, 0 moves, 0 waited)")
+    q.setTestFarVoiceActive(nil)
+
+    // (d) --far-level off -> nothing ever moves (the control arm)
+    Audio.farLevelOn = false
+    let r14 = Audio()
+    r14.setTestFarVoiceActive(false)
+    r14.feedFarLevelForTest(rmsDb: -30.0, peak: 0.1)
+    r14.tuneFarLevel()
+    say(r14.rxLevelMoves == 0 && r14.rxLevelWaited == 0 && r14.farGainApplied == 1.0 && r14.farGainTarget == 1.0,
+        "(14d) REJECT: with --far-level off nothing ever moves (the control arm)")
+    Audio.farLevelOn = true
+    r14.setTestFarVoiceActive(nil)
+
+    // ── 15. SIDETONE ON HEADPHONES ONLY (Task D2) ────────────────────────────
+    //
+    // Feeds a known capture block, runs the render mix on a silent far stream,
+    // and asserts output equals input * -16 dB within 0.1 dB.
+    let origSpeakers = Audio.outputIsSpeakers
+    let origSidetone = Audio.sidetoneEnabled
+    Audio.outputIsSpeakers = false
+    Audio.sidetoneEnabled = true
+    Audio.sidetoneDb = -16.0
+
+    let stAudio = Audio()
+    stAudio.outDevIsBtHfp = false
+    stAudio.mute = false
+    stAudio.updateSidetoneTarget()
+
+    say(stAudio.sidetoneFact == "-16 dB",
+        "(15a) headphones route fact reports '-16 dB' (fact: \(stAudio.sidetoneFact))")
+
+    let testSamples = [Float](repeating: 0.5, count: 480)
+    testSamples.withUnsafeBufferPointer { ptr in
+      stAudio.feedCaptureForSidetoneTest(ptr.baseAddress!, 480)
+    }
+    // Set steady-state gain to -16 dB directly to verify level precision
+    stAudio.forceSidetoneGainForTest(Float(pow(10.0, -16.0 / 20.0)))
+
+    var stOut = [Float](repeating: 0.0, count: 480)
+    stOut.withUnsafeMutableBufferPointer { ptr in
+      stAudio.applySidetone(ptr.baseAddress!, 480)
+    }
+
+    let expectedAmp = 0.5 * Float(pow(10.0, -16.0 / 20.0))
+    let measuredAmp = stOut[240]
+    let diffDb = abs(20.0 * log10(Double(measuredAmp / 0.5)) - (-16.0))
+    say(diffDb < 0.1 && abs(measuredAmp - expectedAmp) < 1e-4,
+        "(15a) headphones render mix equals input * -16 dB within 0.1 dB (measured \(String(format: "%.2f", 20.0 * log10(Double(measuredAmp / 0.5)))) dB, diff \(String(format: "%.3f", diffDb)) dB)")
+    say(stAudio.sidetoneMs > 0,
+        "(15a) and sidetone_ms tracked rendered duration (\(String(format: "%.2f", stAudio.sidetoneMs)) ms)")
+
+    // Starvation: reader past writer adds nothing and counts sidetone_starved
+    let starvedStart = stAudio.sidetoneStarved
+    var starveOut = [Float](repeating: 0.0, count: 48)
+    starveOut.withUnsafeMutableBufferPointer { ptr in
+      stAudio.applySidetone(ptr.baseAddress!, 48)
+    }
+    var starveMax: Float = 0
+    for v in starveOut { if abs(v) > starveMax { starveMax = abs(v) } }
+    say(starveMax == 0.0 && stAudio.sidetoneStarved == starvedStart + 48,
+        "(15b) starvation: reader past writer adds nothing and counts sidetone_starved (\(stAudio.sidetoneStarved - starvedStart) starved)")
+
+    // REJECT: outputIsSpeakers = true -> output stays exactly silent
+    Audio.outputIsSpeakers = true
+    let spkAudio = Audio()
+    spkAudio.outDevIsBtHfp = false
+    spkAudio.mute = false
+    spkAudio.updateSidetoneTarget()
+    say(spkAudio.sidetoneFact == "speakers",
+        "(15c) sidetone fact on speakers is 'speakers'")
+    say(spkAudio.sidetoneGainTarget == 0.0,
+        "(15c) sidetone target gain on speakers is 0")
+    testSamples.withUnsafeBufferPointer { ptr in
+      spkAudio.feedCaptureForSidetoneTest(ptr.baseAddress!, 480)
+    }
+    var spkOut = [Float](repeating: 0.0, count: 480)
+    spkOut.withUnsafeMutableBufferPointer { ptr in
+      spkAudio.applySidetone(ptr.baseAddress!, 480)
+    }
+    var maxSpk: Float = 0
+    for v in spkOut { if abs(v) > maxSpk { maxSpk = abs(v) } }
+    say(maxSpk == 0.0,
+        "(15c) REJECT: with outputIsSpeakers = true output stays exactly silent")
+    Audio.outputIsSpeakers = false
+
+    // REJECT: --sidetone off -> output stays exactly silent
+    Audio.sidetoneEnabled = false
+    let offAudio = Audio()
+    offAudio.outDevIsBtHfp = false
+    offAudio.mute = false
+    offAudio.updateSidetoneTarget()
+    say(offAudio.sidetoneFact == "off",
+        "(15d) sidetone fact with --sidetone off is 'off'")
+    say(offAudio.sidetoneGainTarget == 0.0,
+        "(15d) sidetone target gain with --sidetone off is 0")
+    testSamples.withUnsafeBufferPointer { ptr in
+      offAudio.feedCaptureForSidetoneTest(ptr.baseAddress!, 480)
+    }
+    var offOut = [Float](repeating: 0.0, count: 480)
+    offOut.withUnsafeMutableBufferPointer { ptr in
+      offAudio.applySidetone(ptr.baseAddress!, 480)
+    }
+    var maxOff: Float = 0
+    for v in offOut { if abs(v) > maxOff { maxOff = abs(v) } }
+    say(maxOff == 0.0,
+        "(15d) REJECT: with --sidetone off output stays exactly silent")
+
+    // REJECT: bt_hfp -> output stays exactly silent
+    Audio.sidetoneEnabled = true
+    let hfpAudio = Audio()
+    hfpAudio.outDevIsBtHfp = true
+    hfpAudio.mute = false
+    hfpAudio.updateSidetoneTarget()
+    say(hfpAudio.sidetoneFact == "off",
+        "(15e) sidetone fact in Bluetooth HFP mode is 'off'")
+    say(hfpAudio.sidetoneGainTarget == 0.0,
+        "(15e) sidetone target gain in Bluetooth HFP mode is 0")
+
+    Audio.outputIsSpeakers = origSpeakers
+    Audio.sidetoneEnabled = origSidetone
+
     fputs("GAIN CHECK: \(ok ? "PASS" : "FAIL")\n", stderr)
     return ok
   }
@@ -2519,7 +2918,13 @@ final class Audio {
     let g = sched.voiceGain(ms: ms)
     if ms <= sched.holdMs { return v * g }
     cnS += 1
-    return v * g + cn.next(rms: noiseFloor.rms) * sched.noiseGain(ms: ms)
+    // The comfort noise fades toward the far ROOM's floor. The render-thread
+    // tracker only knows what arrived, and on a speakers call the far microphone
+    // is muted to digital zero most of the time, so its estimate sits at zero and
+    // a gap right after their mute would fade to dead silence. The far end's own
+    // measurement of its room (one byte on the 1 Hz probe, 0.158.0) is the lower
+    // bound. Concealment gaps only: a silence the far end SENT is still silence.
+    return v * g + cn.next(rms: max(noiseFloor.rms, Wire.peerNoiseRms)) * sched.noiseGain(ms: ms)
   }
 
   /// The resampler's value at a fractional absolute position, or nil if the
@@ -3252,15 +3657,18 @@ final class Audio {
             "Linear AEC: removes echo linearly (\(String(format: "%.1f", echoRun.r.echoErleDb)) dB ERLE) without spectral masking")
     }
 
-    // 1.6 Subsonic rumble high-pass filter: 65 Hz 2nd-order Butterworth
+    // 1.6 Subsonic rumble high-pass filter: 55 Hz 2nd-order Butterworth (the
+    // product's default; a 15 Hz thump stands for a table knock -- at 55 Hz the
+    // filter takes 22.6 dB off it, and the 20 Hz probe the 65 Hz version used
+    // would read 17.6, which is the physics of the new corner, not a fault)
     do {
-      let hpf = HighPassFilter(cutoff: 65.0, sampleRate: SR)
+      let hpf = HighPassFilter(sampleRate: SR)
       let nHpf = 48000
       var rumble = [Float](repeating: 0, count: nHpf)
       var voice = [Float](repeating: 0, count: nHpf)
       var fund = [Float](repeating: 0, count: nHpf)
       for i in 0..<nHpf {
-        rumble[i] = 0.5 * sin(Float(2 * Double.pi * 20.0 * Double(i) / SR))
+        rumble[i] = 0.5 * sin(Float(2 * Double.pi * 15.0 * Double(i) / SR))
         voice[i] = 0.5 * sin(Float(2 * Double.pi * 200.0 * Double(i) / SR))
         fund[i] = 0.5 * sin(Float(2 * Double.pi * 85.0 * Double(i) / SR))
       }
@@ -3288,7 +3696,7 @@ final class Audio {
       let voiceAttenDb = 10.0 * log10(inVoiceE / max(outVoiceE, 1e-12))
       let fundAttenDb = 10.0 * log10(inFundE / max(outFundE, 1e-12))
       check(rumbleAttenDb > 18.0 && voiceAttenDb < 0.2 && fundAttenDb < 1.5,
-            "Subsonic HPF: 20 Hz rumble attenuated > 18 dB (\(String(format: "%.1f", rumbleAttenDb)) dB), 85 Hz fundamental (\(String(format: "%.2f", fundAttenDb)) dB) and 200 Hz harmonic preserved (\(String(format: "%.2f", voiceAttenDb)) dB loss)")
+            "Subsonic HPF (55 Hz): 15 Hz rumble attenuated > 18 dB (\(String(format: "%.1f", rumbleAttenDb)) dB), 85 Hz fundamental (\(String(format: "%.2f", fundAttenDb)) dB) and 200 Hz harmonic preserved (\(String(format: "%.2f", voiceAttenDb)) dB loss)")
 
       // Control arm: hpfOn = false bypass leaves signal bit-identical
       let prevHpf = Audio.hpfOn
@@ -4246,7 +4654,7 @@ final class Audio {
     }
   }
 
-  /// 2nd-order Butterworth high-pass filter at 65 Hz (Q = 0.707).
+  /// 2nd-order Butterworth high-pass filter at 55 Hz (Q = 0.707).
   /// Direct Form II Transposed biquad filter with Double-precision state.
   /// Eliminates subsonic rumble (HVAC, fan, table thumps, keyboard vibrations)
   /// below voice fundamentals (85+ Hz) to preserve dynamic range and avoid speaker distortion.
@@ -4259,7 +4667,12 @@ final class Audio {
     let a1: Double
     let a2: Double
 
-    init(cutoff: Double = 65.0, sampleRate: Double = SR, q: Double = 0.7071067811865475) {
+    // 55 Hz, not 65 (0.158.0): naturalness measurably falls once the low cutoff
+    // rises above 55 Hz (Moore & Tan 2003, 168 filter conditions), so 55 is the
+    // line itself. Not 50: the mains here are 50 Hz, and a corner AT the hum
+    // would pass it at -3 dB where 55 still takes ~4 dB off it. A male
+    // fundamental at 85 Hz now loses 0.7 dB instead of 1.5.
+    init(cutoff: Double = 55.0, sampleRate: Double = SR, q: Double = 0.7071067811865475) {
       let w0 = 2.0 * Double.pi * cutoff / sampleRate
       let cosW0 = cos(w0)
       let sinW0 = sin(w0)
@@ -5149,6 +5562,7 @@ final class Audio {
     inScratch = .allocate(capacity: 4096)
     inScratch.initialize(repeating: 0, count: 4096)
     inBufList = .allocate(capacity: 1)
+    updateSidetoneTarget()
   }
 
   // ── Device plumbing ──────────────────────────────────────────────────────
@@ -5502,7 +5916,13 @@ final class Audio {
           + "*** Audio MIDI Setup, and run again.\n\n", stderr)
       throw Err.e("\(input ? "input" : "output") device at \(Int(rate)) Hz, need \(Int(SR)) Hz")
     }
-    if input { inDev = dev } else { outDev = dev }
+    if input {
+      inDev = dev
+    } else {
+      outDev = dev
+      outDevIsBtHfp = (outDev != 0) ? Audio.isBtHfp(dev: outDev, input: false) : false
+      updateSidetoneTarget()
+    }
     // The beat's `in_rate`/`out_rate` read 0 on every live call because they were
     // set only in the other start path. The rate read back is the one in effect.
     if input { hwInRate = rate } else { hwOutRate = rate }
@@ -5525,6 +5945,9 @@ final class Audio {
   }
 
   func start() throws {
+    // The 10 Hz pause check for a waiting gain move (a real engine only: the
+    // gain rig drives `checkPendingTrim` itself and must not race a timer).
+    startPauseCheck()
     // The rig's overrides for the canceller, applied before a sample moves.
     // Every production cadence gets a rig override (`compress-waits-in-test-rigs`);
     // these two are the ones `--aec-sweep` reads the defaults off.
@@ -5596,6 +6019,8 @@ final class Audio {
     // What this call is running on, as facts, and the lab: the 1 Hz analysis
     // thread, and the tapes if this Mac is in lab mode. Off the audio thread, once.
     _ = AudioLab.recordDeviceFacts(inDev: inDev, outDev: outDev)
+    outDevIsBtHfp = (outDev != 0) ? Audio.isBtHfp(dev: outDev, input: false) : false
+    updateSidetoneTarget()
     lab.start()
     if Lab.tapesOn() && !Lab.noTapesForRun {
       Metrics.fact("lab", "on")
@@ -5984,7 +6409,7 @@ final class Audio {
     // that the microphone is not processed.
     applyCaptureTrim(inScratch, Int(n))
 
-    // Subsonic rumble high-pass filter: 2nd-order Butterworth at 65 Hz (Q = 0.707).
+    // Subsonic rumble high-pass filter: 2nd-order Butterworth at 55 Hz (Q = 0.707).
     // Eliminates table thumps, keyboard impacts, and HVAC rumble before LPC compression.
     if Audio.hpfOn {
       captureHpf.process(inScratch, Int(n))
@@ -5992,6 +6417,10 @@ final class Audio {
     // The tape's `raw.wav`: the microphone as heard, after trim and filter,
     // before anything decides what to do with it. A memcpy into a ring, or nothing.
     lab.tape.raw(inScratch, Int(n))
+    for k in 0..<Int(n) {
+      sideRing[sideW & 8191] = inScratch[k]
+      sideW += 1
+    }
 
     // What the microphone actually delivered. Placed HERE deliberately: after the
     // file substitution so a rig measures its own input, and before the simulated
@@ -6309,6 +6738,7 @@ final class Audio {
         out[i] = 0
         CallRecorder.shared.recordAudioSample(0)
       }
+      applySidetone(out, Int(n))
       return
     }
     if ring.pos < 0 {
@@ -6317,6 +6747,7 @@ final class Audio {
           out[i] = 0
           CallRecorder.shared.recordAudioSample(0)
         }
+        applySidetone(out, Int(n))
         return
       }
       ring.pos = Double((hi - Int64(jitTarget)) * Int64(FPP))
@@ -6575,6 +7006,25 @@ final class Audio {
           xfade -= 1
           if xfade == 0 { plcPeriod = 0; plcSamples = 0 }
         }
+        if dgate.farEnvNow > 0.004 {
+          farVoicedSumSq += Double(val) * Double(val)
+          farVoicedN += 1
+          farQuietRun = 0
+        } else {
+          farQuietRun += 1
+        }
+        let farAbs = abs(val)
+        if farAbs > farPeakWin { farPeakWin = farAbs }
+
+        if farGainStep != 0 {
+          farGainApplied += farGainStep
+          if (farGainStep > 0 && farGainApplied >= farGainTarget) || (farGainStep < 0 && farGainApplied <= farGainTarget) {
+            farGainApplied = farGainTarget
+            farGainStep = 0
+          }
+        }
+        val *= farGainApplied
+
         // Presence is applied to what LEAVES the machine, not to what the rest
         // of this loop reasons about. The concealment history, the edge detector
         // and the continuity metrics all want the clean stream; feeding a room
@@ -6740,6 +7190,25 @@ final class Audio {
         } else if !concealZeros {
           val = plcNext()
         }
+        if dgate.farEnvNow > 0.004 {
+          farVoicedSumSq += Double(val) * Double(val)
+          farVoicedN += 1
+          farQuietRun = 0
+        } else {
+          farQuietRun += 1
+        }
+        let farAbs2 = abs(val)
+        if farAbs2 > farPeakWin { farPeakWin = farAbs2 }
+
+        if farGainStep != 0 {
+          farGainApplied += farGainStep
+          if (farGainStep > 0 && farGainApplied >= farGainTarget) || (farGainStep < 0 && farGainApplied <= farGainTarget) {
+            farGainApplied = farGainTarget
+            farGainStep = 0
+          }
+        }
+        val *= farGainApplied
+
         let played = presence(val)
         noteFar(played)
         CallRecorder.shared.recordAudioSample(played)
@@ -6826,6 +7295,10 @@ final class Audio {
       acFired += 1
       acNext = dueHost + Clock.ticks(ns: 400_000_000)   // one every 400 ms
     }
+    // Do NOT feed the sidetone into anything that reaches the wire, the echo canceller's
+    // reference, the tape's played.wav, or the lab's rx analysis: add it at the very last step,
+    // into out[i] only, after emitted is computed and recorded.
+    applySidetone(out, Int(n))
   }
 
 }

@@ -15,7 +15,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.157.0"
+let VERSION = "0.158.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -620,6 +620,7 @@ let KNOWN_FLAGS: Set<String> = [
   // The audio lab (mac/TELEMETRY-AUDIO.md): its rulers' selftest, the lab-mode
   // switch (`--lab on|off`, or bare to print it), and the tape control arm.
   "selftest-audiolab", "lab", "no-tapes",
+  "far-level", "sidetone",
 ]
 // ── A TEST IS NOT A CALL, AND MUST NOT ACT LIKE ONE ─────────────────────────
 //
@@ -1773,10 +1774,21 @@ func postFinalBeat(why: String) -> Bool {
   // anything. Without this line every answered ring would have been reported as
   // an app that died without saying goodbye.
   Crash.endRun()
-  Audio.recordFinishedCall(durationS: Double(beatTick), capSkips: audio.capSkips, renderSkips: audio.renderSkips,
-                           capCallbacks: audio.capCallbacks, explicitOverride: arg("devbuf") != nil)
-  // The tape before the beat: the beat carries the tape's final size and state.
-  if beatReady { audio.finishTapes() }
+  // UNDER `beatReady`, like the tape below: `audio` is created by top-level code
+  // ~3500 lines further down, and three exits reach here BEFORE that -- a ring
+  // answered from the card (`Launcher.beforeReexec`), a cancel while waiting
+  // (`hangUpAndExit`), the caller hanging up while this Mac rang (`handleBye`).
+  // 0.157.0 read `audio.capSkips` here unguarded and every one of those exits
+  // died with SIGSEGV; the goodbye had already left the socket, so bye-check,
+  // calling-check and leave-check stayed green and only the crash reports saw it
+  // (`final-beat-read-audio-before-it-existed`, `top-level-code-runs-in-order`).
+  // An engine that never ran teaches the buffer policy nothing anyway.
+  if beatReady {
+    Audio.recordFinishedCall(durationS: Double(beatTick), capSkips: audio.capSkips, renderSkips: audio.renderSkips,
+                             capCallbacks: audio.capCallbacks, explicitOverride: arg("devbuf") != nil)
+    // The tape before the beat: the beat carries the tape's final size and state.
+    audio.finishTapes()
+  }
   guard Telemetry.enabled else { return false }
   // Last second's percentiles, not a live sort of the audio-thread buffer.
   var beat = audioBeat(uptime: Double(beatTick),
@@ -4330,6 +4342,18 @@ let fecAllowed = !flag("no-fec")
 if flag("no-agc") { Audio.agcOn = false }
 if flag("no-auto-gain") { Audio.autoGain = false }
 if flag("gain-debug") { Audio.gainDebug = true }
+if let fl = arg("far-level") { Audio.farLevelOn = (fl != "off") }
+if let st = arg("sidetone") {
+  if st == "off" {
+    Audio.sidetoneEnabled = false
+  } else {
+    Audio.sidetoneEnabled = true
+    let stripped = st.replacingOccurrences(of: "dB", with: "").replacingOccurrences(of: "db", with: "").trimmingCharacters(in: .whitespaces)
+    if let db = Float(stripped) {
+      Audio.sidetoneDb = db
+    }
+  }
+}
 
 // HOW FAR AWAY THE OTHER PERSON SOUNDS. Distance is monaural -- level, the
 // direct-to-reverberant ratio and spectrum -- so unlike direction it arrives
@@ -7414,6 +7438,11 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "mic_trim": Double(audio.inputTrim), "mic_trim_moves": audio.trimMoves,
     "mic_trim_deferred": audio.trimDeferred, "mic_trim_wait_ms": audio.trimWaitMs,
     "mic_gain_rail": audio.gainAtRail ? 1 : 0,
+    "a_rx_level_gain_db": audio.rxLevelGainDb,
+    "a_rx_level_moves": audio.rxLevelMoves,
+    "a_rx_level_waited": audio.rxLevelWaited,
+    "sidetone_ms": audio.sidetoneMs,
+    "sidetone_starved": audio.sidetoneStarved,
     // Turn-taking is the product now, so it reports like the product.
     "turn_claims": audio.turns.claims, "turn_granted": audio.turns.claimsGranted,
     "turn_to_floor_p50": audio.timeToFloorP50,
@@ -7440,6 +7469,7 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "v_rx_w": gRxWidth, "v_rx_h": gRxHeight,
     "peer_rx_lost": wire.peerRxLost, "peer_rx_recovered": wire.peerRxRecovered,
     "peer_reports": wire.peerReportsLoss ? 1 : 0,
+    "a_peer_noise_reports": wire.peerNoiseReports,
     // 1 direct, 2 relayed, 0 not locked yet. A relayed call is a different
     // product to a direct one and the dashboard could not tell them apart.
     "route": wire.lockedFrom.hasPrefix("relay") ? 2 : (wire.lockedFrom.isEmpty ? 0 : 1),
@@ -7533,6 +7563,7 @@ func audioBeat(uptime: Double, up: Double, down: Double,
   // The listener's numbers -- mac/TELEMETRY-AUDIO.md. Cumulative fields always,
   // window fields only when the window had something to measure.
   audio.labBeat(into: &f, m2eP50: p50)
+  if let v = wire.peerNoiseDb { f["a_peer_noise_db"] = v }
   if let v = p50 { f["m2e_p50"] = v }
   if let v = p95 { f["m2e_p95"] = v }
   if let v = p99 { f["m2e_p99"] = v }

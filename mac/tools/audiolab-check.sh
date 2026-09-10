@@ -88,12 +88,13 @@ def say(ok, what):
 say(len(live) >= 3, f"{len(live)} live beats")
 cumul = ["a_rx_voice_ms","a_rx_conceal_voiced_ms","a_rx_conceal_quiet_ms","a_rx_glitches","a_rx_silence_ms",
          "a_rx_clip_pct","a_rate_fast_ms","a_rate_max_pct","a_tx_voice_ms","a_tx_voice_muted_ms",
-         "a_tx_softlimit_pct","a_echo_talk_s","a_echo_return_s","tape_bytes","tape_full","in_rate","out_rate"]
+         "a_tx_softlimit_pct","a_echo_talk_s","a_echo_return_s","tape_bytes","tape_full","in_rate","out_rate",
+         "a_peer_noise_reports"]
 # `a_rx_noise_db` is deliberately not required: it needs far-end PAUSES, and a
 # recording that talks for the whole call has none to measure -- absent is the
 # right answer there, not a fault.
 window = ["a_rx_level_db_p50","a_rx_level_db_p90","a_tx_level_db_p50","a_tx_noise_db",
-          "a_tx_snr_db","a_rx_bw_khz","a_tx_bw_khz"]
+          "a_tx_snr_db","a_rx_bw_khz","a_tx_bw_khz","a_peer_noise_db"]
 last = live[-1]
 missing = [k for k in cumul if not isinstance(last.get(k), (int, float))]
 say(not missing, "every cumulative field present" if not missing else f"missing cumulative fields: {missing}")

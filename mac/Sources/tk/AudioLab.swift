@@ -113,6 +113,11 @@ final class AudioLab {
   private var rxRead = 0, txRead = 0             // frame ring read cursors (beat)
   private var running = false
   private var turnGaps = TurnGaps()
+  /// This room's floor as last measured (dBFS), for the 1 Hz probe to carry to the
+  /// far end. Written on the reporter thread, read on the socket thread: a plain
+  /// Double so the read can never tear (an Optional is two words); `.nan` = not
+  /// measured yet, which the byte codec sends as "unknown".
+  nonisolated(unsafe) static var txNoiseDbNow: Double = .nan
 
   let tape = Tape()
 
@@ -543,7 +548,10 @@ final class AudioLab {
     let txF = drain(tx, &txRead)
     let t = AudioLab.levels(txF, noiseFrom: true)
     if let v = t.p50 { f["a_tx_level_db_p50"] = v }
-    if let v = t.noise { f["a_tx_noise_db"] = v }
+    if let v = t.noise {
+      f["a_tx_noise_db"] = v
+      AudioLab.txNoiseDbNow = v
+    }
     if let p = t.p50, let n = t.noise { f["a_tx_snr_db"] = p - n }
 
     // Both rings advance one frame per 50 ms wall time, written by render and capture
@@ -997,6 +1005,20 @@ final class AudioLab {
       return false
     }
     let all = [UInt8](repeating: 1, count: 48000)
+    // ── room floor byte codec (0.158.0) ──
+    let b58 = Wire.roomFloorByte(-58.0)
+    let d58 = Wire.roomFloorDb(from: b58)
+    say(b58 == 116 && d58 == -58.0, "room floor codec: -58.0 dB -> byte 116 -> -58.0 dBFS")
+    let b127 = Wire.roomFloorByte(-127.5)
+    let d127 = Wire.roomFloorDb(from: b127)
+    say(b127 == 254 && d127 == -127.0, "room floor codec: -127.5 dB clamps to byte 254 -> -127.0 dBFS")
+    let bNil = Wire.roomFloorByte(nil)
+    let dNil = Wire.roomFloorDb(from: bNil)
+    say(bNil == 255 && dNil == nil, "room floor codec: nil -> byte 255 -> absent -- REJECT row")
+    let bZero = Wire.roomFloorByte(0.0)
+    let dZero = Wire.roomFloorDb(from: bZero)
+    say(bZero == 0 && dZero == 0.0, "room floor codec: 0 dB -> byte 0 -> 0.0 dBFS")
+
     // ── bandwidth ──
     let aSec = Array(a[SR_I..<SR_I * 2])
     let bwRaw = bandwidthKHz(aSec, voiced: all)

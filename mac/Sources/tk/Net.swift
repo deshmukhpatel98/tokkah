@@ -37,6 +37,10 @@ let CAP_PCM16: UInt32 = 1 << 0
 /// Lossless prediction + Rice coding on the payload. Advertised, never assumed:
 /// a peer that does not know the format would read the mode byte as a sample.
 let CAP_PCM_LP: UInt32 = 1 << 1
+/// Extension carrying room floor: TPKTW = TPKTZ + 4.
+/// +0 room_floor UInt8: 255 = unknown/absent, else round(-noiseDb * 2) in 0...254
+/// +1..+3 reserved 0
+let TPKTW = TPKTZ + 4
 let MAGIC: UInt32 = 0x544B_0001
 /// "send me a keyframe". Eight bytes, no payload, sent by a receiver that cannot
 /// decode. Necessary because H.264 parameter sets ride only with keyframes and
@@ -858,6 +862,7 @@ final class Wire {
   /// layer 2 cannot be seen without a monitor-mode capture. So this fact is what
   /// the stack CLAIMS, and the comment is what was seen. `net_svc_mark`:
   /// `unknown` / `l2` / `l3l2` / `l3l2-bk` / `unreadable:<errno>`.
+  private var markingNoted = false
   private func noteMarkingLevel() {
     var lvl: Int32 = -1
     var len = socklen_t(MemoryLayout<Int32>.size)
@@ -933,7 +938,10 @@ final class Wire {
     // The marking level is only knowable once the stack has routed packets out
     // of an interface, so it is read back here, once, a few hundred sends in --
     // and written as a fact, because it is about this Mac on this network.
-    if sent == 300 { noteMarkingLevel() }
+    // `>=` with a flag, not `== 300`: `sent` is also advanced by probe replies and
+    // the relay paths, and the 300th send landed there on the first live check,
+    // so the fact never appeared (`readback-is-not-in-effect`, the other way).
+    if sent >= 300, !markingNoted { markingNoted = true; noteMarkingLevel() }
   }
 
   /// One datagram in the Wi-Fi VOICE queue, from a socket whose default class is
@@ -1080,7 +1088,7 @@ final class Wire {
     candLock.unlock()
     pathLock.unlock()
     if targets.isEmpty { return }
-    var out = [UInt8](repeating: 0, count: TPKTZ)
+    var out = [UInt8](repeating: 0, count: TPKTW)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -1323,6 +1331,11 @@ final class Wire {
   private let lpTmp = UnsafeMutablePointer<UInt8>.allocate(capacity: Lpc.MAXN * 2)
   private(set) var peerRxLost: Int = 0
   private(set) var peerRxRecovered: Int = 0
+  /// The far room's floor (0.158.0), carried in the TPKTW probe extension.
+  private(set) var peerNoiseDb: Double? = nil
+  private(set) var peerNoiseAt: UInt64 = 0
+  private(set) var peerNoiseReports: Int = 0
+  nonisolated(unsafe) static var peerNoiseRms: Float = 0
   /// What the far end reports about ITSELF. `peerPlayed` is the one that
   /// separates "they cannot hear me" from "they are fine and I am not sending".
   private(set) var peerPlayed: Int = 0
@@ -1413,6 +1426,20 @@ final class Wire {
     UInt8(clamping: Int((min(1, max(0, p)) * 255.0).rounded()))
   }
   static func endProb(from b: UInt8) -> Double { Double(b) / 255.0 }
+
+  /// Room floor noise level in dBFS, packed into TPKTZ+0 of the TPKTW probe extension.
+  /// Encoding: 255 = unknown/absent; otherwise v = round(−noiseDb × 2) clamped to 0…254,
+  /// i.e. 0.5 dB steps from 0 dBFS down to −127 dBFS. Decode noiseDb = −Double(v) / 2.
+  static func roomFloorByte(_ noiseDb: Double?) -> UInt8 {
+    guard let db = noiseDb, db.isFinite else { return 255 }
+    let v = Int((-db * 2.0).rounded())
+    return UInt8(clamping: max(0, min(254, v)))
+  }
+
+  static func roomFloorDb(from b: UInt8) -> Double? {
+    if b == 255 { return nil }
+    return b == 0 ? 0.0 : -Double(b) / 2.0
+  }
 
   var selfStatus = 0
   /// What the far end's status byte says. Both are false against a build that
@@ -1614,11 +1641,19 @@ final class Wire {
     p.storeBytes(of: Wire.endProbByte(Audio.turnEndProb),
                  toByteOffset: TPKTX + 7, as: UInt8.self)
     // The video's own receive-side numbers. See TPKTZ.
-    guard p.count >= TPKTZ, let v = reportVideo else { return }
-    p.storeBytes(of: UInt32(truncatingIfNeeded: v.missing).littleEndian,
-                 toByteOffset: TPKTY, as: UInt32.self)
-    p.storeBytes(of: UInt32(truncatingIfNeeded: v.fragsIn).littleEndian,
-                 toByteOffset: TPKTY + 4, as: UInt32.self)
+    if p.count >= TPKTZ, let v = reportVideo {
+      p.storeBytes(of: UInt32(truncatingIfNeeded: v.missing).littleEndian,
+                   toByteOffset: TPKTY, as: UInt32.self)
+      p.storeBytes(of: UInt32(truncatingIfNeeded: v.fragsIn).littleEndian,
+                   toByteOffset: TPKTY + 4, as: UInt32.self)
+    }
+    // The far room's floor (0.158.0). See TPKTW.
+    guard p.count >= TPKTW else { return }
+    let floorByte = Wire.roomFloorByte(AudioLab.txNoiseDbNow)
+    p.storeBytes(of: floorByte, toByteOffset: TPKTZ, as: UInt8.self)
+    p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 1, as: UInt8.self)
+    p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 2, as: UInt8.self)
+    p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 3, as: UInt8.self)
   }
 
   /// The video assembler whose counters get reported to the peer, set when the
@@ -1814,7 +1849,7 @@ final class Wire {
   /// One offset probe. Cheap enough (32 bytes) to send often, and it rides the
   /// media socket so it measures the path the media actually takes.
   func sendTimeProbe() {
-    var out = [UInt8](repeating: 0, count: TPKTZ)
+    var out = [UInt8](repeating: 0, count: TPKTW)
     out.withUnsafeMutableBytes { p in
       p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
       p.storeBytes(of: UInt32(0).littleEndian, toByteOffset: 4, as: UInt32.self)
@@ -2402,6 +2437,23 @@ final class Wire {
           peerVideoFrags = Int(vf)
           peerReportsVideoLoss = true
         }
+        if plainN >= TPKTW {
+          let rf = plain[TPKTZ]
+          if rf == 255 {
+            peerNoiseDb = nil
+            Wire.peerNoiseRms = 0
+          } else {
+            let db = Wire.roomFloorDb(from: rf)
+            peerNoiseDb = db
+            peerNoiseAt = t4
+            peerNoiseReports += 1
+            if let d = db {
+              Wire.peerNoiseRms = Float(pow(10.0, d / 20.0))
+            } else {
+              Wire.peerNoiseRms = 0
+            }
+          }
+        }
         if plainN >= TPKTY {
           let pl = (plain + TPKTX).withMemoryRebound(to: UInt32.self, capacity: 1) { UInt32(littleEndian: $0[0]) }
           peerPlayed = Int(pl)
@@ -2463,7 +2515,7 @@ final class Wire {
           // another thread would put that thread's scheduling delay inside t3-t2,
           // where it is indistinguishable from network asymmetry and biases the
           // offset by half of it.
-          var out = [UInt8](repeating: 0, count: TPKTZ)
+          var out = [UInt8](repeating: 0, count: TPKTW)
           out.withUnsafeMutableBytes { p in
             p.storeBytes(of: TMAGIC.littleEndian, toByteOffset: 0, as: UInt32.self)
             p.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 4, as: UInt32.self)
