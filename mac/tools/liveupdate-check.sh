@@ -234,6 +234,27 @@ else
     || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- the second signature failed: $(cat "$SP/sign2.err")"; exit 2; }
   [ -s "$SP/upd/manifest.json.sig2" ] \
     || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- sign2 produced an empty second signature"; exit 2; }
+  # ── AND A MANIFEST THAT IS NOT NEWER, SIGNED AND READY TO SWAP IN ──────────
+  #
+  # The payload is this same binary, so the image that comes back from the update
+  # still reports the old version and finds "99.0.0" again. That used to cost one
+  # extra update at TK_UPDATE_GRACE seconds after the successor's launch, and the
+  # window was sized to hold it. Two things moved since: opening Kin checks AT
+  # ONCE, and an image restarted mid-call (TK_UPDATE_MIDCALL=1) commits without a
+  # grace -- so the successor re-updated within a second of every launch, forever,
+  # and the far end saw a call that reconnected once a second and carried nothing
+  # (measured 2026-09-11: six installs in 22 s, recv 0/s in every one of the far
+  # end's reports). Production cannot loop this way -- a real payload is newer than
+  # the image it replaces -- so the rig has to do what a real release does: once
+  # the tarball has been served, the manifest on the server stops being newer.
+  # Prepared here, both signatures included, so the swap is three copies.
+  mkdir -p "$SP/upd-stale"
+  printf '{"version":"0.0.1","url":"http://127.0.0.1:%s/dl/tk.tar.gz","sha256":"%s","notes":"rig, already taken"}' \
+    "$UPDPORT" "$SHA" > "$SP/upd-stale/manifest.json"
+  "$HERE/sign" "$SP/upd-stale/manifest.json" > "$SP/upd-stale/manifest.json.sig" 2>/dev/null \
+    || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- signing the stale manifest failed"; exit 2; }
+  KEYCHAIN_NAME="$KCN" "$SIGN2" "$SP/upd-stale/manifest.json" > "$SP/upd-stale/manifest.json.sig2" 2>/dev/null \
+    || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- second-signing the stale manifest failed"; exit 2; }
   spawn python3 -m http.server "$UPDPORT" --bind 127.0.0.1 --directory "$SP/upd" > "$SP/http.log" 2>&1
   perl -e 'select undef,undef,undef,1'
   R4="lurig$$d"
@@ -263,7 +284,20 @@ else
   # the same update again. That is correct behaviour for a real release and an
   # artifact of reusing one binary, so the window is sized to hold exactly one
   # update and its recovery.
-  perl -e 'select undef,undef,undef,22'
+  # Twenty-two seconds, polled: the moment the server has served the tarball once,
+  # the manifest it serves stops being newer (see the stale manifest above), so the
+  # successor's immediate check finds nothing to do and the ONE update this arm is
+  # about is the only one that happens. The tarball goes too, so even a successor
+  # that read the old manifest a hair before the swap cannot take it twice.
+  SWAPPED=""
+  for i in $(seq 1 110); do
+    perl -e 'select undef,undef,undef,0.2'
+    if [ -z "$SWAPPED" ] && grep -q "GET /dl/tk.tar.gz" "$SP/http.log" 2>/dev/null; then
+      cp "$SP/upd-stale/manifest.json" "$SP/upd-stale/manifest.json.sig" "$SP/upd-stale/manifest.json.sig2" "$SP/upd/"
+      rm -f "$SP/upd/dl/tk.tar.gz"
+      SWAPPED=1
+    fi
+  done
   reap
   started "$SP/g.log"; started "$SP/h.log"
 fi
@@ -380,6 +414,10 @@ if [ -f "$SP/h.log" ]; then
   grep -q "update: installed 99.0.0" "$SP/h.log" \
     && say "OK" "the signed update was fetched, verified and installed mid-call" \
     || say "FAIL" "the update never installed: $(grep -m1 '^update:' "$SP/h.log")"
+  NINST=$(grep -c "update: installed 99.0.0" "$SP/h.log" || true)
+  [ "${NINST:-0}" = "1" ] \
+    && say "OK" "exactly once -- the successor found nothing newer and stayed in the call" \
+    || say "FAIL" "the update was taken ${NINST:-0} times in one window -- a re-exec loop, and the far end's silence below is its shadow"
   grep -q "final beat (update-restart)" "$SP/h.log" \
     && say "OK" "and the outgoing image filed its ending before execv took it" \
     || say "FAIL" "the update re-exec filed no final beat -- the call vanishes from the record"
