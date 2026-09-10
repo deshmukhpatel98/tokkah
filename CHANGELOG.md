@@ -48,6 +48,16 @@ controller again (it could not: its two ends are loopback, so it never paused).
 Whether the LAN inhibit is right at all is open — two Macs on one congested
 access point lose voice packets too — and is recorded here rather than settled.
 
+With the rig able to pause again, the question left open since 2026-09-01 ("does
+the pause have a domain at all?") has an answer. `vpause-check`'s ladder now
+climbs to where the voice *with its FEC repair copies* fits: under a full queue
+the voice alone is 2.7 Mbps on the wire (repair copies 1.35), not the clean 0.95,
+so at ceilings of 1.14 and 1.48 Mbps the pause cannot help and the app rightly
+abandons it (864/s → 799/s, 726/s → 639/s); at 2.48 Mbps the pause halved the
+harm (212/s → 83/s) and was kept. The rig judges each abandonment against the
+sender's own bytes-out while paused, so "the voice did not fit" and "a working
+pause was abandoned" are told apart.
+
 ### Rigs — the suite's rot, itemised
 
 Seven rigs failed identically on the shipped 0.156.0 and 0.157.0. Three were the
