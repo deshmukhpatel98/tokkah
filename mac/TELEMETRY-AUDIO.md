@@ -101,6 +101,48 @@ correlation of **0.20**: a −10 dB return under an equal-level far voice can on
 reach ~0.29, and the null (an unrelated voice, best of 9000 lags over one
 second) measured 0.06.
 
+## Turns (0.157.0)
+
+Conversational turn dynamics: the north-star behavioural metric for "does this
+feel like the same room" (PERCEPTION.md §3). Measured on 50 ms frames from the
+audio frame rings (`TurnGaps`). Consecutive voice runs with internal pauses
+under 200 ms are merged into turns; runs under 200 ms are short bursts (backchannels,
+coughs) and never trigger speaker changes.
+
+| field | kind | meaning |
+|---|---|---|
+| `a_turn_changes` | cumul | count of speaker changes across the whole call so far (both directions). Always emitted (0 before first change). |
+| `a_turn_overlap_pct` | cumul | share of speaker changes that overlapped (new speaker started before previous finished), in %. Absent if no changes. |
+| `a_turn_gap_mine_p50_ms` | cumul | median gap when this person answered them (theirs→mine, positive intervals only), ms. Absent if no theirs→mine changes. |
+| `a_turn_gap_mine_p90_ms` | cumul | 90th percentile gap when this person answered them, ms. Absent if no theirs→mine changes. |
+| `a_turn_gap_theirs_p50_ms` | cumul | median gap when they answered this person (mine→theirs, positive intervals only), ms. Absent if no mine→theirs changes. |
+| `a_turn_gap_theirs_p90_ms` | cumul | 90th percentile gap when they answered this person, ms. Absent if no mine→theirs changes. |
+| `a_turn_short_bursts` | cumul | count of vocal runs under 200 ms across both speakers. Always emitted. |
+
+Known inputs (`audio/Tests/KinAudioTests/TurnGapsTests.swift`):
+1. A talks 2.0 s, 300 ms of nobody, B talks 2.0 s → 1 change, gap 300 ± 50 ms, overlap 0 %.
+2. B starts 400 ms before A stops → 1 change, overlap 100 %, no positive gap (p50 absent).
+3. A 100 ms blip inside A's turn → still 1 turn, no change (reject).
+4. A 150 ms "mm" from B during A's turn → counted as a short burst, no change (reject).
+5. A talks with a 150 ms internal pause → 1 turn, not 2.
+6. Nobody talks → 0 changes, every percentile field absent.
+
+## The sender and the socket (0.157.0)
+
+| field | kind | meaning |
+|---|---|---|
+| `mic_trim_deferred` | cumul | gain ticks that wanted to move the trim or the input knob and waited, because the person was talking (a move lands only after 200 ms with no voice). |
+| `mic_trim_wait_ms` | cumul | ms those pending moves waited before a pause let them apply. |
+| `cap_skips_pm` | now | capture wakeups missed per minute of this call so far (`cap_skips` over uptime). Above 20 for a call ≥ 30 s, the next call on this Mac runs a doubled IO buffer. |
+| `render_skips` | cumul | render wakeups missed (the callback came more than 1.5× its period late) — the same hole on the listening side. |
+| `devbuf` | now | the IO buffer in frames this call ran (16 hal / 128 vp by default; `devbuf.json` per IO path). |
+
+| fact | values |
+|---|---|
+| `devbuf_reason` | `default`; `flag` (`--devbuf` given, never persisted); or the stored decision in words, e.g. `skipped 13.6 wakeups a minute at 16 frames — 32 next call`, `clean for 3 calls at 32 — back to 16`, `steady`, `call too short`. |
+| `net_svc` | `vi+vo`: the socket's default class is interactive video and every audio datagram carries the interactive-voice class on its own send; `refused:<errno>` if the option was rejected. |
+| `net_svc_mark` | what the stack claims for this route, read once after 300 sends: `unknown`, `l2` (Wi-Fi queue only), `l3l2` (DSCP too), `l3l2-bk`. On a home Wi-Fi it reads `l3l2` while the wire carries tos 0x0 — the queue class is the part in effect (RESEARCH.md §10). |
+
 ## The bandwidth ruler (`*_bw_khz`)
 
 On ≥ 300 ms of voiced audio in the window: Hann 2048-point FFTs at 50% overlap
@@ -231,6 +273,7 @@ the held audio away).
 ```
 HEARD     clean 99.2% of their voice · 0.4 glitches/min · dead air 3.1 s · level -24 dBFS (swing 2 dB) · band 14 kHz · pitch-up 0 s
 SAID      talked 142 s · 2.3 s of your words never left · soft-limited 0.0% · noise -58 dBFS (SNR 34 dB) · band 12 kHz · trim 0.42
+TURNS     you answered 0.4 s after them (p90 1.1 s) · they answered 0.9 s after you · 31 % of changes overlapped
 RETURN    heard yourself 0% of your talking
 DEVICES   in "MacBook Air Microphone" builtin 48000/1ch · out "EarPods" usb 48000/2ch · phone-mode no · mic mode standard · route headphones
 VERDICT   you heard them: clear · they heard you: 2.3 s of words lost to the floor
