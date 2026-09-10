@@ -234,19 +234,44 @@ fi
 # is a more useful answer than a pass at a number somebody picked. It stops at the
 # first rung that produces a verdict; if no rung does, the note underneath is
 # unchanged and still honest.
+# ── THE VOICE ALONE IS NOT THE CLEAN VOICE ──────────────────────────────────
+#
+# `WITHOUT` is measured on a clean link, where FEC is off. Under a full queue the
+# loss turns FEC on, and its repair copies are not small: measured 2026-09-11 with
+# the picture paused, `bytes out: audio 2.70 Mbps (repair copies 1.35)` against a
+# clean 0.95 -- the voice alone is nearly three times its clean rate the moment it
+# needs protecting. So at 1.15x and 1.5x the clean rate the voice alone does not
+# fit, the pause cannot help, and the app's "NOT HELPING -- ABANDONED" is the
+# controller being RIGHT (813/s -> 692/s at 1.42 Mbps). The first time this arm
+# ever constructed its case, that was read as "a working pause was abandoned".
+#
+# The ladder therefore climbs to where the voice WITH its repair copies fits and
+# the video on top of it does not (5.1 Mbps offered), and every "not helping" rung
+# is judged against the sender's own `bytes out: audio` while the picture was off:
+# a voice that did not fit could not have been helped; a voice that fitted and
+# was abandoned anyway is the defect. The domain is reported, not assumed.
 CAPS="$(python3 -c "
 w=${WITHOUT:-1}
-print(' '.join('%.2f' % (w*f) for f in (1.15, 1.5)))")"
-VERDICT2=""
+print(' '.join('%.2f' % (w*f) for f in (1.15, 1.5, 2.5, 3.5, 4.5)))")"
+VERDICT2=""; OUTCOME=none; PAUSED_AUDIO=""
 for RUNG in $CAPS; do
-  echo "     trying a ceiling of ${RUNG} Mbps (voice alone needs ${WITHOUT})"
+  echo "     trying a ceiling of ${RUNG} Mbps (voice alone needs ${WITHOUT} clean, more with repair copies)"
   run cap --imp-capacity "$RUNG" --imp-capacity-queue
-  VERDICT2="$(grep -oE 'voice harm [^]]*with no video: [A-Za-z ]*' "$SP/cap-a.log" | head -1)"
-  # Only a rung where the pause HELPED ends the ladder. Breaking on any verdict
-  # let the first rung's "NOT HELPING" stop the sweep before a valid ceiling
-  # was ever tried -- and the first rung (0.85x voice alone) could not help by
-  # construction: below the voice's own rate there is nothing a pause gives back.
-  case "$VERDICT2" in *"the pause is helping"*) CAP="$RUNG"; break ;; esac
+  V="$(grep -oE 'voice harm [^]]*with no video: [A-Za-z ]*' "$SP/cap-a.log" | head -1)"
+  case "$V" in
+    *"the pause is helping"*) OUTCOME=helping; VERDICT2="$V"; CAP="$RUNG"; break ;;
+    *"NOT HELPING"*)
+      PAUSED_AUDIO="$(sed -n '/picture: video PAUSED/,/picture: video resumed/p' "$SP/cap-a.log" \
+                      | grep -oE 'bytes out: audio [0-9.]+' | awk '{print $4}' | sort -n | tail -1)"
+      if python3 -c "import sys; sys.exit(0 if ${PAUSED_AUDIO:-99} < ${RUNG} * 0.9 else 1)"; then
+        OUTCOME=abandoned; VERDICT2="$V"; CAP="$RUNG"; break
+      fi
+      echo "     ${V}"
+      echo "     -> the voice alone put ${PAUSED_AUDIO:-?} Mbps on the wire with its repair copies, over this"
+      echo "        ${RUNG} Mbps ceiling: the pause could not help here, the app was right to give the"
+      echo "        picture back, and the ladder climbs" ;;
+    *) echo "     no pause at this rung: $(grep -oE 'conceal [0-9]+/s \(lost [0-9]+[^)]*\)' "$SP/cap-a.log" | tail -1)" ;;
+  esac
 done
 [ -n "$VERDICT2" ] && echo "     $VERDICT2"
 # ── WHAT THIS ARM ACTUALLY FOUND, WHICH IS NOT WHAT IT WAS LOOKING FOR ──────
@@ -271,9 +296,12 @@ done
 # about the product and it is recorded here rather than dressed up as a red tick:
 # an arm that cannot build its case is a COULD NOT RUN, and the honest verdict for
 # arm A alone is that the reported bug is fixed and the control is still missing.
-case "$VERDICT2" in
-  *"the pause is helping"*) say OK "the app measured that the pause worked, and kept it" ;;
-  "")
+case "$OUTCOME" in
+  helping) say OK "at a ${CAP} Mbps ceiling the app measured that the pause worked, and kept it" ;;
+  abandoned)
+    say FAIL "at ${CAP} Mbps the voice alone fitted (${PAUSED_AUDIO} Mbps with its repair copies) and the pause was abandoned anyway: $VERDICT2"
+    fail=1 ;;
+  none)
     echo "  NOTE  arm B could not construct its case at ${CAP} Mbps: the far end reported"
     echo "        $(grep -oE 'conceal [0-9]+/s \(lost [0-9]+[^)]*\)' "$SP/cap-a.log" | tail -1)"
     echo "        so the voice never suffered and the controller correctly never paused."
@@ -282,19 +310,24 @@ case "$VERDICT2" in
     echo "        may mean the pause has no domain on this transport, which is a"
     echo "        question about the product and not a failure of this build."
     ;;
-  *) say FAIL "it abandoned a pause that was working: $VERDICT2"; fail=1 ;;
 esac
-if grep -q "pausing ABANDONED" "$SP/cap-a.log"; then
-  say FAIL "a working pause was abandoned -- the two arms agree and neither proves anything"
-  fail=1
-else
-  say OK "and did not abandon it"
+# The last rung's log is the one on disk. A helping rung must not ALSO carry an
+# abandonment -- a pause kept and then dropped in the same run would be both arms
+# at once. On the other outcomes that line has already been judged above.
+if [ "$OUTCOME" = helping ]; then
+  if grep -q "pausing ABANDONED" "$SP/cap-a.log"; then
+    say FAIL "a working pause was abandoned later in the same run -- the two arms agree and neither proves anything"
+    fail=1
+  else
+    say OK "and did not abandon it"
+  fi
 fi
 
 if [ "$fail" = 0 ]; then
-  case "$VERDICT2" in
-    *"the pause is helping"*)
-      echo "VPAUSE CHECK PASSED -- the app stops the picture only when that helps, and proves it" ;;
+  case "$OUTCOME" in
+    helping)
+      echo "VPAUSE CHECK PASSED -- the app stops the picture only when that helps, and proves it"
+      echo "  (the pause has a domain: a ${CAP} Mbps ceiling, above the voice with its repair copies, below the picture)" ;;
     *)
       echo "VPAUSE CHECK PASSED (arm A only) -- a pause that does not help is abandoned and the"
       echo "  picture comes back. Arm B found no ceiling at which pausing rescues the voice, which"

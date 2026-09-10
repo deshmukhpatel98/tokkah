@@ -29,6 +29,7 @@
 #   --watch updates by itself       <->  --watch --no-update does not
 #   TK_UPDATE_GRACE=2 fetches at 2s <->  TK_UPDATE_GRACE=8 fetches at 8s
 #   a writable install updates once <->  a read-only one re-downloads forever
+#   both signatures install          <->  one signature, or a wrong second one, does not
 #
 # and the negative arms are asserted on a POSITIVE instrument wherever possible:
 # not "no error appeared" but "the server was never asked for the payload", and
@@ -114,6 +115,37 @@ KEYFILE="$HOME/.config/tokkah/mac-update-ed25519.key"
 sign() { # <file> -> base64 signature on stdout
   if [ -n "$SIGN" ]; then "$SIGN" "$1"; else swift "$HERE/sign.swift" "$1"; fi
 }
+# ── AND THE SECOND SIGNATURE, FROM THE KEY THAT CANNOT LEAVE THIS MAC ───────
+#
+# Since 0.130.0 the updater requires `manifest.json.sig2` -- ECDSA P-256 over the
+# same bytes, from a non-extractable key in the kin-signing2 keychain -- beside
+# the Ed25519 `.sig`. This rig went on staging only `.sig`, so for every release
+# after that each arm read "manifest.json.sig2 is missing", the `ok` control never
+# installed, and twenty-two FAIL rows described the rig rather than the product.
+# `tools/sign2` needs KEYCHAIN_NAME and an unlocked keychain, exactly as
+# release.sh does. Only the keychain NAME is exported: the password is read here,
+# used once for the unlock, and never reaches a child process's environment.
+SIGN2="$HERE/sign2"
+[ -x "$SIGN2" ] || cant "tools/sign2 is not built -- (cd mac/tools && swiftc -O sign2.swift -o sign2); every manifest needs a second signature since 0.130.0"
+KIN_SIGNING_ENV="${KIN_SIGNING_ENV:-$HOME/.config/kin-signing/env}"
+[ -f "$KIN_SIGNING_ENV" ] || cant "no signing env at $KIN_SIGNING_ENV -- the second release signature lives in the kin-signing keychain"
+KEYCHAIN_NAME="$(sed -n 's/^KEYCHAIN_NAME=//p' "$KIN_SIGNING_ENV" | tr -d "'\"" | head -1)"
+KC_PW="$(sed -n 's/^KEYCHAIN_PW=//p' "$KIN_SIGNING_ENV" | tr -d "'\"" | head -1)"
+[ -n "$KEYCHAIN_NAME" ] && [ -n "$KC_PW" ] || cant "KEYCHAIN_NAME / KEYCHAIN_PW are not both in $KIN_SIGNING_ENV"
+security unlock-keychain -p "$KC_PW" "$KEYCHAIN_NAME" 2>/dev/null || cant "cannot unlock $KEYCHAIN_NAME, the second signer's keychain"
+unset KC_PW
+export KEYCHAIN_NAME
+sign2() { "$SIGN2" "$1"; }
+# ── THE SIGNER IS PROVED BEFORE A SINGLE VERDICT IS READ ────────────────────
+#
+# The public half sign2 holds has to be the one compiled into the binary under
+# test. With any other key every refusal below would be true for the wrong reason
+# and the `ok` control would fail for a reason that is not the gate
+# (`validate-the-ruler-against-known-inputs`).
+PUB2_TOOL="$("$SIGN2" --pub 2>/dev/null)"
+PUB2_CODE="$(grep -o 'publicKey2Hex = "[0-9a-f]*"' "$HERE/../Sources/tk/Update.swift" | sed 's/.*"\(.*\)"/\1/')"
+[ -n "$PUB2_TOOL" ] && [ "$PUB2_TOOL" = "$PUB2_CODE" ] \
+  || cant "tools/sign2 holds P-256 key ${PUB2_TOOL:0:16}… and Update.swift expects ${PUB2_CODE:0:16}… -- the rig would sign with the wrong key"
 command -v python3 >/dev/null || cant "python3 is needed for the fake update server"
 # ── 8380-8381, AND NOT 8097-8098 ────────────────────────────────────────────
 #
@@ -285,6 +317,7 @@ mkman() { # <arm> <version> <url> <sha> [notes]
   printf '{"version":"%s","url":"%s","sha256":"%s","size":%s,"appName":"Kin","notes":"%s"}' \
     "$2" "$3" "$4" "$GOODSIZE" "${5:-update-check rig}" > "$SP/srv/$1/manifest.json"
   sign "$SP/srv/$1/manifest.json" > "$SP/srv/$1/manifest.json.sig"
+  sign2 "$SP/srv/$1/manifest.json" > "$SP/srv/$1/manifest.json.sig2"
 }
 DL="http://127.0.0.1:8381/dl/$TARNAME"
 
@@ -310,6 +343,8 @@ mkman probe   "$OLDER" "$DL?arm=probe"   "$GOODSHA"
 mkman rw      "$NEW"   "$DL?arm=rw"      "$GOODSHA"
 mkman nosig   "$NEW"   "$DL?arm=nosig"   "$GOODSHA"
 mkman sigjunk "$NEW"   "$DL?arm=sigjunk" "$GOODSHA"
+mkman nosig2  "$NEW"   "$DL?arm=nosig2"  "$GOODSHA"
+mkman sig2bad "$NEW"   "$DL?arm=sig2bad" "$GOODSHA"
 # `down` gets NO directory on the server on purpose: every GET under /down/ is a
 # 404, which is what a server that is not there looks like to `Update.get`.
 
@@ -333,6 +368,23 @@ printf 'this is not base64 at all!!!\n' > "$SP/srv/sigjunk/manifest.json.sig"
 mkdir -p "$SP/srv/manjunk"
 printf '{"nope":1}' > "$SP/srv/manjunk/manifest.json"
 sign "$SP/srv/manjunk/manifest.json" > "$SP/srv/manjunk/manifest.json.sig"
+sign2 "$SP/srv/manjunk/manifest.json" > "$SP/srv/manjunk/manifest.json.sig2"
+
+# ── THE SECOND SIGNER'S TWO ENDINGS ─────────────────────────────────────────
+#
+# Both refusals live in `Update.available` and neither had ever been seen to
+# fire: a manifest carrying only the file key's signature (what a release cut on
+# a machine without the keychain would publish), and a second signature that is
+# well-formed and wrong. Each has to be named on its own line, install nothing,
+# and be a different sentence from the first signer's refusals -- otherwise "the
+# key that cannot leave this Mac" is a claim with no measurement behind it.
+rm -f "$SP/srv/nosig2/manifest.json.sig2"
+python3 - "$SP/srv/sig2bad/manifest.json.sig2" <<'PY'
+import base64, sys
+p = sys.argv[1]; raw = bytearray(base64.b64decode(open(p).read().strip()))
+raw[-1] ^= 0x01     # the last byte of the DER is inside the S integer: still parses, no longer verifies
+open(p, "w").write(base64.b64encode(bytes(raw)).decode() + "\n")
+PY
 
 # ── THE THREE WAYS TO LIE TO AN UPDATER ─────────────────────────────────────
 #
@@ -662,7 +714,7 @@ PY
 # event returns the same value as a real negative. So it is a COULD NOT RUN, and
 # it is checked before a single verdict is printed.
 for d in probe ok older body sig hash tgz watch nowatch ro rw race cadA cadB graceS graceL \
-         down nosig sigjunk manjunk; do
+         down nosig sigjunk manjunk nosig2 sig2bad; do
   mkdir -p "$SP/$d"; mkbundle "$OLD" "$TK" "$SP/$d/Kin.app"
 done
 run probe "$SP/probe" 6 1 2 $ARGS --room "upd${$}pr" --listen 8380 --peer 127.0.0.1:8381 $RING
@@ -773,6 +825,8 @@ run down    "$SP/down"    8 2 3 $ARGS --room "upd${$}dn" --listen 8380 --peer 12
 run nosig   "$SP/nosig"   8 2 3 $ARGS --room "upd${$}ns" --listen 8380 --peer 127.0.0.1:8381 $RING
 run sigjunk "$SP/sigjunk" 8 2 3 $ARGS --room "upd${$}sj" --listen 8380 --peer 127.0.0.1:8381 $RING
 run manjunk "$SP/manjunk" 8 2 3 $ARGS --room "upd${$}mj" --listen 8380 --peer 127.0.0.1:8381 $RING
+run nosig2  "$SP/nosig2"  8 2 3 $ARGS --room "upd${$}n2" --listen 8380 --peer 127.0.0.1:8381 $RING
+run sig2bad "$SP/sig2bad" 8 2 3 $ARGS --room "upd${$}s2" --listen 8380 --peer 127.0.0.1:8381 $RING
 
 # ── 7. TWO UPDATERS AT ONCE ─────────────────────────────────────────────────
 #
@@ -1129,6 +1183,8 @@ needle() { # <arm> -> the line only that arm may print
     nosig)   echo "manifest.json is there but manifest.json.sig is not" ;;
     sigjunk) echo "manifest.json.sig is not base64" ;;
     manjunk) echo "the manifest verified but is not the JSON this build understands" ;;
+    nosig2)  echo "manifest.json.sig2 is missing" ;;
+    sig2bad) echo "manifest second signature INVALID" ;;
   esac
 }
 english() {
@@ -1137,9 +1193,11 @@ english() {
     nosig)   echo "the manifest is published and its signature is not" ;;
     sigjunk) echo "the signature file did not arrive intact" ;;
     manjunk) echo "a correctly signed manifest this build cannot read" ;;
+    nosig2)  echo "a manifest carrying only the file key's signature" ;;
+    sig2bad) echo "a second signature that is well-formed and wrong" ;;
   esac
 }
-for a in down nosig sigjunk manjunk; do
+for a in down nosig sigjunk manjunk nosig2 sig2bad; do
   grep -q "$(needle "$a")" "$SP/$a.log" \
     && say "OK" "$(english "$a") -- named on its own line" \
     || say "FAIL" "$a said nothing of its own: [$(grep -o 'update: .*' "$SP/$a.log" | tail -1)]"
@@ -1150,8 +1208,8 @@ done
 # DISTINCT, not merely present. Four lines that all said "update failed" would
 # pass every assertion above and would be the same defect wearing more words.
 dup=0
-for a in down nosig sigjunk manjunk; do
-  for b in down nosig sigjunk manjunk; do
+for a in down nosig sigjunk manjunk nosig2 sig2bad; do
+  for b in down nosig sigjunk manjunk nosig2 sig2bad; do
     [ "$a" = "$b" ] && continue
     if grep -q "$(needle "$b")" "$SP/$a.log" 2>/dev/null; then
       say "FAIL" "  $a also printed $b's line -- these two endings are not distinguishable"
@@ -1159,7 +1217,7 @@ for a in down nosig sigjunk manjunk; do
     fi
   done
 done
-[ "$dup" = 0 ] && say "OK" "and no two of the four share a line -- they are four endings, not one"
+[ "$dup" = 0 ] && say "OK" "and no two of the six share a line -- they are six endings, not one"
 # CONTROL, the same shape as the one under the tampering arms: a build with the
 # network unplugged prints four different complaints and installs nothing, and
 # would pass everything above.
@@ -1176,6 +1234,9 @@ grep -q "update: installed $NEW" "$SP/ok.log" \
 grep -q "on screen to tell: an update was refused because it" "$SP/sig.log" \
   && say "OK" "a refused signature is put in front of the person" \
   || say "FAIL" "the signature refusal never reached a surface a person can see"
+grep -q "on screen to tell: an update was refused because it carried only one" "$SP/nosig2.log" \
+  && say "OK" "and so is a release missing its second signature -- Kin has stopped updating and says so" \
+  || say "FAIL" "the missing second signature never reached a surface a person can see"
 [ "$(lines "$SP/down.log" "on screen to tell")" = "0" ] \
   && say "OK" "OPPOSITE ARM: an unreachable server is logged and NOT put on the status line" \
   || say "FAIL" "a transient network failure is being shown to the person once a poll"
@@ -1187,7 +1248,7 @@ if [ "$fail" = 0 ]; then
 else
   echo "UPDATE CHECK FAILED -- see above; logs copied to $OUT/update-*.log"
   for f in probe ok older body sig hash tgz watch nowatch ro rw race-w race-f cadA cadB graceS graceL \
-           down nosig sigjunk manjunk install; do
+           down nosig sigjunk manjunk nosig2 sig2bad install; do
     cp "$SP/$f.log" "$OUT/update-$f.log" 2>/dev/null
   done
   cp "$SP/srv.log" "$OUT/update-server.log" 2>/dev/null

@@ -28,6 +28,25 @@ PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
 alive() { kill -0 "$1" 2>/dev/null; }
+# ── GONE IS NOT ENOUGH; IT HAS TO HAVE LEFT ON PURPOSE ──────────────────────
+#
+# Every "gone" verdict below was satisfied on 2026-09-11 by processes that had
+# died with SIGSEGV: the goodbye left the socket first, then the final beat read
+# the audio engine before it existed. `wait <pid>` on a child that has exited
+# returns how -- 0 is a clean exit, 128+N a signal -- and a rig that ends calls
+# has to read it (`unexplained-death-is-a-bug`).
+status_of() { # <pid> -> alive | exit N | signal N
+  if kill -0 "$1" 2>/dev/null; then echo alive; return; fi
+  wait "$1" 2>/dev/null; local st=$?
+  if [ "$st" -ge 128 ]; then echo "signal $((st - 128))"; else echo "exit $st"; fi
+}
+left_cleanly() { # <label> <status>
+  case "$2" in
+    "exit 0") say "OK" "$1 left by exit 0, not by a signal" ;;
+    alive)    say "FAIL" "$1 is still running" ;;
+    *)        say "FAIL" "$1 DIED: $2 -- read the newest tk-*.ips in ~/Library/Logs/DiagnosticReports" ;;
+  esac
+}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/bye-check.$$"
@@ -68,8 +87,9 @@ spawn env TK_KIN_DIR="$ID2" "$TK" $COMMON --listen 8042 --peer 127.0.0.1:8041 \
 B1=$LAST_PID
 perl -e 'select undef,undef,undef,17'
 A1_GONE=no; B1_GONE=no
-alive "$A1" || A1_GONE=yes
-alive "$B1" || B1_GONE=yes
+A1_ST="$(status_of "$A1")"; B1_ST="$(status_of "$B1")"
+[ "$A1_ST" = alive ] || A1_GONE=yes
+[ "$B1_ST" = alive ] || B1_GONE=yes
 reap
 
 # ── RUN 2: the callee presses decline ───────────────────────────────────────
@@ -82,7 +102,8 @@ spawn env TK_KIN_DIR="$ID2" "$TK" $COMMON --listen 8042 --peer 127.0.0.1:8041 \
 B2=$LAST_PID
 perl -e 'select undef,undef,undef,20'
 B2_GONE=no
-alive "$B2" || B2_GONE=yes
+B2_ST="$(status_of "$B2")"
+[ "$B2_ST" = alive ] || B2_GONE=yes
 reap
 
 # ── RUN 3: THE CONTROL -- a bye about some other call ───────────────────────
@@ -126,9 +147,11 @@ grep -qE "ring: sounding|ring: alert|ring: silent" "$SP/b.log" \
 [ "$B1_GONE" = "yes" ] \
   && say "OK" "and the copy that existed only to ask is gone" \
   || say "FAIL" "the ringing copy is still running with a dead card in it"
+left_cleanly "  the ringing copy" "$B1_ST"
 [ "$A1_GONE" = "yes" ] \
   && say "OK" "the caller left too, rather than hanging on its own message" \
   || say "FAIL" "the caller is still running after pressing cancel"
+left_cleanly "  the caller" "$A1_ST"
 
 echo "── 2. decline: the caller is told, in words"
 grep -q "bye (declined): @$H1 told" "$SP/d.log" \
@@ -150,6 +173,7 @@ esac
 [ "$B2_GONE" = "yes" ] \
   && say "OK" "and the declining copy is gone" \
   || say "FAIL" "the declining copy is still running"
+left_cleanly "  the declining copy" "$B2_ST"
 
 echo "── 3. CONTROL: a valid bye about a different call"
 grep -q "hung up on a call this Mac is not on" "$SP/e.log" \

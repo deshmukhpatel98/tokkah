@@ -175,19 +175,50 @@ run panel "$SEQ" 0.35
 naptime 22
 reap
 P="$SP/panel.log"
-FIRST=$(grep -oE 'sheet=settings\[[^]]*\]' "$P" | head -1 | tr '|' '\n' | wc -l | tr -d ' ')
-LAST=$(grep -oE 'sheet=settings\[[^]]*\]' "$P" | tail -1 | tr '|' '\n' | wc -l | tr -d ' ')
 OPENS=$(grep -c 'click more: sent' "$P" || true)
 MISSED=$(grep -c 'NOT ON SCREEN' "$P" || true)
 [ "${OPENS:-0}" -ge 9 ] && say OK "$OPENS presses opened it and landed" \
   || { say FAIL "only ${OPENS:-0} presses landed on the corner button"; fail=1; }
 [ "${MISSED:-0}" = "0" ] && say OK "and every open and close found its control" \
   || { say FAIL "$MISSED presses found nothing -- open and close are out of step"; fail=1; }
-if [ -n "$FIRST" ] && [ "$FIRST" = "$LAST" ]; then
-  say OK "and the panel has the same $FIRST rows on the last open as the first"
+# ── A LEAK IS A ROW THAT IS THERE TWICE, NOT A PANEL THAT GREW ──────────────
+#
+# This compared the row COUNT on the first open with the count on the last, and
+# from 0.140.0 that stopped being a fact about rebuilding: the panel now has rows
+# that arrive while the call is up -- "Integrated VPN" once the far-away relay is
+# found, "Remote Location" once the other end's country is known, "Camera" once a
+# second camera is enumerated -- so the count went 13 -> 14 (or 12 -> 14) on a
+# healthy build and the rig said "a rebuild is leaking" for eight days. A rebuild
+# that leaks appends the SAME rows again, so the measurement is duplication: a
+# label that appears twice in one open. And nothing that was on an earlier open
+# may be gone from a later one -- a panel that loses rows is the other way a
+# rebuild can go wrong. Rows that appeared later are printed by name, so what
+# grew is on the record rather than averaged away.
+labels() { tr '|' '\n' | sed -E 's/^ *sheet=settings\[//; s/\]$//; s/ = .*$//; s/^ *//; s/ *$//' | grep -v '^$'; }
+dups_in() { labels | sort | uniq -d; }
+# THE RULER, ON KNOWN INPUTS FIRST: a dump with a duplicate must be caught, one
+# without must not, or a clean pass below says nothing about the panel.
+[ "$(printf 'sheet=settings[People | Silent = off | People]' | dups_in)" = "People" ] \
+  || { echo "  STRESS CHECK COULD NOT RUN -- the duplicate-row ruler missed a planted duplicate"; exit 2; }
+[ -z "$(printf 'sheet=settings[People | Silent = off | Version = 1]' | dups_in)" ] \
+  || { echo "  STRESS CHECK COULD NOT RUN -- the duplicate-row ruler flagged a clean panel"; exit 2; }
+FIRSTD=$(grep -oE 'sheet=settings\[[^]]*\]' "$P" | head -1)
+LASTD=$(grep -oE 'sheet=settings\[[^]]*\]' "$P" | tail -1)
+FIRST=$(printf '%s' "$FIRSTD" | labels | wc -l | tr -d ' ')
+LAST=$(printf '%s' "$LASTD" | labels | wc -l | tr -d ' ')
+DUPS=$(grep -oE 'sheet=settings\[[^]]*\]' "$P" | while IFS= read -r d; do printf '%s' "$d" | dups_in; done | sort -u | paste -sd, -)
+if [ -z "$FIRSTD" ]; then
+  say FAIL "the panel was never dumped, so nothing here is about its rows"; fail=1
+elif [ -n "$DUPS" ]; then
+  say FAIL "a row appears more than once in one open -- a rebuild is leaking: $DUPS"; fail=1
 else
-  say FAIL "the panel grew from ${FIRST:-?} rows to ${LAST:-?} -- a rebuild is leaking"; fail=1
+  say OK "no row appears twice on any of the $(grep -c 'sheet=settings\[' "$P") opens ($FIRST rows on the first, $LAST on the last)"
 fi
+GONE=$(comm -23 <(printf '%s' "$FIRSTD" | labels | sort) <(printf '%s' "$LASTD" | labels | sort) | paste -sd, -)
+[ -z "$GONE" ] && say OK "and nothing that was on the first open is missing from the last" \
+  || { say FAIL "rows vanished between the first open and the last: $GONE"; fail=1; }
+LATER=$(comm -13 <(printf '%s' "$FIRSTD" | labels | sort) <(printf '%s' "$LASTD" | labels | sort) | paste -sd, -)
+[ -n "$LATER" ] && say note "rows that arrived after the first open (the call learning about itself): $LATER"
 ENDSTATE=$(grep -oE 'more=(open|closed)' "$P" | tail -1)
 [ "$ENDSTATE" = "more=closed" ] && say OK "and the last close really closed it" \
   || { say FAIL "the panel ended $ENDSTATE after a final close"; fail=1; }
@@ -364,7 +395,18 @@ else
   CPU1="$(ps -o %cpu= -p $LA 2>/dev/null | tr -d ' ')"
   ALIVE=$(kill -0 $LA 2>/dev/null && kill -0 $LB 2>/dev/null && echo yes || echo no)
   LATE="$(grep -oE 'conceal [0-9]+/s' "$SP/long-a.log" | tail -1 | grep -oE '[0-9]+')"
-  RECV="$(grep -oE 'recv [0-9]+/s' "$SP/long-a.log" | tail -1 | grep -oE '[0-9]+')"
+  # ── THE LAST SECOND IS ONE SAMPLE; THE END OF A CALL IS A STATE ────────────
+  #
+  # Measured 2026-09-11: the audio device stalled for 750 ms on BOTH ends at the
+  # same instant (a HAL hiccup on this Mac), each graph was rebuilt, "audio is
+  # back" -- and the one report that landed inside that second read `recv 36/s`,
+  # which this line called "media had stopped by the end". A once-fired probe
+  # records a transient (`once-fired-probes-record-transients`). The state at the
+  # end is the MEDIAN of the last five reports; the stall is reported on its own
+  # line, and a stall the graph never came back from is the failure.
+  RECV="$(grep -oE 'recv [0-9]+/s' "$SP/long-a.log" | tail -5 | grep -oE '[0-9]+' | sort -n | sed -n '3p')"
+  STALLS=$(cat "$SP/long-a.log" "$SP/long-b.log" | grep -c 'CAPTURE AND PLAYOUT HAS STOPPED' || true)
+  BACK=$(cat "$SP/long-a.log" "$SP/long-b.log" | grep -c 'audio is back' || true)
   reap
   # 1. IT IS STILL THERE. A call that died is not a call that held steady.
   [ "$ALIVE" = yes ] \
@@ -372,8 +414,13 @@ else
     || { say FAIL "an end died during a long call -- everything below is meaningless"; fail=1; }
   # 2. AND STILL CARRYING MEDIA at the end, not merely alive.
   [ "${RECV:-0}" -gt 500 ] \
-    && say OK "and still carrying media at the end (${RECV}/s, concealment ${LATE:-?}/s)" \
-    || { say FAIL "media had stopped by the end: ${RECV:-0}/s"; fail=1; }
+    && say OK "and still carrying media at the end (median of the last five reports ${RECV}/s, concealment ${LATE:-?}/s)" \
+    || { say FAIL "media had stopped by the end: ${RECV:-0}/s over the last five reports"; fail=1; }
+  if [ "${STALLS:-0}" -gt 0 ]; then
+    [ "${STALLS:-0}" -le "${BACK:-0}" ] \
+      && say note "the audio device stalled ${STALLS} time(s) during the call (no callback for 750 ms) and the graph came back each time -- this Mac's device, and the recovery path at work" \
+      || { say FAIL "the audio device stalled ${STALLS} time(s) and the graph came back only ${BACK:-0} -- a call left silent"; fail=1; }
+  fi
   # 3. THE DRIFT. Measured from the minute mark, so warm-up is not counted as a
   #    leak. 20 MB over this window is far above the 1-3 MB a healthy call moves
   #    and far below what a real leak does.

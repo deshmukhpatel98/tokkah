@@ -40,6 +40,11 @@
 # a camera this ad-hoc bundle has no grant for.
 set -u
 export TK_NO_RAISE=1
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/reopen-check.$$"

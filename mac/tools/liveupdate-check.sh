@@ -195,9 +195,26 @@ reap
 # lane owns.
 UPDPORT=8102
 echo "part four: a real signed update, landed mid-call from a local server"
+# ── BOTH SIGNATURES, AS release.sh CUTS THEM ────────────────────────────────
+#
+# Since 0.130.0 the updater refuses a manifest without `manifest.json.sig2` (P-256,
+# from the non-extractable key in the kin-signing2 keychain) beside the Ed25519
+# `.sig`. This arm went on publishing only `.sig`, so for every release after that
+# it read "the update never installed" about a rig that had published half a
+# release. Same signer, same env file and same unlock as release.sh; only the
+# keychain NAME reaches the child, never the password.
+SIGN2="$HERE/sign2"
+SENV="${KIN_SIGNING_ENV:-$HOME/.config/kin-signing/env}"
 if [ ! -f "$HOME/.config/tokkah/mac-update-ed25519.key" ]; then
   say "FAIL" "part four cannot run: no release key at ~/.config/tokkah/mac-update-ed25519.key, and there is no bypass by design"
+elif [ ! -x "$SIGN2" ] || [ ! -f "$SENV" ]; then
+  say "FAIL" "part four cannot run: the second release signature needs tools/sign2 and $SENV (required since 0.130.0), and there is no bypass by design"
 else
+  KCN="$(sed -n 's/^KEYCHAIN_NAME=//p' "$SENV" | tr -d "'\"" | head -1)"
+  KCP="$(sed -n 's/^KEYCHAIN_PW=//p' "$SENV" | tr -d "'\"" | head -1)"
+  security unlock-keychain -p "$KCP" "$KCN" 2>/dev/null \
+    || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- cannot unlock $KCN, the second signer's keychain"; exit 2; }
+  unset KCP
   mkdir -p "$SP/app" "$SP/upd/dl" "$SP/stage"
   cp "$TK" "$SP/app/tk"
   cp "$TK" "$SP/stage/tk"
@@ -213,6 +230,10 @@ else
     "$UPDPORT" "$SHA" > "$SP/upd/manifest.json"
   "$HERE/sign" "$SP/upd/manifest.json" > "$SP/upd/manifest.json.sig" 2>"$SP/sign.err" \
     || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- signing failed: $(cat "$SP/sign.err")"; exit 2; }
+  KEYCHAIN_NAME="$KCN" "$SIGN2" "$SP/upd/manifest.json" > "$SP/upd/manifest.json.sig2" 2>"$SP/sign2.err" \
+    || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- the second signature failed: $(cat "$SP/sign2.err")"; exit 2; }
+  [ -s "$SP/upd/manifest.json.sig2" ] \
+    || { echo "LIVE-UPDATE CHECK COULD NOT RUN -- sign2 produced an empty second signature"; exit 2; }
   spawn python3 -m http.server "$UPDPORT" --bind 127.0.0.1 --directory "$SP/upd" > "$SP/http.log" 2>&1
   perl -e 'select undef,undef,undef,1'
   R4="lurig$$d"

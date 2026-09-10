@@ -21,6 +21,11 @@ set -u
 # see, which made this rig's verdict depend on whether anybody touched the
 # trackpad while it ran.
 export TK_NO_RAISE=1
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }

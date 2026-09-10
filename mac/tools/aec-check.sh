@@ -24,6 +24,11 @@
 # exactly the part a linear filter cannot cancel. This proves the code path and
 # the arithmetic. Only a two-room call proves the sound (`same-room-is-a-test-artifact`).
 set -u
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 cd "$(dirname "$0")/.."
 # Overridable so the SHIPPED binary can be run through this rig, not just the one
 # on this desk. A release verified by testing the build directory has verified the

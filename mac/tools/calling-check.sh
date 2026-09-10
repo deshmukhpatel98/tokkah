@@ -25,9 +25,25 @@ set -u
 # see, which made this rig's verdict depend on whether anybody touched the
 # trackpad while it ran.
 export TK_NO_RAISE=1
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
+# ── GONE IS NOT ENOUGH; IT HAS TO HAVE LEFT ON PURPOSE ──────────────────────
+#
+# Part three asserted that the process was gone after cancel, and on 2026-09-11
+# it was gone three runs running -- by SIGSEGV, in the final beat, after the bye
+# had already left. `wait <pid>` on an exited child says how it left: 0 is a
+# clean exit, 128+N a signal (`unexplained-death-is-a-bug`).
+status_of() { # <pid> -> alive | exit N | signal N
+  if kill -0 "$1" 2>/dev/null; then echo alive; return; fi
+  wait "$1" 2>/dev/null; local st=$?
+  if [ "$st" -ge 128 ]; then echo "signal $((st - 128))"; else echo "exit $st"; fi
+}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/calling-check.$$"
@@ -66,7 +82,8 @@ spawn env TK_RING_TIMEOUT=60 "$TK" --window --room "$R3" --listen 7999 --peer 12
       --video off $BASE --calling nobody --press-after 3 --press "@cancel" > "$SP/d.log" 2>&1
 CANCEL_PID=$LAST_PID
 perl -e 'select undef,undef,undef,7'
-if kill -0 "$CANCEL_PID" 2>/dev/null; then CANCELLED=no; else CANCELLED=yes; fi
+CANCEL_ST="$(status_of "$CANCEL_PID")"
+if [ "$CANCEL_ST" = alive ]; then CANCELLED=no; else CANCELLED=yes; fi
 reap
 
 fail=0
@@ -133,6 +150,11 @@ grep -q "click cancel at" "$SP/d.log" \
 [ "$CANCELLED" = "yes" ] \
   && say "OK" "and pressing it ended the call instead of just looking pressed" \
   || say "FAIL" "cancel was pressed and the call is still running"
+case "$CANCEL_ST" in
+  "exit 0") say "OK" "and it left by exit 0, not by a signal" ;;
+  alive) ;;
+  *) say "FAIL" "cancel DIED: $CANCEL_ST -- read the newest tk-*.ips in ~/Library/Logs/DiagnosticReports" ;;
+esac
 
 # ── 6. THE RED BUTTON IS ALSO A NO, BEFORE THE CALL EXISTS ──────────────────
 #
@@ -146,10 +168,13 @@ grep -q "click cancel at" "$SP/d.log" \
 spawn "$TK" --window --room "callngE$$" --listen 8047 --peer 127.0.0.1:8048 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling meera --press-after 2 --press close-window > "$SP/e.log" 2>&1
+E_PID=$LAST_PID
 spawn "$TK" --window --room "callngF$$" --listen 8048 --peer 127.0.0.1:8047 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --with meera --press-after 2 --press close-window > "$SP/f.log" 2>&1
+F_PID=$LAST_PID
 perl -e 'select undef,undef,undef,6'
+E_ST="$(status_of "$E_PID")"; F_ST="$(status_of "$F_PID")"
 reap
 grep -q "bye (closed-early): @meera" "$SP/e.log" \
   && say "OK" "closing a Calling… window sends the cancel, same as the button" \
@@ -157,6 +182,13 @@ grep -q "bye (closed-early): @meera" "$SP/e.log" \
 grep -q "bye (closed-early): @meera" "$SP/f.log" \
   && say "OK" "closing an answered-but-not-connected window tells the caller" \
   || say "FAIL" "closing an answered-but-not-connected window told nobody"
+for pair in "the Calling… window:$E_ST" "the answered-but-not-connected window:$F_ST"; do
+  case "${pair##*:}" in
+    "exit 0") say "OK" "and closing ${pair%%:*} left by exit 0" ;;
+    alive) say "FAIL" "closing ${pair%%:*} left the process running" ;;
+    *) say "FAIL" "closing ${pair%%:*} DIED: ${pair##*:} -- read the newest tk-*.ips" ;;
+  esac
+done
 
 echo
 if [ "$fail" = 0 ]; then

@@ -15,6 +15,11 @@
 #
 #   tools/audiolab-check.sh [seconds]
 set -u
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 cd "$(dirname "$0")/.."
 TK="${TK:-./.build/release/tk}"
 [ -x "$TK" ] || { echo "AUDIOLAB CHECK COULD NOT RUN -- no tk at $TK (swift build -c release)"; exit 2; }
@@ -110,12 +115,12 @@ def med(k):
     s = sorted(v for b in live for v in [b.get(k)] if isinstance(v, (int, float)))
     return s[len(s)//2] if s else None
 rb, tb = med("a_rx_bw_khz"), med("a_tx_bw_khz")
-# The ruler moves one 1/6-octave band with the 24 s of content a run lands on
-# (realA has read 6.4, 7.2 and 9.0 across runs; realB 5.7, 6.4 and 8.1), so the
-# absolute bar is the one the product uses: real speech is NOT a telephone band,
-# >= 4.5 kHz, which is where `telemetry.py` says "telephone-grade". The strong
-# assertion is the cross-check after both ends: the same voice must read the same
-# at the end that sent it and the end that heard it, because the wire is lossless.
+# The per-second ruler moves between 3.6 and 10.2 kHz with the second it lands on
+# (a sibilant second against a vowel second), so a beat's five-second median sits
+# on a knife edge and the absolute bar is the one the product uses: real speech is
+# NOT a telephone band, >= 4.5 kHz, which is where `telemetry.py` says
+# "telephone-grade". That the rulers are WIRED is proved here; that they agree
+# with each other is proved on the tapes, second for second, below.
 mine = "realA" if end == "a" else "realB"
 say(tb is not None and tb >= 4.5, f"sent bandwidth {tb} kHz ({mine}, not a telephone band: >= 4.5)")
 say(rb is not None and rb >= 4.5, f"heard bandwidth {rb} kHz ({'realB' if end == 'a' else 'realA'}, not a telephone band: >= 4.5)")
@@ -136,23 +141,24 @@ RA="$(check_beats a "$SP/a/logs/beats.ndjson")"; echo "$RA" | grep -v '^RESULT'
 RB="$(check_beats b "$SP/b/logs/beats.ndjson")"; echo "$RB" | grep -v '^RESULT'
 FA=$(echo "$RA" | awk '/^RESULT/{print $2}'); FB=$(echo "$RB" | awk '/^RESULT/{print $2}')
 [ "${FA:-1}" = 0 ] && [ "${FB:-1}" = 0 ] || fail=1
+# ── THE SAME SECOND, AT BOTH ENDS ────────────────────────────────────────────
+#
 # The transport is lossless, so the voice that left one end must read the same
-# bandwidth at the end that heard it -- within one 1/6-octave band (12%).
-TXA=$(echo "$RA" | awk '/^RESULT/{print $7}'); RXB=$(echo "$RB" | awk '/^RESULT/{print $8}')
-TXB=$(echo "$RB" | awk '/^RESULT/{print $7}'); RXA=$(echo "$RA" | awk '/^RESULT/{print $8}')
-python3 - "$TXA" "$RXB" "$TXB" "$RXA" <<'PY' || fail=1
-import sys
-def f(v):
-    try: return float(v)
-    except Exception: return None
-txa, rxb, txb, rxa = map(f, sys.argv[1:5])
-ok = 0
-for what, s, h in (("realA: sent by A vs heard at B", txa, rxb), ("realB: sent by B vs heard at A", txb, rxa)):
-    good = s is not None and h is not None and 0.84 <= h / s <= 1.19
-    print(f"  {'OK   ' if good else 'FAIL '} {what}: {s} vs {h} kHz (within one band)")
-    ok += 0 if good else 1
-sys.exit(1 if ok else 0)
-PY
+# bandwidth at the end that heard it. This used to be asserted on the MEDIAN of
+# one end's per-beat `a_tx_bw_khz` against the median of the other's `a_rx_bw_khz`,
+# within one band -- and it failed about half of all runs on a healthy build,
+# because a beat value is a median of five per-second readings that swing between
+# 3.6 and 10.2 kHz on real speech, the two ends' windows start at different
+# moments, and their final beats do not even hold the same number of values
+# (measured: A's last beat read 3.59 kHz, B's had none). On the tapes the same
+# second read the same at both ends 24 times out of 24. So the comparison is made
+# there, second for second, with the app's ruler definition calibrated against
+# the shipping binary first, and with a band-limited copy as the row that must
+# fail (`validate-the-ruler-against-known-inputs`). tools/audiolab-bw.py.
+echo "── A2. the same second, sent and heard, on the tapes"
+SELF="$("$TK" --selftest-audiolab 2>&1 | grep -oE 'real speech untouched reads [0-9.]+' | grep -oE '[0-9.]+$')"
+[ -n "$SELF" ] || { echo "  AUDIOLAB CHECK COULD NOT RUN -- tk --selftest-audiolab printed no bandwidth reading to calibrate against"; exit 2; }
+python3 "$(dirname "$0")/audiolab-bw.py" "$SP/tapes-a" "$SP/tapes-b" "$MEDIA/realA.wav" "$SELF" | grep -v '^RESULT' || fail=1
 
 echo "── B. my voice, returning: end A hears itself (B has the echo path), end B does not"
 TA=$(echo "$RA" | awk '/^RESULT/{print $3}'); RTA=$(echo "$RA" | awk '/^RESULT/{print $4}')

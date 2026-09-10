@@ -39,6 +39,11 @@
 # and then the real thing -- a live call's beats, read strictly, because a
 # hand-written fixture only ever tests the fixture.
 set -u
+# Not one handle on the real server: without this every launch here walked
+# @devesh … @devesh9 against the production directory, and spent the ten-a-minute
+# registration budget so the next rig's ends read `429 rate`. Nothing in this rig
+# needs a claimed name.
+export TK_NO_IDENTITY=1
 cd "$(dirname "$0")/.."
 TK="${TK:-./.build/release/tk}"
 [ -x "$TK" ] || { echo "BEAT CHECK COULD NOT RUN -- no tk at $TK"; exit 2; }

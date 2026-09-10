@@ -24,9 +24,34 @@ set -u
 # see, which made this rig's verdict depend on whether anybody touched the
 # trackpad while it ran.
 export TK_NO_RAISE=1
+# ── NOT ONE HANDLE ON THE REAL SERVER ───────────────────────────────────────
+#
+# Without this every end in here walked @devesh, @deveshp, @devesh2 … @devesh9
+# against the production directory on every run -- squatting names a person may
+# want, and spending the registration budget (ten a minute) so the next rig's
+# ends read `429 rate`. Nothing here needs a claim: the ring is handed to the
+# callee in argv exactly as the watcher hands it over.
+export TK_NO_IDENTITY=1
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
+# ── A PROCESS THAT LEFT ON ITS OWN SAYS HOW ─────────────────────────────────
+#
+# `wait <pid>` on a child that has already exited returns its status: 0 is a
+# clean exit and 128+N is a signal. A child still running is left for `reap`.
+# Eleven crash reports in one suite run -- the final beat read the audio engine
+# before it existed, on every exit that happens before a call -- came from rigs
+# whose assertions were all satisfied by a goodbye that had already left the
+# socket. The death was the one thing nobody looked at
+# (`unexplained-death-is-a-bug`).
+status_of() { # <pid> -> alive | exit N | signal N
+  if kill -0 "$1" 2>/dev/null; then echo alive; return; fi
+  wait "$1" 2>/dev/null; local st=$?
+  if [ "$st" -ge 128 ]; then echo "signal $((st - 128))"; else echo "exit $st"; fi
+}
+CRASHDIR="$HOME/Library/Logs/DiagnosticReports"
+crashes() { ls "$CRASHDIR" 2>/dev/null | grep -c '^tk-' || true; }
+CRASH0="$(crashes)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/preanswer-check.$$"
@@ -39,10 +64,41 @@ mkdir -p "$SP"
 # allowed for somebody already in it -- see RINGING.md on what a stranger's ring
 # would otherwise reveal. `somebody` is that contact; `astranger` deliberately is
 # not, and part four is the arm that proves the difference.
-export TK_KIN_DIR="$SP/id"
-mkdir -p "$SP/id"
-KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-printf '{"somebody":"%s"}' "$KEY" > "$SP/id/contacts.json"
+# ── TWO MACS, TWO KEYS, AND THE CALLEE IS TOLD THE CALLER'S REAL ONE ────────
+#
+# This used to give every end one shared directory and hand the callee a made-up
+# key of 32 zero bytes. That stopped meaning anything in 0.128.0, when the media
+# handshake became signed by the device key: a callee told "the caller's key is
+# K" refuses a handshake from anybody who cannot prove K, so a fake K is a call
+# that never keys -- "NO KEY", recv 0/s at the callee, and "connected" at the
+# caller once the ten-second deadline passes. Every FAIL row in the preview
+# section read as a product regression for eight days, and the "real call" rows
+# in part two were passing on `cap` lines with nothing in them.
+#
+# So the caller's identity is SEEDED -- a fixed Ed25519 seed in its own directory,
+# the file the app would otherwise mint on first run -- its public key is derived
+# here with openssl, and that key is what goes into the callee's contact list and
+# onto the ring: the same three facts the watcher and the server line up on a
+# real Mac. The derivation is then checked against the app's own statement of its
+# identity, so a wrong key fails as COULD NOT RUN and never as a verdict.
+CALLER="$SP/caller"; CALLEE="$SP/callee"; STRANGER="$SP/stranger"; CALLER4="$SP/caller4"
+mkdir -p "$CALLER" "$CALLEE" "$STRANGER" "$CALLER4"
+seed_identity() { # <dir> <32-byte seed, 64 hex chars> -> base64 Ed25519 public key on stdout
+  local seed_b64; seed_b64="$(printf '%s' "$2" | xxd -r -p | base64)"
+  printf '{"seed":"%s","tok":"%s","handle":"rig","claimed":false,"quiet":false}' \
+    "$seed_b64" "$(printf '%064d' 0)" > "$1/identity.json"
+  chmod 600 "$1/identity.json"
+  # A PKCS#8 wrapper around the raw seed; the last 32 bytes of the SPKI DER are
+  # the raw public key, which is exactly what the app puts on the wire.
+  { printf '302e020100300506032b657004220420' | xxd -r -p; printf '%s' "$2" | xxd -r -p; } \
+    | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64
+}
+KEY="$(seed_identity "$CALLER" 0101010101010101010101010101010101010101010101010101010101010101)"
+[ "${#KEY}" = 44 ] || { echo "PRE-ANSWER CHECK COULD NOT RUN -- this openssl ($(openssl version)) cannot derive an Ed25519 public key, so the rig cannot seed a caller"; exit 2; }
+printf '{"somebody":"%s"}' "$KEY" > "$CALLEE/contacts.json"
+# Part four's caller is a different Mac on purpose: the first call pins the
+# callee's key under `tester` in the caller's contacts, and the stranger's Mac
+# holds a different key -- a caller that had already met `tester` would refuse it.
 [ -x "$TK" ] || { echo "no tk at $TK -- swift build first"; exit 2; }
 trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 
@@ -71,7 +127,7 @@ if ! head -c 1 "$MEDIA" > /dev/null 2>&1; then
   exit 2
 fi
 R1="preans$$a"
-spawn "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video "$MEDIA" \
+spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video "$MEDIA" \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester --press-after 8 --press "?" > "$SP/a.log" 2>&1
 perl -e 'select undef,undef,undef,2'
@@ -83,7 +139,7 @@ perl -e 'select undef,undef,undef,2'
 # while still turning the camera on in production: the park was placed BELOW the
 # camera bring-up, and a rig that never asks for a camera can never see a camera
 # start. Sweep anything the harness hardcodes that the product picks at runtime.
-spawn "$TK" --window --room "$R1" --listen 8022 --peer 127.0.0.1:8021 --video camera \
+spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R1" --listen 8022 --peer 127.0.0.1:8021 --video camera \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 7 --press "?" > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,12'
@@ -91,14 +147,16 @@ reap
 
 # ── PART TWO: the same ring, answered ───────────────────────────────────────
 R2="preans$$b"
-spawn "$TK" --window --room "$R2" --listen 8023 --peer 127.0.0.1:8024 --video off \
+spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$R2" --listen 8023 --peer 127.0.0.1:8024 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/c.log" 2>&1
 perl -e 'select undef,undef,undef,2'
-spawn "$TK" --window --room "$R2" --listen 8024 --peer 127.0.0.1:8023 --video off \
+spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R2" --listen 8024 --peer 127.0.0.1:8023 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@answer" > "$SP/d.log" 2>&1
+DPID=$LAST_PID
 perl -e 'select undef,undef,undef,14'
+D_ST="$(status_of "$DPID")"
 reap
 
 # ── PART THREE: a click nobody aimed, and the same click from a finger ──────
@@ -110,7 +168,7 @@ reap
 # device. TK_AIM_MS widens the card's own "nobody could have aimed this yet"
 # window so the refusal is reachable without a person at the trackpad.
 R3="preans$$c"
-spawn env TK_AIM_MS=60000 "$TK" --window --room "$R3" --listen 8025 --peer 127.0.0.1:8026 \
+spawn env TK_AIM_MS=60000 TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R3" --listen 8025 --peer 127.0.0.1:8026 \
       --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
       --no-subtitles --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@!answer,?" \
       > "$SP/e.log" 2>&1
@@ -126,15 +184,21 @@ reap
 # ring, and connect nothing. Without it, part one proves only that the feature
 # works and says nothing about who it works FOR.
 R4="preans$$d"
-spawn "$TK" --window --room "$R4" --listen 8027 --peer 127.0.0.1:8028 \
+spawn env TK_KIN_DIR="$CALLER4" "$TK" --window --room "$R4" --listen 8027 --peer 127.0.0.1:8028 \
       --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
       --no-subtitles --calling tester > "$SP/f.log" 2>&1
 perl -e 'select undef,undef,undef,2'
-spawn "$TK" --window --room "$R4" --listen 8028 --peer 127.0.0.1:8027 \
+# `?` first -- the stranger's card, un-connected, is the assertion of part 3b --
+# and THEN the answer. A stranger's ring is the earliest exit in the whole app (its
+# card lives in `NSApplication.run()` above the audio block), which is exactly
+# where 0.157.0 died; see the verdicts under 3b.
+spawn env TK_KIN_DIR="$STRANGER" "$TK" --window --room "$R4" --listen 8028 --peer 127.0.0.1:8027 \
       --video camera --mute --no-telemetry --no-update --no-relocate --no-rings \
-      --no-subtitles --incoming astranger --press-after 6 --press "?" \
+      --no-subtitles --incoming astranger --press-after 6 --press "?,@answer" \
       > "$SP/g.log" 2>&1
-perl -e 'select undef,undef,undef,10'
+GPID=$LAST_PID
+perl -e 'select undef,undef,undef,16'
+G_ST="$(status_of "$GPID")"
 reap
 
 fail=0
@@ -142,6 +206,12 @@ say() { printf "  %-4s %s\n" "$1" "$2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 for f in a b c d e f g; do
   grep -q "^tk " "$SP/$f.log" || { echo "PRE-ANSWER CHECK COULD NOT RUN -- tk never started in $f:"; sed -n '1,5p' "$SP/$f.log" | sed 's/^/  /'; exit 2; }
 done
+# THE RULER FIRST. The key this rig derived must be the identity the caller says
+# it has; otherwise every key-shaped verdict below is about the rig's arithmetic.
+grep -qF "crypto: my identity $KEY," "$SP/a.log" || {
+  echo "PRE-ANSWER CHECK COULD NOT RUN -- the caller's identity is not the key this rig derived:"
+  grep -m1 "crypto: my identity" "$SP/a.log" | sed 's/^/  app: /'
+  echo "  rig: $KEY"; exit 2; }
 
 # ── 1. AN UNANSWERED RING RECEIVES AND SENDS NOTHING ────────────────────────
 #
@@ -209,14 +279,20 @@ echo "$b" | grep -q 'card=ringing' \
 grep -q "answer committed by NSEventType" "$SP/d.log" \
   && say "OK" "answering was a real click, not a handler call" \
   || say "FAIL" "the answer press never reached the button"
-ans=$(grep -cE "^cap " "$SP/d.log")
-[ "$ans" -gt 0 ] \
-  && say "OK" "and after answering it is a real call ($ans media reports)" \
-  || say "FAIL" "answering produced no media at all"
-car=$(grep -cE "^cap " "$SP/c.log")
-[ "$car" -gt 0 ] \
-  && say "OK" "with the caller in it too ($car media reports)" \
-  || say "FAIL" "the caller never got media after the answer"
+# MEDIA, not report lines. `cap` prints every second whether or not anything
+# arrives; counting lines passed a call that never keyed ("NO KEY", recv 0/s).
+ans=$(grep -oE "recv [0-9]+/s" "$SP/d.log" | grep -vc "recv 0/s")
+[ "${ans:-0}" -gt 0 ] \
+  && say "OK" "and after answering it is a real call ($ans reports with the caller's stream arriving)" \
+  || say "FAIL" "answering produced a call that carried nothing: $(grep -oE 'NO KEY|crypt on' "$SP/d.log" | sort | uniq -c | tr '\n' ' ')"
+car=$(grep -oE "recv [0-9]+/s" "$SP/c.log" | grep -vc "recv 0/s")
+[ "${car:-0}" -gt 0 ] \
+  && say "OK" "with the caller receiving too ($car reports)" \
+  || say "FAIL" "the caller never received anything after the answer"
+case "$D_ST" in
+  alive) say "OK" "and the process that answered is still running as the call" ;;
+  *) say "FAIL" "the process that answered died: $D_ST -- read the crash report, do not rerun past it" ;;
+esac
 
 # ── 4. AND IT SOUNDS LIKE A CALL ────────────────────────────────────────────
 grep -q "ring: sounding" "$SP/b.log" \
@@ -251,13 +327,37 @@ grep -q "status=connected" "$SP/b.log" \
 grep -q "is not in this Mac's contacts" "$SP/g.log" \
   && say "OK" "a stranger's ring does not connect early, and says why" \
   || say "FAIL" "a stranger's ring was treated like a contact's"
-STRANGERECV=$(grep -oE "recv [0-9]+/s" "$SP/g.log" | grep -vc "recv 0/s")
+# Only the RING phase: the same log goes on into the answered call below (the
+# re-exec keeps the file descriptor), and that call is supposed to carry media.
+STRANGERECV=$(sed -n '1,/ring: answer committed/p' "$SP/g.log" | grep -oE "recv [0-9]+/s" | grep -vc "recv 0/s")
 [ "${STRANGERECV:-1}" = "0" ] \
-  && say "OK" "and it received nothing, so it revealed nothing" \
-  || say "FAIL" "a stranger's ring opened a path: $STRANGERECV reports received"
+  && say "OK" "and it received nothing while ringing, so it revealed nothing" \
+  || say "FAIL" "a stranger's ring opened a path before it was answered: $STRANGERECV reports received"
 grep -q "card=ringing" "$SP/g.log" \
   && say "OK" "CONTROL: a stranger can still ring you -- the card is there" \
   || say "FAIL" "a stranger cannot ring at all now, which is not the rule"
+# ── AND ANSWERING A STRANGER STARTS A CALL, INSTEAD OF ENDING KIN ───────────
+#
+# 0.157.0 read the audio engine on the way out of every exit that happens before
+# a call -- this answer, a cancel, a caller hanging up while this Mac rang -- and
+# died with SIGSEGV each time. The bye had already left, so every rig that pressed
+# those buttons stayed green. The verdict is therefore the process itself: it
+# re-execs into the call (same pid, new image), is still there afterwards, and the
+# call it walked into carries media.
+grep -q "ring: answer committed by NSEventType" "$SP/g.log" \
+  && say "OK" "the stranger's ring took a real answer click" \
+  || say "FAIL" "the answer press never reached the stranger's card"
+grep -q "re-exec into $R4 -- ring answered" "$SP/g.log" \
+  && say "OK" "and the answer handed over into the call" \
+  || say "FAIL" "the answer never handed over: $(grep -E '^launch:|^ring:' "$SP/g.log" | tail -2 | tr '\n' ' ')"
+case "$G_ST" in
+  alive) say "OK" "and the process that answered a stranger is still running as the call" ;;
+  *) say "FAIL" "the process that answered a stranger's ring died: $G_ST -- read the crash report, do not rerun past it" ;;
+esac
+GRECV=$(grep -oE "recv [0-9]+/s" "$SP/g.log" | grep -vc "recv 0/s")
+[ "${GRECV:-0}" -gt 0 ] \
+  && say "OK" "and the call it walked into carried media ($GRECV reports with the caller's stream)" \
+  || say "FAIL" "the answered stranger's call carried nothing"
 
 # ── 4. A CLICK NOBODY AIMED IS NOT AN ANSWER ────────────────────────────────
 grep -q "ignored a click nobody aimed" "$SP/e.log" \
@@ -294,13 +394,13 @@ grep -q "ignored a click nobody aimed" "$SP/d.log" \
 # the path a real keystroke travels and cannot reach any other app.
 echo "── the keyboard: Return answers, Escape declines, and neither is a hair trigger"
 RK="preans$$k"
-spawn "$TK" --window --room "$RK" --listen 8027 --peer 127.0.0.1:8028 --video off \
+spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$RK" --listen 8027 --peer 127.0.0.1:8028 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/k1.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 # `--press-after 0.2` puts the first Return inside the 600 ms window; the second,
 # a token later, lands well outside it.
-spawn "$TK" --window --room "$RK" --listen 8028 --peer 127.0.0.1:8027 --video off \
+spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$RK" --listen 8028 --peer 127.0.0.1:8027 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 0.2 \
       --press "key:return,?,key:return,?" > "$SP/k2.log" 2>&1
@@ -329,24 +429,47 @@ grep -qE "re-exec|reexec|answering|joining" "$K" \
 
 # ── AND ESCAPE DECLINES ─────────────────────────────────────────────────────
 RE="preans$$e"
-spawn "$TK" --window --room "$RE" --listen 8029 --peer 127.0.0.1:8030 --video off \
+spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$RE" --listen 8029 --peer 127.0.0.1:8030 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/e1.log" 2>&1
 perl -e 'select undef,undef,undef,2'
-spawn "$TK" --window --room "$RE" --listen 8030 --peer 127.0.0.1:8029 --video off \
+spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$RE" --listen 8030 --peer 127.0.0.1:8029 --video off \
       --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 2 \
       --press "key:esc" > "$SP/e2.log" 2>&1
+E2PID=$LAST_PID
 perl -e 'select undef,undef,undef,8'
+E2_ST="$(status_of "$E2PID")"
 reap
 grep -q "ring: declined from the keyboard" "$SP/e2.log" \
   && say OK "Escape declines, with no waiting period" \
   || { say FAIL "Escape did not decline the call:"
        grep -E "^ring:|^key " "$SP/e2.log" | tail -3 | sed 's/^/         /'; fail=1; }
+# A decline is an exit too, and it must be exit 0 -- not the third crash path.
+case "$E2_ST" in
+  "exit 0") say OK "and the declining copy left cleanly (exit 0)" ;;
+  alive) say FAIL "the declining copy is still running after Escape"; fail=1 ;;
+  *) say FAIL "the declining copy died: $E2_ST -- read the crash report"; fail=1 ;;
+esac
+fi
 
+# ── AND NOTHING DIED ─────────────────────────────────────────────────────────
+# Counted as a delta, like stress-check: another copy of the app may be running
+# on this Mac and its reports are not this rig's business.
+NEWCRASH=$(( $(crashes) - CRASH0 ))
+if [ "$NEWCRASH" -le 0 ]; then
+  say OK "no crash reports were written while this ran"
+else
+  say FAIL "$NEWCRASH crash report(s) written during this run -- read them, do not rerun past them:"
+  ls -t "$CRASHDIR" | grep '^tk-' | head -"$NEWCRASH" | sed 's/^/         /'
+fi
+
+# The final line used to be printed unconditionally inside the keyboard block, so
+# a keyboard failure exited 1 under a line that said PASSED.
+if [ "$fail" = 0 ]; then
   echo "PRE-ANSWER CHECK PASSED -- a ring asks, and only an answer starts a call"
 else
   echo "PRE-ANSWER CHECK FAILED -- see above; logs in $SP"
-  for f in a b c d; do cp "$SP/$f.log" "${SCRATCH:-${TMPDIR:-/tmp}}/preanswer-$f.log" 2>/dev/null; done
+  for f in a b c d g; do cp "$SP/$f.log" "${SCRATCH:-${TMPDIR:-/tmp}}/preanswer-$f.log" 2>/dev/null; done
 fi
 exit $fail

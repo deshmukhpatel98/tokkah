@@ -12,6 +12,12 @@
 # person who does the calling had an empty panel for ever, under a hint promising
 # the opposite.
 #
+# (2026-09-11: since 0.128.0 the media handshake is signed by the device key and
+# `wire.onPeerIdentity` pins the PROVEN key under the handle a call was placed to
+# -- so the caller does learn the callee's key now, at the lock, and the claims
+# about "no key" below became claims about "the right key". `called.json` is still
+# the panel's own record of who was actually talked to.)
+#
 # The fix cannot be "write the callee into contacts.json when you dial them",
 # because THE CALLER NEVER LEARNS THE CALLEE'S KEY: the doorbell answers
 # {ok,queued,...} and there is deliberately no handle->key route, and the key on
@@ -45,6 +51,20 @@ export TK_KIN_BASE="http://127.0.0.1:9"
 PIDS=""
 spawn() { "$@" & LAST_PID=$!; PIDS="$PIDS $LAST_PID"; }
 reap() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; wait 2>/dev/null; PIDS=""; }
+# ── A PROCESS THAT LEFT ON ITS OWN SAYS HOW ─────────────────────────────────
+#
+# `wait <pid>` on a child that has already exited returns its status: 0 is a
+# clean exit and 128+N a signal; a child still running is left for `reap`. This
+# rig reported "part one's caller never connected … status=can't reach Kin" twice
+# on 2026-09-11, and the cause was neither the caller nor the server: the CALLEE
+# had answered and died with SIGSEGV on the way into the call (the final beat read
+# the audio engine before it existed). A rig that cannot see a death diagnoses the
+# nearest thing it can see (`unexplained-death-is-a-bug`).
+status_of() { # <pid> -> alive | exit N | signal N
+  if kill -0 "$1" 2>/dev/null; then echo alive; return; fi
+  wait "$1" 2>/dev/null; local st=$?
+  if [ "$st" -ge 128 ]; then echo "signal $((st - 128))"; else echo "exit $st"; fi
+}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TK="${TK:-$HERE/../.build/debug/tk}"
 SP="${SCRATCH:-${TMPDIR:-/tmp}}/contacts-check.$$"
@@ -59,9 +79,29 @@ mkdir -p "$SP"
 # shared directory would let one end's write satisfy an assertion about the other.
 export TK_KIN_DIR="$SP/id"
 mkdir -p "$SP/id"
-# 32 zero bytes, and 32 bytes of 0x01: both decode to a real device key length, so
-# `remember` accepts them and `known[from] == kb64` can genuinely match or miss.
-KA="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+# ── ALICE'S KEY IS ALICE'S KEY ──────────────────────────────────────────────
+#
+# KA used to be 32 zero bytes. Since 0.128.0 the media handshake is signed by the
+# device key, so a callee told "alice's key is KA" refuses a handshake from a
+# caller who cannot prove KA -- and a caller minted on first run never can. Parts
+# one and two put alice's REAL key on the ring: her identity is seeded from a fixed
+# Ed25519 seed in her directories (the file the app would otherwise mint), and its
+# public half is derived here and checked against what the app says it is. KB is
+# any other 32 bytes -- part four only checks that the value on the ring is the
+# value written down, and part six that a dialled name unlocks nothing.
+seed_identity() { # <dir> <32-byte seed, 64 hex chars> -> base64 Ed25519 public key on stdout
+  mkdir -p "$1"
+  local seed_b64; seed_b64="$(printf '%s' "$2" | xxd -r -p | base64)"
+  printf '{"seed":"%s","tok":"%s","handle":"rig","claimed":false,"quiet":false}' \
+    "$seed_b64" "$(printf '%064d' 0)" > "$1/identity.json"
+  chmod 600 "$1/identity.json"
+  { printf '302e020100300506032b657004220420' | xxd -r -p; printf '%s' "$2" | xxd -r -p; } \
+    | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | base64
+}
+ALICE_SEED=0303030303030303030303030303030303030303030303030303030303030303
+KA="$(seed_identity "$SP/a1" "$ALICE_SEED")"
+seed_identity "$SP/a2" "$ALICE_SEED" > /dev/null
+[ "${#KA}" = 44 ] || { echo "CONTACTS CHECK COULD NOT RUN -- this openssl ($(openssl version)) cannot derive an Ed25519 public key"; exit 2; }
 KB="AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
 [ -x "$TK" ] || { echo "CONTACTS CHECK COULD NOT RUN -- no tk at $TK; swift build first"; exit 2; }
 trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
@@ -79,10 +119,11 @@ BASE="--window --video off --mute --no-telemetry --no-update --no-relocate --no-
 # the file correctly and a fix that only decorates the panel are told apart by
 # reading both. Parts one to four read the file. Part five presses the screen.
 called_has() { [ -f "$1/called.json" ] && grep -q "\"$2\"" "$1/called.json"; }
-keyfor() {
+keyfor() { # <dir> <handle> -> the stored key, JSON-decoded: the file escapes "/" as "\/"
   [ -f "$1/contacts.json" ] || return 0
-  sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1/contacts.json"
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1/contacts.json" "$2"
 }
+identity_of() { grep -oE 'crypto: my identity [^,]+' "$1" | head -1 | awk '{print $4}'; }
 dump() { for f in "$1/contacts.json" "$1/called.json"; do
            [ -f "$f" ] && printf '       %s = %s\n' "$(basename "$f")" "$(cat "$f")"
          done; : ; }
@@ -101,7 +142,9 @@ spawn env TK_KIN_DIR="$SP/a1" "$TK" $BASE --room "$R1" --listen 8105 --peer 127.
 perl -e 'select undef,undef,undef,2'
 spawn env TK_KIN_DIR="$SP/b1" "$TK" $BASE --room "$R1" --listen 8106 --peer 127.0.0.1:8105 \
       --incoming alice --incoming-key "$KA" --press-after 4 --press "@answer" > "$SP/b1.log" 2>&1
+B1PID=$LAST_PID
 perl -e 'select undef,undef,undef,19'
+B1_ST="$(status_of "$B1PID")"
 reap
 
 # ── PART TWO: the same call, never answered ─────────────────────────────────
@@ -209,6 +252,19 @@ done
 grep -q "answer committed by NSEventType" "$SP/b1.log" || {
   echo "CONTACTS CHECK COULD NOT RUN -- part one was never answered by a click:"
   grep -m3 "ring: answer" "$SP/b1.log" | sed 's/^/  /'; exit 2; }
+# THE RULER: the key this rig derived is the identity alice says she has.
+grep -qF "crypto: my identity $KA," "$SP/a1.log" || {
+  echo "CONTACTS CHECK COULD NOT RUN -- alice's identity is not the key this rig derived:"
+  grep -m1 "crypto: my identity" "$SP/a1.log" | sed 's/^/  app: /'; echo "  rig: $KA"; exit 2; }
+# A callee that answered and DIED is a product failure, and it is named as one
+# before the caller's silence can be blamed on the network.
+case "$B1_ST" in
+  alive) ;;
+  *) echo "CONTACTS CHECK FAILED -- the callee answered and then died ($B1_ST) on the way into"
+     echo "  the call. That is a crash, not a network problem: read the newest tk-*.ips in"
+     echo "  ~/Library/Logs/DiagnosticReports before touching anything else."
+     tail -3 "$SP/b1.log" | cut -c1-120 | sed 's/^/  /'; exit 1 ;;
+esac
 grep -q "connected via" "$SP/a1.log" || {
   echo "CONTACTS CHECK COULD NOT RUN -- part one's caller never connected, so"
   echo "  there was no call to record. Last state:"
@@ -219,12 +275,20 @@ echo "     caller's dir after the call:"; dump "$SP/a1"
 called_has "$SP/a1" bob \
   && say "OK" "alice called bob, they talked, and bob is written down" \
   || say "FAIL" "the caller recorded NOBODY -- called.json is $(cat "$SP/a1/called.json" 2>/dev/null || echo missing)"
-# The other half, and it is not pedantry: the caller has no verified key for bob
-# and inventing one would seed `known`, the flag that opens a socket to a caller
-# before anybody agrees to talk to them.
-[ -z "$(keyfor "$SP/a1" bob)" ] \
-  && say "OK" "and with NO key against the name, because the caller was never given one" \
-  || say "FAIL" "the caller invented a key for bob: [$(keyfor "$SP/a1" bob)]"
+# ── AND THE KEY AGAINST THE NAME IS THE ONE BOB'S MAC PROVED ────────────────
+#
+# This asserted NO key for bob, on the reasoning that the caller is never handed
+# one. Since 0.128.0 it is: the handshake is signed by the device key, and the
+# proven key is pinned under the handle the call was placed to. So the claim is
+# the stronger one -- the caller holds exactly the key bob's Mac proved, and any
+# other value is the poisoned list this rig exists to see. (With the fake keys
+# this rig used to carry, the handshake never keyed, nothing was ever pinned, and
+# the old row passed for the wrong reason.)
+B1ID="$(identity_of "$SP/b1.log")"; K1="$(keyfor "$SP/a1" bob)"
+[ -n "$B1ID" ] || say "FAIL" "bob's Mac never stated its identity, so the pinned key cannot be checked"
+[ -n "$K1" ] && [ "$K1" = "$B1ID" ] \
+  && say "OK" "and the key against the name is the one bob's Mac proved in the handshake (${K1:0:12}…)" \
+  || say "FAIL" "the caller holds [${K1:-nothing}] for bob; bob's Mac proved [${B1ID:-?}]"
 
 echo "── 2. and the person who called YOU still is, with the right key"
 echo "     callee's dir after the call:"; dump "$SP/b1"
@@ -245,9 +309,18 @@ grep -q "connected via" "$SP/a2.log" \
 called_has "$SP/a2" bob \
   && say "FAIL" "and wrote bob down anyway -- a lock is not an answer" \
   || say "OK" "and wrote nobody down"
-[ ! -f "$SP/a2/contacts.json" ] \
-  && say "OK" "with no key file either" \
-  || say "FAIL" "an unanswered call wrote contacts.json: $(cat "$SP/a2/contacts.json")"
+# The lock keyed the handshake, so the caller learned bob's PROVEN identity and
+# pinned it (0.128.0, see part one). What an unanswered call must not do is put
+# bob in the People panel (`called.json`, asserted above) or pin a key bob's Mac
+# did not prove.
+B2ID="$(identity_of "$SP/b2.log")"; K2="$(keyfor "$SP/a2" bob)"
+if [ -z "$K2" ]; then
+  say "OK" "and pinned no key either"
+elif [ -n "$B2ID" ] && [ "$K2" = "$B2ID" ]; then
+  say "OK" "and the only key it pinned is the one bob's Mac proved at the lock (the People panel still waits for an answer)"
+else
+  say "FAIL" "an unanswered call pinned a key bob never proved: [$K2] vs bob's [${B2ID:-?}]"
+fi
 cmp -s "$SP/b2/contacts.json" "$SP/b2.seed" \
   && say "OK" "and the ringing end's list is byte-identical to what it started with" \
   || say "FAIL" "the ringing end changed its own list: $(cat "$SP/b2/contacts.json")"

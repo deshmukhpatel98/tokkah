@@ -367,7 +367,18 @@ both formats), `lab.json` round trip, and retention pruning (5 fake dirs → 3).
 `--route speakers`, beats to `beat-sink.py`), end B with `--echo-sim 22:0.55`, tapes
 on through `TK_KIN_DIR` + `TK_TAPES_DIR`. Asserts: every field in this file is
 present and finite on both ends; `a_rx_voice_ms` and `a_tx_voice_ms` grow;
-`a_rx_bw_khz` and `a_tx_bw_khz` ≥ 8; end A's `a_echo_return_s` > 1 and end B's
+`a_rx_bw_khz` and `a_tx_bw_khz` ≥ 4.5 at both ends (the rulers are wired), and the
+lossless property is asserted on the tapes rather than on the beats: `sent.wav` at
+the end that spoke against `played.wav` at the end that heard, aligned by envelope
+correlation, the same second read with the same ruler at both ends (≥ 90% of
+aligned seconds within one 1/6-octave band, median ratio within one band; the
+offline ruler is first checked against `--selftest-audiolab`'s own reading, and a
+3.4 kHz low-passed copy of the heard tape must fail the same comparison —
+`tools/audiolab-bw.py`). The beats' per-beat medians are NOT compared across ends:
+each is a median of five per-second readings that swing 3.6–10.2 kHz on real
+speech, the two ends' windows start at different moments, and their final beats
+hold different counts, so that comparison failed about half of all runs on a
+healthy build (2026-09-11). End A's `a_echo_return_s` > 1 and end B's
 < 0.5 (B's voice never returns — the reject); tapes exist for both ends with
 durations within 2 s of the call, `render.bin` record count within 5% of
 duration × 3000, concealed samples in `render.bin` equal to the beat's
