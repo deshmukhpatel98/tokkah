@@ -143,6 +143,49 @@ Known inputs (`audio/Tests/KinAudioTests/TurnGapsTests.swift`):
 | `net_svc` | `vi+vo`: the socket's default class is interactive video and every audio datagram carries the interactive-voice class on its own send; `refused:<errno>` if the option was rejected. |
 | `net_svc_mark` | what the stack claims for this route, read once after 300 sends: `unknown`, `l2` (Wi-Fi queue only), `l3l2` (DSCP too), `l3l2-bk`. On a home Wi-Fi it reads `l3l2` while the wire carries tos 0x0 — the queue class is the part in effect (RESEARCH.md §10). |
 
+## The far room's floor (0.158.0)
+
+On a speakers call the far end's floor mutes its microphone to digital zero
+30–70% of the time, leaving the receiver unable to measure the far room's noise
+floor directly (`a_rx_noise_db` absent). Comfort noise in concealment fades
+toward the far room floor; with no floor to track, it fades toward nothing.
+The sender already measures its own room floor (`a_tx_noise_db`); it carries it
+to the far end once a second over the 1 Hz time probe extension `TPKTW = TPKTZ + 4`.
+
+| field | kind | meaning |
+|---|---|---|
+| `a_peer_noise_db` | window | latest far room floor level reported by the peer, dBFS. Absent when nil (never 0). |
+| `a_peer_noise_reports` | cumul | count of time probes received carrying a room floor value. |
+
+### Wire encoding (`TPKTW` extension)
+
+The 4-byte extension `TPKTW = TPKTZ + 4` rides the time probe (`TMAGIC`):
+- `+0` `room_floor`: `UInt8`. `255` = unknown/absent. Otherwise `v = round(−noiseDb × 2)` clamped to `0…254` (0.5 dB steps from 0 dBFS down to −127 dBFS). Decode: `noiseDb = −Double(v) / 2`.
+- `+1…+3`: reserved 0.
+
+| input | encoded byte | decoded | note |
+|---|---|---|---|
+| −58.0 dBFS | `116` | −58.0 dBFS | typical quiet room |
+| −127.5 dBFS | `254` | −127.0 dBFS | clamped to dynamic range limit |
+| `nil` / absent | `255` | `nil` | unknown / pre-measurement (reject row) |
+| 0.0 dBFS | `0` | 0.0 dBFS | full scale ceiling |
+
+## The listener's level and own voice (0.158.0)
+
+| field | kind | meaning |
+|---|---|---|
+| `a_rx_level_gain_db` | now | the gain this end applies to the far voice before playing it (−6…+6 dB; `KinAudio/LevelHold`). Target −20 dBFS RMS of voiced frames with a ±2 dB dead band; one move ≤ 1 dB per 2 s, only while the far voice has paused ≥ 200 ms; never a raise that would put a peak over −1 dBFS; drifts back to 0 by 0.5 dB per 10 s without a far voice. The sender's trim covers capture headroom; this covers what is heard past the sender's 4× ceiling. `--far-level off` is the control arm. |
+| `a_rx_level_moves` | cumul | moves applied. |
+| `a_rx_level_waited` | cumul | 1 Hz ticks that wanted a move and waited for a pause. |
+| `sidetone_ms` | cumul | ms of this microphone fed back into the headphones at `sidetone` dB (~5 ms after the mouth: device in + out latency and one buffer). Off on speakers, off on a Bluetooth headset in phone mode, off under `--mute`. |
+| `sidetone_starved` | cumul | output samples for which no fresh capture sample had arrived yet (the reader met the writer) — nothing was added for them. |
+
+| fact | values |
+|---|---|
+| `sidetone` | `-16 dB` (the default on headphones; `--sidetone <dB>` sets it), `off` (`--sidetone off`, or a Bluetooth phone-mode headset that does its own), `speakers` (off because of the route). |
+
+Known inputs (`tk --gain-test` sections 14 and 15): a −30 dBFS far voice during continuous speech moves nothing and counts the wait; in a pause it moves ≤ 1 dB with the 20 ms ramp; a −20 dBFS voice moves nothing; `--far-level off` moves nothing (the control arm). A 0.5 full-scale capture block comes out of the headphone mix at exactly −16 dB; on speakers, with `--sidetone off`, and on a phone-mode headset the mix is exactly silent (three rejects); a reader that meets the writer adds nothing and counts the starvation.
+
 ## The bandwidth ruler (`*_bw_khz`)
 
 On ≥ 300 ms of voiced audio in the window: Hann 2048-point FFTs at 50% overlap
@@ -271,13 +314,15 @@ the held audio away).
 `mac/tools/telemetry.sh pair <id>` prints, per end, after the existing groups:
 
 ```
-HEARD     clean 99.2% of their voice · 0.4 glitches/min · dead air 3.1 s · level -24 dBFS (swing 2 dB) · band 14 kHz · pitch-up 0 s
+HEARD     clean 99.2% of their voice · 0.4 glitches/min · dead air 3.1 s · level -24 dBFS (swing 2 dB) · their room −58 dBFS · band 14 kHz · pitch-up 0 s
 SAID      talked 142 s · 2.3 s of your words never left · soft-limited 0.0% · noise -58 dBFS (SNR 34 dB) · band 12 kHz · trim 0.42
 TURNS     you answered 0.4 s after them (p90 1.1 s) · they answered 0.9 s after you · 31 % of changes overlapped
 RETURN    heard yourself 0% of your talking
 DEVICES   in "MacBook Air Microphone" builtin 48000/1ch · out "EarPods" usb 48000/2ch · phone-mode no · mic mode standard · route headphones
 VERDICT   you heard them: clear · they heard you: 2.3 s of words lost to the floor
 ```
+
+The HEARD line gains `· their room −58 dBFS` when `a_peer_noise_db` is present.
 
 First-cut verdict rules (in `telemetry.py`, one place, easy to move):
 
@@ -313,7 +358,8 @@ pitch-up time; from `capture.bin` the seconds of voiced audio with `tx_gain_mean
 ## Rigs that hold this
 
 `tk --selftest-audiolab`: every ruler above on its known inputs, including the
-rejects, plus the WAV writer round trip (1 s written, read back sample-exact for
+rejects, the room floor byte codec on its known inputs and reject row, plus
+the WAV writer round trip (1 s written, read back sample-exact for
 both formats), `lab.json` round trip, and retention pruning (5 fake dirs → 3).
 
 `mac/tools/audiolab-check.sh`: two real ends of a live loopback call
