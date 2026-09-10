@@ -5,6 +5,87 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.159.0 — 2026-09-11
+
+### Fixed — answering a call from someone new crashed Kin (0.157.0)
+
+0.157.0 taught the final beat to record the call's device-buffer facts, and read
+the audio engine to do it. Three exits run before that engine exists: a ring
+answered from the card (the card lives above the audio block for anyone not yet
+in your contacts, and for every ring from an older watcher), a call cancelled
+while still waiting for the other person, and the caller hanging up while this
+Mac was ringing. Each of them dereferenced an uninitialised object and died with
+SIGSEGV — eleven crash reports in one suite run — and every rig that pressed
+those buttons stayed green, because the goodbye had already left the socket
+before the death. The bookkeeping is now guarded on `beatReady` (an engine that
+never ran has nothing to teach the buffer policy; the same guard is in 0.158.0). `bye-check`, `calling-check`,
+`preanswer-check` and `contacts-check` now read how each exiting process left
+(exit 0, or signal N) and count crash reports written while they ran; the
+answer-a-stranger arm is new.
+
+### Fixed — the recogniser is on again
+
+0.138.0 made speech recognition opt-in (`--subtitles`) "to reduce background
+CPU usage", inside a commit about call recording. Nothing in the app ever passed
+the flag, so from that release on no call ran a recogniser, and two shipped
+features died with it: the words of a muted person on the other screen (the one
+case subtitles exist for) and the turn-end prior at both ends (`predict_*` read
+0 on every call). `subtitle-check` and `predict-live-check` failed on it for
+eight days while releases were cut without the suite. Default on again;
+`--no-subtitles` is the control arm and the only switch; `--subtitles` is refused
+as an unknown option. Measured in `stress-check`'s long call (one end, release build, 720p picture plus
+real speech, 210 s): 36.4% of one core at the end with the recogniser on, against
+10.6% and 17.5% in the two runs with it off; the arm's ceiling is 70%. The other
+session was compiling on this Mac for part of that run, so read the delta as
+roughly a fifth of a core, not a precise figure.
+
+### Changed — the video pause on a LAN
+
+The same 0.138.0 commit switched the video pause off on a verified LAN path, with
+no note. Kept for a real same-Wi-Fi call; a path being impaired on purpose
+(`--imp-*`) is exempt, so `vpause-check` can exercise the pause-measure-abandon
+controller again (it could not: its two ends are loopback, so it never paused).
+Whether the LAN inhibit is right at all is open — two Macs on one congested
+access point lose voice packets too — and is recorded here rather than settled.
+
+### Rigs — the suite's rot, itemised
+
+Seven rigs failed identically on the shipped 0.156.0 and 0.157.0. Three were the
+product (above); the rest were rigs that had not followed the product:
+
+- `update-check` and `liveupdate-check` staged only `manifest.json.sig`; since
+  0.130.0 the updater refuses a manifest without `.sig2`, so every arm read "sig2
+  is missing" and the `ok` control never installed (22 FAIL rows about the rig).
+  Both stage the second signature the way `release.sh` does; `update-check` gains
+  two reject arms for the second signer (missing, and well-formed but wrong), and
+  proves the signer's public key is the one compiled into the binary first.
+- `preanswer-check` and `contacts-check` handed the callee a made-up caller key;
+  since 0.128.0 the handshake is signed by the device key, so the callee refused
+  the caller ("NO KEY", recv 0/s) and the "real call" rows were passing on `cap`
+  lines with nothing in them. The caller's identity is now seeded from a fixed
+  Ed25519 seed, its public key derived with openssl and checked against the app's
+  own `crypto: my identity` line before any verdict is read.
+- Eight rigs launched without `TK_NO_IDENTITY` and walked @devesh … @devesh9
+  against the production directory on every run (`preanswer-check`'s caller saw
+  `429 rate` — the registration budget is ten a minute). The doorbell does not
+  rate-limit rig calls; the rigs were claiming names.
+- `stress-check` compared the settings panel's row COUNT on the first open with
+  the last; since 0.140.0 rows arrive during a call ("Integrated VPN" once the
+  relay is found, "Remote Location" once the other end's country is known), so a
+  healthy panel went 13 → 14 and read as a leak. A leak is a label that appears
+  twice in one open, and that is what is measured now (the ruler is checked on a
+  planted duplicate first). Its long call's end-of-call media reading is a
+  median of the last five reports: a 750 ms audio-device stall on both ends at
+  the same instant, recovered by both, had been read as "media stopped".
+- `audiolab-check` compared the median of one end's per-beat `a_tx_bw_khz` with
+  the median of the other's `a_rx_bw_khz`; each is a median of five per-second
+  readings that swing 3.6–10.2 kHz on real speech, the two ends' windows start
+  at different moments, and their final beats hold different counts, so a
+  healthy build failed about half of all runs. The lossless property is now
+  asserted where it holds — on the tapes, the same second at both ends (24 of
+  24 within a band, 22 identical), with the offline ruler calibrated against
+  `--selftest-audiolab`'s own reading and a 3.4 kHz copy as the row that must
+  fail (`tools/audiolab-bw.py`).
 ## Kin 0.158.0 — 2026-09-11
 
 ### Fixed — a crash on answering a ring, shipped in 0.157.0

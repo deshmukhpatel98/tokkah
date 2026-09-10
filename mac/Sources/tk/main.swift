@@ -593,7 +593,7 @@ let KNOWN_FLAGS: Set<String> = [
   "mouth-threshold", "mouth-rotated",
   "ledger-test", "subtitle-test", "sub-over", "sub-floor", "cue-test",
   "no-yield", "yield-db", "yield-after", "yield-test",
-  "subtitles", "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
+  "no-subtitles", "asr-port", "asr", "subtitle-debug", "no-sub-clean", "decimator-test",
   "floor-test", "floor-owd", "no-floor", "floor-debug",
   // The linear echo canceller (0.107.0) and its arms. `--no-aec` is the control
   // and restores 0.106.0: nothing subtracts, and the echo veto runs on the
@@ -6024,9 +6024,20 @@ nonisolated(unsafe) var utteranceWasListening = true
 /// a transcript that falls further behind the longer the call runs.
 nonisolated(unsafe) var fedIn = 0
 nonisolated(unsafe) var fedOut = 0
-let subtitles = (!flag("no-subtitles") && flag("subtitles"))
-  ? Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
-  : nil
+// ── ON, UNLESS SWITCHED OFF ─────────────────────────────────────────────────
+//
+// 0.138.0 made this opt-in (`--subtitles`) "to reduce background CPU usage", in
+// a commit about call recording. Nothing in the app ever passed the flag, so from
+// that release on no call ran a recogniser -- and with it went two shipped
+// features and their telemetry: the words of a muted person on the other screen
+// (the one case subtitles exist for) and the turn-end prior at both ends
+// (`predict_*` read 0 on every call). `subtitle-check` and `predict-live-check`
+// failed on it for eight days while ~30 releases were cut without the suite
+// (`unrun-tests-are-not-coverage`, `feature-behind-a-flag-nobody-runs`). Default
+// on again; `--no-subtitles` is the control arm and the only switch, and the
+// long-call arm of `stress-check` measures what it costs.
+let subtitles = flag("no-subtitles") ? nil
+  : Subtitles(port: Int(arg("asr-port") ?? "8789") ?? 8789, prefer: arg("asr") ?? "apple")
 
 // RECEIVING IS NOT SENDING, and this was inside the block that needs a
 // recogniser -- so a machine without one could not DISPLAY the far end's words
@@ -8410,10 +8421,25 @@ func reportLoop() {
     // `--vpause-test` forces the state without needing a bad link, which is the
     // only way to prove the far end's half on a clean LAN. It is deliberately
     // crude: the point is to exercise the wire bit, the blur and the sentence.
-    vq.inhibitPause = wire.isLAN
+    // ── NOT ON A LAN -- UNLESS THE LAN IS BEING DAMAGED ON PURPOSE ───────────
+    //
+    // 0.138.0 (the call-recording commit) switched the pause off on a verified LAN
+    // path, to keep a same-Wi-Fi call at full frame rate; it said nothing about
+    // why in the code, and it also switched off `vpause-check`, whose two ends are
+    // loopback and therefore always a LAN. The controller's whole defence -- pause,
+    // measure, abandon if it did not help -- could no longer be exercised anywhere.
+    //
+    // An `--imp-*` run declares that its path is damaged ("numbers from this run
+    // describe a damaged path on purpose"), which is the one thing a verified LAN
+    // is assumed not to be. So the inhibit stands for a real LAN call and does not
+    // apply to a path that is being impaired deliberately. Whether the LAN inhibit
+    // is right at all -- two Macs on one congested access point lose voice packets
+    // too -- is a product decision recorded in CHANGELOG 0.159.0, not settled here.
+    let lanInhibit = wire.isLAN && !impair.enabled
+    vq.inhibitPause = lanInhibit
     if let at = arg("vpause-test").flatMap({ Int($0) }) {
       gVideoPaused = beatTick >= at && beatTick < at + 20
-    } else if wire.isLAN {
+    } else if lanInhibit {
       gVideoPaused = false
     } else {
       gVideoPaused = vq.paused
