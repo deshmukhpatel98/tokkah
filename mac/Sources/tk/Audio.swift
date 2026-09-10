@@ -651,9 +651,21 @@ final class Audio {
     }
 
     let quietNow = (testFarVoiceOverride != nil) ? (testFarVoiceOverride == false) : (farQuietRun >= Audio.PAUSE_SAMPLES)
+    trimLock.lock(); defer { trimLock.unlock() }
     let targetDb = levelHold.tick(voicedRmsDb: voicedRmsDb, quietNow: quietNow, peak: Double(peak))
     let targetLinear = Float(pow(10.0, targetDb / 20.0))
-    setFarGainTarget(targetLinear)
+    if targetLinear != farGainTarget { setFarGainTarget(targetLinear) }
+  }
+
+  /// The 10 Hz half of the far-voice levelling (see `startPauseCheck`): lands a
+  /// move the tick decided as soon as the far voice has paused 200 ms, instead
+  /// of waiting for the next tick to happen to sample a pause.
+  func checkPendingFarLevel() {
+    guard Audio.farLevelOn, testFarVoiceOverride == nil else { return }
+    trimLock.lock(); defer { trimLock.unlock() }
+    let targetDb = levelHold.applyPending(quietNow: farQuietRun >= Audio.PAUSE_SAMPLES, countWait: false)
+    let targetLinear = Float(pow(10.0, targetDb / 20.0))
+    if targetLinear != farGainTarget { setFarGainTarget(targetLinear) }
   }
 
   func setTestFarVoiceActive(_ active: Bool?) {
@@ -827,7 +839,10 @@ final class Audio {
     guard pauseTimer == nil else { return }
     let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "kin.gain.pause", qos: .utility))
     t.schedule(deadline: .now() + 0.1, repeating: 0.1, leeway: .milliseconds(20))
-    t.setEventHandler { [weak self] in self?.checkPendingTrim() }
+    t.setEventHandler { [weak self] in
+      self?.checkPendingTrim()
+      self?.checkPendingFarLevel()
+    }
     t.resume()
     pauseTimer = t
   }

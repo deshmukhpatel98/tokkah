@@ -863,22 +863,32 @@ final class Wire {
   /// the stack CLAIMS, and the comment is what was seen. `net_svc_mark`:
   /// `unknown` / `l2` / `l3l2` / `l3l2-bk` / `unreadable:<errno>`.
   private var markingNoted = false
+  /// The raw marking level, read on the send path. −2 = not read yet, −1 =
+  /// getsockopt failed (errno in `markingErrno`). A scalar and nothing else: the
+  /// send path runs on the audio thread, and `Metrics.fact` REFUSES a hot thread
+  /// silently (`guard !hot()`), which is why `net_svc_mark` never appeared in
+  /// 0.157.0 or 0.158.0 although the readback ran. The reporter thread turns
+  /// this into the fact (`markingWord`, main.swift's 1 Hz loop).
+  nonisolated(unsafe) private(set) var markingLevelRaw: Int32 = -2
+  nonisolated(unsafe) private(set) var markingErrno: Int32 = 0
   private func noteMarkingLevel() {
     var lvl: Int32 = -1
     var len = socklen_t(MemoryLayout<Int32>.size)
     let r = getsockopt(fd, SOL_SOCKET, SO_NETSVC_MARKING_LEVEL, &lvl, &len)
-    let word: String
-    if r != 0 { word = "unreadable:\(errno)" }
-    else {
-      switch lvl {
-      case NETSVC_MRKNG_UNKNOWN: word = "unknown"
-      case NETSVC_MRKNG_LVL_L2: word = "l2"
-      case NETSVC_MRKNG_LVL_L3L2_ALL: word = "l3l2"
-      case NETSVC_MRKNG_LVL_L3L2_BK: word = "l3l2-bk"
-      default: word = "other:\(lvl)"
-      }
+    if r != 0 { markingErrno = errno; markingLevelRaw = -1 } else { markingLevelRaw = lvl }
+  }
+  /// `unknown` / `l2` / `l3l2` / `l3l2-bk` / `unreadable:<errno>`, or nil before
+  /// the first readback. Read on the reporter thread only.
+  var markingWord: String? {
+    switch markingLevelRaw {
+    case -2: return nil
+    case -1: return "unreadable:\(markingErrno)"
+    case NETSVC_MRKNG_UNKNOWN: return "unknown"
+    case NETSVC_MRKNG_LVL_L2: return "l2"
+    case NETSVC_MRKNG_LVL_L3L2_ALL: return "l3l2"
+    case NETSVC_MRKNG_LVL_L3L2_BK: return "l3l2-bk"
+    default: return "other:\(markingLevelRaw)"
     }
-    Metrics.fact("net_svc_mark", word)
   }
 
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true, cls: TxCls = .ctl) {

@@ -8564,6 +8564,9 @@ func reportLoop() {
   Resume.touch()
   // Same cadence, same thread, same reason: never from a callback.
   audio.tuneInputGain()
+  // The socket's marking level was read on the send path (a hot thread, where a
+  // fact write is refused); the reporter writes the fact from the scalar it left.
+  if let w = wire.markingWord { Metrics.fact("net_svc_mark", w) }
   // Same cadence: headphones appearing mid-call open it to full duplex.
   audio.checkOutputRoute()
   // ── AND WHEN THE MICROPHONE IS NOT DELIVERING, SAY SO ─────────────────────
