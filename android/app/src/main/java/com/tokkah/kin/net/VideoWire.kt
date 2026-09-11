@@ -104,6 +104,124 @@ object VideoWire {
 
     /** NAL type of a raw NAL (no start code). 7 = SPS, 8 = PPS, 5 = IDR. */
     fun nalType(nal: ByteArray): Int = if (nal.isEmpty()) -1 else nal[0].toInt() and 0x1f
+
+    private class SpsBitReader(private val buf: ByteArray) {
+        private var bitOffset = 0
+        fun readBit(): Int {
+            if (bitOffset / 8 >= buf.size) return 0
+            val b = buf[bitOffset / 8].toInt() and 0xff
+            val bit = (b shr (7 - (bitOffset % 8))) and 1
+            bitOffset++
+            return bit
+        }
+        fun readBits(n: Int): Int {
+            var v = 0
+            for (i in 0 until n) v = (v shl 1) or readBit()
+            return v
+        }
+        fun readUe(): Int {
+            var zeros = 0
+            while (readBit() == 0 && zeros < 32) zeros++
+            if (zeros == 0) return 0
+            return (1 shl zeros) - 1 + readBits(zeros)
+        }
+        fun readSe(): Int {
+            val ue = readUe()
+            val sign = if (ue and 1 != 0) 1 else -1
+            return sign * ((ue + 1) shr 1)
+        }
+    }
+
+    private fun removeEmulationPrevention(src: ByteArray, start: Int, len: Int): ByteArray {
+        val out = ByteArray(len)
+        var o = 0
+        var i = start
+        val end = start + len
+        while (i < end) {
+            if (i + 2 < end && src[i] == 0.toByte() && src[i + 1] == 0.toByte() && src[i + 2] == 3.toByte()) {
+                out[o++] = src[i++]
+                out[o++] = src[i++]
+                i++
+            } else out[o++] = src[i++]
+        }
+        return out.copyOf(o)
+    }
+
+    /** Parses (width, height) out of an H.264 SPS NAL, accounting for cropping. */
+    fun parseSps(spsNal: ByteArray): Pair<Int, Int>? = runCatching {
+        var off = 0
+        while (off + 3 < spsNal.size && spsNal[off] == 0.toByte() && spsNal[off + 1] == 0.toByte()) {
+            if (spsNal[off + 2] == 1.toByte()) { off += 3; break }
+            if (off + 4 <= spsNal.size && spsNal[off + 2] == 0.toByte() && spsNal[off + 3] == 1.toByte()) { off += 4; break }
+            off++
+        }
+        if (off >= spsNal.size) return null
+        if (spsNal[off].toInt() and 0x1f != 7) return null
+        val rbsp = removeEmulationPrevention(spsNal, off + 1, spsNal.size - (off + 1))
+        val reader = SpsBitReader(rbsp)
+        val profileIdc = reader.readBits(8)
+        reader.readBits(8) // constraint flags
+        reader.readBits(8) // level idc
+        reader.readUe()    // seq_parameter_set_id
+
+        if (profileIdc in intArrayOf(100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135)) {
+            val chromaFormatIdc = reader.readUe()
+            if (chromaFormatIdc == 3) reader.readBit()
+            reader.readUe() // bit_depth_luma_minus8
+            reader.readUe() // bit_depth_chroma_minus8
+            reader.readBit() // qpprime_y_zero_transform_bypass_flag
+            val seqScalingMatrixPresent = reader.readBit()
+            if (seqScalingMatrixPresent != 0) {
+                val count = if (chromaFormatIdc != 3) 8 else 12
+                for (i in 0 until count) {
+                    val seqScalingListPresent = reader.readBit()
+                    if (seqScalingListPresent != 0) {
+                        val size = if (i < 6) 16 else 64
+                        var lastScale = 8
+                        var nextScale = 8
+                        for (j in 0 until size) {
+                            if (nextScale != 0) {
+                                val deltaScale = reader.readSe()
+                                nextScale = (lastScale + deltaScale + 256) % 256
+                            }
+                            lastScale = if (nextScale == 0) lastScale else nextScale
+                        }
+                    }
+                }
+            }
+        }
+
+        reader.readUe() // log2_max_frame_num_minus4
+        val picOrderCntType = reader.readUe()
+        if (picOrderCntType == 0) {
+            reader.readUe() // log2_max_pic_order_cnt_lsb_minus4
+        } else if (picOrderCntType == 1) {
+            reader.readBit() // delta_pic_order_always_zero_flag
+            reader.readSe()  // offset_for_non_ref_pic
+            reader.readSe()  // offset_for_top_to_bottom_field
+            val numRefFrames = reader.readUe()
+            for (i in 0 until numRefFrames) reader.readSe()
+        }
+
+        reader.readUe() // max_num_ref_frames
+        reader.readBit() // gaps_in_frame_num_value_allowed_flag
+        val picWidthInMbsMinus1 = reader.readUe()
+        val picHeightInMapUnitsMinus1 = reader.readUe()
+        val frameMbsOnlyFlag = reader.readBit()
+        if (frameMbsOnlyFlag == 0) reader.readBit()
+        reader.readBit() // direct_8x8_inference_flag
+        val frameCroppingFlag = reader.readBit()
+        var cropLeft = 0; var cropRight = 0; var cropTop = 0; var cropBottom = 0
+        if (frameCroppingFlag != 0) {
+            cropLeft = reader.readUe()
+            cropRight = reader.readUe()
+            cropTop = reader.readUe()
+            cropBottom = reader.readUe()
+        }
+        val width = (picWidthInMbsMinus1 + 1) * 16 - (cropLeft + cropRight) * 2
+        val height = (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16 - (cropTop + cropBottom) * 2
+        if (width > 0 && height > 0) Pair(width, height) else null
+    }.getOrNull()
 }
 
 /**

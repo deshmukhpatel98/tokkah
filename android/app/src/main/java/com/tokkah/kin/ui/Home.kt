@@ -75,6 +75,8 @@ class HomeCard(
     val reachHint: String,
     /** The person a long press has offered to remove, if any. */
     val removing: String? = null,
+    /** Installed app version shown in the settings card. */
+    val version: String = "",
 )
 
 @Composable
@@ -162,6 +164,9 @@ fun HomeScreen(
                                 inert = card.reachOn == null,
                                 onClick = onReach,
                             )
+                            if (card.version.isNotEmpty()) {
+                                KinRow("Version", detail = card.version, labelInset = Metric.rowAvatarInset)
+                            }
                             KinHint(card.reachHint)
                         } else {
                             // A call you are still in comes first: it is the only

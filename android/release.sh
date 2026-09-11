@@ -68,8 +68,8 @@ echo "  $VER (code $CODE)"
 
 echo "== build =="
 # Pipes mask exit codes (pipes-mask-exit-codes): the build's status is read directly.
-(cd "$REPO/android" && ./gradlew -q :app:assembleDebug :app:testDebugUnitTest)
-APK_SRC="$REPO/android/app/build/outputs/apk/debug/app-debug.apk"
+(cd "$REPO/android" && ./gradlew -q :app:assembleRelease :app:testDebugUnitTest)
+APK_SRC="$REPO/android/app/build/outputs/apk/release/app-release.apk"
 [ -f "$APK_SRC" ] || { echo "FAILED: no APK at $APK_SRC"; exit 1; }
 # The APK must carry the version it claims.
 "$ANDROID_HOME/build-tools/"*/aapt dump badging "$APK_SRC" 2>/dev/null | grep -q "versionName='$VER'" \

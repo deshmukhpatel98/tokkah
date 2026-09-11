@@ -34,6 +34,7 @@ class RecvRing {
     val concealStarved get() = concealStarvedS / Wire.FPP
     var errMs = 0.0
 
+    val slackWin = Quantiles(2048)
     var slackMin = 1e9
     var slackWinMin = 1e9
     var slackSum = 0.0; var slackN = 0
@@ -47,11 +48,18 @@ class RecvRing {
 
     fun present(seq: Int): Boolean = seq >= 0 && tags[seq % Wire.RING] == seq
 
-    /** One sample by ABSOLUTE index, or null when its packet is not here. */
-    fun sampleAt(i: Long): Float? {
-        if (i < 0) return null
+    fun readSamples(seq: Int, dst: FloatArray, dstOff: Int = 0): Boolean {
+        if (!present(seq)) return false
+        val slot = seq % Wire.RING
+        System.arraycopy(samples, slot * Wire.FPP, dst, dstOff, Wire.FPP)
+        return true
+    }
+
+    /** One sample by ABSOLUTE index, or defaultVal (NaN) when its packet is not here. */
+    fun sampleAt(i: Long, defaultVal: Float = Float.NaN): Float {
+        if (i < 0) return defaultVal
         val sq = (i / Wire.FPP).toInt()
-        if (!present(sq)) return null
+        if (!present(sq)) return defaultVal
         return samples[(sq % Wire.RING) * Wire.FPP + (i % Wire.FPP).toInt()]
     }
 
@@ -80,6 +88,7 @@ class RecvRing {
         if (pos >= 0) {
             val ms = (seq.toLong() * Wire.FPP - pos) / Wire.SR * 1000.0
             slackSum += ms; slackN++
+            slackWin.add(ms)
             if (ms < slackMin) slackMin = ms
             if (ms < slackWinMin) slackWinMin = ms
             if (ms < 0) {

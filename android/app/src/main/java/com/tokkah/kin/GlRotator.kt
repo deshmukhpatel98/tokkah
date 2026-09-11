@@ -8,7 +8,6 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
-import android.opengl.Matrix
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -43,12 +42,31 @@ class GlRotator(
     private var egl: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var ctx: EGLContext = EGL14.EGL_NO_CONTEXT
     private var surf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private val previewLock = Any()
+    private var previewSurf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var previewTargetSurface: Surface? = null
+    private var eglConfig: EGLConfig? = null
     private var program = 0
     private var texId = 0
     private var aPos = 0
     private var aTex = 0
     private var uSt = 0
     private var uRot = 0
+
+    fun setPreviewSurface(surface: Surface?) {
+        synchronized(previewLock) {
+            if (previewTargetSurface == surface) return
+            previewTargetSurface = surface
+            if (egl != EGL14.EGL_NO_DISPLAY && previewSurf != EGL14.EGL_NO_SURFACE) {
+                runCatching { EGL14.eglDestroySurface(egl, previewSurf) }
+                previewSurf = EGL14.EGL_NO_SURFACE
+            }
+            val cfg = eglConfig
+            if (surface != null && surface.isValid && egl != EGL14.EGL_NO_DISPLAY && cfg != null) {
+                previewSurf = EGL14.eglCreateWindowSurface(egl, cfg, surface, intArrayOf(EGL14.EGL_NONE), 0)
+            }
+        }
+    }
 
     /** Where the camera writes. Hand this to the capture session. */
     lateinit var inputTexture: SurfaceTexture; private set
@@ -103,6 +121,7 @@ class GlRotator(
             ),
             0, cfgs, 0, 1, IntArray(1), 0,
         )
+        eglConfig = cfgs[0]
         ctx = EGL14.eglCreateContext(
             egl, cfgs[0], EGL14.EGL_NO_CONTEXT,
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0,
@@ -161,19 +180,7 @@ class GlRotator(
         }
         inputTexture.updateTexImage()
         inputTexture.getTransformMatrix(stMatrix)
-
-        Matrix.setIdentityM(rotMatrix, 0)
-        // Aspect: the camera frame is outH x outW (landscape) and the target is
-        // outW x outH (portrait), so after turning it a quarter the long edge
-        // is scaled to COVER rather than to fit — a face in a letterbox is not
-        // what a phone held upright should send.
-        Matrix.rotateM(rotMatrix, 0, -rotation.toFloat(), 0f, 0f, 1f)
-        if (mirror) Matrix.scaleM(rotMatrix, 0, -1f, 1f, 1f)
-        val turned = rotation % 180 != 0
-        val srcAspect = if (turned) outW.toFloat() / outH else outH.toFloat() / outW
-        val dstAspect = outW.toFloat() / outH
-        if (srcAspect > dstAspect) Matrix.scaleM(rotMatrix, 0, srcAspect / dstAspect, 1f, 1f)
-        else Matrix.scaleM(rotMatrix, 0, 1f, dstAspect / srcAspect, 1f)
+        computeTransformMatrix(rotMatrix, rotation, mirror, outW, outH)
 
         GLES20.glViewport(0, 0, outW, outH)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -193,6 +200,32 @@ class GlRotator(
         // rotation's own cost into the far end's glass-to-glass.
         android.opengl.EGLExt.eglPresentationTimeANDROID(egl, surf, presentationNs)
         EGL14.eglSwapBuffers(egl, surf)
+
+        // If preview surface is attached (in-call hold-to-peek), draw to it without a second camera
+        val ps = synchronized(previewLock) {
+            if (previewTargetSurface?.isValid == true) previewSurf else EGL14.EGL_NO_SURFACE
+        }
+        if (ps != EGL14.EGL_NO_SURFACE) {
+            synchronized(previewLock) {
+                if (previewSurf == ps && previewTargetSurface?.isValid == true) {
+                    if (EGL14.eglMakeCurrent(egl, ps, ps, ctx)) {
+                        GLES20.glViewport(0, 0, outW, outH)
+                        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                        GLES20.glUseProgram(program)
+                        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
+                        GLES20.glUniformMatrix4fv(uSt, 1, false, stMatrix, 0)
+                        GLES20.glUniformMatrix4fv(uRot, 1, false, rotMatrix, 0)
+                        GLES20.glEnableVertexAttribArray(aPos)
+                        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+                        GLES20.glEnableVertexAttribArray(aTex)
+                        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 0, uv)
+                        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                        EGL14.eglSwapBuffers(egl, ps)
+                    }
+                }
+            }
+        }
     }
 
     fun release() {
@@ -200,6 +233,12 @@ class GlRotator(
         runCatching { inputTexture.release() }
         if (egl != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            synchronized(previewLock) {
+                if (previewSurf != EGL14.EGL_NO_SURFACE) {
+                    runCatching { EGL14.eglDestroySurface(egl, previewSurf) }
+                    previewSurf = EGL14.EGL_NO_SURFACE
+                }
+            }
             runCatching { EGL14.eglDestroySurface(egl, surf) }
             runCatching { EGL14.eglDestroyContext(egl, ctx) }
             runCatching { EGL14.eglTerminate(egl) }
@@ -222,5 +261,58 @@ class GlRotator(
         GLES20.glAttachShader(p, shader(GLES20.GL_FRAGMENT_SHADER, f))
         GLES20.glLinkProgram(p)
         return p
+    }
+
+    companion object {
+        /**
+         * Calculates the 4x4 column-major transformation matrix for the vertex shader.
+         * Applies screen-space cover scaling and horizontal mirror flip (S * R * pos):
+         * - Negative X scale mirrors the picture horizontally from right to left (like FaceTime)
+         *   without inverting the vertical axis.
+         * - Clockwise rotation turns the sensor buffer upright in portrait mode.
+         */
+        fun computeTransformMatrix(
+            out: FloatArray,
+            rotation: Int,
+            mirror: Boolean,
+            outW: Int,
+            outH: Int,
+        ) {
+            val turned = rotation % 180 != 0
+            val srcAspect = if (turned) outW.toFloat() / outH else outH.toFloat() / outW
+            val dstAspect = outW.toFloat() / outH
+            val scaleX = if (srcAspect > dstAspect) srcAspect / dstAspect else 1f
+            val scaleY = if (srcAspect > dstAspect) 1f else dstAspect / srcAspect
+            val sx = if (mirror) -scaleX else scaleX
+            val sy = scaleY
+
+            val rad = Math.toRadians(-rotation.toDouble())
+            val c = Math.cos(rad).toFloat()
+            val s = Math.sin(rad).toFloat()
+
+            // Column 0
+            out[0] = sx * c
+            out[1] = sy * s
+            out[2] = 0f
+            out[3] = 0f
+
+            // Column 1
+            out[4] = -sx * s
+            out[5] = sy * c
+            out[6] = 0f
+            out[7] = 0f
+
+            // Column 2
+            out[8] = 0f
+            out[9] = 0f
+            out[10] = 1f
+            out[11] = 0f
+
+            // Column 3
+            out[12] = 0f
+            out[13] = 0f
+            out[14] = 0f
+            out[15] = 1f
+        }
     }
 }

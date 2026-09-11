@@ -27,6 +27,7 @@ object Wire {
     const val TPKT = 4 + 4 + 8 + 8 + 8    // magic, kind, t1, t2, t3             TimeSync.swift:40
     const val TPKTX = TPKT + 8            // + rxLost(u32) rxRecovered(u32)
     const val TPKTY = TPKTX + 8           // + played(u32) muted(u8) qLevel(u8) status(u8) endProb(u8)
+    const val TPKTZ = TPKTY + 8           // + vMissing(u32) vFrags(u32) (TimeSync.swift:95)
 
     // Status bits (Net.swift:903-955)
     const val ST_VPAUSED = 1
@@ -36,10 +37,29 @@ object Wire {
     const val ST_RINGING = 16
     const val ST_VOICING = 32
     const val ST_SEEN_TALKING = 64
+    const val ST_RECORDING = 128
+
+    // Multi-stride FEC chunks (Net.swift:562-565)
+    const val FEC_MAGIC = 0x5446 // 'TF'
+    const val FEC_TYPE_STRIDE = 1
+    const val FEC_TYPE_PARITY = 2
 
     // Audio tag high bits (Net.swift:512): frames | pcm16<<16 | lp<<17
     const val TAG_PCM16 = 1 shl 16
     const val TAG_LP = 1 shl 17
+
+    /** Soft limiter with tanh knee at 0.80 (Mac 0.133 / Net.swift:440). */
+    fun softLimit(x: Float): Float {
+        val knee = 0.80f
+        if (x > knee) {
+            val d = x - knee
+            return knee + (1.0f - knee) * kotlin.math.tanh((d / (1.0f - knee)).toDouble()).toFloat()
+        } else if (x < -knee) {
+            val d = x + knee
+            return -knee + (1.0f - knee) * kotlin.math.tanh((d / (1.0f - knee)).toDouble()).toFloat()
+        }
+        return x
+    }
 
     fun endProbByte(p: Double): Int = (p.coerceIn(0.0, 1.0) * 255.0 + 0.5).toInt().coerceIn(0, 255)
     fun endProb(b: Int): Double = (b and 0xff) / 255.0
@@ -176,9 +196,18 @@ object Wire {
     }
 
     // ── time-sync probe / reply, with the piggybacked receive report ─────────
-    class RxReport(var lost: Int = 0, var recovered: Int = 0, var played: Int = 0,
-                   var muted: Boolean = false, var qLevel: Int = 0, var status: Int = 0,
-                   var endProbByte: Int = 0)
+    class RxReport(
+        var lost: Int = 0,
+        var recovered: Int = 0,
+        var played: Int = 0,
+        var muted: Boolean = false,
+        var qLevel: Int = 0,
+        var status: Int = 0,
+        var endProbByte: Int = 0,
+        var vMissing: Int = 0,
+        var vFrags: Int = 0,
+        var hasVideoLoss: Boolean = false,
+    )
 
     fun packProbe(t1: Long, report: RxReport): ByteArray =
         packT(kind = 0, t1 = t1, t2 = 0, t3 = 0, report)
@@ -187,7 +216,7 @@ object Wire {
         packT(kind = 1, t1 = t1, t2 = t2, t3 = t3, report)
 
     private fun packT(kind: Int, t1: Long, t2: Long, t3: Long, r: RxReport): ByteArray {
-        val out = ByteArray(TPKTY)
+        val out = ByteArray(if (r.hasVideoLoss) TPKTZ else TPKTY)
         putU32(out, 0, TMAGIC)
         putU32(out, 4, kind)
         putU64(out, 8, t1)
@@ -200,6 +229,10 @@ object Wire {
         out[TPKTX + 5] = r.qLevel.toByte()
         out[TPKTX + 6] = r.status.toByte()
         out[TPKTX + 7] = r.endProbByte.toByte()
+        if (r.hasVideoLoss) {
+            putU32(out, TPKTY, r.vMissing)
+            putU32(out, TPKTY + 4, r.vFrags)
+        }
         return out
     }
 
@@ -219,6 +252,11 @@ object Wire {
                 r.qLevel = b[TPKTX + 5].toInt() and 0xff
                 r.status = b[TPKTX + 6].toInt() and 0xff
                 r.endProbByte = b[TPKTX + 7].toInt() and 0xff
+                if (n >= TPKTZ) {
+                    r.hasVideoLoss = true
+                    r.vMissing = u32(b, TPKTY)
+                    r.vFrags = u32(b, TPKTY + 4)
+                }
             }
         }
         return TPacket(kind, u64(b, 8), u64(b, 16), u64(b, 24), r, hasState)

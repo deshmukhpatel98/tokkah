@@ -55,6 +55,9 @@ class VQuality(
     private val quietNeeded = 15
     private val warmup = 8
 
+    private var heavyFor = 0
+    val heavyCap = 12000
+
     init {
         ceilingIdx = if (ceiling != null) {
             var best = 0
@@ -67,9 +70,26 @@ class VQuality(
     val quality: Double get() = LEVELS[level]
 
     /** One second. Returns the new quality when it changed, else null. */
-    fun tick(now: Double, framesLost: Int, concealed: Int, jitGrew: Boolean): Double? {
+    fun tick(now: Double, framesLost: Int, concealed: Int, jitGrew: Boolean, bytesPerFrame: Int = 0): Double? {
         if (held) return null
         if (now < warmup) return null
+
+        // Mac 0.129: >12,000 B/frame for 5 s steps the ladder down
+        if (heavyCap > 0 && !paused && level > 0 && bytesPerFrame > heavyCap) {
+            heavyFor++
+            if (heavyFor >= 5) {
+                heavyFor = 0
+                blockedUntil[level] = now + penalty[level]
+                penalty[level] = minOf(penalty[level] * 2, 120.0)
+                level--
+                stepDowns++
+                quietFor = 0
+                return quality
+            }
+        } else {
+            heavyFor = 0
+        }
+
         val harmed = framesLost > 0 || concealed > 0 || jitGrew
 
         if (paused) {

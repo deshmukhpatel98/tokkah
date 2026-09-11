@@ -125,6 +125,11 @@ class Aec {
     val delayNow: Int get() = delay
     val fracNow: Float get() = frac
     private var rawWin = FloatArray(0)
+    private var xwinBuf = FloatArray(0)
+    private var yBuf = FloatArray(0)
+    private var yBgBuf = FloatArray(0)
+    private var eBuf = FloatArray(0)
+    private var eBgBuf = FloatArray(0)
     private var mix = 0f
     private var micE = 0.0
     private var eE = 0.0
@@ -282,7 +287,8 @@ class Aec {
         // The reference window, oldest first — read at a FRACTIONAL delay when
         // tracking: four raw neighbours per output sample through a cubic
         // Lagrange kernel whose phase is `frac` (`buildWindow`, Aec.swift 1318).
-        val xwin = FloatArray(span)
+        if (xwinBuf.size < span) xwinBuf = FloatArray(span)
+        val xwin = xwinBuf
         val start = endIdx - span
         if (track) {
             val r = span + 3
@@ -305,7 +311,7 @@ class Aec {
         }
 
         var refSq = 0f
-        for (v in xwin) refSq += v * v
+        for (i in 0 until span) { val v = xwin[i]; refSq += v * v }
         val refRms = sqrt(refSq / span)
         // Dividing by silence is the bug; refusing to is the fix, and it sits
         // upstream of any double-talk logic.
@@ -318,8 +324,10 @@ class Aec {
         for (i in 0 until n) micSq += x[i] * x[i]
 
         // y[i] = sum_j f[j] * xwin[t-1+i-j]  — the filter's estimate of the echo.
-        val y = FloatArray(n)
-        val yBg = FloatArray(n)
+        if (yBuf.size < n) yBuf = FloatArray(n)
+        if (yBgBuf.size < n) yBgBuf = FloatArray(n)
+        val y = yBuf
+        val yBg = yBgBuf
         for (i in 0 until n) {
             var a = 0f
             var b = 0f
@@ -332,8 +340,10 @@ class Aec {
             y[i] = a; yBg[i] = b
         }
 
-        val e = FloatArray(n)
-        val eBg = FloatArray(n)
+        if (eBuf.size < n) eBuf = FloatArray(n)
+        if (eBgBuf.size < n) eBgBuf = FloatArray(n)
+        val e = eBuf
+        val eBg = eBgBuf
         var eSq = 0f; var eBgSq = 0f
         for (i in 0 until n) {
             e[i] = x[i] - y[i]; eSq += e[i] * e[i]

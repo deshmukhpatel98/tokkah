@@ -45,6 +45,8 @@ class MouthWatcher {
     var looks = 0; private set
     var lastError: String? = null; private set
 
+    var onVisualState: ((known: Boolean, voice: Boolean) -> Unit)? = null
+
     /** One camera frame. Cheap to call at any rate: it decides when to look. */
     fun note(bitmap: Bitmap, rotationDeg: Int = 0) {
         if (!mouth.on) return
@@ -67,12 +69,64 @@ class MouthWatcher {
                     // face at rest.
                     mouth.noFace()
                 }
+                onVisualState?.invoke(mouth.visualKnown, mouth.visualVoice)
                 inFlight = false
             }
             .addOnFailureListener { e ->
                 lastError = e.message
                 mouth.noFace()
+                onVisualState?.invoke(mouth.visualKnown, mouth.visualVoice)
                 inFlight = false
+            }
+    }
+
+    /** One camera frame directly from an ImageReader, without bitmap allocations. */
+    fun note(image: android.media.Image, rotationDeg: Int = 0) {
+        if (!mouth.on) {
+            image.close()
+            return
+        }
+        val now = System.nanoTime() / 1e6
+        if (now - lastLookMs < 1000.0 / MouthConfig.HZ) {
+            image.close()
+            return
+        }
+        if (inFlight) {
+            dropped++
+            image.close()
+            return
+        }
+        lastLookMs = now
+        inFlight = true
+        looks++
+        val inputImage = try {
+            InputImage.fromMediaImage(image, rotationDeg)
+        } catch (e: Exception) {
+            inFlight = false
+            image.close()
+            return
+        }
+        detector.process(inputImage)
+            .addOnSuccessListener { faces ->
+                val f = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                val lips = f?.getContour(FaceContour.UPPER_LIP_BOTTOM)?.points.orEmpty() +
+                    f?.getContour(FaceContour.LOWER_LIP_TOP)?.points.orEmpty()
+                if (lips.size >= 4) {
+                    mouth.note(lips.map { it.x to it.y }, now)
+                } else {
+                    mouth.noFace()
+                }
+                onVisualState?.invoke(mouth.visualKnown, mouth.visualVoice)
+                inFlight = false
+            }
+            .addOnFailureListener { e ->
+                lastError = e.message
+                mouth.noFace()
+                onVisualState?.invoke(mouth.visualKnown, mouth.visualVoice)
+                inFlight = false
+            }
+            .addOnCompleteListener {
+                try { image.close() } catch (_: Exception) {}
             }
     }
 

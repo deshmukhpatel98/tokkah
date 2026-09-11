@@ -28,6 +28,29 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
     @Volatile private var running = false
     private var record: AudioRecord? = null
     private var track: AudioTrack? = null
+    private var focusRequest: android.media.AudioFocusRequest? = null
+
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                session.audioFocusLost = true
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                session.audioFocusLost = false
+            }
+        }
+    }
+
+    private val deviceCallback = object : android.media.AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            session.speakers = isOnSpeakers()
+        }
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            session.speakers = isOnSpeakers()
+        }
+    }
 
     var captureFrames = 0; private set
     var renderFrames = 0; private set
@@ -38,6 +61,23 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
 
     fun start(): Boolean {
         if (running) return true
+        am?.mode = AudioManager.MODE_IN_COMMUNICATION
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val attr = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attr)
+                .setOnAudioFocusChangeListener(focusListener)
+                .build()
+            focusRequest = req
+            am?.requestAudioFocus(req)
+        } else {
+            @Suppress("DEPRECATION")
+            am?.requestAudioFocus(focusListener, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+        }
+
         val fmt = AudioFormat.Builder()
             .setSampleRate(Wire.SR)
             .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
@@ -97,6 +137,21 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
         Metrics.fact("m2e_basis", "devbuf")
         session.speakers = isOnSpeakers()
 
+        // Default to loudspeaker for video calls when no headset/headphones connected
+        if (session.speakers) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                val spk = am?.availableCommunicationDevices?.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+                if (spk != null) am?.setCommunicationDevice(spk)
+            } else {
+                @Suppress("DEPRECATION")
+                am?.isSpeakerphoneOn = true
+            }
+        }
+
+        am?.registerAudioDeviceCallback(deviceCallback, null)
+
         trk.play()
         rec.startRecording()
         // The devices actually in use. "They could not hear me" is answerable
@@ -113,6 +168,23 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
 
     fun stop() {
         running = false
+        try { am?.unregisterAudioDeviceCallback(deviceCallback) } catch (_: Exception) {}
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            runCatching { am?.clearCommunicationDevice() }
+        } else {
+            @Suppress("DEPRECATION")
+            runCatching { am?.isSpeakerphoneOn = false }
+        }
+        session.audioFocusLost = false
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            focusRequest?.let { runCatching { am?.abandonAudioFocusRequest(it) } }
+        } else {
+            @Suppress("DEPRECATION")
+            runCatching { am?.abandonAudioFocus(focusListener) }
+        }
+        focusRequest = null
+        runCatching { am?.mode = AudioManager.MODE_NORMAL }
+
         try { record?.stop() } catch (_: Exception) {}
         try { track?.stop() } catch (_: Exception) {}
         record?.release(); track?.release()
@@ -252,9 +324,6 @@ class AudioDevice(private val session: CallSession, private val am: AudioManager
             session.renderBlock(buf, buf.size)
             val n = trk.write(buf, 0, buf.size, AudioTrack.WRITE_BLOCKING)
             if (n > 0) renderFrames += n
-            // Route changes mid-call: headphones come out, and the floor must
-            // learn immediately rather than resume a stale belief.
-            if (renderFrames % (Wire.SR / 2) < buf.size) session.speakers = isOnSpeakers()
         }
     }
 }

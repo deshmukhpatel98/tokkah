@@ -1,6 +1,6 @@
 # Kin for Android — parity with Kin for macOS
 
-Audited 2026-09-02 against `mac/Sources/tk` at **0.125.0**. The Mac app is the
+Audited 2026-09-05 against `mac/Sources/tk` at **0.152.0** and Android git HEAD (0.128.1-android.31 / commit `5e77fb3`). The Mac app is the
 product; this file is the port queue and the record of what is already the
 same. Anchors: M: = mac/Sources/tk, A: = android/app/src/main/java/com/tokkah/kin.
 
@@ -102,6 +102,18 @@ has confirmed, never by the code existing (`unrun-tests-are-not-coverage`).
 | the microphone's level in the beat | the Mac writes a_mic_peak / a_mic_rms / a_clip_pct (Audio.swift 4510, main.swift 6970); the phone wrote none, so the reader printed peak 0.00 / rms 0.000 on a call whose gate was open 59% — a blind instrument. Now accumulated from the raw capture with the Mac's 0.997 clip bar. Verified on a live call with the emulator on this Mac's real microphone (-allow-host-audio): peak 0.08, rms <0.001, clip 0% — the first Android beat with a live mic; gate open 70% | ✅ android.31 |
 | audio on a live microphone | LAB ONLY: the emulator now takes this Mac's microphone (`emulator -allow-host-audio`), so the gate/floor/level path runs on real captured sound (gate 59–70% open vs ~0% before). Not a phone: no phone speaker, so no acoustic echo path and the canceller stays correctly off. Real-hardware numbers still need a phone's first call | ⏳ needs a phone |
 | own mouth-to-ear (m2e_p50/95/99) | same names; basis = device buffer, said in the facts | ✅ 0.126.13 |
+| post-quantum hybrid handshake (ML-KEM-768 + X25519) | identical handshake format, key derivation, and pinned verification | ✅ android.31 |
+| dynamic jitter adaptation & monotonic target decay (JitterAdapter) | ported Audio.swift:2442 with quantile tracking, ratchet protection, and decay | ✅ android.31 |
+| soft duplex gate on speaker calls (-22 dB floorDb) | cfg.floorDb = -22.0 on speakers, -120.0 on headphones; ambient room continuity | ✅ android.31 |
+| subsonic capture HPF (65 Hz Butterworth biquad) | raw microphone capture path high-pass filtered before compression/wire | ✅ android.31 |
+| video loss reporting on the wire (TPKTZ) | RxReport carries vMissing and vFrags; parseT/packT support TPKTZ | ✅ android.31 |
+| video quality adaptation under loss & heavy frames (VQuality) | heavyCap = 12000 B step-down, loss-driven ladder retreat | ✅ android.31 |
+| block parity FEC recovery (Type 2 FEC XOR) | bit-exact reconstruction of missing frame from parity chunk in RecvRing | ✅ android.31 |
+| video keyframe request on frame drop | MediaCodec IDR requested whenever assembler detects dropped frame | ✅ android.31 |
+| background call continuity & lifecycle resilience | CallManager + CallService foreground service with partial wake lock and low-latency Wi-Fi | ✅ android.31 |
+| release APK minification & Proguard shrinking | isMinifyEnabled = true, isShrinkResources = true, proguard-rules.pro configured | ✅ android.31 |
+| Digital Asset Links (assetlinks.json) | served at /.well-known/assetlinks.json with debug cert SHA-256 fingerprint | ✅ android.31 |
+| Version in settings card | HomeCard renders Version row with installed version | ✅ android.31 |
 
 ## Found on the way (fixed 0.126.0-android.12)
 

@@ -52,10 +52,22 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     private var inputSurface: Surface? = null
     private var camThread: HandlerThread? = null
     private var codecThread: HandlerThread? = null
+    private var decodeThread: HandlerThread? = null
     private var rotator: GlRotator? = null
     private var decoderConfigured = false
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
+
+    private var currentBitrate = BITRATE
+    private var previewSurface: Surface? = null
+    private var displaySurface: Surface? = null
+    private val decodeLock = Any()
+    private val availableInputBuffers = java.util.ArrayDeque<Int>()
+    private val pendingFrames = java.util.ArrayDeque<ByteArray>()
+    private var annexBScratch = ByteArray(256 * 1024)
+
+    private var mouthWatcher: MouthWatcher? = null
+    private var mouthReader: android.media.ImageReader? = null
 
     var framesEncoded = 0; private set
     var framesDecoded = 0; private set
@@ -82,6 +94,36 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     var lastError: String? = null; private set
     var facingFront = true
     private var sensorOrientation = 90
+
+    init {
+        val prior = session.onVideoFrame
+        session.onVideoFrame = { payload, cap ->
+            onFrameReceived(payload)
+            prior?.invoke(payload, cap)
+        }
+    }
+
+    fun setPreviewSurface(surface: Surface?) {
+        previewSurface = surface
+        rotator?.setPreviewSurface(surface)
+    }
+
+    fun setBitrate(bps: Int) {
+        if (bps <= 0) return
+        currentBitrate = bps
+        try {
+            val bundle = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bps)
+            }
+            encoder?.setParameters(bundle)
+            Metrics.fact("venc_bps", bps.toString())
+        } catch (_: Exception) {}
+    }
+
+    fun setQuality(q: Double) {
+        val bps = (BITRATE * (q / 0.7)).toInt().coerceIn(300_000, BITRATE)
+        setBitrate(bps)
+    }
 
     /**
      * Switch cameras on a LIVE call. `facingFront` alone chose the camera for
@@ -112,15 +154,24 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
         rotator?.release(); rotator = null
         camThread?.quitSafely()
         codecThread?.quitSafely()
+        mouthWatcher?.close(); mouthWatcher = null
+        mouthReader?.close(); mouthReader = null
+        session.visualKnown = false; session.visualVoice = false
         camera = null; encoder = null; camThread = null; codecThread = null
     }
 
     fun startEncode(): Boolean {
         return try {
+            val mw = MouthWatcher()
+            mouthWatcher = mw
+            mw.onVisualState = { known, voice ->
+                session.visualKnown = known
+                session.visualVoice = voice
+            }
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
+                setInteger(MediaFormat.KEY_BIT_RATE, currentBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
                 // Keyframes on demand only. A timer would spend bandwidth on
                 // frames nobody asked for, and the receiver requests one the
@@ -128,9 +179,9 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, Int.MAX_VALUE / 1000)
                 setInteger(MediaFormat.KEY_PROFILE,
                     MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel32)
                 setInteger(MediaFormat.KEY_BITRATE_MODE,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
                 // RealTime: encode on arrival, never batch for quality.
                 setInteger(MediaFormat.KEY_LATENCY, 1)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -179,11 +230,12 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
             // and one GL pass turns it into the encoder's portrait surface.
             val encSurface = enc.createInputSurface()
             val rot = GlRotator(encSurface, W, H)
+            rot.setPreviewSurface(previewSurface)
             rotator = rot
             inputSurface = rot.inputSurface
             enc.start()
             encoder = enc
-            android.util.Log.i("kin", "encoder started ${W}x$H @$FPS ${BITRATE / 1000} kbps")
+            android.util.Log.i("kin", "encoder started ${W}x$H @$FPS ${currentBitrate / 1000} kbps")
             running = true
             openCamera()
             true
@@ -257,16 +309,30 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
                 catch (e: Exception) { lastError = "rotator: ${e.message}" }
             }, h)
         }
+        val map = cm.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)
+        val mouthSize = yuvSizes?.filter { it.width <= 640 }?.maxByOrNull { it.width * it.height }
+            ?: yuvSizes?.firstOrNull()
+            ?: android.util.Size(320, 240)
+        val mr = android.media.ImageReader.newInstance(mouthSize.width, mouthSize.height, ImageFormat.YUV_420_888, 2)
+        mouthReader = mr
+        mr.setOnImageAvailableListener({ reader ->
+            val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+            mouthWatcher?.note(img, sensorOrientation)
+        }, h)
         try {
             cm.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(dev: CameraDevice) {
                     camera = dev
                     val surface = inputSurface ?: return
+                    val surfaces = mutableListOf(surface)
+                    surfaces.add(mr.surface)
                     val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                         addTarget(surface)
+                        addTarget(mr.surface)
                         set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(FPS, FPS))
                     }
-                    dev.createCaptureSession(listOf(surface),
+                    dev.createCaptureSession(surfaces,
                         object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
                             override fun onConfigured(s: android.hardware.camera2.CameraCaptureSession) {
                                 try { s.setRepeatingRequest(req.build(), null, h) }
@@ -290,63 +356,139 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
     // ── decode ───────────────────────────────────────────────────────────────
 
     fun attachDisplay(surface: Surface) {
-        // Chained, not replaced: the face grabber also wants every payload, and
-        // whichever was assigned second would otherwise silently win.
-        val prior = session.onVideoFrame
-        session.onVideoFrame = { payload, cap ->
-            decode(payload, surface)
-            prior?.invoke(payload, cap)
+        setDisplaySurface(surface)
+    }
+
+    fun setDisplaySurface(surface: Surface?) {
+        displaySurface = surface
+        val d = decoder ?: return
+        if (android.os.Build.VERSION.SDK_INT >= 23 && surface != null && surface.isValid) {
+            try {
+                d.setOutputSurface(surface)
+            } catch (e: Exception) {
+                lastError = "setOutputSurface: ${e.message}"
+            }
         }
     }
 
-    private fun decode(payload: ByteArray, surface: Surface) {
+    fun onFrameReceived(payload: ByteArray) {
         val f = VideoWire.parse(payload, payload.size) ?: return
         if (!decoderConfigured) {
-            // Cold start from a keyframe alone: the parameter sets are in band.
+            // Cold start from a keyframe alone: parameter sets in-band
             if (!f.isKeyframe) return
+            val surf = displaySurface
+            if (surf == null || !surf.isValid) return
+
             try {
-                val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H)
-                for ((i, s) in f.parameterSets.withIndex()) {
-                    fmt.setByteBuffer("csd-$i", ByteBuffer.wrap(byteArrayOf(0, 0, 0, 1) + s))
+                val spsNal = f.parameterSets.firstOrNull { VideoWire.nalType(it) == 7 }
+                val size = spsNal?.let { VideoWire.parseSps(it) }
+                val decW = size?.first ?: 1280
+                val decH = size?.second ?: 720
+                val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, decW, decH).apply {
+                    for ((i, s) in f.parameterSets.withIndex()) {
+                        setByteBuffer("csd-$i", ByteBuffer.wrap(byteArrayOf(0, 0, 0, 1) + s))
+                    }
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    }
+                    runCatching { setInteger("vendor.qti-ext-dec-low-latency.enable", 1) }
+                    runCatching { setInteger("vendor.low-latency.enable", 1) }
                 }
+                val dt = HandlerThread("kin-decode").apply { start() }
+                decodeThread = dt
+                val dh = Handler(dt.looper)
                 val d = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                d.configure(fmt, surface, null, 0)
+                Metrics.fact("vdec", runCatching { d.name }.getOrDefault("?"))
+                d.setCallback(object : MediaCodec.Callback() {
+                    override fun onInputBufferAvailable(c: MediaCodec, i: Int) {
+                        synchronized(decodeLock) {
+                            availableInputBuffers.add(i)
+                            feedDecoderLocked()
+                        }
+                    }
+                    override fun onOutputBufferAvailable(c: MediaCodec, i: Int, info: MediaCodec.BufferInfo) {
+                        val s = displaySurface
+                        val render = (s != null && s.isValid)
+                        try {
+                            c.releaseOutputBuffer(i, render)
+                            if (render) framesDecoded++
+                        } catch (e: Exception) {
+                            lastError = "releaseOutput: ${e.message}"
+                        }
+                    }
+                    override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+                        lastError = "decoder: ${e.message}"
+                        session.requestKeyframe()
+                    }
+                    override fun onOutputFormatChanged(c: MediaCodec, of: MediaFormat) {
+                        val w = runCatching { of.getInteger(MediaFormat.KEY_WIDTH) }.getOrDefault(0)
+                        val h = runCatching { of.getInteger(MediaFormat.KEY_HEIGHT) }.getOrDefault(0)
+                        if (w > 0 && h > 0 && (w != decodedW || h != decodedH)) {
+                            decodedW = w; decodedH = h; onDecodedSize?.invoke(w, h)
+                        }
+                    }
+                }, dh)
+                d.configure(fmt, surf, null, 0)
                 d.start()
-                d.outputFormat.let { of ->
-                    val w = runCatching { of.getInteger(MediaFormat.KEY_WIDTH) }.getOrDefault(W)
-                    val h = runCatching { of.getInteger(MediaFormat.KEY_HEIGHT) }.getOrDefault(H)
-                    if (w > 0 && h > 0) { decodedW = w; decodedH = h; onDecodedSize?.invoke(w, h) }
-                }
                 decoder = d
                 decoderConfigured = true
-            } catch (e: Exception) { lastError = "decoder: ${e.message}"; return }
+                decodedW = decW; decodedH = decH; onDecodedSize?.invoke(decW, decH)
+            } catch (e: Exception) {
+                lastError = "decoder: ${e.message}"
+                return
+            }
         }
-        val d = decoder ?: return
-        try {
-            val i = d.dequeueInputBuffer(0)
-            if (i < 0) return
-            val buf = d.getInputBuffer(i) ?: return
-            val tmp = ByteArray(f.avcc.size + 64)
-            val n = VideoWire.avccToAnnexB(f.avcc, tmp)
-            buf.clear(); buf.put(tmp, 0, n)
-            d.queueInputBuffer(i, 0, n, System.nanoTime() / 1000, 0)
-            val info = MediaCodec.BufferInfo()
-            var o = d.dequeueOutputBuffer(info, 0)
-            if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                val of = d.outputFormat
-                val w = runCatching { of.getInteger(MediaFormat.KEY_WIDTH) }.getOrDefault(0)
-                val h = runCatching { of.getInteger(MediaFormat.KEY_HEIGHT) }.getOrDefault(0)
-                if (w > 0 && h > 0 && (w != decodedW || h != decodedH)) {
-                    decodedW = w; decodedH = h; onDecodedSize?.invoke(w, h)
+
+        synchronized(decodeLock) {
+            val d = decoder
+            if (annexBScratch.size < f.avcc.size + 64) {
+                annexBScratch = ByteArray(maxOf(f.avcc.size + 64, annexBScratch.size * 2))
+            }
+            val n = VideoWire.avccToAnnexB(f.avcc, annexBScratch)
+            if (d != null && availableInputBuffers.isNotEmpty() && pendingFrames.isEmpty()) {
+                val i = availableInputBuffers.removeFirst()
+                try {
+                    val buf = d.getInputBuffer(i)
+                    if (buf != null && buf.remaining() >= n) {
+                        buf.clear()
+                        buf.put(annexBScratch, 0, n)
+                        d.queueInputBuffer(i, 0, n, System.nanoTime() / 1000, 0)
+                        return
+                    }
+                } catch (e: Exception) {
+                    lastError = "queueInput: ${e.message}"
                 }
-                o = d.dequeueOutputBuffer(info, 0)
             }
-            while (o >= 0) {
-                d.releaseOutputBuffer(o, true)   // render
-                framesDecoded++
-                o = d.dequeueOutputBuffer(info, 0)
+
+            val annexB = annexBScratch.copyOf(n)
+            if (pendingFrames.size >= 15) {
+                pendingFrames.clear()
+                session.requestKeyframe()
+            } else {
+                pendingFrames.add(annexB)
             }
-        } catch (e: Exception) { lastError = "decode: ${e.message}" }
+            feedDecoderLocked()
+        }
+    }
+
+    private fun feedDecoderLocked() {
+        val d = decoder ?: return
+        while (availableInputBuffers.isNotEmpty() && pendingFrames.isNotEmpty()) {
+            val i = availableInputBuffers.removeFirst()
+            val data = pendingFrames.removeFirst()
+            try {
+                val buf = d.getInputBuffer(i)
+                if (buf != null) {
+                    buf.clear()
+                    buf.put(data)
+                    d.queueInputBuffer(i, 0, data.size, System.nanoTime() / 1000, 0)
+                }
+            } catch (e: Exception) {
+                lastError = "queueInput: ${e.message}"
+            }
+        }
     }
 
     /**
@@ -431,13 +573,15 @@ class VideoDevice(private val ctx: Context, private val session: CallSession) {
 
     fun stop() {
         running = false
-        try { camera?.close() } catch (_: Exception) {}
-        try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
+        stopEncode()
+        synchronized(decodeLock) {
+            availableInputBuffers.clear()
+            pendingFrames.clear()
+        }
         try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
-        rotator?.release(); rotator = null
-        camThread?.quitSafely()
-        codecThread?.quitSafely()
-        camera = null; encoder = null; decoder = null; camThread = null; codecThread = null
+        decoder = null
+        decodeThread?.quitSafely()
+        decodeThread = null
         decoderConfigured = false
     }
 }

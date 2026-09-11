@@ -82,7 +82,16 @@ class CallSession(
     @Volatile var peerSeenTalking = false; private set
     @Volatile var peerSeenTalkingSeen = false; private set
     @Volatile var selfMuted = false
+    @Volatile var audioFocusLost = false
     @Volatile var speakers = true
+    @Volatile var peerVideoMissing = 0; private set
+    @Volatile var peerVideoFrags = 0; private set
+    @Volatile var peerReportsVideoLoss = false; private set
+    private var lastPeerVideoMissing = 0
+    private var lastPeerVideoMissingInitialized = false
+    private var lastVqFrames = 0
+    private var lastVqBytes = 0
+    private val fParityTmp = FloatArray(Wire.FPP)
     /** Set by the UI: this end has left, so stop sending. */
     @Volatile var ended = false
     // ── A BLIP AND A DEPARTURE ARE NOT THE SAME THING (main.swift 3915-4000) ─
@@ -173,7 +182,7 @@ class CallSession(
     private var firstVideoSeen = false
 
     private var sock: DatagramSocket? = null
-    private var candidates = listOf<InetSocketAddress>()
+    @Volatile private var candidates = listOf<InetSocketAddress>()
     private var seq = 0
     private val sendScratch = ByteArray(Wire.HDR + 1 + Wire.FPP * 4 + 64)
     private val pcmScratch = ShortArray(Wire.FPP)
@@ -201,6 +210,7 @@ class CallSession(
     private val prevBlock = ShortArray(Wire.FPP)
     private var prevCap = 0L
     private var havePrev = false
+    private val hpf = HighPassFilter()
     @Volatile var peerRxLost = 0; private set
     @Volatile var peerRxRecovered = 0; private set
     @Volatile var peerReportsLoss = false; private set
@@ -216,6 +226,32 @@ class CallSession(
     @Volatile private var floorBlocks = 0
     @Volatile private var floorHeldBlocks = 0
     @Volatile private var keyAsksIn = 0
+    @Volatile var keyAsksOut = 0; private set
+    @Volatile var relocks = 0; private set
+    @Volatile var lanUpgrade = true
+    @Volatile var pathPrivMs = -1.0; private set
+    @Volatile var useHpf = true
+    @Volatile private var lastRv = 0L
+    @Volatile private var lastProbe = 0L
+    @Volatile private var lastHello = 0L
+
+    fun requestKeyframe() {
+        val now = System.currentTimeMillis()
+        if (now - lastKeyReq > 300) {
+            lastKeyReq = now
+            keyAsksOut++
+            sendSealed(Wire.keyframeRequest())
+        }
+    }
+
+    fun recheckNetwork() {
+        val s = sock ?: return
+        thread(isDaemon = true, name = "kin-roam") {
+            runCatching { mapped = Stun.discoverAny(s) }
+            lastRv = 0L
+            lastProbe = 0L
+        }
+    }
     /** Per-second rates, computed once a beat in [reportLoop]. */
     @Volatile private var upMbps = 0.0
     @Volatile private var downMbps = 0.0
@@ -380,8 +416,42 @@ class CallSession(
                 callSeconds = ((System.currentTimeMillis() - t0) / 1000).toInt()
                 resume?.touch(locked?.toString())
                 power.sample()?.let { (u, sy) -> cpuUser = u; cpuSys = sy }
-                vquality.tick(callSeconds.toDouble(), 0, concealed, false)
-                    ?.let { onQuality?.invoke(it) }
+
+                val adapterGrowsBefore = playout.adapter.grows
+                playout.adapter.step(
+                    t = callSeconds.toDouble(),
+                    r = ring,
+                    peerLost = peerRxLost,
+                    peerRecovered = peerRxRecovered,
+                    peerReportsLoss = peerReportsLoss
+                )
+                val jitGrew = playout.adapter.grows > adapterGrowsBefore
+
+                val pvMissing = peerVideoMissing
+                var vLossDelta = 0
+                if (peerReportsVideoLoss) {
+                    if (!lastPeerVideoMissingInitialized) {
+                        lastPeerVideoMissingInitialized = true
+                        lastPeerVideoMissing = pvMissing
+                    }
+                    vLossDelta = pvMissing - lastPeerVideoMissing
+                    if (vLossDelta < 0) vLossDelta = 0
+                    lastPeerVideoMissing = pvMissing
+                }
+
+                val sentFrames = videoSeq - lastVqFrames
+                val sentBytes = videoBytesSent - lastVqBytes
+                lastVqFrames = videoSeq
+                lastVqBytes = videoBytesSent
+                val bytesPerFrame = if (sentFrames > 0) sentBytes / sentFrames else 0
+
+                vquality.tick(
+                    now = callSeconds.toDouble(),
+                    framesLost = vLossDelta,
+                    concealed = concealed,
+                    jitGrew = jitGrew,
+                    bytesPerFrame = bytesPerFrame
+                )?.let { onQuality?.invoke(it) }
 
                 val now = System.currentTimeMillis()
                 if (now - beatAt > 5000) {
@@ -489,6 +559,9 @@ class CallSession(
         f["conceal_frac"] = held.lastFrac
         // the wire
         f["route"] = if (locked == null) 0 else if (locked == relaySocketAddr()) 2 else 1
+        f["lock_lan"] = if (locked != null && isPrivateSubnet(locked!!)) 1 else 0
+        f["cand_priv"] = candidates.count { isPrivateSubnet(it) }
+        f["path_priv_ms"] = pathPrivMs
         f["turn_ok"] = if (turn != null) 1 else 0
         f["relay"] = turn?.relay ?: "-"
         f["probes"] = tsync.samples
@@ -507,6 +580,8 @@ class CallSession(
         f["v_frags"] = video.fragsIn; f["v_partial_drops"] = video.dropped
         f["vframes"] = video.framesOut
         f["v_key_asks_in"] = keyAsksIn
+        f["v_key_asks_out"] = keyAsksOut
+        f["relocks"] = relocks
         f["v_q_level"] = vquality.level; f["vquality"] = vquality.quality
         f["v_q_downs"] = vquality.stepDowns; f["v_q_ups"] = vquality.stepUps
         f["v_paused_now"] = if (vquality.paused) 1 else 0; f["v_pauses"] = vquality.pauses
@@ -535,12 +610,16 @@ class CallSession(
         if (!running) return
         running = false
         Metrics.fact("outcome", if (hungUp) "hung_up" else "ended")
-        repeat(4) { sendSealed(Wire.goodbye()) }
-        telemetry?.post(beatFields(), phase = "final", version = appVersion)
-        if (hungUp) resume?.end()
-        Thread.sleep(150)
-        decodeQueue?.stop()
-        sock?.close()
+        val ver = appVersion
+        val bFields = beatFields()
+        thread(isDaemon = true, name = "kin-stop") {
+            repeat(4) { sendSealed(Wire.goodbye()) }
+            telemetry?.post(bFields, phase = "final", version = ver)
+            if (hungUp) resume?.end()
+            try { Thread.sleep(150) } catch (_: Exception) {}
+            decodeQueue?.stop()
+            sock?.close()
+        }
     }
 
     // ── the wire ─────────────────────────────────────────────────────────────
@@ -551,6 +630,7 @@ class CallSession(
     private var rvLogs = 0
     var lastSendError: String? = null; private set
     var videoPacketsSent = 0; private set
+    var videoBytesSent = 0; private set
 
     /**
      * RIG ONLY. Suppresses the direct sends so every packet has to ride the
@@ -574,12 +654,50 @@ class CallSession(
         if (turnBound) turn?.let { runCatching { it.sendChannel(s, b, n) } }
     }
 
+    private fun sendRawTo(to: InetSocketAddress, b: ByteArray, n: Int = b.size) {
+        val s = sock ?: return
+        try { s.send(DatagramPacket(b, n, to)); txBytes += n + 28 }
+        catch (e: Exception) { sendErrors++; lastSendError = "${e.javaClass.simpleName}: ${e.message}" }
+    }
+
     private fun sendSealed(b: ByteArray, n: Int = b.size) {
         // No key, nothing sent. v1 fell through to plaintext here "until the
         // handshake completed", which an attacker could hold open by dropping
         // handshakes. Dropped and counted instead.
         val sealed = crypto.seal(b, n)
         if (sealed != null) sendRaw(sealed) else crypto.notePreKeyDrop()
+    }
+
+    private fun sendSealedTo(to: InetSocketAddress, b: ByteArray, n: Int = b.size) {
+        val sealed = crypto.seal(b, n)
+        if (sealed != null) sendRawTo(to, sealed) else crypto.notePreKeyDrop()
+    }
+
+    fun isPrivateSubnet(a: InetSocketAddress): Boolean {
+        val addr = a.address ?: return false
+        val b = addr.address
+        if (b.size != 4) return false
+        val b0 = b[0].toInt() and 0xff
+        val b1 = b[1].toInt() and 0xff
+        if (b0 == 10) return true
+        if (b0 == 172 && b1 in 16..31) return true
+        if (b0 == 192 && b1 == 168) return true
+        if (b0 == 127) return true
+        return false
+    }
+
+    private fun notePathRtt(from: InetSocketAddress, t1: Long, t4: Long) {
+        val rttMs = (KinClock.ns(t4) - KinClock.ns(t1)) / 1e6
+        if (rttMs < 0 || rttMs > 10000) return
+        if (isPrivateSubnet(from)) {
+            if (pathPrivMs < 0 || rttMs < pathPrivMs) pathPrivMs = rttMs
+            val l = locked
+            if (lanUpgrade && (l == null || !isPrivateSubnet(l)) && l != from) {
+                android.util.Log.i("kin", "path: upgraded to LAN $from at ${String.format(java.util.Locale.US, "%.2f", rttMs)} ms rtt (was $l)")
+                locked = from
+                relocks++
+            }
+        }
     }
 
     private fun signalLoop(s: DatagramSocket) {
@@ -589,9 +707,6 @@ class CallSession(
         // rather than preferred or avoided: on a long route the relay's
         // backbone is sometimes genuinely shorter than the public internet.
         val relay = turn?.relay
-        var lastRv = 0L
-        var lastProbe = 0L
-        var lastHello = 0L
         while (running) {
             val now = System.currentTimeMillis()
             if (now - lastRv > 1000) {
@@ -666,7 +781,14 @@ class CallSession(
                 }
                 if (now - lastProbe > 500) {
                     lastProbe = now
-                    sendSealed(Wire.packProbe(KinClock.now(), rxReport()))
+                    val pr = Wire.packProbe(KinClock.now(), rxReport())
+                    sendSealed(pr)
+                    val l = locked
+                    if (lanUpgrade && l != null && !isPrivateSubnet(l)) {
+                        for (c in candidates) {
+                            if (isPrivateSubnet(c) && c != l) sendSealedTo(c, pr)
+                        }
+                    }
                 }
             }
             Thread.sleep(50)
@@ -701,6 +823,11 @@ class CallSession(
         // an older build writes, and zero changes nothing.
         r.endProbByte = Wire.endProbByte(
             predict.probability(System.currentTimeMillis().toDouble()))
+        if (firstVideoSeen || video.dropped > 0) {
+            r.hasVideoLoss = true
+            r.vMissing = video.dropped
+            r.vFrags = video.fragsIn
+        }
         return r
     }
 
@@ -804,12 +931,12 @@ class CallSession(
             }
             System.arraycopy(opened, 0, plainBuf, 0, opened.size)
             b = plainBuf; n = opened.size
+            lastFromPeerMs = System.currentTimeMillis()
             magic = Wire.magic(b, n)
             when (magic) {
                 Wire.TMAGIC -> {
                     val t4 = KinClock.now()
                     val p = Wire.parseT(b, n) ?: continue
-                    locked = pkt.socketAddress as InetSocketAddress
                     p.report?.let { r ->
                         if (p.hasState) {
                             peerStatusSeen = true
@@ -818,6 +945,11 @@ class CallSession(
                             peerPlayed = r.played
                             peerRxLost = r.lost; peerRxRecovered = r.recovered
                             peerReportsLoss = true
+                            if (r.hasVideoLoss) {
+                                peerVideoMissing = r.vMissing
+                                peerVideoFrags = r.vFrags
+                                peerReportsVideoLoss = true
+                            }
                             val owd = (tsync.bestRttMs ?: 0.0) / 2
                             floor.noteFar(peerVoice(), transitMs = owd,
                                 voicing = if (r.status and Wire.ST_VOICING != 0) true else false)
@@ -837,13 +969,14 @@ class CallSession(
                     if (p.kind == 0) {
                         // Reply from THIS thread: a hop to another thread lands
                         // inside t3-t2 and biases the offset by half of it.
-                        sendSealed(Wire.packReply(p.t1, t4, KinClock.now(), rxReport()))
+                        val rep = Wire.packReply(p.t1, t4, KinClock.now(), rxReport())
+                        if (fromAddr != null) sendSealedTo(fromAddr, rep) else sendSealed(rep)
                     } else {
                         tsync.note(p.t1, p.t2, p.t3, t4)
+                        fromAddr?.let { notePathRtt(it, p.t1, t4) }
                     }
                 }
                 Wire.MAGIC -> {
-                    locked = pkt.socketAddress as InetSocketAddress
                     val h = Wire.audioHeader(b, n) ?: continue
                     val frames = minOf(h.frames, Wire.FPP)
                     if (h.lp) {
@@ -868,40 +1001,135 @@ class CallSession(
                     ring.write(h.seq, h.capHost, fbuf, frames)
                     // The redundant tail, if the sender carried one: seq-1.
                     val redOff = Wire.audioPayloadEnd(b, n, h)
-                    if (h.seq > 0 && n > redOff + 8 && !ring.present(h.seq - 1)) {
+                    var extOff = redOff
+                    var hasRedundant = false
+                    if (h.seq > 0 && n > redOff + 8) {
+                        val first2 = Wire.u16(b, redOff)
+                        if (first2 != Wire.FEC_MAGIC) {
+                            hasRedundant = true
+                        }
+                    }
+                    if (hasRedundant) {
                         val rCap = Wire.u64(b, redOff)
                         val at = redOff + 8
                         var ok = false
-                        if (h.lp) {
-                            val m = b[at].toInt() and 0xff
-                            if (n >= at + 1 + m) {
-                                val block = b.copyOfRange(at + 1, at + 1 + m)
-                                if (Lpc.decode(block, m, frames, lpcOut)) {
-                                    for (i in 0 until frames) fbuf[i] = lpcOut[i] / 32767.0f; ok = true
+                        val rLen = if (h.lp) {
+                            if (n > at) 1 + (b[at].toInt() and 0xff) else 0
+                        } else if (h.pcm16) frames * 2 else frames * 4
+                        if (n >= at + rLen && !ring.present(h.seq - 1)) {
+                            if (h.lp) {
+                                val m = b[at].toInt() and 0xff
+                                if (n >= at + 1 + m) {
+                                    val block = b.copyOfRange(at + 1, at + 1 + m)
+                                    if (Lpc.decode(block, m, frames, lpcOut)) {
+                                        for (i in 0 until frames) fbuf[i] = lpcOut[i] / 32767.0f; ok = true
+                                    }
                                 }
-                            }
-                        } else if (h.pcm16) {
-                            if (n >= at + frames * 2) {
+                            } else if (h.pcm16) {
                                 for (i in 0 until frames) {
                                     val v = ((b[at + 2 * i].toInt() and 0xff) or (b[at + 2 * i + 1].toInt() shl 8)).toShort()
                                     fbuf[i] = v / 32767.0f
                                 }
                                 ok = true
+                            } else {
+                                for (i in 0 until frames) fbuf[i] = java.lang.Float.intBitsToFloat(Wire.u32(b, at + 4 * i))
+                                ok = true
                             }
-                        } else if (n >= at + frames * 4) {
-                            for (i in 0 until frames) fbuf[i] = java.lang.Float.intBitsToFloat(Wire.u32(b, at + 4 * i))
-                            ok = true
+                            if (ok) {
+                                ring.write(h.seq - 1, rCap, fbuf, frames)
+                                if (ring.present(h.seq - 1)) ring.recovered++
+                            }
                         }
-                        if (ok) {
-                            ring.write(h.seq - 1, rCap, fbuf, frames)
-                            if (ring.present(h.seq - 1)) ring.recovered++
+                        extOff = at + rLen
+                    }
+
+                    // Multi-stride interleaved redundancy and Parity FEC (Net.swift:1865-1935)
+                    while (extOff + 6 <= n) {
+                        val cMagic = Wire.u16(b, extOff)
+                        if (cMagic != Wire.FEC_MAGIC) break
+                        val cType = Wire.u16(b, extOff + 2)
+                        val cLen = Wire.u16(b, extOff + 4)
+                        if (extOff + 6 + cLen > n) break
+                        val chunkBody = extOff + 6
+                        if (cType == Wire.FEC_TYPE_STRIDE && cLen >= 10) {
+                            val stride = b[chunkBody].toInt() and 0xff
+                            val sSeq = h.seq - stride
+                            val sCap = Wire.u64(b, chunkBody + 2)
+                            val pPtr = chunkBody + 10
+                            if (sSeq >= 0 && !ring.present(sSeq)) {
+                                var ok = false
+                                if (h.lp) {
+                                    val m = b[pPtr].toInt() and 0xff
+                                    if (cLen >= 10 + 1 + m) {
+                                        val block = b.copyOfRange(pPtr + 1, pPtr + 1 + m)
+                                        if (Lpc.decode(block, m, frames, lpcOut)) {
+                                            for (i in 0 until frames) fbuf[i] = lpcOut[i] / 32767.0f; ok = true
+                                        }
+                                    }
+                                } else if (h.pcm16) {
+                                    if (cLen >= 10 + frames * 2) {
+                                        for (i in 0 until frames) {
+                                            val v = ((b[pPtr + 2 * i].toInt() and 0xff) or (b[pPtr + 2 * i + 1].toInt() shl 8)).toShort()
+                                            fbuf[i] = v / 32767.0f
+                                        }
+                                        ok = true
+                                    }
+                                } else if (cLen >= 10 + frames * 4) {
+                                    for (i in 0 until frames) fbuf[i] = java.lang.Float.intBitsToFloat(Wire.u32(b, pPtr + 4 * i))
+                                    ok = true
+                                }
+                                if (ok) {
+                                    ring.write(sSeq, sCap, fbuf, frames)
+                                    if (ring.present(sSeq)) ring.recovered++
+                                }
+                            }
+                        } else if (cType == Wire.FEC_TYPE_PARITY && cLen >= 16 + frames * 4) {
+                            val baseSeq = Wire.u32(b, chunkBody)
+                            val count = b[chunkBody + 4].toInt() and 0xff
+                            val pCap = Wire.u64(b, chunkBody + 8)
+                            val payloadPtr = chunkBody + 16
+                            if (count > 1) {
+                                var missingSeq = -1
+                                var missingCount = 0
+                                for (s in baseSeq until (baseSeq + count)) {
+                                    if (s >= 0 && !ring.present(s)) {
+                                        missingSeq = s
+                                        missingCount++
+                                    }
+                                }
+                                if (missingCount == 1 && missingSeq >= 0) {
+                                    for (i in 0 until frames) {
+                                        fbuf[i] = java.lang.Float.intBitsToFloat(Wire.u32(b, payloadPtr + 4 * i))
+                                    }
+                                    var allFound = true
+                                    for (s in baseSeq until (baseSeq + count)) {
+                                        if (s == missingSeq) continue
+                                        if (ring.readSamples(s, fParityTmp)) {
+                                            for (k in 0 until frames) {
+                                                val pBits = java.lang.Float.floatToRawIntBits(fbuf[k]) xor java.lang.Float.floatToRawIntBits(fParityTmp[k])
+                                                fbuf[k] = java.lang.Float.intBitsToFloat(pBits)
+                                            }
+                                        } else {
+                                            allFound = false
+                                            break
+                                        }
+                                    }
+                                    if (allFound) {
+                                        val recCap = pCap + (maxOf(0, missingSeq - baseSeq) * 16000L)
+                                        ring.write(missingSeq, recCap, fbuf, frames)
+                                        if (ring.present(missingSeq)) ring.recovered++
+                                    }
+                                }
+                            }
                         }
+                        extOff += 6 + cLen
                     }
                 }
                 Wire.VMAGIC -> {
                     val h = Wire.videoHeader(b, n) ?: continue
                     val len = n - Wire.VHDR
                     if (len <= 0) continue
+                    val droppedBefore = video.dropped
                     video.offer(h, b, Wire.VHDR, len)?.let { (payload, cap) ->
                         firstVideoSeen = true
                         // Off this thread. Invoking the decoder here stopped
@@ -911,16 +1139,12 @@ class CallSession(
                         if (q != null) q.submit(payload, payload.size, cap)
                         else onVideoFrame?.invoke(payload, cap)
                     }
-                    // Nothing decodable yet: ask for a keyframe, rate-limited.
+                    // Nothing decodable yet or frame dropped: ask for a keyframe, rate-limited.
                     // Parameter sets ride only with keyframes, so a receiver
                     // joining mid-stream has to ask rather than wait for a timer
                     // the sender does not run.
-                    if (!firstVideoSeen) {
-                        val now = System.currentTimeMillis()
-                        if (now - lastKeyReq > 300) {
-                            lastKeyReq = now
-                            sendSealed(Wire.keyframeRequest())
-                        }
+                    if (video.dropped > droppedBefore || !firstVideoSeen) {
+                        requestKeyframe()
                     }
                 }
                 Wire.SMAGIC -> {
@@ -973,18 +1197,18 @@ class CallSession(
         // The RAW microphone, for the estimator, before anything is subtracted.
         echoAim.noteCapture(x, n)
         if (speakers) {
+            gate.cfg.floorDb = -22.0
             aec.process(x, n, emitRing, emitW, emitRing.size)
             gate.echoResidual = aec.residual
-            // The floor's speaker-duplex gate reads the canceller (Audio.swift
-            // 1116-1119). These two were declared on the floor and fed by
-            // nothing, so the gate could never open.
             floor.aecErleDb = aec.erleDb
             floor.aecEchoPath = aec.echoPathNow
         } else {
+            gate.cfg.floorDb = -120.0
             gate.echoResidual = 1f
             floor.aecErleDb = 0.0
             floor.aecEchoPath = 1f
         }
+        if (useHpf) hpf.process(x, n)
         floor.speakers = speakers
         // The mouth outranks the correlation, and in one direction only.
         gate.mouthSays = visualKnown && visualVoice
@@ -1002,13 +1226,13 @@ class CallSession(
         gate.floorGranted = d.state == Floor.State.MINE
         playout.earOpen = d.playoutOpen
         floor.notePlayout(playout.playoutLive)
-        if (ended || selfMuted || !crypto.established) return
+        if (ended || selfMuted || audioFocusLost || !crypto.established) return
         // FPP-sized packets on the wire whatever the device block size is.
         var at = 0
         while (at + Wire.FPP <= n) {
             val cap = KinClock.now()
             for (i in 0 until Wire.FPP) {
-                val v = x[at + i]
+                val v = Wire.softLimit(x[at + i])
                 pcmScratch[i] = (maxOf(-1f, minOf(1f, v)) * 32767f).toInt().toShort()
             }
             val carry = redundancy && havePrev
@@ -1036,6 +1260,7 @@ class CallSession(
             sendSealed(videoScratch, m)
             videoPacketsSent++
         }
+        videoBytesSent += payload.size
         videoSeq++
         if (videoSeq % 60 == 1) {
             android.util.Log.i("kin", "video out: seq=$videoSeq packets=$videoPacketsSent " +
@@ -1045,6 +1270,10 @@ class CallSession(
 
     /** One render block: the jitter buffer's answer for this device callback. */
     fun renderBlock(out: FloatArray, n: Int) {
+        if (audioFocusLost) {
+            java.util.Arrays.fill(out, 0, n, 0f)
+            return
+        }
         playout.render(out, n, gate)
     }
 
@@ -1053,5 +1282,39 @@ class CallSession(
         safetyCode?.let { append(" · $it") }
         tsync.bestRttMs?.let { append(" · rtt %.0f ms".format(it)) }
         append(" · played ${ring.played} conceal ${ring.concealed}")
+    }
+
+    // 2nd-order Butterworth high-pass filter at 65 Hz (Q = 0.707) (Audio.swift:3756)
+    private class HighPassFilter(cutoff: Double = 65.0, sampleRate: Double = Wire.SR.toDouble(), q: Double = 0.7071067811865475) {
+        private var s1: Double = 0.0
+        private var s2: Double = 0.0
+        private val b0: Double
+        private val b1: Double
+        private val b2: Double
+        private val a1: Double
+        private val a2: Double
+
+        init {
+            val w0 = 2.0 * Math.PI * cutoff / sampleRate
+            val cosW0 = Math.cos(w0)
+            val sinW0 = Math.sin(w0)
+            val alpha = sinW0 / (2.0 * q)
+            val a0 = 1.0 + alpha
+            b0 = ((1.0 + cosW0) / 2.0) / a0
+            b1 = (-(1.0 + cosW0)) / a0
+            b2 = ((1.0 + cosW0) / 2.0) / a0
+            a1 = (-2.0 * cosW0) / a0
+            a2 = (1.0 - alpha) / a0
+        }
+
+        fun process(buf: FloatArray, count: Int) {
+            for (i in 0 until count) {
+                val xd = buf[i].toDouble()
+                val y = b0 * xd + s1
+                s1 = b1 * xd - a1 * y + s2
+                s2 = b2 * xd - a2 * y
+                buf[i] = y.toFloat()
+            }
+        }
     }
 }

@@ -44,8 +44,18 @@ class Crypto(
     val myKemPk: ByteArray get() = kem.publicKey
     private var sendKey: ByteArray? = null
     private var recvKey: ByteArray? = null
+    private var sendKeySpec: SecretKeySpec? = null
+    private var recvKeySpec: SecretKeySpec? = null
+    private var sendCipher: Cipher? = null
+    private var recvCipher: Cipher? = null
+    private val sendNonce = ByteArray(12)
+    private val recvNonce = ByteArray(12)
     private var sendCtr = 0L
     private val lock = Object()
+    private val sendLock = Object()
+    private val recvLock = Object()
+
+    @Volatile var lastSealUs = 0; private set
 
     private var rxHigh = 0L
     private val rxBits = LongArray(REPLAY_WINDOW / 64)
@@ -64,6 +74,7 @@ class Crypto(
     var pinned = false; private set
     var sealed = 0; private set
     var opened = 0; private set
+    var openedSinceKey = 0; private set
     var openFails = 0; private set
     var replayDrops = 0; private set
     var preKeyDrops = 0; private set
@@ -125,7 +136,7 @@ class Crypto(
     fun handshakePackets(caps: Int = Wire.CAP_PCM16 or Wire.CAP_PCM_LP): List<ByteArray> {
         val out = mutableListOf(handshakePacket(caps))
         val done: Boolean; val ct: ByteArray?
-        synchronized(lock) { done = established && opened > 0; ct = myCt }
+        synchronized(lock) { done = established && openedSinceKey > 0; ct = myCt }
         if (done) return out
         out.addAll(kemHalves)
         if (ct != null) out.add(hscPacket(ct))
@@ -190,6 +201,7 @@ class Crypto(
             myCt = null; hscCache = null
             iAmA = lexicographicallyPrecedes(myPublic, eph)
             established = false; sendKey = null; recvKey = null
+            openedSinceKey = 0
             pinned = expected != null
         }
         return Adopt.Adopted
@@ -250,10 +262,23 @@ class Crypto(
         val ikm = secret + kemSecret
         val ka2b = hkdfSha256(ikm, salt, "a2b".toByteArray() + transcript, 32)
         val kb2a = hkdfSha256(ikm, salt, "b2a".toByteArray() + transcript, 32)
+        val sk = if (iAmA) ka2b else kb2a
+        val rk = if (iAmA) kb2a else ka2b
+        synchronized(sendLock) {
+            sendKey = sk
+            sendKeySpec = SecretKeySpec(sk, "AES")
+            sendCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            sendCtr = 0
+        }
+        synchronized(recvLock) {
+            recvKey = rk
+            recvKeySpec = SecretKeySpec(rk, "AES")
+            recvCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            rxHigh = 0
+            rxBits.fill(0)
+        }
         synchronized(lock) {
-            sendKey = if (iAmA) ka2b else kb2a
-            recvKey = if (iAmA) kb2a else ka2b
-            sendCtr = 0; rxHigh = 0; rxBits.fill(0)
+            openedSinceKey = 0
             established = true
         }
     }
@@ -262,24 +287,28 @@ class Crypto(
 
     // ── the packets ───────────────────────────────────────────────────────
 
-    fun seal(plain: ByteArray, n: Int = plain.size): ByteArray? = synchronized(lock) {
-        val k = sendKey ?: return null
+    fun seal(plain: ByteArray, n: Int = plain.size): ByteArray? = synchronized(sendLock) {
+        val cipher = sendCipher ?: return null
+        val keySpec = sendKeySpec ?: return null
+        val t0 = System.nanoTime()
         sendCtr += 1
         val ctr = sendCtr
-        val nonce = ByteArray(12)
-        for (i in 0 until 8) nonce[4 + i] = ((ctr ushr (8 * i)) and 0xff).toByte()
-        val c = Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "AES"), GCMParameterSpec(128, nonce))
-        val ctAndTag = c.doFinal(plain, 0, n)
+        for (i in 0 until 8) sendNonce[4 + i] = ((ctr ushr (8 * i)) and 0xff).toByte()
+        val ctAndTag = try {
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(128, sendNonce))
+            cipher.doFinal(plain, 0, n)
+        } catch (_: Exception) { return null }
         val out = ByteArray(8 + ctAndTag.size)
         for (i in 0 until 8) out[i] = ((ctr ushr (8 * i)) and 0xff).toByte()
         System.arraycopy(ctAndTag, 0, out, 8, ctAndTag.size)
         sealed++
+        lastSealUs = ((System.nanoTime() - t0) / 1000).toInt()
         return out
     }
 
-    fun open(packet: ByteArray, n: Int = packet.size): ByteArray? = synchronized(lock) {
-        val k = recvKey ?: return null
+    fun open(packet: ByteArray, n: Int = packet.size): ByteArray? = synchronized(recvLock) {
+        val cipher = recvCipher ?: return null
+        val keySpec = recvKeySpec ?: return null
         if (n <= 8 + 16) return null
         var ctr = 0L
         for (i in 0 until 8) ctr = ctr or ((packet[i].toLong() and 0xff) shl (8 * i))
@@ -289,12 +318,10 @@ class Crypto(
             if (java.lang.Long.compareUnsigned(back, REPLAY_WINDOW.toLong()) >= 0) { replayDrops++; return null }
             if (bit(ctr)) { replayDrops++; return null }
         }
-        val nonce = ByteArray(12)
-        for (i in 0 until 8) nonce[4 + i] = ((ctr ushr (8 * i)) and 0xff).toByte()
+        for (i in 0 until 8) recvNonce[4 + i] = ((ctr ushr (8 * i)) and 0xff).toByte()
         val pt = try {
-            val c = Cipher.getInstance("AES/GCM/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), GCMParameterSpec(128, nonce))
-            c.doFinal(packet, 8, n - 8)
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(128, recvNonce))
+            cipher.doFinal(packet, 8, n - 8)
         } catch (e: Exception) { openFails++; return null }
         if (java.lang.Long.compareUnsigned(ctr, rxHigh) > 0) {
             val jump = ctr - rxHigh
@@ -304,6 +331,7 @@ class Crypto(
         }
         setBit(ctr)
         opened++
+        synchronized(lock) { openedSinceKey++ }
         return pt
     }
 
@@ -335,6 +363,7 @@ class Crypto(
         f["crypt_expected"] = if (expected != null) 1 else 0
         if (peerEph.isNotEmpty()) f["crypt_role"] = if (iAmA) "a" else "b"
         f["sealed"] = sealed; f["opened"] = opened
+        if (lastSealUs > 0) f["seal_us"] = lastSealUs
         if (replayDrops > 0) f["replay_drop"] = replayDrops
         if (preKeyDrops > 0) f["prekey_drop"] = preKeyDrops
         if (preKeyRx > 0) f["prekey_rx"] = preKeyRx

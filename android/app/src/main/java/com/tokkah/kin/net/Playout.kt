@@ -19,30 +19,19 @@ class Playout(val ring: RecvRing) {
         const val EAR_STEP = 1.0f / (48000f * 4f / 1000f)   // the 4 ms linear close
     }
 
-    var jitTarget = 2
+    val adapter = JitterAdapter(jitMin = 2)
+    var jitTarget: Int
+        get() = adapter.target
+        set(v) { adapter.target = v }
     var earOpen = true
     var mute = false
 
-    /**
-     * Callback size in frames, set by the device layer.
-     *
-     * ── THE BUFFER FLOOR IS A PROPERTY OF THE DEVICE, NOT A CONSTANT ─────────
-     *
-     * The Mac renders FPP frames per callback, so its jitter target of 2
-     * packets is one device block plus one of margin. Android's fast path never
-     * delivers 0.667 ms callbacks — a 192-frame burst consumes SIX packets in
-     * one go — so a target of 2 is starving by construction: measured against
-     * the shipped Mac app, 36191 packets accepted and 15871 samples concealed
-     * as starved, with 19961 arrivals booked late because the cursor had
-     * already run past their slot. Nothing was wrong with the path.
-     *
-     * So the floor is expressed in DEVICE BLOCKS, which is what it always
-     * meant: one whole block, plus two packets of jitter margin.
-     */
     var devBuf = 192
         set(v) {
             field = v
-            jitTarget = max(jitTarget, v / Wire.FPP + 2)
+            val minT = maxOf(2, v / Wire.FPP + 2)
+            adapter.jitMin = minT
+            adapter.target = maxOf(adapter.target, minT)
         }
 
     // ── MOUTH TO EAR, ON THIS END (Audio.swift 5020-5040) ───────────────────
@@ -208,10 +197,10 @@ class Playout(val ring: RecvRing) {
             val a = ring.sampleAt(absI)
             val b = ring.sampleAt(absI + 1)
             var value: Float
-            if (a != null && b != null) {
+            if (!a.isNaN() && !b.isNaN()) {
                 // Catmull-Rom: the buffer already holds the neighbours.
-                val sm = ring.sampleAt(absI - 1) ?: a
-                val s2 = ring.sampleAt(absI + 2) ?: b
+                val sm = ring.sampleAt(absI - 1, a)
+                val s2 = ring.sampleAt(absI + 2, b)
                 val t = fr; val t2 = t * t; val t3 = t2 * t
                 value = 0.5f * ((2 * a) + (-sm + b) * t +
                     (2 * sm - 5 * a + 4 * b - s2) * t2 +

@@ -15,7 +15,7 @@ class Gate {
     var on = true
     /// A full mute, by decision: -120 dB is one part in a million, and a number
     /// rather than a hard zero so the smoothing has something to converge to.
-    /// The old -22 dB duck is a control arm on the Mac (`--gate-floor -22`).
+    /// Configured to -22 dB on speaker calls (Mac 0.150).
     var floorDb = -120.0
     var closeMs = 4.0
     var margin = 2.8f

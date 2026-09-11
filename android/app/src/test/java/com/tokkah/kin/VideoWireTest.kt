@@ -124,4 +124,20 @@ class VideoWireTest {
         }
         assertNull(VideoWire.parse(c.serialized, 4))
     }
+
+    @Test
+    fun parseSpsFromVectorKeyframes() {
+        for (c in cases()) {
+            val f = VideoWire.parse(c.serialized, c.serialized.size)!!
+            if (f.isKeyframe) {
+                val sps = f.parameterSets.firstOrNull { VideoWire.nalType(it) == 7 }
+                if (sps != null) {
+                    val size = VideoWire.parseSps(sps)
+                    assertNotNull("SPS parsed for ${c.name}", size)
+                    assertTrue("${c.name} width > 0", size!!.first > 0)
+                    assertTrue("${c.name} height > 0", size.second > 0)
+                }
+            }
+        }
+    }
 }

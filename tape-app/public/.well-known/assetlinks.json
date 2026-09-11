@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.tokkah.kin",
+      "sha256_cert_fingerprints": [
+        "62:33:2C:1F:ED:CF:A0:DB:22:E2:63:5E:BD:EF:A6:43:85:4E:C3:94:EB:8D:CD:E4:15:EF:A1:03:CE:B8:A0:B8"
+      ]
+    }
+  }
+]

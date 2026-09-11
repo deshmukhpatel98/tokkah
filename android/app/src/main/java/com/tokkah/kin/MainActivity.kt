@@ -74,7 +74,7 @@ class MainActivity : ComponentActivity() {
         // an A/B nobody runs twice. Read here and NOT from a build flag, so the
         // arms are the same binary — a rebuild between arms is a second
         // variable.
-        for (k in listOf("turn", "decodeq")) {
+        for (k in listOf("turn", "decodeq", "subtitles", "lan_upgrade", "hpf")) {
             intent?.getStringExtra(k)?.let { rigFlags[k] = it == "1" || it == "true" }
         }
         run {
@@ -95,10 +95,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, ringOffer: Boolean = false) {
     val ctx = LocalContext.current
-    var room by remember { mutableStateOf(if (ringWho.isEmpty()) initialRoom ?: "" else "") }
-    var session by remember { mutableStateOf<CallSession?>(null) }
-    var audio by remember { mutableStateOf<AudioDevice?>(null) }
-    var video by remember { mutableStateOf<VideoDevice?>(null) }
+    var room by remember { mutableStateOf(if (CallManager.inCall) CallManager.room else if (ringWho.isEmpty()) initialRoom ?: "" else "") }
+    var session by remember { mutableStateOf<CallSession?>(CallManager.session) }
+    var audio by remember { mutableStateOf<AudioDevice?>(CallManager.audio) }
+    var video by remember { mutableStateOf<VideoDevice?>(CallManager.video) }
     var settingsOpen by remember { mutableStateOf(false) }
     var cameraHint by remember { mutableStateOf<String?>(null) }
     var myHandle by remember { mutableStateOf("") }
@@ -208,12 +208,15 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
         // Rig arms, from the launch intent, so an A/B needs no rebuild.
         rigFlags["turn"]?.let { s.useTurn = it }
         rigFlags["decodeq"]?.let { s.useDecodeQueue = it }
+        rigFlags["lan_upgrade"]?.let { s.lanUpgrade = it }
+        rigFlags["hpf"]?.let { s.useHpf = it }
         s.start()
         val a = AudioDevice(s, ctx.getSystemService(AudioManager::class.java))
         a.start()
         val v = VideoDevice(ctx, s)
         s.onKeyframeRequest = { v.requestKeyframe() }
         s.videoStats = { intArrayOf(v.framesEncoded, v.framesDecoded, v.decodedW, v.decodedH) }
+        s.onQuality = { q -> v.setQuality(q) }
         val geo = Geo(ctx)
         s.onTransportLock = {
             geo.onTransportLock()
@@ -225,8 +228,12 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
         if (who.isNotEmpty()) {
             v.wantFaceFor = who
             v.onFace = { handle, bmp -> state.faces.save(handle, bmp) }
-            s.onVideoFrame = { payload, _ -> v.faceFromKeyframe(payload) }
         }
+        s.onVideoFrame = { payload, _ ->
+            v.onFrameReceived(payload)
+            if (who.isNotEmpty()) v.faceFromKeyframe(payload)
+        }
+        CallManager.startCall(ctx, s, a, v, name.trim(), who)
         session = s; audio = a; video = v
         state.inCall = true
         // The Mac checks for a new version when a call starts, and installs
@@ -235,11 +242,15 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
     }
 
     fun leave() {
-        video?.stop(); audio?.stop()
-        session?.stop(hungUp = true)
+        CallManager.leave(ctx)
         video = null; audio = null; session = null
         state.callEnded()
         state.refresh()
+    }
+
+    DisposableEffect(Unit) {
+        CallManager.onLeaveRequested = { leave() }
+        onDispose { CallManager.onLeaveRequested = null }
     }
 
     // The mailbox, and the panel it fills. One owner, so the poll loop and the
@@ -359,9 +370,11 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
         val window = (view.context as? android.app.Activity)?.window ?: return@LaunchedEffect
         val c = androidx.core.view.WindowInsetsControllerCompat(window, view)
         if (session != null) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             c.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             c.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         } else {
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             c.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         }
     }
@@ -386,6 +399,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     reachOn = reachOn,
                     reachHint = reachHint,
                     removing = removing,
+                    version = installedVersion,
                 ),
                 // A denied permission is said, with the way to fix it, the way
                 // the Mac's pill does: the mic first (0.121: "a denied microphone
@@ -537,7 +551,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
             }
 
             DisposableEffect(s) {
-                val subs = Subtitles(ctx, s)
+                val subs = if (rigFlags["subtitles"] == true) Subtitles(ctx, s) else null
                 subsRef = subs
                 s.onText = { text, final, _ ->
                     // A short one is the sound somebody makes to stay with you;
@@ -546,7 +560,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                     if (text.length <= 12 && final) { bloom = text; caption = null }
                     else { caption = text; bloom = null }
                 }
-                onDispose { subs.stop(); s.onText = null }
+                onDispose { subs?.stop(); s.onText = null }
             }
 
             LaunchedEffect(s) {
@@ -835,7 +849,7 @@ fun KinApp(initialRoom: String?, ringWho: String = "", ringKey: String? = null, 
                 },
                 onDial = { dialInto(it) },
                 farVideo = { FarVideo(video) },
-                selfVideo = { if (camGranted) SelfPreview {} },
+                selfVideo = { if (camGranted) PeekPreview(video) },
             )
         }
     }
@@ -866,6 +880,23 @@ private fun SelfPreview(onHint: (String) -> Unit) {
     )
 }
 
+/** In-call peek preview sharing the existing camera feed without opening a second CameraDevice. */
+@Composable
+private fun PeekPreview(video: VideoDevice?) {
+    AndroidView(
+        factory = { c ->
+            SurfaceView(c).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(h: SurfaceHolder) { video?.setPreviewSurface(h.surface) }
+                    override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                    override fun surfaceDestroyed(h: SurfaceHolder) { video?.setPreviewSurface(null) }
+                })
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+    )
+}
+
 /**
  * Their face. A SurfaceView, because here latency is the product.
  *
@@ -889,9 +920,9 @@ private fun FarVideo(video: VideoDevice?) {
             factory = { c ->
                 SurfaceView(c).apply {
                     holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(h: SurfaceHolder) { video?.attachDisplay(h.surface) }
+                        override fun surfaceCreated(h: SurfaceHolder) { video?.setDisplaySurface(h.surface) }
                         override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
-                        override fun surfaceDestroyed(h: SurfaceHolder) {}
+                        override fun surfaceDestroyed(h: SurfaceHolder) { video?.setDisplaySurface(null) }
                     })
                 }
             },

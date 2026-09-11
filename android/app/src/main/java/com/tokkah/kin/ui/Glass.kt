@@ -75,6 +75,9 @@ class BackdropMeter {
     @Volatile var grid = FloatArray(cols * rows) { 0f }
     @Volatile var everSampled = false
     var width = 1; var height = 1
+    private var pixelBuf = IntArray(0)
+    private val nextBuf = FloatArray(cols * rows)
+    private val cntBuf = IntArray(cols * rows)
 
     /** Mean luminance (0..1) under a rectangle in root pixels. */
     fun luma(left: Float, top: Float, right: Float, bottom: Float): Float {
@@ -93,27 +96,30 @@ class BackdropMeter {
         val w = bmp.width; val h = bmp.height
         if (w < 2 || h < 2) return
         width = w; height = h
-        val px = IntArray(w * h)
-        bmp.readPixels(px)
-        val next = FloatArray(cols * rows)
-        val cnt = IntArray(cols * rows)
+        val total = w * h
+        if (pixelBuf.size < total) {
+            pixelBuf = IntArray(total)
+        }
+        bmp.readPixels(pixelBuf, startX = 0, startY = 0, width = w, height = h, bufferOffset = 0, stride = w)
+        java.util.Arrays.fill(nextBuf, 0f)
+        java.util.Arrays.fill(cntBuf, 0)
         // Every 4th pixel each way is plenty for a mean over a cell.
         var y = 0
         while (y < h) {
             var x = 0
             val row = (y * rows / h).coerceAtMost(rows - 1)
             while (x < w) {
-                val p = px[y * w + x]
+                val p = pixelBuf[y * w + x]
                 val l = (0.2126f * ((p shr 16) and 255) + 0.7152f * ((p shr 8) and 255) + 0.0722f * (p and 255)) / 255f
                 val i = row * cols + (x * cols / w).coerceAtMost(cols - 1)
-                next[i] += l; cnt[i]++
+                nextBuf[i] += l; cntBuf[i]++
                 x += 4
             }
             y += 4
         }
         val g = grid.copyOf()
-        for (i in g.indices) if (cnt[i] > 0) {
-            val v = next[i] / cnt[i]
+        for (i in g.indices) if (cntBuf[i] > 0) {
+            val v = nextBuf[i] / cntBuf[i]
             g[i] = if (everSampled) g[i] + (v - g[i]) * 0.25f else v
         }
         grid = g
