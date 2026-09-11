@@ -1,0 +1,638 @@
+{
+  "product": "Onefold",
+  "tension": "You keep running, but the worn-out shoes keep staying.",
+  "idea": "One shoe becomes the next through its own material.",
+  "tagline": "Your next pair starts here.",
+  "wordmark": "Onefold",
+  "tempo": "fast",
+  "palette": {
+    "ground": "#05060a",
+    "ink": "#f3f1ec",
+    "accentA": "#DCA35F",
+    "accentB": "#719BCE"
+  },
+  "productDescription": {
+    "form": "Low-profile road running shoe",
+    "material": "Continuous knit upper and sole in one material",
+    "colour": "Warm sand-amber",
+    "details": [
+      "Soft rounded heel",
+      "Subtle heel-to-toe fold line",
+      "No separate logo"
+    ]
+  },
+  "motif": {
+    "name": "The travelling fold light",
+    "description": "An amber stroke, clipped inside lib.product, travels heel-to-toe along its existing fold line in 600ms.",
+    "returns": [
+      "S1",
+      "S5",
+      "S9",
+      "S13"
+    ]
+  },
+  "voice": {
+    "voice_id": "IKne3meq5aSn9XLyUdCD",
+    "voice_name": "Charlie",
+    "stability": 0.5,
+    "direction": "Close, confident Australian delivery; drive forward without shouting or preaching."
+  },
+  "voiceover": [
+    {
+      "t": 0.3,
+      "text": "Onefold. Worn shoes become new pairs."
+    },
+    {
+      "t": 3.6,
+      "text": "A road running shoe. Made from one material."
+    },
+    {
+      "t": 7.1,
+      "text": "Knit upper and sole. All the same material."
+    },
+    {
+      "t": 11.1,
+      "text": "For the miles you put in every day."
+    },
+    {
+      "t": 15.1,
+      "text": "And when you finally wear it out?"
+    },
+    {
+      "t": 18.8,
+      "text": "It doesn't belong in that drawer forever."
+    },
+    {
+      "t": 22.5,
+      "text": "Send it back instead."
+    },
+    {
+      "t": 24.6,
+      "text": "That same material becomes your next running shoe."
+    },
+    {
+      "t": 28.6,
+      "text": "Another pair, ready to head down the road."
+    },
+    {
+      "t": 32.6,
+      "text": "This pair's finish is the next pair's start."
+    },
+    {
+      "t": 36.8,
+      "text": "Less left behind. More miles to come."
+    },
+    {
+      "t": 40.5,
+      "text": "Run them. Return them."
+    },
+    {
+      "t": 42.6,
+      "text": "Onefold. Your next pair starts here."
+    }
+  ],
+  "score": {
+    "bpm": 120,
+    "harmony": "Open fifths; warm major third enters at 28.5.",
+    "timbres": "Muted kick, brushed metallic ticks, restrained bass, granular knit textures.",
+    "beats": [
+      {
+        "t": 0,
+        "what": "Material pulse opens"
+      },
+      {
+        "t": 3.5,
+        "what": "Hero bass arrival"
+      },
+      {
+        "t": 7,
+        "what": "Knit ticks sharpen"
+      },
+      {
+        "t": 11,
+        "what": "Road kick lands"
+      },
+      {
+        "t": 15,
+        "what": "Wear texture enters"
+      },
+      {
+        "t": 18.5,
+        "what": "Cold drawer knock"
+      },
+      {
+        "t": 22.5,
+        "what": "Return snare cracks"
+      },
+      {
+        "t": 24.5,
+        "what": "Material bass gathers"
+      },
+      {
+        "t": 28.5,
+        "what": "Warm third opens"
+      },
+      {
+        "t": 32.5,
+        "what": "Running pulse doubles"
+      },
+      {
+        "t": 36.5,
+        "what": "Cold texture releases"
+      },
+      {
+        "t": 40.5,
+        "what": "Wordmark chord strikes"
+      },
+      {
+        "t": 42.5,
+        "what": "Invitation chord sustains"
+      }
+    ]
+  },
+  "duration": 45,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 3.5,
+      "title": "Worn Becomes Next",
+      "direction": "Throughout, lib.product fills 560px height. At 0, worn knit paths gather along the fold line, rebuilding as a fresh pair in 600ms: graphic recycling. Amber raking light replaces cold rimlight; at 2, the second shoe separates. Carries L1.",
+      "handoffIn": "Worn shoe already visible",
+      "handoffOut": "Fresh pair facing right",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S2",
+      "start": 3.5,
+      "end": 7,
+      "title": "The Material Hero",
+      "direction": "Throughout, lib.product remains visible; a 480ms snap zoom reaches 720px height, 67% of frame height. Amber grazing light reveals knit relief, rounded heel and uninterrupted sole. At 5.5, a cream edge highlight arrives. Carries L2.",
+      "handoffIn": "Fresh pair facing right",
+      "handoffOut": "Near shoe dominates frame",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S3",
+      "start": 7,
+      "end": 11,
+      "title": "Nothing Comes Apart",
+      "direction": "Throughout, lib.product holds 760px height. A 600ms camera pan follows knit into sole without an exploded view or colour change. Narrow amber illumination makes continuity legible. At 9, the toe texture gains a second grazing light. Carries L3.",
+      "handoffIn": "Near shoe dominates frame",
+      "handoffOut": "Toe points into motion",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S4",
+      "start": 11,
+      "end": 15,
+      "title": "On The Road",
+      "direction": "Throughout, two lib.product instances stand 430px high above drawn road strokes. A 480ms contact-and-rebound establishes running use under warm side light. At 13, the trailing shoe lands as the road perspective shifts forward. Carries L4.",
+      "handoffIn": "Toe points into motion",
+      "handoffOut": "Leading sole approaches ground",
+      "copy": "Out there.",
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S5",
+      "start": 15,
+      "end": 18.5,
+      "title": "Miles Leave Evidence",
+      "direction": "Throughout, lib.product occupies 580px height. At 15, wear overlays enter beneath a 600ms fold-line light sweep; the silhouette stays identical. Amber light reveals abrasion rather than damage theatre. At 17, the heel rotates into view. Carries L5.",
+      "handoffIn": "Leading sole approaches ground",
+      "handoffOut": "Worn heel faces camera",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S6",
+      "start": 18.5,
+      "end": 22.5,
+      "title": "The Waiting Drawer",
+      "direction": "Throughout, worn lib.product copies remain visible at 280px height inside layered SVG drawer compartments. A 600ms camera pullback reveals cold blue dividers, not a mountain of waste. At 20.5, the foreground shoe catches amber light. Carries L6.",
+      "handoffIn": "Worn heel faces camera",
+      "handoffOut": "One shoe singled out",
+      "copy": "Not a collection.",
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S7",
+      "start": 22.5,
+      "end": 24.5,
+      "title": "Choose The Return",
+      "direction": "Throughout, the selected lib.product remains 420px high. On L7's onset, a 480ms lateral move carries it from the cold drawer into a simple gradient shipping tray. Warm overhead light meets it; no invented return terms appear.",
+      "handoffIn": "One shoe singled out",
+      "handoffOut": "Worn shoe in tray",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S8",
+      "start": 24.5,
+      "end": 28.5,
+      "title": "Keep The Material",
+      "direction": "Throughout, lib.product holds at 560px height; its knit paths gather within the original silhouette over 600ms. The tray drops away as amber backlight strengthens. At 26.5, wear flecks disappear into the same path field. Carries L8.",
+      "handoffIn": "Worn shoe in tray",
+      "handoffOut": "Material fills shoe silhouette",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S9",
+      "start": 28.5,
+      "end": 32.5,
+      "title": "A Pair Again",
+      "direction": "Throughout, lib.product stands 600px high. A 600ms fold-line light sweep resolves the gathered paths into clean knit and sole under dimensional amber light. At 30.5, a second shared instance steps into the composition. Carries L9.",
+      "handoffIn": "Material fills shoe silhouette",
+      "handoffOut": "New pair poised forward",
+      "copy": "Again.",
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S10",
+      "start": 32.5,
+      "end": 36.5,
+      "title": "Back Into Stride",
+      "direction": "Throughout, both lib.product shoes remain 450px high in the road world. A 500ms whole-scene push follows their next footfall; amber pools skim the soles. At 34.5, the opposite shoe overtakes camera with another contact beat. Carries L10.",
+      "handoffIn": "New pair poised forward",
+      "handoffOut": "Near shoe crosses foreground",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S11",
+      "start": 36.5,
+      "end": 40.5,
+      "title": "Leave Less Behind",
+      "direction": "Throughout, lib.product grows from 450px to 650px height in a 600ms push. Cold drawer dividers recede behind the warmly lit shoe, without claiming all waste disappears. At 38.5, the camera reveals its rounded heel. Carries L11.",
+      "handoffIn": "Near shoe crosses foreground",
+      "handoffOut": "Warm heel on black",
+      "copy": null,
+      "primitive": "shape",
+      "params": {
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S12",
+      "start": 40.5,
+      "end": 42.5,
+      "title": "Name The Move",
+      "direction": "Throughout, lib.product remains 360px high beneath the cream Onefold wordmark. At L12's onset, a 320ms camera reframe gives the name clean space. Amber heel light persists; the ground remains visible, with no fade or logo on the shoe.",
+      "handoffIn": "Warm heel on black",
+      "handoffOut": "Wordmark above lit shoe",
+      "copy": "Onefold",
+      "primitive": "mark",
+      "params": {
+        "text": "Onefold",
+        "draw": "lib.product"
+      }
+    },
+    {
+      "id": "S13",
+      "start": 42.5,
+      "end": 45,
+      "title": "Your Next Run",
+      "direction": "Throughout until final fade, lib.product remains 480px high beside the invitation. A 600ms fold-line light sweep begins just before L13, warming the knit. At 44.5, the second shoe enters; only at 44.76 does a 240ms fade begin.",
+      "handoffIn": "Wordmark above lit shoe",
+      "handoffOut": "Black at 45 seconds",
+      "copy": "Explore the shoe.",
+      "primitive": "cta",
+      "params": {
+        "text": "Explore the shoe.",
+        "draw": "lib.product"
+      }
+    }
+  ],
+  "productDrawing": {
+    "view": "three-quarter",
+    "layers": [
+      {
+        "tag": "shadow",
+        "path": "M50 744 C50 707 252 678 500 678 C748 678 950 707 950 744 C950 781 748 810 500 810 C252 810 50 781 50 744 Z",
+        "fill": {
+          "radial": [
+            500,
+            744,
+            0,
+            450
+          ],
+          "stops": [
+            [
+              0,
+              "#000000",
+              0.5
+            ],
+            [
+              0.65,
+              "#000000",
+              0.22
+            ],
+            [
+              1,
+              "#000000",
+              0
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "body",
+        "path": "M103 377 C105 343 132 321 167 327 C204 333 231 366 267 382 C319 403 374 369 410 325 C428 303 451 308 473 333 C518 383 553 427 609 458 C667 490 740 500 817 519 C887 536 940 570 951 616 C963 653 932 688 880 703 C726 746 522 733 355 710 C234 696 121 680 77 638 C50 612 61 570 73 531 C84 491 89 427 103 377 Z",
+        "fill": {
+          "linear": [
+            210,
+            320,
+            710,
+            765
+          ],
+          "stops": [
+            [
+              0,
+              "#F0CF9E"
+            ],
+            [
+              0.48,
+              "#DCA35F"
+            ],
+            [
+              1,
+              "#965D2D"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "sole",
+        "path": "M72 583 C112 615 183 632 284 644 C447 665 616 682 773 667 C852 660 913 641 950 613 C963 653 932 688 880 703 C726 746 522 733 355 710 C234 696 121 680 77 638 C61 623 61 602 72 583 Z",
+        "fill": {
+          "linear": [
+            260,
+            585,
+            530,
+            752
+          ],
+          "stops": [
+            [
+              0,
+              "#E4B476"
+            ],
+            [
+              0.58,
+              "#DCA35F"
+            ],
+            [
+              1,
+              "#A86D36"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "collar",
+        "path": "M118 372 C123 342 145 332 169 339 C203 347 233 379 270 394 C322 415 373 374 409 340 C422 326 440 333 447 351 C440 391 388 437 333 456 C271 478 197 449 151 419 C130 405 116 391 118 372 Z",
+        "fill": {
+          "linear": [
+            173,
+            337,
+            294,
+            466
+          ],
+          "stops": [
+            [
+              0,
+              "#F3D5AB"
+            ],
+            [
+              0.5,
+              "#E5B574"
+            ],
+            [
+              1,
+              "#BB8144"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "opening",
+        "path": "M141 374 C145 357 160 353 177 361 C212 377 237 404 275 414 C321 426 369 390 404 355 C414 345 425 345 429 356 C416 389 373 425 326 442 C272 460 207 435 164 408 C146 397 136 385 141 374 Z",
+        "fill": {
+          "linear": [
+            250,
+            355,
+            284,
+            453
+          ],
+          "stops": [
+            [
+              0,
+              "#4B301E"
+            ],
+            [
+              0.57,
+              "#78502B"
+            ],
+            [
+              1,
+              "#C68B4B"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "inner-knit",
+        "path": "M163 401 C209 424 269 445 317 430 C359 417 391 391 418 365 C400 401 363 429 326 442 C272 460 207 435 164 408 Z",
+        "fill": {
+          "linear": [
+            269,
+            402,
+            276,
+            456
+          ],
+          "stops": [
+            [
+              0,
+              "#9C6937"
+            ],
+            [
+              1,
+              "#D8A15F"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "instep",
+        "path": "M432 334 C452 343 478 375 505 407 C539 446 578 474 628 493 C591 516 550 523 510 507 C469 491 431 462 407 430 C416 405 432 372 432 334 Z",
+        "fill": {
+          "linear": [
+            435,
+            347,
+            549,
+            512
+          ],
+          "stops": [
+            [
+              0,
+              "#F2D1A2",
+              0.8
+            ],
+            [
+              0.6,
+              "#E8B97C",
+              0.4
+            ],
+            [
+              1,
+              "#DCA35F",
+              0
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "knit-upper",
+        "path": "M128 438 L136 451 L146 443 M151 450 L159 463 L169 455 M174 462 L182 475 L192 467 M198 475 L206 488 L216 480 M223 487 L231 500 L241 492 M249 498 L257 511 L267 503 M277 508 L285 521 L295 513 M307 516 L315 529 L325 521 M122 479 L130 492 L140 484 M148 492 L156 505 L166 497 M176 507 L184 520 L194 512 M205 522 L213 535 L223 527 M236 535 L244 548 L254 540 M269 546 L277 559 L287 551",
+        "fill": "none",
+        "stroke": "#86552F",
+        "strokeWidth": 3,
+        "alpha": 0.28,
+        "glow": 0
+      },
+      {
+        "tag": "knit-forefoot",
+        "path": "M365 520 L374 531 L384 522 M397 524 L406 535 L416 526 M431 525 L440 536 L450 527 M465 522 L474 533 L484 524 M603 516 L612 527 L623 519 M638 525 L647 536 L658 528 M674 534 L683 545 L694 537 M710 542 L719 553 L730 545 M746 551 L755 562 L766 554 M782 560 L791 571 L802 563 M814 573 L823 584 L834 576 M626 579 L635 590 L646 582 M665 581 L674 592 L685 584 M705 585 L714 596 L725 588",
+        "fill": "none",
+        "stroke": "#F1CD99",
+        "strokeWidth": 3,
+        "alpha": 0.43,
+        "glow": 0
+      },
+      {
+        "tag": "instep-knit",
+        "path": "M405 382 C427 384 451 375 465 365 M421 402 C446 405 471 396 485 387 M441 422 C466 427 491 418 505 410 M464 443 C489 449 514 441 528 433 M489 463 C515 469 539 461 552 454",
+        "fill": "none",
+        "stroke": "#986334",
+        "strokeWidth": 4,
+        "alpha": 0.36,
+        "glow": 0
+      },
+      {
+        "tag": "sole-knit",
+        "path": "M119 621 Q114 634 118 647 M161 634 Q156 648 160 660 M206 644 Q201 659 205 674 M254 652 Q249 668 253 681 M306 660 Q301 676 305 690 M362 668 Q358 683 362 698 M421 674 Q417 690 421 705 M483 680 Q479 696 483 710 M547 684 Q543 700 547 715 M612 686 Q608 702 612 717 M678 684 Q674 700 678 714 M743 679 Q739 695 743 709 M804 670 Q800 686 804 698 M859 657 Q855 673 856 686 M904 642 Q902 656 897 669",
+        "fill": "none",
+        "stroke": "#905B30",
+        "strokeWidth": 3,
+        "alpha": 0.32,
+        "glow": 0
+      },
+      {
+        "tag": "seam",
+        "path": "M93 495 C188 524 257 571 360 584 C475 600 596 561 710 568 C805 571 880 594 936 621",
+        "fill": "none",
+        "stroke": "#8D582E",
+        "strokeWidth": 5,
+        "alpha": 0.46,
+        "glow": 0
+      },
+      {
+        "tag": "fold-highlight",
+        "path": "M94 502 C189 531 257 578 360 591 C475 607 596 568 710 575 C805 578 880 601 932 626",
+        "fill": "none",
+        "stroke": "#EFC795",
+        "strokeWidth": 3,
+        "alpha": 0.52,
+        "glow": 0
+      },
+      {
+        "tag": "sole-highlight",
+        "path": "M82 590 C125 620 196 636 285 648 C448 669 615 686 774 671 C846 664 909 647 941 626",
+        "fill": "none",
+        "stroke": "#F0CA95",
+        "strokeWidth": 4,
+        "alpha": 0.42,
+        "glow": 0
+      },
+      {
+        "tag": "highlight",
+        "path": "M110 378 C113 348 135 331 163 336 C197 342 230 376 266 390 M440 323 C452 325 461 337 473 351 C521 401 553 440 606 469 C667 500 741 509 814 528 C868 541 908 563 929 587 M87 429 C82 474 81 504 72 535",
+        "fill": "none",
+        "stroke": "#F3D8B1",
+        "strokeWidth": 6,
+        "alpha": 0.67,
+        "glow": 0
+      },
+      {
+        "tag": "outline",
+        "path": "M103 377 C105 343 132 321 167 327 C204 333 231 366 267 382 C319 403 374 369 410 325 C428 303 451 308 473 333 C518 383 553 427 609 458 C667 490 740 500 817 519 C887 536 940 570 951 616 C963 653 932 688 880 703 C726 746 522 733 355 710 C234 696 121 680 77 638 C50 612 61 570 73 531 C84 491 89 427 103 377 Z",
+        "fill": "none",
+        "stroke": "#F3F1EC",
+        "strokeWidth": 8,
+        "alpha": 0.7,
+        "glow": 0
+      }
+    ]
+  }
+}

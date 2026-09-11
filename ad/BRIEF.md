@@ -1,3 +1,9 @@
+> **Version 2 (2026-09-05).** The film was rebuilt from two director's treatments;
+> the shot list below is the original (v1) spec and still defines the technical
+> contract (§4 visual system, §6-§9). For what v2 actually does shot by shot, the
+> final copy, and why, read `ad/v2-notes/DECISIONS.md` and the two critiques
+> beside it. Version 1 is frozen in `ad/versions/v1-2026-09-05/` (git tag `ad-v1`).
+
 # Kin — the animated film. Creative brief and technical spec.
 
 Owner of taste: the orchestrator. Owner of the build: the worker. Read all of it
@@ -239,7 +245,9 @@ graph on either a live AudioContext or an OfflineAudioContext)
 - Player: a centered play control (a cream circle with a triangle, glass
   behind it) that starts the film with sound — required by autoplay policy. A
   thin progress hairline along the bottom (cream, 2px) that fills with time.
-  Click anywhere to pause/resume; a mute toggle bottom-right (icon only);
+  Click anywhere to pause/resume; a mute toggle bottom-right (icon only), and
+  beside it a download icon that saves the rendered film (`/ad/dl/Kin.mp4`,
+  served from the release bucket; hidden when the page is not on its own site);
   at the end, a replay control. Query flags: `?autoplay=1&muted=1` starts on
   load without a click (the website hero uses this); `?loop=1` loops;
   `?render=1` hides every control, seeds the grain from the frame index, and

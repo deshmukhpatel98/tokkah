@@ -1,0 +1,259 @@
+{
+  "ours": "ad/engine/out/macmini-study/final.mp4",
+  "reference": "/Users/deveshpatel/Downloads/The new Mac mini with M6 - Apple (1080p, h264).mp4",
+  "durations": {
+    "ours": 43,
+    "reference": 42.92
+  },
+  "structure": {
+    "referenceCuts": 8,
+    "ourCuts": 3,
+    "matchedWithinTol": 1,
+    "tolSeconds": 0.083,
+    "missing": [
+      30.697,
+      30.864,
+      30.948,
+      31.031,
+      31.114,
+      31.615,
+      32.282
+    ],
+    "extra": [
+      4.6,
+      7.8
+    ]
+  },
+  "light": {
+    "correlation": 0.929,
+    "meanAbsDelta": 40.5,
+    "ours": [
+      221,
+      219,
+      219,
+      217,
+      192,
+      160,
+      161,
+      166,
+      198,
+      198,
+      197,
+      196,
+      196,
+      200,
+      211,
+      217,
+      205,
+      201,
+      201,
+      201,
+      201,
+      212,
+      216,
+      216,
+      217,
+      217,
+      215,
+      215,
+      209,
+      201,
+      205,
+      218,
+      221,
+      222,
+      219,
+      220,
+      221,
+      214,
+      18,
+      18,
+      18,
+      18,
+      18
+    ],
+    "reference": [
+      173,
+      167,
+      177,
+      166,
+      149,
+      164,
+      169,
+      165,
+      172,
+      167,
+      171,
+      178,
+      176,
+      180,
+      177,
+      170,
+      156,
+      148,
+      158,
+      170,
+      169,
+      153,
+      151,
+      152,
+      151,
+      153,
+      153,
+      171,
+      148,
+      141,
+      137,
+      123,
+      138,
+      168,
+      165,
+      167,
+      172,
+      159,
+      16,
+      16,
+      16,
+      16,
+      16
+    ]
+  },
+  "motion": {
+    "correlation": 0.34
+  },
+  "type": [
+    {
+      "t": 34.8,
+      "referenceBoxes": 6,
+      "ourBoxes": 7,
+      "pairs": [
+        {
+          "ref": [
+            832,
+            440,
+            1205,
+            797
+          ],
+          "ours": [
+            1344,
+            492,
+            1493,
+            573
+          ],
+          "centreDeltaPx": 409.1,
+          "widthRatio": 0.399,
+          "heightRatio": 0.227
+        },
+        {
+          "ref": [
+            220,
+            490,
+            479,
+            591
+          ],
+          "ours": [
+            220,
+            490,
+            479,
+            591
+          ],
+          "centreDeltaPx": 0,
+          "widthRatio": 1,
+          "heightRatio": 1
+        },
+        {
+          "ref": [
+            1344,
+            492,
+            1773,
+            573
+          ],
+          "ours": [
+            1506,
+            492,
+            1773,
+            573
+          ],
+          "centreDeltaPx": 81,
+          "widthRatio": 0.622,
+          "heightRatio": 1
+        },
+        {
+          "ref": [
+            90,
+            494,
+            211,
+            571
+          ],
+          "ours": [
+            90,
+            492,
+            211,
+            571
+          ],
+          "centreDeltaPx": 1,
+          "widthRatio": 1,
+          "heightRatio": 1.026
+        },
+        {
+          "ref": [
+            492,
+            494,
+            643,
+            591
+          ],
+          "ours": [
+            490,
+            492,
+            643,
+            589
+          ],
+          "centreDeltaPx": 2.2,
+          "widthRatio": 1.013,
+          "heightRatio": 1
+        },
+        {
+          "ref": [
+            1452,
+            602,
+            1661,
+            645
+          ],
+          "ours": [
+            1452,
+            602,
+            1623,
+            645
+          ],
+          "centreDeltaPx": 19,
+          "widthRatio": 0.818,
+          "heightRatio": 1
+        }
+      ]
+    },
+    {
+      "t": 36.6,
+      "referenceBoxes": 1,
+      "ourBoxes": 1,
+      "pairs": [
+        {
+          "ref": [
+            900,
+            446,
+            1015,
+            587
+          ],
+          "ours": [
+            828,
+            452,
+            953,
+            579
+          ],
+          "centreDeltaPx": 67,
+          "widthRatio": 1.087,
+          "heightRatio": 0.901
+        }
+      ]
+    }
+  ]
+}

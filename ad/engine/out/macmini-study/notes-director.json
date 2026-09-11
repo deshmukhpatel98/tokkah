@@ -1,0 +1,32 @@
+[
+  {
+    "shot": "S3",
+    "severity": 3,
+    "note": "The upgrade beat is missing. The reference at 4.6-7.8 s is a CLOSE high three-quarter view of the box's top face filling about 60% of the frame width, with a hand descending from above holding a small square chip, lowering it onto the top, then a small spark. Ours holds the wide shot of the plain box.",
+    "fix": "From c.tl 0 to 0.5 move three.camera from the S2 framing to a high three-quarter close-up: position about (0.9, 2.1, 2.3) looking at (0, 0.28, 0), so the box's top fills ~60% of the frame width. Build a hand with three.get('hand', ...): a palm (a flattened rounded box 0.28 x 0.08 x 0.32, three.plastic('#e0b79a', 0.7)) with four finger capsules (r 0.035, len 0.22) and a thumb, holding a chip: a thin dark square three.roundedBox(0.36, 0.03, 0.36, 0.02, three.plastic('#1c1f2a', 0.5)) with a lighter inset square on top. The hand enters from above at c.tl 0.6 (y from 2.4 down to 0.62 over 900 ms with lib.ease), releases the chip onto the box top (chip rests at y 0.515) at c.tl 1.9, and rises out of frame by c.tl 2.6. At c.tl 2.7 a spark: three or four thin emissive lines (three.glow('B', 3)) radiating 0.25 m from the chip for 250 ms, then gone. Hold the close framing to the end of the shot and hand it off."
+  },
+  {
+    "shot": "S10",
+    "severity": 3,
+    "note": "The launch must be FIVE HARD CUTS: at film times 30.70, 31.11, 31.53, 31.95 and 32.37 the picture changes completely in one frame, then a soft transition at 32.78 into S11. Ours is one continuous shot, so the scorer matched 1 of 8 reference cuts.",
+    "fix": "Inside the shot, switch composition abruptly on c.t crossing each cut time (no easing across the cut; use if/else on c.t): 30.70-31.11 the booster rig lifting off, camera low and wide, the rig leaving the frame upward; 31.11-31.53 white cloud masses (clusters of 12-20 matte white spheres r 0.3-0.9) filling the frame, camera inside them, the rig passing through small; 31.53-31.95 a different cloud close-up, camera close, spheres r 1.2-2.0 filling the frame; 31.95-32.37 the rig small at the top of the frame trailing blue flame (emissive cones, three.glow('B', 4)) through a gap in the clouds; 32.37-32.78 one more cloud close-up, brighter (a lib.field on c.light at 0.2 alpha over the whole frame). Each cut must produce a big change in overall brightness or composition so a scene-change detector reads it. Keep the studio call for the floor colour but let the clouds cover it."
+  },
+  {
+    "shot": "S12",
+    "severity": 2,
+    "note": "The headline must be on screen by 34.2 s and hold to 35.7 s; the scorer found the product box at 0 px delta but the headline unmatched at 34.8 s.",
+    "fix": "Draw lib.text(c.light, 'The Little', {x: 90, y: 490, size: 112, font: 'sans', weight: 600, color: 'ink', align: 'left', baseline: 'top', alpha}) with alpha rising over 400 ms from film time 33.6; 'Pebble' right-aligned at x 1773, y 492, same size/weight, from 33.9; 'with P2' centred at x 1556, y 602, size 58, weight 400, from 34.1. Hold all three to 35.7 then fade over 300 ms with the box. Keep the box exactly where it is (its box matched the reference at 0 px)."
+  },
+  {
+    "shot": "S13",
+    "severity": 2,
+    "note": "The logo card: our mark is 67 px off the reference position and 10% short.",
+    "fix": "Draw our mark centred at exactly (957, 516) with an overall height of 141 px: lib.mark(c.light, 957, 516, 60, 38, 0.95, 0.9, 0.12, alpha) gives two discs spanning about 141 px tall; alpha in over 300 ms from film time 36.0, hold to 37.95, then cut to black in one frame (no fade)."
+  },
+  {
+    "shot": "S14",
+    "severity": 2,
+    "note": "The legal line is not readable in our black frames; the reference shows one line of small mid-grey text across the bottom.",
+    "fix": "Fill the frame black (lib.shape or fillRect with '#000000' on c.scene, alpha 1; do not call three.studio here so the 3D layer stays clear). From film time 38.4 draw lib.text(c.light, 'Subject to availability. Performance compared against the previous generation Pebble.', {x: 957, y: 1017, size: 22, font: 'sans', color: '#8a8c92', align: 'center', alpha}) with alpha over 300 ms, and hold to the end. Nothing else in the frame."
+  }
+]

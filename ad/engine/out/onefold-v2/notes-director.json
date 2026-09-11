@@ -1,0 +1,14 @@
+[
+  {
+    "shot": "S12",
+    "severity": 3,
+    "note": "The reveal splits the frame into two unrelated halves: the mark and the name sit left of centre around x 760 while the shoe hangs small at the far right. A reveal is one composition.",
+    "fix": "Build one two-column end composition and hold it. LEFT: the shoe comes to rest at (620,600) at 600 px over 600 ms (lib.ease), lit by lib.field(scene, 560, 760, 520, 'A', 0.32) and a soft shadow (lib.shape ellipse, ground, alpha 0.45) under it; breathing 0.3%. RIGHT: the mark grows with lib.mark(light, 1300, 360, 100, 64, 0.88, 0.74, 0.14, 1) from r 20 over 700 ms (lib.easeMark) on the narrator's 'Run them. Return them.'; the name is drawn on canvas so it can sit in the right column: lib.text(light, 'Onefold', {x: 1300, y: 560, size: 152, font: 'serif', color: 'ink', align: 'center', alpha}) rising 8 px over 600 ms from c.shot.start + 0.5. Do NOT use dom.wordmark/dom.tagline/dom.cta in this shot (they are full-width centred and would fight the column). Hand off: the shoe at (620,600) 600 px, the mark at (1300,360) r 100, the name at (1300,560)."
+  },
+  {
+    "shot": "S13",
+    "severity": 3,
+    "note": "The CTA line 'Explore the shoe.' overprints the tagline: both land in the same band. And a second shoe slides in over the first in the last second, muddying the one image the film should end on.",
+    "fix": "Continue exactly from S12's hand-off and change nothing about the shoe, the mark or the name. Add the tagline on canvas: lib.text(light, 'Your next pair starts here.', {x: 1300, y: 660, size: 52, font: 'serif', italic: true, color: 'ink', align: 'center', alpha}) over 500 ms from c.shot.start + 0.2 (the narrator says it at 41.6 s). Add the CTA below it, clearly separated: lib.text(light, 'Explore the shoe.', {x: 1300, y: 760, size: 30, font: 'sans', color: 'muted', align: 'center', alpha}) over 500 ms from c.shot.start + 1.2. No second shoe, no road, no travel: the only motion is the shoe's 0.3% breath. Hold. Multiply EVERY alpha in the shot, the shoe included, by (1 - lib.span(c.t, c.D - 0.8, c.D, lib.linear)) so the whole frame fades to ground by the end."
+  }
+]

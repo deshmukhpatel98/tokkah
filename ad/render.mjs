@@ -33,6 +33,12 @@ function parseArgs(args) {
     stills: null,
     keepFrames: false,
     page: 'ad/kin-ad.html',
+    out: null,
+    noScore: false,
+    scoreOnly: false,
+    capture: 'png',
+    gpu: false,
+    encode: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -75,6 +81,21 @@ function parseArgs(args) {
       options.page = args[++i];
     } else if (arg.startsWith('--page=')) {
       options.page = arg.slice(7);
+    } else if (arg === '--out') {
+      options.out = args[++i];
+    } else if (arg.startsWith('--out=')) {
+      options.out = arg.slice(6);
+    } else if (arg === '--no-score') {
+      options.noScore = true;
+    } else if (arg === '--score-only') {
+      options.scoreOnly = true;
+    } else if (arg === '--encode') {
+      options.encode = true;
+    } else if (arg === '--gpu') {
+      options.gpu = true;
+    } else if (arg === '--capture') {
+      options.capture = args[++i];
+      if (!['png', 'jpeg'].includes(options.capture)) throw new Error(`--capture must be png or jpeg, got ${options.capture}`);
     } else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: node ad/render.mjs [options]
 Options:
@@ -84,6 +105,12 @@ Options:
   --stills <N>        Export N evenly spaced still PNGs to ad/out/stills/ and exit
   --keep-frames       Do not delete ad/out/frames/ after muxing
   --page <path>       Target HTML page (default: ad/kin-ad.html)
+  --out <dir>         Output directory (default: ad/out); lets renders run in parallel
+  --no-score          Video only: skip the score and mux no audio (parallel slices)
+  --score-only        Render only the full-length score.wav and exit
+  --capture png|jpeg  Frame capture format (default png; jpeg is ~3x faster, quality 95)
+  --gpu               Do not pass --disable-gpu to the browser (faster canvas work on Apple silicon)
+  --encode            Let the page encode the video itself (WebCodecs H.264, ~200 fps) instead of screenshots
 `);
       process.exit(0);
     } else {
@@ -276,7 +303,7 @@ async function main() {
     `--user-data-dir=${tempDir}`,
     '--no-first-run',
     '--no-default-browser-check',
-    '--disable-gpu',
+    ...(options.gpu ? [] : ['--disable-gpu']),
     '--hide-scrollbars',
     '--disable-component-update',
     '--disable-background-networking',
@@ -377,7 +404,7 @@ async function main() {
     throw new Error(`Invalid time range: --from (${from}) must be less than --to (${to})`);
   }
 
-  const outDir = path.resolve(import.meta.dirname, 'out');
+  const outDir = options.out ? path.resolve(options.out) : path.resolve(import.meta.dirname, 'out');
   fs.mkdirSync(outDir, { recursive: true });
 
   // Stills mode
@@ -424,9 +451,29 @@ async function main() {
   // Clean existing frames
   const existing = fs.readdirSync(framesDir);
   for (const f of existing) {
-    if (f.endsWith('.png')) fs.unlinkSync(path.join(framesDir, f));
+    if (f.endsWith('.png') || f.endsWith('.jpg')) fs.unlinkSync(path.join(framesDir, f));
   }
 
+  let encodedVideo = null;
+  if (options.encode && !options.scoreOnly) {
+    console.log(`[render] Encoding ${totalFrames} frames at ${fps} fps in-page (span: ${from}s - ${to}s)...`);
+    const t0 = performance.now();
+    const encRes = await cdp.send('Runtime.evaluate', { expression: `window.kinAd.encodeStart({ fps: ${fps}, from: ${from}, to: ${to} })`, awaitPromise: true, returnByValue: true });
+    if (encRes.exceptionDetails) throw new Error(`Encode error: ${encRes.exceptionDetails.text} ${encRes.exceptionDetails.exception?.description || ''}`);
+    const info = encRes.result.value;
+    encodedVideo = path.join(outDir, 'video.mp4');
+    const fd = fs.openSync(encodedVideo, 'w');
+    const CH = 3 * 1024 * 1024;
+    for (let off = 0; off < info.bytes; off += CH) {
+      const r = await cdp.send('Runtime.evaluate', { expression: `window.kinAd.encodeChunk(${off}, ${Math.min(CH, info.bytes - off)})`, returnByValue: true });
+      if (r.exceptionDetails) { fs.closeSync(fd); throw new Error('encode chunk failed'); }
+      fs.writeSync(fd, Buffer.from(r.result.value, 'base64'));
+    }
+    fs.closeSync(fd);
+    const secs = (performance.now() - t0) / 1000;
+    console.log(`[render] Encoded ${info.frames} frames (${info.codec}, ${info.hardware}) in ${secs.toFixed(2)}s (${(info.frames / secs).toFixed(0)} fps) -> ${(info.bytes / 1024 / 1024).toFixed(1)} MB`);
+  }
+  if (!options.scoreOnly && !options.encode) {
   console.log(`[render] Capturing ${totalFrames} frames at ${fps} fps (span: ${from}s - ${to}s)...`);
 
   const captureStart = performance.now();
@@ -441,8 +488,8 @@ async function main() {
       throw new Error(`Seek error at frame ${i} (t=${t}): ${seekRes.exceptionDetails.text || JSON.stringify(seekRes.exceptionDetails)}`);
     }
 
-    const snap = await cdp.send('Page.captureScreenshot', { format: 'png' });
-    const frameFile = `${String(i + 1).padStart(5, '0')}.png`;
+    const snap = await cdp.send('Page.captureScreenshot', options.capture === 'jpeg' ? { format: 'jpeg', quality: 95 } : { format: 'png' });
+    const frameFile = `${String(i + 1).padStart(5, '0')}.${options.capture === 'jpeg' ? 'jpg' : 'png'}`;
     fs.writeFileSync(path.join(framesDir, frameFile), Buffer.from(snap.data, 'base64'));
 
     const done = i + 1;
@@ -459,7 +506,10 @@ async function main() {
   const totalCaptureTime = (performance.now() - captureStart) / 1000;
   const avgCaptureMs = (totalCaptureTime * 1000) / totalFrames;
   console.log(`[render] Frame capture complete: ${totalFrames} frames in ${totalCaptureTime.toFixed(2)}s (avg ${avgCaptureMs.toFixed(1)} ms/frame)`);
+  }
 
+  const wavPath = path.join(outDir, 'score.wav');
+  if (!options.noScore) {
   // Audio score rendering
   console.log(`[render] Rendering offline score at 48000 Hz...`);
 
@@ -540,7 +590,6 @@ async function main() {
     throw new Error(`Invalid WAV data size returned: ${totalWavBytes}`);
   }
 
-  const wavPath = path.join(outDir, 'score.wav');
   const chunkSize = 1024 * 1024; // 1 MB chunks (well within <= 4 MB limit)
   const fd = fs.openSync(wavPath, 'w');
 
@@ -568,6 +617,14 @@ async function main() {
   fs.closeSync(fd);
   await cdp.send('Runtime.evaluate', { expression: 'delete window.__wavData;' });
   console.log(`[render] Score written to ${path.relative(process.cwd(), wavPath)} (${totalWavBytes} bytes)`);
+  }
+  if (options.scoreOnly) {
+    cdp.close();
+    cleanup();
+    fs.rmSync(framesDir, { recursive: true, force: true });
+    console.log('[render] Score only; done.');
+    return;
+  }
 
   // Close browser before ffmpeg muxing
   cdp.close();
@@ -578,20 +635,22 @@ async function main() {
   console.log(`[render] Muxing video with ffmpeg...`);
 
   const mp4Path = path.join(outDir, 'kin-ad.mp4');
-  const muxArgs = [
+  const muxArgs = encodedVideo ? [
+    '-y', '-i', encodedVideo, ...(options.noScore ? [] : ['-i', wavPath]),
+    '-map', '0:v', ...(options.noScore ? [] : ['-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest']),
+    '-c:v', 'copy', '-movflags', '+faststart', mp4Path
+  ] : [
     '-y',
     '-framerate', String(fps),
     '-start_number', '1',
-    '-i', path.join(framesDir, '%05d.png'),
-    '-i', wavPath,
+    '-i', path.join(framesDir, options.capture === 'jpeg' ? '%05d.jpg' : '%05d.png'),
+    ...(options.noScore ? [] : ['-i', wavPath]),
     '-c:v', 'libx264',
     '-crf', '17',
     '-preset', 'slow',
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-shortest',
+    ...(options.noScore ? [] : ['-c:a', 'aac', '-b:a', '192k', '-shortest']),
     mp4Path
   ];
 
@@ -603,7 +662,7 @@ async function main() {
 
   // Hero cut (26.0–38.0 s span, muted, 1280×720, -crf 22)
   const heroMp4Path = path.join(outDir, 'kin-ad-hero.mp4');
-  if (from <= 26.0 && to >= 38.0) {
+  if (!options.out && !options.noScore && from <= 26.0 && to >= 38.0) {
     console.log(`[render] Producing hero cut (26.0s - 38.0s)...`);
     const heroStart = 26.0 - from;
     const heroDuration = 12.0; // 38.0 - 26.0
@@ -632,6 +691,7 @@ async function main() {
 
   // Frame cleanup
   if (!options.keepFrames) {
+    if (encodedVideo && !options.keepFrames) { try { fs.unlinkSync(encodedVideo); } catch (e) {} }
     fs.rmSync(framesDir, { recursive: true, force: true });
     console.log(`[render] Temporary frame PNGs cleaned up`);
   } else {

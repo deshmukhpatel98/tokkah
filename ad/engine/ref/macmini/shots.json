@@ -1,0 +1,46 @@
+{
+  "reference": "The new Mac mini with M6 (Apple), 43.02 s, 1920x1080, 23.976 fps, stereo 44.1 kHz",
+  "measuredBy": "ffmpeg scene scores + signalstats + connected-component text boxes; eyes on 1 fps and key-frame sheets",
+  "genre": "white-studio product comedy: one hero object receives an upgrade and transforms through four superpower vignettes, then a type lockup, logo, legal",
+  "stage": { "ground": "#b6b8bd", "groundLum": 170, "type": "#111111", "shadow": "soft, from upper-left, long and diffuse", "table": "seamless white studio sweep, horizon about y 620" },
+  "structure": [
+    { "id": "S1", "start": 0.0, "end": 2.5, "title": "Empty studio", "subject": "none, then a hand slides the box in from the left", "camera": "static, eye-level front, wide", "transition": "continuous" },
+    { "id": "S2", "start": 2.5, "end": 4.6, "title": "The box", "subject": "the box alone, centred, front-on", "camera": "slow push-in", "transition": "continuous" },
+    { "id": "S3", "start": 4.6, "end": 7.8, "title": "The chip", "subject": "close on the top face; a hand lowers a chip labelled with the upgrade name onto it; a small lightning spark", "camera": "high three-quarter, close", "transition": "soft (score 0.13 at 7.84)" },
+    { "id": "S4", "start": 7.8, "end": 10.7, "title": "Arms", "subject": "front-on; a cartoon muscular arm punches out of the side, then legs; the box does push-ups", "camera": "eye-level, wide", "transition": "soft (0.128 at 10.68)" },
+    { "id": "S5", "start": 10.7, "end": 13.4, "title": "Flex", "subject": "the box stands on legs and flexes both arms", "camera": "eye-level, medium", "transition": "continuous" },
+    { "id": "S6", "start": 13.4, "end": 15.9, "title": "Wheels", "subject": "the box on the table grows wheels; a small toy-like truck skids in on a track leaving dust", "camera": "low, wide", "transition": "soft (0.118 at 15.93)" },
+    { "id": "S7", "start": 15.9, "end": 22.1, "title": "Monster truck", "subject": "the truck build-up: exhaust stacks, flames, a green roll bar; racing along tracks, dust", "camera": "low tracking, then three-quarter", "transition": "soft (0.11 at 22.11)" },
+    { "id": "S8", "start": 22.1, "end": 28.2, "title": "Robot", "subject": "a robot form: a pink brain-like head, two mechanical arms; then many tentacle arms holding a camera, keyboard, charts, a molecule; then a single walking robot", "camera": "eye-level medium, wide for the tentacle spread", "transition": "several soft (0.10-0.16 between 23.4 and 28.2)" },
+    { "id": "S9", "start": 28.2, "end": 30.7, "title": "Rocket", "subject": "the box with a red-and-grey jetpack of boosters, blue flames", "camera": "front, medium", "transition": "hard cut at 30.70" },
+    { "id": "S10", "start": 30.7, "end": 32.8, "title": "Launch", "subject": "five rapid cuts about 0.42 s apart: lift-off, through white cloud masses, cloud close-ups", "camera": "cuts", "transition": "hard cuts at 30.70, 31.11, 31.53, 31.95, 32.37; soft 32.78" },
+    { "id": "S11", "start": 32.8, "end": 33.6, "title": "Back on the table", "subject": "the plain box alone on white, small, centred", "camera": "static, high front", "transition": "continuous" },
+    { "id": "S12", "start": 33.6, "end": 35.7, "title": "Lockup", "subject": "'The Mighty' enters left, product name enters right, sub-line under it; the box stays centred", "camera": "static", "transition": "soft (0.181 at 35.74)" },
+    { "id": "S13", "start": 35.7, "end": 37.95, "title": "Logo", "subject": "type and box out; the logo alone centred", "camera": "static", "transition": "hard cut to black at 37.95" },
+    { "id": "S14", "start": 37.95, "end": 43.02, "title": "Legal", "subject": "black; one line of small legal text near the bottom", "camera": "static", "transition": "end" }
+  ],
+  "type": {
+    "note": "boxes measured at 1920x1080 from frames at 34.8 s (lockup), 36.6 s (logo), 40.0 s (legal); sizes are glyph-box heights, not font sizes",
+    "lockup": {
+      "headline": { "text": "The Mighty", "x0": 90, "x1": 643, "capTop": 490, "baseline": 571, "descender": 591, "capHeight": 81, "weight": "semibold sans (SF Pro Display class)", "colour": "#111111", "align": "left block" },
+      "product": { "box": [832, 440, 1205, 797], "centre": [1018, 618], "width": 373 },
+      "name": { "text": "Mac mini", "x0": 1344, "x1": 1773, "capTop": 492, "baseline": 573, "capHeight": 81, "weight": "semibold sans" },
+      "sub": { "text": "with M6", "x0": 1452, "x1": 1661, "top": 602, "bottom": 645, "height": 43, "weight": "regular sans", "centredUnder": "name (centre 1556 vs 1558)" },
+      "timing": { "textIn": "33.6-34.2 (headline first, then name and sub)", "hold": "to 35.7", "out": "35.7-36.0 with the box" }
+    },
+    "logo": { "box": [900, 446, 1015, 587], "centre": [957, 516], "height": 141, "timing": "36.0 in, hold to 37.95" },
+    "legal": { "band": [430, 1004, 1485, 1031], "glyphHeight": "21-25", "colour": "mid grey on black", "timing": "38.4-43.0" }
+  },
+  "audio": {
+    "note": "RMS per ~0.27 s in analysis.json; music from 0.1 s at about -21 dB RMS, a dip at 1.2-1.3 s, then -18 to -20 dB through the vignettes; percussive hits align with the transformations and the five launch cuts; silence after the logo cut",
+    "voice": "none; music and sound effects only"
+  },
+  "perSecond": "analysis.json: luminance 165-180 through the studio scenes, 137-150 during the rocket and cloud scenes, 16 on black; motion energy peaks 0.09-0.13 during the launch cuts (30-32 s), lowest during the held type cards",
+  "replicationTargets": {
+    "structure": "14 segments, boundaries within 2 frames of the above; the five launch cuts at 0.42 s spacing",
+    "type": "lockup boxes within 4 px and 3% size; timing within 2 frames; logo and legal positions likewise, with a fictional mark and name of matching box widths",
+    "light": "ground luminance 165-180 in studio segments; a soft upper-left key and a long diffuse shadow under the object",
+    "motion": "one hero object throughout; each vignette adds parts to it rather than replacing it",
+    "notMeasured": "surface realism of the 3D characters and clouds"
+  }
+}

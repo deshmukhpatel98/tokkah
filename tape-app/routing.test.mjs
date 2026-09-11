@@ -141,6 +141,33 @@ try {
   sec('(f) /mac keeps its 302, so the first landing-page URL still works');
   eq(await served('https://room.tokkah.com/mac'), '302 -> https://kin.tokkah.com/', '/mac');
   eq(await served('https://room.tokkah.com/mac.html'), '302 -> https://kin.tokkah.com/', '/mac.html');
+
+  sec('(g) the film download is the release door, not an asset');
+  // The bucket is empty in this harness, so a path the route CLAIMS answers
+  // 404 from the worker itself; one it does not claim is handed to ASSETS.
+  eq(await served('https://kin.tokkah.com/ad/dl/Kin.mp4'), '404 (no asset)', '/ad/dl/<file> reads the bucket');
+  eq(await served('https://kin.tokkah.com/ad/kin-ad'), '/ad/kin-ad', 'the film page itself is still an asset');
+  eq(await served('https://kin.tokkah.com/ad/kin-ad.js'), '/ad/kin-ad.js', 'and so is its script');
+  // With the film in the bucket, the door hands over a FILE, not a page: a
+  // browser given video/mp4 alone would open a player for a click that said
+  // "download".
+  const bucket = await mf.getR2Bucket('MACREL', WORKER);
+  await bucket.put('Kin.mp4', new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112]));
+  const film = await mf.dispatchFetch('https://kin.tokkah.com/ad/dl/Kin.mp4');
+  eq(film.status, 200, 'the film is served');
+  eq(film.headers.get('content-type'), 'video/mp4', 'as video/mp4');
+  eq(film.headers.get('content-disposition'), 'attachment; filename="Kin.mp4"', 'as a download, named');
+  eq(film.headers.get('content-length'), '8', 'with its length');
+  eq(film.headers.get('cache-control'), 'public, max-age=300', 'and a short cache: the render can be replaced');
+  await film.arrayBuffer();
+  // The installer's door is untouched by the film's: a disk image keeps its own
+  // type and is not turned into an attachment by header.
+  await bucket.put('Kin.dmg', new Uint8Array([1, 2, 3]));
+  const dmg = await mf.dispatchFetch('https://kin.tokkah.com/macos/dl/Kin.dmg');
+  eq(dmg.status, 200, 'the dmg is served');
+  eq(dmg.headers.get('content-type'), 'application/x-apple-diskimage', 'the dmg keeps its type');
+  eq(dmg.headers.get('content-disposition'), null, 'and gets no disposition');
+  await dmg.arrayBuffer();
 } finally {
   await mf.dispose();
 }

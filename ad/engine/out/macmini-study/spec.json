@@ -1,0 +1,565 @@
+{
+  "product": "Pebble, a small desktop computer",
+  "tension": "",
+  "idea": "A frame-accurate study of the reference's structure, timing, light and type, with Pebble, a small desktop computer in the hero's place.",
+  "tagline": "The Little Pebble",
+  "wordmark": "Pebble",
+  "tempo": "reference",
+  "palette": {
+    "ground": "#b6b8bd",
+    "ink": "#111111",
+    "accentA": "#F0B64A",
+    "accentB": "#4B7BD6"
+  },
+  "productDescription": {
+    "form": "a squat rounded-square brushed-aluminium box, 1.97 x 0.5 x 1.97 m in stage units (197 mm square, 50 mm tall), corner radius 0.16, a plain top, a thin black rubber foot ring underneath, a small white power light low on the front",
+    "material": "as described",
+    "colour": "as described",
+    "details": []
+  },
+  "motif": {
+    "name": "the hero object",
+    "description": "one object throughout; every vignette adds parts to it (limbs, wheels, arms, boosters) drawn with lib.shapes around lib.product, never replacing it",
+    "returns": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9",
+      "S10",
+      "S11",
+      "S12",
+      "S13",
+      "S14"
+    ]
+  },
+  "voice": null,
+  "voiceover": [],
+  "score": {
+    "bpm": null,
+    "harmony": "RMS per ~0.27 s in analysis.json; music from 0.1 s at about -21 dB RMS, a dip at 1.2-1.3 s, then -18 to -20 dB through the vignettes; percussive hits align with the transformations and the five launch cuts; silence after the logo cut",
+    "timbres": "music and sound effects only; hits on every transformation and on each of the launch cuts",
+    "beats": [
+      {
+        "t": 0,
+        "what": "Empty studio"
+      },
+      {
+        "t": 2.5,
+        "what": "The box"
+      },
+      {
+        "t": 4.6,
+        "what": "The chip"
+      },
+      {
+        "t": 7.8,
+        "what": "Arms"
+      },
+      {
+        "t": 10.7,
+        "what": "Flex"
+      },
+      {
+        "t": 13.4,
+        "what": "Wheels"
+      },
+      {
+        "t": 15.9,
+        "what": "Monster truck"
+      },
+      {
+        "t": 22.1,
+        "what": "Robot"
+      },
+      {
+        "t": 28.2,
+        "what": "Rocket"
+      },
+      {
+        "t": 30.7,
+        "what": "Launch"
+      },
+      {
+        "t": 32.8,
+        "what": "Back on the table"
+      },
+      {
+        "t": 33.6,
+        "what": "Lockup"
+      },
+      {
+        "t": 35.7,
+        "what": "Logo"
+      },
+      {
+        "t": 37.95,
+        "what": "Legal"
+      }
+    ]
+  },
+  "stage": {
+    "ground": "#b6b8bd",
+    "groundLum": 170,
+    "type": "#111111",
+    "shadow": "soft, from upper-left, long and diffuse",
+    "table": "seamless white studio sweep, horizon about y 620"
+  },
+  "referenceTargets": {
+    "structure": "14 segments, boundaries within 2 frames of the above; the five launch cuts at 0.42 s spacing",
+    "type": "lockup boxes within 4 px and 3% size; timing within 2 frames; logo and legal positions likewise, with a fictional mark and name of matching box widths",
+    "light": "ground luminance 165-180 in studio segments; a soft upper-left key and a long diffuse shadow under the object",
+    "motion": "one hero object throughout; each vignette adds parts to it rather than replacing it",
+    "notMeasured": "surface realism of the 3D characters and clouds"
+  },
+  "duration": 43.02,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 2.5,
+      "title": "Empty studio",
+      "direction": "none, then a hand slides the box in from the left. Camera: static, eye-level front, wide. Transition into the next: continuous.",
+      "handoffIn": "black / empty studio",
+      "handoffOut": "The box begins: the box alone, centred, front-on",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S2",
+      "start": 2.5,
+      "end": 4.6,
+      "title": "The box",
+      "direction": "the box alone, centred, front-on. Camera: slow push-in. Transition into the next: continuous.",
+      "handoffIn": "Empty studio: none, then a hand slides the box in from the left",
+      "handoffOut": "The chip begins: close on the top face; a hand lowers a chip labelled with the upgrade name onto it; a small lightning spark",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S3",
+      "start": 4.6,
+      "end": 7.8,
+      "title": "The chip",
+      "direction": "close on the top face; a hand lowers a chip labelled with the upgrade name onto it; a small lightning spark. Camera: high three-quarter, close. Transition into the next: soft (score 0.13 at 7.84).",
+      "handoffIn": "The box: the box alone, centred, front-on",
+      "handoffOut": "Arms begins: front-on; a cartoon muscular arm punches out of the side, then legs; the box does push-ups",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S4",
+      "start": 7.8,
+      "end": 10.7,
+      "title": "Arms",
+      "direction": "front-on; a cartoon muscular arm punches out of the side, then legs; the box does push-ups. Camera: eye-level, wide. Transition into the next: soft (0.128 at 10.68).",
+      "handoffIn": "The chip: close on the top face; a hand lowers a chip labelled with the upgrade name onto it; a small lightning spark",
+      "handoffOut": "Flex begins: the box stands on legs and flexes both arms",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S5",
+      "start": 10.7,
+      "end": 13.4,
+      "title": "Flex",
+      "direction": "the box stands on legs and flexes both arms. Camera: eye-level, medium. Transition into the next: continuous.",
+      "handoffIn": "Arms: front-on; a cartoon muscular arm punches out of the side, then legs; the box does push-ups",
+      "handoffOut": "Wheels begins: the box on the table grows wheels; a small toy-like truck skids in on a track leaving dust",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S6",
+      "start": 13.4,
+      "end": 15.9,
+      "title": "Wheels",
+      "direction": "the box on the table grows wheels; a small toy-like truck skids in on a track leaving dust. Camera: low, wide. Transition into the next: soft (0.118 at 15.93).",
+      "handoffIn": "Flex: the box stands on legs and flexes both arms",
+      "handoffOut": "Monster truck begins: the truck build-up: exhaust stacks, flames, a green roll bar; racing along tracks, dust",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S7",
+      "start": 15.9,
+      "end": 22.1,
+      "title": "Monster truck",
+      "direction": "the truck build-up: exhaust stacks, flames, a green roll bar; racing along tracks, dust. Camera: low tracking, then three-quarter. Transition into the next: soft (0.11 at 22.11).",
+      "handoffIn": "Wheels: the box on the table grows wheels; a small toy-like truck skids in on a track leaving dust",
+      "handoffOut": "Robot begins: a robot form: a pink brain-like head, two mechanical arms; then many tentacle arms holding a camera, keyboard, charts, a molecule; then a single walking robot",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S8",
+      "start": 22.1,
+      "end": 28.2,
+      "title": "Robot",
+      "direction": "a robot form: a pink brain-like head, two mechanical arms; then many tentacle arms holding a camera, keyboard, charts, a molecule; then a single walking robot. Camera: eye-level medium, wide for the tentacle spread. Transition into the next: several soft (0.10-0.16 between 23.4 and 28.2).",
+      "handoffIn": "Monster truck: the truck build-up: exhaust stacks, flames, a green roll bar; racing along tracks, dust",
+      "handoffOut": "Rocket begins: the box with a red-and-grey jetpack of boosters, blue flames",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S9",
+      "start": 28.2,
+      "end": 30.7,
+      "title": "Rocket",
+      "direction": "the box with a red-and-grey jetpack of boosters, blue flames. Camera: front, medium. Transition into the next: hard cut at 30.70.",
+      "handoffIn": "Robot: a robot form: a pink brain-like head, two mechanical arms; then many tentacle arms holding a camera, keyboard, charts, a molecule; then a single walking robot",
+      "handoffOut": "Launch begins: five rapid cuts about 0.42 s apart: lift-off, through white cloud masses, cloud close-ups",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S10",
+      "start": 30.7,
+      "end": 32.8,
+      "title": "Launch",
+      "direction": "five rapid cuts about 0.42 s apart: lift-off, through white cloud masses, cloud close-ups. Camera: cuts. Transition into the next: hard cuts at 30.70, 31.11, 31.53, 31.95, 32.37; soft 32.78.",
+      "handoffIn": "Rocket: the box with a red-and-grey jetpack of boosters, blue flames",
+      "handoffOut": "Back on the table begins: the plain box alone on white, small, centred",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S11",
+      "start": 32.8,
+      "end": 33.6,
+      "title": "Back on the table",
+      "direction": "the plain box alone on white, small, centred. Camera: static, high front. Transition into the next: continuous.",
+      "handoffIn": "Launch: five rapid cuts about 0.42 s apart: lift-off, through white cloud masses, cloud close-ups",
+      "handoffOut": "Lockup begins: 'The Mighty' enters left, product name enters right, sub-line under it; the box stays centred",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S12",
+      "start": 33.6,
+      "end": 35.7,
+      "title": "Lockup",
+      "direction": "'The Mighty' enters left, product name enters right, sub-line under it; the box stays centred. Camera: static. Transition into the next: soft (0.181 at 35.74). TYPE LOCKUP, measured on the reference and to be matched within 4 px: headline \"The Little\" as a left block x 90-643, cap top 490, baseline 571, cap height 81 px, semibold sans (SF Pro Display class); the product centred at (1018,618) 373 px wide; name \"Pebble\" x 1344-1773 baseline 573; sub \"with P2\" 43 px tall centred under the name at y 602-645. Timing: 33.6-34.2 (headline first, then name and sub); hold to 35.7; out 35.7-36.0 with the box. Use lib.text with font \"sans\" for these (canvas text, positions exact).",
+      "handoffIn": "Back on the table: the plain box alone on white, small, centred",
+      "handoffOut": "Logo begins: type and box out; the logo alone centred",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S13",
+      "start": 35.7,
+      "end": 37.95,
+      "title": "Logo",
+      "direction": "type and box out; the logo alone centred. Camera: static. Transition into the next: hard cut to black at 37.95. LOGO: our mark alone, centred at (957,516), 141 px tall, in at 36.0 in, hold to 37.95.",
+      "handoffIn": "Lockup: 'The Mighty' enters left, product name enters right, sub-line under it; the box stays centred",
+      "handoffOut": "Legal begins: black; one line of small legal text near the bottom",
+      "copy": null,
+      "primitive": "shape",
+      "params": {}
+    },
+    {
+      "id": "S14",
+      "start": 37.95,
+      "end": 43.02,
+      "title": "Legal",
+      "direction": "black; one line of small legal text near the bottom. Camera: static. Transition into the next: end. LEGAL: black frame; one line of small text (21-25 px glyphs, mid grey) across x 430-1485 at y 1004-1031, in at 38.4-43.0.",
+      "handoffIn": "Logo: type and box out; the logo alone centred",
+      "handoffOut": "end",
+      "copy": null,
+      "primitive": "cta",
+      "params": {}
+    }
+  ],
+  "productDrawing": {
+    "view": "three-quarter",
+    "layers": [
+      {
+        "tag": "shadow",
+        "path": "M 22 720 C 58 652 259 603 506 617 C 748 630 965 690 978 756 C 990 820 803 872 551 873 C 296 874 74 812 22 751 C 13 740 13 730 22 720 Z",
+        "fill": {
+          "radial": [
+            502,
+            744,
+            0,
+            485
+          ],
+          "stops": [
+            [
+              0,
+              "#111111",
+              0.22
+            ],
+            [
+              0.65,
+              "#111111",
+              0.09
+            ],
+            [
+              1,
+              "#111111",
+              0
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "contact-shadow",
+        "path": "M 83 694 C 149 648 334 643 537 656 C 737 669 902 709 931 752 C 951 789 775 829 568 832 C 364 835 155 786 91 740 C 69 724 66 709 83 694 Z",
+        "fill": {
+          "radial": [
+            520,
+            746,
+            0,
+            425
+          ],
+          "stops": [
+            [
+              0,
+              "#111111",
+              0.28
+            ],
+            [
+              0.7,
+              "#111111",
+              0.12
+            ],
+            [
+              1,
+              "#111111",
+              0
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "sole",
+        "path": "M 63 544 L 938 521 L 938 537 C 938 550 932 557 920 565 L 607 773 C 587 786 568 791 545 781 L 88 600 C 71 593 63 582 63 567 Z",
+        "fill": {
+          "linear": [
+            120,
+            556,
+            671,
+            789
+          ],
+          "stops": [
+            [
+              0,
+              "#343330"
+            ],
+            [
+              0.55,
+              "#191918"
+            ],
+            [
+              1,
+              "#111111"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "body",
+        "path": "M 453 181 L 919 365 C 938 373 948 385 948 397 L 948 527 C 948 539 942 546 930 554 L 607 762 C 587 775 568 780 544 770 L 81 587 C 61 579 52 569 52 551 L 52 421 C 52 412 58 406 70 398 L 393 190 C 413 177 431 172 453 181 Z",
+        "fill": {
+          "linear": [
+            141,
+            372,
+            550,
+            790
+          ],
+          "stops": [
+            [
+              0,
+              "#E8D2AA"
+            ],
+            [
+              0.38,
+              "#D8B878"
+            ],
+            [
+              0.76,
+              "#BE995B"
+            ],
+            [
+              1,
+              "#987642"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "side",
+        "path": "M 544 634 C 568 644 587 639 607 626 L 930 418 C 942 410 948 404 948 397 L 948 527 C 948 539 942 546 930 554 L 607 762 C 587 775 568 780 544 770 Z",
+        "fill": {
+          "linear": [
+            544,
+            603,
+            952,
+            509
+          ],
+          "stops": [
+            [
+              0,
+              "#BD985A"
+            ],
+            [
+              0.13,
+              "#AF8C50"
+            ],
+            [
+              0.65,
+              "#A08350"
+            ],
+            [
+              1,
+              "#786444"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "top",
+        "path": "M 453 181 L 919 365 C 938 373 948 385 948 397 C 948 404 942 410 930 418 L 607 626 C 587 639 568 644 544 634 L 81 451 C 61 443 52 433 52 421 C 52 412 58 406 70 398 L 393 190 C 413 177 431 172 453 181 Z",
+        "fill": {
+          "linear": [
+            235,
+            193,
+            753,
+            646
+          ],
+          "stops": [
+            [
+              0,
+              "#F2E2C5"
+            ],
+            [
+              0.38,
+              "#E5CCA0"
+            ],
+            [
+              0.73,
+              "#DEBA7D"
+            ],
+            [
+              1,
+              "A"
+            ]
+          ]
+        },
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "seam",
+        "path": "M 54 431 C 57 441 66 448 82 454 L 544 637 C 568 647 588 642 609 629 L 932 421 C 941 415 946 409 948 403",
+        "fill": "none",
+        "stroke": "ink",
+        "strokeWidth": 2,
+        "alpha": 0.22,
+        "glow": 0
+      },
+      {
+        "tag": "brushed-top",
+        "path": "M 373 216 L 891 420 M 338 243 L 854 447 M 303 270 L 819 474 M 267 297 L 783 501 M 232 324 L 748 528 M 197 351 L 712 555 M 161 378 L 677 582 M 126 405 L 641 609",
+        "fill": "none",
+        "stroke": "#FFFFFF",
+        "strokeWidth": 1,
+        "alpha": 0.09,
+        "glow": 0
+      },
+      {
+        "tag": "brushed-body",
+        "path": "M 83 483 L 535 661 M 87 501 L 538 679 M 87 525 L 539 703 M 89 551 L 454 695 M 119 576 L 417 694 M 641 632 L 916 455 M 648 674 L 918 500 M 668 700 L 907 546",
+        "fill": "none",
+        "stroke": "#F3DEB8",
+        "strokeWidth": 1,
+        "alpha": 0.09,
+        "glow": 0
+      },
+      {
+        "tag": "power-bezel",
+        "path": "M 480 705 L 494 710 C 500 712 501 717 498 721 C 496 725 492 725 488 723 L 476 718 C 470 716 469 711 472 708 C 474 705 477 704 480 705 Z",
+        "fill": "#625842",
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "power-light",
+        "path": "M 480 709 L 492 714 C 495 715 496 717 494 719 C 493 720 491 720 489 719 L 478 714 C 476 713 475 711 477 710 C 478 709 479 709 480 709 Z",
+        "fill": "#FFFFFF",
+        "stroke": "none",
+        "strokeWidth": 0,
+        "alpha": 1,
+        "glow": 0
+      },
+      {
+        "tag": "highlight",
+        "path": "M 70 401 L 396 193 C 414 181 432 178 451 186 L 914 368 M 62 425 C 65 434 72 440 86 445 L 547 628 C 566 635 581 635 598 625",
+        "fill": "none",
+        "stroke": "#FFFFFF",
+        "strokeWidth": 4,
+        "alpha": 0.54,
+        "glow": 0
+      },
+      {
+        "tag": "lower-rim",
+        "path": "M 68 561 C 70 569 76 574 88 579 L 547 761 C 567 770 585 765 601 755 L 927 546",
+        "fill": "none",
+        "stroke": "#E5C995",
+        "strokeWidth": 2,
+        "alpha": 0.3,
+        "glow": 0
+      },
+      {
+        "tag": "outline",
+        "path": "M 453 181 L 919 365 C 938 373 948 385 948 397 L 948 527 C 948 539 942 546 930 554 L 607 762 C 587 775 568 780 544 770 L 81 587 C 61 579 52 569 52 551 L 52 421 C 52 412 58 406 70 398 L 393 190 C 413 177 431 172 453 181 Z",
+        "fill": "none",
+        "stroke": "ink",
+        "strokeWidth": 8,
+        "alpha": 0.72,
+        "glow": 0
+      }
+    ]
+  }
+}

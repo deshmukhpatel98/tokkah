@@ -1,0 +1,1 @@
+{ "name": "kin-ad-vendor", "private": true, "type": "module", "dependencies": { "three": "0.170.0", "mp4-muxer": "5.1.5" }, "devDependencies": { "esbuild": "0.24.0" } }

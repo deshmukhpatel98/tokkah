@@ -256,7 +256,7 @@ Download: https://kin.tokkah.com
 Source: https://github.com/deshmukhpatel98/tokkah
 
 ### Gallery List
-1. Film: 75-second animated film (ad/out/kin-ad.mp4, hosted at https://kin.tokkah.com/ad/kin-ad)
+1. Film: 75-second animated film (ad/out/kin-ad.mp4, hosted at https://kin.tokkah.com/ad/kin-ad; MP4 download at https://kin.tokkah.com/ad/dl/Kin.mp4)
 2. Call interface GIF: docs/media/kin-call.gif (showing active call with edge band glow)
 3. Dialing and connecting GIF: docs/media/kin-dial.gif (showing handle entry and connection)
 4. Global light-speed arc GIF: docs/media/kin-globe.gif (showing Delhi to Amsterdam arc and 150 ms goal)
@@ -310,7 +310,7 @@ We maintain a disciplined measurement culture. Every technical claim ships with 
 ## 8. Assets Checklist
 
 ### Media Assets
-- Film MP4: ad/out/kin-ad.mp4 (75-second animated film, 1080p with full WebAudio score)
+- Film MP4: ad/out/kin-ad.mp4 (75-second animated film, 1080p with full WebAudio score); public download https://kin.tokkah.com/ad/dl/Kin.mp4, the download icon beside the film's mute control
 - Film Hero Loop: ad/out/kin-ad-hero.mp4 (muted video loop for website hero)
 - Active Call GIF: docs/media/kin-call.gif (demonstrating active call and edge band illumination)
 - Dialing Flow GIF: docs/media/kin-dial.gif (demonstrating handle entry and connection handshake)

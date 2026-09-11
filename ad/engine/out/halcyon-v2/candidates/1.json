@@ -1,0 +1,141 @@
+{
+  "product": "Halcyon, a bedside sunrise lamp that wakes you without an alarm",
+  "tension": "Your phone asks you to stop something before your day has even started.",
+  "idea": "A small pool of warmth grows until the phone has nothing to say.",
+  "tone": "quiet, warm, unhurried",
+  "tagline": "Wake into light.",
+  "palette": {
+    "ground": "#05060a",
+    "ink": "#f3f1ec",
+    "accentA": "#FFB56B",
+    "accentB": "#789BDF"
+  },
+  "voice": {
+    "voice_id": "pFZP5JQG7iQjIQuC4Bku",
+    "voice_name": "Lily",
+    "stability": 0.5,
+    "direction": "Warm and close, not whispered; speak simply, then leave the light alone."
+  },
+  "duration": 40,
+  "shots": [
+    {
+      "id": "S1",
+      "start": 0,
+      "end": 4,
+      "primitive": "glow",
+      "params": {
+        "color": "A",
+        "from": 0,
+        "to": 0.14,
+        "x": 0.5,
+        "y": 0.68,
+        "radius": 300,
+        "curve": "ease"
+      }
+    },
+    {
+      "id": "S2",
+      "start": 4,
+      "end": 7,
+      "primitive": "shape",
+      "params": {
+        "path": "M330 120 L670 120 Q715 120 715 165 L715 835 Q715 880 670 880 L330 880 Q285 880 285 835 L285 165 Q285 120 330 120 Z",
+        "fill": "none",
+        "stroke": "B",
+        "strokeWidth": 3,
+        "size": 560,
+        "x": 0.5,
+        "y": 0.58,
+        "motion": "shudder",
+        "glow": 0.12
+      }
+    },
+    {
+      "id": "S3",
+      "start": 7,
+      "end": 11.5,
+      "primitive": "shape",
+      "params": {
+        "path": "M180 690 L180 520 C180 325 323 170 500 170 C677 170 820 325 820 520 L820 690 Q820 730 780 730 L220 730 Q180 730 180 690 Z M300 765 L700 765 Q720 765 720 785 L720 800 L280 800 L280 785 Q280 765 300 765 Z",
+        "fill": "A",
+        "stroke": "none",
+        "strokeWidth": 0,
+        "size": 650,
+        "x": 0.5,
+        "y": 0.62,
+        "motion": "fadein",
+        "glow": 0.25
+      }
+    },
+    {
+      "id": "S4",
+      "start": 11.5,
+      "end": 23,
+      "primitive": "glow",
+      "params": {
+        "color": "A",
+        "from": 0.14,
+        "to": 0.72,
+        "x": 0.5,
+        "y": 0.68,
+        "radius": 1200,
+        "curve": "ease"
+      }
+    },
+    {
+      "id": "S5",
+      "start": 23,
+      "end": 28,
+      "primitive": "shape",
+      "params": {
+        "path": "M330 120 L670 120 Q715 120 715 165 L715 835 Q715 880 670 880 L330 880 Q285 880 285 835 L285 165 Q285 120 330 120 Z",
+        "fill": "none",
+        "stroke": "A",
+        "strokeWidth": 3,
+        "size": 560,
+        "x": 0.5,
+        "y": 0.58,
+        "motion": "still",
+        "glow": 0
+      }
+    },
+    {
+      "id": "S6",
+      "start": 28,
+      "end": 32,
+      "primitive": "title",
+      "params": {
+        "copy": "Nothing to silence.",
+        "size": 76
+      }
+    },
+    {
+      "id": "S7",
+      "start": 32,
+      "end": 36,
+      "primitive": "mark",
+      "params": {
+        "wordmark": "Halcyon"
+      }
+    },
+    {
+      "id": "S8",
+      "start": 36,
+      "end": 40,
+      "primitive": "cta",
+      "params": {
+        "lines": [
+          "Wake into light."
+        ]
+      }
+    }
+  ],
+  "voiceover": [
+    {
+      "t": 16,
+      "text": "No alarm. Just a slow arrival of light."
+    }
+  ],
+  "_angle": "lead with the product's single move as an image, let the tension be implied",
+  "_effort": "high"
+}
