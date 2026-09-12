@@ -785,17 +785,26 @@ enum Launcher {
     status.isBordered = false
     v.addSubview(status)
 
-    let peopleRows = people.map { ContactRow(handle: $0) }
+    var peopleRows = people.map { ContactRow(handle: $0) }
     // "yesterday" on the row, so the order explains itself. `valueIsWord` is the
     // muted small rendering the mine-row's "copy" already uses; these labels are
     // not pressable and draw exactly like every other secondary word here.
     let lastTimes = Identity.lastCallTimes()
+    let missedTimes = Identity.missedCalls()
     for r in peopleRows {
-      if let t = lastTimes[r.handleName] {
+      r.hasMissedCall = Identity.hasMissedCall(for: r.handleName)
+      if r.hasMissedCall {
+        if let mt = missedTimes[r.handleName] {
+          r.value = Relative.time(mt)
+        } else {
+          r.value = "missed"
+        }
+        r.valueIsWord = true
+        r.valueColor = Palette.bad
+      } else if let t = lastTimes[r.handleName] {
         r.value = Relative.time(t)
         r.valueIsWord = true
       }
-      r.hasMissedCall = Identity.hasMissedCall(for: r.handleName)
     }
     // ── THE GREEN DOTS, REFRESHED WHILE THE WINDOW IS OPEN ───────────────────
     //
@@ -1024,6 +1033,7 @@ enum Launcher {
       /// The settings card is open: your handle, the login item, silent mode.
       var settingsOpen = false
       var renaming = false
+      var openedRenameFromFront = false
       var onOpenRename: () -> Void = {}
       var onCancelRename: () -> Void = {}
       var onCommitRename: () -> Void = {}
@@ -1033,7 +1043,7 @@ enum Launcher {
       @objc func settings() {
         guard !ringing else { return }
         settingsOpen.toggle()
-        if !settingsOpen { renaming = false }
+        if !settingsOpen { renaming = false; openedRenameFromFront = false }
         fputs("home: settings \(settingsOpen ? "open" : "closed")\n", stderr)
         relayout()
       }
@@ -1247,7 +1257,12 @@ enum Launcher {
     t.ring = { [weak t] who in
       guard let t, !t.done, !t.ringing else { return }
       Identity.clearMissedCalls(for: who)
-      for r in peopleRows where r.handleName == who { r.hasMissedCall = false }
+      for r in peopleRows where r.handleName == who {
+        r.hasMissedCall = false
+        r.valueColor = nil
+        let lastTimes = Identity.lastCallTimes()
+        r.value = lastTimes[who].map { Relative.time($0) } ?? ""
+      }
       t.ringing = true
       t.ringSettled = false
       let gen = t.ringGen
@@ -1417,12 +1432,10 @@ enum Launcher {
         if !linkRow.spokenName.isEmpty { column += [linkRow] }
         column += people.isEmpty ? [emptyHint] : peopleRows.filter { people.contains($0.handleName) }
         column += [fieldBack, status, inviteRow]
-        // A brand-new install has nobody to call until somebody knows this
-        // Mac's name -- so the name stays on the front card exactly until the
-        // first person is in the list, then moves behind the `…`.
-        if people.isEmpty {
-          column += Identity.handle.isEmpty ? [mineHint, changeNameRow] : [mineRow]
-        }
+        // Your handle and handle management on the front card:
+        // You always see who you are and have direct access to change your handle
+        // in the main app itself, without having to dig through menus.
+        column += Identity.handle.isEmpty ? [mineHint, changeNameRow] : [mineRow, changeNameRow]
       }
       // A hint with nothing in it is not a row. They exist only to carry a
       // failure, and an empty one reserving 34 points of card is the padding
@@ -1565,9 +1578,11 @@ enum Launcher {
     saveRenameRow.target = t; saveRenameRow.action = #selector(Target.commitRename(_:))
     cancelRenameRow.target = t; cancelRenameRow.action = #selector(Target.cancelRename(_:))
     renameField.target = t; renameField.action = #selector(Target.commitRename(_:))
+    mineRow.onChangeHandle = { [weak t] in t?.onOpenRename() }
 
     t.onOpenRename = { [weak t] in
       guard let t, !t.ringing else { return }
+      if !t.settingsOpen { t.openedRenameFromFront = true }
       t.settingsOpen = true
       t.renaming = true
       renameField.stringValue = Identity.handle.isEmpty ? Identity.suggestedHandle : Identity.handle
@@ -1582,6 +1597,10 @@ enum Launcher {
     t.onCancelRename = { [weak t] in
       guard let t else { return }
       t.renaming = false
+      if t.openedRenameFromFront {
+        t.settingsOpen = false
+        t.openedRenameFromFront = false
+      }
       renameStatus.setText("")
       t.relayout()
     }
@@ -1607,6 +1626,10 @@ enum Launcher {
             changeNameRow.setLabel("Change your handle")
             mineHint.setText("")
             t.renaming = false
+            if t.openedRenameFromFront {
+              t.settingsOpen = false
+              t.openedRenameFromFront = false
+            }
             renameStatus.setText("")
             t.relayout()
           case .taken:
@@ -1634,13 +1657,38 @@ enum Launcher {
       mineHint.setText("")
       t?.relayout()
     }
-    Identity.startRinging(gapMs: 3000) { r in
+    Identity.startRinging(gapMs: 3000) { [weak t] r in
       guard r.ageMs < 60_000 else { return }
       if r.kind == "bye" {
         Identity.noteCancelled(r)
         Identity.noteMissedCall(r.from)
-        for row in peopleRows where row.handleName == r.from {
-          row.hasMissedCall = true
+        DispatchQueue.main.async {
+          if let row = peopleRows.first(where: { $0.handleName == r.from }) {
+            row.hasMissedCall = true
+            row.value = "missed"
+            row.valueIsWord = true
+            row.valueColor = Palette.bad
+            t?.relayout()
+          } else {
+            let newRow = ContactRow(handle: r.from)
+            newRow.hasMissedCall = true
+            newRow.value = "missed"
+            newRow.valueIsWord = true
+            newRow.valueColor = Palette.bad
+            newRow.acceptsFirstClick = false
+            newRow.target = t; newRow.action = #selector(Target.callRow(_:))
+            newRow.onRemove = { [weak newRow, weak t] in
+              Identity.hide(r.from)
+              if let idx = people.firstIndex(of: r.from) { people.remove(at: idx) }
+              newRow?.isHidden = true
+              t?.relayout()
+            }
+            v.addSubview(newRow)
+            people.insert(r.from, at: 0)
+            if people.count > 5 { people.removeLast() }
+            peopleRows.insert(newRow, at: 0)
+            t?.relayout()
+          }
         }
         return
       }

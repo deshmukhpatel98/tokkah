@@ -575,6 +575,7 @@ enum Identity {
     defer { claimGate.lock(); claiming = false; claimGate.unlock() }
     var s = ensure()
     // Already settled: refresh the lease under the SAME name and stop.
+    var takenHandle: String? = nil
     if s.claimed {
       switch attempt(s.handle, s) {
       case .won:
@@ -586,6 +587,7 @@ enum Identity {
         // The server says another key owns this name! We do NOT own it.
         // Step down from claimed state and walk the ladder to claim our own valid handle.
         fputs("identity: @\(s.handle) is taken by another key -- reclaiming\n", stderr)
+        takenHandle = s.handle
         s.claimed = false
         lock.lock(); cached = s; lock.unlock()
         save(s)
@@ -608,6 +610,7 @@ enum Identity {
     let deadline = Date().addingTimeInterval(passBudget)
     var tried = 0
     for cand in names where tried < 30 {
+      if let takenHandle, cand == takenHandle { continue }
       tried += 1
       // ── ASK AGAIN FOR THE SAME NAME, NOT FOR THE NEXT ONE ──────────────────
       //
@@ -1075,8 +1078,10 @@ enum Identity {
   /// between two launches over identical data reads as the app forgetting you.
   static func contactHandlesByRecency() -> [String] {
     let t = lastCallTimes()
+    let m = missedCalls()
     return contactHandles().sorted {
-      let a = t[$0] ?? 0, b = t[$1] ?? 0
+      let a = max(t[$0] ?? 0, m[$0] ?? 0)
+      let b = max(t[$1] ?? 0, m[$1] ?? 0)
       return a == b ? $0 < $1 : a > b
     }
   }
@@ -1145,7 +1150,7 @@ enum Identity {
     // the read path, so every list in the app -- the front door and the People
     // panel in a call -- agrees about who is on it.
     let gone = hidden()
-    return Set(contacts().keys).union(called()).filter { !gone.contains($0) }.sorted()
+    return Set(contacts().keys).union(called()).union(missedCalls().keys).filter { !gone.contains($0) }.sorted()
   }
 
   /// Bind a handle to the key that actually rang. Called when a call is accepted,
@@ -2122,11 +2127,13 @@ enum Identity {
     eq("pro candidate contains deveshpro", String(proCands.contains("deveshpro")), "true")
     eq("air and pro candidates differ", String(airCands != proCands), "true")
 
-    // ── MISSED CALLS STORAGE ──────────────────────────────────────────────────
+    // ── MISSED CALLS STORAGE & CONTACT RANKING ────────────────────────────────
     clearMissedCalls(for: "selftestuser")
     eq("missed call initially absent", String(hasMissedCall(for: "selftestuser")), "false")
     noteMissedCall("selftestuser")
     eq("missed call noted", String(hasMissedCall(for: "selftestuser")), "true")
+    eq("missed caller included in contactHandles", String(contactHandles().contains("selftestuser")), "true")
+    eq("missed caller ranked at top of contactHandlesByRecency", contactHandlesByRecency().first, "selftestuser")
     clearMissedCalls(for: "selftestuser")
     eq("missed call cleared", String(hasMissedCall(for: "selftestuser")), "false")
 
@@ -2194,6 +2201,11 @@ enum Identity {
     save(s)
     trouble(nil)
     fputs("identity: you are now @\(want)\n", stderr)
+    // Abort any in-flight poll request on the old handle so the ring loop wakes
+    // up and immediately begins polling the new handle without waiting up to 25 s.
+    pollSession.getAllTasks { tasks in
+      for t in tasks { t.cancel() }
+    }
     DispatchQueue.main.async { onClaimed?(want) }
     return .ok
   }

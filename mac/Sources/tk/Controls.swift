@@ -1408,14 +1408,29 @@ final class ContactRow: SheetRow {
       trailingAction = onRemove
     }
   }
+  var onChangeHandle: (() -> Void)?
   @objc private func removeSelf() { onRemove?() }
   @objc private func clearMissedSelf() {
     Identity.clearMissedCalls(for: handle)
     hasMissedCall = false
   }
+  @objc private func changeHandleSelf() { onChangeHandle?() }
+  @objc private func copyMineSelf() {
+    guard !handle.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString("@" + handle, forType: .string)
+  }
 
   override func menu(for event: NSEvent) -> NSMenu? {
     let m = NSMenu()
+    if onChangeHandle != nil {
+      let change = NSMenuItem(title: "Change handle…", action: #selector(changeHandleSelf), keyEquivalent: "")
+      change.target = self
+      m.addItem(change)
+      let copy = NSMenuItem(title: "Copy @" + handle, action: #selector(copyMineSelf), keyEquivalent: "")
+      copy.target = self
+      m.addItem(copy)
+    }
     if hasMissedCall {
       let clear = NSMenuItem(title: "Clear Missed Call", action: #selector(clearMissedSelf),
                              keyEquivalent: "")
@@ -5566,7 +5581,7 @@ final class CallControls: NSView {
   private(set) var people: [String] = []
 
   private func buildPeoplePage() {
-    people = Array(Identity.contactHandles().prefix(CallControls.peopleShown))
+    people = Array(Identity.contactHandlesByRecency().prefix(CallControls.peopleShown))
     var items: [NSView] = []
     if people.isEmpty {
       // NOT an empty panel, and not a greyed row. The truthful thing to say is how
@@ -5575,6 +5590,12 @@ final class CallControls: NSView {
     }
     for h in people {
       let r = ContactRow(handle: h)
+      r.hasMissedCall = Identity.hasMissedCall(for: h)
+      if r.hasMissedCall {
+        r.value = "missed"
+        r.valueColor = Palette.bad
+        r.valueIsWord = true
+      }
       r.target = self; r.action = #selector(callContactRow(_:))
       items.append(r)
     }

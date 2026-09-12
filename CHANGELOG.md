@@ -5,6 +5,37 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.165.0 — 2026-09-12
+
+Front-door handle management, missed call contact ranking, and rename listener reset.
+
+### Fixed — front-door handle management always accessible
+
+- `mineRow` and `changeNameRow` are now always visible on the main app front
+  card, ensuring your handle and the option to change it are immediately
+  accessible without having to discover the settings panel.
+- Opening rename from the front card and either cancelling or committing now
+  cleanly restores the front card instead of stranding the user in settings.
+- Added contextual menu ("Change handle…", "Copy @handle") directly on the user's
+  handle row.
+
+### Fixed — missed call contact ranking and live updates
+
+- Missed callers are now included in `contactHandles()` and ranked at the top of
+  the contacts list by recency in `contactHandlesByRecency()`.
+- Added missed call badges and relative time indicators to in-call People page
+  rows (`buildPeoplePage`).
+- Incoming `bye` cancellations while the launcher is open now dynamically
+  surface the caller at the top of the contacts list with the red dot badge on
+  the main thread.
+
+### Fixed — rename listener reset and presence robustness
+
+- Abort active long-poll data tasks on handle rename so the poller immediately
+  switches to listening on the newly claimed handle.
+- Durable Object presence verification now confirms either registered public key
+  or session token.
+
 ## Kin 0.164.0 — 2026-09-12
 
 Two Macs with the same computer name or username previously collided on handles,
