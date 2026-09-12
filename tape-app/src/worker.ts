@@ -496,8 +496,8 @@ export class Room implements DurableObject {
     const last = this.kinLastPoll.get(to);
     const heardMs = held ? 0 : (last === undefined ? null : Date.now() - last);
     // The credential is durable; presence is not. A handle with a stored token
-    // is somebody's, whatever this isolate has or has not heard since it woke.
-    const registered = (await this.kinTokLoad()) !== null;
+    // or public key is somebody's, whatever this isolate has or has not heard since it woke.
+    const registered = (await this.kinKeyLoad()) !== null || (await this.kinTokLoad()) !== null;
     return json(kinPresenceBody(heardMs, registered));
   }
 
