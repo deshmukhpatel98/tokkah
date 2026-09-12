@@ -1611,6 +1611,24 @@ final class Audio {
   private(set) var outputName = ""
   private(set) var onSpeakers = true
   static var gateAuto = true
+  /// ── MEASURED BEATS DECLARED ──────────────────────────────────────────────
+  ///
+  /// The route reads "headphones" whenever the built-in jack is in use, and a
+  /// jack holds a pair of desk speakers as readily as a pair of earphones.
+  /// Live, 2026-09-12, the first call between two homes: the far Mac declared
+  /// headphones for the whole call, its own detector measured the speaker
+  /// reaching the microphone at 0.87, and with the turn rule and the canceller
+  /// both standing down the caller heard their own voice back at -8.8 dB, one
+  /// second late, for 38% of what they said -- "a lot of reverb".
+  ///
+  /// So the detector gets a vote. A coupling it measures on two consecutive
+  /// checks -- a second apart, at an acoustic delay -- overrides a declared
+  /// headphone route for the rest of the call, and the log and the beat say
+  /// so. Two checks, not one: a single tick can be a cough into leaky earbuds.
+  /// Sticky, because a route that flaps flaps the turn rule with it.
+  static let MEASURED_SPEAKER_CORR = 0.5
+  private var couplingChecks = 0
+  private(set) var speakersMeasured = false
   /// ── PINNING THE ROUTE, BECAUSE THE ROUTE CANNOT BE PLUGGED IN ────────────
   ///
   /// The headphone path is now most of the product -- the classifier, the cues,
@@ -1626,6 +1644,19 @@ final class Audio {
   func checkOutputRoute() {
     var (name, speakers) = Audio.outputDevice()
     if let f = Audio.routeForced { speakers = f; name = "\(name) [forced \(f ? "speakers" : "headphones")]" }
+    if !speakers, !speakersMeasured, Audio.routeForced == nil {
+      let acoustic = echoCorr >= Audio.MEASURED_SPEAKER_CORR && echoDelayMs >= 1 && echoDelayMs <= 300
+      couplingChecks = acoustic ? couplingChecks + 1 : 0
+      if couplingChecks >= 2 {
+        speakersMeasured = true
+        fputs("output: \(name) says headphones, but this machine's speaker reaches its microphone"
+            + " (\(String(format: "%.2f", echoCorr)) at \(Int(echoDelayMs)) ms) -- treating it as speakers"
+            + " for the rest of the call\n", stderr)
+        Metrics.count("route_measured_speakers")
+        Metrics.fact("route_measured", "speakers")
+      }
+    }
+    if speakersMeasured { speakers = true; name = "\(name) [speaker heard by the mic]" }
     guard name != outputName || speakers != onSpeakers else { return }
     let firstLook = outputName.isEmpty
     outputName = name

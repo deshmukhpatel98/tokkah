@@ -39,7 +39,11 @@ let CAP_PCM16: UInt32 = 1 << 0
 let CAP_PCM_LP: UInt32 = 1 << 1
 /// Extension carrying room floor: TPKTW = TPKTZ + 4.
 /// +0 room_floor UInt8: 255 = unknown/absent, else round(-noiseDb * 2) in 0...254
-/// +1..+3 reserved 0
+/// +1 audio_wait UInt8 (0.163.0): 0 = absent (every older build writes 0), else
+///    round(playoutTargetMs / 4), capped at 255 = 1020 ms. How long this end is
+///    holding the far voice before playing it -- the one number that says the
+///    path is queueing, and the sender's picture is what fills a queue.
+/// +2..+3 reserved 0
 let TPKTW = TPKTZ + 4
 let MAGIC: UInt32 = 0x544B_0001
 /// "send me a keyframe". Eight bytes, no payload, sent by a receiver that cannot
@@ -1603,6 +1607,12 @@ final class Wire {
   /// The ring whose counters get reported to the peer. Set when the receive loop
   /// starts; nil before that, which reports zeros and is harmless.
   private weak var reportRing: RecvRing?
+  /// How long the FAR end is holding our voice before playing it, ms, from the
+  /// probe's report (TPKTW +1); -1 until a build that sends it has reported.
+  /// Read by the picture controller once a second: a voice waiting 600 ms behind
+  /// our picture is the picture's problem to fix.
+  private(set) var peerAudioWaitMs = -1
+  private(set) var peerAudioWaitAt: UInt64 = 0
 
   /// Append this machine's receive-side counters to a time-sync packet.
   private func appendRxReport(_ p: UnsafeMutableRawBufferPointer) {
@@ -1667,7 +1677,10 @@ final class Wire {
     guard p.count >= TPKTW else { return }
     let floorByte = Wire.roomFloorByte(AudioLab.txNoiseDbNow)
     p.storeBytes(of: floorByte, toByteOffset: TPKTZ, as: UInt8.self)
-    p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 1, as: UInt8.self)
+    // How long the far voice is waiting in THIS end's buffer, for the far end's
+    // picture controller. See TPKTW.
+    let waitByte = UInt8(clamping: Int(((reportRing?.tracker.targetMs ?? 0) / 4.0).rounded()))
+    p.storeBytes(of: waitByte, toByteOffset: TPKTZ + 1, as: UInt8.self)
     p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 2, as: UInt8.self)
     p.storeBytes(of: UInt8(0), toByteOffset: TPKTZ + 3, as: UInt8.self)
   }
@@ -2462,6 +2475,8 @@ final class Wire {
           peerReportsVideoLoss = true
         }
         if plainN >= TPKTW {
+          let wb = plain[TPKTZ + 1]
+          if wb > 0 { peerAudioWaitMs = Int(wb) * 4; peerAudioWaitAt = t4 }
           let rf = plain[TPKTZ]
           if rf == 255 {
             peerNoiseDb = nil

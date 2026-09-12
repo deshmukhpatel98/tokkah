@@ -15,7 +15,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.162.0"
+let VERSION = "0.163.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -569,7 +569,7 @@ if let logPath = arg("log") {
 let KNOWN_FLAGS: Set<String> = [
   "acoustic", "audio", "conceal", "devbuf", "display", "dump", "dump-metal",
   "cursor-ahead", "dump-playout", "echo-sim", "fps", "fullscreen", "id", "imp-burst", "imp-delay",
-  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
+  "selftest-lpc", "no-lp", "gui", "vq-step", "jit-shrink-margin", "vq-hold", "cam-picker-test", "no-vparity", "vq-harm-pct", "vq-wait-ms", "shot", "shot-after", "press", "no-telemetry", "tel-endpoint", "vpsnr", "vpsnr-frames", "vquality",
   "imp-drop", "imp-jitter", "imp-spike", "imp-spike-hz", "interp", "jit", "listen",
   "mute", "no-fec", "no-rt", "no-update", "pcm32", "peer", "playout", "room",
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
@@ -5800,6 +5800,7 @@ let vqStep: (at: Double, q: Double)? = arg("vq-step").flatMap { spec in
 var vqStepDone = false
 let vParityOff = flag("no-vparity")
 var lastVqHarmed = false
+var lastVqDelayHarmed = false
 // ── WHAT `--video` ACCEPTS, SAID OUT LOUD ──────────────────────────────────
 //
 // This was `videoArg == "camera" ? CameraSource() : FileSource(path: videoArg)`,
@@ -7550,6 +7551,8 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "turn_bound": wire.turn?.hasChannel == true ? 1 : 0,
     "turn_ind": wire.turn?.indications ?? 0,
     "turn_rebind": wire.turn?.rebinds ?? 0,
+    // How long the far end says it is holding OUR voice (ms; -1 = not reported).
+    "peer_a_wait_ms": wire.peerAudioWaitMs,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
     // The INSTANT, kept for continuity, and the PEAK beside it -- the final beat
     // of a call that reached 0.71 reported 0.04, so every summary built on the
@@ -7722,6 +7725,7 @@ func reportLoop() {
       + "  net rtt \(tsync.bestRttMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " jit \(tsync.rttSpreadMs.map { String(format: "%.2f", $0) } ?? "-")"
       + " (\(tsync.samples) probes)"
+      + (wire.peerAudioWaitMs >= 0 ? "  their-wait \(wire.peerAudioWaitMs) ms" : "")
       + (crypto.map { c in c.established
            ? "  crypt on (\(c.sealed)/\(c.opened) sealed/opened, \(c.openFails) bad"
              + (c.plaintextRx > 0 ? ", \(c.plaintextRx) plaintext refused" : "")
@@ -8456,10 +8460,40 @@ func reportLoop() {
     lastVqVoiceLost = pLost; lastVqVoiceRec = pRec
     let voiceRate = Double(voiceDelta) / Double(sentNow)
     let voiceHarmed = voiceRate * 100.0 > HARM_RETREAT
+    // ── A VOICE WAITING BEHIND THE PICTURE ────────────────────────────────────
+    //
+    // Loss was the only signal here, and a queue is not loss. Live, 2026-09-12,
+    // the first call between two homes: both ends pushed 5-11 Mbps of picture
+    // through two relays and two home uplinks, nothing much was LOST, but the
+    // far voice arrived up to 500 ms late and the playout buffer -- correctly --
+    // held 600 ms of it. Half a second of lag for 30 seconds, until the picture
+    // controllers stepped down on the little loss there was. The voice is the
+    // product; the picture is what fills a queue. So the far end now reports how
+    // long it is holding our voice (probe TPKTW +1), and this end's own buffer
+    // says the same about theirs -- on Wi-Fi the two directions share the air --
+    // and either past 150 ms retreats the picture a rung a second and blocks the
+    // climb, exactly as the picture's own loss does. Fresh within 3 s, or ignored.
+    let DELAY_RETREAT_MS = Double(arg("vq-wait-ms") ?? "150") ?? 150.0
+    let theirWait = wire.peerAudioWaitMs
+    let theirWaitFresh = theirWait >= 0 && Clock.msSigned(Clock.now(), wire.peerAudioWaitAt) < 3000
+    let ourWait = audio.ring.tracker.targetMs
+    let theirsOver = theirWaitFresh && Double(theirWait) >= DELAY_RETREAT_MS
+    let oursOver = ourWait >= DELAY_RETREAT_MS
+    let delayHarmed = theirsOver || oursOver
+    if delayHarmed != lastVqDelayHarmed {
+      lastVqDelayHarmed = delayHarmed
+      var where_: [String] = []
+      if theirWaitFresh { where_.append("\(theirWait) ms at their end") }
+      if oursOver || !theirWaitFresh { where_.append("\(Int(ourWait)) ms at ours") }
+      let line = Int(DELAY_RETREAT_MS)
+      let verb = delayHarmed ? "over the \(line) ms line, so quality retreats" : "back under the \(line) ms line, so quality may climb again"
+      fputs("  picture: the voice is waiting \(where_.joined(separator: " and ")) -- \(verb)\n", stderr)
+    }
+    if delayHarmed { Metrics.count("vq_wait_harm_s") }
     let wasLevel = vq.level
     let changed = vq.tick(now: Double(beatTick),
-                          pictureHarmed: harmIsVideo ? harmed : false,
-                          voiceHarmed: voiceHarmed,
+                          pictureHarmed: (harmIsVideo ? harmed : false) || delayHarmed,
+                          voiceHarmed: voiceHarmed || delayHarmed,
                           voiceHarmRaw: voiceDelta,
                           bytesPerFrame: sentFrames > 0 ? sentBytes / sentFrames : 0)
     if vq.level < wasLevel, !harmed, sentFrames > 0 {

@@ -5,6 +5,42 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.163.0 — 2026-09-12
+
+The first call that connected between two homes (0.162.0, 45 s) sounded bad in
+two ways the telemetry names, and both are addressed here.
+
+### Fixed — the voice no longer waits behind the picture
+
+Both ends pushed 5–11 Mbps of picture through two relays and two home uplinks.
+Little was lost, so neither picture controller retreated for 20 s; meanwhile
+the far voice arrived up to 500 ms late and the playout buffer, correctly,
+held 600 ms of it — half a second of lag for most of the call (`m2e_p50`
+636 ms against a 20 ms round trip). The picture controller steered on loss
+alone, and a queue is not loss.
+
+- The receiver now reports how long it is holding the far voice (probe
+  extension `TPKTW +1`, 4 ms units; older builds write 0 = absent).
+- A voice waiting over 150 ms at either end (`--vq-wait-ms` moves the line)
+  retreats the picture a rung a second and blocks the climb, exactly as the
+  picture's own loss does. The beat carries `peer_a_wait_ms`; the per-second
+  line says `their-wait N ms`; `vq_wait_harm_s` counts the seconds it fired.
+
+### Fixed — a speaker the microphone can hear is a speaker
+
+The far Mac's built-in jack was in use, so the route read "headphones" for the
+whole call — and the turn rule, the canceller and the sidetone mute all stood
+down. Its own detector measured the speaker reaching the microphone at 0.87.
+The caller heard their own voice back at −8.8 dB, one second late, for 38% of
+what they said. A coupling the detector measures on two consecutive one-second
+checks (≥ 0.5 at an acoustic delay) now overrides a declared headphone route
+for the rest of the call: the turn rule and sidetone behave as on speakers,
+the log says why, and the beat carries `route_measured`.
+
+Still open from that call: the caller's own microphone was trimmed to its
+floor by the overload guard (raw peaks of 3.5× full scale on the built-in
+microphone), so they arrived at −37 dBFS with an 18 dB signal-to-noise ratio.
+
 ## Kin 0.162.0 — 2026-09-12
 
 ### Fixed — a call between two homes never connected
