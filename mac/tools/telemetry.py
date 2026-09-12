@@ -388,6 +388,13 @@ def heard_clean_pct(bs):
 
 # (direction, word, predicate over a dict of the derived numbers)
 VERDICTS = [
+    # Nothing ever arrived from the far end: the call never connected. Before
+    # these two words a call with zero packets either way graded "clear / clear"
+    # (2026-09-12, seven attempts between two homes -- green-metrics-can-hide-defects).
+    ("heard", "NEVER CONNECTED -- nothing arrived from them",
+                                        lambda d: d["recv"] == 0 and (d["uptime"] or 0) >= 5),
+    ("said",  "never reached them -- no key was ever agreed",
+                                        lambda d: d["crypt"] == 0 and (d["uptime"] or 0) >= 5),
     ("heard", "a few patches",          lambda d: d["patched_pct"] is not None and 1.0 <= d["patched_pct"] < 3.0),
     ("heard", "patchy",                 lambda d: d["patched_pct"] is not None and d["patched_pct"] >= 3.0),
     ("heard", "clicks",                 lambda d: d["glitch_per_min"] is not None and d["glitch_per_min"] >= 3.0),
@@ -420,6 +427,9 @@ def lab_numbers(bs):
     d["clean_pct"] = heard_clean_pct(bs)
     d["patched_pct"] = (100.0 - d["clean_pct"]) if d["clean_pct"] is not None else None
     up = last(bs, "uptime_s", None)
+    d["uptime"] = up
+    d["recv"] = last(bs, "recv", None)
+    d["crypt"] = last(bs, "crypt", None)
     gl = last(bs, "a_rx_glitches", None)
     d["glitch_per_min"] = (gl / (up / 60.0)) if (gl is not None and up and up > 30) else (0.0 if gl is not None else None)
     d["glitches"] = gl
@@ -544,6 +554,16 @@ def lab_summary(bs):
               + (f"  ·  tapes {facts.get('tapes')}" if facts.get("tapes") else ""))
     else:
         print("  DEVICES   not in this build")
+    # The relay: did this end get one, did it bind a channel toward the peer, and
+    # did the peer ever reach us through it. Facts written by Turn.swift (0.162.0).
+    relay, ch = facts.get("relay"), facts.get("relay_channel")
+    if relay or ch:
+        ind, rb = last(bs, "turn_ind", None), last(bs, "turn_rebind", None)
+        print(f"  RELAY     {relay or '?'}" + (f"  ·  channel {ch}" if ch else "")
+              + (f"  ·  they reached our relay {ind}x" if ind else "")
+              + (f"  ·  channel moved {rb}x" if rb else ""))
+    elif last(bs, "turn_ok", None) is not None:
+        print(f"  RELAY     {'allocated' if last(bs, 'turn_ok', 0) else 'none'} (pre-0.162 build: no detail)")
     def side(direction, have):
         if not have:
             return "not in this build"

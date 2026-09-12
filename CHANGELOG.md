@@ -5,6 +5,47 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.162.0 — 2026-09-12
+
+### Fixed — a call between two homes never connected
+
+The first call between two different networks (Airtel and Excitel, both Delhi)
+was tried seven times and not one packet crossed in either direction; the one
+earlier call outside this Wi-Fi (0.155.0) had the same shape. Three faults in
+the relay client, each alone enough (`mac/Sources/tk/Turn.swift`):
+
+- The relay channel request sent its channel number as attribute `0x001C`
+  (MESSAGE-INTEGRITY-SHA256) instead of `0x000C` (CHANNEL-NUMBER). Every
+  ChannelBind was refused — 0 of 109 in this Mac's log — and the failure line
+  carried no error code. Fixed; the line now says which error.
+- Each call is a new process on the same UDP port, and the previous process
+  never returned its relay allocation. The server still held that 10-minute
+  lease on the same 5-tuple and refused the next Allocate with 437 — 234 times
+  in this log, every attempt after the first within ten minutes. The lease is
+  now released on every exit and remembered on disk, so a process that crashed
+  still has its lease evicted by the next one, with the credentials it left.
+- Packets the relay forwarded as STUN Data Indications (a peer with a
+  permission but no channel, or from a port other than the bound one) were
+  dropped as pre-key noise. They are unwrapped now; when the far end reaches
+  the relay from an address other than the bound one, replies go there as Send
+  Indications and the channel is re-bound to it.
+
+Also: allocation, permission and channel are refreshed every four minutes (a
+relayed call would have gone deaf at five); "peers on same Wi-Fi" now needs the
+same public address AND the same subnet — a match on a 192.168.1.x subnet alone
+described two different homes as one room; the beat carries `turn_bound`,
+`turn_ind`, `turn_rebind` and the facts `relay` / `relay_channel`; and
+`telemetry.sh` says NEVER CONNECTED for a call with no inbound packets instead
+of "clear".
+
+Dual-path audio (direct and relay at once) stays off; it is `--dual-path`. It
+had never run live because no call ever held a channel, and it doubles the
+upstream audio of every relayed call.
+
+`tk --selftest-turn` holds the relay client's messages to the wire numbers, with
+the 0.161 encoding as a negative arm; `release.sh` gates on it
+(`mac/tools/turn-check.sh`).
+
 ## Kin 0.161.0 — 2026-09-11
 
 ### Fixed — the far-voice levelling now sees a pause

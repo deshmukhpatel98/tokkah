@@ -15,7 +15,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.161.0"
+let VERSION = "0.162.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -114,6 +114,15 @@ if flag("selftest-rename") {
 if flag("selftest-install") {
   let ok = Install.selftest()
   fputs("selftest-install: \(ok ? "PASS" : "FAIL")\n", stderr)
+  exit(ok ? 0 : 1)
+}
+// Same contract: the relay client's message builder and parser, held to the
+// wire numbers with the 0.161 encoding as a negative arm. No socket, no
+// network. release.sh gates on it. See the header of Turn.swift.
+if flag("selftest-turn") {
+  fputs("turn selftest:\n", stderr)
+  let ok = TurnClient.selftest()
+  fputs("selftest-turn: \(ok ? "PASS" : "FAIL")\n", stderr)
   exit(ok ? 0 : 1)
 }
 // Same contract again: pure derivation, no network, no disk write. A handle
@@ -565,6 +574,7 @@ let KNOWN_FLAGS: Set<String> = [
   "mute", "no-fec", "no-rt", "no-update", "pcm32", "peer", "playout", "room",
   "secret", "stall-out", "starve-pct", "stun", "stunserver", "vbitrate", "video", "vsync",
   "window", "version", "help", "press-after", "selftest-rename", "selftest-install",
+  "selftest-turn", "dual-path",
   "no-relocate", "leave-exits", "log", "selftest-identity", "handle", "claim", "cam-twopass", "quiet", "prev-call",
   // The far-away test / integrated VPN on from the first packet, for the rig
   // and for a Mac driven from a terminal; the sheet and the menu switch it during a call.
@@ -1774,6 +1784,11 @@ func postFinalBeat(why: String) -> Bool {
   // anything. Without this line every answered ring would have been reported as
   // an app that died without saying goodbye.
   Crash.endRun()
+  // And give the relay back, for the same reason and in the same place: a
+  // lease that outlives its process is a 437 for the next call on this port
+  // (Turn.swift). One datagram, no wait, nothing to read; a no-op when this
+  // process never held one.
+  TurnClient.releaseActive()
   // UNDER `beatReady`, like the tape below: `audio` is created by top-level code
   // ~3500 lines further down, and three exits reach here BEFORE that -- a ring
   // answered from the card (`Launcher.beforeReexec`), a cancel while waiting
@@ -3576,7 +3591,18 @@ if let room = arg("room") {
               let peerL = p.localIP else { return false }
         return isSameSubnet(String(myL), peerL)
       }()
-      let onSameLan = samePublicIP || sameLocalSubnet
+      // ── SAME WI-FI MEANS BOTH, NOT EITHER ──────────────────────────────────
+      //
+      // This was `samePublicIP || sameLocalSubnet`, and nearly every home
+      // router on earth hands out 192.168.1.x. The first call between two
+      // homes (2026-09-12, Airtel <-> Excitel) matched on the subnet alone,
+      // printed "peers on same Wi-Fi" with THEIR public address -- so the line
+      // read as if the addresses had matched -- and aimed the first packets at
+      // a 192.168.1.10 that does not exist on this network. The race sends to
+      // every candidate regardless, so this alone did not kill the call; the
+      // relay did (Turn.swift). But a guess that is wrong for most pairs of
+      // strangers is not a guess worth starting on. Same rule in `addAll`.
+      let onSameLan = samePublicIP && sameLocalSubnet
 
       var cands: [String] = []
       if let lip = p.localIP, let lport = p.localPort {
@@ -3591,9 +3617,13 @@ if let room = arg("room") {
       }
       bindTarget = (p.ip, p.port)
       if onSameLan, let lip = p.localIP, let lport = p.localPort {
-        fputs("room \(room): peers on same Wi-Fi (public \(p.ip)) -- locking direct LAN \(lip):\(lport)\n", stderr)
+        fputs("room \(room): peers on same Wi-Fi (both behind \(p.ip), both on \(lip)'s subnet) -- starting on the LAN \(lip):\(lport)\n", stderr)
         wire.setPeer(ip: lip, port: lport)
       } else {
+        if sameLocalSubnet, let lip = p.localIP {
+          fputs("room \(room): their LAN address \(lip) is on a subnet like ours, but their public address"
+              + " \(p.ip) is not ours (\(myPubIP ?? "?")) -- different networks, starting on \(p.ip):\(p.port)\n", stderr)
+        }
         wire.setPeer(ip: p.ip, port: p.port)
       }
       fputs("room \(room): peer \(p.id) (\(p.ageMs) ms old) -- racing \(cands.joined(separator: " and "))\n", stderr)
@@ -3689,8 +3719,24 @@ if let room = arg("room") {
   // says what asking for it anyway costs.
   Metrics.mark("turn_blocked_ms", Int(Date().timeIntervalSince(turnWaitBegan) * 1000))
   if turnJoined {
-    if let t = wire.turn, let b = bindTarget, t.bindPeer(fd: wire.fd, ip: b.0, port: b.1) {
-      fputs("turn: channel bound to \(b.0):\(b.1)\n", stderr)
+    if let t = wire.turn, let b = bindTarget {
+      if t.bindPeer(fd: wire.fd, ip: b.0, port: b.1) {
+        fputs("turn: channel bound to \(b.0):\(b.1)\n", stderr)
+      }
+      // ── AND KEEP IT ALIVE FOR THE LENGTH OF THE CALL ───────────────────────
+      //
+      // The allocation lives 600 s, the permission 300 s, the channel 600 s,
+      // and nothing refreshed any of them: a relayed call would have gone deaf
+      // at five minutes. Every four minutes, from a plain thread; the replies
+      // land in the receive loop (`noteReply`). Also where a bind that failed
+      // above is asked for again.
+      let turnFd = wire.fd
+      Thread {
+        while true {
+          Thread.sleep(forTimeInterval: 240)
+          t.keepAlive(fd: turnFd)
+        }
+      }.start()
     }
   } else {
     // Never seen; said out loud rather than raced past, because this branch is a
@@ -4102,7 +4148,9 @@ if let room = arg("room") {
                 let peerL = p.localIP else { return false }
           return isSameSubnet(String(myL), peerL)
         }()
-        let onSameLan = samePublicIP || sameLocalSubnet
+        // Both, not either -- see the join above. With `||` every refresh
+        // re-aimed an unlocked call at a 192.168.1.x that was in another home.
+        let onSameLan = samePublicIP && sameLocalSubnet
 
         if let lip = p.localIP, let lport = p.localPort { wire.addCandidate(ip: lip, port: lport) }
         wire.addCandidate(ip: p.ip, port: p.port)
@@ -5416,6 +5464,7 @@ if flag("no-rt") { Wire.noRealtime = true }
 if flag("pcm32") { Wire.forceFloat = true; fputs("audio wire: 32-bit float forced\n", stderr) }
 if flag("no-lp") { Wire.forceNoLp = true; fputs("audio wire: payload compression off\n", stderr) }
 if flag("no-lan-upgrade") { Wire.lanUpgrade = false; fputs("net: LAN path upgrade off (legacy lock-once)\n", stderr) }
+if flag("dual-path") { Wire.dualPath = true; fputs("net: dual-path audio on -- every audio packet goes direct AND through the relay\n", stderr) }
 if let ap = arg("audio") { fputs(audio.loadAudioSource(ap) + "\n", stderr) }
 if let dp = arg("dump-playout") { fputs(audio.startDump(dp) + "\n", stderr) }
 if let ed = arg("echo-sim") {
@@ -7494,6 +7543,13 @@ func audioBeat(uptime: Double, up: Double, down: Double,
     "cand_priv": pd.candPriv,
     "path_priv_ms": pd.privRttMs,
     "turn_ok": wire.turn != nil ? 1 : 0,
+    // The relay, past "allocated": a channel bound toward the peer, how many
+    // packets the far end pushed through OUR relay (Data Indications), and how
+    // often the channel had to follow them to a new port. Zero everywhere on a
+    // direct call; all zero on a relayed one is the 0.161 shape.
+    "turn_bound": wire.turn?.hasChannel == true ? 1 : 0,
+    "turn_ind": wire.turn?.indications ?? 0,
+    "turn_rebind": wire.turn?.rebinds ?? 0,
     "mic_muted": (display?.controls?.micMuted ?? false) ? 1 : 0,
     // The INSTANT, kept for continuity, and the PEAK beside it -- the final beat
     // of a call that reached 0.71 reported 0.04, so every summary built on the

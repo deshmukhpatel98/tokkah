@@ -123,6 +123,7 @@ echo "== rename migration =="
 # did not put it, or gone. There is no second attempt, so it is proven here.
 echo "== install migration =="
 "$REPO/mac/.build/release/tk" --selftest-install || { echo "FAILED: install self-test"; exit 1; }
+"$REPO/mac/.build/release/tk" --selftest-turn --no-telemetry || { echo "FAILED: turn self-test"; exit 1; }
 
 echo "== plists =="
 python3 - "$REPO/mac/bundle/Info.plist" "$REPO/tape-app/public/macos/install.sh" <<'PYCHK'

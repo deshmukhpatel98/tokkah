@@ -894,7 +894,7 @@ final class Wire {
   private func wireSend(_ p: UnsafePointer<UInt8>, _ n: Int, allowTunnel: Bool = true, cls: TxCls = .ctl) {
     let directValid = peer.sin_port != 0 && peer.sin_addr.s_addr != 0 && peer.sin_addr.s_addr != inet_addr("0.0.0.0")
     let tunnelActive = allowTunnel && (cfTunnel?.isRouting == true)
-    let turnActive = allowTunnel && (sendViaTurn || turn?.hasChannel == true) && turn != nil
+    let turnActive = Wire.dualPath && allowTunnel && (sendViaTurn || turn?.hasChannel == true) && turn != nil
 
     if cls == .audio && directValid && (tunnelActive || turnActive) {
       // ── DUAL-PATH PACKET RACING (Direct STUN/P2P + Anycast Relay / TURN) ──
@@ -1326,6 +1326,12 @@ final class Wire {
   /// default; `--no-lan-upgrade` is the control arm (the legacy "lock once and
   /// never re-evaluate" behaviour that left a live call on a 700-pkt/s hairpin).
   nonisolated(unsafe) static var lanUpgrade = true
+  /// Send audio both direct AND through the relay, first arrival wins. OFF by
+  /// default and switched on with `--dual-path`: it doubles the upstream audio
+  /// of every call that holds a relay channel, and until 0.162.0 no call ever
+  /// held one (Turn.swift), so it has never run live. Not a default to flip
+  /// as the side effect of a relay fix.
+  nonisolated(unsafe) static var dualPath = false
   private(set) var peerCaps: UInt32 = 0
   var sendPcm16: Bool { !Wire.forceFloat && (peerCaps & CAP_PCM16) != 0 }
   /// Compression rides ON TOP of 16-bit: the coder's input is int16 samples, so
@@ -2132,8 +2138,16 @@ final class Wire {
       }
       if n < 8 { if n < 0 { usleep(200) }; continue }
       recvBytes += Int(n) + 28
-      // ChannelData from our TURN server is the media, wrapped. Slide the
-      // payload to the front so the rest of this loop does not know about TURN.
+      // A reply from our relay -- to a keepalive, a re-bind -- is neither media
+      // nor a handshake. Consumed here; before, it fell through as an unknown
+      // magic: pre-key noise, or a failed decrypt counted against the cipher.
+      if let t = turn, t.isStunFromRelay(buf, Int(n), from: src) {
+        t.noteReply(buf, Int(n))
+        continue
+      }
+      // ChannelData or a Data Indication from our TURN server is the media,
+      // wrapped. Slide the payload to the front so the rest of this loop does
+      // not know about TURN.
       if let t = turn, let inner = t.unwrap(buf, Int(n), from: src) {
         if inner.1 < 8 { continue }
         memmove(buf, inner.0, inner.1)
