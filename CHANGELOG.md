@@ -5,6 +5,48 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.164.0 — 2026-09-12
+
+Two Macs with the same computer name or username previously collided on handles,
+displayed unconfirmed handles, and could not call each other. Handle management
+also lived inside the active call interface rather than at the front door.
+
+### Fixed — handle collision across machines and robust claiming
+
+- Two Macs with identical account names now derive distinct candidate ladders:
+  device qualifiers from the computer name (`air`, `pro`, `mini`, `studio`,
+  `imac`, etc.) are placed on the candidate ladder before numeric suffixes, and
+  the fallback ladder now extends to 99.
+- `Identity.handle` returns `""` while `claimed == false`. Machines never display
+  or advertise an unconfirmed handle before the server confirms registration.
+- If a machine's local handle is claimed by another key on the server (403 taken),
+  it steps down `claimed = false` and walks the ladder to claim its own valid,
+  distinct handle.
+- Identity registration and lease refreshes now run immediately at launch
+  (`Identity.start()`) while the home window is open, so newly installed Macs
+  claim their handle before the user navigates away.
+
+### Fixed — handle management moved to the main app front door
+
+- The option to choose or change your handle is now located in the main app
+  launcher settings card (behind `…` and on the front card for fresh installs),
+  with inline editing, validation, and real-time server verification.
+- Removed handle rename controls from the in-call controls sheet (`Controls.swift`).
+
+### Fixed — calling someone by name while on the home screen
+
+- `Launcher.home()` now starts listening for incoming rings while sitting at
+  the front door (`Identity.startRinging`), re-execing immediately into the call
+  when rung. Calls made to people while their Kin app is sitting on the home
+  screen now ring through reliably.
+
+### Added — in-app red dot notification for missed calls
+
+- When a call is cancelled (`bye`) before answer or unanswered, an in-app red
+  dot badge appears on the contact's avatar in the home screen contacts list.
+- Badges clear automatically when placing a call to that contact, or via the
+  contact's contextual right-click menu ("Clear Missed Call").
+
 ## Kin 0.163.0 — 2026-09-12
 
 The first call that connected between two homes (0.162.0, 45 s) sounded bad in

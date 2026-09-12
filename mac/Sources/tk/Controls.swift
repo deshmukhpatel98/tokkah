@@ -945,6 +945,8 @@ class SheetRow: NSButton {
   /// typewriter face, which reads as a serial number rather than as something to
   /// press. Same slot, different job, so it has to be told which.
   var valueIsWord = false { didSet { needsDisplay = true } }
+  /// Custom color for the value text (e.g. Palette.bad for missed call labels).
+  var valueColor: NSColor? { didSet { needsDisplay = true } }
   // ── A ROW HAS TO SAY WHAT PRESSING IT WILL DO ──────────────────────────────
   //
   // Everything on the right-hand side of a row was drawn identically: "yesterday",
@@ -1274,8 +1276,8 @@ class SheetRow: NSButton {
       let f = valueIsWord ? Type_.button
             : (pending ? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) : Type_.code)
       // An ACTION reads at full strength inside a chip; a fact reads muted and bare.
-      let ink: NSColor = valueIsAction ? Palette.fg
-        : ((pending || valueIsWord) ? Palette.muted : Palette.fg)
+      let ink: NSColor = valueColor ?? (valueIsAction ? Palette.fg
+        : ((pending || valueIsWord) ? Palette.muted : Palette.fg))
       var a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: ink]
       if !pending, !valueIsWord { a[.kern] = 13.0 * 0.09 }
       let sz = (value as NSString).size(withAttributes: a)
@@ -1331,7 +1333,7 @@ class SheetRow: NSButton {
 // The other return on subclassing is that `clickTargets` needed no line at all --
 // it already collects `sheet.rows`, and a `ContactRow` IS a `SheetRow`.
 final class ContactRow: SheetRow {
-  private let handle: String
+  private var handle: String
   /// Who this row is, for the action that has to ring them. `tag` is taken -- the
   /// camera rows use it as an index -- and a handle is not an integer.
   var handleName: String { handle }
@@ -1347,8 +1349,28 @@ final class ContactRow: SheetRow {
     didSet {
       guard reachable != oldValue else { return }
       needsDisplay = true
-      setAccessibilityLabel("call @" + handle + (reachable == true ? ", reachable now" : ""))
+      updateAccessibility()
     }
+  }
+
+  /// ── UNREAD MISSED CALL INDICATOR ──────────────────────────────────────────
+  ///
+  /// Drawn as a red dot on the avatar's top-right shoulder, with "missed call"
+  /// announced for VoiceOver and offered in the contextual menu. Cleared when
+  /// the person is called or the notification is dismissed.
+  var hasMissedCall: Bool = false {
+    didSet {
+      guard hasMissedCall != oldValue else { return }
+      needsDisplay = true
+      updateAccessibility()
+    }
+  }
+
+  private func updateAccessibility() {
+    var label = "call @" + handle
+    if reachable == true { label += ", reachable now" }
+    if hasMissedCall { label += ", missed call" }
+    setAccessibilityLabel(label)
   }
 
   /// The handle is the row: the colour, the letter and the words all come from it.
@@ -1357,11 +1379,18 @@ final class ContactRow: SheetRow {
   /// a claim and needs a trust model this app does not yet have.
   init(handle: String) {
     self.handle = handle
-    super.init("@" + handle, glyph: nil)
+    super.init(handle.isEmpty ? "" : "@" + handle, glyph: nil)
     textInset = Metric.rowAvatarInset
-    setAccessibilityLabel("call @" + handle)
+    setAccessibilityLabel(handle.isEmpty ? "" : "call @" + handle)
   }
   required init?(coder: NSCoder) { fatalError() }
+
+  func updateHandle(_ newHandle: String) {
+    self.handle = newHandle
+    setLabel(newHandle.isEmpty ? "" : "@" + newHandle)
+    updateAccessibility()
+    needsDisplay = true
+  }
 
   // ── TAKING SOMEBODY OFF THE LIST ───────────────────────────────────────────
   //
@@ -1380,14 +1409,26 @@ final class ContactRow: SheetRow {
     }
   }
   @objc private func removeSelf() { onRemove?() }
+  @objc private func clearMissedSelf() {
+    Identity.clearMissedCalls(for: handle)
+    hasMissedCall = false
+  }
+
   override func menu(for event: NSEvent) -> NSMenu? {
-    guard onRemove != nil else { return super.menu(for: event) }
     let m = NSMenu()
-    let item = NSMenuItem(title: "Remove @" + handle, action: #selector(removeSelf),
-                          keyEquivalent: "")
-    item.target = self
-    m.addItem(item)
-    return m
+    if hasMissedCall {
+      let clear = NSMenuItem(title: "Clear Missed Call", action: #selector(clearMissedSelf),
+                             keyEquivalent: "")
+      clear.target = self
+      m.addItem(clear)
+    }
+    if onRemove != nil {
+      let item = NSMenuItem(title: "Remove @" + handle, action: #selector(removeSelf),
+                            keyEquivalent: "")
+      item.target = self
+      m.addItem(item)
+    }
+    return m.items.isEmpty ? super.menu(for: event) : m
   }
 
   // ── DRAWN, NOT LAYERED ─────────────────────────────────────────────────────
@@ -1414,6 +1455,17 @@ final class ContactRow: SheetRow {
       NSBezierPath(ovalIn: at.insetBy(dx: -2, dy: -2)).fill()
       NSGraphicsContext.current?.restoreGraphicsState()
       Palette.ok.setFill()
+      NSBezierPath(ovalIn: at).fill()
+    }
+    // Missed call indicator: red dot on the avatar's top-right shoulder.
+    if hasMissedCall {
+      let dd: CGFloat = 9
+      let at = NSRect(x: box.maxX - dd + 1, y: box.maxY - dd + 1, width: dd, height: dd)
+      NSGraphicsContext.current?.saveGraphicsState()
+      NSGraphicsContext.current?.compositingOperation = .destinationOut
+      NSBezierPath(ovalIn: at.insetBy(dx: -2, dy: -2)).fill()
+      NSGraphicsContext.current?.restoreGraphicsState()
+      Palette.bad.setFill()
       NSBezierPath(ovalIn: at).fill()
     }
     // The ×, only while the pointer is on the row: at rest the row is a name and
@@ -5340,17 +5392,8 @@ final class CallControls: NSView {
     peopleEntry.chevron = true
     peopleEntry.target = self; peopleEntry.action = #selector(peopleRow(_:))
     items.append(peopleEntry)
-    // ── CHANGING YOUR NAME, WHETHER OR NOT YOU HAVE ONE ──────────────────────
-    //
-    // Present even when `handle` is empty, and that is the case it matters most in:
-    // an unclaimed handle means every name this Mac suggested was already taken,
-    // and the person it happened to is exactly the one who needs to pick another.
-    // Hiding the row until the name works would hide it from everybody it is for.
-    let rename = SheetRow(handle.isEmpty ? "Choose your name" : "Change your name",
-                          glyph: Glyph.pencil)
-    rename.chevron = true
-    rename.target = self; rename.action = #selector(renameRow(_:))
-    items.append(rename)
+    // Handle management is located in the main app's home window, not in the
+    // in-call controls sheet.
     let recRow = SheetRow(CallRecorder.shared.isRecording ? "Stop recording" : "Record call", glyph: Glyph.record)
     recRow.target = self; recRow.action = #selector(recordRow(_:))
     if CallRecorder.shared.isRecording {
@@ -5667,6 +5710,8 @@ final class CallControls: NSView {
   @objc private func callContactRow(_ sender: SheetRow) {
     guard let row = sender as? ContactRow else { return }
     Metrics.tap("call_contact")
+    Identity.clearMissedCalls(for: row.handleName)
+    row.hasMissedCall = false
     closeMore()
     dial(row.handleName)
   }

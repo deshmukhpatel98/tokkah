@@ -15,7 +15,7 @@ import Foundation
 // network contributes nothing. Whatever it reports is the pipeline, exactly.
 // Only once that number is known is it worth putting the Pacific in the middle.
 
-let VERSION = "0.163.0"
+let VERSION = "0.164.0"
 
 // ── ONE MAGIC PER PACKET KIND ─────────────────────────────────────────────────
 //
@@ -1140,8 +1140,7 @@ if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
   //
   // So this branch does not ring anybody. It carries the news of a ring that has
   // happened into the image that will wait for the answer -- the same `--calling`
-  // flag the in-call dial path uses, which is what puts a name and a cancel
-  // button on the waiting card instead of an invite link.
+  if !isTestRun, !noIdentity { Identity.start() }
   guard let intent = Launcher.home(resume: resumable) else { exit(0) }  // closed the window
   // Video on by default here and off for the command line: someone who typed
   // `tk` is measuring something, someone who double-clicked wants a video call.
@@ -2995,6 +2994,7 @@ display?.controls?.onAnswerRing = {
   // Answering is a call too: without this line only the CALLER's list learned
   // recency and the callee's front door stayed alphabetical forever.
   Identity.noteCallTime(o.from)
+  Identity.clearMissedCalls(for: o.from)
   display?.controls?.setStatus("answering \(Identity.display(o.from))…")
   // `--with`: WHO this room is shared with, carried through the re-exec.
   // `--incoming` is an event and rightly dies at the handoff, but the answered
@@ -3206,6 +3206,7 @@ func handleBye(_ r: Identity.Ring) {
     Metrics.mark("bye_recv_ms", sinceLaunch())
     Metrics.fact("outcome", "they hung up before this Mac answered")
     Ringer.stop()
+    Identity.noteMissedCall(r.from)
     gOffered = nil
     Identity.ringShowing = false
     display?.controls?.hideIncoming()

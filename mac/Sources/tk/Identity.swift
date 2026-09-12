@@ -142,9 +142,16 @@ enum Identity {
   }
   static var file: URL { dir.appendingPathComponent("identity.json") }
 
-  /// The handle to show and to copy. Never nil once `start()` has run, because a
-  /// name derived from this Mac exists whether or not the server has heard of it.
+  /// The handle to show and to copy. Only non-empty once claimed on the server,
+  /// so unconfirmed names are never presented as owned.
   static var handle: String {
+    lock.lock(); defer { lock.unlock() }
+    guard let c = cached, c.claimed else { return "" }
+    return c.handle
+  }
+
+  /// A proposed or unconfirmed handle for placeholders and suggestions.
+  static var suggestedHandle: String {
     lock.lock(); defer { lock.unlock() }
     return cached?.handle ?? Identity.candidates().first ?? "kin"
   }
@@ -198,7 +205,7 @@ enum Identity {
   }
 
   /// Every name this Mac could answer to, best first, then the ladder. First come
-  /// first served: if `devesh` is gone we ask for `deveshp`, then `devesh2`.
+  /// first served: if `devesh` is gone we ask for `deveshair`, `deveshp`, then `devesh2`.
   static func candidates() -> [String] {
     // An explicit `--handle` is a decision, not a hint: it replaces the ladder
     // rather than heading it, because falling back from a name someone typed to
@@ -212,28 +219,55 @@ enum Identity {
       }
       return [h]
     }
+    return candidatesFor(fullUserName: NSFullUserName(),
+                         computerName: computerName(),
+                         userName: NSUserName())
+  }
+
+  /// Extracted for testability and determinism. Generates the preference ladder,
+  /// using distinguishing device qualifiers to prevent two machines with similar
+  /// names from colliding into the exact same rung.
+  static func candidatesFor(fullUserName: String, computerName: String?, userName: String) -> [String] {
     var out: [String] = []
     func push(_ s: String?) {
       guard let s, let h = sanitize(s), !out.contains(h) else { return }
       out.append(h)
     }
-    let full = NSFullUserName()                       // "Devesh Patel"
-    let words = full.split(separator: " ").map(String.init)
+    let words = fullUserName.split(separator: " ").map(String.init)
     push(words.first)                                 // devesh
     // "Devesh's MacBook Air" -> devesh
-    push(computerName()?.split(separator: " ").first.map { stripPossessive(String($0)) })
+    push(computerName?.split(separator: " ").first.map { stripPossessive(String($0)) })
 
     guard let base = out.first else {
-      push(NSUserName())
+      push(userName)
       return out
     }
+
+    // Distinguishing device qualifiers:
+    // If two Macs belong to the same person (e.g. "Devesh's MacBook Air" and
+    // "Devesh's MacBook Pro"), distinguishing tokens like "air", "pro", "mini" give each
+    // a distinct, intuitive handle before they have to fall back to anonymous numbers.
+    if let comp = computerName {
+      let compTokens = comp.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        .filter { !$0.isEmpty }
+        .map { $0.lowercased() }
+        .filter { $0 != "s" && $0 != base }
+      let priorityQualifiers = ["air", "pro", "mini", "studio", "imac", "macbook", "mac", "laptop", "desktop", "work", "home", "office"]
+      for q in priorityQualifiers where compTokens.contains(q) {
+        push(base + q)
+      }
+      for tok in compTokens where !priorityQualifiers.contains(tok) && tok.count >= 2 {
+        push(base + tok)
+      }
+    }
+
     // Short first, and person-like before machine-like. The brief was explicit
     // that the handle has to be SHORT, so `deveshp` outranks `deveshpatel`, and
     // both outrank `devesh2` -- a digit reads like a spare account.
     if words.count > 1, let ini = words[1].first { push(base + String(ini)) }
-    push(NSUserName())                                // deveshpatel
+    push(userName)                                    // deveshpatel
     if words.count > 1 { push(base + words[1]) }      // deveshpatel, if not already
-    for n in 2...9 { push(base + String(n)) }
+    for n in 2...99 { push(base + String(n)) }
     return out
   }
 
@@ -542,15 +576,27 @@ enum Identity {
     var s = ensure()
     // Already settled: refresh the lease under the SAME name and stop.
     if s.claimed {
-      // Tell the UI regardless of what the refresh says: the handle is already
-      // ours on disk, and hiding it because a lease refresh timed out would make
-      // the name disappear from the sheet on a bad network.
-      let named = s.handle
-      DispatchQueue.main.async { onClaimed?(named) }
-      trouble(nil)
-      if case .won = attempt(s.handle, s) { return }
-      // A refresh that fails is not a reason to take a new name either.
-      return
+      switch attempt(s.handle, s) {
+      case .won:
+        let named = s.handle
+        DispatchQueue.main.async { onClaimed?(named) }
+        trouble(nil)
+        return
+      case .taken:
+        // The server says another key owns this name! We do NOT own it.
+        // Step down from claimed state and walk the ladder to claim our own valid handle.
+        fputs("identity: @\(s.handle) is taken by another key -- reclaiming\n", stderr)
+        s.claimed = false
+        lock.lock(); cached = s; lock.unlock()
+        save(s)
+        // Fall through to walk the candidate ladder below!
+      case .busy, .refused, .unreachable:
+        // Network hiccup on lease refresh: keep the claimed handle on disk and retry later
+        let named = s.handle
+        DispatchQueue.main.async { onClaimed?(named) }
+        trouble(nil)
+        return
+      }
     }
     let names = candidates()
     guard !names.isEmpty else {
@@ -561,7 +607,7 @@ enum Identity {
     }
     let deadline = Date().addingTimeInterval(passBudget)
     var tried = 0
-    for cand in names where tried < 12 {
+    for cand in names where tried < 30 {
       tried += 1
       // ── ASK AGAIN FOR THE SAME NAME, NOT FOR THE NEXT ONE ──────────────────
       //
@@ -907,6 +953,69 @@ enum Identity {
       try? FileManager.default.removeItem(at: lastCallFile)
       try? FileManager.default.moveItem(at: tmp, to: lastCallFile)
     }
+  }
+
+  // ── MISSED CALLS ───────────────────────────────────────────────────────────
+  //
+  // Unread missed calls: when someone rings us and hangs up before we answer,
+  // or a call is declined/unanswered, a red dot indicator appears on their avatar
+  // in the contacts list. Cleared when the user calls them or clears it via
+  // the context menu.
+  static var missedFile: URL { dir.appendingPathComponent("missed.json") }
+  private static let missedLock = NSLock()
+
+  static func missedCalls() -> [String: Double] {
+    missedLock.lock(); defer { missedLock.unlock() }
+    guard let d = try? Data(contentsOf: missedFile),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Double]
+    else { return [:] }
+    return o
+  }
+
+  static func hasMissedCall(for handle: String) -> Bool {
+    guard let h = sanitize(handle) else { return false }
+    return missedCalls()[h] != nil
+  }
+
+  static func noteMissedCall(_ raw: String, at t: Double = Date().timeIntervalSince1970) {
+    guard let handle = sanitize(raw) else { return }
+    missedLock.lock()
+    defer { missedLock.unlock() }
+    var map = (try? Data(contentsOf: missedFile))
+      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Double] } ?? [:]
+    map[handle] = t
+    guard let d = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]) else { return }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let tmp = missedFile.appendingPathExtension("tmp")
+    if (try? d.write(to: tmp)) != nil {
+      try? FileManager.default.removeItem(at: missedFile)
+      try? FileManager.default.moveItem(at: tmp, to: missedFile)
+    }
+    fputs("missed call: noted from @\(handle)\n", stderr)
+  }
+
+  static func clearMissedCalls(for raw: String) {
+    guard let handle = sanitize(raw) else { return }
+    missedLock.lock()
+    defer { missedLock.unlock() }
+    guard var map = (try? Data(contentsOf: missedFile))
+      .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Double] }),
+      map[handle] != nil else { return }
+    map.removeValue(forKey: handle)
+    guard let d = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]) else { return }
+    let tmp = missedFile.appendingPathExtension("tmp")
+    if (try? d.write(to: tmp)) != nil {
+      try? FileManager.default.removeItem(at: missedFile)
+      try? FileManager.default.moveItem(at: tmp, to: missedFile)
+    }
+    fputs("missed call: cleared for @\(handle)\n", stderr)
+  }
+
+  static func clearAllMissedCalls() {
+    missedLock.lock()
+    defer { missedLock.unlock() }
+    try? FileManager.default.removeItem(at: missedFile)
   }
 
   // ── PEOPLE YOU HAVE ASKED NOT TO SEE ──────────────────────────────────────
@@ -2005,6 +2114,22 @@ enum Identity {
     check("a bye for another room is refused", sign: byeMsg,
           verify: ringMessage(to: to, from: from, room: "zzzz-yyyy-xxx", t: t, kind: "bye"),
           want: false)
+
+    // ── DISTINGUISHING DEVICE QUALIFIERS ──────────────────────────────────────
+    let airCands = candidatesFor(fullUserName: "Devesh Patel", computerName: "Devesh’s MacBook Air", userName: "deveshpatel")
+    let proCands = candidatesFor(fullUserName: "Devesh Patel", computerName: "Devesh’s MacBook Pro", userName: "deveshpatel")
+    eq("air candidate contains deveshair", String(airCands.contains("deveshair")), "true")
+    eq("pro candidate contains deveshpro", String(proCands.contains("deveshpro")), "true")
+    eq("air and pro candidates differ", String(airCands != proCands), "true")
+
+    // ── MISSED CALLS STORAGE ──────────────────────────────────────────────────
+    clearMissedCalls(for: "selftestuser")
+    eq("missed call initially absent", String(hasMissedCall(for: "selftestuser")), "false")
+    noteMissedCall("selftestuser")
+    eq("missed call noted", String(hasMissedCall(for: "selftestuser")), "true")
+    clearMissedCalls(for: "selftestuser")
+    eq("missed call cleared", String(hasMissedCall(for: "selftestuser")), "false")
+
     return ok
   }
 
@@ -2069,6 +2194,7 @@ enum Identity {
     save(s)
     trouble(nil)
     fputs("identity: you are now @\(want)\n", stderr)
+    DispatchQueue.main.async { onClaimed?(want) }
     return .ok
   }
 

@@ -795,6 +795,7 @@ enum Launcher {
         r.value = Relative.time(t)
         r.valueIsWord = true
       }
+      r.hasMissedCall = Identity.hasMissedCall(for: r.handleName)
     }
     // ── THE GREEN DOTS, REFRESHED WHILE THE WINDOW IS OPEN ───────────────────
     //
@@ -922,6 +923,35 @@ enum Launcher {
     verRow.textInset = Metric.rowAvatarInset
     v.addSubview(verRow)
     v.addSubview(verHint)
+    // ── HANDLE MANAGEMENT IN MAIN APP ────────────────────────────────────────
+    let changeNameRow = SheetRow(Identity.handle.isEmpty ? "Choose your handle" : "Change your handle",
+                                 glyph: Glyph.pencil)
+    changeNameRow.chevron = true
+    changeNameRow.textInset = Metric.rowAvatarInset
+    v.addSubview(changeNameRow)
+
+    let renameFieldBack = vibrant(Metric.fieldHeight)
+    let renameField = plainField("your handle", Identity.handle.isEmpty ? Identity.suggestedHandle : Identity.handle)
+    for x in [renameFieldBack, renameField] as [NSView] { v.addSubview(x) }
+
+    let saveRenameRow = SheetRow("Save handle")
+    saveRenameRow.value = "save"
+    saveRenameRow.valueIsWord = true
+    saveRenameRow.valueIsAction = true
+    saveRenameRow.textInset = Metric.rowAvatarInset
+    v.addSubview(saveRenameRow)
+
+    let cancelRenameRow = SheetRow("Cancel")
+    cancelRenameRow.value = "cancel"
+    cancelRenameRow.valueIsWord = true
+    cancelRenameRow.textInset = Metric.rowAvatarInset
+    v.addSubview(cancelRenameRow)
+
+    let renameHint = SheetHint("Letters and numbers, starting with a letter.")
+    let renameStatus = SheetHint("")
+    v.addSubview(renameHint)
+    v.addSubview(renameStatus)
+
     // ── THE FURNITURE GOES BEHIND ONE BUTTON ─────────────────────────────────
     //
     // Your own handle, the login item, silent mode: all three are ABOUT you and
@@ -952,7 +982,7 @@ enum Launcher {
     // wrong here. Observed, before this line: an app launch put the list under a
     // resting pointer and the next click rang @arjun.
     for r in peopleRows { r.acceptsFirstClick = false }
-    for r in [linkRow, inviteRow, resumeRow, mineRow, reachRow, verRow] { r.acceptsFirstClick = false }
+    for r in [linkRow, inviteRow, resumeRow, mineRow, reachRow, verRow, changeNameRow, saveRenameRow, cancelRenameRow] { r.acceptsFirstClick = false }
 
     // ── WHAT THIS WINDOW IS FOR, IN ONE VALUE ─────────────────────────────────
     //
@@ -993,9 +1023,17 @@ enum Launcher {
       var stopRing: () -> Void = {}
       /// The settings card is open: your handle, the login item, silent mode.
       var settingsOpen = false
+      var renaming = false
+      var onOpenRename: () -> Void = {}
+      var onCancelRename: () -> Void = {}
+      var onCommitRename: () -> Void = {}
+      @objc func openRename(_ sender: Any?) { onOpenRename() }
+      @objc func cancelRename(_ sender: Any?) { onCancelRename() }
+      @objc func commitRename(_ sender: Any?) { onCommitRename() }
       @objc func settings() {
         guard !ringing else { return }
         settingsOpen.toggle()
+        if !settingsOpen { renaming = false }
         fputs("home: settings \(settingsOpen ? "open" : "closed")\n", stderr)
         relayout()
       }
@@ -1208,6 +1246,8 @@ enum Launcher {
     }
     t.ring = { [weak t] who in
       guard let t, !t.done, !t.ringing else { return }
+      Identity.clearMissedCalls(for: who)
+      for r in peopleRows where r.handleName == who { r.hasMissedCall = false }
       t.ringing = true
       t.ringSettled = false
       let gen = t.ringGen
@@ -1339,29 +1379,34 @@ enum Launcher {
         // The card about YOU: handle, the login item, silent mode. Everything
         // here used to sit under the people list and push the card up over the
         // camera picture.
-        column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
-        column += [reachRow, reachHint]
-        if t?.updateChecking == true {
-          verRow.setLabel("Version")
-          verRow.value = "checking\u{2026}"
-          verRow.valueIsWord = true
-          verRow.valueIsAction = false
-          verRow.inert = true
-        } else if Update.pending != nil {
-          verRow.setLabel("Update ready")
-          verRow.value = "restart"
-          verRow.valueIsWord = true
-          verRow.valueIsAction = true
-          verRow.inert = false
+        if t?.renaming == true {
+          column += [renameHint, renameFieldBack, saveRenameRow, cancelRenameRow, renameStatus]
         } else {
-          verRow.setLabel("Version")
-          verRow.value = VERSION
-          verRow.valueIsWord = true
-          verRow.valueIsAction = true
-          verRow.inert = false
+          column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
+          column += [changeNameRow]
+          column += [reachRow, reachHint]
+          if t?.updateChecking == true {
+            verRow.setLabel("Version")
+            verRow.value = "checking\u{2026}"
+            verRow.valueIsWord = true
+            verRow.valueIsAction = false
+            verRow.inert = true
+          } else if Update.pending != nil {
+            verRow.setLabel("Update ready")
+            verRow.value = "restart"
+            verRow.valueIsWord = true
+            verRow.valueIsAction = true
+            verRow.inert = false
+          } else {
+            verRow.setLabel("Version")
+            verRow.value = VERSION
+            verRow.valueIsWord = true
+            verRow.valueIsAction = true
+            verRow.inert = false
+          }
+          verHint.setText(t?.updateNote ?? "")
+          column += [verRow, verHint]
         }
-        verHint.setText(t?.updateNote ?? "")
-        column += [verRow, verHint]
       } else {
         // A call you are still in comes first: it is the only row on this card
         // about something already happening. Then a link somebody just sent you,
@@ -1376,7 +1421,7 @@ enum Launcher {
         // Mac's name -- so the name stays on the front card exactly until the
         // first person is in the list, then moves behind the `…`.
         if people.isEmpty {
-          column += Identity.handle.isEmpty ? [mineHint] : [mineRow]
+          column += Identity.handle.isEmpty ? [mineHint, changeNameRow] : [mineRow]
         }
       }
       // A hint with nothing in it is not a row. They exist only to carry a
@@ -1384,8 +1429,10 @@ enum Launcher {
       // this card was asked to stop spending.
       column = column.filter { ($0 as? SheetHint).map { !$0.text.isEmpty } ?? true }
       let shown = Set(column.map { ObjectIdentifier($0) })
-      for x in [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
-                emptyHint, reachRow, reachHint, verRow, verHint] as [NSView] {
+      let allViews: [NSView] = [fieldBack, status, linkRow, inviteRow, resumeRow, mineRow, mineHint,
+                                emptyHint, reachRow, reachHint, verRow, verHint, changeNameRow,
+                                renameHint, renameFieldBack, saveRenameRow, cancelRenameRow, renameStatus]
+      for x in allViews {
         x.isHidden = !shown.contains(ObjectIdentifier(x))
       }
       moreBtn.on = t?.settingsOpen == true
@@ -1397,6 +1444,7 @@ enum Launcher {
       // The field is not in `column` -- it rides inside its `Vibrant` backing --
       // so its visibility follows the thing it sits in.
       field.isHidden = fieldBack.isHidden
+      renameField.isHidden = renameFieldBack.isHidden
 
       func heightOf(_ x: NSView) -> CGFloat {
         if x === status { return statusH }
@@ -1405,7 +1453,7 @@ enum Launcher {
         // last line under the card's bottom edge everywhere else this was done by
         // hand. The measure needs the width, which is known here and nowhere else.
         if let h = x as? SheetHint { h.measure(width: rowW); return h.wantedHeight }
-        if x === fieldBack { return Metric.fieldHeight }
+        if x === fieldBack || x === renameFieldBack { return Metric.fieldHeight }
         return Metric.sheetRow
       }
       let gap = Metric.s1
@@ -1423,6 +1471,10 @@ enum Launcher {
           // the label.
           field.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
                                width: rowW - Metric.s4 * 2, height: 19)
+        }
+        if x === renameFieldBack {
+          renameField.frame = NSRect(x: x.frame.minX + Metric.s4, y: y + (hh - 19) / 2,
+                                     width: rowW - Metric.s4 * 2, height: 19)
         }
         x.needsDisplay = true
       }
@@ -1508,6 +1560,97 @@ enum Launcher {
     // Same free time the faces get: the room is knowable the moment the pointer
     // lands on the row, and it is very likely the one about to be joined.
     linkRow.onHover = { [weak t] in if let r = t?.clipRoom { Warm.room(r, why: "hover link") } }
+
+    changeNameRow.target = t; changeNameRow.action = #selector(Target.openRename(_:))
+    saveRenameRow.target = t; saveRenameRow.action = #selector(Target.commitRename(_:))
+    cancelRenameRow.target = t; cancelRenameRow.action = #selector(Target.cancelRename(_:))
+    renameField.target = t; renameField.action = #selector(Target.commitRename(_:))
+
+    t.onOpenRename = { [weak t] in
+      guard let t, !t.ringing else { return }
+      t.settingsOpen = true
+      t.renaming = true
+      renameField.stringValue = Identity.handle.isEmpty ? Identity.suggestedHandle : Identity.handle
+      renameStatus.setText("")
+      t.relayout()
+      DispatchQueue.main.async {
+        renameField.window?.makeFirstResponder(renameField)
+        renameField.currentEditor()?.selectAll(nil)
+      }
+    }
+
+    t.onCancelRename = { [weak t] in
+      guard let t else { return }
+      t.renaming = false
+      renameStatus.setText("")
+      t.relayout()
+    }
+
+    t.onCommitRename = { [weak t] in
+      guard let t else { return }
+      let want = renameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      let clean = want.hasPrefix("@") ? String(want.dropFirst()) : want
+      guard let name = Identity.sanitize(clean) else {
+        renameStatus.setText("Letters and numbers, 2-32 chars, starting with a letter.")
+        t.relayout()
+        return
+      }
+      renameStatus.setText("Asking for @\(name)…")
+      t.relayout()
+      Thread { [weak t] in
+        let outcome = Identity.renamed(to: name)
+        DispatchQueue.main.async {
+          guard let t else { return }
+          switch outcome {
+          case .ok:
+            mineRow.updateHandle(name)
+            changeNameRow.setLabel("Change your handle")
+            mineHint.setText("")
+            t.renaming = false
+            renameStatus.setText("")
+            t.relayout()
+          case .taken:
+            renameStatus.setText("@\(name) belongs to someone else.")
+            t.relayout()
+          case .notAName:
+            renameStatus.setText("That name can’t be used.")
+            t.relayout()
+          case .noAnswer:
+            renameStatus.setText("Could not reach the server — try again.")
+            t.relayout()
+          }
+        }
+      }.start()
+    }
+
+    // ── IDENTITY CLAIM & RING LISTENER WHILE AT FRONT DOOR ───────────────────
+    if !isTestRun, !noIdentity {
+      Identity.ensure()
+      Identity.start()
+    }
+    Identity.onClaimed = { [weak t] named in
+      mineRow.updateHandle(named)
+      changeNameRow.setLabel("Change your handle")
+      mineHint.setText("")
+      t?.relayout()
+    }
+    Identity.startRinging(gapMs: 3000) { r in
+      guard r.ageMs < 60_000 else { return }
+      if r.kind == "bye" {
+        Identity.noteCancelled(r)
+        Identity.noteMissedCall(r.from)
+        for row in peopleRows where row.handleName == r.from {
+          row.hasMissedCall = true
+        }
+        return
+      }
+      if r.kind == nil {
+        Launcher.reexec(room: r.room,
+                        extra: ["--incoming", r.from, "--incoming-key", r.k,
+                                "--video", "camera", "--window"],
+                        why: "ring from @\(r.from)")
+      }
+    }
 
     // ── READING THE CLIPBOARD, AND SAYING SO ON A ROW ────────────────────────
     //
@@ -1822,6 +1965,7 @@ enum Launcher {
       // back to the list. Each press undoes one thing.
       if e.keyCode == 53 {
         if t.ringing { t.stopRing(); return nil }
+        if t.renaming { t.onCancelRename(); return nil }
         if t.settingsOpen { t.settings(); return nil }
         if editing, !(field.currentEditor()?.string.isEmpty ?? true) {
           field.stringValue = ""; field.currentEditor()?.string = ""
@@ -2159,6 +2303,7 @@ enum Launcher {
     t.copyTimer = nil
     t.inviteTimer?.invalidate()
     t.inviteTimer = nil
+    Identity.onClaimed = nil
     // ── RELEASING THE CAMERA, WHICH USED TO BE EXEC'S JOB ────────────────────
     //
     // `stopRunning()` alone was enough while a re-exec followed: the process
