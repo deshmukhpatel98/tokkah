@@ -916,11 +916,20 @@ final class Audio {
   //
   // Raise-only, once per graph build: a slider UNDER the floor is lifted to it,
   // a slider above it is somebody's business and is left alone, and it is never
-  // lowered -- the overload guard already protects a hot microphone digitally
-  // (`trimOverload`), so the two cannot fight. `--mic-gain-floor 0.9` tunes it;
-  // `--no-mic-gain-floor` is the control arm.
+  // lowered. The floor is a RESCUE, not a target: `tuneInputGain` is this app's
+  // own leveller and it turns this same hardware knob deliberately -- down when
+  // speech peaks hot, up when it is quiet, converging on -8 dBFS -- so the
+  // slider's resting place IS a measurement, and a first draft of this floor at
+  // 0.80 would have stomped that measurement upward at every call start and
+  // clipped the first word (measured live: the leveller moved 0.59 -> 0.41
+  // inside one 25 s call, on purpose). 0.35 is the code's own long-standing
+  // "below this the call sounds broken" line: under it the ADC's noise eats the
+  // voice faster than the leveller's climb can save it, so the rescue is
+  // instant and everything above it belongs to the leveller.
+  // `--mic-gain-floor 0.8` still forces the old idea; `--no-mic-gain-floor` is
+  // the control arm.
   static var micGainFloorOn = true
-  static var micGainFloor: Float = 0.80
+  static var micGainFloor: Float = 0.35
   /// Raise the system input slider to the floor if it sits below it. Read back
   /// after the write (`readback-is-not-in-effect`): some devices refuse the set,
   /// and a refusal must land in the log as the truth rather than the wish.

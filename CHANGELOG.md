@@ -5,6 +5,25 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.169.0 — 2026-09-17
+
+The input-slider floor is a rescue, not a target: 35%, under the app's own leveller.
+
+### Fixed — the floor was about to fight the leveller
+
+- The "drifting" input slider turned out to be Kin's own automatic leveller
+  doing its job: `tuneInputGain` turns the hardware knob deliberately, aiming
+  speech at −8 dBFS, deferring moves to pauses and logging every one. Measured
+  live within the hour of 0.168.0: the leveller moved the slider 59% → 41%
+  inside one 25-second call, on purpose. The 80% floor 0.168.0 shipped would
+  have stomped that learned position upward at every call start and clipped
+  the first word until the leveller pulled it back.
+- The floor now sits at 35% — the code's own long-standing "below this the
+  call sounds broken" line, where the ADC's noise eats the voice faster than
+  the leveller's climb can rescue it. Under 35% the rescue is instant; above
+  it, the slider's resting place is the leveller's measurement and is left
+  alone. `--mic-gain-floor 0.8` still forces the old idea if wanted.
+
 ## Kin 0.168.0 — 2026-09-17
 
 The app picks the better microphone, and earbuds never silently sound like a telephone.
