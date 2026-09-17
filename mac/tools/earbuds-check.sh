@@ -39,6 +39,13 @@ echo "── the decision table, on known routes"
 "$TK" --earbuds-test > "$SP/unit.log" 2>&1
 want "known answers pass, three rejects included" "$SP/unit.log" 'EARBUDS TEST PASSED'
 
+echo "── the microphone pick, on known devices"
+# Pure decisions over fabricated facts (0.168.0): the devices the rule exists
+# for -- an HFP headset mic, a Mac mini with nothing built in -- cannot be
+# plugged into a rig, so the rig holds the DECISION to known answers instead.
+"$TK" --micpick-test > "$SP/micpick.log" 2>&1
+want "the pick steers off HFP, respects real choices, and its arm never steers" "$SP/micpick.log" 'MIC PICK TEST PASSED'
+
 echo "── the front door, clicked"
 # The same real click controls-check makes on a contact row, on a FORCED
 # loudspeaker route: the row must fire, and the refusal must be what it fires --

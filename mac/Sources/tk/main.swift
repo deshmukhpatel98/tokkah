@@ -600,6 +600,8 @@ let KNOWN_FLAGS: Set<String> = [
   "no-corrveto", "floor-soft", "no-headphone-duplex",
   // Earbuds-only calling (0.166.0): the control arm and its known-answer test.
   "no-earbuds-gate", "earbuds-test",
+  // The microphone pick and the input-slider floor (0.168.0), with their arms.
+  "no-mic-pick", "micpick-test", "no-mic-gain-floor", "mic-gain-floor",
   "speaker-duplex", "no-speaker-duplex", "speaker-duplex-path",
   "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
@@ -654,7 +656,7 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS: Set<String> = [
   "gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
-  "subtitle-test", "decimator-test", "headphone-test", "earbuds-test",
+  "subtitle-test", "decimator-test", "headphone-test", "earbuds-test", "micpick-test",
   "predict-test", "floor-test", "turn-test",
   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-far-test", "aec-test", "backdrop-test", "boost-test", "selftest-boost",
@@ -748,9 +750,18 @@ if let io = arg("io") {
 // A/B-able on a real call rather than argued about.
 if !Audio.ioPinned {
   let (name, speakers) = Audio.outputDevice()
-  Audio.ioKind = speakers ? "vp" : "hal"
+  // The one headphone configuration the raw path cannot carry: a Mac whose ONLY
+  // microphone is the Bluetooth earbuds' own (a Mac mini). HFP runs at 8-16 kHz,
+  // the HAL path hard-stops on a device that will not do 48 kHz, and the walk
+  // through other devices finds nothing -- a call with no microphone at all.
+  // VoiceProcessingIO converts rates as part of its job, so that configuration
+  // rides the duplex unit: telephone-grade either way (that is what HFP is),
+  // but a call that WORKS, and the route pill says what it sounds like.
+  let hfpOnly = !speakers && Audio.micIsHfpOnly()
+  Audio.ioKind = speakers || hfpOnly ? "vp" : "hal"
   let why = speakers ? "speakers, so the echo canceller is on"
-                     : "headphones, so nothing is between the mic and the wire"
+          : hfpOnly ? "the earbuds' own mic is the only one, so the converting unit carries its telephone rate"
+                    : "headphones, so nothing is between the mic and the wire"
   fputs("audio: out is \(name) -- \(why)\n", stderr)
 }
 Metrics.fact("io_reason", Audio.ioPinned ? "pinned" : "route")
@@ -4961,6 +4972,12 @@ func applyGateFlags() {
   // route again and a loudspeaker call is protected by the echo gate and the
   // floor, which is exactly 0.165.0.
   if flag("no-earbuds-gate") { Audio.earbudsOnly = false }
+  // The control arms for the microphone pick and the input-slider floor
+  // (0.168.0): the system default is used unconditionally, and the slider is
+  // read but never touched, which is exactly 0.167.0.
+  if flag("no-mic-pick") { Audio.micPickOn = false }
+  if flag("no-mic-gain-floor") { Audio.micGainFloorOn = false }
+  if let v = arg("mic-gain-floor"), let f = Float(v), f > 0, f <= 1 { Audio.micGainFloor = f }
   // Full duplex on LOUDSPEAKERS, while the canceller is measurably delivering.
   // Ships off -- see `Floor.Cfg.speakerDuplex` for why this one is the exception
   // to "new audio features go out on by default".
@@ -5060,6 +5077,48 @@ if flag("earbuds-test") {
   print(bad ? "  EARBUDS TEST FAILED"
             : "  EARBUDS TEST PASSED -- speakers hold the microphone and refuse the doors,"
             + " earbuds release both, and the control arm is exactly 0.165.0")
+  exit(bad ? 1 : 0)
+}
+
+// ── THE MICROPHONE PICK, PROVEN ON KNOWN DEVICES (0.168.0) ──────────────────
+//
+// Pure decisions over fabricated device facts, because the devices this rule
+// exists for -- a Bluetooth headset's HFP mic, a Mac mini with nothing built
+// in -- cannot be plugged into a rig. The REJECT arms are the product's two
+// promises: a person's full-band default is never second-guessed, and the
+// control arm never steers at all.
+if flag("micpick-test") {
+  var bad = false
+  func say(_ ok: Bool, _ what: String) {
+    print("  \(what.padding(toLength: 72, withPad: " ", startingAt: 0)) \(ok ? "ok" : "WRONG")")
+    if !bad { bad = !ok }
+  }
+  typealias C = Audio.MicCandidate
+  let builtin = C(id: 11, transport: "builtin", maxRate: 48000)
+  let usb     = C(id: 12, transport: "usb", maxRate: 48000)
+  let virt    = C(id: 13, transport: "virtual", maxRate: 48000)
+  let agg     = C(id: 16, transport: "aggregate", maxRate: 48000)
+  let bt2     = C(id: 14, transport: "bluetooth", maxRate: 16000)
+  let cheap   = C(id: 15, transport: "usb", maxRate: 16000)
+  Audio.micPickOn = true
+  say(Audio.rankMic(defaultIsHfp: true, candidates: [virt, bt2, usb, builtin]) == 11,
+      "an HFP default is steered to the built-in mic over everything else")
+  say(Audio.rankMic(defaultIsHfp: true, candidates: [agg, virt, usb]) == 12,
+      "no built-in (a Mac mini with a USB mic): the full-band USB mic wins")
+  say(Audio.rankMic(defaultIsHfp: true, candidates: [virt, agg, bt2, cheap]) == nil,
+      "only loopbacks, headsets and telephone-rate devices: nothing is picked")
+  say(Audio.rankMic(defaultIsHfp: true, candidates: []) == nil,
+      "no other device at all (a bare Mac mini): the earbuds' mic stays")
+  say(Audio.rankMic(defaultIsHfp: false, candidates: [builtin, usb]) == nil,
+      "REJECT: a full-band default is never steered -- a plugged mic is a decision")
+  Audio.micPickOn = false
+  say(Audio.rankMic(defaultIsHfp: true, candidates: [builtin]) == nil,
+      "REJECT: --no-mic-pick never steers, whatever the facts say")
+  Audio.micPickOn = true
+  print(bad ? "  MIC PICK TEST FAILED"
+            : "  MIC PICK TEST PASSED -- an HFP mic is steered off before it can drag the"
+            + " link to telephone quality, a real choice is never second-guessed, and the"
+            + " control arm never steers")
   exit(bad ? 1 : 0)
 }
 
@@ -5489,15 +5548,17 @@ if let m = arg("presence") {
   }
 }
 
-// ── AND THE HOLD SAYS SO, ON THE SURFACE THE PERSON IS LOOKING AT ───────────
+// ── AND THE ROUTE SAYS SO, ON THE SURFACE THE PERSON IS LOOKING AT ──────────
 //
 // Same pill as "your microphone isn't keeping up", same reason: a person whose
-// microphone is held silent is otherwise looking at a call that seems perfectly
-// fine while the other end hears nothing. Wired before the first
-// `checkOutputRoute` so a call that STARTS held (a link-join on speakers) says
-// so on its first frame rather than after the first route change.
-Audio.onEarbudsHold = { hold in
-  display?.controls?.setRouteWarning(hold ? "pop in earbuds — nobody can hear you" : "")
+// microphone is held silent -- or whose earbuds another app has dragged into
+// telephone-grade phone mode -- is otherwise looking at a call that seems
+// perfectly fine while sounding wrong. One callback carries every route
+// sentence (the hold, phone mode, or empty), wired before the first
+// `checkOutputRoute` so a call that STARTS in either state says so on its
+// first frame rather than after the first route change.
+Audio.onRouteLine = { line in
+  display?.controls?.setRouteWarning(line)
 }
 // Which arm this call ran, so a telemetry row can never be read against the
 // wrong product: flag("...") == false is the shipped gate, and the beat says so.

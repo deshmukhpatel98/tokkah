@@ -5,6 +5,52 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.168.0 — 2026-09-17
+
+The app picks the better microphone, and earbuds never silently sound like a telephone.
+
+### Added — the microphone pick
+
+- A Bluetooth headset's own microphone is never opened automatically: opening
+  one drags the whole Bluetooth link into HFP phone mode — telephone-grade in
+  BOTH directions, playout included. When macOS defaults to one, the call is
+  steered to the built-in mic (a studio-grade part on every portable), or to
+  the first full-band real device; loopback/aggregate devices are never picked.
+  A person's explicit choice in the panel is never second-guessed, and a
+  full-band default (a wired headset, a USB interface) is left exactly where
+  macOS put it. `--no-mic-pick` is the control arm.
+- A Mac whose ONLY microphone is the earbuds' own (a Mac mini) used to lose the
+  mic entirely on the raw path — HFP runs at 8–16 kHz and the raw path
+  hard-stops below 48 kHz. That configuration now rides the converting unit:
+  phone quality (that is what HFP is), but a call that works, and it says so.
+- The rate-refusal device walk now tries real hardware before virtual/aggregate
+  devices — alphabetical order used to put a loopback driver in front of the
+  built-in mic, which would have sent the far end silence with a green light on.
+
+### Added — phone mode is detected and named
+
+- The route is re-read every second for HFP on the OUTPUT side too: another app
+  (Dictation, a browser) grabbing the earbuds' mic drops the link to phone mode
+  without any device change, and the call now says "your earbuds are in phone
+  mode — another app is using their microphone" on the pill, clears it when the
+  link recovers, and records `earbuds_phone_mode` (`own-mic` / `another-app` /
+  `off`) per beat. The telemetry verdict names it beside the measured
+  bandwidth row: the bandwidth says what it sounded like, this says why.
+
+### Added — the input slider has a floor
+
+- macOS input volume drifts (anything running Apple's voice unit with AGC turns
+  the hardware slider; found live at 14% once — quiet AND clipped at once).
+  Below the floor the ADC's own noise eats the voice and nothing downstream can
+  put it back. The slider is now raised to 80% when found below it — raise
+  only, once per graph build, read back after the write, never lowered, and
+  never touched by rigs. The overload guard still protects a hot mic digitally,
+  so the two cannot fight. `--mic-gain-floor 0.9` tunes it;
+  `--no-mic-gain-floor` is the control arm.
+- Proven by `--micpick-test` (six known answers, two rejects: a full-band
+  default is never steered, and the control arm never steers), run by
+  `tools/earbuds-check.sh`.
+
 ## Kin 0.167.0 — 2026-09-17
 
 A held microphone now counts its unspoken words.

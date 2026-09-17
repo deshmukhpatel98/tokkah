@@ -826,6 +826,139 @@ final class Audio {
     let f = AudioLab.deviceFacts(dev, input: input)
     return f.transport.hasPrefix("bluetooth") && (f.channels == 1 || (f.rate > 0 && f.rate <= 16000))
   }
+
+  // ── THE MICROPHONE PICK (0.168.0) ─────────────────────────────────────────
+  //
+  // A Bluetooth earbud's own microphone is the one input that is provably wrong
+  // on static facts alone: opening it drags the whole Bluetooth link to HFP, so
+  // BOTH directions -- the mic and the earbuds' own playout -- drop to telephone
+  // grade. Any full-band microphone on this Mac beats it before a sample is
+  // heard, and on a portable the built-in is a known studio-grade part.
+  //
+  // The pick only ever overrides what macOS DEFAULTED to, and only in that one
+  // unambiguous case. A person's explicit choice (`chosenInputUID`) never gets
+  // here -- `defaultDevice` resolves it first -- and a full-band default (a
+  // wired headset, a USB interface) is left exactly where macOS put it: the
+  // contest between two full-band microphones needs ears, not facts, and until
+  // the measured audition exists this does not guess. `--no-mic-pick` is the
+  // control arm and restores the system default unconditionally.
+  static var micPickOn = true
+  struct MicCandidate { let id: AudioDeviceID; let transport: String; let maxRate: Int }
+  /// The decision alone, on facts alone, so a rig can hold it to known answers
+  /// without any of the machines it would need to plug in. Returns the device
+  /// to use INSTEAD of the default, or nil for "leave the default alone".
+  static func rankMic(defaultIsHfp: Bool, candidates: [MicCandidate]) -> AudioDeviceID? {
+    guard micPickOn, defaultIsHfp else { return nil }
+    var other: AudioDeviceID = 0
+    for c in candidates {
+      // Another headset's HFP mic is the same trap with a different name, and
+      // a virtual or aggregate device is not a microphone at all -- picking a
+      // loopback driver would send the far end silence with a green light on.
+      if c.transport.hasPrefix("bluetooth") { continue }
+      if c.transport == "virtual" || c.transport == "aggregate" || c.transport == "airplay" { continue }
+      guard c.maxRate >= 32000 else { continue }
+      if c.transport == "builtin" { return c.id }
+      if other == 0 { other = c.id }
+    }
+    return other == 0 ? nil : other
+  }
+  /// The real devices, handed to the decision. Called off the audio thread.
+  static func betterMic(than def: AudioDeviceID) -> AudioDeviceID? {
+    guard micPickOn, def != 0 else { return nil }
+    guard isBtHfp(dev: def, input: true) else {
+      Metrics.fact("mic_pick", "default")
+      return nil
+    }
+    var cands: [MicCandidate] = []
+    for d in devices(input: true) {
+      guard let id = resolve(d.uid, input: true), id != def else { continue }
+      let f = AudioLab.deviceFacts(id, input: true)
+      cands.append(MicCandidate(id: id, transport: f.transport,
+                                maxRate: f.rates.last ?? Int(f.rate)))
+    }
+    guard let pick = rankMic(defaultIsHfp: true, candidates: cands) else {
+      Metrics.fact("mic_pick", "hfp-only")
+      fputs("mic: the earbuds' own microphone is the only one on this Mac -- the whole"
+          + " Bluetooth link runs at telephone quality, both directions, while it is open\n", stderr)
+      return nil
+    }
+    Metrics.fact("mic_pick", "steered")
+    Metrics.count("mic_pick_steered")
+    fputs("mic: \"\(name(of: def))\" is a Bluetooth headset microphone -- opening it would"
+        + " drop the whole link to telephone quality, so the call uses \"\(name(of: pick))\""
+        + " and the earbuds keep their full sound\n", stderr)
+    return pick
+  }
+  /// Is the earbuds' HFP mic genuinely the only microphone here (a Mac mini)?
+  /// Read where the IO path is decided: the HAL path hard-stops on a device
+  /// that will not do 48 kHz, and an HFP mic never will -- VoiceProcessingIO
+  /// converts, so that one configuration rides the duplex unit instead.
+  static func micIsHfpOnly() -> Bool {
+    guard earbudsOnly || micPickOn else { return false }
+    var def: AudioDeviceID = 0
+    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz, &def)
+    if let picked = resolve(chosenInputUID, input: true) { def = picked }
+    guard isBtHfp(dev: def, input: true) else { return false }
+    return betterMic(than: def) == nil
+  }
+
+  // ── THE INPUT SLIDER HAS A FLOOR (0.168.0) ────────────────────────────────
+  //
+  // macOS input volume drifts: apps running Apple's voice unit with AGC on --
+  // this app's own retired speakers path among them -- turn the HARDWARE slider,
+  // and it stays wherever the last one left it. Found live at 14% once (quiet
+  // AND clipped at the same time, see the note over the volume read), and at
+  // 82% on this Mac with nobody having touched it. Below the floor the ADC's
+  // own noise eats the voice and no digital gain downstream can put it back.
+  //
+  // Raise-only, once per graph build: a slider UNDER the floor is lifted to it,
+  // a slider above it is somebody's business and is left alone, and it is never
+  // lowered -- the overload guard already protects a hot microphone digitally
+  // (`trimOverload`), so the two cannot fight. `--mic-gain-floor 0.9` tunes it;
+  // `--no-mic-gain-floor` is the control arm.
+  static var micGainFloorOn = true
+  static var micGainFloor: Float = 0.80
+  /// Raise the system input slider to the floor if it sits below it. Read back
+  /// after the write (`readback-is-not-in-effect`): some devices refuse the set,
+  /// and a refusal must land in the log as the truth rather than the wish.
+  func floorInputGain(_ dev: AudioDeviceID) {
+    guard Audio.micGainFloorOn, dev != 0 else { return }
+    // The input slider is MACHINE state, not call state: a rig that raised it
+    // would be reaching out of its scratch directory into the Mac of whoever is
+    // sitting at it. Every rig exports TK_NO_IDENTITY and production never sets
+    // it -- the same fence TK_KIN_DIR rides (`rig-isolation-that-does-not-isolate`).
+    guard ProcessInfo.processInfo.environment["TK_NO_IDENTITY"] == nil else { return }
+    var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+      mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    var vol: Float32 = -1
+    var sz = UInt32(MemoryLayout<Float32>.size)
+    if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &vol) != noErr {
+      a.mElement = 1                       // per-channel devices expose nothing on main
+      sz = UInt32(MemoryLayout<Float32>.size)
+      if AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &vol) != noErr { return }
+    }
+    guard vol >= 0, vol < Audio.micGainFloor else { return }
+    var want = Float32(Audio.micGainFloor)
+    var settable = DarwinBoolean(false)
+    guard AudioObjectIsPropertySettable(dev, &a, &settable) == noErr, settable.boolValue,
+          AudioObjectSetPropertyData(dev, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &want) == noErr
+    else {
+      fputs("mic gain: input volume is at \(Int(vol * 100))% and this device refuses"
+          + " to be set -- System Settings > Sound > Input is the fix\n", stderr)
+      return
+    }
+    var got: Float32 = -1
+    sz = UInt32(MemoryLayout<Float32>.size)
+    _ = AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &got)
+    Metrics.count("mic_gain_raised")
+    Metrics.fact("mic_gain", String(format: "%.2f", got >= 0 ? got : want))
+    fputs("mic gain: input volume was at \(Int(vol * 100))% -- raised to"
+        + " \(Int((got >= 0 ? got : want) * 100))% (the floor;"
+        + " something with automatic gain keeps turning this down)\n", stderr)
+  }
   /// Quiet sample counter on capture thread: reset to 0 on voiced block, += n otherwise.
   /// A pause is quietRun >= 0.200 * SR. Initialized to 200 ms so newly created instances
   /// start in a quiet state before voice is detected.
@@ -1671,9 +1804,13 @@ final class Audio {
   // `--no-earbuds-gate` is the control arm and restores 0.165.0 exactly: the
   // doors open on any route and the echo gate and floor protect a speaker call.
   static var earbudsOnly = true
-  /// Fired on the reporter thread when the hold engages or releases, so the
-  /// surface can say why nobody can hear this person. Nil until a window exists.
-  static var onEarbudsHold: ((Bool) -> Void)?
+  /// The one sentence the route has for the person right now -- the hold, phone
+  /// mode, or empty -- fired on the reporter thread whenever it changes. One
+  /// callback for every route sentence, because the pill it feeds has already
+  /// been broken once by two writers.
+  static var onRouteLine: ((String) -> Void)?
+  private var routeLineSaid = ""
+  private var phoneModeSaid = false
   /// The door test, asked wherever a call could START: placing one, answering
   /// one. It reads the DECLARED route (plus the rig override) because there is
   /// no live audio to measure yet -- the measured vote joins in
@@ -1700,6 +1837,38 @@ final class Audio {
       }
     }
     if speakersMeasured { speakers = true; name = "\(name) [speaker heard by the mic]" }
+    // ── ONE SENTENCE ABOUT THE ROUTE, FROM ONE PLACE, EVERY TICK ────────────
+    //
+    // Before the change-guard below, deliberately: Bluetooth earbuds drop to
+    // phone mode (HFP, telephone-grade BOTH directions) the moment ANY app
+    // opens their microphone -- Dictation, a browser tab, this app's own
+    // hfp-only pick on a Mac with no other mic -- and the device NAME does not
+    // change when it happens, only its rate. A detector behind the guard would
+    // miss every one of those. One composed line and one saved copy, because
+    // this pill slot has already been broken once by two writers.
+    if outDev != 0 { outDevIsBtHfp = Audio.isBtHfp(dev: outDev, input: false) }
+    let phoneMode = !speakers && outDevIsBtHfp
+    let hfpSelf = phoneMode && Audio.isBtHfp(dev: inDev, input: true)
+    // The hold is derived from THIS tick's facts rather than read back from
+    // `gEarbudsHold`, which the block further down only updates after the
+    // change-guard -- reading it here would put the pill a whole tick behind
+    // the mute it explains.
+    let holdNow = Audio.earbudsOnly && speakers
+    let routeLine = holdNow ? "pop in earbuds — nobody can hear you"
+      : hfpSelf ? "the earbuds\u{2019} microphone is the only one on this Mac — this call is phone quality"
+      : phoneMode ? "your earbuds are in phone mode — another app is using their microphone"
+      : ""
+    if routeLine != routeLineSaid {
+      routeLineSaid = routeLine
+      Audio.onRouteLine?(routeLine)
+    }
+    if phoneMode != phoneModeSaid {
+      phoneModeSaid = phoneMode
+      Metrics.fact("earbuds_phone_mode", phoneMode ? (hfpSelf ? "own-mic" : "another-app") : "off")
+      if phoneMode { Metrics.count("earbuds_phone_mode") }
+      fputs(phoneMode ? "route: \(routeLine)\n"
+                      : "route: the earbuds are out of phone mode -- full sound is back\n", stderr)
+    }
     guard name != outputName || speakers != onSpeakers else { return }
     let firstLook = outputName.isEmpty
     outputName = name
@@ -1725,7 +1894,6 @@ final class Audio {
         fputs(speakers
             ? "route: no earbuds -- the microphone is held silent until they are in\n"
             : "route: earbuds in -- the microphone is live\n", stderr)
-        Audio.onEarbudsHold?(speakers)
       }
       Metrics.fact("earbuds_hold", speakers ? "on" : "off")
     } else if Audio.gateAuto {
@@ -5697,6 +5865,10 @@ final class Audio {
       mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
       mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz, &id)
+    // The automatic pick (0.168.0): only ever moves off a Bluetooth headset's
+    // HFP microphone, and never off anything a person chose -- their choice
+    // returned above before this line could run.
+    if input, let better = Audio.betterMic(than: id) { return better }
     return id
   }
 
@@ -5938,6 +6110,7 @@ final class Audio {
     // A person cannot be expected to find this. The slider is in System Settings,
     // it is not where anyone looks when a call sounds bad, and nothing in the app
     // has ever mentioned it. So the app reads it and says so.
+    floorInputGain(inDev)
     var vol: Float32 = -1
     var va = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
       mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
@@ -6034,6 +6207,7 @@ final class Audio {
     }
     if input {
       inDev = dev
+      floorInputGain(dev)
     } else {
       outDev = dev
       outDevIsBtHfp = (outDev != 0) ? Audio.isBtHfp(dev: outDev, input: false) : false
@@ -6363,7 +6537,22 @@ final class Audio {
     // The preferred device first: whatever the person chose, or the system default.
     do { return try makeUnit(input: input) } catch { firstError = error }
     let preferred = input ? inDev : outDev
-    for d in Audio.devices(input: input) {
+    // Real hardware before loopback drivers: the walk is alphabetical, and on a
+    // Mac with BlackHole installed "B" comes before "M(acBook)" -- a rate
+    // refusal would have moved the call onto a virtual device that hears
+    // nothing, with a green light on. A virtual device is still tried LAST,
+    // because a person who aggregated their whole rig deserves sound over
+    // silence.
+    let walk = Audio.devices(input: input).sorted { a, b in
+      func virt(_ d: Audio.Device) -> Bool {
+        guard let id = Audio.resolve(d.uid, input: input) else { return true }
+        let t = AudioLab.deviceFacts(id, input: input).transport
+        return t == "virtual" || t == "aggregate" || t == "airplay"
+      }
+      let (va, vb) = (virt(a), virt(b))
+      return va == vb ? a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending : !va
+    }
+    for d in walk {
       guard let id = Audio.resolve(d.uid, input: input), id != preferred else { continue }
       do {
         let u = try makeUnit(input: input, forced: id)

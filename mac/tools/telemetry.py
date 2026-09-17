@@ -406,6 +406,9 @@ VERDICTS = [
     ("heard", "telephone-grade",        lambda d: d["rx_bw"] is not None and d["rx_bw"] < 4.5),
     ("heard", "distorted",              lambda d: d["rx_clip_pct"] is not None and d["rx_clip_pct"] >= 0.1),
     ("heard", "dead air",               lambda d: d["dead_s"] is not None and d["dead_s"] >= 1.0),
+    # Named beside the measured "telephone-grade" row rather than instead of it:
+    # the bandwidth row says what it sounded like, this one says why.
+    ("heard", "earbuds in phone mode",  lambda d: d.get("phone_mode")),
     ("heard", "sped up",                lambda d: d["fast_s"] is not None and d["fast_s"] > 2.0),
     # The earbuds hold (0.166.0) mutes the same words a floor would have, and it
     # rides the same counter -- but blaming "the floor" for a hold would send a
@@ -467,6 +470,10 @@ def lab_numbers(bs):
     # counts, because the LAST beat of a call that ended with earbuds back in
     # would read "off" over a call whose middle was held.
     d["earbuds_hold"] = any(sub([b], "facts", "earbuds_hold") == "on" for b in bs)
+    # Phone mode (0.168.0): the Bluetooth link dropped to HFP at some point in
+    # the call -- telephone-grade both directions -- either because the earbuds'
+    # own mic is the only one on that Mac, or because another app grabbed it.
+    d["phone_mode"] = any(sub([b], "facts", "earbuds_phone_mode") in ("own-mic", "another-app") for b in bs)
     d["turn_changes"] = last(bs, "a_turn_changes", None)
     d["turn_overlap_pct"] = last(bs, "a_turn_overlap_pct", None)
     d["turn_mine_p50_s"] = last(bs, "a_turn_gap_mine_p50_ms", None)
