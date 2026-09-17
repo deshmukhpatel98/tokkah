@@ -5,6 +5,24 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.167.0 — 2026-09-17
+
+A held microphone now counts its unspoken words.
+
+### Fixed — the beat could not see the earbuds hold
+
+- On the first held call after 0.166.0 shipped, the held end's own record read
+  "0.0 s of your words never left" and "they heard you: clear" while the far
+  end measured 27 s of received dead air (calls `99bghdpbaaa0` /
+  `kgc2er0tlfga`). The hold is a gain of zero applied at the send buffer, so
+  it now counts into the same "words that did not leave" ledger the gate and
+  the floor already use — measured where the gain is applied, like them.
+- The verdict names the right mechanism: "N s held — no earbuds in", and the
+  floor row yields to the hold row so one silence gets one name instead of
+  blaming machinery that stood down. Verified live before this shipped: the
+  same held-call shape reads "5.3 s held — no earbuds in" when the deployed
+  telemetry is parsed back (call `jv6q76ka2naz`).
+
 ## Kin 0.166.0 — 2026-09-17
 
 Calls are earbuds-only: full duplex everywhere, and the floor stands down.

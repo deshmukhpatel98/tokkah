@@ -5481,9 +5481,15 @@ final class Audio {
         x[k] *= eff
         // Words that did not leave, counted where the gain is applied and by the
         // gate's own definition of a word -- no second opinion about voice here.
+        // The earbuds hold is a second gain stage (its memset is a gain of zero,
+        // applied at the send buffer), so it counts here too: without this a
+        // held end's beat read "0.0 s of your words never left" and "they heard
+        // you: clear" while the far end measured 27 s of dead air -- the exact
+        // shape `telemetry-must-self-diagnose` exists to refuse, live on call
+        // 99bghdpbaaa0 the hour this shipped.
         if blockVoiced {
           txVoiceS += 1
-          if eff < 0.5 { txVoiceMutedS += 1 }
+          if eff < 0.5 || gEarbudsHold { txVoiceMutedS += 1 }
         }
       }
       if yWant < 1 { yieldSamples += n }

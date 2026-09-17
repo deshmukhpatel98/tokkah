@@ -407,7 +407,12 @@ VERDICTS = [
     ("heard", "distorted",              lambda d: d["rx_clip_pct"] is not None and d["rx_clip_pct"] >= 0.1),
     ("heard", "dead air",               lambda d: d["dead_s"] is not None and d["dead_s"] >= 1.0),
     ("heard", "sped up",                lambda d: d["fast_s"] is not None and d["fast_s"] > 2.0),
-    ("said",  "words lost to the floor",lambda d: d["muted_s"] is not None and d["muted_s"] >= 0.5),
+    # The earbuds hold (0.166.0) mutes the same words a floor would have, and it
+    # rides the same counter -- but blaming "the floor" for a hold would send a
+    # reader hunting through machinery that stood down. The hold row wins and
+    # the floor row yields to it, so one silence gets one name.
+    ("said",  "held for earbuds",       lambda d: d.get("earbuds_hold") and d["muted_s"] is not None and d["muted_s"] >= 0.5),
+    ("said",  "words lost to the floor",lambda d: not d.get("earbuds_hold") and d["muted_s"] is not None and d["muted_s"] >= 0.5),
     ("said",  "went out distorted",     lambda d: d["knee_pct"] is not None and d["knee_pct"] >= 0.5),
     ("said",  "noisy mic",              lambda d: d["snr_db"] is not None and d["snr_db"] < 20.0),
     ("said",  "telephone-grade mic",    lambda d: d["tx_bw"] is not None and d["tx_bw"] < 4.5),
@@ -458,6 +463,10 @@ def lab_numbers(bs):
     d["return_pct"] = (100.0 * ret / talk) if (talk and ret is not None and talk > 0) else (0.0 if ret is not None else None)
     d["return_db"] = med(series(bs, "a_echo_return_db"))
     d["return_lag"] = med(series(bs, "a_echo_return_lag_ms"))
+    # Whether the earbuds hold was ever engaged on this end: any beat saying so
+    # counts, because the LAST beat of a call that ended with earbuds back in
+    # would read "off" over a call whose middle was held.
+    d["earbuds_hold"] = any(sub([b], "facts", "earbuds_hold") == "on" for b in bs)
     d["turn_changes"] = last(bs, "a_turn_changes", None)
     d["turn_overlap_pct"] = last(bs, "a_turn_overlap_pct", None)
     d["turn_mine_p50_s"] = last(bs, "a_turn_gap_mine_p50_ms", None)
@@ -573,6 +582,7 @@ def lab_summary(bs):
         out = []
         for x in w:
             if x == "words lost to the floor": out.append(f"{d['muted_s']:.1f} s of words lost to the floor")
+            elif x == "held for earbuds": out.append(f"{d['muted_s']:.1f} s held — no earbuds in")
             elif x == "dead air": out.append(f"dead air {d['dead_s']:.0f} s")
             elif x == "sped up": out.append(f"sped up for {d['fast_s']:.0f} s")
             elif x == "heard yourself": out.append(f"heard yourself {d['return_pct']:.0f}% at {f1(d['return_db'], ' dB')}")
