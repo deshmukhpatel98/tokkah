@@ -5066,7 +5066,22 @@ if flag("earbuds-test") {
   a.checkOutputRoute()
   say(!Audio.needsEarbuds(), "earbuds: the doors open")
   say(!gEarbudsHold, "earbuds: the microphone is live again")
-  // 3. REJECT: the control arm on the same loudspeaker route is 0.165.0 --
+  // 3. A route that DECLARES headphones but MEASURES as a loudspeaker -- leaky
+  //    wired earbuds with an inline mic, or desk speakers on the jack -- is
+  //    protected, never muted: the first live call after 0.166.0 muted a person
+  //    WEARING earbuds for 2.7 s of the 3 s they spoke (call 2i22mizhk149l,
+  //    coupling 0.95 off their own inline mic). The floor and the echo gate are
+  //    the remedy there; the hold is only for a route that IS a loudspeaker.
+  Audio.routeForced = false
+  a.speakersMeasured = true
+  a.checkOutputRoute()
+  say(!gEarbudsHold, "measured-not-declared: the microphone is NEVER held")
+  say(Audio.gate.on, "measured-not-declared: the 0.165.0 echo gate engages instead")
+  say(Audio.outputIsSpeakers && Audio.outputMeasuredOnly,
+      "measured-not-declared: the route fact still says speakers, marked measured")
+  say(!Audio.needsEarbuds(), "measured-not-declared: the doors stay open (they read DECLARED)")
+  a.speakersMeasured = false
+  // 4. REJECT: the control arm on the same loudspeaker route is 0.165.0 --
   //    open doors, no hold, and the echo gate back up protecting the call.
   Audio.earbudsOnly = false
   Audio.routeForced = true

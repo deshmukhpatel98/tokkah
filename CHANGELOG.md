@@ -5,6 +5,29 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.170.0 — 2026-09-17
+
+A person wearing earbuds is never muted: the measured route gets the floor, not the hold.
+
+### Fixed — the hold silenced somebody wearing wired earbuds, live
+
+- On the first real call after the earbuds-only release (call `2i22mizhk149l`,
+  16:16 today), the far end had wired earbuds in the headphone jack. Their
+  inline cable mic heard enough earbud leakage (coupling 0.95) that the
+  measured-speaker override — built for desk speakers on the jack — flipped
+  their route, and the hold muted them: they spoke 3 s, 2.7 s never left, and
+  the other end heard 10.7 s of dead air. Full duplex was the point, and the
+  product silenced the person it shipped for.
+- Two loudspeaker verdicts now get two remedies. A **declared** loudspeaker
+  (the built-in speakers — nothing plugged in) still holds the microphone. A
+  **measured** one (declared headphones, coupling heard) gets the proven
+  0.163–0.165 protection instead: the linear canceller plus one voice at a
+  time. A false or benign coupling now degrades a call; it can never silence
+  a person. The doors are unchanged (they always read the declared route).
+- Proven by four new `--earbuds-test` arms: the measured route is never held,
+  the echo gate engages there, the route fact still says speakers (marked
+  measured), and the doors stay open.
+
 ## Kin 0.169.0 — 2026-09-17
 
 The input-slider floor is a rescue, not a target: 35%, under the app's own leveller.

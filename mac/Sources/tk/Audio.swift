@@ -1661,12 +1661,15 @@ final class Audio {
     // product rather than two that can disagree.
     let fl = Audio.sharedFloor
     fl.yieldsOnTie = wantYield
-    // Under earbuds-only the floor never engages: a loudspeaker route holds the
-    // microphone silent (`gEarbudsHold`) instead, and a floor fed `speakers`
-    // there would close this person's ear over a transmission that is already
-    // zero. The route FACT (`Audio.outputIsSpeakers`) is untouched -- this is
-    // the turn rule's input, not the readout (`one-condition-two-concerns`).
-    fl.speakers = Audio.outputIsSpeakers && !Audio.earbudsOnly
+    // Under earbuds-only the floor engages for exactly one route: DECLARED
+    // headphones that MEASURE as a loudspeaker (leaky earbuds, desk speakers on
+    // the jack) -- there the floor and the canceller are the remedy, because
+    // the hold's mute silenced a person wearing earbuds on the first live call
+    // after 0.166.0. A declared loudspeaker is held instead, and a floor fed
+    // `speakers` there would close this person's ear over a transmission that
+    // is already zero. The route FACT (`Audio.outputIsSpeakers`) is untouched --
+    // this is the turn rule's input, not the readout (`one-condition-two-concerns`).
+    fl.speakers = Audio.outputIsSpeakers && (!Audio.earbudsOnly || Audio.outputMeasuredOnly)
     // What the canceller is achieving, so the floor can stand down on evidence
     // rather than on a route. Zero when the canceller is off, which is the value
     // that changes nothing.
@@ -1790,7 +1793,10 @@ final class Audio {
   /// Sticky, because a route that flaps flaps the turn rule with it.
   static let MEASURED_SPEAKER_CORR = 0.5
   private var couplingChecks = 0
-  private(set) var speakersMeasured = false
+  /// Not `private(set)`: `--earbuds-test` plants it to prove the measured route
+  /// gets the floor and never the hold -- the arm that was missing when the
+  /// first live call muted a person wearing earbuds.
+  var speakersMeasured = false
   /// ── PINNING THE ROUTE, BECAUSE THE ROUTE CANNOT BE PLUGGED IN ────────────
   ///
   /// The headphone path is now most of the product -- the classifier, the cues,
@@ -1833,6 +1839,9 @@ final class Audio {
   func checkOutputRoute() {
     var (name, speakers) = Audio.outputDevice()
     if let f = Audio.routeForced { speakers = f; name = "\(name) [forced \(f ? "speakers" : "headphones")]" }
+    // What the route DECLARES, kept apart from what the detector measures: the
+    // two get different remedies under earbuds-only (see `outputMeasuredOnly`).
+    let declaredSpeakers = speakers
     if !speakers, !speakersMeasured, Audio.routeForced == nil {
       let acoustic = echoCorr >= Audio.MEASURED_SPEAKER_CORR && echoDelayMs >= 1 && echoDelayMs <= 300
       couplingChecks = acoustic ? couplingChecks + 1 : 0
@@ -1861,8 +1870,9 @@ final class Audio {
     // The hold is derived from THIS tick's facts rather than read back from
     // `gEarbudsHold`, which the block further down only updates after the
     // change-guard -- reading it here would put the pill a whole tick behind
-    // the mute it explains.
-    let holdNow = Audio.earbudsOnly && speakers
+    // the mute it explains. DECLARED speakers only: a measured flip is handled
+    // by the floor and the canceller, not by muting somebody wearing earbuds.
+    let holdNow = Audio.earbudsOnly && declaredSpeakers
     let routeLine = holdNow ? "pop in earbuds — nobody can hear you"
       : hfpSelf ? "the earbuds\u{2019} microphone is the only one on this Mac — this call is phone quality"
       : phoneMode ? "your earbuds are in phone mode — another app is using their microphone"
@@ -1887,24 +1897,31 @@ final class Audio {
     // conclusion as a fact is what once put the whole turn-taking layer behind a
     // pair of headphones (`one-condition-two-concerns`).
     Audio.outputIsSpeakers = speakers
+    Audio.outputMeasuredOnly = speakers && !declaredSpeakers
     if Audio.earbudsOnly {
-      // The hold IS the echo measure now, so the gate stands down with the
-      // floor: a gate left keyed to the route would duck a transmission that is
-      // already zeroed, and a floor left standing would close this person's EAR
-      // on a route where the whole point is that they keep hearing the far end
-      // while they put earbuds in.
+      // Two loudspeaker verdicts, two remedies. A DECLARED loudspeaker (the
+      // built-in speakers -- nobody plugged anything in) holds the microphone:
+      // the hold is the echo measure, the gate stands down with the floor, and
+      // the ear stays open so they hear the far end while they put earbuds in.
+      // A MEASURED one (declared headphones, coupling heard by the detector --
+      // leaky earbuds with an inline mic, or desk speakers on the jack) gets
+      // the 0.165.0 protection instead: canceller plus one voice at a time.
+      // Muting was tried first, live, on the first real call after 0.166.0
+      // shipped -- and it muted a person WEARING earbuds for 2.7 s of the 3 s
+      // they spoke. A false or benign coupling must degrade a call, never
+      // silence a person.
       if Audio.gateAuto {
-        Audio.gate.on = false
+        Audio.gate.on = Audio.outputMeasuredOnly
         Audio.sharedGate.cfg = Audio.gate
       }
-      if gEarbudsHold != speakers {
-        gEarbudsHold = speakers
-        Metrics.count(speakers ? "earbuds_hold_on" : "earbuds_hold_off")
-        fputs(speakers
+      if gEarbudsHold != declaredSpeakers {
+        gEarbudsHold = declaredSpeakers
+        Metrics.count(declaredSpeakers ? "earbuds_hold_on" : "earbuds_hold_off")
+        fputs(declaredSpeakers
             ? "route: no earbuds -- the microphone is held silent until they are in\n"
             : "route: earbuds in -- the microphone is live\n", stderr)
       }
-      Metrics.fact("earbuds_hold", speakers ? "on" : "off")
+      Metrics.fact("earbuds_hold", declaredSpeakers ? "on" : "off")
     } else if Audio.gateAuto {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
@@ -1918,11 +1935,11 @@ final class Audio {
     // all, and a line that read the same either way would hide the single
     // biggest difference in how a call feels.
     let duplex = Audio.sharedFloor.cfg.headphoneDuplex
-    let how = speakers ? (Audio.earbudsOnly
-                            ? "earbuds only: the microphone is held until earbuds are in"
-                            : "one at a time, so nobody hears themselves")
-                       : (duplex ? "both at once, no turns, nothing in the way"
-                                 : "one at a time (--no-headphone-duplex)")
+    let how = !speakers ? (duplex ? "both at once, no turns, nothing in the way"
+                                  : "one at a time (--no-headphone-duplex)")
+            : Audio.earbudsOnly && declaredSpeakers
+              ? "earbuds only: the microphone is held until earbuds are in"
+            : "one at a time, so nobody hears themselves"
     let presInfo = Audio.presence.on ? " (spatial presence: \(Audio.presenceMode))" : ""
     fputs("output\(firstLook ? ":" : " is now:") \(name) -- \(how)\(presInfo)\n", stderr)
   }
@@ -5709,6 +5726,16 @@ final class Audio {
   /// lands -- see `noteFar(transitMs:)`, which exists because assuming this was
   /// zero was a hidden distance limit.
   nonisolated(unsafe) static var owdMsNow: Double = 0
+  /// True when the route DECLARES headphones but the coupling detector measured
+  /// this machine's playout reaching its own microphone -- leaky wired earbuds
+  /// with an inline cable mic, or desk speakers on the jack. The distinction
+  /// decides the REMEDY under earbuds-only: a declared loudspeaker holds the
+  /// mic (nobody plugged anything in), a measured one gets the 0.165.0
+  /// protection instead (canceller + one voice at a time) -- because the first
+  /// live call after 0.166.0 muted a person WEARING wired earbuds for 90% of
+  /// what they said (call 2i22mizhk149l: coupling 0.95 off their own inline
+  /// mic, "they heard you: 2.7 s held" against 3 s talked).
+  nonisolated(unsafe) static var outputMeasuredOnly = false
   /// The route, as a fact and not as the echo gate's conclusion about it.
   nonisolated(unsafe) static var outputIsSpeakers = true {
     didSet {
