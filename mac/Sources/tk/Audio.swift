@@ -13,6 +13,21 @@ import KinAudio
 //
 // File scope, so the button is safe from the moment it is drawn.
 nonisolated(unsafe) var gMicMuted = false
+// ── The earbuds hold: the route's own mute, beside the person's ──────────────
+//
+// Since 0.166.0 a call is an earbuds product: the doors (placing, answering)
+// refuse a loudspeaker route outright, and if the route becomes a loudspeaker
+// anyway -- earbuds pulled mid-call, a link-join on speakers, a jack that
+// declared headphones and measured as a speaker -- this holds the microphone
+// silent instead of resurrecting the floor. Playout stays open: they keep
+// hearing the far end while they put earbuds back in, and nothing this
+// machine's speaker plays can return to them because nothing is sent.
+//
+// A separate flag from `gMicMuted`, deliberately: one is the person's decision
+// and one is the route's, they clear on different events, and folding them into
+// one bool is `one-condition-two-concerns`. Read on the audio thread like
+// `gMicMuted`: a Bool read costs nothing and allocates nothing.
+nonisolated(unsafe) var gEarbudsHold = false
 import AVFoundation
 import AudioToolbox
 import CoreAudio
@@ -1504,7 +1519,12 @@ final class Audio {
     // product rather than two that can disagree.
     let fl = Audio.sharedFloor
     fl.yieldsOnTie = wantYield
-    fl.speakers = Audio.outputIsSpeakers
+    // Under earbuds-only the floor never engages: a loudspeaker route holds the
+    // microphone silent (`gEarbudsHold`) instead, and a floor fed `speakers`
+    // there would close this person's ear over a transmission that is already
+    // zero. The route FACT (`Audio.outputIsSpeakers`) is untouched -- this is
+    // the turn rule's input, not the readout (`one-condition-two-concerns`).
+    fl.speakers = Audio.outputIsSpeakers && !Audio.earbudsOnly
     // What the canceller is achieving, so the floor can stand down on evidence
     // rather than on a route. Zero when the canceller is off, which is the value
     // that changes nothing.
@@ -1640,6 +1660,29 @@ final class Audio {
   ///
   /// Production never sets it, so the guard below is unchanged there.
   static var routeForced: Bool?
+  // ── EARBUDS ONLY (0.166.0) ───────────────────────────────────────────────
+  //
+  // The two output routes were two different products -- loudspeakers got the
+  // floor, the canceller and one voice at a time; earbuds got full duplex and
+  // the pure microphone. This keeps only the good one: calls are placed,
+  // answered and carried on earbuds, and a loudspeaker route holds the
+  // microphone silent (`gEarbudsHold`) instead of engaging the floor.
+  //
+  // `--no-earbuds-gate` is the control arm and restores 0.165.0 exactly: the
+  // doors open on any route and the echo gate and floor protect a speaker call.
+  static var earbudsOnly = true
+  /// Fired on the reporter thread when the hold engages or releases, so the
+  /// surface can say why nobody can hear this person. Nil until a window exists.
+  static var onEarbudsHold: ((Bool) -> Void)?
+  /// The door test, asked wherever a call could START: placing one, answering
+  /// one. It reads the DECLARED route (plus the rig override) because there is
+  /// no live audio to measure yet -- the measured vote joins in
+  /// `checkOutputRoute` once a call is running.
+  static func needsEarbuds() -> Bool {
+    guard earbudsOnly else { return false }
+    if let f = routeForced { return f }
+    return outputDevice().speakers
+  }
 
   func checkOutputRoute() {
     var (name, speakers) = Audio.outputDevice()
@@ -1666,7 +1709,26 @@ final class Audio {
     // conclusion as a fact is what once put the whole turn-taking layer behind a
     // pair of headphones (`one-condition-two-concerns`).
     Audio.outputIsSpeakers = speakers
-    if Audio.gateAuto {
+    if Audio.earbudsOnly {
+      // The hold IS the echo measure now, so the gate stands down with the
+      // floor: a gate left keyed to the route would duck a transmission that is
+      // already zeroed, and a floor left standing would close this person's EAR
+      // on a route where the whole point is that they keep hearing the far end
+      // while they put earbuds in.
+      if Audio.gateAuto {
+        Audio.gate.on = false
+        Audio.sharedGate.cfg = Audio.gate
+      }
+      if gEarbudsHold != speakers {
+        gEarbudsHold = speakers
+        Metrics.count(speakers ? "earbuds_hold_on" : "earbuds_hold_off")
+        fputs(speakers
+            ? "route: no earbuds -- the microphone is held silent until they are in\n"
+            : "route: earbuds in -- the microphone is live\n", stderr)
+        Audio.onEarbudsHold?(speakers)
+      }
+      Metrics.fact("earbuds_hold", speakers ? "on" : "off")
+    } else if Audio.gateAuto {
       Audio.gate.on = speakers
       Audio.sharedGate.cfg = Audio.gate
     }
@@ -1679,7 +1741,9 @@ final class Audio {
     // all, and a line that read the same either way would hide the single
     // biggest difference in how a call feels.
     let duplex = Audio.sharedFloor.cfg.headphoneDuplex
-    let how = speakers ? "one at a time, so nobody hears themselves"
+    let how = speakers ? (Audio.earbudsOnly
+                            ? "earbuds only: the microphone is held until earbuds are in"
+                            : "one at a time, so nobody hears themselves")
                        : (duplex ? "both at once, no turns, nothing in the way"
                                  : "one at a time (--no-headphone-duplex)")
     let presInfo = Audio.presence.on ? " (spatial presence: \(Audio.presenceMode))" : ""
@@ -6654,7 +6718,10 @@ final class Audio {
         // end, and the moment they answer it would conceal speech out of a
         // silence we chose. Reading an Int on the audio thread costs nothing and
         // allocates nothing, which is the only kind of check allowed here.
-        if gMicMuted || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
+        // `gEarbudsHold` zeroes for the same reason the other two do: the route
+        // is a loudspeaker, so what this microphone hears includes that speaker,
+        // and under earbuds-only the hold is the echo measure.
+        if gMicMuted || gEarbudsHold || (wire?.peerRinging ?? false) { memset(capBuf, 0, FPP * 4) }
         let histSlot = Int(capSeq) % Audio.CAP_HIST_COUNT
         // `knee` counts the samples that entered the soft limiter's bend (past
         // 0.80): the far end hears those bent. Counted on both wire formats --
@@ -6678,7 +6745,8 @@ final class Audio {
         }
         lab.txPacket(knee: knee)
         lab.tape.capture(seq: capSeq, hostNs: Clock.ns(cap), gain: dgate.effectiveGain,
-                         muted: gMicMuted || (wire?.peerRinging ?? false), voiced: dgate.blockVoiced)
+                         muted: gMicMuted || gEarbudsHold || (wire?.peerRinging ?? false),
+                         voiced: dgate.blockVoiced)
         capHistoryCap[histSlot] = cap
         capHistorySeq[histSlot] = capSeq
 

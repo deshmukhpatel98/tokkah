@@ -1229,6 +1229,9 @@ enum Launcher {
     // that grows: this pill is measured once (see `setHint(measuring:)`) and can.
     var dotTimer: Timer?
     var hintBefore = ""
+    // The earbuds door's own look at the route, so its sentence clears itself
+    // when earbuds go in rather than sitting stale over a door that is now open.
+    var earbudsTimer: Timer?
     let dimOthers: (String?) -> Void = { who in
       for r in peopleRows {
         r.forcedActive = who != nil && r.handleName == who
@@ -1256,6 +1259,30 @@ enum Launcher {
     }
     t.ring = { [weak t] who in
       guard let t, !t.done, !t.ringing else { return }
+      // ── THE DOOR: A CALL IS PLACED ON EARBUDS OR NOT AT ALL (0.166.0) ──────
+      //
+      // Checked before anything is warmed, minted or rung, so the other Mac
+      // never rings for a call this end cannot carry. The sentence sits on the
+      // hint line this screen already narrates with, and a once-a-second look
+      // takes it down the moment earbuds go in -- but only while the line is
+      // still this one: the hint is shared, and clearing somebody else's
+      // sentence would be this door reaching into the camera's mouth.
+      if Audio.needsEarbuds() {
+        Metrics.count("call_needs_earbuds")
+        fputs("ring: @\(who) needs earbuds -- not rung\n", stderr)
+        let line = "Pop in earbuds to call \(Identity.display(who))."
+        setHint(line)
+        earbudsTimer?.invalidate()
+        var looks = 0
+        let et = Timer(timeInterval: 1, repeats: true) { tm in
+          looks += 1
+          guard hint.stringValue == line, looks < 600 else { tm.invalidate(); return }
+          if !Audio.needsEarbuds() { setHint(""); tm.invalidate() }
+        }
+        RunLoop.main.add(et, forMode: .common)
+        earbudsTimer = et
+        return
+      }
       Identity.clearMissedCalls(for: who)
       for r in peopleRows where r.handleName == who {
         r.hasMissedCall = false

@@ -2217,7 +2217,32 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     hint.stringValue = ""
     mode = .ringing
     applyMode()
+    // ── AND WHAT ANSWERING NEEDS, BEFORE THE PRESS (0.166.0) ────────────────
+    //
+    // The sentence is up while the ring rings, not only after a refused click:
+    // the seconds somebody spends reaching for earbuds are seconds the ring is
+    // still ringing, and a card that speaks only after a failed press spends
+    // them in silence. Re-read once a second -- the cadence the call itself
+    // re-reads the route at -- so earbuds going in clear it by themselves.
+    refreshRingRoute()
+    routeTimer?.invalidate()
+    let rt = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshRingRoute() }
+    RunLoop.main.add(rt, forMode: .common)
+    routeTimer = rt
   }
+
+  private var routeTimer: Timer?
+  private func refreshRingRoute() {
+    guard mode == .ringing else { return }
+    let line = Audio.needsEarbuds() ? "Pop in earbuds to answer" : ""
+    guard hint.stringValue != line else { return }
+    hint.stringValue = line
+    needsLayout = true
+  }
+  /// A press on `answer` was refused for the route. The sentence is already up
+  /// from the once-a-second look; this makes the refusal immediate rather than
+  /// up-to-a-second late, so the press is never silently ignored.
+  func answerNeedsEarbuds() { refreshRingRoute() }
 
   /// This app is ringing somebody. The mirror of `setIncoming`.
   func setOutgoing(to who: String) {
@@ -2343,6 +2368,7 @@ final class WaitingCard: NSView, NSTextFieldDelegate {
     dotsView.isHidden = m != .calling
     if m == .calling { startDots() } else { stopDots() }
     if m != .calling { ringTimer?.invalidate(); ringTimer = nil }
+    if m != .ringing { routeTimer?.invalidate(); routeTimer = nil }
     // The same circle means "ask me who" and then "ring them". Saying so is the
     // difference between a button that changed and a button that moved.
     callIcon.toolTip = m == .dial ? "Call this name" : "Call someone by name"
@@ -3925,9 +3951,21 @@ final class CallControls: NSView {
   /// Kin's own action on the sound. Outranks the above while it is non-empty.
   func setRoomWarning(_ line: String) { warnRoom = line; renderWarning() }
 
+  /// The earbuds hold (0.166.0): the route has no earbuds in it, so the
+  /// microphone is held silent and this is the sentence that says so. Its own
+  /// slot rather than a write into `warnRoom` -- that pill has already been
+  /// broken once by two writers sharing one string (see the note over
+  /// `warnPeer`). Below the permission sentence, because a microphone macOS
+  /// refuses stays silent whatever the earbuds do; above the room and the peer,
+  /// because it is this end's to fix and theirs are not.
+  private var warnRoute = ""
+  func setRouteWarning(_ line: String) { warnRoute = line; renderWarning() }
+
   private func renderWarning() {
-    // Local first, then the room, then the peer. See `setTrouble`.
-    let line = !troubleLocal.isEmpty ? troubleLocal : (warnRoom.isEmpty ? warnPeer : warnRoom)
+    // Local first, then the route, then the room, then the peer. See `setTrouble`.
+    let line = !troubleLocal.isEmpty ? troubleLocal
+             : !warnRoute.isEmpty ? warnRoute
+             : (warnRoom.isEmpty ? warnPeer : warnRoom)
     guard line != warnText else { return }
     warnText = line
     fputs("warning: \(line.isEmpty ? "(cleared)" : line)\n", stderr)
@@ -4569,6 +4607,9 @@ final class CallControls: NSView {
   }
 
   func hideIncoming() { onMain { [weak self] in self?.waiting.clearIncoming() } }
+
+  /// A press on `answer` was refused because the route has no earbuds in it.
+  func ringNeedsEarbuds() { onMain { [weak self] in self?.waiting.answerNeedsEarbuds() } }
 
   /// This Mac is ringing somebody. The mirror of `showIncoming`, and the reason
   /// the caller no longer stares at an invite link wondering if it worked.

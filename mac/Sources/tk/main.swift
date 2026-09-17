@@ -598,6 +598,8 @@ let KNOWN_FLAGS: Set<String> = [
   "no-auto-gain", "gain-debug", "presence", "presence-run",
   "no-gate", "gate-floor", "gate-margin", "gate-test", "force-gate", "gate-coupling",
   "no-corrveto", "floor-soft", "no-headphone-duplex",
+  // Earbuds-only calling (0.166.0): the control arm and its known-answer test.
+  "no-earbuds-gate", "earbuds-test",
   "speaker-duplex", "no-speaker-duplex", "speaker-duplex-path",
   "no-mouth", "mouth-influence", "mouth-test", "mouth-media", "mouth-talking", "mouth-still", "mouth-blind",
   "mouth-threshold", "mouth-rotated",
@@ -652,7 +654,7 @@ let KNOWN_FLAGS: Set<String> = [
 // that can actually hurt somebody.
 let TEST_FLAGS: Set<String> = [
   "gate-test", "mouth-test", "ledger-test", "cue-test", "yield-test",
-  "subtitle-test", "decimator-test", "headphone-test",
+  "subtitle-test", "decimator-test", "headphone-test", "earbuds-test",
   "predict-test", "floor-test", "turn-test",
   "corr-test", "quantile-test", "reopen-test", "gain-test", "echo-state-test",
   "predict-far-test", "aec-test", "backdrop-test", "boost-test", "selftest-boost",
@@ -2901,6 +2903,17 @@ if let peerNow = gCalling?.who ?? arg("with") ?? gOffered?.from, !peerNow.isEmpt
 }
 startRingingOnce()
 display?.controls?.onCall = { who in
+  // ── THE DOOR: A CALL IS PLACED ON EARBUDS OR NOT AT ALL (0.166.0) ─────────
+  //
+  // Checked before the room is minted and before anything rings, so nobody's
+  // Mac rings for a call this end cannot carry. The status pill is where this
+  // surface already narrates ("that is not a name"), so the refusal lands there.
+  if Audio.needsEarbuds() {
+    Metrics.count("call_needs_earbuds")
+    fputs("ring: @\(who) needs earbuds -- not rung\n", stderr)
+    display?.controls?.setStatus("pop in earbuds to call")
+    return
+  }
   // Off main: signing and an HTTPS round trip, on the thread that draws.
   Thread {
     let room = Launcher.mintRoom()
@@ -2966,6 +2979,19 @@ display?.controls?.onCall = { who in
 // draw a card with two buttons that did nothing. The poll loop is conditional;
 // being able to answer is not.
 display?.controls?.onAnswerRing = {
+  // ── THE DOOR: ANSWERING NEEDS EARBUDS TOO (0.166.0) ───────────────────────
+  //
+  // The ring keeps ringing -- it plays on the loudspeaker and the microphone is
+  // not open, so there is nothing to protect -- and the card says what to do.
+  // The moment earbuds go in, the same press answers; the card's own once-a-
+  // second look at the route clears the sentence by itself.
+  if Audio.needsEarbuds() {
+    Metrics.count("answer_needs_earbuds")
+    Metrics.tap("answer", ok: false)
+    fputs("ring: answer needs earbuds -- still ringing\n", stderr)
+    display?.controls?.ringNeedsEarbuds()
+    return
+  }
   // WHAT PRESSED IT. Answering re-execs the process, so by the time anything is
   // wrong the evidence is gone -- and an answer that fires with nobody at the
   // keyboard is indistinguishable in every other log line from one a person
@@ -4917,6 +4943,10 @@ func applyGateFlags() {
   // this is the reference experience -- the only way to hear what echo costs the
   // feel of a call is to be able to turn the compensation for it off and on.
   if flag("no-headphone-duplex") { Audio.sharedFloor.cfg.headphoneDuplex = false }
+  // The control arm for earbuds-only calling (0.166.0): the doors open on any
+  // route again and a loudspeaker call is protected by the echo gate and the
+  // floor, which is exactly 0.165.0.
+  if flag("no-earbuds-gate") { Audio.earbudsOnly = false }
   // Full duplex on LOUDSPEAKERS, while the canceller is measurably delivering.
   // Ships off -- see `Floor.Cfg.speakerDuplex` for why this one is the exception
   // to "new audio features go out on by default".
@@ -4977,6 +5007,48 @@ if let r = arg("route") {
 // never moved and the deadlock rule never fired -- the entire turn-taking
 // product, off for anyone wearing headphones.
 //
+// ── EARBUDS-ONLY, PROVEN ON KNOWN ROUTES (0.166.0) ──────────────────────────
+//
+// Known answers on both routes, and arms it MUST reject: the control arm
+// (`--no-earbuds-gate`) has to behave exactly like 0.165.0 -- echo gate up, no
+// hold -- or the arm is not a control. Routes are FORCED here, never read from
+// the machine, because a test whose verdict depends on what is plugged into the
+// Mac running it is measuring the Mac (`rig-picks-a-parameter-the-product-does-not`).
+if flag("earbuds-test") {
+  var bad = false
+  func say(_ ok: Bool, _ what: String) {
+    print("  \(what.padding(toLength: 66, withPad: " ", startingAt: 0)) \(ok ? "ok" : "WRONG")")
+    if !bad { bad = !ok }
+  }
+  let a = Audio()
+  // 1. A loudspeaker route: the doors refuse, the microphone is held, and the
+  //    echo gate stands down because the hold IS the echo measure now.
+  Audio.earbudsOnly = true
+  Audio.routeForced = true
+  a.checkOutputRoute()
+  say(Audio.needsEarbuds(), "speakers: the doors refuse")
+  say(gEarbudsHold, "speakers: the microphone is held")
+  say(!Audio.gate.on, "speakers: the echo gate stands down under the hold")
+  // 2. Earbuds arrive mid-run -- the same transition a person makes -- and
+  //    everything releases without a restart.
+  Audio.routeForced = false
+  a.checkOutputRoute()
+  say(!Audio.needsEarbuds(), "earbuds: the doors open")
+  say(!gEarbudsHold, "earbuds: the microphone is live again")
+  // 3. REJECT: the control arm on the same loudspeaker route is 0.165.0 --
+  //    open doors, no hold, and the echo gate back up protecting the call.
+  Audio.earbudsOnly = false
+  Audio.routeForced = true
+  a.checkOutputRoute()
+  say(!gEarbudsHold, "REJECT: --no-earbuds-gate never holds the microphone")
+  say(Audio.gate.on, "REJECT: --no-earbuds-gate raises the 0.165.0 echo gate instead")
+  say(!Audio.needsEarbuds(), "REJECT: --no-earbuds-gate opens the doors on speakers")
+  print(bad ? "  EARBUDS TEST FAILED"
+            : "  EARBUDS TEST PASSED -- speakers hold the microphone and refuse the doors,"
+            + " earbuds release both, and the control arm is exactly 0.165.0")
+  exit(bad ? 1 : 0)
+}
+
 // The assertions below are PAIRS, because the cheap way to pass "a headphone
 // user still gets a bid" is a classifier that says bid to everything.
 if flag("headphone-test") {
@@ -5403,6 +5475,19 @@ if let m = arg("presence") {
   }
 }
 
+// ── AND THE HOLD SAYS SO, ON THE SURFACE THE PERSON IS LOOKING AT ───────────
+//
+// Same pill as "your microphone isn't keeping up", same reason: a person whose
+// microphone is held silent is otherwise looking at a call that seems perfectly
+// fine while the other end hears nothing. Wired before the first
+// `checkOutputRoute` so a call that STARTS held (a link-join on speakers) says
+// so on its first frame rather than after the first route change.
+Audio.onEarbudsHold = { hold in
+  display?.controls?.setRouteWarning(hold ? "pop in earbuds — nobody can hear you" : "")
+}
+// Which arm this call ran, so a telemetry row can never be read against the
+// wrong product: flag("...") == false is the shipped gate, and the beat says so.
+Metrics.fact("earbuds_gate", Audio.earbudsOnly ? "on" : "off")
 audio.checkOutputRoute()
 
 // ── TWO IMPLEMENTATIONS OF THE SAME SOUND ────────────────────────────────
@@ -6173,7 +6258,7 @@ if let subs = subtitles {
     // `yieldGainNow` is the turn-taking one; a voice held down by either is a
     // voice the other person is not getting, which is the same problem the mute
     // switch causes deliberately.
-    let audible = !gMicMuted
+    let audible = !gMicMuted && !gEarbudsHold
       && Audio.sharedGate.gain * Audio.sharedGate.yieldGainNow > 0.5
     if !audible { wire.sendSubtitle(text, final: final, listening: listening) }
     // ── AND NEVER ON YOUR OWN SCREEN ─────────────────────────────────────────
@@ -8603,7 +8688,9 @@ func reportLoop() {
   //
   // Fourth instance today of one condition answering two questions. "Do I have a
   // video encoder" was deciding "does the other person find out I muted".
-  wire.selfMuted = display?.controls?.micMuted ?? false
+  // The earbuds hold is a mute the far end should hear about the same way: to
+  // them there is no difference between a pressed mute and a held one.
+  wire.selfMuted = (display?.controls?.micMuted ?? false) || gEarbudsHold
   FarTest.shared?.tick()
   wire.selfStatus = (gVideoPaused ? Wire.ST_VPAUSED : 0)
                   | ((camOff || noCameraHere) ? Wire.ST_CAMOFF : 0)
