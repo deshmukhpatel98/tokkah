@@ -61,7 +61,10 @@ audits() { grep -oE 'audit state controls.*' "$1"; }
 # -- a pattern that means something different from what it reads is how a rig
 # reports a fault nobody can reproduce.
 caps() { audits "$1" | grep -oE '(theirs|mine)="[^"]*"' | tail -2 | tr '\n' ' '; }
-C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings"
+# `--route headphones` since 0.166.0: the earbuds hold makes every voice
+# inaudible on a loudspeaker route, so the negative arm ("an audible voice is
+# not subtitled") only exists on the route real calls run on.
+C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --route headphones"
 
 # ── 1. A MUTED VOICE IS READ ON THE OTHER SCREEN ────────────────────────────
 #

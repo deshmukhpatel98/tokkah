@@ -1,5 +1,13 @@
 # The floor: who is heard, and who hears
 
+> **Status, 0.166.0: the floor stands down in the shipped config.** Calls are
+> earbuds-only now — both doors refuse a loudspeaker route, and a route that
+> becomes a loudspeaker mid-call holds the microphone silent instead of raising
+> the floor. Everything below remains the truth about the machinery, which is
+> kept, tested (`--floor-test`, `--earbuds-test`) and reachable: it is what
+> `--no-earbuds-gate` restores, and it is the fallback if earbuds-only turns
+> out to cost more calls than it improves.
+
 The rule, decided by the person this app is for:
 
 > **One microphone is live at a time, and that same machine's speaker is not.**

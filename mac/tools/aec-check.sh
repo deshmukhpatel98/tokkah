@@ -50,8 +50,12 @@ trap 'reap; rm -rf "$SP"' EXIT
 # nothing (no echo line, "0 dB removed", FAIL). The echo path here is simulated
 # and the real playout is muted, so the physical route is irrelevant to what is
 # being measured and pinning it is honest.
+# `--no-earbuds-gate` for the same reason as `--no-floor`: since 0.166.0 the
+# shipped config holds the microphone silent on a loudspeaker route, and a
+# canceller rig whose capture is zeroed measures nothing. This rig exists to
+# keep the CONTROL ARM's machinery honest, so it runs the control arm.
 COMMON=(--video off --mute --no-telemetry --no-update --no-relocate --no-rings
-        --no-subtitles --no-floor --route speakers)
+        --no-subtitles --no-floor --no-earbuds-gate --route speakers)
 # 22 ms and 0.55: a laptop's own speaker to its own microphone, which is the
 # case the whole feature is for.
 ECHO="22:0.55"

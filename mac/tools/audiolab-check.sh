@@ -44,8 +44,11 @@ done
 # A talks leaves no echo to return -- the floor has its own rig. `--no-aec` at B so
 # the return is not cancelled before it can be measured. `--route speakers` pins
 # the route (a pair of earbuds would stand the whole echo machinery down).
+# `--no-earbuds-gate` joins them for the same reason: since 0.166.0 the shipped
+# config holds capture silent on a loudspeaker route, and a lab whose microphone
+# transmits nothing has no echo, no levels and no tapes worth a verdict.
 COMMON=(--video off --mute --no-update --no-relocate --no-rings --no-subtitles
-        --no-floor --no-aec --route speakers --tel-endpoint "http://127.0.0.1:9/beat")
+        --no-floor --no-aec --no-earbuds-gate --route speakers --tel-endpoint "http://127.0.0.1:9/beat")
 
 # Lab mode for both rig installs, in scratch identity dirs the real Kin never sees.
 for e in a b c d; do

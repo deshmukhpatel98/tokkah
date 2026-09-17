@@ -120,7 +120,12 @@ skip() { printf "  %-4s %s\n" "SKIP" "$1"; skipped="$skipped
 # `--video` is NOT in here: one arm feeds a bright picture through it, and two
 # `--video` flags on one command line is an argument nobody should have to reason
 # about. `shoot` supplies exactly one, always.
-C="--window --mute --no-telemetry --no-update --no-relocate --no-rings"
+# `--no-earbuds-gate --route speakers` since 0.166.0: this is the FLOOR's rig,
+# and in the shipped config the floor never engages on any route (earbuds are
+# duplex, loudspeakers hold the microphone silent) -- its subject only exists on
+# the control arm. Pinned to speakers too, so the verdict stops depending on
+# what is plugged into the Mac running it.
+C="--window --mute --no-telemetry --no-update --no-relocate --no-rings --no-earbuds-gate --route speakers"
 
 # ── ONE PHOTOGRAPH, AND THE RECTANGLES THAT GO WITH IT ──────────────────────
 #
@@ -739,11 +744,18 @@ if [ -z "$LIVE_MEDIA" ]; then
   say "note" "  only arm here with a voice in it, so this is a real gap, not a pass)"
 else
   LR="flrlive$$"
+  # The one pair in this file that did not ride on $C, so it alone ran the
+  # SHIPPED config when 0.166.0 landed: earbuds-only stood the floor down, the
+  # hold silenced capture, arms 1-4 still passed on cue traffic, and the
+  # blindness guard (arm 5) was the only thing that noticed. The rig's own
+  # flags, spelled by hand, drifted from the rig's own premise.
   spawn "$TK" --window --video off --audio "$LIVE_MEDIA/realA.wav" --no-telemetry \
-        --no-update --no-relocate --no-rings --room "$LR" --listen 8341 \
+        --no-update --no-relocate --no-rings --no-earbuds-gate --route speakers \
+        --room "$LR" --listen 8341 \
         --peer 127.0.0.1:8342 > "$SP/live-a.log" 2>&1
   spawn "$TK" --window --video off --audio "$LIVE_MEDIA/realB.wav" --no-telemetry \
-        --no-update --no-relocate --no-rings --room "$LR" --listen 8342 \
+        --no-update --no-relocate --no-rings --no-earbuds-gate --route speakers \
+        --room "$LR" --listen 8342 \
         --peer 127.0.0.1:8341 > "$SP/live-b.log" 2>&1
   W=0; V=0
   while [ "$W" -lt 120 ]; do

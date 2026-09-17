@@ -50,7 +50,10 @@ trap 'reap; rm -rf "$SP"' EXIT
 R="mutechk$$"
 # --mute is the RIG's speaker flag (the machine's speakers belong to whoever is
 # sitting at it). `--press mic` is the app's microphone button. Different things.
-C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
+# `--route headphones` since 0.166.0: on a loudspeaker route the earbuds hold
+# is a second, permanent mute, and this rig's subject is the one the person
+# presses. Earbuds is the only route a real call has now.
+C="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles --route headphones"
 reap; perl -e 'select undef,undef,undef,0.6'
 # A mutes at 6 s and unmutes at 12 s.
 spawn "$TK" $C --room "$R" --listen 7471 --peer 127.0.0.1:7472 \

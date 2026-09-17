@@ -1127,6 +1127,20 @@ if arg("room") == nil, arg("peer") == nil, !flag("gui"),
   // No link. Fall through to the front door -- see `shouldPrompt`.
 }
 
+// ── THE DOOR'S FLAGS, PARSED BEFORE THE DOOR ────────────────────────────────
+//
+// The front door blocks inside `Launcher.home` below, long before the flag
+// section this file parses routes and arms in -- so the two flags its earbuds
+// door reads (`--route`, `--no-earbuds-gate`) would arrive after the door had
+// already answered, and no rig could ever reach the refusal
+// (`handler-tests-cannot-see-interaction-bugs`). Read here as well: pure
+// assignments from argv, so reading them twice is reading them once. The late
+// block keeps the validation and still refuses a misspelled route.
+if flag("no-earbuds-gate") { Audio.earbudsOnly = false }
+if let r = arg("route"), r == "speakers" || r == "headphones" {
+  Audio.routeForced = (r == "speakers")
+}
+
 // `--gui` still opens the join window, for typing a name on purpose.
 if Launcher.shouldPrompt(hasRoom: arg("room") != nil,
                          hasPeer: arg("peer") != nil,

@@ -5,6 +5,13 @@ Goal: tap a name, the other Mac rings, they tap once, they are in. See memory
 key, mailbox, abuse model). This file is only the **ring and connect path** — what it costs,
 what of that is physics, and what of it is ours.
 
+> **0.166.0: both ends of this path now have an earbuds door.** Placing a call
+> on a loudspeaker route is refused before the ring is sent ("pop in earbuds to
+> call"); an incoming ring still rings on speakers — the mic is closed while it
+> rings — but the answer press needs earbuds, and the card says so while it
+> keeps ringing. Everything below about the ring's cost and shape is unchanged;
+> the door sits in front of it.
+
 > **Re-pointed at the deployed server, 2026-08-24.** Every `worker.ts` reference in this file
 > is now **by symbol name and never by line.** The 21 line numbers that used to be here were
 > all wrong within days of being written — the doorbell section is under active edit, and a

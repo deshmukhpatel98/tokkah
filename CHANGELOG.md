@@ -5,6 +5,43 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.166.0 — 2026-09-17
+
+Calls are earbuds-only: full duplex everywhere, and the floor stands down.
+
+### Changed — a call needs earbuds, at both doors
+
+The two output routes were two different products: loudspeakers got the floor,
+the canceller and one voice at a time; earbuds got full duplex and the pure
+microphone. This release keeps only the good one.
+
+- Placing a call — a face on the home screen, a name in the dial card — on a
+  loudspeaker route is refused with "pop in earbuds to call" instead of ringing
+  anybody. The check runs before the room is minted, so the other Mac never
+  rings for a call this end cannot carry.
+- An incoming call still **rings** on speakers (the microphone is closed while
+  it rings, so there is nothing to protect), but answering needs earbuds: the
+  card says "Pop in earbuds to answer", keeps ringing, re-reads the route once
+  a second, and the same press answers the moment they are in.
+- Mid-call, a loudspeaker route — earbuds pulled, a link-join on speakers, or a
+  jack-declared "headphones" the coupling detector measures as a speaker —
+  **holds the microphone silent** instead of engaging the floor. Playout stays
+  open, so you keep hearing the far end while you put them back in; the pill
+  says "pop in earbuds — nobody can hear you"; the far end sees the ordinary
+  muted state; your words reach them as subtitles when the recogniser is on.
+  The hold releases within a second of earbuds returning.
+- The floor and the echo gate stand down entirely: every call that can start is
+  full duplex on the pure microphone. `--no-earbuds-gate` is the control arm
+  and restores 0.165.0 exactly — floor, canceller, one voice at a time.
+- Telemetry: `earbuds_gate` (arm), `earbuds_hold` (state), `earbuds_hold_on/off`
+  (transitions), `call_needs_earbuds` / `answer_needs_earbuds` (what each door
+  refuses) — the numbers that say what the policy costs, per direction.
+- Proven by `--earbuds-test` (known answers on forced routes, three arms it
+  must reject) and `tools/earbuds-check.sh` (both doors really clicked; the
+  hold and its control arm on a live loopback call — 12 assertions). The
+  `--route`/`--no-earbuds-gate` flags are now parsed before the front door
+  blocks, or no rig could ever have reached the home-screen refusal.
+
 ## Kin 0.165.0 — 2026-09-12
 
 Front-door handle management, missed call contact ranking, and rename listener reset.

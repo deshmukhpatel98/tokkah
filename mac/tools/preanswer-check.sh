@@ -1,6 +1,10 @@
 #!/bin/bash
 # ── IS A RING A CALL BEFORE ANYBODY ANSWERS IT? ──────────────────────────────
 #
+# `--route headphones` on every launch since 0.166.0: answering is refused on a
+# loudspeaker route, and this rig's subject is the ring-then-answer flow, not
+# the door (the door has its own rig, `earbuds-check`).
+#
 # It was. The watcher opens Kin with BOTH `--room <r>` and `--incoming <who>`, so
 # the copy that exists to ASK fell through into the rendezvous and joined. With
 # nobody having pressed anything, measured on two real processes:
@@ -128,7 +132,7 @@ if ! head -c 1 "$MEDIA" > /dev/null 2>&1; then
 fi
 R1="preans$$a"
 spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$R1" --listen 8021 --peer 127.0.0.1:8022 --video "$MEDIA" \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester --press-after 8 --press "?" > "$SP/a.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 # Exactly the watcher's launch line, which is the one that will keep arriving from
@@ -140,7 +144,7 @@ perl -e 'select undef,undef,undef,2'
 # camera bring-up, and a rig that never asks for a camera can never see a camera
 # start. Sweep anything the harness hardcodes that the product picks at runtime.
 spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R1" --listen 8022 --peer 127.0.0.1:8021 --video camera \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 7 --press "?" > "$SP/b.log" 2>&1
 perl -e 'select undef,undef,undef,12'
 reap
@@ -148,11 +152,11 @@ reap
 # ── PART TWO: the same ring, answered ───────────────────────────────────────
 R2="preans$$b"
 spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$R2" --listen 8023 --peer 127.0.0.1:8024 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/c.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R2" --listen 8024 --peer 127.0.0.1:8023 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@answer" > "$SP/d.log" 2>&1
 DPID=$LAST_PID
 perl -e 'select undef,undef,undef,14'
@@ -169,7 +173,7 @@ reap
 # window so the refusal is reachable without a person at the trackpad.
 R3="preans$$c"
 spawn env TK_AIM_MS=60000 TK_KIN_DIR="$CALLEE" "$TK" --window --room "$R3" --listen 8025 --peer 127.0.0.1:8026 \
-      --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --video off --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings \
       --no-subtitles --incoming somebody --incoming-key "$KEY" --press-after 3 --press "@!answer,?" \
       > "$SP/e.log" 2>&1
 perl -e 'select undef,undef,undef,10'
@@ -185,7 +189,7 @@ reap
 # works and says nothing about who it works FOR.
 R4="preans$$d"
 spawn env TK_KIN_DIR="$CALLER4" "$TK" --window --room "$R4" --listen 8027 --peer 127.0.0.1:8028 \
-      --video off --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --video off --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings \
       --no-subtitles --calling tester > "$SP/f.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 # `?` first -- the stranger's card, un-connected, is the assertion of part 3b --
@@ -193,7 +197,7 @@ perl -e 'select undef,undef,undef,2'
 # card lives in `NSApplication.run()` above the audio block), which is exactly
 # where 0.157.0 died; see the verdicts under 3b.
 spawn env TK_KIN_DIR="$STRANGER" "$TK" --window --room "$R4" --listen 8028 --peer 127.0.0.1:8027 \
-      --video camera --mute --no-telemetry --no-update --no-relocate --no-rings \
+      --video camera --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings \
       --no-subtitles --incoming astranger --press-after 6 --press "?,@answer" \
       > "$SP/g.log" 2>&1
 GPID=$LAST_PID
@@ -395,13 +399,13 @@ grep -q "ignored a click nobody aimed" "$SP/d.log" \
 echo "── the keyboard: Return answers, Escape declines, and neither is a hair trigger"
 RK="preans$$k"
 spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$RK" --listen 8027 --peer 127.0.0.1:8028 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/k1.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 # `--press-after 0.2` puts the first Return inside the 600 ms window; the second,
 # a token later, lands well outside it.
 spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$RK" --listen 8028 --peer 127.0.0.1:8027 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 0.2 \
       --press "key:return,?,key:return,?" > "$SP/k2.log" 2>&1
 perl -e 'select undef,undef,undef,12'
@@ -430,11 +434,11 @@ grep -qE "re-exec|reexec|answering|joining" "$K" \
 # ── AND ESCAPE DECLINES ─────────────────────────────────────────────────────
 RE="preans$$e"
 spawn env TK_KIN_DIR="$CALLER" "$TK" --window --room "$RE" --listen 8029 --peer 127.0.0.1:8030 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --calling tester > "$SP/e1.log" 2>&1
 perl -e 'select undef,undef,undef,2'
 spawn env TK_KIN_DIR="$CALLEE" "$TK" --window --room "$RE" --listen 8030 --peer 127.0.0.1:8029 --video off \
-      --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
+      --mute --route headphones --no-telemetry --no-update --no-relocate --no-rings --no-subtitles \
       --incoming somebody --incoming-key "$KEY" --press-after 2 \
       --press "key:esc" > "$SP/e2.log" 2>&1
 E2PID=$LAST_PID

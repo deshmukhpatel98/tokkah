@@ -129,7 +129,9 @@ LANE_STATE="permissions-check firstrun-ring-check relaunch-check update-check do
 # 6 reports had media" -- a latency and a rate, which by the rule at the top of
 # this file means it is measuring the machine as much as the build. It failed
 # twice in the parallel lane and passed every time it was run alone.
-LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check controls-check beat-check turn-check crash-check seal-check"
+# `earbuds-check` is sockets, cards and logs on its own ports (8125-8128), its
+# own scratch and its own identity dirs, so it parallelises like the rest.
+LANE_LOGIC="invite-check camoff-check calling-check leave-check contacts-check controls-check beat-check turn-check crash-check seal-check earbuds-check"
 
 # The two whose whole cost is a real-time pass over real speech. `predict-check`
 # feeds 600 s of recording at 1x on purpose -- the recogniser's partials arrive

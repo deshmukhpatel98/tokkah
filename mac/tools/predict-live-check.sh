@@ -59,12 +59,20 @@ arm() {                              # arm <label> <extra flags...>
   local label="$1"; shift
   local R="pl$$$label"
   reap; nap 0.5
+  # `--no-earbuds-gate --route speakers` since 0.166.0: the prior releases
+  # FLOORS, and in the shipped config the floor never engages on any route
+  # (earbuds are duplex, loudspeakers hold the microphone) -- so this rig's
+  # subject only exists on the control arm. Pinned to speakers as well, so its
+  # verdict stops depending on what is plugged into the Mac running it: at
+  # 0.165.0 it silently required the real route to be a loudspeaker.
   "$TK" --window --video off --audio "$MEDIA/realA.wav" --no-telemetry --no-update \
-        --no-relocate --no-rings --room "$R" --listen 8161 --peer 127.0.0.1:8162 "$@" \
+        --no-relocate --no-rings --no-earbuds-gate --route speakers \
+        --room "$R" --listen 8161 --peer 127.0.0.1:8162 "$@" \
         > "$SP/$label-a.log" 2>&1 &
   PIDS="$PIDS $!"
   "$TK" --window --video off --audio "$MEDIA/realB.wav" --no-telemetry --no-update \
-        --no-relocate --no-rings --room "$R" --listen 8162 --peer 127.0.0.1:8161 "$@" \
+        --no-relocate --no-rings --no-earbuds-gate --route speakers \
+        --room "$R" --listen 8162 --peer 127.0.0.1:8161 "$@" \
         > "$SP/$label-b.log" 2>&1 &
   PIDS="$PIDS $!"
   # WAIT FOR MEDIA, not for a clock: a call that never connected produces zero

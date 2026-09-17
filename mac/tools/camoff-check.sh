@@ -47,7 +47,9 @@ trap 'reap; rm -rf "$SP"' EXIT
 R="camoffchk$$"
 # --mute on both ends, always: the machine's speakers belong to whoever is
 # sitting at it, and a rig that plays out loud gets turned off.
-A_ARGS="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
+# `--route headphones` since 0.166.0: on a loudspeaker route the pill carries
+# the earbuds hold's sentence, and this rig asserts the pill's exact words.
+A_ARGS="--mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles --route headphones"
 reap; perl -e 'select undef,undef,undef,0.6'
 # A HAS NO CAMERA. This is the whole subject.
 spawn "$TK" --room "$R" --listen 7911 --peer 127.0.0.1:7912 --video off $A_ARGS > "$SP/a.log" 2>&1

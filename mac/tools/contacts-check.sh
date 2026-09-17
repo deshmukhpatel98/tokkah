@@ -109,7 +109,11 @@ trap 'reap; [ -n "${KEEP:-}" ] || rm -rf "$SP"' EXIT
 # `--video off` everywhere. Nothing here is about a picture, and a person is using
 # this Mac: a rig that turns the camera on puts a green light next to them for no
 # assertion's sake. `--mute` for the same reason -- the speakers are theirs.
-BASE="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles"
+# `--route headphones` since 0.166.0: answering is refused on a loudspeaker
+# route, and this rig's subject is the contact list, not the door. Earbuds is
+# the only route a real call has now, so pinning it is the product config --
+# the door has its own rig (`earbuds-check`).
+BASE="--window --video off --mute --no-telemetry --no-update --no-relocate --no-rings --no-subtitles --route headphones"
 
 # ── THE FILE IS EVIDENCE OF A DIFFERENT KIND FROM A TREE DUMP ───────────────
 #
