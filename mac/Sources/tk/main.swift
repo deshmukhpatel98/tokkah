@@ -5634,6 +5634,9 @@ if let loaded = Audio.loadDevBuf(io: Audio.ioKind) {
 if let db = arg("devbuf"), let v = Int(db), v >= 8, v <= 4096 {
   Audio.devBuf = v
   devBufReason = "flag"
+  // A pinned arm gets exactly what it pinned, on every device: the Bluetooth
+  // floor must not silently hand a sweep a size it did not ask for.
+  Audio.devBufPinned = true
 }
 Metrics.fact("devbuf_reason", devBufReason)
 if flag("no-rt") { Wire.noRealtime = true }

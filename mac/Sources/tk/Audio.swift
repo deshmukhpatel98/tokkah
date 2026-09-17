@@ -1826,6 +1826,9 @@ final class Audio {
   static var onRouteLine: ((String) -> Void)?
   private var routeLineSaid = ""
   private var phoneModeSaid = false
+  private var starveAtLastCheck = 0
+  private var btStrainTicks = 0
+  private var btStrainSaid = false
   /// The door test, asked wherever a call could START: placing one, answering
   /// one. It reads the DECLARED route (plus the rig override) because there is
   /// no live audio to measure yet -- the measured vote joins in
@@ -1867,6 +1870,31 @@ final class Audio {
     if outDev != 0 { outDevIsBtHfp = Audio.isBtHfp(dev: outDev, input: false) }
     let phoneMode = !speakers && outDevIsBtHfp
     let hfpSelf = phoneMode && Audio.isBtHfp(dev: inDev, input: true)
+    // ── AND WHEN BLUETOOTH IS LOSING THE CALL, SAY SO ───────────────────────
+    //
+    // Bluetooth shares the 2.4 GHz band with Wi-Fi, and on one live call the
+    // Bluetooth end starved 2375 times while the wired end starved 34 -- in
+    // the same room, on the same network. The buffer floor above fixes the
+    // half of that which is ours; the radio contention is not ours to fix, and
+    // the only useful thing the app can do is name it and say what works.
+    //
+    // Latched for the call once true, and only after three consecutive seconds
+    // above the threshold: a suggestion that appears and vanishes while
+    // somebody is talking is worse than no suggestion. Wired measured 0.3
+    // episodes a second against this threshold of 8, so the margin is 25x.
+    if outDev != 0, !btStrainSaid {
+      let isBt = AudioLab.deviceFacts(outDev, input: false).transport.hasPrefix("bluetooth")
+      let per = starveEpisodes - starveAtLastCheck
+      starveAtLastCheck = starveEpisodes
+      btStrainTicks = (isBt && per >= 8) ? btStrainTicks + 1 : 0
+      if btStrainTicks >= 3 {
+        btStrainSaid = true
+        Metrics.count("bt_audio_strain")
+        Metrics.fact("bt_audio_strain", "yes")
+        fputs("route: this Bluetooth output is starving (\(per)/s) -- Bluetooth shares"
+            + " the radio with Wi-Fi, so wired earbuds carry a call better\n", stderr)
+      }
+    }
     // The hold is derived from THIS tick's facts rather than read back from
     // `gEarbudsHold`, which the block further down only updates after the
     // change-guard -- reading it here would put the pill a whole tick behind
@@ -1876,6 +1904,7 @@ final class Audio {
     let routeLine = holdNow ? "pop in earbuds — nobody can hear you"
       : hfpSelf ? "the earbuds\u{2019} microphone is the only one on this Mac — this call is phone quality"
       : phoneMode ? "your earbuds are in phone mode — another app is using their microphone"
+      : btStrainSaid ? "these Bluetooth earbuds are struggling — wired earbuds sound better"
       : ""
     if routeLine != routeLineSaid {
       routeLineSaid = routeLine
@@ -5949,6 +5978,41 @@ final class Audio {
   // inherited. 128 frames == 2.67 ms; the device may refuse and pick its own,
   // which is why the achieved value is read back and reported. Set AFTER the
   // sample rate: changing the rate can reset the buffer size underneath you.
+  // ── A BLUETOOTH DEVICE CANNOT BE ASKED FOR 16 FRAMES (0.171.0) ────────────
+  //
+  // The HAL path asks every device for `devBuf` -- 16 frames, 0.33 ms -- which
+  // is right for built-in and wired hardware and impossible for Bluetooth. A
+  // BT device does not deliver a third of a millisecond at a time: it moves
+  // audio in ~10-20 ms bursts over a radio it shares with Wi-Fi, so a ring
+  // drained on a 0.33 ms clock is empty for most of every burst.
+  //
+  // Measured live, 2026-09-17, one call, two ends of the same room:
+  //
+  //   realme Buds Air7 (bluetooth out)   2375 starve episodes, ~14 ms each
+  //                                      739 glitches/min, 33 s of the 126 s
+  //                                      call concealed
+  //   EarPods (wired out)                34 episodes, 26 glitches/min
+  //
+  // 2375 episodes averaging 14 ms is not a network shape -- it is one gap per
+  // burst, which is the buffer. 512 frames (10.7 ms) is the smallest size that
+  // spans a burst; against Bluetooth's own 150-250 ms of playout latency it
+  // costs nothing that can be heard, and it is a FLOOR, so a device already
+  // asking for more keeps it.
+  //
+  // Per DEVICE, not per call: a Mac with wired input and BT output must not
+  // have its microphone slowed to the speaker's clock. An explicit `--devbuf`
+  // still wins outright -- a pinned rig arm that silently got 512 would be
+  // measuring something it did not ask for (`rig-parameter-hides-its-own-severity`).
+  static let BT_MIN_BUFFER_FRAMES = 512
+  static var devBufPinned = false
+  private func requestedFrames(_ dev: AudioDeviceID, input: Bool) -> UInt32 {
+    let want = UInt32(Audio.devBuf)
+    guard !Audio.devBufPinned, dev != 0 else { return want }
+    let t = AudioLab.deviceFacts(dev, input: input).transport
+    guard t.hasPrefix("bluetooth") else { return want }
+    return max(want, UInt32(Audio.BT_MIN_BUFFER_FRAMES))
+  }
+
   private func setBufferFrames(_ dev: AudioDeviceID, _ n: UInt32, input: Bool) -> UInt32 {
     var v = n
     var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
@@ -6088,8 +6152,8 @@ final class Audio {
     // refuse (it does its own block processing), so the ACCEPTED size is read
     // back and printed rather than assumed: a request that silently did nothing
     // would look identical to one that worked.
-    let gotIn = setBufferFrames(inDev, UInt32(Audio.devBuf), input: true)
-    let gotOut = setBufferFrames(outDev, UInt32(Audio.devBuf), input: false)
+    let gotIn = setBufferFrames(inDev, requestedFrames(inDev, input: true), input: true)
+    let gotOut = setBufferFrames(outDev, requestedFrames(outDev, input: false), input: false)
     inLatencyMs = deviceLatencyMs(inDev, input: true)
     outLatencyMs = deviceLatencyMs(outDev, input: false)
     var inRate: Float64 = 0, outRate: Float64 = 0
@@ -6252,10 +6316,16 @@ final class Audio {
     // The beat's `in_rate`/`out_rate` read 0 on every live call because they were
     // set only in the other start path. The rate read back is the one in effect.
     if input { hwInRate = rate } else { hwOutRate = rate }
-    let got = setBufferFrames(dev, UInt32(Audio.devBuf), input: input)
+    let asked = requestedFrames(dev, input: input)
+    let got = setBufferFrames(dev, asked, input: input)
     if input { inLatencyMs = deviceLatencyMs(dev, input: true) } else { outLatencyMs = deviceLatencyMs(dev, input: false) }
     let lat = input ? inLatencyMs : outLatencyMs
+    if asked > UInt32(Audio.devBuf) {
+      Metrics.fact(input ? "devbuf_in" : "devbuf_out", "bt:\(got)")
+      Metrics.count("devbuf_bt_floor")
+    }
     fputs("[\(input ? "in" : "out")] \"\(nm)\" \(Int(rate)) Hz  bufferFrames=\(got)"
+        + " (asked \(asked)\(asked > UInt32(Audio.devBuf) ? " -- Bluetooth: a 0.33 ms buffer cannot span a radio burst" : ""))"
         + "  deviceLatency=\(String(format: "%.2f", lat)) ms\n", stderr)
 
     // Float32, deinterleaved, MONO on the wire. Mono because one voice is one

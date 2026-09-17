@@ -5,6 +5,37 @@ the change landed on `main`.
 
 This project measures its claims; where a change has a number, the number is here.
 
+## Kin 0.171.0 — 2026-09-17
+
+Bluetooth earbuds stop glitching: a 0.33 ms buffer cannot span a radio burst.
+
+### Fixed — the output buffer was sized for wired hardware only
+
+- The raw audio path asks every device for a 16-frame (0.33 ms) buffer. That is
+  right for built-in and wired hardware and impossible for Bluetooth, which
+  moves audio in ~10–20 ms bursts over a radio it shares with Wi-Fi: the ring
+  is empty for most of every burst. Measured on one live call, two ends in the
+  same room on the same network — Bluetooth earbuds: **2375 starvation
+  episodes of ~14 ms each, 739 glitches/min, 33 s of a 126 s call concealed**;
+  wired EarPods: **34 episodes, 26 glitches/min**. 2375 gaps of one burst each
+  is not a network shape, it is the buffer.
+- A Bluetooth device now gets a 512-frame (10.7 ms) floor — the smallest size
+  that spans a burst, and nothing against Bluetooth's own 150–250 ms of
+  playout latency. Per device, so a wired mic beside Bluetooth output keeps its
+  own small buffer; a floor, so a device already asking for more keeps it; and
+  an explicit `--devbuf` still wins outright, so a pinned sweep is never handed
+  a size it did not ask for.
+
+### Added — the radio contention is named
+
+- The half that is not ours: Bluetooth and Wi-Fi share 2.4 GHz, so the
+  Bluetooth end's transmissions bunch and the *other* end hears the gaps (34
+  dropouts of ~250 ms, and 463 lost video frames against 10, on that same
+  call). When a Bluetooth output starves hard for three seconds together, the
+  call says "these Bluetooth earbuds are struggling — wired earbuds sound
+  better" and records `bt_audio_strain`. Latched for the call, because a
+  suggestion that blinks while somebody is talking is worse than none.
+
 ## Kin 0.170.0 — 2026-09-17
 
 A person wearing earbuds is never muted: the measured route gets the floor, not the hold.
